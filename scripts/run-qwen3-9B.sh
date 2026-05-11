@@ -10,7 +10,7 @@ sleep 3
 pkill -9 ray
 pkill -9 python
 
-set -ex
+set -exo pipefail
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
@@ -38,12 +38,18 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
 
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
-TP=1
+SAVE_DIR="checkpoints/${MODEL_DIR##*/}"
+LOG_DIR="${SAVE_DIR}"
+LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+TP=2
+mkdir -p "${LOG_DIR}"
+echo "Logging to ${LOG_FILE}"
+
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
    --ref-load ${MODEL_DIR}/torch_dist
-   --save checkpoints/${MODEL_DIR##*/}/
-   --load checkpoints/${MODEL_DIR##*/}/
+   --save ${SAVE_DIR}/
+   --load ${SAVE_DIR}/
    --save-interval 20
 )
 
@@ -159,4 +165,5 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
+   ${MISC_ARGS[@]} \
+   2>&1 | tee -a "${LOG_FILE}"
