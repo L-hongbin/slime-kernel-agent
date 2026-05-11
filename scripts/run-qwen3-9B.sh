@@ -11,6 +11,32 @@ touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "Logging to ${LOG_FILE}"
 
+dump_ray_logs() {
+    local ray_log_dir="/tmp/ray/session_latest/logs"
+    local log_file
+
+    echo "ray start failed; dumping Ray logs from ${ray_log_dir}"
+    if [[ ! -d "${ray_log_dir}" ]]; then
+        echo "Ray log directory does not exist: ${ray_log_dir}"
+        return
+    fi
+
+    for log_file in \
+        "${ray_log_dir}/gcs_server.out" \
+        "${ray_log_dir}/gcs_server.err" \
+        "${ray_log_dir}/raylet.out" \
+        "${ray_log_dir}/raylet.err" \
+        "${ray_log_dir}/dashboard.log" \
+        "${ray_log_dir}/dashboard.err" \
+        "${ray_log_dir}/dashboard_agent.log" \
+        "${ray_log_dir}/dashboard_agent.err"; do
+        if [[ -f "${log_file}" ]]; then
+            echo "===== ${log_file} ====="
+            tail -n 200 "${log_file}" || true
+        fi
+    done
+}
+
 # for rerun the task
 pkill -9 sglang || true
 sleep 3
@@ -142,7 +168,15 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s:-120}
+NO_PROXY_EXTRA="localhost,127.0.0.1,${MASTER_ADDR}"
+export no_proxy="${NO_PROXY_EXTRA}${no_proxy:+,${no_proxy}}"
+export NO_PROXY="${NO_PROXY_EXTRA}${NO_PROXY:+,${NO_PROXY}}"
+
+if ! ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus ${NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265; then
+    dump_ray_logs
+    exit 1
+fi
 
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
