@@ -121,7 +121,7 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
-ray job submit --address="${RAY_JOB_ADDRESS}" \
+submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-nodes 1 \

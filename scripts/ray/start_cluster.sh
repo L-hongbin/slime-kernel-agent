@@ -137,6 +137,14 @@ preseed_dashboard_agent_port_files() {
 wait_for_ray_job_server() {
     local timeout_s=${RAY_JOB_SERVER_WAIT_TIME_S:-120}
     local deadline=$((SECONDS + timeout_s))
+    local dashboard_agent_log="${RAY_TMPDIR:-/tmp/ray}/session_latest/logs/dashboard_agent.log"
+
+    while ((SECONDS < deadline)); do
+        if [[ -f "${dashboard_agent_log}" ]] && grep -q "Dashboard agent http address:" "${dashboard_agent_log}"; then
+            break
+        fi
+        sleep 1
+    done
 
     while ((SECONDS < deadline)); do
         if ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
@@ -148,6 +156,44 @@ wait_for_ray_job_server() {
     echo "error: Ray job server did not become ready within ${timeout_s}s: ${RAY_JOB_ADDRESS}" >&2
     dump_ray_logs
     return 1
+}
+
+submit_ray_job() {
+    local timeout_s=${RAY_JOB_SUBMIT_RETRY_TIMEOUT_S:-120}
+    local deadline=$((SECONDS + timeout_s))
+    local retry_delay_s=${RAY_JOB_SUBMIT_RETRY_DELAY_S:-2}
+    local marker_file
+    local exit_code
+
+    while true; do
+        marker_file=$(mktemp)
+        set +e
+        ray job submit "$@" 2>&1 | awk -v marker_file="${marker_file}" '
+            {
+                print
+                fflush()
+                if (index($0, "No available agent to submit job") > 0) {
+                    system("touch " marker_file)
+                }
+            }
+        '
+        exit_code=${PIPESTATUS[0]}
+        set -e
+
+        if [[ "${exit_code}" -eq 0 ]]; then
+            rm -f "${marker_file}"
+            return 0
+        fi
+
+        if [[ ! -s "${marker_file}" ]] || ((SECONDS >= deadline)); then
+            rm -f "${marker_file}"
+            return "${exit_code}"
+        fi
+
+        rm -f "${marker_file}"
+        echo "Ray job agent is not ready yet; retrying submit in ${retry_delay_s}s"
+        sleep "${retry_delay_s}"
+    done
 }
 
 start_ray_cluster() {
