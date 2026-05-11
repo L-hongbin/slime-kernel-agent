@@ -197,3 +197,4 @@ _examples_synced/
 data/
 tmp.md
 *.bundle
+checkpoints/
