@@ -1,16 +1,25 @@
 #!/bin/bash
 
-# for rerun the task
-pkill -9 sglang
-sleep 3
-ray stop --force
-pkill -9 ray
-pkill -9 python
-sleep 3
-pkill -9 ray
-pkill -9 python
-
 set -exo pipefail
+
+MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
+SAVE_DIR="checkpoints/${MODEL_DIR##*/}"
+LOG_DIR="${SAVE_DIR}"
+LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p "${LOG_DIR}"
+touch "${LOG_FILE}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+echo "Logging to ${LOG_FILE}"
+
+# for rerun the task
+pkill -9 sglang || true
+sleep 3
+ray stop --force || true
+pkill -9 ray || true
+pkill -9 python || true
+sleep 3
+pkill -9 ray || true
+pkill -9 python || true
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
@@ -37,13 +46,7 @@ echo "NUM_GPUS: $NUM_GPUS"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
 
-MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}"
-LOG_DIR="${SAVE_DIR}"
-LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
 TP=2
-mkdir -p "${LOG_DIR}"
-echo "Logging to ${LOG_FILE}"
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
@@ -165,5 +168,4 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
-   2>&1 | tee -a "${LOG_FILE}"
+   ${MISC_ARGS[@]}
