@@ -44,6 +44,17 @@ stop_ray_processes() {
     pkill -9 python || true
 }
 
+clean_ray_session_dirs() {
+    local ray_tmpdir="${RAY_TMPDIR:-/tmp/ray}"
+
+    [[ "${RAY_CLEAN_TMP_SESSION_DIRS:-1}" == "1" ]] || return
+    [[ -d "${ray_tmpdir}" ]] || return
+
+    find "${ray_tmpdir}" -mindepth 1 -maxdepth 1 \
+        \( -name 'session_*' -o -name 'session_latest' \) \
+        -exec rm -rf {} + || true
+}
+
 detect_num_gpus() {
     local detected_gpus
 
@@ -81,35 +92,42 @@ detect_nvlink() {
 }
 
 preseed_dashboard_agent_port_files() {
+    set +x
+
     local ray_tmpdir="${RAY_TMPDIR:-/tmp/ray}"
     local timeout_s=${RAY_PORT_FILE_PRESEED_TIMEOUT_S:-30}
     local deadline=$((SECONDS + timeout_s))
     local started_at
+    local session_link
+    local session_dir
     local raylet_out
     local raylet_mtime
     local node_id
-    local session_dir
 
     # Some Ray builds fatal after ~15s if dashboard agent port files are not
     # written yet, even though the dashboard agent is still starting.
     started_at=$(date +%s)
+    session_link="${ray_tmpdir}/session_latest"
+
     while ((SECONDS < deadline)); do
-        for raylet_out in "${ray_tmpdir}"/session_*/logs/raylet.out; do
-            [[ -f "${raylet_out}" ]] || continue
-            raylet_mtime=$(stat -c %Y "${raylet_out}" 2>/dev/null || echo 0)
-            [[ "${raylet_mtime}" -ge "${started_at}" ]] || continue
-
-            node_id=$(sed -n 's/.*Setting node ID node_id=\([0-9a-f]*\).*/\1/p' "${raylet_out}" | tail -n 1)
-            [[ -n "${node_id}" ]] || continue
-
-            session_dir=$(dirname "$(dirname "${raylet_out}")")
-            printf '%s' "${RAY_DASHBOARD_AGENT_GRPC_PORT}" >"${session_dir}/metrics_agent_port_${node_id}"
-            printf '%s' "${RAY_METRICS_EXPORT_PORT}" >"${session_dir}/metrics_export_port_${node_id}"
-            printf '%s' "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" >"${session_dir}/dashboard_agent_listen_port_${node_id}"
-            echo "Preseeded Ray dashboard port files for node ${node_id} in ${session_dir}"
-            return 0
-        done
-        sleep 0.1
+        session_dir=$(readlink -f "${session_link}" 2>/dev/null || true)
+        if [[ -n "${session_dir}" ]]; then
+            raylet_out="${session_dir}/logs/raylet.out"
+            if [[ -f "${raylet_out}" ]]; then
+                raylet_mtime=$(stat -c %Y "${raylet_out}" 2>/dev/null || echo 0)
+                if [[ "${raylet_mtime}" -ge "${started_at}" ]]; then
+                    node_id=$(sed -n 's/.*Setting node ID node_id=\([0-9a-f]*\).*/\1/p' "${raylet_out}" | tail -n 1)
+                    if [[ -n "${node_id}" ]]; then
+                        printf '%s' "${RAY_DASHBOARD_AGENT_GRPC_PORT}" >"${session_dir}/metrics_agent_port_${node_id}"
+                        printf '%s' "${RAY_METRICS_EXPORT_PORT}" >"${session_dir}/metrics_export_port_${node_id}"
+                        printf '%s' "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" >"${session_dir}/dashboard_agent_listen_port_${node_id}"
+                        echo "Preseeded Ray dashboard port files for node ${node_id} in ${session_dir}"
+                        return 0
+                    fi
+                fi
+            fi
+        fi
+        sleep 0.2
     done
 
     echo "Did not preseed Ray dashboard port files within ${timeout_s}s"
@@ -145,6 +163,7 @@ start_ray_cluster() {
     RAY_RUNTIME_ENV_AGENT_PORT=${RAY_RUNTIME_ENV_AGENT_PORT:-52367}
     RAY_OBJECT_STORE_MEMORY=${RAY_OBJECT_STORE_MEMORY:-10000000000}
     export RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s:-120}
+    export RAY_agent_register_timeout_ms=${RAY_agent_register_timeout_ms:-120000}
 
     export MASTER_ADDR NODE_ADDR RAY_PORT RAY_DASHBOARD_PORT
 
@@ -153,11 +172,12 @@ start_ray_cluster() {
     export NO_PROXY="${no_proxy_extra}${NO_PROXY:+,${NO_PROXY}}"
 
     stop_ray_processes
+    clean_ray_session_dirs
     detect_num_gpus
     detect_nvlink
 
     local port_preseed_pid=""
-    if [[ "${RAY_PRESEED_DASHBOARD_PORT_FILES:-1}" == "1" ]]; then
+    if [[ "${RAY_PRESEED_DASHBOARD_PORT_FILES:-0}" == "1" ]]; then
         preseed_dashboard_agent_port_files &
         port_preseed_pid=$!
     fi
