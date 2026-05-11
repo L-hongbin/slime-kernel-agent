@@ -80,6 +80,58 @@ detect_nvlink() {
     echo "HAS_NVLINK: ${HAS_NVLINK} (detected ${nvlink_count} NVLink references)"
 }
 
+preseed_dashboard_agent_port_files() {
+    local ray_tmpdir="${RAY_TMPDIR:-/tmp/ray}"
+    local timeout_s=${RAY_PORT_FILE_PRESEED_TIMEOUT_S:-30}
+    local deadline=$((SECONDS + timeout_s))
+    local started_at
+    local raylet_out
+    local raylet_mtime
+    local node_id
+    local session_dir
+
+    # Some Ray builds fatal after ~15s if dashboard agent port files are not
+    # written yet, even though the dashboard agent is still starting.
+    started_at=$(date +%s)
+    while ((SECONDS < deadline)); do
+        for raylet_out in "${ray_tmpdir}"/session_*/logs/raylet.out; do
+            [[ -f "${raylet_out}" ]] || continue
+            raylet_mtime=$(stat -c %Y "${raylet_out}" 2>/dev/null || echo 0)
+            [[ "${raylet_mtime}" -ge "${started_at}" ]] || continue
+
+            node_id=$(sed -n 's/.*Setting node ID node_id=\([0-9a-f]*\).*/\1/p' "${raylet_out}" | tail -n 1)
+            [[ -n "${node_id}" ]] || continue
+
+            session_dir=$(dirname "$(dirname "${raylet_out}")")
+            printf '%s' "${RAY_DASHBOARD_AGENT_GRPC_PORT}" >"${session_dir}/metrics_agent_port_${node_id}"
+            printf '%s' "${RAY_METRICS_EXPORT_PORT}" >"${session_dir}/metrics_export_port_${node_id}"
+            printf '%s' "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" >"${session_dir}/dashboard_agent_listen_port_${node_id}"
+            echo "Preseeded Ray dashboard port files for node ${node_id} in ${session_dir}"
+            return 0
+        done
+        sleep 0.1
+    done
+
+    echo "Did not preseed Ray dashboard port files within ${timeout_s}s"
+    return 0
+}
+
+wait_for_ray_job_server() {
+    local timeout_s=${RAY_JOB_SERVER_WAIT_TIME_S:-120}
+    local deadline=$((SECONDS + timeout_s))
+
+    while ((SECONDS < deadline)); do
+        if ray job list --address="${RAY_JOB_ADDRESS}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    echo "error: Ray job server did not become ready within ${timeout_s}s: ${RAY_JOB_ADDRESS}" >&2
+    dump_ray_logs
+    return 1
+}
+
 start_ray_cluster() {
     RAY_ROLE=${RAY_ROLE:-head}
     MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
@@ -90,6 +142,7 @@ start_ray_cluster() {
     RAY_DASHBOARD_AGENT_LISTEN_PORT=${RAY_DASHBOARD_AGENT_LISTEN_PORT:-52365}
     # Keep this outside Ray's default worker port range, 10002-19999.
     RAY_METRICS_EXPORT_PORT=${RAY_METRICS_EXPORT_PORT:-20000}
+    RAY_RUNTIME_ENV_AGENT_PORT=${RAY_RUNTIME_ENV_AGENT_PORT:-52367}
     RAY_OBJECT_STORE_MEMORY=${RAY_OBJECT_STORE_MEMORY:-10000000000}
     export RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s:-120}
 
@@ -103,6 +156,12 @@ start_ray_cluster() {
     detect_num_gpus
     detect_nvlink
 
+    local port_preseed_pid=""
+    if [[ "${RAY_PRESEED_DASHBOARD_PORT_FILES:-1}" == "1" ]]; then
+        preseed_dashboard_agent_port_files &
+        port_preseed_pid=$!
+    fi
+
     if [[ "${RAY_ROLE}" == "head" ]]; then
         if ! ray start --head \
             --node-ip-address "${MASTER_ADDR}" \
@@ -114,21 +173,31 @@ start_ray_cluster() {
             --dashboard-port "${RAY_DASHBOARD_PORT}" \
             --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
             --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
+            --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
             --metrics-export-port "${RAY_METRICS_EXPORT_PORT}"; then
+            [[ -z "${port_preseed_pid}" ]] || kill "${port_preseed_pid}" 2>/dev/null || true
             dump_ray_logs
             return 1
         fi
+        [[ -z "${port_preseed_pid}" ]] || wait "${port_preseed_pid}" || true
 
         RAY_JOB_ADDRESS="http://127.0.0.1:${RAY_DASHBOARD_PORT}"
+        wait_for_ray_job_server
     elif [[ "${RAY_ROLE}" == "worker" ]]; then
         if ! ray start \
             --address "${MASTER_ADDR}:${RAY_PORT}" \
             --node-ip-address "${NODE_ADDR}" \
             --num-gpus "${NUM_GPUS}" \
+            --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
+            --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
+            --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
+            --metrics-export-port "${RAY_METRICS_EXPORT_PORT}" \
             --disable-usage-stats; then
+            [[ -z "${port_preseed_pid}" ]] || kill "${port_preseed_pid}" 2>/dev/null || true
             dump_ray_logs
             return 1
         fi
+        [[ -z "${port_preseed_pid}" ]] || wait "${port_preseed_pid}" || true
 
         RAY_JOB_ADDRESS=""
     else
