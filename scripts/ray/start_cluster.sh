@@ -162,8 +162,10 @@ start_ray_cluster() {
     RAY_METRICS_EXPORT_PORT=${RAY_METRICS_EXPORT_PORT:-20000}
     RAY_RUNTIME_ENV_AGENT_PORT=${RAY_RUNTIME_ENV_AGENT_PORT:-52367}
     RAY_OBJECT_STORE_MEMORY=${RAY_OBJECT_STORE_MEMORY:-10000000000}
+    RAY_AGENT_REGISTER_TIMEOUT_MS=${RAY_AGENT_REGISTER_TIMEOUT_MS:-120000}
+    RAY_SYSTEM_CONFIG=${RAY_SYSTEM_CONFIG:-"{\"agent_register_timeout_ms\":${RAY_AGENT_REGISTER_TIMEOUT_MS}}"}
     export RAY_raylet_start_wait_time_s=${RAY_raylet_start_wait_time_s:-120}
-    export RAY_agent_register_timeout_ms=${RAY_agent_register_timeout_ms:-120000}
+    export RAY_agent_register_timeout_ms=${RAY_agent_register_timeout_ms:-${RAY_AGENT_REGISTER_TIMEOUT_MS}}
 
     export MASTER_ADDR NODE_ADDR RAY_PORT RAY_DASHBOARD_PORT
 
@@ -177,7 +179,7 @@ start_ray_cluster() {
     detect_nvlink
 
     local port_preseed_pid=""
-    if [[ "${RAY_PRESEED_DASHBOARD_PORT_FILES:-0}" == "1" ]]; then
+    if [[ "${RAY_PRESEED_DASHBOARD_PORT_FILES:-1}" == "1" ]]; then
         preseed_dashboard_agent_port_files &
         port_preseed_pid=$!
     fi
@@ -194,7 +196,8 @@ start_ray_cluster() {
             --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
             --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
             --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
-            --metrics-export-port "${RAY_METRICS_EXPORT_PORT}"; then
+            --metrics-export-port "${RAY_METRICS_EXPORT_PORT}" \
+            --system-config "${RAY_SYSTEM_CONFIG}"; then
             [[ -z "${port_preseed_pid}" ]] || kill "${port_preseed_pid}" 2>/dev/null || true
             dump_ray_logs
             return 1
@@ -212,6 +215,7 @@ start_ray_cluster() {
             --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
             --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
             --metrics-export-port "${RAY_METRICS_EXPORT_PORT}" \
+            --system-config "${RAY_SYSTEM_CONFIG}" \
             --disable-usage-stats; then
             [[ -z "${port_preseed_pid}" ]] || kill "${port_preseed_pid}" 2>/dev/null || true
             dump_ray_logs
