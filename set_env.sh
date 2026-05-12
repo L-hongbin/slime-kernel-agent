@@ -3,4 +3,6 @@ if [[ ! -d "/nfs/FM/chenshuailin/checkpoints" ]]; then
     ln -s /ms/FM/checkpoints /nfs/FM/chenshuailin/checkpoints
 fi
 
+
+cd $(dirname $0)
 pip install -e . --no-deps --break-system-packages
