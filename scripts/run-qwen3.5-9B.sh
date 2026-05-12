@@ -19,12 +19,6 @@ source "${SCRIPT_DIR}/ray/start_cluster.sh"
 source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
 
 TP=2
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
-SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.12}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-1}
-SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY:-4}
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 
 CKPT_ARGS=(
@@ -45,12 +39,12 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --rm-type deepscaler
    --num-rollout 3000
-   --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
-   --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT}
+   --rollout-batch-size 32
+   --n-samples-per-prompt 8
    --rollout-max-response-len 8192
    --rollout-temperature 1
 
-   --global-batch-size ${GLOBAL_BATCH_SIZE}
+   --global-batch-size 256
    --balance-data
 )
 
@@ -108,9 +102,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
-   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
-   --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
-   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY}
+   --sglang-mem-fraction-static 0.7
 )
 
 MISC_ARGS=(
@@ -140,7 +132,6 @@ submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node ${NUM_GPUS} \
    --colocate \
-   --no-offload-train \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

@@ -31,7 +31,7 @@
 当前训练入口：
 
 ```bash
-scripts/run-qwen3-9B.sh
+scripts/run-qwen3.5-9B.sh
 ```
 
 Ray 启动逻辑已拆到：
@@ -44,12 +44,10 @@ scripts/ray/start_cluster.sh
 
 ```bash
 TP=2
-ROLLOUT_BATCH_SIZE=4
-N_SAMPLES_PER_PROMPT=8
-GLOBAL_BATCH_SIZE=32
-SGLANG_MEM_FRACTION_STATIC=0.12
-SGLANG_MAX_RUNNING_REQUESTS=1
-SGLANG_SERVER_CONCURRENCY=4
+--rollout-batch-size 32
+--n-samples-per-prompt 8
+--global-batch-size 256
+--sglang-mem-fraction-static 0.7
 SAVE_INTERVAL=1
 ```
 
@@ -180,53 +178,33 @@ Qwen3.5-9B colocate 训练和 SGLang rollout 时，显存峰值很高。早期�
 
 ### 解决方式
 
-在 `scripts/run-qwen3-9B.sh` 里降低 rollout 和 batch 压力。和 `f27762a4` 基线相比，具体变化是：
+曾在 `scripts/run-qwen3.5-9B.sh` 里临时降低 rollout 和 batch 压力，用于排查 colocate 显存峰值。该组问题 3 的降载改动现已按要求恢复为原脚本默认值，避免把 debug 配置作为默认训练配置。
 
-| 参数 | 原值 | 当前值 | 说明 |
-| --- | --- | --- | --- |
-| `--rollout-batch-size` | `32` | `4` | 每轮采样 prompt 数从 32 降到 4。 |
-| `--n-samples-per-prompt` | `8` | `8` | 保持不变。 |
-| `--global-batch-size` | `256` | `32` | 跟随 `4 * 8`，保证一个 rollout batch 对应一次 update。 |
-| `--sglang-mem-fraction-static` | `0.7` | `0.12` | 大幅减少 SGLang 静态显存占用，给 Megatron/optimizer/checkpoint 留空间。 |
-| `--sglang-max-running-requests` | 原脚本未显式设置；SGLang 默认是 `None`，运行时按容量动态推导 | `1` | 限制单个 SGLang engine 同时运行请求数。 |
-| `--sglang-server-concurrency` | 原脚本未显式设置；slime 默认 `512` | `4` | 限制发给 SGLang server 的 HTTP 并发。 |
+| 参数 | 当前值 | 说明 |
+| --- | --- | --- |
+| `--rollout-batch-size` | `32` | 恢复原脚本每轮采样 prompt 数。 |
+| `--n-samples-per-prompt` | `8` | 保持原值。 |
+| `--global-batch-size` | `256` | 恢复原脚本全局 batch。 |
+| `--sglang-mem-fraction-static` | `0.7` | 恢复原脚本 SGLang 静态显存比例。 |
+| `--sglang-max-running-requests` | 未显式设置 | 不再在脚本默认限制 SGLang running requests。 |
+| `--sglang-server-concurrency` | 未显式设置 | 不再在脚本默认限制 SGLang server 并发。 |
+| `--no-offload-train` | 未传入 | 不再强制关闭 train offload。 |
 
-对应脚本默认值：
-
-```bash
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
-SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.12}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-1}
-SGLANG_SERVER_CONCURRENCY=${SGLANG_SERVER_CONCURRENCY:-4}
-```
-
-同时保留：
+当前脚本保留的是原始 colocate 参数：
 
 ```bash
---no-offload-train
+--colocate
+--rollout-batch-size 32
+--n-samples-per-prompt 8
+--global-batch-size 256
+--sglang-mem-fraction-static 0.7
 ```
 
-之前尝试过 train offload，但在这个环境里和 memory saver/pause 路径交互不稳定，所以最终使用 no-offload 的保守配置。
+如果后续还需要定位 colocate 显存问题，建议另做 debug preset 或参数 sweep，不再直接改默认训练脚本。
 
 ### 验证结果
 
-稳定运行后观测到：
-
-- SGLang engines 正常启动。
-- 权重同步 `update_weights` 成功。
-- rollout generation 可以完整跑完 `32/32`。
-- actor train 可以完成。
-- 训练持续跑到 iteration 2 并成功保存 checkpoint。
-
-典型耗时：
-
-```text
-Rollout generation: 32/32 [17:00]
-Timer actor_train end (elapsed: 32.0s)
-Timer train end (elapsed: 55.5s)
-```
+问题 3 的降载脚本改动已回退，当前未重新用原始 rollout/SGLang 参数做长跑验证。已验证过的 checkpoint 保存和 optimizer 保存修复见问题 6。
 
 ## 问题 4：pinned CPU tensor backup 在当前环境下不稳定
 
@@ -255,7 +233,7 @@ SLIME_TENSOR_BACKUP_PIN_MEMORY=0
 ```
 
 - 当 pinned allocation 失败时自动 fallback 到非 pinned CPU tensor。
-- `scripts/run-qwen3-9B.sh` 的 Ray runtime env 中固定传：
+- `scripts/run-qwen3.5-9B.sh` 的 Ray runtime env 中固定传：
 
 ```json
 "SLIME_TENSOR_BACKUP_PIN_MEMORY": "0"
@@ -318,7 +296,7 @@ checkpoints/Qwen3.5-9B/iter_0000019.failed_20260512_0410
 
 ### 解决方式
 
-最终修复在 `scripts/run-qwen3-9B.sh`：
+最终修复在 `scripts/run-qwen3.5-9B.sh`：
 
 - 删除 `NO_SAVE_OPTIM` 逻辑。
 - 不再传 `--no-save-optim`。
@@ -398,7 +376,6 @@ backup/dev_csl-before-review-rewrite-20260512_102058
 它没有覆盖以下问题，所以这些仍保留在 proposed commit 中：
 
 - Ray dashboard agent 端口文件超时和 job agent ready 竞态。
-- Qwen3.5-9B rollout/batch/SGLang 并发的保守默认值。
 - pinned CPU tensor backup fallback。
 - eval 路径与启动前 eval 的调试噪音。
 - optimizer checkpoint 使用 fully reshardable 格式保存。
@@ -413,7 +390,7 @@ ssh chenshuailin@192.168.16.55 'docker start slime-qwen9b-train-current'
 
 它会从最新 checkpoint marker 恢复，即 iteration `2`。
 
-如果是长跑，建议先把 `scripts/run-qwen3-9B.sh` 里的 debug 保存间隔调大，例如：
+如果是长跑，建议先把 `scripts/run-qwen3.5-9B.sh` 里的 debug 保存间隔调大，例如：
 
 ```bash
 SAVE_INTERVAL=${SAVE_INTERVAL:-20}
