@@ -47,8 +47,8 @@ stop_ray_processes() {
 clean_ray_session_dirs() {
     local ray_tmpdir="${RAY_TMPDIR:-/tmp/ray}"
 
-    [[ "${RAY_CLEAN_TMP_SESSION_DIRS:-1}" == "1" ]] || return
-    [[ -d "${ray_tmpdir}" ]] || return
+    [[ "${RAY_CLEAN_TMP_SESSION_DIRS:-1}" == "1" ]] || return 0
+    [[ -d "${ray_tmpdir}" ]] || return 0
 
     find "${ray_tmpdir}" -mindepth 1 -maxdepth 1 \
         \( -name 'session_*' -o -name 'session_latest' \) \

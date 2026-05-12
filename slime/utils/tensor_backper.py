@@ -1,10 +1,13 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+import logging
+import os
 
 import torch
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
+logger = logging.getLogger(__name__)
 
 
 class TensorBackuper(ABC):
@@ -43,6 +46,11 @@ class _TensorBackuperNormal(TensorBackuper):
     def __init__(self, source_getter):
         super().__init__(source_getter=source_getter)
         self._backups: dict[str, dict[str, torch.Tensor]] = defaultdict(dict)
+        self._use_pin_memory = os.environ.get("SLIME_TENSOR_BACKUP_PIN_MEMORY", "1").lower() not in {
+            "0",
+            "false",
+            "no",
+        }
 
     @property
     def backup_tags(self):
@@ -56,9 +64,23 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+                backup_dict[name] = self._new_backup_tensor(param)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
+
+    def _new_backup_tensor(self, param: torch.Tensor) -> torch.Tensor:
+        if self._use_pin_memory:
+            try:
+                return torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+            except Exception as exc:
+                if not isinstance(exc, RuntimeError) and type(exc).__name__ != "AcceleratorError":
+                    raise
+                self._use_pin_memory = False
+                logger.warning(
+                    "Pinned CPU tensor backup allocation failed; falling back to non-pinned CPU tensors. Error: %s",
+                    exc,
+                )
+        return torch.empty_like(param, device=torch.device("cpu"))
 
     @torch.no_grad()
     def copy(self, *, src_tag: str, dst_tag: str):
