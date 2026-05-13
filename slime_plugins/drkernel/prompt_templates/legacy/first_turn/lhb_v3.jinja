@@ -1,0 +1,112 @@
+You are a PyTorch and CUDA expert. Accelerate the given PyTorch `Model` by creating a high-performance CUDA C++ extension that is faster than the baseline and numerically correct.
+
+========================
+KEY RULES
+========================
+- Implement core computation with real custom CUDA `__global__` kernels, called through C-interface launchers and pybind wrappers.
+- Do not use PyTorch/ATen compute shortcuts. Python `MODEL_NEW` should call `cuda_extension` ops for core computation; C++ bindings may use tensor boundary APIs for validation, metadata, allocation, data pointers, and stream handling.
+- Allowed compute backends: raw CUDA for custom ops, cuBLAS for GEMM when appropriate, and cuDNN for Conv/ConvTranspose when appropriate.
+- Preserve the original `Model` constructor signature and parameter/buffer structure so `state_dict` loading remains compatible.
+- Do not use inline CUDA strings or call `torch.utils.cpp_extension.load` / `load_inline` yourself.
+- Output only `CUDA_KERNELS`, `APPLY_BINDINGS`, and `MODEL_NEW`. `APPLY_BINDINGS` must include exactly `#include "../binding_registry.h"` and register functions with `REGISTER_BINDING(...);`.
+
+========================
+UNIFIED WORKFLOW
+========================
+
+Write CUDA kernels with `__global__` functions and C-interface launchers.
+```cpp
+#include <cuda_runtime.h>
+
+template<int BLOCK_SIZE>
+__global__ void my_kernel_impl(float* output, const float* input, int size) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    for (int i = tid; i < size; i += stride) {
+        output[i] = input[i];
+    }
+}
+
+extern "C" void my_kernel_launcher(
+    float* output,
+    const float* input,
+    int size,
+    cudaStream_t stream
+) {
+    int blocks = (size + 255) / 256;
+    my_kernel_impl<256><<<blocks, 256, 0, stream>>>(output, input, size);
+}
+```
+
+Write C++/pybind wrappers in `APPLY_BINDINGS`.
+```cpp
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+extern "C" void my_kernel_launcher(
+    float* output,
+    const float* input,
+    int size,
+    cudaStream_t stream
+);
+
+torch::Tensor my_kernel_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+    auto output = torch::empty_like(input);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    my_kernel_launcher(output.data_ptr<float>(), input.data_ptr<float>(), input.numel(), stream);
+    return output;
+}
+
+void register_my_kernel(pybind11::module& m) {
+    m.def("my_kernel_forward", &my_kernel_forward, "my kernel forward");
+}
+
+REGISTER_BINDING(my_kernel, register_my_kernel);
+```
+
+Write `MODEL_NEW` as Python code that calls the compiled extension.
+```python
+import torch
+import torch.nn as nn
+import cuda_extension
+
+class ModelNew(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+        # Preserve original parameters and buffers.
+
+    def forward(self, x):
+        return cuda_extension.my_kernel_forward(x)
+```
+
+========================
+OUTPUT FORMAT (STRICT MARKDOWN)
+========================
+
+You MUST follow this EXACT format:
+
+### CUDA_KERNELS
+```cpp
+<CUDA .cu code here>
+```
+
+### APPLY_BINDINGS
+```cpp
+<apply_bindings.cpp code here>
+```
+
+### MODEL_NEW
+```python
+<model_new.py code here>
+```
+
+Before output:
+- Ensure all 3 sections exist.
+- Ensure each section has valid code.
+- Ensure no extra text outside sections.
+
+{{ problem }}

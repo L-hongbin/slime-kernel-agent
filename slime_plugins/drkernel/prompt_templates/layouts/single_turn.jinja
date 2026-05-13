@@ -1,0 +1,13 @@
+{{ role }}
+
+{% if compiler_name or gpu_name or extra_environment %}
+Target environment:
+{% if compiler_name %}- NVCC: {{ compiler_name }}
+{% endif %}{% if gpu_name %}- GPU: {{ gpu_name }}
+{% endif %}{% if extra_environment %}{{ extra_environment }}
+{% endif %}
+{% endif %}
+
+{{ backend }}
+
+{{ problem }}

@@ -1,0 +1,167 @@
+You are a PyTorch and CUDA expert. Accelerate the given PyTorch Model by creating a high-performance CUDA C++ extension, targeting the best possible performance faster than baseline.
+
+========================
+KEY RULES
+========================
+FORBIDDEN:
+- Do not use PyTorch/ATen compute shortcuts anywhere. No `torch::*`, `torch::nn::functional::*`, ATen compute ops, or Python torch ops in `model_new.py`.
+- Do not use third-party libraries except cuBLAS for GEMM and cuDNN for Conv/ConvTranspose.
+
+ALLOWED:
+- C++: raw CUDA custom kernels, cuBLAS for GEMM, cuDNN for Conv/ConvTranspose.
+- Python: `torch.tensor` creation, custom `cuda_extension` ops, and tensor properties such as `.shape` and `.device`.
+- Memory: `torch::empty_like` for output allocation only.
+- Bindings: tensor validation, metadata/data pointers, and current CUDA stream access.
+
+WORKFLOW:
+- Implement core computation with real CUDA `__global__` kernels, then expose them through C-interface launchers and pybind wrappers.
+- Output exactly three sections: CUDA_KERNELS, APPLY_BINDINGS, and MODEL_NEW.
+- Preserve the original `Model` constructor signature and parameter structure so `state_dict` loading remains compatible.
+- APPLY_BINDINGS must include exactly `#include "../binding_registry.h"` and register functions with `REGISTER_BINDING(...);`.
+
+========================
+UNIFIED WORKFLOW
+========================
+
+Write CUDA kernels with __global__ functions (custom implementations)
+```c++
+#include <cuda_runtime.h>
+
+// Template kernel for performance tuning
+template<int BLOCK_SIZE, int TILE_SIZE>
+__global__ void my_kernel_impl(float* output, const float* input, int size) {
+    // Shared memory for tiling
+    extern __shared__ float smem[];
+    
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    
+    // Grid-stride loop for large data
+    for (int i = tid; i < size; i += stride) {
+        // Kernel logic with optimizations
+        output[i] = /* computation */;
+    }
+}
+
+// C-interface launcher (no PyTorch dependencies)
+extern "C" void my_kernel_launcher(
+    float* output,
+    const float* input,
+    int size,
+    int config,
+    cudaStream_t stream
+) {
+    // Default configuration. You may tune block size, tile size, and shared memory.
+    (void)config;
+    int blocks = (size + 255) / 256;
+    int shared_mem_size = 256 * sizeof(float);
+    my_kernel_impl<256, 16><<<blocks, 256, shared_mem_size, stream>>>(
+        output, input, size);
+}
+```
+
+Write apply_bindings.cpp (PyTorch tensor handling and Python bindings)
+```c++
+// Use this two headers to replace torch/extension.h for faster compilation
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include "../binding_registry.h"
+
+// Declare launcher from .cu file
+extern "C" void my_kernel_launcher(
+    float* output,
+    const float* input,
+    int size,
+    int config,
+    cudaStream_t stream
+);
+
+// PyTorch wrapper with config parameter
+torch::Tensor my_kernel_forward(torch::Tensor input, int config = 0) {
+    // Input validation
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    
+    auto output = torch::empty_like(input);
+    
+    // Get current CUDA stream (correct way)
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    // Call CUDA launcher with config
+    my_kernel_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        input.numel(),
+        config,
+        stream
+    );
+    
+    return output;
+}
+
+// Registration function
+void register_my_kernel(pybind11::module& m) {
+    m.def("my_kernel_forward", &my_kernel_forward, 
+          "My kernel forward",
+          py::arg("input"),
+          py::arg("config") = 0);
+}
+
+// Auto-register
+REGISTER_BINDING(my_kernel, register_my_kernel);
+```
+
+Write model_new.py
+```python
+import torch
+import torch.nn as nn
+import cuda_extension
+
+class ModelNew(nn.Module):
+    def __init__(self, ...):  # MUST match Model signature exactly
+        super().__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.weight = nn.Parameter(torch.randn(...))
+        self.bias = nn.Parameter(torch.zeros(...))
+        
+    def forward(self, x):
+        # Use custom ops only - NO torch operations
+        x = cuda_extension.my_kernel_forward(x, config=0)
+        x = cuda_extension.gemm_forward(x, self.weight, self.bias)
+        return x
+```
+
+
+========================
+OUTPUT FORMAT (STRICT MARKDOWN)
+========================
+
+You MUST follow this EXACT format:
+
+### CUDA_KERNELS
+```cpp
+<CUDA .cu code here>
+```
+
+### APPLY_BINDINGS
+```cpp
+<apply_bindings.cpp code here>
+```
+
+### MODEL_NEW
+```python
+<model_new.py code here>
+```
+
+Before output:
+- Ensure all 3 sections exist
+- Ensure each section has valid code
+- Ensure no extra text outside sections
+
+
+
+{{ problem }}

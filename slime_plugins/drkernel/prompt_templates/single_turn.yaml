@@ -1,0 +1,23 @@
+profiles:
+  drkernel_single_turn_v1:
+    layout: layouts/single_turn.jinja
+    role:
+      select: random
+      candidates:
+        - id: accelerate_best_perf
+          text_path: roles/accelerate_best_perf.jinja
+        - id: optimize_correctness
+          text_path: roles/optimize_correctness.jinja
+    first_turn_template:
+      select: random
+      candidates:
+        - id: csl_cuda_agent
+          backend_text_path: backends/csl_cuda_agent.jinja
+        - id: lhb_v3
+          backend_text_path: backends/lhb_v3.jinja
+        - id: lhb_v4
+          backend_text_path: backends/lhb_v4.jinja
+        - id: pybind11_module
+          backend_text_path: backends/pybind11_module.jinja
+        - id: tvm_ffi_module
+          backend_text_path: backends/tvm_ffi_module.jinja

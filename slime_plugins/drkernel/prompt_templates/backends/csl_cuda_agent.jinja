@@ -1,0 +1,61 @@
+Do not use inline CUDA strings or call `torch.utils.cpp_extension.load` / `load_inline` yourself.
+
+Output exactly this section structure:
+
+### CUDA_KERNELS
+```cpp
+<CUDA .cu source: kernels, device helpers, and C ABI launcher functions>
+```
+
+### APPLY_BINDINGS
+```cpp
+<C++/pybind source that exposes launcher wrappers to Python>
+```
+
+### MODEL_NEW
+```python
+<Python ModelNew implementation using cuda_extension>
+```
+
+CUDA_KERNELS requirements:
+- Implement the core computation with real CUDA C++ code. Prefer custom `__global__` kernels.
+- You may use cuBLAS for GEMM and cuDNN for convolution when appropriate; no other third-party compute libraries.
+- Do not use PyTorch, ATen, or Python APIs in this section.
+- Expose launcher functions callable from APPLY_BINDINGS, typically with raw pointers, sizes/strides, scalar parameters, and `cudaStream_t`.
+
+APPLY_BINDINGS requirements:
+- Include exactly `#include "../binding_registry.h"`.
+- Register exported functions with `REGISTER_BINDING(name, register_fn);` including the trailing semicolon. Example:
+  ```cpp
+  #include <torch/types.h>
+  #include <torch/csrc/utils/pybind.h>
+  #include <cuda_runtime.h>
+  #include <c10/cuda/CUDAStream.h>
+  #include "../binding_registry.h"
+
+  extern "C" void my_kernel_launcher(float* out, const float* in, int n, cudaStream_t stream);
+
+  torch::Tensor my_kernel_forward(torch::Tensor input) {
+      TORCH_CHECK(input.is_cuda(), "input must be CUDA");
+      auto output = torch::empty_like(input);
+      cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+      my_kernel_launcher(output.data_ptr<float>(), input.data_ptr<float>(), input.numel(), stream);
+      return output;
+  }
+
+  void register_my_kernel(pybind11::module& m) {
+      m.def("my_kernel_forward", &my_kernel_forward, "my kernel forward");
+  }
+  REGISTER_BINDING(my_kernel, register_my_kernel);
+  ```
+- You may use `torch::Tensor`, `TORCH_CHECK`, tensor metadata, `data_ptr`, allocation such as `torch::empty` / `torch::empty_like`, and `c10::cuda::getCurrentCUDAStream()` for the Python/CUDA boundary.
+- Do not use PyTorch or ATen compute operators such as `torch::matmul`, `at::matmul`, `torch::softmax`, `at::conv`, or native operator dispatch to implement the model logic.
+
+MODEL_NEW requirements:
+- Define `class ModelNew(nn.Module)`.
+- Match the original `Model.__init__` and `forward` signatures.
+- Preserve state_dict compatibility: parameter and buffer names, shapes, dtypes, and semantics must match the original model.
+- Import and call the compiled extension as `cuda_extension`.
+- In `forward`, perform the core computation through `cuda_extension` calls. Do not bypass the CUDA implementation with PyTorch compute ops.
+- Minimal tensor bookkeeping such as shape/device/dtype inspection or layout adaptation is allowed when needed for binding compatibility.
+
