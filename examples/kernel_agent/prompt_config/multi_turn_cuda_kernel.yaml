@@ -1,0 +1,51 @@
+method: system
+prompt: null
+
+per_turn_prompts:
+  - name: first_turn
+    condition: "current_turn == 0"
+    history_mode: all
+    skip_env: 0.0
+    response_truncation: python_code, answer_code
+    template: null
+  - name: tool_response
+    condition: "make_up_tool_response == True"
+    history_mode: all
+    skip_env: 0.0
+    response_truncation: python_code, answer_code
+    update_memory: false
+    template: |
+      Now you have received the server feedback for your last implementation. Based on that and all your previous responses, improve the implementation.
+
+      CRITICAL RULES:
+      1. If the feedback reports compilation, runtime, correctness, or other errors, fix those errors first.
+      2. If the previous implementation was correct, do not output the same code; try a different CUDA optimization strategy for better performance.
+      3. Avoid decoy kernels. In the server feedback, you might see `"decoy_kernel": true`. A decoy kernel means the evaluation system detected that you bypassed writing actual custom CUDA kernels and instead used PyTorch's native operators (for example, `torch.matmul`, `F.softmax`, `torch.exp`) or their C++ equivalents (`aten::*`) as a shortcut.
+         To avoid generating decoy kernels:
+         - You MUST write genuine custom CUDA C++ kernels (`__global__` functions) for the core computations.
+         - DO NOT use native PyTorch operators in `model_new.py` or C++ bindings to cheat the performance test.
+         - Only `cuBLAS` (for GEMM) and `cuDNN` (for Conv) are allowed as third-party calls; everything else must be implemented by you.
+
+      Here is the server feedback. Please refer to this feedback to improve the implementation:
+      Server feedback (status/metrics/errors):
+      {feedback}
+
+      Modify any section as needed.
+
+      Return an improved CUDA implementation with the same output format:
+      ### CUDA_KERNELS
+      ```cpp
+      <CUDA .cu code here>
+      ```
+
+      ### APPLY_BINDINGS
+      ```cpp
+      // Must include exactly: #include "../binding_registry.h"
+      <apply_bindings.cpp code here>
+      ```
+      
+      ### MODEL_NEW
+      ```python
+      <model_new.py code here>
+      ```
+      Let's think step by step.

@@ -1,0 +1,525 @@
+import asyncio
+import json
+import logging
+import random
+import time
+from copy import deepcopy
+from functools import cache
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+try:
+    import ray
+except ImportError:
+    ray = None
+
+from slime.rollout.sglang_rollout import GenerateState
+from slime.utils.http_utils import post
+from slime.utils.types import Sample
+
+try:
+    from .config import CUDA_AGENT_CONFIGS
+    from .kernel_response import run_kernel_eval
+    from .kernel_reward import calculate_reward
+    from .utils import normalize_env_feedback, precheck_response
+except ImportError:
+    from config import CUDA_AGENT_CONFIGS
+    from kernel_response import run_kernel_eval
+    from kernel_reward import calculate_reward
+    from utils import normalize_env_feedback, precheck_response
+
+logger = logging.getLogger(__name__)
+
+
+if ray is not None:
+
+    @ray.remote
+    class SlowestRequestTracker:
+        def __init__(self) -> None:
+            self.slowest_request_time = 0.0
+            self.current_step = -1
+
+        def update_slowest_time(
+            self,
+            request_time: float,
+            global_step: int,
+            step_window: int,
+            min_delta_seconds: float,
+        ) -> bool:
+            if step_window > 0 and global_step % step_window == 0 and global_step > self.current_step:
+                self.slowest_request_time = 0.0
+                self.current_step = global_step
+
+            if request_time > self.slowest_request_time + min_delta_seconds:
+                self.slowest_request_time = request_time
+                return True
+            return False
+
+
+DEFAULT_TOOL_RESPONSE_TEMPLATE = """Now you have received the server feedback for your last implementation. Based on that and all your previous responses, improve the implementation.
+
+Here is the server feedback. Please refer to this feedback to improve the implementation:
+Server feedback (status/metrics/errors):
+{feedback}
+
+Modify any section as needed.
+
+Return an improved CUDA implementation with the same output format.
+Let's think step by step.
+"""
+
+
+def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if isinstance(prompt, list):
+        return deepcopy(prompt)
+    return [{"role": "user", "content": str(prompt)}]
+
+
+def _tokenize_prompt(tokenizer, messages: list[dict[str, Any]]) -> list[int]:
+    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    return tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+
+
+@cache
+def _load_tool_response_template() -> str:
+    config_path = CUDA_AGENT_CONFIGS.get("multi_turn_prompt_config_path")
+    if config_path is None:
+        logger.warning(
+            "CUDA_AGENT_CONFIGS['multi_turn_prompt_config_path'] is not set; using built-in CUDA agent prompt template."
+        )
+        return DEFAULT_TOOL_RESPONSE_TEMPLATE
+
+    with Path(config_path).open(encoding="utf-8") as f:
+        prompt_cfg = yaml.safe_load(f) or {}
+
+    for item in prompt_cfg.get("per_turn_prompts", []) or []:
+        if item.get("name") == "tool_response" and item.get("template"):
+            return str(item["template"])
+
+    raise ValueError(f"multi_turn_prompt_config_path={config_path} does not define a tool_response template.")
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep = max_chars // 2
+    return text[:keep] + "...(truncated)..." + text[-keep:]
+
+
+def _apply_feedback_template(env_result: dict[str, Any], template: str) -> str:
+    payload = env_result.get("env_state") or env_result.get("reward_extra_info") or env_result
+    try:
+        feedback = json.dumps(payload, ensure_ascii=False, indent=2)
+    except TypeError:
+        feedback = str(payload)
+
+    max_chars = int(CUDA_AGENT_CONFIGS["max_feedback_chars"])
+    # max_chars <= 0 means no truncation
+    feedback = _truncate_middle(feedback, max_chars)
+    return template.format(feedback=feedback)
+
+
+def _json_dumps_for_log(payload: Any) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+    except TypeError:
+        return str(payload)
+
+
+def _split_think_response(response: str) -> tuple[str | None, str]:
+    start_tag = "<think>"
+    end_tag = "</think>"
+    start = response.find(start_tag)
+    end = response.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+    if start < 0 or end < 0:
+        return None, response
+    response_think = response[start + len(start_tag) : end].strip("\n")
+    response_content = (response[:start] + response[end + len(end_tag) :]).lstrip("\n")
+    return response_think, response_content
+
+
+def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
+    env_state = env_result.get("env_state") if isinstance(env_result, dict) else None
+    return env_state if isinstance(env_state, dict) else {}
+
+
+def _log_env_state(label: str, env_state: dict[str, Any], sample: Sample) -> None:
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    metadata = sample.metadata or {}
+    task_id = env_state.get("task_id") or metadata.get("uuid") or "unknown"
+    log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
+    if log_max_chars <= 0:
+        log_max_chars = 8192
+    logger.info(
+        "[cuda_agent][kernel_env] %s task_id=%s:\n%s",
+        label,
+        task_id,
+        _truncate_middle(_json_dumps_for_log(env_state), log_max_chars),
+    )
+
+
+def _normalize_env_result(env_result: dict[str, Any], sample: Sample) -> dict[str, Any]:
+    raw_env_state = _get_env_state(env_result) or env_result
+    # _log_env_state("raw_env_state", raw_env_state, sample)
+    normalized_env_state = normalize_env_feedback(raw_env_state)
+    # _log_env_state("normalized_env_state", normalized_env_state, sample)
+    return {**env_result, "env_state": normalized_env_state, "reward_extra_info": normalized_env_state}
+
+
+def _should_log_multiturn(sample: Sample) -> bool:
+    if not logger.isEnabledFor(logging.INFO):
+        return False
+
+    metadata = sample.metadata or {}
+    if metadata.get("log_multi_turn") or metadata.get("should_log"):
+        return True
+
+    sample_rate = float(CUDA_AGENT_CONFIGS.get("log_multi_turn_sample_rate", 0.0) or 0.0)
+    if sample_rate <= 0:
+        return False
+    if sample_rate >= 1:
+        return True
+    return random.random() < sample_rate
+
+
+def _get_global_step(args, sample: Sample | None = None) -> int:
+    metadata = sample.metadata if sample is not None and isinstance(sample.metadata, dict) else {}
+    for key in ("global_step", "step", "iteration"):
+        value = metadata.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+
+    for key in ("global_step", "step", "iteration"):
+        value = getattr(args, key, None)
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+async def _is_slowest_multiturn(args, sample: Sample, total_request_time: float) -> bool:
+    if ray is None or not ray.is_initialized():
+        return False
+
+    try:
+        try:
+            tracker = ray.get_actor("CudaAgentSlowestRequestTracker")
+        except ValueError:
+            tracker = SlowestRequestTracker.options(name="CudaAgentSlowestRequestTracker", get_if_exists=True).remote()
+
+        object_ref = tracker.update_slowest_time.remote(
+            float(total_request_time),
+            _get_global_step(args, sample),
+            int(CUDA_AGENT_CONFIGS.get("log_slowest_step_window", 10)),
+            float(CUDA_AGENT_CONFIGS.get("log_slowest_min_delta_seconds", 5.0)),
+        )
+        timeout = float(CUDA_AGENT_CONFIGS.get("slowest_tracker_timeout", 2.0))
+        done, _ = await asyncio.to_thread(ray.wait, [object_ref], num_returns=1, timeout=timeout)
+        if not done:
+            logger.debug("Slowest tracker update timed out after %.2fs; skipping slowest-request logging.", timeout)
+            return False
+        return bool(await asyncio.to_thread(ray.get, done[0]))
+    except Exception as exc:
+        logger.debug("Failed to update slowest tracker: %s", exc)
+        return False
+
+
+def _log_multiturn_messages(
+    sample: Sample,
+    messages: list[dict[str, Any]],
+    turn_logs: list[dict[str, Any]],
+    finish_reason: str,
+    is_slowest: bool = False,
+    total_request_time: float | None = None,
+) -> None:
+    if not logger.isEnabledFor(logging.INFO):
+        return
+
+    metadata = sample.metadata or {}
+    sample_id = metadata.get("uuid") or metadata.get("uid") or metadata.get("index") or "unknown"
+    total_model_time = sum(float(item.get("model_time", 0.0)) for item in turn_logs)
+    total_env_time = sum(float(item.get("env_time", 0.0)) for item in turn_logs)
+    if total_request_time is None:
+        total_request_time = total_model_time + total_env_time
+    logger.info(
+        "[cuda_agent][multi_turn][%s] sample=%s turns=%s finish_reason=%s total_request_time=%.3fs "
+        "total_model_time=%.3fs total_env_time=%.3fs",
+        "slowest" if is_slowest else "sampled",
+        sample_id,
+        len(turn_logs),
+        finish_reason,
+        total_request_time,
+        total_model_time,
+        total_env_time,
+    )
+
+    log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
+
+    for item in turn_logs:
+        env_state = item.get("env_state") if isinstance(item.get("env_state"), dict) else {}
+        reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
+        logger.info(
+            "[cuda_agent][turn %s] model_time=%.3fs env_time=%.3fs prompt_tokens=%s response_tokens=%s "
+            "finish_type=%s status=%s error=%s speedup=%s correctness=%s compiled=%s reward=%s",
+            item.get("turn_idx"),
+            float(item.get("model_time", 0.0)),
+            float(item.get("env_time", 0.0)),
+            item.get("prompt_tokens"),
+            item.get("response_tokens"),
+            item.get("finish_type"),
+            env_state.get("status"),
+            env_state.get("error"),
+            env_state.get("speedup"),
+            env_state.get("correctness"),
+            env_state.get("compiled"),
+            reward,
+        )
+        logger.info(
+            "[cuda_agent][turn %s] prompt:\n%s",
+            item.get("turn_idx"),
+            _truncate_middle(str(item.get("prompt", "")), log_max_chars),
+        )
+        response_think, response_content = _split_think_response(str(item.get("response", "")))
+        if response_think is not None:
+            logger.info(
+                "[cuda_agent][turn %s] response_think:\n%s",
+                item.get("turn_idx"),
+                _truncate_middle(response_think, log_max_chars),
+            )
+        logger.info(
+            "[cuda_agent][turn %s] response_content:\n%s",
+            item.get("turn_idx"),
+            _truncate_middle(response_content, log_max_chars),
+        )
+        # logger.info(
+        #     "[cuda_agent][turn %s] env_feedback:\n%s",
+        #     item.get("turn_idx"),
+        #     _truncate_middle(_json_dumps_for_log(env_state), log_max_chars),
+        # )
+        if item.get("format_feedback") is not None:
+            logger.info(
+                "[cuda_agent][turn %s] format_feedback:\n%s",
+                item.get("turn_idx"),
+                _truncate_middle(str(item.get("format_feedback", "")), log_max_chars),
+            )
+
+    logger.info(
+        "[cuda_agent][multi_turn] messages:\n%s",
+        _truncate_middle(_json_dumps_for_log(messages), log_max_chars),
+    )
+
+
+def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
+    if turn_idx + 1 >= max_turns:
+        return True
+    for key in ("done", "env_done", "success"):
+        if key in env_result:
+            return bool(env_result[key])
+    env_state = env_result.get("env_state") or {}
+    if isinstance(env_state, dict):
+        for key in ("done", "env_done"):
+            if key in env_state:
+                return bool(env_state[key])
+    return False
+
+
+def _get_label_value(sample: Sample, key: str) -> Any:
+    if isinstance(sample.label, dict):
+        return sample.label.get(key)
+    return None
+
+
+async def cuda_kernel_env(
+    args,
+    sample: Sample,
+    response: str,
+    turn_idx: int,
+) -> dict[str, Any]:
+    entry_point = _get_label_value(sample, "entry_point")
+    if entry_point is None:
+        raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
+    env_config = CUDA_AGENT_CONFIGS["env"]
+    if CUDA_AGENT_CONFIGS.get("do_precheck", False):
+        precheck_entry_point = f"{entry_point}New"
+        precheck_result = precheck_response(response, precheck_entry_point, CUDA_AGENT_CONFIGS["kernel_backend"])
+        if precheck_result is not None:
+            return {"env_state": precheck_result, "reward_extra_info": precheck_result}
+
+    payload = {
+        "response": response,
+        "ground_truth": _get_label_value(sample, "ground_truth"),
+        "kernel_backend": CUDA_AGENT_CONFIGS["kernel_backend"],
+        "reference_backend": CUDA_AGENT_CONFIGS["reference_backend"],
+        "entry_point": entry_point,
+        "uuid": (sample.metadata or {}).get("uuid"),
+        "return_full_state": True,
+        "metadata": sample.metadata,
+        "turn_idx": turn_idx,
+    }
+    env_result = await run_kernel_eval(args, sample, payload, env_config)
+    return _normalize_env_result(env_result, sample)
+
+
+def _sample_for_turn(
+    base_sample: Sample,
+    *,
+    prompt_ids: list[int],
+    response: str,
+    response_ids: list[int],
+    log_probs: list[float],
+    reward: float | dict[str, Any],
+    status: Sample.Status,
+    turn_idx: int,
+    env_result: dict[str, Any],
+    keep_turn: bool = True,
+) -> Sample:
+    turn_sample = deepcopy(base_sample)
+    turn_sample.tokens = prompt_ids + response_ids
+    turn_sample.response = response
+    turn_sample.response_length = len(response_ids)
+    turn_sample.rollout_log_probs = log_probs
+    turn_sample.reward = reward
+    turn_sample.status = status
+    turn_sample.loss_mask = [1 if keep_turn else 0] * len(response_ids)
+    turn_sample.metadata = dict(turn_sample.metadata or {})
+    turn_sample.metadata.update(
+        {
+            "turn_idx": turn_idx,
+            "env_result": env_result,
+        }
+    )
+    return turn_sample
+
+
+async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
+    """Generate CUDA-kernel multi-turn rollouts.
+
+    This follows the drkernel-style structure: each assistant turn becomes one
+    training Sample. Environment feedback is appended to the conversation
+    messages and therefore becomes part of the next turn prompt, not part of the
+    current turn response.
+    """
+
+    state = GenerateState(args)
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    messages = _as_messages(sample.prompt)
+    max_turns = int(CUDA_AGENT_CONFIGS["max_turns"])
+    template = _load_tool_response_template()
+    output_samples: list[Sample] = []
+    should_log = _should_log_multiturn(sample)
+    turn_logs: list[dict[str, Any]] = []
+    finish_reason = "max_turns"
+
+    for turn_idx in range(max_turns):
+        prompt_text = state.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        max_context_len = getattr(args, "rollout_max_context_len", None)
+        if max_context_len is not None and len(prompt_ids) >= max_context_len:
+            sample.status = Sample.Status.TRUNCATED
+            finish_reason = "prompt_truncated"
+            logger.warning("CUDA agent prompt exceeds context length at turn %s: %s", turn_idx, len(prompt_ids))
+            break
+
+        payload = {
+            "input_ids": prompt_ids,
+            "sampling_params": sampling_params,
+            "return_logprob": True,
+        }
+        model_started_at = time.monotonic()
+        output = await post(url, payload)
+        model_time = time.monotonic() - model_started_at
+        finish_type = output["meta_info"]["finish_reason"]["type"]
+        if finish_type == "abort":
+            sample.status = Sample.Status.ABORTED
+            finish_reason = "model_abort"
+            if should_log:
+                _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
+            return output_samples or [sample]
+
+        token_logprobs = output["meta_info"].get("output_token_logprobs", [])
+        response_ids = [item[1] for item in token_logprobs]
+        log_probs = [item[0] for item in token_logprobs]
+        response = output["text"]
+        if not response_ids:
+            response_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
+            log_probs = [0.0] * len(response_ids)
+
+        status = Sample.Status.TRUNCATED if finish_type == "length" else Sample.Status.COMPLETED
+        env_started_at = time.monotonic()
+        env_result = await cuda_kernel_env(
+            args,
+            sample,
+            response,
+            turn_idx,
+        )
+        env_time = time.monotonic() - env_started_at
+        env_state = _get_env_state(env_result)
+        turn_log = {
+            "turn_idx": turn_idx,
+            "model_time": model_time,
+            "env_time": env_time,
+            "prompt_tokens": len(prompt_ids),
+            "response_tokens": len(response_ids),
+            "finish_type": finish_type,
+            "prompt": prompt_text,
+            "response": response,
+            "env_state": env_state,
+            "env_result": env_result,
+            "format_feedback": None,
+        }
+        turn_logs.append(turn_log)
+        keep_turn = bool(env_result.get("loss_mask", 1)) if isinstance(env_result, dict) else True
+        output_samples.append(
+            _sample_for_turn(
+                sample,
+                prompt_ids=prompt_ids,
+                response=response,
+                response_ids=response_ids,
+                log_probs=log_probs,
+                reward=None,
+                status=status,
+                turn_idx=turn_idx,
+                env_result=env_result,
+                keep_turn=keep_turn,
+            )
+        )
+
+        messages.append({"role": "assistant", "content": response})
+        
+        format_feedback = _apply_feedback_template(env_result, template)
+        turn_log["format_feedback"] = format_feedback
+
+        if _is_done(env_result, turn_idx, max_turns):
+            finish_reason = "env_done" if turn_idx + 1 < max_turns else "max_turns"
+            break
+        
+        messages.append({"role": "user", "content": format_feedback})
+
+    total_request_time = sum(float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs)
+    is_slowest = await _is_slowest_multiturn(args, sample, total_request_time) if turn_logs else False
+    if should_log or is_slowest:
+        _log_multiturn_messages(
+            sample,
+            messages,
+            turn_logs,
+            finish_reason,
+            is_slowest=is_slowest,
+            total_request_time=total_request_time,
+        )
+    return output_samples
+
+
+async def reward_func(args, samples: Sample | list[Sample], **kwargs):
+    """Compute reward from the CUDA env response collected during generation."""
+
+    if isinstance(samples, list):
+        return [calculate_reward(sample.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"]) for sample in samples]
+    return calculate_reward(samples.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])

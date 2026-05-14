@@ -1395,6 +1395,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             default=None,
             help="Path to the YAML config for custom function arguments.",
         )
+        reset_arg(
+            parser,
+            "--multi-turn-prompt-config-path",
+            type=str,
+            default=None,
+            help="Path to the YAML config for multi-turn prompt templates.",
+        )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 
         return parser
