@@ -1,0 +1,32 @@
+eval:
+  defaults:
+    # DrKernel Qwen3-14B offline / KernelBench L1 fullset eval settings.
+    n_samples_per_eval_prompt: 8
+    temperature: 1.0
+    top_p: 0.95
+    top_k: 20
+    max_prompt_len: 32768
+    max_response_len: 32768
+    max_context_len: 32768
+  datasets:
+    - name: kernelbench_level1
+      path: data/kernelbench-level1-validation/train.parquet
+      input_key: ground_truth
+      label_key: ground_truth
+      metadata_key: extra_info
+      metadata_overrides:
+        benchmark: kernelbench
+        entry_point: Model
+        is_valid: true
+        level: 1
+        split: validation
+      n_samples_per_eval_prompt: 8
+
+# Companion launch arg from the same DrKernel eval setup that is not a dataset
+# field in slime's eval config:
+#   eval batch size / concurrency should be controlled by the run script.
+# KernelGym reward-side eval params live in slime_plugins/drkernel/kernelgym_rm.py:
+#   task timeout 90s, client timeout 1800s
+#   num_correct_trials=5, num_perf_trials=50, num_warmup=30, perf_trim_count=5
+#   reference_backend=torch_compile
+#   detect_decoy_kernel=true, enable_profiling=true, verbose_errors=true
