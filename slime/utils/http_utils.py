@@ -153,6 +153,19 @@ _post_actors: list[object] = []
 _post_actor_idx: int = 0
 
 
+def get_sglang_client_concurrency(args) -> int:
+    """Return client-side SGLang concurrency capped per engine by max-running."""
+
+    num_engines = args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    per_engine_concurrency = args.sglang_server_concurrency
+    max_running_requests = getattr(args, "sglang_max_running_requests", None)
+    if max_running_requests is None:
+        per_engine_concurrency = int(per_engine_concurrency * 1.5)
+    else:
+        per_engine_concurrency = int(min(per_engine_concurrency * 1.5, max_running_requests))
+    return max(1, per_engine_concurrency) * num_engines
+
+
 def _next_actor():
     global _post_actor_idx
     if not _post_actors:
@@ -204,7 +217,7 @@ def init_http_client(args):
     if not args.rollout_num_gpus:
         return
 
-    _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+    _client_concurrency = get_sglang_client_concurrency(args)
     if _http_client is None:
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=_client_concurrency),

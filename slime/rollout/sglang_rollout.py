@@ -19,7 +19,7 @@ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_fil
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
-from slime.utils.http_utils import get, post
+from slime.utils.http_utils import get, get_sglang_client_concurrency, post
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -61,6 +61,33 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     return tokenizer.encode(sample.prompt, add_special_tokens=False)
 
 
+def _cap_sampling_params_by_context(
+    sample: Sample,
+    prompt_ids: list[int],
+    sampling_params: dict[str, Any],
+) -> dict[str, Any]:
+    max_context_len = sampling_params.pop("_slime_max_context_len", None)
+    if max_context_len is None:
+        return sampling_params
+
+    # SGLang rejects requests that exactly fill the configured context window
+    # on this path, so keep one token of headroom after prompt + completion.
+    remaining_tokens = max(0, int(max_context_len) - len(prompt_ids) - 1)
+    max_new_tokens = int(sampling_params.get("max_new_tokens") or 0)
+    if remaining_tokens < max_new_tokens:
+        logger.debug(
+            "Capping max_new_tokens from %d to %d for sample %s because prompt_len=%d and max_context_len=%d",
+            max_new_tokens,
+            remaining_tokens,
+            sample.index,
+            len(prompt_ids),
+            int(max_context_len),
+        )
+        sampling_params = sampling_params.copy()
+        sampling_params["max_new_tokens"] = remaining_tokens
+    return sampling_params
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -91,14 +118,13 @@ class GenerateState(metaclass=SingletonMeta):
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        )
+        self.semaphore = asyncio.Semaphore(get_sglang_client_concurrency(args))
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
             top_k=args.rollout_top_k,
             max_new_tokens=args.rollout_max_response_len,
+            _slime_max_context_len=args.rollout_max_context_len,
             stop=args.rollout_stop,
             stop_token_ids=args.rollout_stop_token_ids,
             skip_special_tokens=args.rollout_skip_special_tokens,
@@ -162,6 +188,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ), f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+    sampling_params = _cap_sampling_params_by_context(sample, prompt_ids, sampling_params)
 
     assert (
         sampling_params["max_new_tokens"] >= 0
@@ -513,12 +540,14 @@ async def eval_rollout_single_dataset(
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
     if cache_key not in EVAL_PROMPT_DATASET:
         tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-        processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        processor = (
+            load_processor(args.hf_checkpoint, trust_remote_code=True) if args.multimodal_keys is not None else None
+        )
         EVAL_PROMPT_DATASET[cache_key] = Dataset(
             path=dataset_cfg.path,
             tokenizer=tokenizer,
             processor=processor,
-            max_length=args.eval_max_prompt_len,
+            max_length=dataset_cfg.max_prompt_len,
             prompt_key=dataset_cfg.input_key,
             label_key=dataset_cfg.label_key,
             multimodal_keys=args.multimodal_keys,
@@ -534,6 +563,7 @@ async def eval_rollout_single_dataset(
         top_p=dataset_cfg.top_p,
         top_k=dataset_cfg.top_k,
         max_new_tokens=dataset_cfg.max_response_len,
+        _slime_max_context_len=dataset_cfg.max_context_len,
         stop=args.rollout_stop,
         stop_token_ids=args.rollout_stop_token_ids,
         skip_special_tokens=args.rollout_skip_special_tokens,
@@ -552,9 +582,8 @@ async def eval_rollout_single_dataset(
             sample_index += 1
             sample.metadata = dataset_cfg.inject_metadata(getattr(sample, "metadata", None))
             sample.generate_function_path = getattr(dataset_cfg, "custom_generate_function_path", None)
-            sampling_params = base_sampling_params
+            sampling_params = base_sampling_params.copy()
             if getattr(args, "sglang_enable_deterministic_inference", False):
-                sampling_params = base_sampling_params.copy()
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             tasks.append(
                 asyncio.create_task(
