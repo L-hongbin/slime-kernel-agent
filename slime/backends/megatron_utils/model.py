@@ -145,10 +145,15 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     """
     # Iteration-based training.
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    # Eval-only runs use num_rollout=0 but still initialize the actor model so
+    # weights can be loaded and pushed into rollout engines before evaluation.
+    # Megatron's scheduler requires a positive decay window even when no
+    # training step will be executed.
+    scheduler_train_iters = max(args.train_iters, 1)
     if args.lr_decay_iters is None:
-        args.lr_decay_iters = args.train_iters
+        args.lr_decay_iters = scheduler_train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-    wd_incr_steps = args.train_iters * args.global_batch_size
+    wd_incr_steps = scheduler_train_iters * args.global_batch_size
     wsd_decay_steps = None
     if args.lr_wsd_decay_iters is not None:
         wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size

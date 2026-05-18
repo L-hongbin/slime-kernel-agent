@@ -83,13 +83,23 @@ def _wait_server_healthy(base_url, api_key, is_process_alive):
     }
 
     with requests.Session() as session:
+        attempt = 0
         while True:
+            attempt += 1
             try:
-                response = session.get(f"{base_url}/health_generate", headers=headers)
+                response = session.get(f"{base_url}/health_generate", headers=headers, timeout=5)
                 if response.status_code == 200:
                     break
-            except requests.RequestException:
-                pass
+                if attempt == 1 or attempt % 30 == 0:
+                    logger.info(
+                        "Waiting for SGLang server health at %s/health_generate: status=%s, body=%r",
+                        base_url,
+                        response.status_code,
+                        response.text[:200],
+                    )
+            except requests.RequestException as e:
+                if attempt == 1 or attempt % 30 == 0:
+                    logger.info("Waiting for SGLang server health at %s/health_generate: %r", base_url, e)
 
             if not is_process_alive():
                 raise Exception("Server process terminated unexpectedly.")
