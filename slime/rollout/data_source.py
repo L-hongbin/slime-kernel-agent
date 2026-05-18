@@ -60,7 +60,11 @@ class RolloutDataSource(DataSource):
 
         if args.rollout_global_dataset and args.prompt_data is not None:
             tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
-            processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+            processor = (
+                load_processor(args.hf_checkpoint, trust_remote_code=True)
+                if args.multimodal_keys is not None
+                else None
+            )
 
             # TODO move (during the refactor)
             if (d := args.dump_details) is not None:
