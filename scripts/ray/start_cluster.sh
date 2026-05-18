@@ -163,13 +163,19 @@ submit_ray_job() {
     local deadline=$((SECONDS + timeout_s))
     local retry_delay_s=${RAY_JOB_SUBMIT_RETRY_DELAY_S:-2}
     local marker_file
+    local output_file
     local exit_code
+    local follow_exit_code
+    local submission_id
 
     while true; do
         marker_file=$(mktemp)
+        output_file=$(mktemp)
         set +e
-        ray job submit "$@" 2>&1 | awk -v marker_file="${marker_file}" '
+        ray job submit --no-wait "$@" 2>&1 | awk -v marker_file="${marker_file}" -v output_file="${output_file}" '
             {
+                print >> output_file
+                fflush(output_file)
                 print
                 fflush()
                 if (index($0, "No available agent to submit job") > 0) {
@@ -182,17 +188,84 @@ submit_ray_job() {
 
         if [[ "${exit_code}" -eq 0 ]]; then
             rm -f "${marker_file}"
-            return 0
+            submission_id=$(sed -n "s/.*Job '\([^']*\)' submitted successfully.*/\1/p" "${output_file}" | tail -n 1)
+            rm -f "${output_file}"
+
+            if [[ -z "${submission_id}" ]]; then
+                echo "warning: Ray job was submitted, but submission id was not found in CLI output" >&2
+                return 1
+            fi
+
+            set +e
+            follow_ray_job_logs "${submission_id}"
+            follow_exit_code=$?
+            set -e
+            return "${follow_exit_code}"
         fi
 
         if [[ ! -s "${marker_file}" ]] || ((SECONDS >= deadline)); then
-            rm -f "${marker_file}"
+            rm -f "${marker_file}" "${output_file}"
             return "${exit_code}"
         fi
 
-        rm -f "${marker_file}"
+        rm -f "${marker_file}" "${output_file}"
         echo "Ray job agent is not ready yet; retrying submit in ${retry_delay_s}s"
         sleep "${retry_delay_s}"
+    done
+}
+
+follow_ray_job_logs() {
+    local submission_id=$1
+    local reconnect_delay_s=${RAY_JOB_LOG_RECONNECT_DELAY_S:-2}
+    local status_file
+    local status
+    local logs_exit
+    local status_exit
+
+    echo "Following Ray job logs for ${submission_id}"
+
+    while true; do
+        set +e
+        ray job logs "${submission_id}" --address="${RAY_JOB_ADDRESS}" --follow
+        logs_exit=$?
+
+        if [[ "${logs_exit}" -ge 128 ]]; then
+            set -e
+            return "${logs_exit}"
+        fi
+
+        status_file=$(mktemp)
+        ray job status "${submission_id}" --address="${RAY_JOB_ADDRESS}" 2>&1 | tee "${status_file}"
+        status_exit=${PIPESTATUS[0]}
+        set -e
+
+        if [[ "${status_exit}" -ne 0 ]]; then
+            rm -f "${status_file}"
+            return "${status_exit}"
+        fi
+
+        status=$(sed -n "s/.*Status for job '[^']*': \([A-Z_]*\).*/\1/p" "${status_file}" | tail -n 1)
+        rm -f "${status_file}"
+
+        case "${status}" in
+            SUCCEEDED)
+                return 0
+                ;;
+            FAILED | STOPPED)
+                return 1
+                ;;
+            RUNNING | PENDING)
+                echo "Ray job log stream ended while status=${status}; reconnecting in ${reconnect_delay_s}s"
+                sleep "${reconnect_delay_s}"
+                ;;
+            *)
+                if [[ "${logs_exit}" -ne 0 ]]; then
+                    return "${logs_exit}"
+                fi
+                echo "warning: could not determine terminal Ray job status for ${submission_id}: ${status:-unknown}" >&2
+                return 1
+                ;;
+        esac
     done
 }
 
