@@ -20,6 +20,7 @@ from slime.utils.ppo_utils import (
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    get_rloo_returns,
 )
 from slime.utils.types import RolloutBatch
 
@@ -574,7 +575,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
     This function extracts rewards, log-probs, values, and masks from
     `rollout_data`, computes KL divergences, then applies the chosen advantage
     estimator. Supported methods: "grpo", "gspo", "ppo", "reinforce_plus_plus",
-    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
+    "reinforce_plus_plus_baseline", and "rloo". When `args.normalize_advantages` is
     True, advantages are whitened across the data-parallel group using masked
     statistics.
 
@@ -629,11 +630,19 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         custom_adv_fn(args, rollout_data)
         advantages, returns = rollout_data["advantages"], rollout_data["returns"]
 
-    elif args.advantage_estimator in ["grpo", "gspo"]:
+    elif args.advantage_estimator in ["grpo", "gspo", "rloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
         advantages = [r for r in returns]
+
+    # elif args.advantage_estimator == "rloo":
+    #     rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
+    #     advantages, returns = get_rloo_returns(
+    #         rewards=rewards,
+    #         kl=kl,
+    #         n_samples_per_prompt=args.n_samples_per_prompt,
+    #     )
 
     elif args.advantage_estimator == "ppo":
         old_rewards = rewards

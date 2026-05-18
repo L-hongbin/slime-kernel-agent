@@ -352,6 +352,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--use-multi-turn",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to use all turns from a custom multi-turn generate function as training samples. "
+                    "When disabled, the custom generate function should return only the last turn sample."
+                ),
+            )
+            parser.add_argument(
+                "--filter-by-last-turn",
+                action="store_true",
+                default=False,
+                help=(
+                    "When --use-multi-turn is enabled, apply dynamic sampling filter only to the last turn group. "
+                    "If the last turn group is kept, all turn groups from the same rollout are kept; otherwise all "
+                    "turn groups from that rollout are dropped."
+                ),
+            )
+            parser.add_argument(
+                "--max-turns",
+                type=int,
+                default=None,
+                help=(
+                    "Maximum number of turns for multi-turn rollout. Also used to scale rollout target group "
+                    "counts when --use-multi-turn is enabled."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -812,6 +840,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus",
                     "reinforce_plus_plus_baseline",
                     "ppo",
+                    "rloo",
                 ],
                 default="grpo",
                 help=(

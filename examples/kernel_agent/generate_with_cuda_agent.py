@@ -399,7 +399,7 @@ def _sample_for_turn(
     return turn_sample
 
 
-async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
+async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     """Generate CUDA-kernel multi-turn rollouts.
 
     This follows the drkernel-style structure: each assistant turn becomes one
@@ -411,7 +411,10 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> lis
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     messages = _as_messages(sample.prompt)
-    max_turns = int(CUDA_AGENT_CONFIGS["max_turns"])
+    max_turns = getattr(args, "max_turns", None)
+    if max_turns is None:
+        raise ValueError("--max-turns must be set for CUDA kernel agent rollout")
+    max_turns = int(max_turns)
     template = _load_tool_response_template()
     output_samples: list[Sample] = []
     should_log = _should_log_multiturn(sample)
@@ -442,7 +445,9 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> lis
             finish_reason = "model_abort"
             if should_log:
                 _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
-            return output_samples or [sample]
+            if getattr(args, "use_multi_turn", False):
+                return output_samples or [sample]
+            return output_samples[-1] if output_samples else sample
 
         token_logprobs = output["meta_info"].get("output_token_logprobs", [])
         response_ids = [item[1] for item in token_logprobs]
@@ -514,7 +519,9 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> lis
             is_slowest=is_slowest,
             total_request_time=total_request_time,
         )
-    return output_samples
+    if getattr(args, "use_multi_turn", False):
+        return output_samples
+    return output_samples[-1] if output_samples else sample
 
 
 async def reward_func(args, samples: Sample | list[Sample], **kwargs):

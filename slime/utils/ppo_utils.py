@@ -208,6 +208,37 @@ def get_grpo_returns(
     return returns
 
 
+def get_rloo_returns(
+    rewards: torch.Tensor,
+    kl: list[torch.Tensor],
+    n_samples_per_prompt: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Compute outcome-level RLOO advantages grouped by prompt.
+    Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+
+    Each contiguous group of ``n_samples_per_prompt`` samples is treated as one
+    prompt group. The leave-one-out baseline for a sample is the mean reward of
+    the other samples in that group. For singleton groups, no baseline is used.
+    """
+    assert n_samples_per_prompt >= 1, "n_samples_per_prompt must be >= 1 for RLOO"
+
+    advantages = torch.empty_like(rewards)
+    for start in range(0, rewards.numel(), n_samples_per_prompt):
+        end = min(start + n_samples_per_prompt, rewards.numel())
+        group_rewards = rewards[start:end]
+        group_size = group_rewards.numel()
+        if group_size == 1:
+            group_advantages = group_rewards
+        else:
+            group_sum = group_rewards.sum()
+            loo_baseline = (group_sum - group_rewards) / (group_size - 1)
+            group_advantages = group_rewards - loo_baseline
+        advantages[start:end] = group_advantages
+
+    returns = get_grpo_returns(rewards, kl)
+    return get_grpo_returns(advantages, kl), returns
+
+
 def get_reinforce_plus_plus_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],

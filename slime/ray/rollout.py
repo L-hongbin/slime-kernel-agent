@@ -658,12 +658,18 @@ class RolloutManager:
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         if (
-            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline", "rloo"]
             and self.args.rewards_normalization
         ):
             # group norm
             rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
+            expected_reward_count = self.args.n_samples_per_prompt * self.args.rollout_batch_size
+            # if getattr(self.args, "use_multi_turn", False):
+            #     max_turns = getattr(self.args, "max_turns", None)
+            #     assert max_turns is not None, "--max-turns must be set when --use-multi-turn is enabled"
+            #     expected_reward_count *= int(max_turns)
+
+            if rewards.shape[-1] == expected_reward_count:
                 rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
             else:
                 # when samples count are not equal in each group
@@ -674,7 +680,16 @@ class RolloutManager:
             if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
-
+            if self.args.advantage_estimator in ["rloo"]:
+                #Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+                # Each contiguous group of ``n_samples_per_prompt`` samples is treated as one
+                # prompt group. The leave-one-out baseline for a sample is the mean reward of
+                # the other samples in that group. For singleton groups, no baseline is used.
+                group_len = rewards.shape[-1]
+                if group_len == 1:
+                    rewards = torch.zeros_like(rewards)  # zero normalization if only one sample in the group
+                else:
+                    rewards = rewards * group_len / (group_len - 1)
             return raw_rewards, rewards.flatten().tolist()
 
         return raw_rewards, raw_rewards

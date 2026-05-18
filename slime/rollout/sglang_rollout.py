@@ -146,7 +146,8 @@ class GenerateState(metaclass=SingletonMeta):
                     )
                 )
             )
-        self.remaining_batch_size += len(samples)
+        n_samples = len(samples)
+        self.remaining_batch_size += n_samples
 
 
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
@@ -309,7 +310,7 @@ async def generate_and_rm(
 )
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
-) -> list[Sample]:
+) -> list[Sample] | list[list[Sample]]:
     state = GenerateState(args)
 
     if state.aborted:
@@ -332,14 +333,38 @@ async def generate_and_rm_group(
 
     group = await asyncio.gather(*tasks)
 
+    if getattr(args, "use_multi_turn", False):
+        group = _split_turns_as_sample_groups(group)
+
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
+        assert group and all(isinstance(sample, Sample) for sample in group), "Group RM requires all samples to be valid"
         with trace_span(group, "group_reward_model"):
             rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
 
     return group
+
+
+def _split_turns_as_sample_groups(group: list[Sample] | list[list[Sample]]) -> list[list[Sample]]:
+    assert group and all(isinstance(samples, list) for samples in group), (
+        "--use-multi-turn requires custom generate to return list[Sample] for each original sample, "
+        f"got group={type(group).__name__}"
+    )
+
+    turn_groups: dict[int, list[Sample]] = {}
+    for sample_outputs in group:
+        assert sample_outputs and all(isinstance(sample, Sample) for sample in sample_outputs), (
+            "--use-multi-turn expects list[list[Sample]] after generate_and_rm_group"
+        )
+        for sample in sample_outputs:
+            turn_idx = sample.metadata.get("turn_idx") if sample.metadata is not None else None
+            assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
+            turn_groups.setdefault(int(turn_idx), []).append(sample)
+
+    sorted_turn_indices = sorted(turn_groups)
+    return [turn_groups[turn_idx] for turn_idx in sorted_turn_indices]
 
 
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
@@ -412,43 +437,82 @@ async def generate_rollout_async(
 
     metric_gatherer = MetricGatherer()
 
-    # target_data_size is the total number of valid samples to get
+    use_multi_turn = getattr(args, "use_multi_turn", False)
+    max_turns = getattr(args, "max_turns", None)
+    filter_by_last_turn = use_multi_turn and getattr(args, "filter_by_last_turn", False)
+    
+    if use_multi_turn:
+        assert max_turns is not None, "--max-turns must be set when --use-multi-turn is enabled"
+        max_turns = int(max_turns)
+        assert max_turns >= 1, "--max-turns must be >= 1"
+
+    # target_data_size is the number of original prompt groups to accept.
+    # In multi-turn mode, one accepted prompt group can contribute multiple turn groups to data.
     target_data_size = args.rollout_batch_size
 
+    accepted_count = 0
     data = []
     all_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
-    while len(data) < target_data_size:
+    while accepted_count < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
+            # If over_sampling_batch_size is None, rollout_batch_size will be used as the default over_sampling_batch_size.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
-            group: list[Sample] = task.result()
+            task_group = task.result()
+            groups: list[list[Sample]] = task_group if isinstance(task_group[0], list) else [task_group]
+            is_filtered = True
+            
+            last_turn_dynamic_filter_output = None
+            if filter_by_last_turn:
+                last_turn_dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, groups[-1])
+            all_data.extend(groups)
 
-            if do_print:
-                sample = group[0][0] if isinstance(group[0], list) else group[0]
-                logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+            for group in groups:
+                assert group and all(isinstance(sample, Sample) for sample in group), (
+                    f"Rollout group must be list[Sample], got {type(group).__name__}"
                 )
-                do_print = False
 
-            assert len(group) == args.n_samples_per_prompt
-            all_data.append(group)
-            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
-            if not dynamic_filter_output.keep:
-                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                if do_print:
+                    sample = group[0]
+                    logger.info(
+                        f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    )
+                    do_print = False
+
+                if last_turn_dynamic_filter_output is not None:
+                    # Use the last turn's filter result to keep or drop the whole multi-turn trajectory.
+                    if last_turn_dynamic_filter_output.keep:
+                        if accepted_count < target_data_size:
+                            data.extend(groups)
+                            is_filtered = False
+                    else:
+                        for _ in groups:
+                            metric_gatherer.on_dynamic_filter_drop(reason=last_turn_dynamic_filter_output.reason)
+                    break
+                else:
+                    dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+
+                    if not dynamic_filter_output.keep:
+                        metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                        continue
+                    # add the samples to the data
+                    # NOTE: here we have not stored all the unused samples back to the data buffer.
+                    if accepted_count < target_data_size:
+                        data.append(group)
+                        is_filtered = False
+
+            if is_filtered:
                 state.remaining_batch_size -= 1
-                continue
-
-            # add the samples to the data
-            # NOTE: here we have not stored all the unused samples back to the data buffer.
-            if len(data) < target_data_size:
-                data.append(group)
+                assert state.remaining_batch_size >= 0
+            else:
+                accepted_count += 1
                 pbar.update(args.n_samples_per_prompt)
 
     pbar.close()
@@ -460,7 +524,7 @@ async def generate_rollout_async(
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
 
-    assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
+    assert accepted_count == target_data_size, f"Got {accepted_count} samples, expected {target_data_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
     all_samples = sorted(
         all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index

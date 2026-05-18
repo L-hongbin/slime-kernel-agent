@@ -388,7 +388,6 @@ def _maybe_start_rollout(args):
 async def _run(args) -> None:
     logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     _init_ray_for_kernel_env(args)
-    CUDA_AGENT_CONFIGS["max_turns"] = args.max_turns
     CUDA_AGENT_CONFIGS["max_feedback_chars"] = args.max_feedback_chars
     CUDA_AGENT_CONFIGS["log_multi_turn_sample_rate"] = 1.0
     CUDA_AGENT_CONFIGS["do_precheck"] = args.do_precheck

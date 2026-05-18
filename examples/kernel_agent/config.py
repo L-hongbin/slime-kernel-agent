@@ -1,5 +1,4 @@
 CUDA_AGENT_CONFIGS = {
-    "max_turns": 3,
     "max_feedback_chars": 0,
     "log_multi_turn_sample_rate": 0.01,
     "log_slowest_step_window": 10,

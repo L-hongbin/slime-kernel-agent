@@ -1,5 +1,7 @@
 from typing import Any
 
+import torch
+
 try:
     from .utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
 except ImportError:
@@ -9,6 +11,54 @@ except ImportError:
 def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
     env_state = env_result.get("env_state") if isinstance(env_result, dict) else {}
     return calculate_reward_speedup(env_state, config)["reward"]
+
+
+def reward_post_process_by_group(args, samples):
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    rewards = list(raw_rewards)
+
+    idx_to_group_index: dict[int, object] = {}
+    reward_groups: dict[object, list[float]] = {}
+    for idx, sample in enumerate(samples):
+        group_index = sample.group_index
+        if getattr(args, "use_multi_turn", False):
+            turn_idx = sample.metadata.get("turn_idx") if sample.metadata is not None else None
+            assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
+            group_index = group_index, int(turn_idx)
+        idx_to_group_index[idx] = group_index
+        reward_groups.setdefault(group_index, []).append(raw_rewards[idx])
+
+    group_stats: dict[object, dict[str, float]] = {}
+    for group_index, group_reward_values in reward_groups.items():
+        group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
+        group_stats[group_index] = {
+            "mean": group_rewards.mean().item(),
+            "std": group_rewards.std().item(),
+            "size": len(group_reward_values),
+        }
+
+    for idx, raw_reward in enumerate(raw_rewards):
+        group_index = idx_to_group_index[idx]
+        stats = group_stats[group_index]
+        reward = raw_reward - stats["mean"]
+
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            reward = reward / (stats["std"] + 1e-6)
+
+        if args.advantage_estimator == "rloo":
+            # Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+            # Each contiguous group of ``n_samples_per_prompt`` samples is treated as one
+            # prompt group. The leave-one-out baseline for a sample is the mean reward of
+            # the other samples in that group. For singleton groups, no baseline is used.
+            group_len = stats["size"]
+            if group_len == 1:
+                reward = 0.0
+            else:
+                reward = reward * group_len / (group_len - 1)
+
+        rewards[idx] = reward
+
+    return raw_rewards, rewards
 
 
 def _resolve_failure_reward(env_state: dict[str, Any], config: dict[str, Any]) -> float:
