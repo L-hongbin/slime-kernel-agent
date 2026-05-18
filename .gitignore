@@ -198,3 +198,4 @@ data/
 tmp.md
 *.bundle
 checkpoints/
+.vscode/

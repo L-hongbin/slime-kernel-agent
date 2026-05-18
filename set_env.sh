@@ -6,3 +6,4 @@ fi
 
 cd $(dirname $0)
 pip install -e . --no-deps --break-system-packages
+pip install debugpy --break-system-packages
