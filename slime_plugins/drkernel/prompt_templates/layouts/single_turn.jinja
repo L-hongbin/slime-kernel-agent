@@ -1,13 +1,22 @@
-{{ role }}
+{{ role.strip() }}
 
-{% if compiler_name or gpu_name or extra_environment %}
+{%- if compiler_name or gpu_name or extra_environment %}
+
 Target environment:
-{% if compiler_name %}- NVCC: {{ compiler_name }}
-{% endif %}{% if gpu_name %}- GPU: {{ gpu_name }}
-{% endif %}{% if extra_environment %}{{ extra_environment }}
-{% endif %}
-{% endif %}
+{%- if compiler_name %}
+- NVCC: {{ compiler_name }}
+{%- endif %}
+{%- if gpu_name %}
+- GPU: {{ gpu_name }}
+{%- endif %}
+{%- if extra_environment %}
+{{ extra_environment.strip() }}
+{%- endif %}
+{%- endif %}
 
-{{ backend }}
+{{ backend.strip() }}
 
-{{ problem }}
+You are given the following PyTorch model:
+```python
+{{ problem.strip("\n") }}
+```

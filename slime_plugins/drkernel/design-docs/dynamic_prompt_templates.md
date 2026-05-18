@@ -47,7 +47,7 @@ layout：
 ```text
 slime_plugins/drkernel/
   prompt_templates/
-    single_turn.yaml
+    single_turn_v1.yaml
     layouts/
       single_turn.jinja
     roles/
@@ -100,49 +100,46 @@ layout 支持这些可选变量：
 
 ## YAML 配置
 
-`single_turn.yaml` 只描述可组合空间，不为 legacy 等价性硬编码多个 profile：
+`single_turn_v1.yaml` 只描述可组合空间，不为 legacy 等价性硬编码多个 profile：
 
 ```yaml
 profiles:
   drkernel_single_turn_v1:
     layout: layouts/single_turn.jinja
     role:
-      select: random
+      select: cycle
       candidates:
         - id: accelerate_best_perf
           text_path: roles/accelerate_best_perf.jinja
         - id: optimize_correctness
           text_path: roles/optimize_correctness.jinja
     first_turn_template:
-      select: random
+      select: cycle
       candidates:
         - id: csl_cuda_agent
           backend_text_path: backends/csl_cuda_agent.jinja
         - id: lhb_v3
           backend_text_path: backends/lhb_v3.jinja
-        - id: lhb_v4
-          backend_text_path: backends/lhb_v4.jinja
         - id: pybind11_module
           backend_text_path: backends/pybind11_module.jinja
         - id: tvm_ffi_module
           backend_text_path: backends/tvm_ffi_module.jinja
 ```
 
-legacy 等价性不靠 YAML 固化。测试里指定 legacy 对应 role/backend 组合，验证组合结果和本地 `legacy/` 参考副本内容一致。目前可精确还原的组合包括 `lhb_v4 + accelerate_best_perf`、`csl_cuda_agent + optimize_correctness`、`pybind11_module + optimize_correctness`、`tvm_ffi_module + optimize_correctness`。
+legacy 等价性不靠 YAML 固化。测试里指定 legacy 对应 role/backend 组合，验证组合结果和本地 `legacy/` 参考副本内容一致。`lhb_v4` 保留为 legacy 文件，但不在 `drkernel_single_turn_v1` 的 active backend 候选中。目前 active profile 覆盖的可精确还原组合包括 `csl_cuda_agent + optimize_correctness`、`pybind11_module + optimize_correctness`、`tvm_ffi_module + optimize_correctness`。
 
 ## 数据格式
 
-parquet/jsonl 只保存任务内容和可选模板约束：
+parquet/jsonl 只保存任务内容和唯一的可选模板 allowed list：
 
 ```json
 {
   "ground_truth": "原始 KernelBench/DrKernel problem 文本",
   "extra_info": {
     "task_id": "kernelbench_l1_0001",
-    "prompt_profile": "drkernel_single_turn_v1",
-    "template_overrides": {
-      "role": null,
-      "first_turn_template": null
+    "template_allowed": {
+      "role": ["accelerate_best_perf", "optimize_correctness"],
+      "first_turn_template": ["csl_cuda_agent", "pybind11_module"]
     }
   }
 }
@@ -156,7 +153,7 @@ parquet/jsonl 只保存任务内容和可选模板约束：
 --metadata-key extra_info
 ```
 
-custom rollout 负责最终 prompt 渲染，因此不建议在 Dataset 阶段启用 `--apply-chat-template`。如果需要 chat template，应在 rollout 选完 first-turn template 后统一调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`。
+custom rollout 负责最终 prompt 渲染和 chat template，因此不要在 Dataset 阶段启用 `--apply-chat-template`。DrKernel rollout 会在选完 first-turn template 后调用 tokenizer 的 `apply_chat_template(..., add_generation_prompt=True)`，再把结果发给 SGLang。
 
 ## Rollout 渲染流程
 
@@ -164,22 +161,24 @@ custom rollout 负责最终 prompt 渲染，因此不建议在 Dataset 阶段启
 
 1. 从 `data_source.get_samples(args.rollout_batch_size)` 取样本组。
 2. 对每个 `Sample` 读取 `sample.prompt` 作为原始 problem。
-3. 从 `sample.metadata["prompt_profile"]` 或默认 CLI 参数确定 profile。
-4. 从 role 和 backend 候选中选择片段；CLI/metadata override 可以固定任一维度。
+3. 使用固定 profile `drkernel_single_turn_v1`。
+4. 从 role 和 backend 候选中选择片段；唯一的限制入口是 `sample.metadata["template_allowed"]`。如果它限制了某个 slot，就只在 allowed list 内按 profile 策略选择。allowed list 长度为 1 时等价于固定该 slot。
 5. 从 args 读取 `compiler_name`、`gpu_name`、`extra_environment`。
 6. 渲染 layout，得到 first-turn user prompt。
 7. 记录选择结果到 `sample.metadata["chosen_prompt_slots"]`。
-8. 将最终 prompt 写回 `sample.prompt`。
-9. 调用 `slime.rollout.sglang_rollout.generate_and_rm_group()` 继续生成和打分。
+8. 将 first-turn user prompt 保存到 `sample.metadata["drkernel_user_prompt"]`。
+9. 使用 tokenizer 对 `[{"role": "user", "content": user_prompt}]` 调用 `apply_chat_template(..., add_generation_prompt=True)`。
+10. 将 chat-template 后的最终 prompt 写回 `sample.prompt`。
+11. 调用 `slime.rollout.sglang_rollout.generate_and_rm_group()` 继续生成和打分。
 
 选择结果示例：
 
 ```json
 {
   "chosen_prompt_slots": {
-    "profile": "drkernel_lhb_v4_equiv_v1",
+    "profile": "drkernel_single_turn_v1",
     "role": "accelerate_best_perf",
-    "first_turn_template": "lhb_v4",
+    "first_turn_template": "lhb_v3",
     "compiler_name": "nvcc_12_4",
     "gpu_name": "H100"
   }
@@ -191,17 +190,8 @@ custom rollout 负责最终 prompt 渲染，因此不建议在 Dataset 阶段启
 建议新增 DrKernel plugin 参数：
 
 ```bash
---drkernel-prompt-config-path slime_plugins/drkernel/prompt_templates/single_turn.yaml
---drkernel-prompt-profile drkernel_single_turn_v1
 --drkernel-compiler-name nvcc_12_4
 --drkernel-gpu-name H100
-```
-
-可选强制覆盖参数：
-
-```bash
---drkernel-role-id accelerate_best_perf
---drkernel-first-turn-template-id lhb_v4
 ```
 
 ## 后续扩展
@@ -223,4 +213,4 @@ checkpoints/drkernel_prompt_debug/rollout_000001.sample.txt
 - YAML profile 加载。
 - role/backend 候选路径存在。
 - 测试中固定可精确还原 legacy 的 role/backend 组合；不带环境信息时，组合渲染结果和旧模板渲染结果在空白归一化后相同。
-- 强制指定 `--drkernel-role-id` / `--drkernel-first-turn-template-id` 后选择正确候选。
+- 通过 `sample.metadata["template_allowed"]` 固定 role/backend 后选择正确候选；不再提供第二套模板选择入口。
