@@ -380,6 +380,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "counts when --use-multi-turn is enabled."
                 ),
             )
+            parser.add_argument(
+                "--multi-turn-gamma",
+                type=float,
+                default=1.0,
+                help="Discount factor for multi-turn reward folding used by custom multi-turn rollout functions.",
+            )
 
             # partial rollout
             parser.add_argument(
@@ -841,6 +847,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "reinforce_plus_plus_baseline",
                     "ppo",
                     "rloo",
+                    "trloo",
                 ],
                 default="grpo",
                 help=(
@@ -1719,6 +1726,13 @@ def slime_validate_args(args):
 
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+
+    if args.use_multi_turn and args.custom_reward_post_process_path is None:
+        logger.warning(
+            "--use-multi-turn can produce uneven turn groups. Configure --custom-reward-post-process-path "
+            "for turn-aware reward normalization, for example "
+            "examples.kernel_agent.kernel_reward.reward_post_process_by_group."
+        )
 
     if args.get_mismatch_metrics:
         assert (

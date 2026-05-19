@@ -23,12 +23,12 @@ try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import run_kernel_eval
     from .kernel_reward import calculate_reward
-    from .utils import normalize_env_feedback, precheck_response
+    from .utils import normalize_env_feedback, postprocess_turn_samples, precheck_response
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import run_kernel_eval
     from kernel_reward import calculate_reward
-    from utils import normalize_env_feedback, precheck_response
+    from utils import normalize_env_feedback, postprocess_turn_samples, precheck_response
 
 logger = logging.getLogger(__name__)
 
@@ -133,11 +133,27 @@ def _split_think_response(response: str) -> tuple[str | None, str]:
     end_tag = "</think>"
     start = response.find(start_tag)
     end = response.find(end_tag, start + len(start_tag)) if start >= 0 else -1
-    if start < 0 or end < 0:
-        return None, response
-    response_think = response[start + len(start_tag) : end].strip("\n")
-    response_content = (response[:start] + response[end + len(end_tag) :]).lstrip("\n")
-    return response_think, response_content
+    if start >= 0 and end >= 0:
+        response_think = response[start + len(start_tag) : end].strip("\n")
+        response_content = (response[:start] + response[end + len(end_tag) :]).lstrip("\n")
+        return response_think, response_content
+
+    end = response.rfind(end_tag)
+    if end >= 0:
+        response_think = response[:end].strip("\n")
+        response_content = response[end + len(end_tag) :].lstrip("\n")
+        return response_think, response_content
+
+    return None, response
+
+
+def _process_thinking_content(response: str, turn_idx: int, max_turns: int) -> str:
+    next_turn_idx = turn_idx + 1
+    if next_turn_idx >= max_turns or CUDA_AGENT_CONFIGS.get("keep_history_thinking", True):
+        return response
+
+    _, response_content = _split_think_response(response)
+    return response_content
 
 
 def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
@@ -265,7 +281,9 @@ def _log_multiturn_messages(
 
     for item in turn_logs:
         env_state = item.get("env_state") if isinstance(item.get("env_state"), dict) else {}
-        reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
+        reward = item.get("reward")
+        if reward is None:
+            reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
         logger.info(
             "[cuda_agent][turn %s] model_time=%.3fs env_time=%.3fs prompt_tokens=%s response_tokens=%s "
             "finish_type=%s status=%s error=%s speedup=%s correctness=%s compiled=%s reward=%s",
@@ -379,7 +397,6 @@ def _sample_for_turn(
     status: Sample.Status,
     turn_idx: int,
     env_result: dict[str, Any],
-    keep_turn: bool = True,
 ) -> Sample:
     turn_sample = deepcopy(base_sample)
     turn_sample.tokens = prompt_ids + response_ids
@@ -388,7 +405,7 @@ def _sample_for_turn(
     turn_sample.rollout_log_probs = log_probs
     turn_sample.reward = reward
     turn_sample.status = status
-    turn_sample.loss_mask = [1 if keep_turn else 0] * len(response_ids)
+    turn_sample.loss_mask = [1] * len(response_ids)
     turn_sample.metadata = dict(turn_sample.metadata or {})
     turn_sample.metadata.update(
         {
@@ -443,10 +460,14 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         if finish_type == "abort":
             sample.status = Sample.Status.ABORTED
             finish_reason = "model_abort"
-            if should_log:
-                _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
+            _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
+            output_samples = postprocess_turn_samples(
+                output_samples,
+                finish_reason=finish_reason,
+                args=args,
+            )
             if getattr(args, "use_multi_turn", False):
-                return output_samples or [sample]
+                return output_samples
             return output_samples[-1] if output_samples else sample
 
         token_logprobs = output["meta_info"].get("output_token_logprobs", [])
@@ -467,6 +488,19 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         )
         env_time = time.monotonic() - env_started_at
         env_state = _get_env_state(env_result)
+        turn_sample = _sample_for_turn(
+            sample,
+            prompt_ids=prompt_ids,
+            response=response,
+            response_ids=response_ids,
+            log_probs=log_probs,
+            reward=None,
+            status=status,
+            turn_idx=turn_idx,
+            env_result=env_result,
+        )
+        turn_reward = await reward_func(args, turn_sample)
+        turn_sample.reward = turn_reward
         turn_log = {
             "turn_idx": turn_idx,
             "model_time": model_time,
@@ -478,26 +512,18 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             "response": response,
             "env_state": env_state,
             "env_result": env_result,
+            "reward": turn_reward,
             "format_feedback": None,
         }
         turn_logs.append(turn_log)
-        keep_turn = bool(env_result.get("loss_mask", 1)) if isinstance(env_result, dict) else True
-        output_samples.append(
-            _sample_for_turn(
-                sample,
-                prompt_ids=prompt_ids,
-                response=response,
-                response_ids=response_ids,
-                log_probs=log_probs,
-                reward=None,
-                status=status,
-                turn_idx=turn_idx,
-                env_result=env_result,
-                keep_turn=keep_turn,
-            )
-        )
+        output_samples.append(turn_sample)
 
-        messages.append({"role": "assistant", "content": response})
+        messages.append(
+            {
+                "role": "assistant",
+                "content": _process_thinking_content(response, turn_idx, max_turns),
+            }
+        )
         
         format_feedback = _apply_feedback_template(env_result, template)
         turn_log["format_feedback"] = format_feedback
@@ -519,6 +545,11 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             is_slowest=is_slowest,
             total_request_time=total_request_time,
         )
+    output_samples = postprocess_turn_samples(
+        output_samples,
+        finish_reason=finish_reason,
+        args=args,
+    )
     if getattr(args, "use_multi_turn", False):
         return output_samples
     return output_samples[-1] if output_samples else sample
@@ -527,6 +558,11 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
 async def reward_func(args, samples: Sample | list[Sample], **kwargs):
     """Compute reward from the CUDA env response collected during generation."""
 
+    def get_reward(sample: Sample):
+        if sample.reward is not None:
+            return sample.reward
+        return calculate_reward(sample.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
+
     if isinstance(samples, list):
-        return [calculate_reward(sample.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"]) for sample in samples]
-    return calculate_reward(samples.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
+        return [get_reward(sample) for sample in samples]
+    return get_reward(samples)

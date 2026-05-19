@@ -14,7 +14,10 @@ def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> floa
 
 
 def reward_post_process_by_group(args, samples):
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if args.advantage_estimator == "trloo":
+        raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
+    else:
+        raw_rewards = [sample.get_reward_value(args) for sample in samples]
     rewards = list(raw_rewards)
 
     idx_to_group_index: dict[int, object] = {}
@@ -26,6 +29,8 @@ def reward_post_process_by_group(args, samples):
             assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
             group_index = group_index, int(turn_idx)
         idx_to_group_index[idx] = group_index
+        sample_reward = raw_rewards[idx]
+        
         reward_groups.setdefault(group_index, []).append(raw_rewards[idx])
 
     group_stats: dict[object, dict[str, float]] = {}
@@ -45,7 +50,7 @@ def reward_post_process_by_group(args, samples):
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
             reward = reward / (stats["std"] + 1e-6)
 
-        if args.advantage_estimator == "rloo":
+        if args.advantage_estimator in ["rloo", "trloo"]:
             # Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
             # Each contiguous group of ``n_samples_per_prompt`` samples is treated as one
             # prompt group. The leave-one-out baseline for a sample is the mean reward of

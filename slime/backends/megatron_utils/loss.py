@@ -630,7 +630,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         custom_adv_fn(args, rollout_data)
         advantages, returns = rollout_data["advantages"], rollout_data["returns"]
 
-    elif args.advantage_estimator in ["grpo", "gspo", "rloo"]:
+    elif args.advantage_estimator in ["grpo", "gspo", "rloo", "trloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?

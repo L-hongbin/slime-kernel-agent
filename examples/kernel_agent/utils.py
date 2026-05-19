@@ -1,5 +1,16 @@
+import logging
 import re
 from typing import Any
+
+from slime.utils.types import Sample
+
+try:
+    from .config import CUDA_AGENT_CONFIGS
+except ImportError:
+    from config import CUDA_AGENT_CONFIGS
+
+logger = logging.getLogger(__name__)
+_MULTI_TURN_GAMMA_WARNING_LOGGED = False
 
 
 VALIDATION_ERROR = "VALIDATION_ERROR"
@@ -352,3 +363,77 @@ def precheck_response(
     if backend == "cuda_agent":
         return precheck_cuda_agent_response(response, entry_point)
     return None
+
+
+def _set_multi_turn_rewards(output_samples: list[Sample], finish_reason: str, args=None) -> None:
+    global _MULTI_TURN_GAMMA_WARNING_LOGGED
+
+    gamma = getattr(args, "multi_turn_gamma", None) if args is not None else None
+    if gamma is None:
+        gamma = CUDA_AGENT_CONFIGS["reward"].get("multi_turn_gamma", 1.0)
+    elif not _MULTI_TURN_GAMMA_WARNING_LOGGED:
+        logger.warning(
+            "Using args.multi_turn_gamma=%s for multi-turn reward folding; "
+            "CUDA_AGENT_CONFIGS['reward']['multi_turn_gamma'] will be ignored.",
+            gamma,
+        )
+        _MULTI_TURN_GAMMA_WARNING_LOGGED = True
+    gamma = float(gamma)
+    if args.advantage_estimator not in ["trloo"] or gamma == 0.0:
+        return
+
+    multi_turn_reward = 0.0
+    for reverse_idx, sample in enumerate(reversed(output_samples)):
+        turn_idx = sample.metadata.get("turn_idx") if isinstance(sample.metadata, dict) else None
+        expected_turn_idx = len(output_samples) - 1 - reverse_idx
+        assert int(turn_idx) == expected_turn_idx, f"turn_idx mismatch: {turn_idx=} {expected_turn_idx=}"
+        turn_reward = 0.0 if sample.remove_sample else float(sample.reward)
+        multi_turn_reward = turn_reward + gamma * multi_turn_reward
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata.update(
+            {
+                "multi_turn_reward": multi_turn_reward,
+                "trajectory_finish_reason": finish_reason,
+            }
+        )
+
+
+def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, args=None) -> list[Sample]:
+    """Postprocess turn samples.
+
+    finalize_mode:
+    - None: keep all generated turn samples.
+    - "positive": after max_reward > 0, mark turns with reward <= 0 as remove_sample.
+    - "improve": after max_reward > 0, mark turns with reward <= max_reward as remove_sample.
+    """
+
+    if not output_samples:
+        return []
+
+    if finish_reason == "model_abort":
+        for sample in output_samples:
+            sample.remove_sample = True
+        _set_multi_turn_rewards(output_samples, finish_reason, args)
+        return output_samples
+
+    finalize_mode = CUDA_AGENT_CONFIGS.get("finalize_mode", "positive")
+    if finalize_mode is None:
+        _set_multi_turn_rewards(output_samples, finish_reason, args)
+        return output_samples
+
+    def is_meaningful_turn(sample: Sample, max_reward: float) -> bool:
+        if max_reward > 0.0:
+            reward = float(sample.reward)
+            if finalize_mode == "improve":
+                return reward > max_reward
+            return reward > 0.0
+        return True
+
+    max_reward = float(output_samples[0].reward)
+    for sample in output_samples[1:]:
+        if not is_meaningful_turn(sample, max_reward):
+            sample.remove_sample = True
+        max_reward = max(max_reward, float(sample.reward))
+
+    _set_multi_turn_rewards(output_samples, finish_reason, args)
+    return output_samples

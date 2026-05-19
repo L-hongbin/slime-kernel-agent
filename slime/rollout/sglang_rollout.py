@@ -466,6 +466,10 @@ async def generate_rollout_async(
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task_group = task.result()
+            if not task_group:
+                state.remaining_batch_size -= 1
+                assert state.remaining_batch_size >= 0
+                continue
             groups: list[list[Sample]] = task_group if isinstance(task_group[0], list) else [task_group]
             is_filtered = True
             
