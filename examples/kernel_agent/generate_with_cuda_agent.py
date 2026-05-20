@@ -4,11 +4,7 @@ import logging
 import random
 import time
 from copy import deepcopy
-from functools import cache
-from pathlib import Path
 from typing import Any
-
-import yaml
 
 try:
     import ray
@@ -23,12 +19,22 @@ try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import run_kernel_eval
     from .kernel_reward import calculate_reward
-    from .utils import normalize_env_feedback, postprocess_turn_samples, precheck_response
+    from .utils import (
+        normalize_env_feedback,
+        postprocess_turn_samples,
+        precheck_response,
+        split_think_response,
+    )
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import run_kernel_eval
     from kernel_reward import calculate_reward
-    from utils import normalize_env_feedback, postprocess_turn_samples, precheck_response
+    from utils import (
+        normalize_env_feedback,
+        postprocess_turn_samples,
+        precheck_response,
+        split_think_response,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -77,28 +83,14 @@ def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"role": "user", "content": str(prompt)}]
 
 
-def _tokenize_prompt(tokenizer, messages: list[dict[str, Any]]) -> list[int]:
-    prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    return tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-
-
-@cache
-def _load_tool_response_template() -> str:
-    config_path = CUDA_AGENT_CONFIGS.get("multi_turn_prompt_config_path")
-    if config_path is None:
+def _get_tool_response_template(state: GenerateState) -> str:
+    template = (state.multi_turn_templates or {}).get("tool_response")
+    if template is None:
         logger.warning(
-            "CUDA_AGENT_CONFIGS['multi_turn_prompt_config_path'] is not set; using built-in CUDA agent prompt template."
+            "multi-turn tool_response template is not set; using built-in CUDA agent prompt template."
         )
         return DEFAULT_TOOL_RESPONSE_TEMPLATE
-
-    with Path(config_path).open(encoding="utf-8") as f:
-        prompt_cfg = yaml.safe_load(f) or {}
-
-    for item in prompt_cfg.get("per_turn_prompts", []) or []:
-        if item.get("name") == "tool_response" and item.get("template"):
-            return str(item["template"])
-
-    raise ValueError(f"multi_turn_prompt_config_path={config_path} does not define a tool_response template.")
+    return template
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
@@ -126,34 +118,6 @@ def _json_dumps_for_log(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, indent=2)
     except TypeError:
         return str(payload)
-
-
-def _split_think_response(response: str) -> tuple[str | None, str]:
-    start_tag = "<think>"
-    end_tag = "</think>"
-    start = response.find(start_tag)
-    end = response.find(end_tag, start + len(start_tag)) if start >= 0 else -1
-    if start >= 0 and end >= 0:
-        response_think = response[start + len(start_tag) : end].strip("\n")
-        response_content = (response[:start] + response[end + len(end_tag) :]).lstrip("\n")
-        return response_think, response_content
-
-    end = response.rfind(end_tag)
-    if end >= 0:
-        response_think = response[:end].strip("\n")
-        response_content = response[end + len(end_tag) :].lstrip("\n")
-        return response_think, response_content
-
-    return None, response
-
-
-def _process_thinking_content(response: str, turn_idx: int, max_turns: int) -> str:
-    next_turn_idx = turn_idx + 1
-    if next_turn_idx >= max_turns or CUDA_AGENT_CONFIGS.get("keep_history_thinking", True):
-        return response
-
-    _, response_content = _split_think_response(response)
-    return response_content
 
 
 def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
@@ -305,7 +269,7 @@ def _log_multiturn_messages(
             item.get("turn_idx"),
             _truncate_middle(str(item.get("prompt", "")), log_max_chars),
         )
-        response_think, response_content = _split_think_response(str(item.get("response", "")))
+        response_think, response_content = split_think_response(str(item.get("response", "")))
         if response_think is not None:
             logger.info(
                 "[cuda_agent][turn %s] response_think:\n%s",
@@ -416,6 +380,51 @@ def _sample_for_turn(
     return turn_sample
 
 
+def _pad_turn_samples(
+    output_samples: list[Sample],
+    base_sample: Sample,
+    *,
+    enabled: bool,
+    max_turns: int,
+    pad_token_id: int | None,
+    pad_token: str | None,
+) -> list[Sample]:
+    if not enabled:
+        return output_samples
+    if pad_token_id is None or pad_token is None:
+        raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
+
+    samples_by_turn = {
+        int(sample.metadata["turn_idx"]): sample
+        for sample in output_samples
+        if isinstance(sample.metadata, dict) and "turn_idx" in sample.metadata
+    }
+    padded_samples = list(output_samples)
+    for turn_idx in range(max_turns):
+        if turn_idx in samples_by_turn:
+            continue
+
+        fake_sample = deepcopy(base_sample)
+        fake_sample.tokens = [pad_token_id]
+        fake_sample.response = pad_token
+        fake_sample.response_length = 1
+        fake_sample.rollout_log_probs = [0.0]
+        fake_sample.reward = 0.0
+        fake_sample.status = Sample.Status.COMPLETED
+        fake_sample.loss_mask = [0]
+        fake_sample.remove_sample = True
+        fake_sample.metadata = dict(fake_sample.metadata or {})
+        fake_sample.metadata.update(
+            {
+                "turn_idx": turn_idx,
+                "is_pad_turn": True,
+            }
+        )
+        padded_samples.append(fake_sample)
+
+    return sorted(padded_samples, key=lambda sample: int(sample.metadata["turn_idx"]))
+
+
 async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     """Generate CUDA-kernel multi-turn rollouts.
 
@@ -432,14 +441,31 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
     if max_turns is None:
         raise ValueError("--max-turns must be set for CUDA kernel agent rollout")
     max_turns = int(max_turns)
-    template = _load_tool_response_template()
+    padding_turns = bool(getattr(args, "use_multi_turn", False) and getattr(args, "padding_turns", False))
+    pad_token_id = None
+    pad_token = None
+    if padding_turns:
+        pad_token_id = state.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = state.tokenizer.eos_token_id
+        if pad_token_id is None:
+            raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
+        pad_token = state.tokenizer.pad_token or state.tokenizer.eos_token
+        if pad_token is None:
+            pad_token = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
+    template = _get_tool_response_template(state)
     output_samples: list[Sample] = []
     should_log = _should_log_multiturn(sample)
     turn_logs: list[dict[str, Any]] = []
     finish_reason = "max_turns"
 
     for turn_idx in range(max_turns):
-        prompt_text = state.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        prompt_text = state.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            **state.apply_chat_template_kwargs,
+        )
         prompt_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
         max_context_len = getattr(args, "rollout_max_context_len", None)
         if max_context_len is not None and len(prompt_ids) >= max_context_len:
@@ -461,6 +487,14 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             sample.status = Sample.Status.ABORTED
             finish_reason = "model_abort"
             _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
+            output_samples = _pad_turn_samples(
+                output_samples,
+                sample,
+                enabled=padding_turns,
+                max_turns=max_turns,
+                pad_token_id=pad_token_id,
+                pad_token=pad_token,
+            )
             output_samples = postprocess_turn_samples(
                 output_samples,
                 finish_reason=finish_reason,
@@ -521,17 +555,17 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         messages.append(
             {
                 "role": "assistant",
-                "content": _process_thinking_content(response, turn_idx, max_turns),
+                "content": response,
             }
         )
-        
+
         format_feedback = _apply_feedback_template(env_result, template)
         turn_log["format_feedback"] = format_feedback
 
         if _is_done(env_result, turn_idx, max_turns):
             finish_reason = "env_done" if turn_idx + 1 < max_turns else "max_turns"
             break
-        
+
         messages.append({"role": "user", "content": format_feedback})
 
     total_request_time = sum(float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs)
@@ -545,6 +579,14 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             is_slowest=is_slowest,
             total_request_time=total_request_time,
         )
+    output_samples = _pad_turn_samples(
+        output_samples,
+        sample,
+        enabled=padding_turns,
+        max_turns=max_turns,
+        pad_token_id=pad_token_id,
+        pad_token=pad_token,
+    )
     output_samples = postprocess_turn_samples(
         output_samples,
         finish_reason=finish_reason,

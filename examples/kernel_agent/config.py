@@ -4,7 +4,6 @@ CUDA_AGENT_CONFIGS = {
     "log_slowest_step_window": 10,
     "log_slowest_min_delta_seconds": 5.0,
     "slowest_tracker_timeout": 2.0,
-    "keep_history_thinking": True,
     # None: keep all generated turn samples; "positive": keep positive turns after a positive best reward;
     # "improve": keep only turns that improve the best reward after a positive best reward.
     "finalize_mode": "positive",
@@ -15,10 +14,9 @@ CUDA_AGENT_CONFIGS = {
         "min_group_size": None,
         "reward_std_threshold": 1e-3,
     },
-    "multi_turn_prompt_config_path": "examples/kernel_agent/prompt_config/multi_turn_cuda_kernel.yaml",
     "kernel_backend": "cuda_agent",
     "reference_backend": "torch",
-    "do_precheck": False,
+    "do_precheck": True,
     "env": {
         "kernel_eval_function_path": None,
         "kernel_eval_url": None,

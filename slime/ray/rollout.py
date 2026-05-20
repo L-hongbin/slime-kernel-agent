@@ -364,6 +364,12 @@ class RolloutManager:
         self.custom_reward_post_process_func = None
         if self.args.custom_reward_post_process_path is not None:
             self.custom_reward_post_process_func = load_function(self.args.custom_reward_post_process_path)
+        elif getattr(self.args, "use_multi_turn", False):
+            logger.warning(
+                "--use-multi-turn is enabled without --custom-reward-post-process-path. "
+                "The default _post_process_rewards will include padded turns or remove_sample entries "
+                "when computing reward mean/std, which may bias advantage normalization."
+            )
         self.custom_convert_samples_to_train_data_func = None
         if self.args.custom_convert_samples_to_train_data_path is not None:
             self.custom_convert_samples_to_train_data_func = load_function(

@@ -166,7 +166,7 @@ class ModelNew(nn.Module):
 
 
 class FakeTokenizer:
-    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         rendered = []
         for message in messages:
             rendered.append(f"<|{message['role']}|>\n{message['content']}")
@@ -184,6 +184,11 @@ class FakeTokenizer:
 class FakeGenerateState:
     def __init__(self, args):
         self.tokenizer = FakeTokenizer()
+        self.multi_turn_templates = None
+        self.apply_chat_template_kwargs = {}
+
+    def _is_qwen3_5_model(self):
+        return False
 
 
 def _json_dumps(payload: Any) -> str:
@@ -435,6 +440,8 @@ async def _run(args) -> None:
             ci_test=False,
             use_rollout_routing_replay=False,
             use_distributed_post=False,
+            multi_turn_prompt_config_path=args.multi_turn_prompt_config_path,
+            preserve_history_thinking=args.preserve_history_thinking,
             num_gpus_per_node=args.num_gpus_per_node,
         )
         sampling_params = {"max_new_tokens": args.max_new_tokens, "temperature": 0.0}
@@ -442,6 +449,8 @@ async def _run(args) -> None:
         if use_real_model:
             init_http_client(rollout_args)
         output_samples = await generate_with_cuda_agent.generate(rollout_args, sample, sampling_params)
+        state = generate_with_cuda_agent.GenerateState(rollout_args)
+        tool_response_template = generate_with_cuda_agent._get_tool_response_template(state)
         print(f"\n[cuda_agent][generate_smoke] output_samples={len(output_samples)}")
         for idx, output_sample in enumerate(output_samples):
             env_result = (output_sample.metadata or {}).get("env_result", {})
@@ -449,7 +458,7 @@ async def _run(args) -> None:
             reward = calculate_reward(env_result, CUDA_AGENT_CONFIGS["reward"])
             format_feedback = generate_with_cuda_agent._apply_feedback_template(
                 env_result,
-                generate_with_cuda_agent._load_tool_response_template(),
+                tool_response_template,
             )
             print(f"\n[cuda_agent][generate_smoke][sample {idx}] status={output_sample.status}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] response_length={output_sample.response_length}")
@@ -477,6 +486,12 @@ def parse_args():
     parser.add_argument("--max-turns", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=256)
     parser.add_argument("--max-feedback-chars", type=int, default=0)
+    parser.add_argument(
+        "--multi-turn-prompt-config-path",
+        default=None,
+        help="YAML config path for multi-turn prompt templates. Defaults to the built-in CUDA agent template.",
+    )
+    parser.add_argument("--preserve-history-thinking", action="store_true", default=False)
     parser.add_argument("--rollout-max-context-len", type=int, default=8192)
     parser.add_argument("--uuid", default="generate-smoke")
     parser.add_argument("--prompt", default="Write a CUDA identity implementation.")

@@ -122,6 +122,25 @@ def normalize_env_feedback(env_state: dict[str, Any]) -> dict[str, Any]:
     return env_state
 
 
+def split_think_response(response: str) -> tuple[str | None, str]:
+    start_tag = "<think>"
+    end_tag = "</think>"
+    start = response.find(start_tag)
+    end = response.find(end_tag, start + len(start_tag)) if start >= 0 else -1
+    if start >= 0 and end >= 0:
+        response_think = response[start + len(start_tag) : end].strip("\n")
+        response_content = (response[:start] + response[end + len(end_tag) :]).lstrip("\n")
+        return response_think, response_content
+
+    end = response.rfind(end_tag)
+    if end >= 0:
+        response_think = response[:end].strip("\n")
+        response_content = response[end + len(end_tag) :].lstrip("\n")
+        return response_think, response_content
+
+    return None, response
+
+
 def validate_code(code: str | None, entry_point: str = "Model") -> tuple[bool, str]:
     if not code:
         return False, f"MODEL_NEW validation error: Python code is required and must contain a '{entry_point}' class"
@@ -413,6 +432,7 @@ def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, a
     if finish_reason == "model_abort":
         for sample in output_samples:
             sample.remove_sample = True
+            sample.reward = 0.0
         _set_multi_turn_rewards(output_samples, finish_reason, args)
         return output_samples
 
@@ -431,9 +451,11 @@ def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, a
 
     max_reward = float(output_samples[0].reward)
     for sample in output_samples[1:]:
+        reward = float(sample.reward)
         if not is_meaningful_turn(sample, max_reward):
             sample.remove_sample = True
-        max_reward = max(max_reward, float(sample.reward))
+            sample.reward = 0.0
+        max_reward = max(max_reward, reward)
 
     _set_multi_turn_rewards(output_samples, finish_reason, args)
     return output_samples

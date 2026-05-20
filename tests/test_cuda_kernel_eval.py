@@ -7,7 +7,7 @@ import pytest
 
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.utils import normalize_env_feedback, precheck_cuda_agent_response
+from examples.kernel_agent.utils import normalize_env_feedback, precheck_cuda_agent_response, split_think_response
 from slime.utils.types import Sample
 
 
@@ -242,7 +242,7 @@ def _skip_unselected_compiled_case(request, case, compiled_key):
 
 
 def _format_feedback_for_test(env_result):
-    template = generate_with_cuda_agent._load_tool_response_template()
+    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_templates=None))
     return generate_with_cuda_agent._apply_feedback_template(env_result, template)
 
 
@@ -364,7 +364,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     assert "response_think" in caplog.text
     assert "try a simple copy kernel" in caplog.text
     assert "response_content" in caplog.text
-    _, response_content = generate_with_cuda_agent._split_think_response(response_with_think)
+    _, response_content = split_think_response(response_with_think)
     assert "### CUDA_KERNELS" in response_content
     if not case["feedback_compiled"]:
         assert "nvcc fatal: syntax error" in caplog.text
@@ -373,7 +373,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
 @pytest.mark.unit
 def test_split_think_response_handles_generation_prompt_prefilled_think():
     response = "reasoning from model\n</think>\n### CUDA_KERNELS\n```cpp\ncode\n```"
-    response_think, response_content = generate_with_cuda_agent._split_think_response(response)
+    response_think, response_content = split_think_response(response)
     assert response_think == "reasoning from model"
     assert response_content.startswith("### CUDA_KERNELS")
 

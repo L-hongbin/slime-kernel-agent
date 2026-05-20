@@ -16,6 +16,89 @@ from slime.utils.logging_utils import configure_logger
 logger = logging.getLogger(__name__)
 
 
+def _parse_opsm_config(config: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(config)
+    except json.JSONDecodeError as exc:
+        raise ValueError('--opsm-config must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.') from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError("--opsm-config must parse to a dictionary/object.")
+    return parsed
+
+
+def _parse_opsm_args(args) -> None:
+    opsm_delta_provided = args.opsm_delta is not None
+    opsm_lower_provided = args.opsm_lower is not None
+    opsm_upper_provided = args.opsm_upper is not None
+
+    if args.opsm_config is not None:
+        config = _parse_opsm_config(args.opsm_config)
+        allowed_keys = {"mode", "aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage"}
+        unknown_keys = set(config) - allowed_keys
+        if unknown_keys:
+            raise ValueError(f"Unknown --opsm-config keys: {sorted(unknown_keys)}")
+
+        if "mode" in config:
+            args.opsm_mode = str(config["mode"])
+        if "aggregation" in config:
+            args.opsm_aggregation = str(config["aggregation"])
+        if "delta" in config:
+            if "lower" in config:
+                logger.warning("--opsm-config delta is ignored because lower is also set.")
+            else:
+                args.opsm_lower = float(config["delta"])
+                logger.warning("--opsm-config delta is deprecated; using it as lower.")
+        if "lower" in config:
+            args.opsm_lower = float(config["lower"])
+        if "upper" in config:
+            args.opsm_upper = float(config["upper"])
+        if "token_veto_threshold" in config:
+            args.opsm_token_veto_threshold = float(config["token_veto_threshold"])
+        if "use_advantage" in config:
+            args.opsm_use_advantage = bool(config["use_advantage"])
+    elif opsm_delta_provided:
+        if not opsm_lower_provided:
+            args.opsm_lower = args.opsm_delta
+            logger.warning("--opsm-delta is deprecated; using it as --opsm-lower.")
+        else:
+            logger.warning("--opsm-delta is ignored because --opsm-lower is set.")
+
+    if args.opsm_upper is None:
+        args.opsm_upper = float("inf")
+        if not opsm_upper_provided:
+            logger.warning("--opsm-upper is not set; using infinity.")
+
+    if args.opsm_lower is None:
+        args.opsm_lower = 1e-4
+        logger.warning("--opsm-lower is not set; using default 1e-4.")
+    args.opsm_delta = args.opsm_lower
+
+    if args.opsm_token_veto_threshold is not None and args.opsm_token_veto_threshold <= 0:
+        raise ValueError(
+            f"--opsm-token-veto-threshold must be positive, got {args.opsm_token_veto_threshold}."
+        )
+    if args.opsm_aggregation not in {"kl", "geometric", "turns_geometric"}:
+        raise ValueError(
+            "--opsm-aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "
+            f"got {args.opsm_aggregation!r}."
+        )
+    if args.opsm_aggregation == "turns_geometric" and args.max_turns is None:
+        raise ValueError("--max-turns must be set when --opsm-aggregation=turns_geometric.")
+
+    logger.info(
+        "OPSM config resolved: mode=%s, aggregation=%s, lower=%s, upper=%s, "
+        "token_veto_threshold=%s, use_advantage=%s, config=%s",
+        args.opsm_mode,
+        args.opsm_aggregation,
+        args.opsm_lower,
+        args.opsm_upper,
+        args.opsm_token_veto_threshold,
+        args.opsm_use_advantage,
+        args.opsm_config,
+    )
+
+
 def reset_arg(parser, name, **kwargs):
     """
     Reset the default value of a Megatron argument.
@@ -378,6 +461,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Maximum number of turns for multi-turn rollout. Also used to scale rollout target group "
                     "counts when --use-multi-turn is enabled."
+                ),
+            )
+            parser.add_argument(
+                "--padding-turns",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether custom multi-turn rollout functions should pad missing turns with fake samples. "
+                    "The padded samples should be masked out from loss."
+                ),
+            )
+            parser.add_argument(
+                "--preserve-history-thinking",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether multi-turn prompt rendering should preserve previous assistant <think> blocks. "
+                    "Custom generate functions should pass this through to tokenizer.apply_chat_template when supported."
                 ),
             )
             parser.add_argument(
@@ -1001,8 +1102,63 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsm-delta",
                 type=float,
-                default=1e-4,
-                help="The threshold for Off-Policy Sequence Masking (OPSM).",
+                default=None,
+                help="Deprecated alias for --opsm-lower. Kept for backward compatibility.",
+            )
+            parser.add_argument(
+                "--opsm-mode",
+                type=str,
+                choices=["loop", "batched"],
+                default="loop",
+                help="OPSM mask implementation. 'loop' keeps the existing per-sample computation.",
+            )
+            parser.add_argument(
+                "--opsm-aggregation",
+                type=str,
+                choices=["kl", "geometric", "turns_geometric"],
+                default="kl",
+                help=(
+                    "OPSM rejection sampling aggregation level. 'kl' keeps the existing seq_kl > lower rule; "
+                    "'geometric' uses sequence-level geometric mean of importance ratios; "
+                    "'turns_geometric' uses a geometric mean over each contiguous --max-turns samples."
+                ),
+            )
+            parser.add_argument(
+                "--opsm-lower",
+                type=float,
+                default=None,
+                help="Lower threshold for Off-Policy Sequence Masking (OPSM). Defaults to --opsm-delta.",
+            )
+            parser.add_argument(
+                "--opsm-upper",
+                type=float,
+                default=None,
+                help="Optional upper threshold for custom OPSM modes.",
+            )
+            parser.add_argument(
+                "--opsm-token-veto-threshold",
+                type=float,
+                default=None,
+                help=(
+                    "Optional per-token importance-ratio veto threshold. If any valid token has "
+                    "exp(current_logprob - old_logprob) below this value, the whole sequence is masked."
+                ),
+            )
+            parser.add_argument(
+                "--opsm-no-use-advantage",
+                action="store_false",
+                dest="opsm_use_advantage",
+                default=True,
+                help="Disable negative-advantage gating for OPSM rejection and mask by OPSM thresholds only.",
+            )
+            parser.add_argument(
+                "--opsm-config",
+                type=str,
+                default=None,
+                help=(
+                    "Optional OPSM config. Overrides OPSM mode, aggregation, thresholds, and token veto when set. "
+                    'Must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
+                ),
             )
             return parser
 
@@ -1632,6 +1788,8 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if args.use_opsm:
+        _parse_opsm_args(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.use_slime_router:

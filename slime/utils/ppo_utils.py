@@ -6,6 +6,32 @@ from argparse import Namespace
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+
+
+SAFETY_BOUND = 20
+
+
+def _get_opsm_mask(
+    aggregated_value: torch.Tensor,
+    advantage: torch.Tensor,
+    *,
+    opsm_lower: float | None,
+    opsm_upper: float | None,
+    opsm_use_advantage: bool,
+) -> torch.Tensor:
+    reject = torch.zeros_like(aggregated_value, dtype=torch.bool)
+    if opsm_upper is not None:
+        reject = reject | (aggregated_value > opsm_upper)
+    if opsm_lower is not None:
+        reject = reject | (aggregated_value < opsm_lower)
+    while reject.dim() < advantage.dim():
+        reject = reject.unsqueeze(-1)
+    if opsm_use_advantage:
+        reject = (advantage < 0) & reject
+    else:
+        reject = reject.expand_as(advantage)
+    return reject.float()
 
 
 @torch.compile(dynamic=True)
@@ -51,6 +77,190 @@ def compute_approx_kl(
     return kl
 
 
+def _compute_opsm_mask_loop(
+    args: Namespace,
+    full_log_probs: list[torch.Tensor],
+    full_old_log_probs: list[torch.Tensor],
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    opsm_mask_list = []
+    device = advantages[0].device
+    opsm_clipfrac = torch.tensor(0.0, device=device)
+    token_veto_threshold = args.opsm_token_veto_threshold
+    if token_veto_threshold is not None and token_veto_threshold <= 0:
+        raise ValueError(f"opsm_token_veto_threshold must be positive, got {token_veto_threshold}.")
+    opsm_aggregation = getattr(args, "opsm_aggregation", "kl")
+    log_ratios = [
+        # Compute log ratio: log(pi_rollout / pi_train).
+        (full_old_log_prob - full_log_prob) * loss_mask
+        for full_log_prob, full_old_log_prob, loss_mask in zip(
+            full_log_probs,
+            full_old_log_probs,
+            loss_masks,
+            strict=True,
+        )
+    ]
+
+    if opsm_aggregation == "turns_geometric":
+        max_turns = getattr(args, "max_turns", None)
+        if max_turns is None:
+            raise ValueError("--max-turns must be set when --opsm-aggregation=turns_geometric.")
+        max_turns = int(max_turns)
+        if max_turns <= 0:
+            raise ValueError(f"--max-turns must be positive when --opsm-aggregation=turns_geometric, got {max_turns}.")
+        if len(full_log_probs) % max_turns != 0:
+            raise ValueError(
+                "--opsm-aggregation=turns_geometric requires samples to be ordered in complete turn groups: "
+                f"got {len(full_log_probs)} samples, max_turns={max_turns}. "
+                "For multi-turn rollout, consider enabling --filter-by-last-turn and --padding-turns so each "
+                "accepted trajectory contributes exactly max_turns samples."
+            )
+        aggregated_values = []
+        for start in range(0, len(log_ratios), max_turns):
+            group_log_ratios = log_ratios[start : start + max_turns]
+            group_loss_masks = loss_masks[start : start + max_turns]
+            valid_token_count = torch.clamp_min(sum(loss_mask.sum() for loss_mask in group_loss_masks), 1)
+            train_over_old_log_ratio_mean = -sum(log_ratio.sum() for log_ratio in group_log_ratios)
+            train_over_old_log_ratio_mean = train_over_old_log_ratio_mean / valid_token_count
+            aggregated_value = torch.exp(
+                torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+            )
+            aggregated_values.extend([aggregated_value] * len(group_log_ratios))
+    elif opsm_aggregation == "kl":
+        aggregated_values = [
+            log_ratio.sum() / torch.clamp_min(loss_mask.sum(), 1)
+            for log_ratio, loss_mask in zip(log_ratios, loss_masks, strict=True)
+        ]
+    elif opsm_aggregation == "geometric":
+        aggregated_values = []
+        for log_ratio, loss_mask in zip(log_ratios, loss_masks, strict=True):
+            valid_token_count = torch.clamp_min(loss_mask.sum(), 1)
+            train_over_old_log_ratio_mean = -log_ratio.sum() / valid_token_count
+            aggregated_values.append(
+                torch.exp(torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND))
+            )
+    else:
+        raise ValueError(f"Unknown opsm_aggregation: {opsm_aggregation}")
+
+    for log_ratio, loss_mask, advantage, aggregated_value in zip(
+        log_ratios,
+        loss_masks,
+        advantages,
+        aggregated_values,
+        strict=True,
+    ):
+        valid_token_count = torch.clamp_min(loss_mask.sum(), 1)
+        has_catastrophic_token = False
+        if token_veto_threshold is not None:
+            log_veto_threshold = torch.log(
+                torch.tensor(token_veto_threshold, device=log_ratio.device, dtype=log_ratio.dtype)
+            )
+            has_catastrophic_token = bool(((-log_ratio < log_veto_threshold) & loss_mask.bool()).any().item())
+        if has_catastrophic_token:
+            mask = torch.ones_like(loss_mask, dtype=torch.float32)
+        else:
+            mask = _get_opsm_mask(
+                aggregated_value,
+                advantage,
+                opsm_lower=args.opsm_lower,
+                opsm_upper=args.opsm_upper,
+                opsm_use_advantage=args.opsm_use_advantage,
+            )
+        opsm_clipfrac += mask.sum() / valid_token_count
+        opsm_mask_list.append(1 - mask)
+
+    opsm_mask = torch.cat(opsm_mask_list, dim=0)
+    return opsm_mask, opsm_clipfrac
+
+
+def _compute_opsm_mask_batched(
+    args: Namespace,
+    full_log_probs: list[torch.Tensor],
+    full_old_log_probs: list[torch.Tensor],
+    advantages: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    full_log_probs_padded = pad_sequence(full_log_probs, batch_first=True, padding_value=0)
+    full_old_log_probs_padded = pad_sequence(full_old_log_probs, batch_first=True, padding_value=0)
+    loss_masks_padded = pad_sequence(loss_masks, batch_first=True, padding_value=0)
+    advantages_padded = pad_sequence(advantages, batch_first=True, padding_value=0)
+    local_response_lengths = [len(item) for item in loss_masks]
+    valid_token_counts = torch.clamp_min(loss_masks_padded.sum(dim=1), 1)
+    # Compute log ratio: log(pi_rollout / pi_train).
+    log_ratio = (full_old_log_probs_padded - full_log_probs_padded) * loss_masks_padded
+    token_veto_threshold = args.opsm_token_veto_threshold
+    if token_veto_threshold is not None and token_veto_threshold <= 0:
+        raise ValueError(f"opsm_token_veto_threshold must be positive, got {token_veto_threshold}.")
+    opsm_aggregation = getattr(args, "opsm_aggregation", "kl")
+
+    if opsm_aggregation == "kl":
+        aggregated_value = log_ratio.sum(dim=1) / valid_token_counts
+    elif opsm_aggregation == "geometric":
+        train_over_old_log_ratio_mean = -log_ratio.sum(dim=1) / valid_token_counts
+        aggregated_value = torch.exp(
+            torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        )
+    elif opsm_aggregation == "turns_geometric":
+        max_turns = getattr(args, "max_turns", None)
+        if max_turns is None:
+            raise ValueError("--max-turns must be set when --opsm-aggregation=turns_geometric.")
+        max_turns = int(max_turns)
+        if max_turns <= 0:
+            raise ValueError(f"--max-turns must be positive when --opsm-aggregation=turns_geometric, got {max_turns}.")
+        batch_size = log_ratio.size(0)
+        if batch_size % max_turns != 0:
+            raise ValueError(
+                "--opsm-aggregation=turns_geometric requires samples to be ordered in complete turn groups: "
+                f"got {batch_size} samples, max_turns={max_turns}. "
+                "For multi-turn rollout, consider enabling --filter-by-last-turn and --padding-turns so each "
+                "accepted trajectory contributes exactly max_turns samples."
+            )
+        group_count = batch_size // max_turns
+        grouped_log_ratio = log_ratio.reshape(group_count, max_turns, log_ratio.size(1))
+        grouped_loss_masks = loss_masks_padded.reshape(group_count, max_turns, loss_masks_padded.size(1))
+        grouped_valid_token_counts = torch.clamp_min(grouped_loss_masks.sum(dim=(1, 2)), 1)
+        train_over_old_log_ratio_mean = -grouped_log_ratio.sum(dim=(1, 2)) / grouped_valid_token_counts
+        grouped_aggregated_value = torch.exp(
+            torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
+        )
+        aggregated_value = grouped_aggregated_value.repeat_interleave(max_turns)
+    else:
+        raise ValueError(f"Unknown opsm_aggregation: {opsm_aggregation}")
+
+    mask = _get_opsm_mask(
+        aggregated_value,
+        advantages_padded,
+        opsm_lower=args.opsm_lower,
+        opsm_upper=args.opsm_upper,
+        opsm_use_advantage=args.opsm_use_advantage,
+    )
+    if token_veto_threshold is not None:
+        log_veto_threshold = torch.log(
+            torch.tensor(
+                token_veto_threshold,
+                device=full_log_probs_padded.device,
+                dtype=full_log_probs_padded.dtype,
+            )
+        )
+        catastrophic_tokens = (-log_ratio < log_veto_threshold) & loss_masks_padded.bool()
+        has_catastrophic_token = catastrophic_tokens.any(
+            dim=1,
+            keepdim=True,
+        )
+        mask = torch.where(has_catastrophic_token, torch.ones_like(mask), mask)
+
+    opsm_mask_list = []
+    opsm_clipfrac = torch.tensor(0.0, device=advantages[0].device)
+    for i, local_response_length in enumerate(local_response_lengths):
+        sample_mask = mask[i, :local_response_length]
+        opsm_clipfrac += sample_mask.sum() / valid_token_counts[i]
+        opsm_mask_list.append(1 - sample_mask)
+
+    opsm_mask = torch.cat(opsm_mask_list, dim=0)
+    return opsm_mask, opsm_clipfrac
+
+
 def compute_opsm_mask(
     args: Namespace,
     full_log_probs: list[torch.Tensor],
@@ -69,27 +279,13 @@ def compute_opsm_mask(
 
     Returns:
         Tuple of `(opsm_mask, opsm_clipfrac)` where `opsm_mask` is a
-        concatenated tensor of per-token masks and
+        concatenated response-token mask for sample-level decisions (`1` keeps
+        the sample tokens in the policy loss, `0` masks the sample tokens out) and
         `opsm_clipfrac` is the count of masked sequences.
     """
-    opsm_mask_list = []
-    device = advantages[0].device
-    opsm_clipfrac = torch.tensor(0.0, device=device)
-
-    for full_log_prob, full_old_log_prob, advantage, loss_mask in zip(
-        full_log_probs, full_old_log_probs, advantages, loss_masks, strict=False
-    ):
-        # Calculate sequence-level KL
-        seq_kl = ((full_old_log_prob - full_log_prob) * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1)
-
-        # Create mask: 0 if (advantage < 0 and seq_kl > delta), else 1
-        mask = ((advantage < 0) & (seq_kl > args.opsm_delta)).float()
-        opsm_clipfrac += mask.sum() / torch.clamp_min(loss_mask.sum(), 1)
-
-        opsm_mask_list.append(1 - mask)
-
-    opsm_mask = torch.cat(opsm_mask_list, dim=0)
-    return opsm_mask, opsm_clipfrac
+    if getattr(args, "opsm_mode", "loop") == "loop":
+        return _compute_opsm_mask_loop(args, full_log_probs, full_old_log_probs, advantages, loss_masks)
+    return _compute_opsm_mask_batched(args, full_log_probs, full_old_log_probs, advantages, loss_masks)
 
 
 def compute_gspo_kl(

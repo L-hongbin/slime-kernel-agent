@@ -1,16 +1,19 @@
 import asyncio
 import copy
 import inspect
+import json
 import logging
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pybase64
 import sglang_router
+import yaml
 from packaging.version import parse
 from tqdm import tqdm
 
@@ -90,6 +93,12 @@ class GenerateState(metaclass=SingletonMeta):
         self.args = args
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
+        self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
+        logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)
+        self._warn_history_thinking_template()
+        self.multi_turn_templates = self._load_multi_turn_templates(
+            getattr(args, "multi_turn_prompt_config_path", None)
+        )
 
         self.semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
@@ -115,6 +124,63 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_rank = 0
 
         self.reset()
+
+    @staticmethod
+    def _load_multi_turn_templates(config_path: str | None) -> dict[str, str] | None:
+        if config_path is None:
+            return None
+
+        with open(config_path, encoding="utf-8") as f:
+            prompt_cfg = yaml.safe_load(f) or {}
+
+        templates = {}
+        for item in prompt_cfg.get("per_turn_prompts", []) or []:
+            name = item.get("name")
+            template = item.get("template")
+            if name and template:
+                templates[str(name)] = str(template)
+        if not templates:
+            return None
+
+        logger.info("Loaded multi_turn_templates from %s: %s", config_path, templates)
+        return templates
+
+    def _warn_history_thinking_template(self) -> None:
+        if not bool(getattr(self.args, "preserve_history_thinking", False)):
+            return
+
+        if self._is_qwen3_5_model():
+            logger.warning(
+                "args.preserve_history_thinking=True with a Qwen3.5/Qwen3.6-series tokenizer. "
+                "Pass preserve_thinking=True to tokenizer.apply_chat_template when rendering multi-turn prompts."
+            )
+            return
+
+        logger.warning(
+            "args.preserve_history_thinking=True. The tokenizer.apply_chat_template behavior is model-specific "
+            "and may not preserve previous assistant <think> blocks; please verify the rendered multi-turn prompt "
+            "or add model-specific handling."
+        )
+
+    def _get_apply_chat_template_kwargs(self) -> dict[str, Any]:
+        kwargs = dict(getattr(self.args, "apply_chat_template_kwargs", None) or {})
+        if bool(getattr(self.args, "preserve_history_thinking", False)) and self._is_qwen3_5_model():
+            kwargs["preserve_thinking"] = True
+        return kwargs
+
+    def _is_qwen3_5_model(self) -> bool:
+        hf_checkpoint = getattr(self.args, "hf_checkpoint", None)
+        if not hf_checkpoint:
+            return False
+        config_path = Path(hf_checkpoint) / "config.json"
+        if not config_path.exists():
+            return False
+        try:
+            with config_path.open(encoding="utf-8") as f:
+                model_type = str((json.load(f) or {}).get("model_type", "")).lower()
+        except (OSError, json.JSONDecodeError):
+            return False
+        return model_type in {"qwen3_5", "qwen3.5"} or model_type.startswith(("qwen3_5", "qwen3.5"))
 
     @contextmanager
     def dp_rank_context(self):

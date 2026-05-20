@@ -18,19 +18,21 @@ def reward_post_process_by_group(args, samples):
         raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     else:
         raw_rewards = [sample.get_reward_value(args) for sample in samples]
-    rewards = list(raw_rewards)
+    rewards = [None] * len(raw_rewards)
 
     idx_to_group_index: dict[int, object] = {}
     reward_groups: dict[object, list[float]] = {}
     for idx, sample in enumerate(samples):
+        if sample.remove_sample:
+            rewards[idx] = raw_rewards[idx]
+            continue
+
         group_index = sample.group_index
         if getattr(args, "use_multi_turn", False):
             turn_idx = sample.metadata.get("turn_idx") if sample.metadata is not None else None
             assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
             group_index = group_index, int(turn_idx)
         idx_to_group_index[idx] = group_index
-        sample_reward = raw_rewards[idx]
-        
         reward_groups.setdefault(group_index, []).append(raw_rewards[idx])
 
     group_stats: dict[object, dict[str, float]] = {}
@@ -43,6 +45,9 @@ def reward_post_process_by_group(args, samples):
         }
 
     for idx, raw_reward in enumerate(raw_rewards):
+        if rewards[idx] is not None:
+            continue
+
         group_index = idx_to_group_index[idx]
         stats = group_stats[group_index]
         reward = raw_reward - stats["mean"]
