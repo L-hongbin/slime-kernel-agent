@@ -288,6 +288,72 @@ def compute_opsm_mask(
     return _compute_opsm_mask_batched(args, full_log_probs, full_old_log_probs, advantages, loss_masks)
 
 
+def compute_coverage_rejection_mask(
+    args: Namespace,
+    env_info: list[dict],
+    loss_masks: list[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Compute coverage-based rejection sampling mask.
+
+    Correct samples are kept with probability based on coverage:
+    `(coverage - threshold) / factor`, clamped to [0, 1]. Incorrect samples are
+    always kept. The returned mask is a concatenated response-token mask where
+    `1` keeps tokens in policy loss and `0` masks them out.
+    """
+    if len(env_info) != len(loss_masks):
+        raise ValueError(
+            f"env_info length must match loss_masks length, got {len(env_info)} and {len(loss_masks)}."
+        )
+
+    coverage_key = getattr(args, "coverage_rs_key", "time_coverage")
+    if coverage_key not in {"time_coverage", "num_coverage"}:
+        raise ValueError(f"--coverage-rs-key must be 'time_coverage' or 'num_coverage', got {coverage_key!r}.")
+
+    threshold = float(getattr(args, "coverage_rs_threshold", 0.3))
+    factor = getattr(args, "coverage_rs_factor", 0.1)
+    factor = None if factor is None else float(factor)
+    device = loss_masks[0].device
+
+    coverage_values = []
+    correctness_values = []
+    for info in env_info:
+        info = info or {}
+        coverage_values.append(float(info.get(coverage_key, 0.0)))
+        correctness_values.append(bool(info.get("correctness", False)) and not bool(info.get("decoy_kernel", False)))
+
+    coverage = torch.tensor(coverage_values, dtype=torch.float32, device=device)
+    correctness = torch.tensor(correctness_values, dtype=torch.bool, device=device)
+    if factor is None or factor == 0:
+        keep_prob = (coverage >= threshold).float()
+    else:
+        keep_prob = ((coverage - threshold) / factor).clamp(min=0.0, max=1.0)
+    keep_prob = torch.where(correctness, keep_prob, torch.ones_like(keep_prob))
+
+    sample_mask = torch.bernoulli(keep_prob).float()
+    coverage_mask = torch.cat(
+        [mask.expand_as(loss_mask).float() for mask, loss_mask in zip(sample_mask, loss_masks, strict=True)],
+        dim=0,
+    )
+
+    valid_sample_mask = torch.tensor(
+        [bool(loss_mask.bool().any().item()) for loss_mask in loss_masks],
+        dtype=torch.bool,
+        device=device,
+    )
+    rejected = 1 - sample_mask
+    metrics = {}
+    if valid_sample_mask.any():
+        metrics["coverage_rs_masked_fraction"] = rejected[valid_sample_mask].mean()
+        metrics["coverage_rs_mean_coverage"] = coverage[valid_sample_mask].mean()
+        metrics["coverage_rs_min_coverage"] = coverage[valid_sample_mask].min()
+        metrics["coverage_rs_max_coverage"] = coverage[valid_sample_mask].max()
+        correct_valid_mask = correctness & valid_sample_mask
+        if correct_valid_mask.any():
+            metrics["coverage_rs_correct_only_masked_fraction"] = rejected[correct_valid_mask].mean()
+
+    return coverage_mask, metrics
+
+
 def compute_gspo_kl(
     full_log_probs: list[torch.Tensor],
     full_old_log_probs: list[torch.Tensor],

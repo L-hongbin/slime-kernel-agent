@@ -1160,6 +1160,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     'Must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
                 ),
             )
+            parser.add_argument(
+                "--use-coverage-rs",
+                action="store_true",
+                default=False,
+                help="Whether to enable coverage-based rejection sampling after OPSM.",
+            )
+            parser.add_argument(
+                "--coverage-rs-key",
+                type=str,
+                choices=["time_coverage", "num_coverage"],
+                default="time_coverage",
+                help="Coverage metric used by coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--coverage-rs-threshold",
+                type=float,
+                default=0.3,
+                help="Coverage threshold used by coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--coverage-rs-factor",
+                type=float,
+                default=0.1,
+                help="Linear keep-probability factor used by coverage-based rejection sampling.",
+            )
             return parser
 
         def add_on_policy_distillation_arguments(parser):

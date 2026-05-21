@@ -1,4 +1,5 @@
 import logging
+import random
 import re
 from typing import Any
 
@@ -10,7 +11,6 @@ except ImportError:
     from config import CUDA_AGENT_CONFIGS
 
 logger = logging.getLogger(__name__)
-_MULTI_TURN_GAMMA_WARNING_LOGGED = False
 
 
 VALIDATION_ERROR = "VALIDATION_ERROR"
@@ -119,6 +119,8 @@ def normalize_env_feedback(env_state: dict[str, Any]) -> dict[str, Any]:
                 "error_message": error_message,
             }
         )
+    else:
+        env_state.setdefault("decoy_kernel", False)
     return env_state
 
 
@@ -384,20 +386,15 @@ def precheck_response(
     return None
 
 
-def _set_multi_turn_rewards(output_samples: list[Sample], finish_reason: str, args=None) -> None:
-    global _MULTI_TURN_GAMMA_WARNING_LOGGED
+def _mark_remove_sample(sample: Sample, reason: str) -> None:
+    sample.remove_sample = True
+    sample.reward = 0.0
+    sample.metadata = dict(sample.metadata or {})
+    sample.metadata["remove_reason"] = reason
 
-    gamma = getattr(args, "multi_turn_gamma", None) if args is not None else None
-    if gamma is None:
-        gamma = CUDA_AGENT_CONFIGS["reward"].get("multi_turn_gamma", 1.0)
-    elif not _MULTI_TURN_GAMMA_WARNING_LOGGED:
-        logger.warning(
-            "Using args.multi_turn_gamma=%s for multi-turn reward folding; "
-            "CUDA_AGENT_CONFIGS['reward']['multi_turn_gamma'] will be ignored.",
-            gamma,
-        )
-        _MULTI_TURN_GAMMA_WARNING_LOGGED = True
-    gamma = float(gamma)
+
+def _set_multi_turn_rewards(args, output_samples: list[Sample], finish_reason: str) -> None:
+    gamma = float(getattr(args, "multi_turn_gamma", 1.0))
     if args.advantage_estimator not in ["trloo"] or gamma == 0.0:
         return
 
@@ -417,7 +414,38 @@ def _set_multi_turn_rewards(output_samples: list[Sample], finish_reason: str, ar
         )
 
 
-def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, args=None) -> list[Sample]:
+def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
+    if not getattr(args, "use_coverage_rs", False):
+        return
+
+    coverage_key = getattr(args, "coverage_rs_key", "time_coverage")
+    threshold = float(getattr(args, "coverage_rs_threshold", 0.3))
+    factor = getattr(args, "coverage_rs_factor", 0.1)
+    factor = None if factor is None else float(factor)
+
+    for sample in output_samples:
+        if sample.remove_sample:
+            continue
+        env_extra_info = sample.metadata.get("env_extra_info") if isinstance(sample.metadata, dict) else None
+        if not isinstance(env_extra_info, dict):
+            raise ValueError("--use-coverage-rs requires sample.metadata['env_extra_info'].")
+        if coverage_key not in env_extra_info:
+            raise KeyError(f"env_extra_info missing coverage key: {coverage_key}")
+
+        is_correct = bool(env_extra_info["correctness"]) and not bool(env_extra_info["decoy_kernel"])
+        if not is_correct:
+            continue
+
+        coverage = float(env_extra_info[coverage_key])
+        if factor is None or factor == 0.0:
+            keep_prob = 1.0 if coverage >= threshold else 0.0
+        else:
+            keep_prob = min(max((coverage - threshold) / factor, 0.0), 1.0)
+        if random.random() > keep_prob:
+            _mark_remove_sample(sample, "coverage_rs")
+
+
+def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: str) -> list[Sample]:
     """Postprocess turn samples.
 
     finalize_mode:
@@ -429,16 +457,24 @@ def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, a
     if not output_samples:
         return []
 
+    for sample in output_samples:
+        if sample.remove_sample:
+            sample.metadata = dict(sample.metadata or {})
+            sample.metadata.setdefault("remove_reason", "pre_removed")
+            sample.reward = 0.0
+
     if finish_reason == "model_abort":
         for sample in output_samples:
-            sample.remove_sample = True
-            sample.reward = 0.0
-        _set_multi_turn_rewards(output_samples, finish_reason, args)
+            reason = "pad_turn" if sample.metadata.get("is_pad_turn") else "model_abort"
+            _mark_remove_sample(sample, reason)
+        _set_multi_turn_rewards(args, output_samples, finish_reason)
         return output_samples
+
+    _apply_coverage_rs(args, output_samples)
 
     finalize_mode = CUDA_AGENT_CONFIGS.get("finalize_mode", "positive")
     if finalize_mode is None:
-        _set_multi_turn_rewards(output_samples, finish_reason, args)
+        _set_multi_turn_rewards(args, output_samples, finish_reason)
         return output_samples
 
     def is_meaningful_turn(sample: Sample, max_reward: float) -> bool:
@@ -451,11 +487,12 @@ def postprocess_turn_samples(output_samples: list[Sample], finish_reason: str, a
 
     max_reward = float(output_samples[0].reward)
     for sample in output_samples[1:]:
+        if sample.remove_sample:
+            continue
         reward = float(sample.reward)
         if not is_meaningful_turn(sample, max_reward):
-            sample.remove_sample = True
-            sample.reward = 0.0
+            _mark_remove_sample(sample, f"finalize_{finalize_mode}")
         max_reward = max(max_reward, reward)
 
-    _set_multi_turn_rewards(output_samples, finish_reason, args)
+    _set_multi_turn_rewards(args, output_samples, finish_reason)
     return output_samples

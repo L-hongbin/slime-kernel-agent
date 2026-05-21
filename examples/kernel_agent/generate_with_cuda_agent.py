@@ -125,30 +125,6 @@ def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
     return env_state if isinstance(env_state, dict) else {}
 
 
-def _log_env_state(label: str, env_state: dict[str, Any], sample: Sample) -> None:
-    if not logger.isEnabledFor(logging.INFO):
-        return
-    metadata = sample.metadata or {}
-    task_id = env_state.get("task_id") or metadata.get("uuid") or "unknown"
-    log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
-    if log_max_chars <= 0:
-        log_max_chars = 8192
-    logger.info(
-        "[cuda_agent][kernel_env] %s task_id=%s:\n%s",
-        label,
-        task_id,
-        _truncate_middle(_json_dumps_for_log(env_state), log_max_chars),
-    )
-
-
-def _normalize_env_result(env_result: dict[str, Any], sample: Sample) -> dict[str, Any]:
-    raw_env_state = _get_env_state(env_result) or env_result
-    # _log_env_state("raw_env_state", raw_env_state, sample)
-    normalized_env_state = normalize_env_feedback(raw_env_state)
-    # _log_env_state("normalized_env_state", normalized_env_state, sample)
-    return {**env_result, "env_state": normalized_env_state, "reward_extra_info": normalized_env_state}
-
-
 def _should_log_multiturn(sample: Sample) -> bool:
     if not logger.isEnabledFor(logging.INFO):
         return False
@@ -165,26 +141,6 @@ def _should_log_multiturn(sample: Sample) -> bool:
     return random.random() < sample_rate
 
 
-def _get_global_step(args, sample: Sample | None = None) -> int:
-    metadata = sample.metadata if sample is not None and isinstance(sample.metadata, dict) else {}
-    for key in ("global_step", "step", "iteration"):
-        value = metadata.get(key)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                pass
-
-    for key in ("global_step", "step", "iteration"):
-        value = getattr(args, key, None)
-        if value is not None:
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                pass
-    return 0
-
-
 async def _is_slowest_multiturn(args, sample: Sample, total_request_time: float) -> bool:
     if ray is None or not ray.is_initialized():
         return False
@@ -195,9 +151,15 @@ async def _is_slowest_multiturn(args, sample: Sample, total_request_time: float)
         except ValueError:
             tracker = SlowestRequestTracker.options(name="CudaAgentSlowestRequestTracker", get_if_exists=True).remote()
 
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        try:
+            rollout_step = int(metadata.get("rollout_step", 0))
+        except (TypeError, ValueError):
+            rollout_step = 0
+
         object_ref = tracker.update_slowest_time.remote(
             float(total_request_time),
-            _get_global_step(args, sample),
+            rollout_step,
             int(CUDA_AGENT_CONFIGS.get("log_slowest_step_window", 10)),
             float(CUDA_AGENT_CONFIGS.get("log_slowest_min_delta_seconds", 5.0)),
         )
@@ -319,6 +281,43 @@ def _get_label_value(sample: Sample, key: str) -> Any:
     return None
 
 
+def _require_env_value(mapping: dict[str, Any], key: str, path: str) -> Any:
+    if key not in mapping:
+        raise KeyError(f"env_result missing required field for env_extra_info: {path}.{key}")
+    return mapping[key]
+
+
+def _extract_env_extra_info(env_result: dict[str, Any]) -> dict[str, Any]:
+    env_state = _require_env_value(env_result, "env_state", "env_result")
+    if not isinstance(env_state, dict):
+        raise TypeError("env_result.env_state must be a dict for env_extra_info extraction.")
+
+    metadata = _require_env_value(env_state, "metadata", "env_result.env_state")
+    if not isinstance(metadata, dict):
+        raise TypeError("env_result.env_state.metadata must be a dict for env_extra_info extraction.")
+
+    num_custom_kernels = metadata.get("num_custom_kernels", 0)
+    num_total_kernels = metadata.get("num_total_kernels", 0)
+    custom_kernel_time = metadata.get("custom_kernel_time_in_profiling_us", 0)
+    total_kernel_time = metadata.get("total_kernel_run_time_in_profiling_us", 0)
+    num_coverage = 0.0
+    if float(num_total_kernels) > 0:
+        num_coverage = float(num_custom_kernels) / float(num_total_kernels)
+    time_coverage = 0.0
+    if float(total_kernel_time) > 0:
+        time_coverage = float(custom_kernel_time) / float(total_kernel_time)
+
+    return {
+        "time_coverage": float(f"{time_coverage:.2f}"),
+        "num_coverage": float(f"{num_coverage:.2f}"),
+        "correctness": _require_env_value(env_state, "correctness", "env_result.env_state"),
+        "compilation": _require_env_value(env_state, "compiled", "env_result.env_state"),
+        "speedup": _require_env_value(env_state, "speedup", "env_result.env_state"),
+        "decoy_kernel": _require_env_value(env_state, "decoy_kernel", "env_result.env_state"),
+        "precheck": env_state.get("precheck"),
+    }
+
+
 async def cuda_kernel_env(
     args,
     sample: Sample,
@@ -333,6 +332,8 @@ async def cuda_kernel_env(
         precheck_entry_point = f"{entry_point}New"
         precheck_result = precheck_response(response, precheck_entry_point, CUDA_AGENT_CONFIGS["kernel_backend"])
         if precheck_result is not None:
+            precheck_result = dict(precheck_result)
+            precheck_result.setdefault("decoy_kernel", None)
             return {"env_state": precheck_result, "reward_extra_info": precheck_result}
 
     payload = {
@@ -347,7 +348,11 @@ async def cuda_kernel_env(
         "turn_idx": turn_idx,
     }
     env_result = await run_kernel_eval(args, sample, payload, env_config)
-    return _normalize_env_result(env_result, sample)
+    raw_env_state = _get_env_state(env_result) or env_result
+    normalized_env_state = normalize_env_feedback(raw_env_state)
+    if CUDA_AGENT_CONFIGS.get("do_precheck", False):
+        normalized_env_state["precheck"] = "passed"
+    return {**env_result, "env_state": normalized_env_state, "reward_extra_info": normalized_env_state}
 
 
 def _sample_for_turn(
@@ -375,6 +380,7 @@ def _sample_for_turn(
         {
             "turn_idx": turn_idx,
             "env_result": env_result,
+            "env_extra_info": _extract_env_extra_info(env_result),
         }
     )
     return turn_sample
@@ -384,13 +390,10 @@ def _pad_turn_samples(
     output_samples: list[Sample],
     base_sample: Sample,
     *,
-    enabled: bool,
     max_turns: int,
     pad_token_id: int | None,
     pad_token: str | None,
 ) -> list[Sample]:
-    if not enabled:
-        return output_samples
     if pad_token_id is None or pad_token is None:
         raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
 
@@ -418,6 +421,7 @@ def _pad_turn_samples(
             {
                 "turn_idx": turn_idx,
                 "is_pad_turn": True,
+                "remove_reason": "pad_turn",
             }
         )
         padded_samples.append(fake_sample)
@@ -487,18 +491,18 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             sample.status = Sample.Status.ABORTED
             finish_reason = "model_abort"
             _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
-            output_samples = _pad_turn_samples(
-                output_samples,
-                sample,
-                enabled=padding_turns,
-                max_turns=max_turns,
-                pad_token_id=pad_token_id,
-                pad_token=pad_token,
-            )
+            if padding_turns:
+                output_samples = _pad_turn_samples(
+                    output_samples,
+                    sample,
+                    max_turns=max_turns,
+                    pad_token_id=pad_token_id,
+                    pad_token=pad_token,
+                )
             output_samples = postprocess_turn_samples(
+                args,
                 output_samples,
                 finish_reason=finish_reason,
-                args=args,
             )
             if getattr(args, "use_multi_turn", False):
                 return output_samples
@@ -533,6 +537,8 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             turn_idx=turn_idx,
             env_result=env_result,
         )
+        turn_sample.metadata["model_time"] = model_time
+        turn_sample.metadata["env_time"] = env_time
         turn_reward = await reward_func(args, turn_sample)
         turn_sample.reward = turn_reward
         turn_log = {
@@ -579,18 +585,18 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             is_slowest=is_slowest,
             total_request_time=total_request_time,
         )
-    output_samples = _pad_turn_samples(
-        output_samples,
-        sample,
-        enabled=padding_turns,
-        max_turns=max_turns,
-        pad_token_id=pad_token_id,
-        pad_token=pad_token,
-    )
+    if padding_turns:
+        output_samples = _pad_turn_samples(
+            output_samples,
+            sample,
+            max_turns=max_turns,
+            pad_token_id=pad_token_id,
+            pad_token=pad_token,
+        )
     output_samples = postprocess_turn_samples(
+        args,
         output_samples,
         finish_reason=finish_reason,
-        args=args,
     )
     if getattr(args, "use_multi_turn", False):
         return output_samples

@@ -1216,12 +1216,201 @@ def compute_metrics_from_samples(args, samples):
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= _compute_kernel_agent_metrics(samples)
+    if getattr(args, "use_multi_turn", False):
+        log_dict |= _compute_kernel_multi_turn_metrics(samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
+    return log_dict
+
+
+FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0, 3.0)
+
+
+def _compute_kernel_multi_turn_metrics(samples):
+    values_by_turn = {}
+    sample_trajectory = {}
+    for sample in samples:
+        metadata = sample.metadata or {}
+        if "turn_idx" not in metadata:
+            continue
+        env_extra_info = metadata.get("env_extra_info")
+        if not isinstance(env_extra_info, dict):
+            continue
+
+        try:
+            turn_idx = int(metadata["turn_idx"])
+        except (TypeError, ValueError):
+            continue
+
+        correctness = bool(env_extra_info.get("correctness")) and not bool(env_extra_info.get("decoy_kernel"))
+        compilation = bool(env_extra_info.get("compilation"))
+        speedup = env_extra_info.get("speedup")
+        if isinstance(speedup, bool) or not isinstance(speedup, (int, float)):
+            continue
+
+        if sample.index is not None:
+            sample_trajectory.setdefault(sample.index, {})[turn_idx] = {
+                "correctness": correctness,
+                "compilation": compilation,
+                "speedup": float(speedup),
+            }
+
+        turn_values = values_by_turn.setdefault(
+            turn_idx,
+            {
+                "correctness": [],
+                "compilation": [],
+                "speedup": [],
+                "fast": {threshold: [] for threshold in FAST_THRESHOLDS},
+            },
+        )
+        turn_values["correctness"].append(float(correctness))
+        turn_values["compilation"].append(float(compilation))
+        turn_values["speedup"].append(float(speedup))
+        for threshold in FAST_THRESHOLDS:
+            turn_values["fast"][threshold].append(float(correctness and speedup >= threshold))
+
+    log_dict = {}
+    for turn_idx in sorted(values_by_turn):
+        turn_values = values_by_turn[turn_idx]
+        prefix = f"kernel/turn{turn_idx}"
+        for key in ("correctness", "compilation", "speedup"):
+            values = turn_values[key]
+            if values:
+                log_dict[f"{prefix}/{key}"] = np.mean(values).item()
+        for threshold, values in turn_values["fast"].items():
+            if values:
+                log_dict[f"{prefix}/fast@{threshold:g}"] = np.mean(values).item()
+    log_dict |= _compute_kernel_trajectory_metrics(sample_trajectory)
+    return log_dict
+
+
+def _compute_kernel_trajectory_metrics(sample_trajectory):
+    first_turn_correct = []
+    last_turn_correct = []
+    improved_samples = 0
+    regressed_samples = 0
+    best_by_turn = {
+        1: {"correctness": [], "compilation": [], "speedup": []},
+        2: {"correctness": [], "compilation": [], "speedup": []},
+        3: {"correctness": [], "compilation": [], "speedup": []},
+    }
+
+    for trajectory in sample_trajectory.values():
+        if not trajectory:
+            continue
+        sorted_turns = [trajectory[turn_idx] for turn_idx in sorted(trajectory)]
+        first_correct = bool(sorted_turns[0]["correctness"])
+        last_correct = bool(sorted_turns[-1]["correctness"])
+        first_turn_correct.append(float(first_correct))
+        last_turn_correct.append(float(last_correct))
+        if not first_correct and last_correct:
+            improved_samples += 1
+        elif first_correct and not last_correct:
+            regressed_samples += 1
+
+        for turn_count, metrics in best_by_turn.items():
+            visible_turns = sorted_turns[:turn_count]
+            if not visible_turns:
+                continue
+            metrics["correctness"].append(float(any(turn["correctness"] for turn in visible_turns)))
+            metrics["compilation"].append(float(any(turn["compilation"] for turn in visible_turns)))
+            metrics["speedup"].append(max(float(turn["speedup"]) for turn in visible_turns))
+
+    if not first_turn_correct:
+        return {}
+
+    log_dict = {
+        "kernel/correct_improvement/first_turn_correct_rate": np.mean(first_turn_correct).item(),
+        "kernel/correct_improvement/last_turn_correct_rate": np.mean(last_turn_correct).item(),
+        "kernel/correct_improvement/improved_samples": improved_samples,
+        "kernel/correct_improvement/regressed_samples": regressed_samples,
+        "kernel/correct_improvement/net_improvement": improved_samples - regressed_samples,
+    }
+    for turn_count, metrics in best_by_turn.items():
+        prefix = f"kernel/trajectory/best_by_turn_{turn_count}"
+        for key, values in metrics.items():
+            if values:
+                log_dict[f"{prefix}/{key}"] = np.mean(values).item()
+    return log_dict
+
+
+def _compute_kernel_agent_metrics(samples):
+    bool_keys = {"correctness", "compilation", "decoy_kernel"}
+    coverage_keys = {"time_coverage", "num_coverage"}
+    values_by_key = {}
+    time_values = {"model_time": [], "env_time": []}
+    total_count = len(samples)
+    coverage_rs_masked_count = 0
+    correct_count = 0
+    coverage_rs_correct_masked_count = 0
+    precheck_count = 0
+    precheck_passed_count = 0
+
+    for sample in samples:
+        metadata = sample.metadata or {}
+        is_coverage_rs_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
+        if is_coverage_rs_masked:
+            coverage_rs_masked_count += 1
+
+        for key in time_values:
+            value = metadata.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            time_values[key].append(float(value))
+
+        env_extra_info = metadata.get("env_extra_info")
+        if not isinstance(env_extra_info, dict):
+            continue
+
+        precheck = env_extra_info.get("precheck")
+        if precheck in ("passed", "failed"):
+            precheck_count += 1
+            if precheck == "passed":
+                precheck_passed_count += 1
+
+        is_correct = bool(env_extra_info.get("correctness")) and not bool(env_extra_info.get("decoy_kernel"))
+        if is_correct:
+            correct_count += 1
+            if is_coverage_rs_masked:
+                coverage_rs_correct_masked_count += 1
+
+        for key, value in env_extra_info.items():
+            if key in bool_keys:
+                if isinstance(value, bool):
+                    values_by_key.setdefault(key, []).append(float(value))
+                continue
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                values_by_key.setdefault(key, []).append(float(value))
+
+    log_dict = {}
+    for key, values in values_by_key.items():
+        if not values:
+            continue
+        prefix = "coverage" if key in coverage_keys else "env_extra_info"
+        if key in bool_keys:
+            log_dict[f"{prefix}/{key}/mean"] = np.mean(values).item()
+        else:
+            stats = compute_statistics(values)
+            for stat_key in ("min", "max", "mean"):
+                log_dict[f"{prefix}/{key}/{stat_key}"] = stats[stat_key]
+    if total_count > 0:
+        log_dict["coverage/coverage_rs_masked_fraction"] = coverage_rs_masked_count / total_count
+    if correct_count > 0:
+        log_dict["coverage/coverage_rs_correct_masked_fraction"] = coverage_rs_correct_masked_count / correct_count
+    if precheck_count > 0:
+        log_dict["kernel/precheck_pass_rate"] = precheck_passed_count / precheck_count
+    for key, values in time_values.items():
+        if values:
+            log_dict[f"kernel/time/{key}/mean"] = np.mean(values).item()
+            log_dict[f"kernel/time/{key}/sum"] = np.sum(values).item()
     return log_dict
 
 

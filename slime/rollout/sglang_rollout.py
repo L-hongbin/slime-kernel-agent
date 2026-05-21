@@ -23,6 +23,7 @@ from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
+from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -40,6 +41,14 @@ __all__ = ["generate_rollout", "get_model_url"]
 logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
+
+
+def _set_rollout_step_metadata(args: Namespace, rollout_id: int, samples: list[list[Sample]]) -> None:
+    rollout_step = compute_rollout_step(args, rollout_id)
+    for group in samples:
+        for sample in group:
+            sample.metadata = sample.metadata or {}
+            sample.metadata["rollout_step"] = rollout_step
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -526,6 +535,7 @@ async def generate_rollout_async(
             # get samples from the buffer and submit the generation requests.
             # If over_sampling_batch_size is None, rollout_batch_size will be used as the default over_sampling_batch_size.
             samples = data_source(args.over_sampling_batch_size)
+            _set_rollout_step_metadata(args, rollout_id, samples)
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish

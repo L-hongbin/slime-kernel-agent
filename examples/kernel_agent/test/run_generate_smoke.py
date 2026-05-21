@@ -202,6 +202,19 @@ def _read_data_row(path: str, sample_index: int) -> dict[str, Any]:
     raise IndexError(f"sample_index={sample_index} is out of range for {path}")
 
 
+def _get_row_value(row: dict[str, Any], key: str) -> Any:
+    value: Any = row
+    for part in key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return None
+        value = value[part]
+    return value
+
+
+def _root_key(key: str) -> str:
+    return key.split(".", 1)[0]
+
+
 def _build_sample(args) -> Sample:
     if not args.sample_path:
         return Sample(
@@ -211,7 +224,7 @@ def _build_sample(args) -> Sample:
         )
 
     row = _read_data_row(args.sample_path, args.sample_index)
-    prompt = row.get(args.prompt_key)
+    prompt = _get_row_value(row, args.prompt_key)
     if prompt is None:
         raise KeyError(f"prompt_key={args.prompt_key!r} not found in sample. Available keys: {list(row.keys())}")
     if isinstance(prompt, list):
@@ -223,12 +236,13 @@ def _build_sample(args) -> Sample:
             end_index = 2 * int(args.start_turn_index) + 1
             prompt = prompt[:end_index]
 
-    entry_point = row.get(args.entry_point_key) or "Model"
-    ground_truth = row.get(args.ground_truth_key) or REFERENCE_IDENTITY_CODE
-    metadata = {key: value for key, value in row.items() if key not in {args.prompt_key, args.ground_truth_key}}
+    entry_point = _get_row_value(row, args.entry_point_key) or "Model"
+    ground_truth = _get_row_value(row, args.ground_truth_key) or REFERENCE_IDENTITY_CODE
+    excluded_keys = {_root_key(args.prompt_key), _root_key(args.ground_truth_key)}
+    metadata = {key: value for key, value in row.items() if key not in excluded_keys}
     metadata.update(
         {
-            "uuid": str(row.get(args.uuid_key) or args.uuid),
+            "uuid": str(_get_row_value(row, args.uuid_key) or args.uuid),
             "source_row": args.sample_index,
             "sample_path": args.sample_path,
             "log_multi_turn": True,
@@ -396,6 +410,7 @@ async def _run(args) -> None:
     CUDA_AGENT_CONFIGS["max_feedback_chars"] = args.max_feedback_chars
     CUDA_AGENT_CONFIGS["log_multi_turn_sample_rate"] = 1.0
     CUDA_AGENT_CONFIGS["do_precheck"] = args.do_precheck
+    CUDA_AGENT_CONFIGS["finalize_mode"] = None if args.finalize_mode == "none" else args.finalize_mode
 
     response = VALID_CUDA_AGENT_RESPONSE if args.compiled else INVALID_COMPILE_CUDA_AGENT_RESPONSE
     use_real_model = args.start_rollout or args.real_model
@@ -442,7 +457,17 @@ async def _run(args) -> None:
             use_distributed_post=False,
             multi_turn_prompt_config_path=args.multi_turn_prompt_config_path,
             preserve_history_thinking=args.preserve_history_thinking,
+            keep_history_thinking=args.keep_history_thinking,
             num_gpus_per_node=args.num_gpus_per_node,
+            max_turns=args.max_turns,
+            use_multi_turn=args.use_multi_turn,
+            padding_turns=args.padding_turns,
+            advantage_estimator=args.advantage_estimator,
+            multi_turn_gamma=args.multi_turn_gamma,
+            use_coverage_rs=args.use_coverage_rs,
+            coverage_rs_key=args.coverage_rs_key,
+            coverage_rs_threshold=args.coverage_rs_threshold,
+            coverage_rs_factor=args.coverage_rs_factor,
         )
         sampling_params = {"max_new_tokens": args.max_new_tokens, "temperature": 0.0}
 
@@ -461,9 +486,28 @@ async def _run(args) -> None:
                 tool_response_template,
             )
             print(f"\n[cuda_agent][generate_smoke][sample {idx}] status={output_sample.status}")
+            print(f"[cuda_agent][generate_smoke][sample {idx}] remove_sample={output_sample.remove_sample}")
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] remove_reason="
+                f"{(output_sample.metadata or {}).get('remove_reason')}"
+            )
+            print(f"[cuda_agent][generate_smoke][sample {idx}] turn_idx={(output_sample.metadata or {}).get('turn_idx')}")
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] is_pad_turn="
+                f"{(output_sample.metadata or {}).get('is_pad_turn')}"
+            )
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] multi_turn_reward="
+                f"{(output_sample.metadata or {}).get('multi_turn_reward')}"
+            )
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] env_extra_info:\n"
+                f"{_json_dumps((output_sample.metadata or {}).get('env_extra_info'))}"
+            )
             print(f"[cuda_agent][generate_smoke][sample {idx}] response_length={output_sample.response_length}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] response:\n{output_sample.response}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] reward={reward}")
+            print(f"[cuda_agent][generate_smoke][sample {idx}] sample.reward={output_sample.reward}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] env_state:\n{_json_dumps(env_state)}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] format_feedback:\n{format_feedback}")
 
@@ -492,6 +536,16 @@ def parse_args():
         help="YAML config path for multi-turn prompt templates. Defaults to the built-in CUDA agent template.",
     )
     parser.add_argument("--preserve-history-thinking", action="store_true", default=False)
+    parser.add_argument("--keep-history-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--use-multi-turn", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--padding-turns", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--advantage-estimator", default="grpo")
+    parser.add_argument("--multi-turn-gamma", type=float, default=1.0)
+    parser.add_argument("--finalize-mode", choices=("none", "positive", "improve"), default="positive")
+    parser.add_argument("--use-coverage-rs", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--coverage-rs-key", choices=("time_coverage", "num_coverage"), default="time_coverage")
+    parser.add_argument("--coverage-rs-threshold", type=float, default=0.3)
+    parser.add_argument("--coverage-rs-factor", type=float, default=0.1)
     parser.add_argument("--rollout-max-context-len", type=int, default=8192)
     parser.add_argument("--uuid", default="generate-smoke")
     parser.add_argument("--prompt", default="Write a CUDA identity implementation.")
