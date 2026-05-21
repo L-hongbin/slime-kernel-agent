@@ -10,10 +10,8 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import train_metric_utils
-from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
-from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
@@ -224,61 +222,37 @@ def gather_log_data(
 
 
 class DataIterator:
-    """Micro-batch iterator over rollout dicts.
-
-    Supports either fixed contiguous micro-batches or an explicit per-step
-    index schedule (for dynamic batch sizing / sequence-length balancing).
-    """
+    """Iterator over a rollout dict following an explicit micro-batch index schedule."""
 
     def __init__(
         self,
         rollout_data: RolloutBatch,
-        micro_batch_size: int | None = None,
-        micro_batch_indices: list[list[int]] | None = None,
+        micro_batch_indices: list[list[int]],
     ) -> None:
-        """Initialize an iterator over `rollout_data`.
+        """Initialize an iterator over ``rollout_data``.
 
         Args:
-            rollout_data: Dict of per-sample fields for the local step.
-            micro_batch_size: Fixed contiguous slice size when not using dynamic scheduling.
-            micro_batch_indices: Explicit indices per micro-batch when using dynamic balancing.
-                Must be mutually exclusive with `micro_batch_size`.
+            rollout_data: Dict of per-sample fields for this DP rank.
+            micro_batch_indices: List of mbs, each mbs being the local sample indices to select.
         """
         self.rollout_data = rollout_data
-        self.micro_batch_size = micro_batch_size
         self.micro_batch_indices = micro_batch_indices
-        assert micro_batch_size is None or micro_batch_indices is None
         self.offset = 0
 
     def get_next(self, keys: Sequence[str]) -> dict[str, list[object] | None]:
         """Return the next micro-batch for the requested keys.
 
-        - If `micro_batch_indices` is provided, selects rows according to the current
-          index list for each requested key.
-        - Otherwise, slices a contiguous window of size `micro_batch_size` starting
-          at the current offset.
-
         Returns a dict mapping each key to a list subset (or None if absent).
         """
         batch = {}
+        indices = self.micro_batch_indices[self.offset]
         for key in keys:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
             else:
-                if self.micro_batch_indices is not None:
-                    indices = self.micro_batch_indices[self.offset]
-                    batch[key] = [vals[i] for i in indices]
-                else:
-                    assert self.offset + self.micro_batch_size <= len(
-                        vals
-                    ), f"offset: {self.offset}, micro_batch_size: {self.micro_batch_size}, len(vals): {len(vals)}"
-                    batch[key] = vals[self.offset : self.offset + self.micro_batch_size]
-
-        if self.micro_batch_indices is not None:
-            self.offset += 1
-        else:
-            self.offset += self.micro_batch_size
+                batch[key] = [vals[i] for i in indices]
+        self.offset += 1
         return batch
 
     def reset(self) -> "DataIterator":
@@ -287,102 +261,11 @@ class DataIterator:
         return self
 
 
-def get_data_iterator(
-    args: Namespace,
-    model: torch.nn.Module | Sequence[torch.nn.Module],
-    rollout_data: RolloutBatch,
-) -> tuple[list[DataIterator], list[int]]:
-    """
-    Create iterators and a micro-batch schedule for a rollout step.
-
-    - If `use_dynamic_batch_size` is False, splits into fixed-size contiguous
-      micro-batches of `micro_batch_size`.
-    - If True, computes the number of micro-batches per local step based on
-      `max_tokens_per_gpu` and per-sample lengths, all-reduces to a DP-wide
-      maximum, optionally enforces divisibility for Virtual Pipeline Parallelism (VPP), and builds a balanced
-      index schedule to equalize token counts across micro-batches.
-
-    Returns `(data_iterators, num_microbatches)` where:
-    - `data_iterators`: list of `DataIterator`, one per VPP stage (size 1 if VPP disabled)
-    - `num_microbatches`: list[int], one per local step in the rollout (length = steps)
-    """
-    dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
-    dp_group = mpu.get_data_parallel_group()
-    vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size()
-    if vpp_size is None:
-        vpp_size = 1
-    if vpp_size > 1:
-        from megatron.core.utils import get_model_config
-
-        config = get_model_config(model[0])
-        microbatch_group_size_per_vp_stage = config.microbatch_group_size_per_vp_stage
-    cp_size = mpu.get_context_parallel_world_size()
-
-    num_local_samples = len(rollout_data["total_lengths"])
-    global_batch_size = rollout_data.get("dynamic_global_batch_size", args.global_batch_size)
-    num_local_gbs = global_batch_size // dp_size
-    num_steps_per_rollout = num_local_samples // num_local_gbs
-
-    if global_batch_size != args.global_batch_size:
-        logger.info(
-            f"Using dynamic global_batch_size={global_batch_size} (original={args.global_batch_size}), "
-            f"num_local_samples={num_local_samples}, num_steps_per_rollout={num_steps_per_rollout}"
-        )
-
-    def _generate_data_iterator(rollout_data, micro_batch_size, micro_batch_indices=None):
-        data_iterator = []
-        for _ in range(vpp_size):
-            data_iterator.append(DataIterator(rollout_data, micro_batch_size, micro_batch_indices))
-        return data_iterator
-
-    if not args.use_dynamic_batch_size:
-        num_microbatches = [num_local_gbs // args.micro_batch_size for _ in range(num_steps_per_rollout)]
-        data_iterator = _generate_data_iterator(rollout_data, args.micro_batch_size)
-    else:
-        assert args.max_tokens_per_gpu is not None
-        # calculate the number of mirobatches for each step
-        samples = rollout_data["total_lengths"]
-        assert len(samples) == num_local_samples
-        num_microbatches = []
-        for i in range(num_steps_per_rollout):
-            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
-            num_microbatches.append(
-                get_minimum_num_micro_batch_size(samples[start:end], args.max_tokens_per_gpu * cp_size)
-            )
-
-        num_microbatches = torch.tensor(num_microbatches, dtype=torch.int, device=torch.cuda.current_device())
-        dist.all_reduce(num_microbatches, op=dist.ReduceOp.MAX, group=dp_group)
-
-        if vpp_size > 1:
-            # vpp requies the number of microbatches to be divisible by vpp_size
-            num_microbatches = torch.clamp(
-                num_microbatches // microbatch_group_size_per_vp_stage * microbatch_group_size_per_vp_stage,
-                min=1,
-            )
-
-        num_microbatches = num_microbatches.tolist()
-
-        # balance the each micro batch
-        samples = rollout_data["total_lengths"]
-        # balance the number of mirobatches across steps
-        micro_batch_indices = []
-        for i, num_mbs in enumerate(num_microbatches):
-            start, end = i * num_local_gbs, (i + 1) * num_local_gbs
-            samples = rollout_data["total_lengths"][start:end]
-            partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
-            for j in range(num_mbs):
-                for k in range(len(partitions[j])):
-                    partitions[j][k] += start
-            micro_batch_indices.extend(partitions)
-
-        assert len(set(sum(micro_batch_indices, []))) == num_local_samples
-
-        data_iterator = _generate_data_iterator(rollout_data, None, micro_batch_indices)
-
-    return (
-        data_iterator,
-        num_microbatches,
-    )
+def get_data_iterator(rollout_data: RolloutBatch) -> list[DataIterator]:
+    """Build one ``DataIterator`` per VPP stage from the pre-computed schedule in ``rollout_data``."""
+    vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+    micro_batch_indices = rollout_data["micro_batch_indices"]
+    return [DataIterator(rollout_data, micro_batch_indices) for _ in range(vpp_size)]
 
 
 def log_rollout_data(
@@ -416,6 +299,8 @@ def log_rollout_data(
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "num_microbatches",
+                "micro_batch_indices",
             ]:
                 continue
             # Upload per sample mean for each rollout value
