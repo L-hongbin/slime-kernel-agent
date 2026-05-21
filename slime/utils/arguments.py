@@ -481,13 +481,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Custom generate functions should pass this through to tokenizer.apply_chat_template when supported."
                 ),
             )
-            parser.add_argument(
-                "--multi-turn-gamma",
-                type=float,
-                default=1.0,
-                help="Discount factor for multi-turn reward folding used by custom multi-turn rollout functions.",
-            )
-
             # partial rollout
             parser.add_argument(
                 "--partial-rollout",
@@ -957,6 +950,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--multi-turn-gamma",
+                type=float,
+                default=1.0,
+                help="Discount factor for multi-turn reward folding used by multi-turn advantage estimators.",
+            )
+            parser.add_argument(
                 "--disable-compute-advantages-and-returns",
                 action="store_false",
                 dest="compute_advantages_and_returns",
@@ -1159,31 +1158,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Optional OPSM config. Overrides OPSM mode, aggregation, thresholds, and token veto when set. "
                     'Must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
                 ),
-            )
-            parser.add_argument(
-                "--use-coverage-rs",
-                action="store_true",
-                default=False,
-                help="Whether to enable coverage-based rejection sampling after OPSM.",
-            )
-            parser.add_argument(
-                "--coverage-rs-key",
-                type=str,
-                choices=["time_coverage", "num_coverage"],
-                default="time_coverage",
-                help="Coverage metric used by coverage-based rejection sampling.",
-            )
-            parser.add_argument(
-                "--coverage-rs-threshold",
-                type=float,
-                default=0.3,
-                help="Coverage threshold used by coverage-based rejection sampling.",
-            )
-            parser.add_argument(
-                "--coverage-rs-factor",
-                type=float,
-                default=0.1,
-                help="Linear keep-probability factor used by coverage-based rejection sampling.",
             )
             return parser
 
@@ -1453,6 +1427,72 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_kernel_agent_arguments(parser):
+            parser.add_argument(
+                "--kernel-env-url",
+                dest="kernel_env_url",
+                type=str,
+                default=None,
+                help="Kernel agent environment server URL, e.g. http://127.0.0.1:8002.",
+            )
+            parser.add_argument(
+                "--kernel-backend",
+                type=str,
+                choices=["cuda_agent", "triton"],
+                default="cuda_agent",
+                help="Kernel backend name sent to the kernel agent environment.",
+            )
+            parser.add_argument(
+                "--reference-backend",
+                type=str,
+                choices=["torch", "torch_compile"],
+                default="torch",
+                help="Reference backend name sent to the kernel agent environment.",
+            )
+            parser.add_argument(
+                "--do-precheck",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="Whether the kernel agent should run client-side precheck before env execution.",
+            )
+            parser.add_argument(
+                "--finalize-mode",
+                type=str,
+                choices=["none", "positive", "improve"],
+                default="positive",
+                help=(
+                    "Kernel agent turn finalization mode. 'none' keeps all generated turn samples; "
+                    "'positive' removes non-positive turns after a positive best reward; "
+                    "'improve' removes turns that do not improve the best reward."
+                ),
+            )
+            parser.add_argument(
+                "--use-coverage-rs",
+                action="store_true",
+                default=False,
+                help="Whether to enable coverage-based rejection sampling for kernel-agent turn samples.",
+            )
+            parser.add_argument(
+                "--coverage-rs-key",
+                type=str,
+                choices=["time_coverage", "num_coverage"],
+                default="time_coverage",
+                help="Coverage metric used by kernel-agent coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--coverage-rs-threshold",
+                type=float,
+                default=0.3,
+                help="Coverage threshold used by kernel-agent coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--coverage-rs-factor",
+                type=float,
+                default=0.1,
+                help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
+            )
+            return parser
+
         def add_rollout_buffer_arguments(parser):
             parser.add_argument(
                 "--rollout-buffer-url",
@@ -1601,6 +1641,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_debug_arguments(parser)
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
+        parser = add_kernel_agent_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_ci_arguments(parser)

@@ -125,6 +125,12 @@ def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
     return env_state if isinstance(env_state, dict) else {}
 
 
+def _get_env_config(args) -> dict[str, Any]:
+    env_config = deepcopy(CUDA_AGENT_CONFIGS["env"])
+    env_config["kernel_env_url"] = getattr(args, "kernel_env_url", None)
+    return env_config
+
+
 def _should_log_multiturn(sample: Sample) -> bool:
     if not logger.isEnabledFor(logging.INFO):
         return False
@@ -277,7 +283,11 @@ def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
 
 def _get_label_value(sample: Sample, key: str) -> Any:
     if isinstance(sample.label, dict):
-        return sample.label.get(key)
+        value = sample.label.get(key)
+        if value is not None:
+            return value
+    if isinstance(sample.metadata, dict):
+        return sample.metadata.get(key)
     return None
 
 
@@ -327,10 +337,13 @@ async def cuda_kernel_env(
     entry_point = _get_label_value(sample, "entry_point")
     if entry_point is None:
         raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
-    env_config = CUDA_AGENT_CONFIGS["env"]
-    if CUDA_AGENT_CONFIGS.get("do_precheck", False):
+    env_config = _get_env_config(args)
+    do_precheck = bool(getattr(args, "do_precheck", True))
+    kernel_backend = getattr(args, "kernel_backend", "cuda_agent")
+    reference_backend = getattr(args, "reference_backend", "torch")
+    if do_precheck:
         precheck_entry_point = f"{entry_point}New"
-        precheck_result = precheck_response(response, precheck_entry_point, CUDA_AGENT_CONFIGS["kernel_backend"])
+        precheck_result = precheck_response(response, precheck_entry_point, kernel_backend)
         if precheck_result is not None:
             precheck_result = dict(precheck_result)
             precheck_result.setdefault("decoy_kernel", None)
@@ -339,8 +352,8 @@ async def cuda_kernel_env(
     payload = {
         "response": response,
         "ground_truth": _get_label_value(sample, "ground_truth"),
-        "kernel_backend": CUDA_AGENT_CONFIGS["kernel_backend"],
-        "reference_backend": CUDA_AGENT_CONFIGS["reference_backend"],
+        "kernel_backend": kernel_backend,
+        "reference_backend": reference_backend,
         "entry_point": entry_point,
         "uuid": (sample.metadata or {}).get("uuid"),
         "return_full_state": True,
@@ -350,7 +363,7 @@ async def cuda_kernel_env(
     env_result = await run_kernel_eval(args, sample, payload, env_config)
     raw_env_state = _get_env_state(env_result) or env_result
     normalized_env_state = normalize_env_feedback(raw_env_state)
-    if CUDA_AGENT_CONFIGS.get("do_precheck", False):
+    if do_precheck:
         normalized_env_state["precheck"] = "passed"
     return {**env_result, "env_state": normalized_env_state, "reward_extra_info": normalized_env_state}
 

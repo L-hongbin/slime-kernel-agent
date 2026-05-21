@@ -8,7 +8,7 @@ PROMPT_KEY=${PROMPT_KEY:-prompt}
 GROUND_TRUTH_KEY=${GROUND_TRUTH_KEY:-reward_model.ground_truth}
 ENTRY_POINT_KEY=${ENTRY_POINT_KEY:-extra_info.entry_point}
 UUID_KEY=${UUID_KEY:-extra_info.uuid}
-KERNEL_EVAL_URL=${KERNEL_EVAL_URL:-http://192.168.207.229:8002}
+KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.207.229:8002}
 
 ROLLOUT_HOST=${ROLLOUT_HOST:-127.0.0.1}
 ROLLOUT_PORT=${ROLLOUT_PORT:-30000}
@@ -48,7 +48,7 @@ python examples/kernel_agent/test/run_generate_smoke.py \
   --ground-truth-key "${GROUND_TRUTH_KEY}" \
   --entry-point-key "${ENTRY_POINT_KEY}" \
   --uuid-key "${UUID_KEY}" \
-  --kernel-eval-url "${KERNEL_EVAL_URL}" \
+  --kernel-env-url "${KERNEL_ENV_URL}" \
   --rollout-host "${ROLLOUT_HOST}" \
   --rollout-port "${ROLLOUT_PORT}" \
   --max-turns "${MAX_TURNS}" \

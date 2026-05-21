@@ -420,9 +420,9 @@ async def _run(args) -> None:
     if args.mock_env:
         _install_fake_env(args.compiled)
     else:
-        if not args.kernel_eval_url:
-            raise ValueError("--kernel-eval-url is required when --real-env is set")
-        CUDA_AGENT_CONFIGS["env"]["kernel_eval_url"] = args.kernel_eval_url
+        if not args.kernel_env_url:
+            raise ValueError("--kernel-env-url is required when --real-env is set")
+        CUDA_AGENT_CONFIGS["env"]["kernel_env_url"] = args.kernel_env_url
         CUDA_AGENT_CONFIGS["env"]["kernel_eval_max_retries"] = args.kernel_eval_max_retries
         CUDA_AGENT_CONFIGS["env"]["kernel_eval_client_timeout"] = args.kernel_eval_client_timeout
         CUDA_AGENT_CONFIGS["env"]["kernel_eval_task_timeout"] = args.kernel_eval_task_timeout
@@ -516,7 +516,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Smoke-test the full CUDA agent generate -> env -> feedback path.")
     parser.add_argument("--real-env", dest="mock_env", action="store_false", help="Call the real KernelServer env.")
     parser.set_defaults(mock_env=True)
-    parser.add_argument("--kernel-eval-url", default="", help="KernelServer URL, for example http://192.168.16.21:8003.")
+    parser.add_argument("--kernel-env-url", default="", help="KernelServer URL, for example http://192.168.16.21:8003.")
     parser.add_argument("--real-model", action="store_true", help="Use an already running rollout /generate endpoint.")
     parser.add_argument("--start-rollout", action="store_true", help="Start a local SGLang rollout server before generate.")
     parser.add_argument("--rollout-command", default="", help="Custom command used by --start-rollout.")

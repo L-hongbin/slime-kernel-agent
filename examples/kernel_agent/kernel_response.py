@@ -189,9 +189,9 @@ def _ensure_ray_initialized() -> None:
 
 def _get_kernel_eval_worker(config: dict[str, Any]):
     _ensure_ray_initialized()
-    server_url = config["kernel_eval_url"]
+    server_url = config["kernel_env_url"]
     if not server_url:
-        raise RuntimeError("kernel_eval_url is required for kernel eval.")
+        raise RuntimeError("kernel_env_url is required for kernel eval.")
     worker_key = (
         server_url,
         int(config["kernel_eval_task_timeout"]),

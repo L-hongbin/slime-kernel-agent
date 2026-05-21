@@ -472,7 +472,9 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
 
     _apply_coverage_rs(args, output_samples)
 
-    finalize_mode = CUDA_AGENT_CONFIGS.get("finalize_mode", "positive")
+    finalize_mode = getattr(args, "finalize_mode", "positive")
+    if finalize_mode == "none":
+        finalize_mode = None
     if finalize_mode is None:
         _set_multi_turn_rewards(args, output_samples, finish_reason)
         return output_samples

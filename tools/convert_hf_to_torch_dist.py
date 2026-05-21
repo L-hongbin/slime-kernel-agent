@@ -18,6 +18,25 @@ from slime.utils.logging_utils import configure_logger
 from slime.utils.memory_utils import print_memory
 
 
+def patch_checkpoint_preload_tensors():
+    import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
+    base_writer = filesystem_async_module.FileSystemWriterAsync
+
+    class FileSystemWriterSyncPreload(base_writer):
+        @staticmethod
+        def preload_tensors(*args, **kwargs):
+            if "non_blocking" in kwargs:
+                kwargs["non_blocking"] = False
+            elif len(args) > 1 and isinstance(args[-1], bool):
+                args = args[:-1] + (False,)
+            else:
+                kwargs["non_blocking"] = False
+            return base_writer.preload_tensors(*args, **kwargs)
+
+    filesystem_async_module.FileSystemWriterAsync = FileSystemWriterSyncPreload
+
+
 def add_convertion_args(parser):
     """Add conversion arguments to the parser"""
     parser.add_argument("--hf-checkpoint", type=str, required=True, help="HuggingFace model path")
@@ -78,12 +97,7 @@ def get_args():
 
 
 def main():
-    if torch.version.hip:
-        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
-        from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
-
-        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
-        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+    patch_checkpoint_preload_tensors()
 
     configure_logger()
 
