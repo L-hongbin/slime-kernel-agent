@@ -47,9 +47,9 @@ def _wrap_problem_for_prompt(problem: str) -> str:
     return f"You are given the following PyTorch model:\n```python\n{problem_body}\n```"
 
 
-def _load_single_turn_profile():
-    config = yaml.safe_load((_TEMPLATE_ROOT / "single_turn_v1.yaml").read_text(encoding="utf-8"))
-    return config["profiles"]["drkernel_single_turn_v1"]
+def _load_drkernel_v1_profile():
+    config = yaml.safe_load((_TEMPLATE_ROOT / "prompts_v1.yaml").read_text(encoding="utf-8"))
+    return config["profiles"]["drkernel_v1"]
 
 
 @lru_cache(maxsize=1)
@@ -153,7 +153,7 @@ def _render_review_sample(
     metadata = dict(source_record["extra_info"], review_data_index=sample_index - 1)
     metadata["template_allowed"] = {
         "role": [role_id],
-        "first_turn_template": [template_id],
+        "backend": [template_id],
     }
     sample = SimpleNamespace(
         group_index=0,
@@ -168,23 +168,29 @@ def _render_review_sample(
 
 
 @pytest.mark.unit
-def test_drkernel_single_turn_yaml_is_composable():
-    profile = _load_single_turn_profile()
+def test_drkernel_prompts_yaml_is_composable():
+    profile = _load_drkernel_v1_profile()
 
-    assert profile["layout"] == "layouts/single_turn.jinja"
+    assert profile["layout"] == "layouts/first_turn.jinja"
     assert profile["role"]["select"] == "cycle"
-    assert profile["first_turn_template"]["select"] == "cycle"
+    assert profile["backend"]["select"] == "cycle"
 
     role_ids = {candidate["id"] for candidate in profile["role"]["candidates"]}
     assert role_ids == {"accelerate_best_perf", "optimize_correctness"}
 
-    backend_ids = {candidate["id"] for candidate in profile["first_turn_template"]["candidates"]}
+    backend_ids = {candidate["id"] for candidate in profile["backend"]["candidates"]}
     assert backend_ids == set(_ACTIVE_FIRST_TURN)
 
     for candidate in profile["role"]["candidates"]:
         assert (_TEMPLATE_ROOT / candidate["text_path"]).exists()
-    for candidate in profile["first_turn_template"]["candidates"]:
-        assert (_TEMPLATE_ROOT / candidate["backend_text_path"]).exists()
+    for candidate in profile["backend"]["candidates"]:
+        assert (_TEMPLATE_ROOT / candidate["first_turn_text_path"]).exists()
+        # Multi-turn coupling: every backend candidate must declare a paired tool_response template
+        # so that turn-≥1 output format stays consistent with turn-0 backend.
+        assert (
+            "tool_response_text_path" in candidate
+        ), f"backend candidate {candidate['id']!r} is missing tool_response_text_path"
+        assert (_TEMPLATE_ROOT / candidate["tool_response_text_path"]).exists()
 
 
 @pytest.mark.unit
@@ -202,16 +208,16 @@ def test_drkernel_legacy_equivalence_is_covered_by_tests(template_id, role_id):
     # problem wrapper, ignoring whitespace differences and without env injection.
     # lhb_v3 remains a valid backend choice, but it does not have an exact role
     # string among the two runtime role variants.
-    profile = _load_single_turn_profile()
+    profile = _load_drkernel_v1_profile()
     layout = (_TEMPLATE_ROOT / profile["layout"]).read_text(encoding="utf-8")
 
     role_candidate = next(candidate for candidate in profile["role"]["candidates"] if candidate["id"] == role_id)
     backend_candidate = next(
-        candidate for candidate in profile["first_turn_template"]["candidates"] if candidate["id"] == template_id
+        candidate for candidate in profile["backend"]["candidates"] if candidate["id"] == template_id
     )
 
     role = (_TEMPLATE_ROOT / role_candidate["text_path"]).read_text(encoding="utf-8")
-    backend = (_TEMPLATE_ROOT / backend_candidate["backend_text_path"]).read_text(encoding="utf-8")
+    backend = (_TEMPLATE_ROOT / backend_candidate["first_turn_text_path"]).read_text(encoding="utf-8")
     problem = "def example_problem(x):\n    return x + 1\n"
 
     rendered = _render_template(
@@ -249,7 +255,7 @@ def test_drkernel_prompt_renderer_applies_template_allowed_and_records_metadata(
         metadata={
             "template_allowed": {
                 "role": ["accelerate_best_perf"],
-                "first_turn_template": ["lhb_v3"],
+                "backend": ["lhb_v3"],
             }
         },
     )
@@ -259,9 +265,9 @@ def test_drkernel_prompt_renderer_applies_template_allowed_and_records_metadata(
 
     assert sample.metadata["raw_problem"] == "class Model:\n    pass\n"
     assert sample.metadata["chosen_prompt_slots"] == {
-        "profile": "drkernel_single_turn_v1",
+        "profile": "drkernel_v1",
         "role": "accelerate_best_perf",
-        "first_turn_template": "lhb_v3",
+        "backend": "lhb_v3",
         "compiler_name": "nvcc_12_4",
         "gpu_name": "H100",
     }
@@ -296,9 +302,9 @@ def test_drkernel_prompt_renderer_cycles_candidates_without_allowed_list():
     result = renderer.render_sample(args, sample, rollout_id=3)
 
     assert result.chosen == {
-        "profile": "drkernel_single_turn_v1",
+        "profile": "drkernel_v1",
         "role": "optimize_correctness",
-        "first_turn_template": "tvm_ffi_module",
+        "backend": "tvm_ffi_module",
     }
 
 
@@ -317,7 +323,7 @@ def test_drkernel_prompt_renderer_prints_tvm_ffi_review_sample():
         metadata={
             "template_allowed": {
                 "role": ["optimize_correctness"],
-                "first_turn_template": ["tvm_ffi_module"],
+                "backend": ["tvm_ffi_module"],
             }
         },
     )
@@ -325,7 +331,7 @@ def test_drkernel_prompt_renderer_prints_tvm_ffi_review_sample():
     renderer = _new_prompt_renderer()
     result = renderer.render_sample(args, sample, rollout_id=3)
 
-    assert result.chosen["first_turn_template"] == "tvm_ffi_module"
+    assert result.chosen["backend"] == "tvm_ffi_module"
     assert "TVM-FFI" in result.prompt
     assert "tvm_ffi_extension" in result.prompt
     assert "correctness.\n\n\nTarget environment:" not in result.prompt
@@ -349,7 +355,7 @@ def test_drkernel_apply_to_sample_applies_chat_template_after_prompt_rendering(f
         metadata={
             "template_allowed": {
                 "role": ["accelerate_best_perf"],
-                "first_turn_template": ["lhb_v3"],
+                "backend": ["lhb_v3"],
             },
             "tools": [{"name": "compile"}],
         },
@@ -375,9 +381,9 @@ def test_drkernel_apply_to_sample_applies_chat_template_after_prompt_rendering(f
 
 @pytest.mark.unit
 def test_drkernel_prompt_renderer_saves_formatted_review_samples(prompt_review_file):
-    profile = _load_single_turn_profile()
+    profile = _load_drkernel_v1_profile()
     role_ids = [candidate["id"] for candidate in profile["role"]["candidates"]]
-    template_ids = [candidate["id"] for candidate in profile["first_turn_template"]["candidates"]]
+    template_ids = [candidate["id"] for candidate in profile["backend"]["candidates"]]
     combo_count = len(role_ids) * len(template_ids)
     total = combo_count + 1
     review_records = _load_real_review_records(total)
@@ -433,4 +439,212 @@ def test_drkernel_prompt_renderer_saves_formatted_review_samples(prompt_review_f
     for role_id in role_ids:
         assert f"role: {role_id}" in review_text
     for template_id in template_ids:
-        assert f"first_turn_template: {template_id}" in review_text
+        assert f"backend: {template_id}" in review_text
+
+
+# ---------------------------------------------------------------------------
+# Multi-turn renderer surface: first_turn_messages / tool_response / materialize
+# ---------------------------------------------------------------------------
+
+
+def _new_prompt_renderer_with_profile(profile_name: str) -> DrKernelPromptRenderer:
+    renderer = DrKernelPromptRenderer("/fake/qwen")
+    renderer.profile_name = profile_name
+    renderer.profile = renderer.config["profiles"][profile_name]
+    return renderer
+
+
+@pytest.mark.unit
+def test_render_first_turn_messages_seeds_metadata_and_messages_list():
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name="nvcc_12_4",
+        drkernel_gpu_name="H100",
+        drkernel_extra_environment=None,
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={},
+    )
+
+    renderer = _new_prompt_renderer()
+    messages = renderer.render_first_turn_messages(args, sample, rollout_id=0)
+
+    # Returned list is exactly one user turn and is stored on the sample.
+    assert len(messages) == 1
+    assert messages[0]["role"] == "user"
+    assert sample.metadata["messages"] is messages
+
+    # Audit metadata is populated for downstream multi-turn driver and dump-details.
+    chosen = sample.metadata["chosen_prompt_slots"]
+    assert chosen["profile"] == renderer.profile_name
+    assert chosen["backend"] == "tvm_ffi_module"
+    assert chosen["role"] in {"accelerate_best_perf", "optimize_correctness"}
+    assert sample.metadata["raw_problem"] == "class Model:\n    pass\n"
+    assert sample.metadata["drkernel_user_prompt"] == messages[0]["content"]
+
+
+@pytest.mark.unit
+def test_render_tool_response_message_uses_tvm_ffi_paired_template():
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name=None,
+        drkernel_gpu_name=None,
+        drkernel_extra_environment=None,
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={},
+    )
+
+    # Default renderer's active profile is drkernel_v1_tvm_ffi, so turn-0 backend is tvm_ffi_module.
+    renderer = _new_prompt_renderer()
+    renderer.render_first_turn_messages(args, sample, rollout_id=0)
+
+    feedback = "compile error: undefined symbol my_kernel_launcher in apply_bindings.cpp:24"
+    tool_msg = renderer.render_tool_response_message(args, sample, feedback=feedback)
+
+    assert tool_msg["role"] == "user"
+    assert feedback in tool_msg["content"]
+    # tvm_ffi tool_response template namedrops TVM-FFI; pybind variant would not.
+    assert "TVM-FFI" in tool_msg["content"]
+    assert "tvm_ffi_extension" in tool_msg["content"]
+
+
+@pytest.mark.unit
+def test_render_tool_response_message_uses_pybind_paired_template():
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name=None,
+        drkernel_gpu_name=None,
+        drkernel_extra_environment=None,
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={"template_allowed": {"backend": ["pybind11_module"]}},
+    )
+
+    # Switch to the multi-backend profile so we can force the pybind path.
+    renderer = _new_prompt_renderer_with_profile("drkernel_v1")
+    renderer.render_first_turn_messages(args, sample, rollout_id=0)
+    assert sample.metadata["chosen_prompt_slots"]["backend"] == "pybind11_module"
+
+    tool_msg = renderer.render_tool_response_message(args, sample, feedback="undefined symbol my_kernel")
+
+    assert "undefined symbol my_kernel" in tool_msg["content"]
+    assert "CUDA_KERNELS" in tool_msg["content"]
+    # The pybind variant must not pull in tvm_ffi-specific verbiage.
+    assert "TVM-FFI" not in tool_msg["content"]
+    assert "tvm_ffi_extension" not in tool_msg["content"]
+
+
+@pytest.mark.unit
+def test_render_tool_response_message_requires_first_turn_to_have_run():
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name=None,
+        drkernel_gpu_name=None,
+        drkernel_extra_environment=None,
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={},  # no chosen_prompt_slots
+    )
+
+    renderer = _new_prompt_renderer()
+    with pytest.raises(RuntimeError, match="render_first_turn_messages"):
+        renderer.render_tool_response_message(args, sample, feedback="any")
+
+
+@pytest.mark.unit
+def test_render_tool_response_message_errors_when_candidate_lacks_tool_path():
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name=None,
+        drkernel_gpu_name=None,
+        drkernel_extra_environment=None,
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={},
+    )
+
+    renderer = _new_prompt_renderer()
+    renderer.render_first_turn_messages(args, sample, rollout_id=0)
+
+    # Drop the tool_response_text_path field from the chosen backend candidate to simulate a misconfigured profile.
+    chosen_backend = sample.metadata["chosen_prompt_slots"]["backend"]
+    for candidate in renderer.profile["backend"]["candidates"]:
+        if candidate["id"] == chosen_backend:
+            del candidate["tool_response_text_path"]
+
+    with pytest.raises(KeyError, match="tool_response_text_path"):
+        renderer.render_tool_response_message(args, sample, feedback="any")
+
+
+@pytest.mark.unit
+def test_materialize_prompt_passes_full_messages_list_to_tokenizer(fake_tokenizer):
+    args = Namespace(
+        rollout_seed=0,
+        drkernel_compiler_name=None,
+        drkernel_gpu_name=None,
+        drkernel_extra_environment=None,
+        apply_chat_template_kwargs={"enable_thinking": False},
+    )
+    sample = SimpleNamespace(
+        group_index=0,
+        index=0,
+        prompt="class Model:\n    pass\n",
+        metadata={},
+        tokens=[7, 8, 9],
+    )
+
+    renderer = _new_prompt_renderer()
+    messages = renderer.render_first_turn_messages(args, sample, rollout_id=0)
+    messages.append({"role": "assistant", "content": "<think>plan</think>\nfirst draft answer"})
+    messages.append(renderer.render_tool_response_message(args, sample, feedback="compile_error"))
+
+    renderer.materialize_prompt(args, sample, messages)
+
+    last_call = fake_tokenizer.calls[-1]
+    assert [m["role"] for m in last_call["messages"]] == ["user", "assistant", "user"]
+    assert last_call["add_generation_prompt"] is True
+    assert last_call["tokenize"] is False
+    assert last_call["kwargs"] == {"enable_thinking": False}
+    # Materialize clears stale rollout tokens so they don't leak into the next-turn submit.
+    assert sample.tokens == []
+
+
+@pytest.mark.unit
+def test_tool_response_text_path_pairs_each_backend_with_matching_output_format():
+    """Sanity guard: every backend's tool_response template references the same output sections."""
+    config = yaml.safe_load((_TEMPLATE_ROOT / "prompts_v1.yaml").read_text(encoding="utf-8"))
+    pybind_backends = {"csl_cuda_agent", "lhb_v3", "pybind11_module"}
+    tvm_ffi_backends = {"tvm_ffi_module"}
+
+    for profile_name, profile in config["profiles"].items():
+        for candidate in profile["backend"]["candidates"]:
+            tool_path = candidate["tool_response_text_path"]
+            body = (_TEMPLATE_ROOT / tool_path).read_text(encoding="utf-8")
+            # Both families ask the model to return the three-section response.
+            assert "CUDA_KERNELS" in body
+            assert "APPLY_BINDINGS" in body
+            assert "MODEL_NEW" in body
+            assert "{{ feedback }}" in body
+
+            if candidate["id"] in tvm_ffi_backends:
+                assert "TVM-FFI" in body, f"{profile_name}/{candidate['id']} should namedrop TVM-FFI in tool_response"
+            elif candidate["id"] in pybind_backends:
+                assert (
+                    "TVM-FFI" not in body
+                ), f"{profile_name}/{candidate['id']} tool_response leaked TVM-FFI verbiage into pybind family"

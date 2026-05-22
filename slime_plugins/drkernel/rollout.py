@@ -36,7 +36,7 @@ __all__ = [
 
 
 # Fixed composable prompt pack for this rollout plugin (not CLI-configurable).
-_PROMPT_CONFIG_PATH = Path(__file__).resolve().parent / "prompt_templates" / "single_turn_v1.yaml"
+_PROMPT_CONFIG_PATH = Path(__file__).resolve().parent / "prompt_templates" / "prompts_v1.yaml"
 
 
 @dataclass(frozen=True)
@@ -61,7 +61,7 @@ class DrKernelPromptRenderer:
 
     The runtime YAML intentionally describes a composable search space:
     - role is selected independently;
-    - first_turn_template selects the backend/rule body;
+    - backend selects the per-backend template set (first-turn body + tool-response body);
     - compiler/GPU info is injected from args/metadata as plain strings.
 
     Legacy equivalence is covered in tests by fixing specific role/backend pairs.
@@ -70,8 +70,8 @@ class DrKernelPromptRenderer:
     def __init__(self, hf_checkpoint: str) -> None:
         self.template_root = _PROMPT_CONFIG_PATH.parent
         self.config: dict = yaml.safe_load(_PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
-        # self.profile_name = "drkernel_single_turn_v1"
-        self.profile_name = "drkernel_single_turn_tvm_ffi_only"
+        # self.profile_name = "drkernel_v1"
+        self.profile_name = "drkernel_v1_tvm_ffi"
 
         profiles = self.config.get("profiles", {})
         if self.profile_name not in profiles:
@@ -99,11 +99,11 @@ class DrKernelPromptRenderer:
         backend_candidate = self._select_candidate(
             rollout_id=rollout_id,
             sample=sample,
-            slot_name="first_turn_template",
+            slot_name="backend",
         )
 
         role = self._load_fragment(role_candidate["text_path"])
-        backend = self._load_fragment(backend_candidate["backend_text_path"])
+        backend = self._load_fragment(backend_candidate["first_turn_text_path"])
         layout = self._load_fragment(self.profile["layout"])
 
         compiler_name = metadata.get("compiler_name") or _get_arg(args, "drkernel_compiler_name")
@@ -123,7 +123,7 @@ class DrKernelPromptRenderer:
         chosen = {
             "profile": self.profile_name,
             "role": role_candidate["id"],
-            "first_turn_template": backend_candidate["id"],
+            "backend": backend_candidate["id"],
         }
         if compiler_name:
             chosen["compiler_name"] = compiler_name
@@ -133,13 +133,46 @@ class DrKernelPromptRenderer:
             chosen["extra_environment"] = extra_environment
         return PromptRenderResult(prompt=prompt, chosen=chosen)
 
-    def apply_to_sample(self, args: Namespace, sample: Any, rollout_id: int) -> Any:
+    def render_first_turn_messages(self, args: Namespace, sample: Any, rollout_id: int) -> list[dict[str, str]]:
+        """Render the first-turn user message and seed sample.metadata['messages'].
+
+        The returned list is also stored on the sample so multi-turn callers can
+        keep appending assistant responses and tool-response messages to it.
+        """
         result = self.render_sample(args, sample, rollout_id)
         sample.metadata["raw_problem"] = sample.prompt
         sample.metadata["chosen_prompt_slots"] = result.chosen
         sample.metadata["drkernel_user_prompt"] = result.prompt
 
         messages = [{"role": "user", "content": result.prompt}]
+        sample.metadata["messages"] = messages
+        return messages
+
+    def render_tool_response_message(self, args: Namespace, sample: Any, feedback: str) -> dict[str, str]:
+        """Render the next user turn whose tool template is keyed off the chosen backend.
+
+        Requires ``render_first_turn_messages`` to have populated
+        ``sample.metadata['chosen_prompt_slots']['backend']`` first.
+        """
+        chosen = sample.metadata.get("chosen_prompt_slots") or {}
+        backend_id = chosen.get("backend")
+        if not backend_id:
+            raise RuntimeError(
+                "render_tool_response_message requires render_first_turn_messages to have run first; "
+                "chosen_prompt_slots['backend'] is missing."
+            )
+        candidate = self._lookup_candidate("backend", backend_id)
+        tool_path = candidate.get("tool_response_text_path")
+        if not tool_path:
+            raise KeyError(
+                f"Profile {self.profile_name!r} backend candidate {backend_id!r} "
+                "is missing 'tool_response_text_path'; multi-turn rendering is not configured for it."
+            )
+        body = self._render_template(self._load_fragment(tool_path), feedback=feedback)
+        return {"role": "user", "content": body}
+
+    def materialize_prompt(self, args: Namespace, sample: Any, messages: list[dict[str, str]]) -> Any:
+        """Apply the tokenizer chat template over ``messages`` and write back ``sample.prompt``."""
         tools = sample.metadata.get("tools")
         sample.prompt = self.tokenizer.apply_chat_template(
             messages,
@@ -153,6 +186,17 @@ class DrKernelPromptRenderer:
         if hasattr(sample, "tokens"):
             sample.tokens = []
         return sample
+
+    def apply_to_sample(self, args: Namespace, sample: Any, rollout_id: int) -> Any:
+        messages = self.render_first_turn_messages(args, sample, rollout_id)
+        return self.materialize_prompt(args, sample, messages)
+
+    def _lookup_candidate(self, slot_name: str, candidate_id: str) -> dict[str, Any]:
+        slot_cfg: dict = self.profile[slot_name]
+        for candidate in slot_cfg["candidates"]:
+            if candidate["id"] == candidate_id:
+                return candidate
+        raise KeyError(f"Unknown candidate {candidate_id!r} for slot {slot_name!r} in profile {self.profile_name!r}")
 
     def _load_fragment(self, relative_path: str) -> str:
         path = (self.template_root / relative_path).resolve()

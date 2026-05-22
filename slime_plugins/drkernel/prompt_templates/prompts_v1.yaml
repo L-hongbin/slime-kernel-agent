@@ -1,0 +1,40 @@
+profiles:
+  drkernel_v1:
+    layout: layouts/first_turn.jinja
+    role:
+      select: cycle
+      candidates:
+        - id: accelerate_best_perf
+          text_path: roles/accelerate_best_perf.jinja
+        - id: optimize_correctness
+          text_path: roles/optimize_correctness.jinja
+    backend:
+      select: cycle
+      candidates:
+        - id: csl_cuda_agent
+          first_turn_text_path: backends/csl_cuda_agent.jinja
+          tool_response_text_path: tool_response/pybind_short.jinja
+        - id: lhb_v3
+          first_turn_text_path: backends/lhb_v3.jinja
+          tool_response_text_path: tool_response/pybind_short.jinja
+        - id: pybind11_module
+          first_turn_text_path: backends/pybind11_module.jinja
+          tool_response_text_path: tool_response/pybind_short.jinja
+        - id: tvm_ffi_module
+          first_turn_text_path: backends/tvm_ffi_module.jinja
+          tool_response_text_path: tool_response/tvm_ffi_short.jinja
+  drkernel_v1_tvm_ffi:
+    layout: layouts/first_turn.jinja
+    role:
+      select: cycle
+      candidates:
+        - id: accelerate_best_perf
+          text_path: roles/accelerate_best_perf.jinja
+        - id: optimize_correctness
+          text_path: roles/optimize_correctness.jinja
+    backend:
+      select: cycle
+      candidates:
+        - id: tvm_ffi_module
+          first_turn_text_path: backends/tvm_ffi_module.jinja
+          tool_response_text_path: tool_response/tvm_ffi_short.jinja
