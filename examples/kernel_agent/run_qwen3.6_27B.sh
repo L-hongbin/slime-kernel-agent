@@ -17,7 +17,6 @@ export PYTHONBUFFERED=16
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
-KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://127.0.0.1:8002}
 
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen2.5-3B/
@@ -49,6 +48,12 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 256
    --balance-data
+)
+
+CURRICULUM_ARGS=(
+   --use-dynamic-curriculum
+   --difficulty-level-key difficulty_level
+   --difficulty-score-key difficulty_score
 )
 
 PERF_ARGS=(
@@ -122,10 +127,6 @@ CUSTOM_ARGS=(
    # --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
-KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
-)
-
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats
@@ -147,11 +148,11 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
+   ${CURRICULUM_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${KERNEL_AGENT_ARGS[@]} \
    ${CUSTOM_ARGS[@]}

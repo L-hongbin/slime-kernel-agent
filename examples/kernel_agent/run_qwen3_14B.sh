@@ -148,6 +148,12 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
+CURRICULUM_ARGS=(
+   --use-dynamic-curriculum
+   --difficulty-level-key difficulty_level
+   --difficulty-score-key difficulty_score
+)
+
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
@@ -268,6 +274,7 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
+   ${CURRICULUM_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${RL_ARGS[@]} \
    ${WANDB_ARGS[@]} \

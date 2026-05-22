@@ -1019,7 +1019,6 @@ def policy_loss_function(
 
     if args.use_opsm:
         reported_loss["opsm_clipfrac"] = opsm_clipfrac
-        reported_loss["opsm_reject_rate"] = opsm_clipfrac / max(len(batch["loss_masks"]), 1)
 
     # Add OPD metrics if available
     if "opd_reverse_kl" in batch:

@@ -283,6 +283,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
+            parser.add_argument("--use-dynamic-curriculum", action="store_true", help="是否使用课程学习")
+            parser.add_argument("--difficulty-level-key", type=str, default="difficulty_level", help="level字段")
+            parser.add_argument("--difficulty-score-key", type=str, default="difficulty_score", help="score字段")
 
             return parser
 

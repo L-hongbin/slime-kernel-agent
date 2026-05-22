@@ -359,6 +359,15 @@ class RolloutManager:
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
+        if getattr(self.args, "use_dynamic_curriculum", False):
+            from slime.rollout.curriculum_data_source import DynamicCurriculumWrapper
+
+            self.data_source = DynamicCurriculumWrapper(
+                args=args,
+                base_data_source=self.data_source,
+            )
+
+
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None

@@ -216,6 +216,9 @@ class Dataset:
             prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
 
             metadata = data.get(metadata_key) or {}
+            for key in ("difficulty_level", "difficulty_score"):
+                if key in data and key not in metadata:
+                    metadata[key] = data[key]
             tools = None
             if tool_key is not None and tool_key in data:
                 tools = data[tool_key]
