@@ -70,7 +70,9 @@ class DrKernelPromptRenderer:
     def __init__(self, hf_checkpoint: str) -> None:
         self.template_root = _PROMPT_CONFIG_PATH.parent
         self.config: dict = yaml.safe_load(_PROMPT_CONFIG_PATH.read_text(encoding="utf-8"))
-        self.profile_name = "drkernel_single_turn_v1"
+        # self.profile_name = "drkernel_single_turn_v1"
+        self.profile_name = "drkernel_single_turn_tvm_ffi_only"
+
         profiles = self.config.get("profiles", {})
         if self.profile_name not in profiles:
             raise KeyError(f"Unknown DrKernel prompt profile: {self.profile_name}")
