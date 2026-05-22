@@ -64,9 +64,9 @@ def _build_inputs(
     if force_token_veto:
         if opsm_token_veto_threshold is None:
             raise ValueError("--force-token-veto requires --opsm-token-veto-threshold.")
-        full_log_probs[0][0] = full_old_log_probs[0][0] + torch.log(
-            torch.tensor(opsm_token_veto_threshold, device=device)
-        ) - 1.0
+        full_log_probs[0][0] = (
+            full_old_log_probs[0][0] + torch.log(torch.tensor(opsm_token_veto_threshold, device=device)) - 1.0
+        )
 
     return (
         Namespace(

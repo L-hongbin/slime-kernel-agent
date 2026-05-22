@@ -20,7 +20,9 @@ def _parse_opsm_config(config: str) -> dict[str, Any]:
     try:
         parsed = json.loads(config)
     except json.JSONDecodeError as exc:
-        raise ValueError('--opsm-config must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.') from exc
+        raise ValueError(
+            '--opsm-config must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
+        ) from exc
 
     if not isinstance(parsed, dict):
         raise ValueError("--opsm-config must parse to a dictionary/object.")
@@ -75,9 +77,7 @@ def _parse_opsm_args(args) -> None:
     args.opsm_delta = args.opsm_lower
 
     if args.opsm_token_veto_threshold is not None and args.opsm_token_veto_threshold <= 0:
-        raise ValueError(
-            f"--opsm-token-veto-threshold must be positive, got {args.opsm_token_veto_threshold}."
-        )
+        raise ValueError(f"--opsm-token-veto-threshold must be positive, got {args.opsm_token_veto_threshold}.")
     if args.opsm_aggregation not in {"kl", "geometric", "turns_geometric"}:
         raise ValueError(
             "--opsm-aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "

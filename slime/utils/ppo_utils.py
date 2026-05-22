@@ -198,9 +198,7 @@ def _compute_opsm_mask_batched(
         aggregated_value = log_ratio.sum(dim=1) / valid_token_counts
     elif opsm_aggregation == "geometric":
         train_over_old_log_ratio_mean = -log_ratio.sum(dim=1) / valid_token_counts
-        aggregated_value = torch.exp(
-            torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND)
-        )
+        aggregated_value = torch.exp(torch.clamp(train_over_old_log_ratio_mean, min=-SAFETY_BOUND, max=SAFETY_BOUND))
     elif opsm_aggregation == "turns_geometric":
         max_turns = getattr(args, "max_turns", None)
         if max_turns is None:
@@ -301,9 +299,7 @@ def compute_coverage_rejection_mask(
     `1` keeps tokens in policy loss and `0` masks them out.
     """
     if len(env_info) != len(loss_masks):
-        raise ValueError(
-            f"env_info length must match loss_masks length, got {len(env_info)} and {len(loss_masks)}."
-        )
+        raise ValueError(f"env_info length must match loss_masks length, got {len(env_info)} and {len(loss_masks)}.")
 
     coverage_key = getattr(args, "coverage_rs_key", "time_coverage")
     if coverage_key not in {"time_coverage", "num_coverage"}:

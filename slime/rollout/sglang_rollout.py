@@ -413,7 +413,9 @@ async def generate_and_rm_group(
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
-        assert group and all(isinstance(sample, Sample) for sample in group), "Group RM requires all samples to be valid"
+        assert group and all(
+            isinstance(sample, Sample) for sample in group
+        ), "Group RM requires all samples to be valid"
         with trace_span(group, "group_reward_model"):
             rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
@@ -430,9 +432,9 @@ def _split_turns_as_sample_groups(group: list[Sample] | list[list[Sample]]) -> l
 
     turn_groups: dict[int, list[Sample]] = {}
     for sample_outputs in group:
-        assert sample_outputs and all(isinstance(sample, Sample) for sample in sample_outputs), (
-            "--use-multi-turn expects list[list[Sample]] after generate_and_rm_group"
-        )
+        assert sample_outputs and all(
+            isinstance(sample, Sample) for sample in sample_outputs
+        ), "--use-multi-turn expects list[list[Sample]] after generate_and_rm_group"
         for sample in sample_outputs:
             turn_idx = sample.metadata.get("turn_idx") if sample.metadata is not None else None
             assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
@@ -515,7 +517,7 @@ async def generate_rollout_async(
     use_multi_turn = getattr(args, "use_multi_turn", False)
     max_turns = getattr(args, "max_turns", None)
     filter_by_last_turn = use_multi_turn and getattr(args, "filter_by_last_turn", False)
-    
+
     if use_multi_turn:
         assert max_turns is not None, "--max-turns must be set when --use-multi-turn is enabled"
         max_turns = int(max_turns)
@@ -548,16 +550,16 @@ async def generate_rollout_async(
                 continue
             groups: list[list[Sample]] = task_group if isinstance(task_group[0], list) else [task_group]
             is_filtered = True
-            
+
             last_turn_dynamic_filter_output = None
             if filter_by_last_turn:
                 last_turn_dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, groups[-1])
             all_data.extend(groups)
 
             for group in groups:
-                assert group and all(isinstance(sample, Sample) for sample in group), (
-                    f"Rollout group must be list[Sample], got {type(group).__name__}"
-                )
+                assert group and all(
+                    isinstance(sample, Sample) for sample in group
+                ), f"Rollout group must be list[Sample], got {type(group).__name__}"
 
                 if do_print:
                     sample = group[0]

@@ -696,7 +696,7 @@ class RolloutManager:
                 std = rewards.std(dim=-1, keepdim=True)
                 rewards = rewards / (std + 1e-6)
             if self.args.advantage_estimator in ["rloo"]:
-                #Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
+                # Compute advantage for RLOO based on https://arxiv.org/abs/2402.14740
                 # Each contiguous group of ``n_samples_per_prompt`` samples is treated as one
                 # prompt group. The leave-one-out baseline for a sample is the mean reward of
                 # the other samples in that group. For singleton groups, no baseline is used.
