@@ -38,3 +38,4 @@ The repository's top-level harness files are the stable operational documents th
    - state what workaround, judgment call, or temporary procedure was used instead
    - state whether the gap still exists in the skill after the task
 4. In final summaries, prefer a combined "problem and resolution" structure instead of separating "problems" and "adjustments".
+5. Don’t fight errors. Whenever you encounter the same error twice, research the web and find 3-5 possible ways to fix it. Then choose the most efficient solution and implement it.

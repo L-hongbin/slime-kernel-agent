@@ -199,3 +199,4 @@ tmp.md
 *.bundle
 checkpoints/
 .vscode/
+uv.lock
