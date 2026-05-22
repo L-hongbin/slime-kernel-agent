@@ -21,9 +21,9 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
     filter_config = CUDA_AGENT_CONFIGS.get("filter", {})
     reject_low_variance_groups = bool(filter_config.get("reject_low_variance_groups", True))
     reject_small_groups = bool(filter_config.get("reject_small_groups", True))
-    
+
     target_group_size = getattr(args, "target_group_size", None) or filter_config.get("target_group_size")
-    target_group_size = target_group_size or getattr(args, "n_samples_per_prompt")
+    target_group_size = target_group_size or args.n_samples_per_prompt
     min_group_size = getattr(args, "min_group_size", None)
     if min_group_size is None:
         min_group_size = filter_config.get("min_group_size")
@@ -40,7 +40,7 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
             f"With min_group_size={min_group_size}, padding to target_group_size={target_group_size} "
             f"would result in >{padding_ratio:.0f}% padding per group."
         )
-   
+
     reward_std_threshold = getattr(args, "reward_std_threshold", None)
     if reward_std_threshold is None:
         reward_std_threshold = filter_config.get("reward_std_threshold", 1e-3)
@@ -57,7 +57,6 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
             reward_std_threshold,
         )
         _FILTER_CONFIG_LOGGED = True
-    
 
     valid_samples = [sample for sample in samples if not sample.remove_sample]
     if reject_small_groups and len(valid_samples) < min_group_size:

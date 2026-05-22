@@ -19,22 +19,13 @@ try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import run_kernel_eval
     from .kernel_reward import calculate_reward
-    from .utils import (
-        normalize_env_feedback,
-        postprocess_turn_samples,
-        precheck_response,
-        split_think_response,
-    )
+    from .utils import normalize_env_feedback, postprocess_turn_samples, precheck_response, split_think_response
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import run_kernel_eval
     from kernel_reward import calculate_reward
-    from utils import (
-        normalize_env_feedback,
-        postprocess_turn_samples,
-        precheck_response,
-        split_think_response,
-    )
+
+    from utils import normalize_env_feedback, postprocess_turn_samples, precheck_response, split_think_response
 
 logger = logging.getLogger(__name__)
 
@@ -86,9 +77,7 @@ def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _get_tool_response_template(state: GenerateState) -> str:
     template = (state.multi_turn_templates or {}).get("tool_response")
     if template is None:
-        logger.warning(
-            "multi-turn tool_response template is not set; using built-in CUDA agent prompt template."
-        )
+        logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
         return DEFAULT_TOOL_RESPONSE_TEMPLATE
     return template
 
@@ -580,7 +569,9 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
 
         messages.append({"role": "user", "content": format_feedback})
 
-    total_request_time = sum(float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs)
+    total_request_time = sum(
+        float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs
+    )
     is_slowest = await _is_slowest_multiturn(args, sample, total_request_time) if turn_logs else False
     if should_log or is_slowest:
         _log_multiturn_messages(

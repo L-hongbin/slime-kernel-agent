@@ -65,9 +65,9 @@ class _HybridHttpWorker:
             limits=self._limits,
             headers={"Content-Type": "application/json"},
         )
-        self._rate_limit_worker = _TokenBucketWorker.options(name="kernel-eval-rate-limiter", get_if_exists=True).remote(
-            rate_limit
-        )
+        self._rate_limit_worker = _TokenBucketWorker.options(
+            name="kernel-eval-rate-limiter", get_if_exists=True
+        ).remote(rate_limit)
         self._task_status: dict[str, dict[str, Any]] = {}
 
     def _backoff(self, attempt: int, base: int = 2, cap: int = 30) -> float:
@@ -103,7 +103,9 @@ class _HybridHttpWorker:
                     return {"status": "failed", "error_message": "rate limiter acquire timeout"}
 
                 if attempt == 0:
-                    print(f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}")
+                    print(
+                        f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}"
+                    )
                 response = self._client.post(f"{self.server_url}/evaluate", json=task_data)
                 try:
                     print(
@@ -218,9 +220,7 @@ def _get_kernel_eval_worker(args, config: dict[str, Any]):
         acquire_timeout,
     )
     if worker_key not in _WORKERS:
-        _WORKERS[worker_key] = _HybridHttpWorker.options(
-            max_concurrency=worker_max_concurrency
-        ).remote(
+        _WORKERS[worker_key] = _HybridHttpWorker.options(max_concurrency=worker_max_concurrency).remote(
             server_url,
             rate_limit,
             task_timeout,
@@ -254,9 +254,7 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
     }
     if payload.get("uuid"):
         task_payload["uuid"] = payload["uuid"]
-    if payload.get(
-        "split_compile_and_execute", _kernel_eval_param(args, config, "split_compile_and_execute", True)
-    ):
+    if payload.get("split_compile_and_execute", _kernel_eval_param(args, config, "split_compile_and_execute", True)):
         task_payload["split_compile_and_execute"] = True
     if payload.get(
         "enable_compile_artifact_cache", _kernel_eval_param(args, config, "enable_compile_artifact_cache", True)

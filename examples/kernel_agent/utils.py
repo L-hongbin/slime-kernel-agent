@@ -6,9 +6,9 @@ from typing import Any
 from slime.utils.types import Sample
 
 try:
-    from .config import CUDA_AGENT_CONFIGS
+    pass
 except ImportError:
-    from config import CUDA_AGENT_CONFIGS
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +277,9 @@ def precheck_cuda_agent_code(
             register_binding_issue = _find_register_binding_semicolon_issue(source_map)
             if register_binding_issue is not None:
                 issue_file, issue_line = register_binding_issue
-                return fail(f"{issue_file}:{issue_line} has REGISTER_BINDING(...) without a trailing ';'", SYNTAX_ERROR)
+                return fail(
+                    f"{issue_file}:{issue_line} has REGISTER_BINDING(...) without a trailing ';'", SYNTAX_ERROR
+                )
         elif normalized_mode == "tvm_ffi":
             if binding_api == "python_extension":
                 return fail(

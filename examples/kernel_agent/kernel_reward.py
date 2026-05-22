@@ -92,14 +92,20 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     num_custom_kernel = result.get("num_custom_kernel", metadata.get("num_custom_kernel", 0)) or 0
     num_total_kernels = result.get("num_total_kernels", metadata.get("num_total_kernels", 0)) or 0
-    custom_time = result.get(
-        "custom_kernel_cuda_time_in_profiling_us",
-        metadata.get("custom_kernel_cuda_time_in_profiling_us", 0),
-    ) or 0
-    total_time = result.get(
-        "total_kernel_run_time_in_profiling_us",
-        metadata.get("total_kernel_run_time_in_profiling_us", 0),
-    ) or 0
+    custom_time = (
+        result.get(
+            "custom_kernel_cuda_time_in_profiling_us",
+            metadata.get("custom_kernel_cuda_time_in_profiling_us", 0),
+        )
+        or 0
+    )
+    total_time = (
+        result.get(
+            "total_kernel_run_time_in_profiling_us",
+            metadata.get("total_kernel_run_time_in_profiling_us", 0),
+        )
+        or 0
+    )
 
     number_coverage = float(num_custom_kernel) / float(num_total_kernels) if num_total_kernels else 0.0
     time_coverage = float(custom_time) / float(total_time) if total_time else 0.0
@@ -147,9 +153,10 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
     if not compiled and config["apply_compilation_fail_penalty"]:
         reward = float(config["compilation_fail_penalty"])
     else:
-        reward = float(config["init_correct_weight"]) * float(correctness) + float(
-            config["init_performance_weight"]
-        ) * reward_speedup
+        reward = (
+            float(config["init_correct_weight"]) * float(correctness)
+            + float(config["init_performance_weight"]) * reward_speedup
+        )
 
     coverage_info = {
         "coverage": 0.0,

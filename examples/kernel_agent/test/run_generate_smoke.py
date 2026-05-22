@@ -405,7 +405,9 @@ def _maybe_start_rollout(args):
 
 
 async def _run(args) -> None:
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     _init_ray_for_kernel_env(args)
     CUDA_AGENT_CONFIGS["max_feedback_chars"] = args.max_feedback_chars
     CUDA_AGENT_CONFIGS["log_multi_turn_sample_rate"] = 1.0
@@ -491,7 +493,9 @@ async def _run(args) -> None:
                 f"[cuda_agent][generate_smoke][sample {idx}] remove_reason="
                 f"{(output_sample.metadata or {}).get('remove_reason')}"
             )
-            print(f"[cuda_agent][generate_smoke][sample {idx}] turn_idx={(output_sample.metadata or {}).get('turn_idx')}")
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] turn_idx={(output_sample.metadata or {}).get('turn_idx')}"
+            )
             print(
                 f"[cuda_agent][generate_smoke][sample {idx}] is_pad_turn="
                 f"{(output_sample.metadata or {}).get('is_pad_turn')}"
@@ -516,9 +520,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Smoke-test the full CUDA agent generate -> env -> feedback path.")
     parser.add_argument("--real-env", dest="mock_env", action="store_false", help="Call the real KernelServer env.")
     parser.set_defaults(mock_env=True)
-    parser.add_argument("--kernel-env-url", default="", help="KernelServer URL, for example http://192.168.16.21:8003.")
+    parser.add_argument(
+        "--kernel-env-url", default="", help="KernelServer URL, for example http://192.168.16.21:8003."
+    )
     parser.add_argument("--real-model", action="store_true", help="Use an already running rollout /generate endpoint.")
-    parser.add_argument("--start-rollout", action="store_true", help="Start a local SGLang rollout server before generate.")
+    parser.add_argument(
+        "--start-rollout", action="store_true", help="Start a local SGLang rollout server before generate."
+    )
     parser.add_argument("--rollout-command", default="", help="Custom command used by --start-rollout.")
     parser.add_argument("--model-path", default="", help="Model path for python -m sglang.launch_server.")
     parser.add_argument("--hf-checkpoint", default="", help="Tokenizer checkpoint. Defaults to --model-path.")
@@ -572,7 +580,9 @@ def parse_args():
     parser.add_argument("--kernel-eval-client-timeout", type=int, default=300)
     parser.add_argument("--kernel-eval-task-timeout", type=int, default=120)
     parser.add_argument("--kernel-eval-heartbeat-interval", type=float, default=5.0)
-    parser.add_argument("--ray-address", default="", help="Ray address for kernel env workers. Empty starts local Ray.")
+    parser.add_argument(
+        "--ray-address", default="", help="Ray address for kernel env workers. Empty starts local Ray."
+    )
     parser.add_argument("--ray-num-cpus", type=int, default=2)
     parser.add_argument("--num-correct-trials", type=int, default=1)
     parser.add_argument("--num-perf-trials", type=int, default=1)

@@ -20,7 +20,6 @@ from slime.utils.ppo_utils import (
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
-    get_rloo_returns,
 )
 from slime.utils.types import RolloutBatch
 
