@@ -2,10 +2,12 @@
 
 set -eo pipefail
 
+EVAL_CONFIG_PATH=scripts/eval_kernelbench_level1.yaml
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}"
+RUN_TS="$(date +%Y%m%d_%H%M%S)"
+SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}"
 LOG_DIR="${SAVE_DIR}"
-LOG_FILE="${LOG_DIR}/run_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${LOG_DIR}/run_log"
 mkdir -p "${LOG_DIR}"
 touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
@@ -18,7 +20,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/ray/start_cluster.sh"
 source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
 
-TP=2
+TP=4
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 
 CKPT_ARGS=(
@@ -32,16 +34,21 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
+   --custom-rm-path slime_plugins.drkernel.kernelgym_rm.custom_rm
+   --rollout-function-path slime_plugins.drkernel.rollout.generate_rollout
    --prompt-data data/drkernel-rl-data-0513/train.parquet
-   --input-key prompt
-   --label-key label
-   --apply-chat-template
+   --input-key ground_truth
+   --label-key ground_truth
+   --metadata-key extra_info
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 3000
+   --num-rollout 0
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --n-samples-per-eval-prompt 8
+   --rollout-max-prompt-len 32767
+   --rollout-max-response-len 32767
+   --rollout-max-context-len 32768
    --rollout-temperature 1
 
    --global-batch-size 256
@@ -51,10 +58,12 @@ ROLLOUT_ARGS=(
 EVAL_ARGS=(
    --eval-interval 20
    --skip-eval-before-train
-   --eval-prompt-data aime data/kernelbench-level1-validation/train.parquet
-   --n-samples-per-eval-prompt 1
-   --eval-max-response-len 16384
-   --eval-top-p 1
+   --eval-config "${EVAL_CONFIG_PATH}"
+   --eval-max-prompt-len 32768
+   --eval-max-response-len 32768
+   --eval-max-context-len 32768
+   --rm-url http://192.168.16.40:20111
+   --dump-details ${SAVE_DIR}/dumps
 )
 
 PERF_ARGS=(
@@ -76,9 +85,9 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
-   --use-kl-loss
-   --kl-loss-coef 0.00
-   --kl-loss-type low_var_kl
+   # --use-kl-loss
+   # --kl-loss-coef 0.00
+   # --kl-loss-type low_var_kl
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -102,7 +111,10 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
+   --sglang-context-length 32768
+   --sglang-max-running-requests 64
    --sglang-mem-fraction-static 0.7
+   --sglang-decode-log-interval 400
 )
 
 MISC_ARGS=(
@@ -129,8 +141,7 @@ RUNTIME_ENV_JSON="{
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
-   --actor-num-nodes 1 \
-   --actor-num-gpus-per-node ${NUM_GPUS} \
+   --actor-num-gpus-per-node 8 \
    --colocate \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
@@ -142,3 +153,5 @@ submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]}
+
+   # --debugpy \

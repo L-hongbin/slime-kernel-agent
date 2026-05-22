@@ -1,7 +1,7 @@
 eval:
   defaults:
     # DrKernel Qwen3-14B offline / KernelBench L1 fullset eval settings.
-    n_samples_per_eval_prompt: 8
+    # n_samples_per_eval_prompt: 8
     temperature: 1.0
     top_p: 0.95
     top_k: 20
@@ -20,7 +20,7 @@ eval:
         is_valid: true
         level: 1
         split: validation
-      n_samples_per_eval_prompt: 8
+      # n_samples_per_eval_prompt: 8
 
 # Companion launch arg from the same DrKernel eval setup that is not a dataset
 # field in slime's eval config:
