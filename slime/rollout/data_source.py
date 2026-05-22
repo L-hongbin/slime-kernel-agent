@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class DataSource(abc.ABC):
     @abc.abstractmethod
-    def get_samples(self, num_samples: int) -> list[list[Sample]]:
+    def get_samples(self, num_samples: int, rollout_id=None) -> list[list[Sample]]:
         """
         Return num_samples samples
         """
@@ -87,7 +87,7 @@ class RolloutDataSource(DataSource):
         else:
             self.dataset = None
 
-    def get_samples(self, num_samples):
+    def get_samples(self, num_samples, rollout_id=None):
         # TODO further improve code
         if self.dataset is not None:
             if self.sample_offset + num_samples <= len(self.dataset):
@@ -174,7 +174,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         else:
             self.buffer_filter = load_function(self.args.buffer_filter_path)
 
-    def get_samples(self, num_samples: int) -> list[list[Sample]]:
+    def get_samples(self, num_samples: int, rollout_id=None) -> list[list[Sample]]:
         """
         Return num_samples samples
         """
@@ -185,7 +185,7 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
         if num_samples == 0:
             return samples
 
-        samples += super().get_samples(num_samples=num_samples)
+        samples += super().get_samples(num_samples=num_samples, rollout_id=rollout_id)
         return samples
 
     def _get_samples_from_buffer(self, num_samples: int) -> list[list[Sample]]:
