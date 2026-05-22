@@ -69,7 +69,31 @@ class KernelGymClient:
         object.__setattr__(self, "base_url", base_url)
         object.__setattr__(self, "_owns_session", self.session is None)
 
+    @classmethod
+    async def create(cls, base_url: str, **kwargs: Any) -> KernelGymClient:
+        """Create a client and verify the KernelGym `/health` endpoint is reachable."""
+
+        client = cls(base_url, **kwargs)
+        await client._check_health()
+        return client
+
+    async def _check_health(self) -> None:
+        try:
+            payload = await self._request_json(
+                "GET",
+                "/health",
+                timeout_s=5,
+                max_retries=0,
+            )
+        except KernelGymRequestError as exc:
+            raise KernelGymRequestError(f"KernelGym health check failed for {self.base_url}: {exc}") from exc
+
+        status = payload.get("status")
+        if status != "healthy":
+            raise KernelGymRequestError(f"KernelGym at {self.base_url} is not healthy (status={status!r}): {payload}")
+
     async def __aenter__(self) -> KernelGymClient:
+        await self._check_health()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -120,14 +144,18 @@ class KernelGymClient:
         path: str,
         *,
         json: dict[str, Any] | None = None,
+        timeout_s: float | None = None,
+        max_retries: int | None = None,
     ) -> dict[str, Any]:
         session = self._get_session()
         url = f"{self.base_url}{path}"
         last_error: Exception | None = None
+        request_timeout = aiohttp.ClientTimeout(total=timeout_s or self.timeout_s)
+        retry_limit = self.max_retries if max_retries is None else max_retries
 
-        for attempt in range(self.max_retries + 1):
+        for attempt in range(retry_limit + 1):
             try:
-                async with session.request(method, url, json=json) as response:
+                async with session.request(method, url, json=json, timeout=request_timeout) as response:
                     text = await response.text()
                     if response.status >= 400:
                         raise KernelGymRequestError(
@@ -146,7 +174,7 @@ class KernelGymClient:
                     return payload
             except (aiohttp.ClientError, asyncio.TimeoutError, KernelGymRequestError) as exc:
                 last_error = exc
-                if attempt >= self.max_retries:
+                if attempt >= retry_limit:
                     break
                 delay = self.retry_base_delay_s * (2**attempt)
                 logger.info(
@@ -156,7 +184,7 @@ class KernelGymClient:
                     type(exc).__name__,
                     delay,
                     attempt + 1,
-                    self.max_retries,
+                    retry_limit,
                 )
                 await asyncio.sleep(delay)
 
@@ -304,7 +332,7 @@ async def evaluate_sample(
 
     owns_client = client is None
     if client is None:
-        client = KernelGymClient(
+        client = await KernelGymClient.create(
             _get_rm_url(args),
             max_retries=int(_get_arg(args, "kernelgym_max_retries", 2)),
         )
@@ -328,7 +356,7 @@ async def custom_rm(args: Any, sample_or_samples: Sample | list[Sample], **_: An
     """Optional single-turn slime custom RM wrapper for KernelGym smoke tests."""
 
     samples = sample_or_samples if isinstance(sample_or_samples, list) else [sample_or_samples]
-    client = KernelGymClient(
+    client = await KernelGymClient.create(
         _get_rm_url(args),
         max_retries=int(_get_arg(args, "kernelgym_max_retries", 2)),
     )

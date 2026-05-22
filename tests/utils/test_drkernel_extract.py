@@ -28,7 +28,7 @@ class ModelNew:
 
     submission = extract_kernel_submission(response)
 
-    assert submission.backend == "cuda_agent"
+    assert submission.backend == "auto"
     assert submission.sections == {
         "CUDA_KERNELS": 'extern "C" __global__ void add_one(float* x) {}',
         "APPLY_BINDINGS": "PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}",

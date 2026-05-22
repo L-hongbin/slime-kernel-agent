@@ -17,7 +17,8 @@ __all__ = [
     "strip_think_blocks",
 ]
 
-CUDA_KERNEL_BACKEND = "cuda_agent"
+# KernelGym resolves "auto" from submission markers (tvm_ffi vs cuda_agent).
+CUDA_KERNEL_BACKEND = "auto"
 
 CUDA_AGENT_SECTION_ORDER = (
     ("CUDA_KERNELS", "cpp"),

@@ -1,6 +1,7 @@
 import asyncio
 import re
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -19,6 +20,7 @@ from slime_plugins.drkernel.kernelgym_rm import (
     KERNELGYM_VERBOSE_ERRORS,
     KERNELGYM_WORKFLOW,
     KernelGymClient,
+    KernelGymRequestError,
     _get_rm_url,
     build_evaluation_request,
     evaluate_sample,
@@ -48,7 +50,7 @@ def test_build_evaluation_request_uses_sample_label_as_reference_code():
 
     assert re.fullmatch(r"parallel_task_\d{6}_[0-9a-f]{8}", request["task_id"])
     assert request["reference_code"] == "import torch\nclass Model:\n    pass"
-    assert request["backend"] == "cuda_agent"
+    assert request["backend"] == "auto"
     assert request["entry_point"] == "Model"
     assert request["workflow"] == KERNELGYM_WORKFLOW
     assert request["use_reference_cache"] is KERNELGYM_USE_REFERENCE_CACHE
@@ -257,6 +259,37 @@ def test_rm_url_is_required():
 @pytest.mark.unit
 def test_kernelgym_client_default_timeout_is_hardcoded():
     assert KernelGymClient("http://kernelgym").timeout_s == KERNELGYM_CLIENT_TIMEOUT_S
+
+
+@pytest.mark.unit
+def test_kernelgym_client_check_health_rejects_unhealthy_status():
+    async def run() -> None:
+        async def fake_request_json(self, method, path, **kwargs):
+            assert method == "GET"
+            assert path == "/health"
+            return {"status": "degraded", "gpu_status": {}}
+
+        with patch.object(KernelGymClient, "_request_json", fake_request_json):
+            client = KernelGymClient("http://kernelgym")
+            with pytest.raises(KernelGymRequestError, match="is not healthy"):
+                await client._check_health()
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_kernelgym_client_create_runs_health_check():
+    async def run() -> None:
+        async def fake_request_json(self, method, path, **kwargs):
+            assert method == "GET"
+            assert path == "/health"
+            return {"status": "healthy", "gpu_status": {"cuda:0": {"available": True}}}
+
+        with patch.object(KernelGymClient, "_request_json", fake_request_json):
+            client = await KernelGymClient.create("http://kernelgym")
+            assert client.base_url == "http://kernelgym"
+
+    asyncio.run(run())
 
 
 @pytest.mark.unit
