@@ -1,13 +1,13 @@
 eval:
   defaults:
-    # DrKernel Qwen3-14B offline / KernelBench L1 fullset eval settings.
+    # DrKernel offline / KernelBench L1 fullset eval settings.
     # n_samples_per_eval_prompt: 8
     temperature: 1.0
     top_p: 0.95
     top_k: 20
-    max_prompt_len: 32768
-    max_response_len: 32768
-    max_context_len: 32768
+    # max_prompt_len: 32768
+    # max_response_len: 32768
+    # max_context_len: 32768
   datasets:
     - name: kernelbench_level1
       path: data/kernelbench-level1-validation/train.parquet

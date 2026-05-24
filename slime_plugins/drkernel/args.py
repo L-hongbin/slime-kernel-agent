@@ -66,4 +66,20 @@ def add_custom_arguments(parser):
             "the decision keeps or drops every turn group from the same rollout."
         ),
     )
+    # Deferred import: rollout.py pulls in heavy deps (jinja2, transformers, slime
+    # internals). We only need the default-value constant here, and parse_args
+    # callers don't otherwise need rollout.py to be imported eagerly.
+    from slime_plugins.drkernel.rollout import DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS
+
+    parser.add_argument(
+        "--kernelgym-error-summary-chars",
+        type=int,
+        default=DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS,
+        help=(
+            "Character limit for the summarized error_message field that gets injected into the next-turn "
+            "tool_response. The summarizer keeps a few nvcc error / stack-frame lines and drops raw stderr / "
+            "internal KernelGym profiling. ~400 tokens by default — covers most failure modes without flooding "
+            "the prompt. See slime_plugins/drkernel/design-docs/feedback_summarization.md."
+        ),
+    )
     return parser

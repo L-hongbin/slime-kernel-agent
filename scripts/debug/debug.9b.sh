@@ -2,23 +2,30 @@
 
 set -eo pipefail
 
+# Parametrized for sweep runs. Override e.g. CTX_LEN=65536 bash debug.9b.sh.
+CTX_LEN=${CTX_LEN:-32768}
+N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-1}
+ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
+ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
+
 EVAL_CONFIG_PATH=scripts/eval_kernelbench_level1.yaml
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}"
+SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}"
 LOG_DIR="${SAVE_DIR}"
 LOG_FILE="${LOG_DIR}/run_log"
 mkdir -p "${LOG_DIR}"
 touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
-echo "Logging to ${LOG_FILE}"
+echo "Logging to ${LOG_FILE} (CTX_LEN=${CTX_LEN}, N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT})"
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/ray/start_cluster.sh"
-source "${SCRIPT_DIR}/models/qwen3.5-9B.sh"
+# debug.9b.sh lives in scripts/debug/; ray/ and models/ are siblings of debug/.
+source "${SCRIPT_DIR}/../ray/start_cluster.sh"
+source "${SCRIPT_DIR}/../models/qwen3.5-9B.sh"
 
 TP=4
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
@@ -45,10 +52,10 @@ ROLLOUT_ARGS=(
    --num-rollout 0
    --rollout-batch-size 32
    --n-samples-per-prompt 8
-   --n-samples-per-eval-prompt 8
-   --rollout-max-prompt-len 32767
-   --rollout-max-response-len 32767
-   --rollout-max-context-len 32768
+   --n-samples-per-eval-prompt ${N_SAMPLES_PER_EVAL_PROMPT}
+   --rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}
+   --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN}
+   --rollout-max-context-len ${CTX_LEN}
    --rollout-temperature 1
 
    --global-batch-size 256
@@ -59,11 +66,20 @@ EVAL_ARGS=(
    --eval-interval 20
    --skip-eval-before-train
    --eval-config "${EVAL_CONFIG_PATH}"
-   --eval-max-prompt-len 32768
-   --eval-max-response-len 32768
-   --eval-max-context-len 32768
+   --eval-max-prompt-len ${CTX_LEN}
+   --eval-max-response-len ${CTX_LEN}
+   --eval-max-context-len ${CTX_LEN}
    --rm-url http://192.168.16.40:20111
    --dump-details ${SAVE_DIR}/dumps
+)
+
+DRKERNEL_PLUGIN_ARGS=(
+   --use-multi-turn
+   # smoke: max-turns 3 (full multi-turn loop exercised; reduce to 2 if KernelGym is slow)
+   --max-turns 3
+   # NOTE: --padding-turns / --multi-turn-gamma / --filter-by-last-turn are training-side flags
+   # and have no effect in the eval driver (generate_multi_turn_eval_sample). Add them when
+   # the training-side multi-turn rollout lands.
 )
 
 PERF_ARGS=(
@@ -111,7 +127,7 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
-   --sglang-context-length 32768
+   --sglang-context-length ${CTX_LEN}
    --sglang-max-running-requests 64
    --sglang-mem-fraction-static 0.7
    --sglang-decode-log-interval 400
@@ -128,13 +144,17 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-# Build the runtime environment JSON with proper variable substitution
+# Build the runtime environment JSON with proper variable substitution.
+# DRKERNEL_SMOKE_MAX_PROMPTS caps eval to first N prompts in eval_rollout_single_dataset.
+# Unset (or set to 0) for full validation-set eval.
+DRKERNEL_SMOKE_MAX_PROMPTS=${DRKERNEL_SMOKE_MAX_PROMPTS:-100}
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\"
+    \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\",
+    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\"
   }
 }"
 
@@ -152,6 +172,6 @@ submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]}
-
+   ${MISC_ARGS[@]} \
+   ${DRKERNEL_PLUGIN_ARGS[@]}
    # --debugpy \
