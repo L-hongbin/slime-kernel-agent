@@ -59,6 +59,7 @@
 | 20260524_142451_ctx65536_n8_summ1600_v2_3_env_n8 | 800 | tvm_ffi_module_v2_3.jinja | Y | 35.0% | 48.8% | 51.4% | 16.6% | 24.2% | 27.9% | 6.0% | 7.6% | 9.0% | 1.0% | 1.0% | 1.4% |
 | 20260524_154851_ctx65536_n8_summ1600_v2_3_noenv_n8 | 800 | tvm_ffi_module_v2_3.jinja | N | 35.4% | 49.9% | 50.1% | 20.1% | 29.6% | 29.4% | 9.4% | 12.1% | 11.0% | 1.1% | 2.0% | 1.6% |
 | 20260525_052501_ctx65536_n8_summ1600_rotated_mm_bf16_n8 | 800 | tvm_ffi_module_v2_3.jinja | N | 33.8% | 46.0% | 45.8% | 19.1% | 25.6% | 25.1% | 7.0% | 9.5% | 8.9% | 0.6% | 0.8% | 1.1% |
+| 20260525_071901_ctx65536_n8_summ1600_rotated_mm_nocenter_bf16_n8 | 800 | tvm_ffi_module_v2_3.jinja | N | 36.9% | 48.8% | 48.5% | 20.1% | 26.6% | 24.9% | 7.4% | 10.4% | 9.1% | 1.2% | 0.6% | 1.0% |
 
 #### 27B 观察
 
@@ -66,7 +67,7 @@
 - **env block 影响**：env_n8 vs noenv_n8 paired McNemar，env 始终略差（n=400 时 reward p=0.0029，n=800 收窄；T1 fast@1.0 始终显著差 p=0.0045）。Mechanism：env block 触发 hardware cargo-culting（692/800 提 sm_89），但不转化为更高 fast@x
 - **fast@1.2 T3 的天花板 ~1.5-1.6%** 在所有 v2_3 variants 上一致，与 LHB DIR1 报告的 6.6% 仍有显著 gap。这是 model + training-data 限制（模型在 tvm_ffi 后端从未写出激进优化），不是模板问题
 - v2 / v2_1 / v2_2 中间版本：加了 accessor doc / numel caveat 等"额外解释"，反而 compile T1 略降到 30%-36% 区间（vs v1 的 40%+ 和 v2_3 的 35%+）
-- **Hadamard offline rotation 在 BF16 下也有 ~4pp 精度成本**：rotated MM 100×8 vs v2_3 noenv 100×8 paired comparison，T3 compile -4.3pp (50.1% → 45.8%)、T3 correct -4.3pp (29.4% → 25.1%)。理论上 orthogonal rotation 数学等价，但实测 BF16 精度限制 + RMSNorm 融合后 round-trip + non-power-of-2 hidden=5120 用 random orthogonal 不是真 Hadamard 都贡献了一些累积舍入误差。重要的是这 4pp 是 **rotation 的 trade-off cost**，预期收益在 INT8 量化时 outliers 不爆炸（待 RTN INT8 实测验证）
+- **Hadamard offline rotation 在 BF16 下有 ~4pp 精度成本**：rotated MM 100×8 vs v2_3 noenv 100×8 paired comparison，T3 correct 29.4% → 25.1%（with centering）/ 24.9%（no centering）。**Forward-divergence probe**（详见 `scripts/quantize/PROBE_RESULTS.md`）证明 rotation 数学完全等价（pipeline_fp32 vs raw_fp32 logit L2 差异 = 0%），4pp 全部归因 BF16 部署：1.14pp 来自 bf16 vs fp32 forward 算术（即便不 rotation 也存在），0.44pp 来自 bf16 storage truncation of rotated weights。多轮 5k-token trajectory 上累积成 ~5 nats/turn KL drift，导致 4.3pp T3 correct 损失。**Centering 不是 4pp 主因** —— 禁掉 centering 后 T3 correct 仍 24.9%，几乎一样
 
 ---
 

@@ -74,21 +74,25 @@ Online (every RL step, milliseconds):
 - ✅ Hadamard rotation pipeline 完整跑通（`scripts/quantize/rotate_bf16_llmcompressor.py` + sglang multimodal load 验证）
 - ✅ Rotated MM BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-mm-bf16/`
 - ✅ **Forward-divergence probe 完成**（见 `scripts/quantize/PROBE_RESULTS.md`）：证明 rotation 数学等价，4pp 损失全部归因 bf16 部署 cost（1.14pp 算术 + 0.44pp storage）；fp32/fp64 pipeline 验证 rotation 0% 额外 cost
-- ✅ **Rotated MM BF16 100×8 baseline 完成**（1h21min）— **rotation 在 BF16 下有 ~4pp 精度成本**：
+- ✅ **Rotated MM BF16 100×8 baseline 完成**（两次：with-centering + no-centering，各 ~80min）
 
-  | metric | v2_3 noenv 100×8（unrotated baseline） | Rotated MM 100×8 | Δ |
-  |---|---|---|---|
-  | T1 compile | 35.4% | 33.8% | -1.6pp |
-  | T2 compile | 49.9% | 46.0% | -3.9pp |
-  | T3 compile | 50.1% | 45.8% | **-4.3pp** |
-  | T1 correct | 20.1% | 19.1% | -1.0pp |
-  | T2 correct | 29.6% | 25.6% | -4.0pp |
-  | T3 correct | 29.4% | 25.1% | **-4.3pp** (~15% relative) |
-  | T3 fast@1.0 | 11.0% | 8.9% | -2.1pp |
-  | T3 fast@1.2 | 1.6% | 1.1% | -0.5pp |
-  | overall reward | ~0.28 | 0.2513 | -0.03 |
+  | metric | unrotated baseline | rotated **with-centering** | rotated **no-centering** | Δ (no-center vs base) |
+  |---|---|---|---|---|
+  | T1 compile | 35.4% | 33.8% | 36.9% | +1.5pp |
+  | T2 compile | 49.9% | 46.0% | 48.8% | -1.1pp |
+  | T3 compile | 50.1% | 45.8% | 48.5% | -1.6pp |
+  | T1 correct | 20.1% | 19.1% | 20.1% | 0pp |
+  | T2 correct | 29.6% | 25.6% | 26.6% | -3.0pp |
+  | T3 correct | 29.4% | 25.1% | 24.9% | **-4.5pp** |
+  | T3 fast@1.0 | 11.0% | 8.9% | 9.1% | -1.9pp |
+  | T3 fast@1.2 | 1.6% | 1.1% | 1.0% | -0.6pp |
+  | overall reward | ~0.28 | 0.2513 | **0.2488** | -0.03 |
 
-  原因（推测）：(a) BF16 7-bit mantissa 在 R/R.T 矩阵乘后累积舍入；(b) RMSNorm 融合后 weights round-trip BF16；(c) hidden=5120 非 power-of-2 用 random orthogonal 不是真 Hadamard；(d) per-token activation magnitudes 在 rotated basis 下分布变了，BF16 截断行为不同
+  **关键观察**：禁用 `_center_embeddings`（codex 最初猜测的 4pp 主因）几乎无效 —— T3 correct 24.9% vs 25.1% 基本同噪音 band。Compile 略升（45.8% → 48.5%）但 correct 不动。说明 centering 不是 4pp 的主因。
+
+  → 触发 forward-divergence probe，最终定位 4pp 是 bf16 deployment 固有累积代价（见上一行 Probe 结果 + `PROBE_RESULTS.md`）：
+    - 1.14pp 来自 bf16 vs fp32 forward 算术
+    - 0.44pp 来自 bf16 storage truncation of rotated weights
 - ⏸ INT8 RTN 扩展 + slime 训-rollout 闭环 wiring 待做
 
 ### Rotation cost 的策略含义（已细化，见 Probe 段）
