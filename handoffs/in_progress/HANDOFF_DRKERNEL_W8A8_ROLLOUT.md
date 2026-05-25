@@ -160,6 +160,17 @@ AttributeError: 'Qwen3_5TextConfig' object has no attribute 'num_experts'
 
 **结论**：暴露了"SGLang 这个 dense entry 实际是死代码" —— Qwen3_5ForCausalLM 类代码齐全但从没被当独立入口跑通过（否则启动期 expert-location 立刻爆 AttributeError，PR 不可能 merge）。llmcompressor 把多模态模型量化成 ForCausalLM 是常规操作，撞上 ecosystem mismatch。
 
+#### sglang main 分支也没修（核实于 2026-05-25）
+
+WebFetch `https://raw.githubusercontent.com/sgl-project/sglang/main/python/sglang/srt/models/qwen3_5.py` 结果：
+
+- `EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]` —— `Qwen3_5ForCausalLM` 仍未注册
+- `Qwen3_5ForCausalLM.get_model_config_for_expert_location` 仍是 `num_logical_experts=config.num_experts`（无 getattr 守卫）
+
+**间接证据**：MoE 变体的同名方法已被改过加了 `text_config = getattr(config, "text_config", config)`（处理 multimodal config 嵌套），但 dense 那一份没动 —— 说明维护者最近碰过这块代码但没人触发过 dense 路径。"dense entry 是死代码"的判断在 main 上仍然成立。
+
+**含义**：升级 sglang 不能解锁本次 W8A8 加载；retry 路径 C（等上游）需要主动提 issue 推动修复（改动很小：1 行 `getattr` + EntryClass 加 1 项），但需要 sglang 维护者愿意 review/merge。
+
 ## Codex 二审（独立核实，2026-05-25）
 
 prompt: `/tmp/codex_phase2_abandon.txt`
