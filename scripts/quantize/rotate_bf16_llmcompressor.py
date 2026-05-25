@@ -36,6 +36,9 @@ import os
 import re
 
 import torch
+from llmcompressor.modifiers.transform.spinquant.mappings import SpinQuantMapping
+from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
+from transformers import AutoTokenizer
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
 
@@ -70,7 +73,6 @@ def build_qwen35_mapping():
 
     Done lazily so the script's --help works without llmcompressor installed.
     """
-    from llmcompressor.modifiers.transform.spinquant.mappings import SpinQuantMapping
 
     return SpinQuantMapping(
         embedding=r"re:.*language_model\.embed_tokens$",
@@ -111,7 +113,6 @@ def build_qwen35_norm_mappings(model):
 
     (Diagnosis from codex review of the script, 2026-05-25.)
     """
-    from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
 
     named = dict(model.named_modules())
     # Only consider language_model layers — multimodal vision tower has its
@@ -216,15 +217,13 @@ def parse_args():
     ap.add_argument(
         "--rotations",
         default="R1",
-        help="Comma-separated subset of {R1,R2}. Default R1 only. R2 is per-head and "
-        "questionable for linear_attn layers. R3/R4 are online and not supported here.",
+        help="Comma-separated subset of {R1,R2}. Default R1 only. R2 is per-head and questionable for linear_attn layers. R3/R4 are online and not supported here.",
     )
     ap.add_argument(
         "--transform-type",
         default="random-hadamard",
         choices=["hadamard", "random-hadamard", "random-matrix"],
-        help="Hidden_size=5120 for Qwen3.6-27B is not a power of 2, so plain hadamard may "
-        "need block_size. random-hadamard is the safest default.",
+        help="Hidden_size=5120 for Qwen3.6-27B is not a power of 2, so plain hadamard may need block_size. random-hadamard is the safest default.",
     )
     ap.add_argument("--transform-block-size", type=int, default=None, help="Override hidden_size auto-selection")
     return ap.parse_args()
@@ -233,8 +232,6 @@ def parse_args():
 def main():
     args = parse_args()
     rotations = [r.strip() for r in args.rotations.split(",") if r.strip()]
-
-    from transformers import AutoTokenizer
 
     print(f"[rotate] loading multimodal model from {args.model_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -289,7 +286,26 @@ def main():
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform import SpinQuantModifier
 
-    modifier = SpinQuantModifier(
+    # llmcompressor's SpinQuantModifier.on_start unconditionally calls
+    # _center_embeddings(model), which subtracts each embedding row's
+    # hidden-dim mean BEFORE applying R1. That's an additive per-token
+    # perturbation that does NOT cancel through residual rotation +
+    # RMSNorm (RMSNorm is scale-invariant but NOT translation-invariant).
+    # Result: the saved checkpoint is no longer mathematically equivalent
+    # to the original BF16 model.
+    #
+    # Codex audit (2026-05-25) of our first rotated BF16 100x8 ckpt
+    # showing T3 correct -4.3pp identified centering as the root cause.
+    # Disable it here for the BF16-equivalence experiment. If we add
+    # quantization later we can re-evaluate whether to re-enable it
+    # (centering is meant to reduce channel-mean outliers in downstream
+    # weight quantization; cost is the rotation-only baseline isn't
+    # math-identical to original BF16 anymore).
+    class _NoCenterSpinQuantModifier(SpinQuantModifier):
+        def _center_embeddings(self, model):
+            return
+
+    modifier = _NoCenterSpinQuantModifier(
         rotations=rotations,
         transform_type=args.transform_type,
         mappings=mapping,
