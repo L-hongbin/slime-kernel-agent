@@ -264,6 +264,23 @@ def main():
     # calibration dataset needed for R1/R2.
     oneshot(model=model, recipe=[modifier])
 
+    # sglang's Qwen3_5ForCausalLM expects `layers_block_type` with values
+    # `attention` / `linear_attention`. HF Qwen3.5 exposes `layer_types` with
+    # values `full_attention` / `linear_attention`. Add the alias here so the
+    # saved config has both, sidestepping the dense-entry naming dead-code in
+    # sglang. (Third bug in the dense path after EntryClass + num_experts;
+    # patched separately in scripts/quantize/sglang_qwen3_5_dense_entry.patch
+    # but cleanest to add the alias on the producer side too.)
+    if not hasattr(model.config, "layers_block_type") and hasattr(model.config, "layer_types"):
+        model.config.layers_block_type = [
+            "attention" if lt == "full_attention" else lt for lt in model.config.layer_types
+        ]
+        print(
+            f"[rotate] added layers_block_type alias ({len(model.config.layers_block_type)} layers) "
+            f"for sglang dense entry compatibility",
+            flush=True,
+        )
+
     print(f"[rotate] saving rotated BF16 to {args.output_path}", flush=True)
     model.save_pretrained(args.output_path)
     tokenizer.save_pretrained(args.output_path)
