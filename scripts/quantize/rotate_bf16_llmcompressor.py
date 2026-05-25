@@ -310,6 +310,30 @@ def main():
     print(f"[rotate] saving rotated BF16 to {args.output_path}", flush=True)
     model.save_pretrained(args.output_path)
     tokenizer.save_pretrained(args.output_path)
+
+    # Copy multimodal preprocessor / vocab / merges from source dir.
+    # save_pretrained writes config + tokenizer but not image_processor /
+    # video_processor / merges. sglang's multimodal entry refuses to load
+    # without preprocessor_config.json.
+    import shutil
+    from pathlib import Path
+
+    src = Path(args.model_path)
+    dst = Path(args.output_path)
+    for fname in (
+        "preprocessor_config.json",
+        "video_preprocessor_config.json",
+        "configuration.json",  # ModelScope cooperatively
+        "merges.txt",
+        "vocab.json",
+        "chat_template.jinja",  # in case save_pretrained didn't write it
+    ):
+        s = src / fname
+        d = dst / fname
+        if s.is_file() and not d.is_file():
+            shutil.copy2(s, d)
+            print(f"[rotate] copied multimodal config: {fname}", flush=True)
+
     print("[rotate] done", flush=True)
 
 
