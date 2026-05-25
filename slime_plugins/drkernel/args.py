@@ -82,4 +82,26 @@ def add_custom_arguments(parser):
             "the prompt. See slime_plugins/drkernel/design-docs/feedback_summarization.md."
         ),
     )
+    # First-turn target-environment hints that flow into the prompt layout's
+    # "Target environment:" block (NVCC / GPU / extra notes). Per-sample
+    # metadata can override these (e.g. mixed-GPU training); CLI args set the
+    # eval-time default. Leave empty to suppress the block entirely.
+    parser.add_argument(
+        "--drkernel-compiler-name",
+        type=str,
+        default=None,
+        help='Compiler version string injected into the prompt as "NVCC: <value>". E.g. "CUDA 12.9, V12.9.86".',
+    )
+    parser.add_argument(
+        "--drkernel-gpu-name",
+        type=str,
+        default=None,
+        help='GPU identification string injected into the prompt as "GPU: <value>". E.g. "NVIDIA A800-SXM4-80GB (SM 8.0)".',
+    )
+    parser.add_argument(
+        "--drkernel-extra-environment",
+        type=str,
+        default=None,
+        help="Free-form additional environment notes appended after NVCC/GPU lines (e.g. tvm_ffi version, sccache state).",
+    )
     return parser

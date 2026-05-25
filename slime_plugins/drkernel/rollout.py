@@ -107,8 +107,15 @@ class DrKernelPromptRenderer:
             slot_name="backend",
         )
 
-        role = self._load_fragment(role_candidate["text_path"])
-        backend = self._load_fragment(backend_candidate["first_turn_text_path"])
+        # Render each fragment through jinja before string-injecting into the outer
+        # layout. Without this pass, jinja constructs in the fragment ({# ... #}
+        # comments, {{ ... }} placeholders) survive as literal text in the final
+        # prompt — exactly the leak that produced the v2/v2.1/v2.2 ablation
+        # confound (May 2026). Fragments currently have no placeholders, so an
+        # empty render context is safe; if a fragment later needs vars, add them
+        # here and in the test.
+        role = self._render_template(self._load_fragment(role_candidate["text_path"]))
+        backend = self._render_template(self._load_fragment(backend_candidate["first_turn_text_path"]))
         layout = self._load_fragment(self.profile["layout"])
 
         compiler_name = metadata.get("compiler_name") or _get_arg(args, "drkernel_compiler_name")

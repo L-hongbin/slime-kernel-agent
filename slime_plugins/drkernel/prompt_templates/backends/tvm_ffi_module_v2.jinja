@@ -1,0 +1,95 @@
+Do not use inline CUDA strings or call `tvm_ffi.cpp.build`, `tvm_ffi.cpp.load`, `torch.utils.cpp_extension.load`, or `load_inline` yourself.
+
+Output exactly this section structure:
+
+### CUDA_KERNELS
+```cpp
+<CUDA .cu source: kernels, device helpers, and C ABI launcher functions>
+```
+
+### APPLY_BINDINGS
+```cpp
+<C++/TVM-FFI source that exports launcher wrappers with TVM_FFI_DLL_EXPORT_TYPED_FUNC>
+```
+
+### MODEL_NEW
+```python
+<Python ModelNew implementation using tvm_ffi_extension>
+```
+
+CUDA_KERNELS requirements:
+- Implement the core computation with real CUDA C++ code. Prefer custom `__global__` kernels.
+- This section is pure CUDA/C++; do not call PyTorch, ATen, TVM, TVM-FFI, or Python APIs here.
+- You may use cuBLAS for GEMM, cuDNN for convolution, and CUB or Thrust for primitives when appropriate.
+- Expose launcher functions for APPLY_BINDINGS: raw pointers, sizes/strides, scalar parameters, and an opaque `void*` stream handle. Keep `cudaStream_t` and other CUDA runtime types inside this section.
+
+APPLY_BINDINGS requirements:
+- Use TVM-FFI bindings only. Include `#include <tvm/ffi/tvm_ffi.h>` and `#include <tvm/ffi/extra/c_env_api.h>`.
+- Export each Python-callable wrapper with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function_name);`.
+- TVM-FFI receives tensors as `tvm::ffi::Tensor`. Common accessors:
+  - `t.shape()[i]` — dimension `i` (NOTE: `shape()` is a method that returns a view; `t.shape[i]` is wrong)
+  - `t.ndim()` — rank as `int`; `t.numel()` — total element count
+  - `t.dtype()` — `DLDataType` (compare against `DLDataType{kDLFloat, 32, 1}` for float32, etc.)
+  - `t.data_ptr()` — `void*`, cast to your kernel's element type
+  - `t.device()` — `DLDevice`; use `.device_type` and `.device_id`
+  - `t.IsContiguous()` — call only when your kernel requires contiguity
+- Get the current CUDA stream from the TVM-FFI environment:
+  `void* stream_handle = TVMFFIEnvGetStream(input.device().device_type, input.device().device_id);`
+- Validate op-specific invariants with `TVM_FFI_ICHECK` (device, dtype, ndim, output shape, contiguity). Do not assume `output.numel() == input.numel()` — that only holds for elementwise ops.
+- Allocate output tensors in Python (passed in by `MODEL_NEW` via `torch.empty` / `torch.empty_like`); the binding fills them. This keeps shape derivation in Python where it is easier to express and inspect.
+- The binding's job is to marshal tensors into your launcher; do not invoke PyTorch / ATen compute operators here.
+- Minimal example (1D elementwise float32, output preallocated in Python; adapt shape, dtype, and validation for your op):
+  ```cpp
+  #include <tvm/ffi/tvm_ffi.h>
+  #include <tvm/ffi/extra/c_env_api.h>
+
+  extern "C" void my_kernel_launcher(float* out, const float* in, int64_t n, void* stream_handle);
+
+  void my_kernel_forward(tvm::ffi::Tensor input, tvm::ffi::Tensor output) {
+      TVM_FFI_ICHECK(input.device().device_type == kDLCUDA) << "input must be CUDA";
+      void* stream_handle = TVMFFIEnvGetStream(
+          input.device().device_type, input.device().device_id);
+      my_kernel_launcher(
+          static_cast<float*>(output.data_ptr()),
+          static_cast<const float*>(input.data_ptr()),
+          input.shape()[0],
+          stream_handle);
+  }
+
+  TVM_FFI_DLL_EXPORT_TYPED_FUNC(my_kernel_forward, my_kernel_forward);
+  ```
+
+MODEL_NEW requirements:
+- Define `class ModelNew(nn.Module)` matching the original `Model.__init__` and `forward` signatures.
+- Preserve parameter / buffer attribute names, shapes, and dtypes so the original `state_dict` still loads. Do not invent new trainable parameters, do not rename, and do not create attribute names containing `.`.
+- If the original `Model` uses a submodule (e.g. `self.conv`, `self.linear`), instantiate the same submodule in `ModelNew` and pass its `.weight` / `.bias` into `tvm_ffi_extension` calls. Do not replace it with a new `nn.Parameter` on the same attribute name.
+- Import the compiled extension as `tvm_ffi_extension` and route the core computation through it; do not bypass with PyTorch compute operators (`torch.matmul`, `F.conv2d`, etc.).
+- Allocate output tensors with `torch.empty` / `torch.empty_like(..., device=x.device, dtype=x.dtype)` and pass them into the wrapper.
+- Example:
+  ```python
+  import torch
+  import torch.nn as nn
+  import tvm_ffi_extension
+
+  class ModelNew(nn.Module):
+      def __init__(self, ...):
+          super().__init__()
+
+      def forward(self, x):
+          out = torch.empty_like(x)
+          tvm_ffi_extension.my_kernel_forward(x.contiguous(), out)
+          return out
+  ```
+
+{# v2 changes from v1 (LHB byte-identical):
+- Drop redundant "no PyTorch ops" reminders (now only at APPLY_BINDINGS + MODEL_NEW; CUDA_KERNELS uses a positive "pure CUDA/C++" phrasing).
+- Drop redundant launcher-signature restatement (only stated in CUDA_KERNELS).
+- Drop negative API list ("Do NOT use PYBIND11_MODULE/REGISTER_BINDING/torch::Tensor") which can prime the model. Replaced with positive "Use TVM-FFI bindings only" + explicit accessor-API documentation (codex audit: shape/data_ptr/dtype were top failure modes).
+- Add explicit accessor docs (shape() method, ndim, numel, dtype DLDataType, data_ptr void* cast, device().device_type/device_id, IsContiguous).
+- Allow CUB / Thrust (was overly restricted to cuBLAS / cuDNN). CUTLASS deliberately NOT added — codex flagged it as an environment-include risk.
+- Add explicit "do not assume output.numel() == input.numel()" caveat (v1 example cargo-culted this and broke for reductions/conv).
+- Simplify example's ICHECK boilerplate to one device check; remove f32-specific dtype/numel ICHECKs from the example pattern but keep the rule "validate op-specific invariants" so the model adds appropriate checks itself.
+- Consolidate MODEL_NEW parameter-preservation rules from 4 sentences to 2 (matched-signature + submodule preservation).
+- Keep tvm::ffi::Tensor (LHB-proven API); did NOT switch to TensorView despite codex suggestion (unverified API risk).
+- Keep Python-only output allocation (LHB-aligned); rolled back v2's earlier "either Python OR binding" relaxation after codex flagged missing in-binding recipe.
+#}

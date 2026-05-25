@@ -36,5 +36,5 @@ profiles:
       select: cycle
       candidates:
         - id: tvm_ffi_module
-          first_turn_text_path: backends/tvm_ffi_module.jinja
+          first_turn_text_path: backends/tvm_ffi_module_v2_3.jinja
           tool_response_text_path: tool_response/tvm_ffi_short.jinja
