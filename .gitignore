@@ -200,3 +200,4 @@ tmp.md
 checkpoints/
 .vscode/
 uv.lock
+.claude
