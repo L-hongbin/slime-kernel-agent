@@ -1,0 +1,56 @@
+Subject: [PATCH] sglang: allow Qwen3_5ForCausalLM dense entry to load
+
+Two changes to `python/sglang/srt/models/qwen3_5.py`:
+
+1. Add `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` to `EntryClass` so
+   checkpoints whose `architectures` tag points at the dense causal class
+   are routed here instead of failing with
+   "Qwen3_5ForCausalLM has no SGlang implementation".
+
+2. Guard `Qwen3_5ForCausalLM.get_model_config_for_expert_location` so it
+   short-circuits to `None` when the model config has no `num_experts`
+   field (dense variants). `_init_common` / `init_trivial` already
+   null-check the result, so returning None silently skips EPLB init for
+   dense models — which is correct.
+
+Background: llmcompressor's `AutoModelForCausalLM.from_pretrained` load
+path rewrites the saved `architectures` field from
+`Qwen3_5ForConditionalGeneration` to `Qwen3_5ForCausalLM`. Without this
+patch, sglang refuses to load such checkpoints (Blocker 1) and even when
+the EntryClass guard is bypassed, EPLB init crashes with
+`AttributeError: 'Qwen3_5TextConfig' object has no attribute 'num_experts'`
+(Blocker 2). See `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md`.
+
+Apply (sglang repo root, e.g. /sgl-workspace/sglang on .22):
+    cd /sgl-workspace/sglang && patch -p1 < /path/to/sglang_qwen3_5_dense_entry.patch
+
+To revert:
+    cd /sgl-workspace/sglang && patch -p1 -R < /path/to/sglang_qwen3_5_dense_entry.patch
+
+Verified to apply cleanly against sglang 0.5.10.post1 (2026-05-25).
+
+---
+ python/sglang/srt/models/qwen3_5.py | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
+--- a/python/sglang/srt/models/qwen3_5.py
++++ b/python/sglang/srt/models/qwen3_5.py
+@@ -1093,6 +1093,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+
+     @classmethod
+     def get_model_config_for_expert_location(cls, config):
++        # Dense Qwen3_5 variants (e.g. W8A8-quantized 27B saved with
++        # architectures=["Qwen3_5ForCausalLM"]) have no num_experts. Returning
++        # None lets sglang's _init_common / init_trivial short-circuit cleanly.
++        if not hasattr(config, "num_experts"):
++            return None
+         return ModelConfigForExpertLocation(
+             num_layers=config.num_hidden_layers,
+             num_logical_experts=config.num_experts,
+@@ -1721,4 +1726,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+             num_groups=None,
+         )
+
+-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
++EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM]

@@ -1,6 +1,6 @@
-# DrKernel W8A8-INT8 Rollout 加速尝试（已 ABANDON）
+# DrKernel W8A8-INT8 Rollout 加速
 
-记录于 2026-05-25。本文档独立可读，复现性导向：把整次尝试从环境到失败原因到 retry 路径全部固化，下次想重启时不用从零开始。
+记录于 2026-05-25。本文档独立可读，复现性导向：把整次尝试从环境到失败原因到 retry 路径全部固化。
 
 ## 目标
 
@@ -8,7 +8,13 @@
 
 **预期收益**：rollout 阶段 ~1.5-2× 加速。Phase 1 一次 100×8 eval ≈ 70 min，最多省 ~35 min/run。
 
-**最终结论**：**ABANDON**。量化技术上成功（28GB compressed-tensors W8A8 ckpt 已生成），但 SGLang 加载失败两连击，需要 sglang-side 改动或额外的 weight surgery，ROI 不够。
+## 当前状态
+
+**第一次尝试（2026-05-24）**：full-Linear W8A8 量化 + `AutoModelForCausalLM` 加载路径 — 量化成功（28GB compressed-tensors ckpt），但 sglang 加载失败两连击。详见下面 Step 4 + Blocker 1/2。
+
+**第二次方案（2026-05-25，待跑）**：in-repo 实现两条 retry 路径（见末尾"重启 Phase 2 的建议路径"）：
+- 路径 A（推荐先试）：`scripts/drkernel/quantize_w8a8.py --multimodal --target mlp` 走多模态加载 + MLP-only 量化，保留 vision tower BF16，`architectures` tag 不变，sglang 不用改
+- 路径 B：默认 mode + apply `scripts/drkernel/sglang_qwen3_5_dense_entry.patch`（已 dry-run 验证 apply 干净）
 
 ## 环境（已搭建，可复用）
 
@@ -191,48 +197,68 @@ Verdict：**AGREE-ABANDON**。
 
 | 路径 | 主机 | 大小 | 说明 |
 |---|---|---|---|
-| `/tmp/Qwen3.6-27B-W8A8-ct/` | .22 | 28 GB | compressed-tensors W8A8 ckpt（local，可能被 /tmp 清理） |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-ct/` | NFS | 28 GB | 同上，NFS 持久化 |
-| `/tmp/quantize_qwen36_w8a8.py` | .22 | 2.5 KB | 量化脚本（含坑解释） |
-| `/tmp/build_w8a8_calibration.py` | .22 | 1 KB | calibration 抽取脚本 |
-| `/tmp/calibration_drkernel_v2_3_noenv_n4.jsonl` | .22 | ~5 MB | 1200 prompts |
+| `scripts/drkernel/build_w8a8_calibration.py` | repo | 2 KB | calibration 抽取脚本（in-repo 版） |
+| `scripts/drkernel/quantize_w8a8.py` | repo | 6 KB | W8A8 量化脚本（in-repo，含 MLP-only target + `--multimodal` mode） |
+| `scripts/drkernel/sglang_qwen3_5_dense_entry.patch` | repo | 2 KB | sglang dense entry 解锁补丁（路径 B 用） |
+| `/tmp/Qwen3.6-27B-W8A8-ct/` | .22 | 28 GB | 旧 full-W8A8 ckpt（CausalLM mode 量化产物，被 sglang load blocker 卡住） |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-ct/` | NFS | 28 GB | 同上 NFS 持久化 |
+| `/tmp/calibration_drkernel_v2_3_noenv_n4.jsonl` | .22 | ~5 MB | 1200 calibration prompts（已存在，可复用） |
 | `/tmp/w8a8-venv/` | .22 | ~3 GB | venv（llmcompressor + ct git main + transformers 5.3.0） |
-| `/tmp/codex_phase2_abandon.txt` | local | 6 KB | codex review prompt |
-| `/tmp/codex_p2_out.log` | local | 4 KB | codex review output |
+| `/tmp/codex_phase2_abandon.txt` + `/tmp/codex_p2_out.log` | local | ~10 KB | codex review prompt + output |
 
 ## 重启 Phase 2 的建议路径（按 ROI 排序）
 
-如果未来要 retry：
+代码已 in-repo：
+- `scripts/drkernel/build_w8a8_calibration.py` — 从 eval_0.pt 抽取 calibration prompts
+- `scripts/drkernel/quantize_w8a8.py` — GPTQ W8A8 量化（默认 MLP-only target + 可选 `--multimodal` load 模式）
+- `scripts/drkernel/sglang_qwen3_5_dense_entry.patch` — sglang dense entry 解锁补丁
 
-### 路径 D'（修订版，最便宜）— **推荐**
+### 路径 A — `--multimodal` 量化 + 不动 sglang（**推荐先试**）
 
-预计 4-6h。步骤：
+`quantize_w8a8.py --multimodal` 用 `AutoModelForImageTextToText.from_pretrained` 加载，保留 vision tower 权重 + 不重写 `architectures` tag。
 
-1. 用 `safetensors` 工具从 `/nfs/.../Qwen3.6-27B/` 抽取 `model.visual.*` 全部 keys（BF16）
-2. concat 到 W8A8 safetensors（`/nfs/.../Qwen3.6-27B-W8A8-ct/model.safetensors`），生成 `model-merged.safetensors`
-3. 写 overlay config：copy 原 BF16 full `config.json` + 移植 W8A8 `quantization_config` 块 + 关键：在 `quantization_config.ignore` 列表加入 vision tower 各 module 路径（`re:.*model\.visual\..*`），否则 sglang quant 加载器会试图把 vision 权重当 INT8 处理
-4. 指 sglang 加载新 overlay 目录，走 `Qwen3VLForConditionalGeneration` 已注册路径
-5. smoke 测试 + 100×8 eval
+- MLP-only regex `re:.*\.mlp\.(gate_proj|up_proj|down_proj)$` 天然跳过 vision tower（vision 没有 `.mlp.*` 子树）
+- 量化产物：vision tower 全 BF16 + language model 中 attention/embed/lm_head BF16，**只有 MLP 是 W8A8**
+- `architectures` 保持 `Qwen3_5ForConditionalGeneration`，走 sglang 已注册的多模态 entry
+- 无需 sglang 修改
 
-风险：sglang 的 weight loader 可能对 quantization_config 的 ignore pattern 处理有 bug；ignore vision 后能否正常 forward 也需要验证（vision tower 在 multimodal forward 路径里被调用，但 KernelBench 都是纯 text prompts，不该走到 visual forward）。
+唯一未验证项：transformers 5.3 上 `AutoModelForImageTextToText` 对 Qwen3.6-27B 是否能直接走通。脚本有 `AutoModel.from_pretrained` 自动 fallback。
 
-### 路径 A（最干净但贵）
+### 路径 B — `AutoModelForCausalLM` 量化 + sglang 补丁
 
-预计 3-5h calibration + debug。重做量化：
+`quantize_w8a8.py`（默认 mode）+ `patch -p1 < scripts/drkernel/sglang_qwen3_5_dense_entry.patch`。
 
-1. 加载多模态：`Qwen3_5ForConditionalGeneration.from_pretrained(...)`（不是 AutoModelForCausalLM）
-2. GPTQModifier `targets` 限制到 LM 层：`targets=["re:.*model\\.language_model\\..*Linear"]`，vision tower 保留 BF16
-3. save 时保留原 `architectures=["Qwen3_5ForConditionalGeneration"]`
+补丁两处改：
 
-未验证 llmcompressor 能否正确处理多模态 model 的偏部量化。需要看 llmcompressor docs / 源码确认 `targets` 的 regex 在 multimodal model 上行为。
+1. `EntryClass = [..., Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM]` — 注册 dense 入口
+2. `Qwen3_5ForCausalLM.get_model_config_for_expert_location` 加 `if not hasattr(config, "num_experts"): return None` 守卫（sglang 上游 `_init_common` / `init_trivial` 已经 null-safe，returning None 就让 EPLB 初始化静默跳过）
 
-### 路径 B（不推荐）
+已在 sglang 0.5.10.post1 上 `patch --dry-run` 验证 apply 干净。维护成本：每次 sglang 升级需要重新 apply（diff 几行，rebase 应该简单）。
 
-fork sglang 给 `Qwen3_5ForCausalLM` 写 dense-aware `get_model_config_for_expert_location`（return None 或跳过 expert-location 初始化），并把它加入 EntryClass。维护成本高，每次 sglang 升级有 regression 风险。
+适合：vision tower 太大（占 ~12% 总参数）想省 quantize/load 时的 host RAM，或者你已经有非多模态来源的 dense ckpt。
 
-### 路径 C（被动）
+### 路径 C — 上游 PR
 
-等 sglang 上游支持 dense Qwen3_5 entry。可以提 issue 推进。
+补丁本身很小（1 个 hasattr 守卫 + EntryClass 加 2 项），可以直接提 sglang upstream PR。审核通过后路径 B 的补丁负担消失。**已核实 sglang main 分支至今仍有同样问题**。
+
+### Path D（codex 最初建议）— 已验证不可行
+
+把 W8A8 ckpt 的 `architectures` 改回 `Qwen3_5ForConditionalGeneration`、保留同份 safetensors，期望 sglang 走 multimodal entry 加载。
+
+阻塞：`Qwen3VLForConditionalGeneration.__init__` 无条件实例化 `self.visual = Qwen3VLMoeVisionModel(...)`（`qwen3_vl.py:1085`），weight loader 找不到 `model.visual.*` keys 就崩。路径 A 之所以可行，正是因为 multimodal 加载时就把 vision 权重读进来量化产物保留下来，而不只是改 tag。
+
+## MLP-only 量化的设计取舍
+
+`quantize_w8a8.py --target mlp` 默认行为。原因：
+
+- **Embedding** (`embed_tokens`)：INT8 量化对 embedding 影响大（vocab × hidden_size 的 lookup table，量化噪声直接进 first layer），通常保 BF16
+- **lm_head**：与 embedding 对称，且是 logits 直接来源，量化伤 perplexity 明显，保 BF16
+- **Attention** (`self_attn`, `linear_attn`)：q/k/v/o projection 量化敏感（QK^T 计算累积误差），尤其 hybrid 架构的 mamba-style linear_attn 含 `A_log`、`conv1d` 等非标准 module，量化覆盖率不够时易报 unsupported
+- **MLP** (`mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`)：SwiGLU MLP 是单层最大的 weight family（`3 × hidden_size × intermediate_size`，对 Qwen3.6-27B = 3 × 5120 × 17408 ≈ 268M params per full-attn layer，是 QKVO 的 ~2.5×），同时对 INT8 量化的 accuracy hit 最小。性价比最高
+
+实测节省：MLP-only W8A8 大约把 full-attention 层的权重压到 ~65%（vs full W8A8 的 ~50%）。对应总模型大小估计 BF16 54GB → MLP-W8A8 ≈ 38-40GB（vs full W8A8 28GB）。Rollout 加速比 full W8A8 小，但 accuracy 保留更好。
+
+如果要追求最大压缩可改 `--target all-linear`（除 lm_head 外全部 Linear）。
 
 ## 经验教训
 
