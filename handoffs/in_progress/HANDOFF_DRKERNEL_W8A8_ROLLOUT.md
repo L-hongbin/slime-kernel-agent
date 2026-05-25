@@ -72,9 +72,34 @@ Online (every RL step, milliseconds):
 ### 当前进度
 
 - ✅ Hadamard rotation pipeline 完整跑通（`scripts/quantize/rotate_bf16_llmcompressor.py` + sglang multimodal load 验证）
-- ✅ Rotated MM BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-mm-bf16/`，100×1 smoke T3 correct 27%（与 BF16 baseline 同 noise band 内），rotation 数学被证保留
-- ⏳ Rotated MM BF16 100×8 baseline 跑着（验证 rotation 净影响在 n=8 下）
+- ✅ Rotated MM BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-mm-bf16/`
+- ✅ **Rotated MM BF16 100×8 baseline 完成**（1h21min）— **rotation 在 BF16 下有 ~4pp 精度成本**：
+
+  | metric | v2_3 noenv 100×8（unrotated baseline） | Rotated MM 100×8 | Δ |
+  |---|---|---|---|
+  | T1 compile | 35.4% | 33.8% | -1.6pp |
+  | T2 compile | 49.9% | 46.0% | -3.9pp |
+  | T3 compile | 50.1% | 45.8% | **-4.3pp** |
+  | T1 correct | 20.1% | 19.1% | -1.0pp |
+  | T2 correct | 29.6% | 25.6% | -4.0pp |
+  | T3 correct | 29.4% | 25.1% | **-4.3pp** (~15% relative) |
+  | T3 fast@1.0 | 11.0% | 8.9% | -2.1pp |
+  | T3 fast@1.2 | 1.6% | 1.1% | -0.5pp |
+  | overall reward | ~0.28 | 0.2513 | -0.03 |
+
+  原因（推测）：(a) BF16 7-bit mantissa 在 R/R.T 矩阵乘后累积舍入；(b) RMSNorm 融合后 weights round-trip BF16；(c) hidden=5120 非 power-of-2 用 random orthogonal 不是真 Hadamard；(d) per-token activation magnitudes 在 rotated basis 下分布变了，BF16 截断行为不同
 - ⏸ INT8 RTN 扩展 + slime 训-rollout 闭环 wiring 待做
+
+### Rotation cost 的策略含义
+
+4pp 是 **rotation 的 sunk cost**，不是 free win。决定整个 strategy 是否成立的关键测试还在前面：
+- **Unrotated + RTN INT8**（基线对比）：预计 -10pp+，因为 outliers 直接放大 quant scale
+- **Rotated + RTN INT8**：预计 ~-6pp 相对 unrotated BF16（4pp rotation + 2pp RTN）
+- 比较：**Rotated + RTN 应当比 Unrotated + RTN 好 3-4pp，且总精度损失约 6pp 相对 unrotated BF16**
+
+如果实测下来 Rotated + RTN 也只能做到 -8pp+，说明 rotation 不值，应该回到考虑别的方向（KV cache quant、speculative decoding、不带 rotation 的 W4A16 GPTQModel ckpt 等）。
+
+实际上**最便宜的下一步是先跑 Unrotated + RTN INT8** —— 如果它的损失已经在可接受范围（比如 < 5pp），rotation 的 4pp sunk cost 就完全不值得付出。
 
 ## 历史路径（已废弃）
 
