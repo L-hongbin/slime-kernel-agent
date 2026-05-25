@@ -5,13 +5,14 @@ set -eo pipefail
 # Parametrized for sweep runs. Override e.g. CTX_LEN=65536 bash debug.9b.sh.
 CTX_LEN=${CTX_LEN:-32768}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-1}
+EXPT_LABEL=${EXPT_LABEL:-}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
 EVAL_CONFIG_PATH=scripts/eval_kernelbench_level1.yaml
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}"
+SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}${EXPT_LABEL:+_${EXPT_LABEL}}"
 LOG_DIR="${SAVE_DIR}"
 LOG_FILE="${LOG_DIR}/run_log"
 mkdir -p "${LOG_DIR}"
@@ -60,6 +61,7 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 256
    --balance-data
+   --debug-rollout-only
 )
 
 EVAL_ARGS=(
@@ -157,6 +159,12 @@ RUNTIME_ENV_JSON="{
     \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\"
   }
 }"
+
+# Pre-launch sanity check: render the first-turn prompt with the current
+# profile (drkernel_v1_tvm_ffi → v2_3 cleanup template) and assert no jinja
+# markers leaked. No --expected-gpu-words check since this script runs noenv.
+PYTHONPATH="${SCRIPT_DIR}/../.." python3 "${SCRIPT_DIR}/render_prompt_check.py" \
+   --hf-checkpoint "${MODEL_DIR}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

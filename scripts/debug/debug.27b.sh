@@ -75,11 +75,32 @@ EVAL_ARGS=(
    --dump-details ${SAVE_DIR}/dumps
 )
 
+# Runtime environment hints for the prompt's "Target environment:" block.
+# These describe the KernelGym compile/eval host (192.168.16.40), NOT the local
+# training/inference box: KG compiles & benchmarks every kernel on .40 with
+# /usr/local/cuda-12.9/bin/nvcc targeting -gencode=arch=compute_89,code=sm_89
+# on 8x NVIDIA GeForce RTX 4090. Telling the model the wrong arch (e.g. the
+# A800 on .22) would mislead its tensor-core / SM-specific optimizations.
+# Set DRKERNEL_NO_TARGET_ENV=1 to suppress the entire block (ablation mode).
+if [ "${DRKERNEL_NO_TARGET_ENV:-0}" = "1" ]; then
+    DRKERNEL_GPU_NAME=""
+    DRKERNEL_COMPILER_NAME=""
+else
+    DRKERNEL_GPU_NAME=${DRKERNEL_GPU_NAME:-"NVIDIA GeForce RTX 4090 (SM 8.9, Ada Lovelace)"}
+    DRKERNEL_COMPILER_NAME=${DRKERNEL_COMPILER_NAME:-"CUDA 12.9 (nvcc, targeting sm_89)"}
+fi
+
 DRKERNEL_PLUGIN_ARGS=(
    --use-multi-turn
    --max-turns 3
    --kernelgym-error-summary-chars ${KERNELGYM_ERROR_SUMMARY_CHARS}
 )
+if [ -n "${DRKERNEL_GPU_NAME}" ]; then
+   DRKERNEL_PLUGIN_ARGS+=(--drkernel-gpu-name "${DRKERNEL_GPU_NAME}")
+fi
+if [ -n "${DRKERNEL_COMPILER_NAME}" ]; then
+   DRKERNEL_PLUGIN_ARGS+=(--drkernel-compiler-name "${DRKERNEL_COMPILER_NAME}")
+fi
 
 PERF_ARGS=(
    --tensor-model-parallel-size ${TP}
@@ -157,6 +178,24 @@ RUNTIME_ENV_JSON="{
   }
 }"
 
+# Pre-launch sanity check: render the first-turn prompt with the current
+# profile + the values we are about to pass via DRKERNEL_PLUGIN_ARGS. Catches
+# (a) leaked jinja markers like `{# ... #}` or `{{ ... }}` and (b) bash
+# array-quoting bugs that truncate multi-word values such as the GPU name
+# from "NVIDIA A800-SXM4-80GB" to just "NVIDIA". Exits non-zero on failure so
+# the run aborts before a 50-min eval that would produce confounded data.
+_RENDER_CHECK_ARGS=(
+   --hf-checkpoint "${MODEL_DIR}"
+   --drkernel-gpu-name "${DRKERNEL_GPU_NAME}"
+   --drkernel-compiler-name "${DRKERNEL_COMPILER_NAME}"
+)
+# Only enforce GPU-word presence when we're injecting the env block; otherwise
+# skip the word check so render_prompt_check doesn't false-fail on no-env runs.
+if [ -n "${DRKERNEL_GPU_NAME}" ]; then
+   _RENDER_CHECK_ARGS+=(--expected-gpu-words "${DRKERNEL_GPU_NAME}")
+fi
+PYTHONPATH="${SCRIPT_DIR}/.." python3 "${SCRIPT_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
+
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
@@ -172,6 +211,6 @@ submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    ${EVAL_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${DRKERNEL_PLUGIN_ARGS[@]}
+   "${DRKERNEL_PLUGIN_ARGS[@]}"
 
    # --debugpy \
