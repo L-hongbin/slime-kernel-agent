@@ -504,3 +504,168 @@ speedup shaping 和多轮 best-of-turn 聚合暂不接入，避免 reward 语义
 - 多轮反馈已经确定走自定义 rollout；不要再把主线拆到 `--custom-rm-path` 或 `--data-source-path`。
 - custom rollout 必须显式维护 `tokens`、`response_length`、`status`、`reward`、`loss_mask`，否则后续默认 train-data conversion 会不可靠。
 - 训练容器与 KernelGYM endpoint 的网络可达性必须在容器内验证。
+
+## 2026-05-24/25 Phase 1+2 实验日志（27B / KernelBench Level1 / 多轮 eval）
+
+### Phase 1：v2_3 模板 + env-block ablation — 已结论
+
+**结论：ADOPT v2_3 cleanup 作为默认；DROP "Target environment" env-block 配置（卸下相关 plumbing 或保留为 off-by-default）。**
+
+背景：之前 v1（与 LHB DIR1 byte-identical）出现 fast@1.2 显著低于 LHB DIR1 的 gap（1.4% vs 6.6%）。逐步 ablation 后落地 v2_3：相对于 v1 只增加"轻量 cleanup"（移除模板中泄漏的 jinja 注释、去除 prompt 末尾 cargo-cult markers），其它行为不变。
+
+两个 100×8（800 samples） paired eval：
+- v2_3_env_n8：在 first-turn prompt 顶部注入 `Target environment:` 块（GPU="RTX 4090 SM 8.9"，NVCC="12.9 sm_89"）
+- v2_3_noenv_n8：无 env 块
+
+| metric | v1 (n=4) | env_n8 | noenv_n8 |
+|---|---|---|---|
+| T1 compile | 39.0% | 35.0% | 35.4% |
+| T3 compile | 45.8% | 51.4% | 50.1% |
+| T1 correct | 26.5% | 16.6% | 20.1% |
+| T3 correct | 26.8% | 28.0% | 29.4% |
+| T1 fast@1.0 | 15.8% | 6.0% | 9.4% |
+| T3 fast@1.0 | 11.8% | 9.0% | 11.0% |
+| T3 fast@1.2 | 2.2% | 1.4% | 1.6% |
+
+Paired McNemar (n=800, env vs noenv)：
+- T1 fast@1.0：env 显著差，p=0.0045
+- T3 reward：env 略差，但 n=800 时不显著（n=400 时 p=0.0029，n=800 收窄）
+- 其它 metrics 差异不显著
+
+机制层面 cleanup 收益：
+- `.shape(0)` 错误：env 58 vs noenv 3
+- pybind11/REGISTER_BINDING 残漏：env 68 vs noenv 1
+- env 模式会触发 hardware cargo-culting（692/800 responses 提到 `sm_89`），但并不转化为更高 fast@x
+
+fast@1.2 gap 解释：模型在 tvm_ffi 后端从未写出激进优化（cluster gap 而非 cargo-cult gap）；training data limitation。
+
+#### Phase 1 交付物
+- 模板：`slime_plugins/drkernel/prompt_templates/backends/tvm_ffi_module_v2_3.jinja`（默认）
+- 渲染修复：`slime_plugins/drkernel/rollout.py` 中 `_load_fragment` 全部经 `_render_template`（修复 jinja `{# #}` 注释泄漏）
+- 启动 sanity check：`scripts/debug/render_prompt_check.py`（在 submit_ray_job 前 render first-turn prompt，遇 `{{`/`{%`/`{#` 残漏 或 expected GPU words 缺失则 exit 非 0）
+- 启动脚本：`scripts/debug/debug.27b.sh` 已硬编码 GPU="NVIDIA GeForce RTX 4090 (SM 8.9, Ada Lovelace)" + NVCC="CUDA 12.9 (nvcc, targeting sm_89)"，`DRKERNEL_NO_TARGET_ENV=1` 关掉 env 块
+- 数据：v2_3_env_n8 / v2_3_noenv_n8 的 eval_0.pt 在 `checkpoints/Qwen3.6-27B/20260524_*_v2_3_*_n8/dumps/rollout_data/`
+- Codex review 报告：`/tmp/codex_phase1_complete_output.log`
+
+#### Phase 1 后续动作（推荐）
+1. 把 env-block plumbing 从 `debug.27b.sh` + `rollout.py` + 模板 里彻底卸掉（或者改为默认 off），减少 cognitive load
+2. v2_3 模板 normalize 命名（删 `_v2_3` 后缀），让 default 路径直接走 cleanup 版本
+3. 把 `render_prompt_check.py` 集成进 `scripts/run-*.sh` 而非只 debug 路径
+
+### Phase 2：W8A8-INT rollout 加速 — 已放弃（abandoned, blocked）
+
+**结论：ABANDON。量化本身成功（28GB compressed-tensors INT8 ckpt），但 sglang 0.5.10.post1 加载 `Qwen3_5ForCausalLM` 失败，需要 sglang-side 改动，超出 ROI。**
+
+#### 详细路径
+
+1. ✅ Calibration 集：从 v2_3_noenv n=4 dump 提取 1200 个 T0/T1/T2 prompt 写入 `/tmp/calibration_drkernel_v2_3_noenv_n4.jsonl`（512 用作 calibration sample）
+2. ✅ 量化脚本：`/tmp/quantize_qwen36_w8a8.py`
+    - 路径：llmcompressor（git main）+ compressed-tensors（git main）+ transformers 5.3.0
+    - `GPTQModifier(targets="Linear", scheme="W8A8", ignore=["lm_head"])`，single-modifier（SmoothQuant 无 Qwen3_5 mapping，drop）
+    - 跑了 ~3h 在 .22 八卡 A800
+3. ✅ Checkpoint 写入：`/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-ct/`（28GB single safetensors，quant_method=compressed-tensors, format=int-quantized, token-dynamic activations + per-channel static weights）
+4. ❌ SGLang load smoke：两连失败
+    - **Blocker 1**：`ValueError: Qwen3_5ForCausalLM has no SGlang implementation`。原因：llmcompressor 在量化时将 architecture 从 `Qwen3_5ForConditionalGeneration`（multimodal，sglang 已注册）改成 `Qwen3_5ForCausalLM`（dense LM only，sglang 类存在但**不在 EntryClass**）
+    - 临时 patch：把 `Qwen3_5ForCausalLM` 加入 `/sgl-workspace/sglang/python/sglang/srt/models/qwen3_5.py` 的 `EntryClass`（已 revert）
+    - **Blocker 2**：`AttributeError: 'Qwen3_5TextConfig' object has no attribute 'num_experts'`。原因：`Qwen3_5ForCausalLM.get_model_config_for_expert_location` 实现里硬编码访问 `config.num_experts`，假设 MoE config。dense ckpt 没有该字段。要修需要修改 sglang 类层多个方法，影响面大。
+5. ✅ Patch 已回滚：`/sgl-workspace/sglang/python/sglang/srt/models/qwen3_5.py` 已恢复为 EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+
+#### 为什么放弃
+
+- W8A8 预期收益：rollout 阶段 ~1.5–2× 加速；Phase 1 一次 100×8 eval ≈ 70 min，最多能省 ~35 min/run
+- 解锁成本：要么 (a) 修改 sglang 类层（多个 method 都 hardcode MoE 假设；维护 fork），要么 (b) 重新量化保留 ForConditionalGeneration 架构（保留 vision tower 权重，量化只覆盖 LM linear 层；HF AutoModelForConditionalGeneration 路径 + GPTQ 配置目标只 hit `model.language_model.*` 层；可行但又是 3-6h 实验且不保证 sglang 加载成功）
+- Phase 1 已经提供了清晰可 ship 的结论（DROP env block），无 wall-time 紧急性
+
+#### 留下来的 artifacts（保留可复用）
+
+- `/tmp/quantize_qwen36_w8a8.py` — 量化脚本
+- `/tmp/build_w8a8_calibration.py` — calibration dataset 抽取
+- `/tmp/calibration_drkernel_v2_3_noenv_n4.jsonl` — 1200 个 prompts
+- `/tmp/Qwen3.6-27B-W8A8-ct/` 和 `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-ct/` — 28GB W8A8 ckpt
+- `/tmp/w8a8-venv/` on .22 — llmcompressor + compressed-tensors 环境
+
+#### 关键细节 — 现有 W8A8 ckpt 的权重命名（codex review 后核实）
+
+`/nfs/.../Qwen3.6-27B-W8A8-ct/model.safetensors` 的权重 key 仍然带 `model.language_model.*` 前缀（共 1347 keys），符合多模态 architecture 的语言模型部分命名。但 `model.visual.*` 完全缺失（llmcompressor 在 `AutoModelForCausalLM.from_pretrained` 时丢弃了 vision tower）。
+
+#### Path D（codex 推荐路径）— 经核实仍受阻
+
+Codex 给出的"低成本 retry"：拿原 BF16 full multimodal config.json + 把 W8A8 的 quantization_config 移植进去 + 保留 `architectures=["Qwen3_5ForConditionalGeneration"]` + 指向同一份 W8A8 safetensors。验证后：
+
+- ✅ 权重 key 名匹配（W8A8 weights 已是 `model.language_model.*` 前缀）
+- ❌ sglang 的 `Qwen3VLForConditionalGeneration.__init__` 无条件实例化 `self.visual = Qwen3VLMoeVisionModel(...)`（`/sgl-workspace/sglang/python/sglang/srt/models/qwen3_vl.py:1085`），不受 `language_only` 影响
+- ❌ sglang 的 `--language-only` server arg 只影响 mooncake transfer engine 初始化（`model_runner.py:1054`），不会跳过 vision 权重加载
+- ❌ 加载时 sglang weight loader 会找 `model.visual.*` keys → 缺失 → 加载失败
+
+Path D 要可行还需 weight surgery：把原 BF16 `model.visual.*` 权重合并进 W8A8 safetensors，并且 ensure sglang quant_config 不会试图量化 vision tower。预计 0.5-1 day。
+
+#### 重启 Phase 2 的建议路径（按推荐优先级）
+
+如果未来要 retry，按 ROI 排序：
+- **路径 D'（修订版，最便宜）**：先拿 BF16 vision tower 的权重（用 safetensors 工具从 `/nfs/.../Qwen3.6-27B/` 抽取 `model.visual.*` 全部 keys），再 concat 到 W8A8 safetensors，写一个 overlay config（原 full config + W8A8 `quantization_config` 块，但 `ignore` 列表必须包含 vision tower 各 module 路径以免 sglang quant 加载器试图把它们当 INT8 处理）。预计 4-6h，主要是 weight concat + ignore 配置 + smoke debug。
+- **路径 A（最干净但贵）**：重做量化，用 `Qwen3_5ForConditionalGeneration.from_pretrained` 加载原 multimodal，GPTQModifier `targets` 限制为 `["re:.*model\\.language_model\\..*"]`，vision tower 保留 BF16。save 时保留原 architecture。完整重跑 3-5h calibration。
+- **路径 B（不推荐）**：fork sglang，给 `Qwen3_5ForCausalLM` 写 dense-aware `get_model_config_for_expert_location` 并加入 EntryClass。维护成本高，碰升级回归风险大。
+- **路径 C**：等 sglang 上游支持 dense Qwen3_5 entry。
+
+#### Codex 警告（来自 Phase 2 review）
+
+- **FP8 KV cache** 在 Qwen3.5 上默认 scale=1.0 会伤 reasoning-heavy 精度（sglang docs warn），不要轻易加 `--kv-cache-dtype fp8` 到 sweep
+- llmcompressor 没有"保留原 multimodal architecture 但只 save AutoModelForCausalLM 抽取"的 save 选项；要么 retry path A 走多模态加载，要么 path D' 手动 weight surgery
+
+#### Phase 2 的副产物 — 推荐 sglang flag sweep（不依赖 W8A8）
+
+Codex 给出 top-3 候选（按预期 wall-time win × 命中概率）：
+1. Speculative decoding NEXTN：`--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`（如果模型有 NEXTN draft，前文已看到 sglang 注册了 `qwen3_5_mtp.py`，可能可用）
+2. `--mamba-scheduler-strategy extra_buffer --page-size 64`（Qwen3.5 hybrid attn 含 mamba layers）
+3. 显存压榨：`--max-running-requests 96/128 + --mem-fraction-static 0.92/0.94 + --schedule-policy lpm`（如果 n=8 同 prompt 共享前缀）
+
+每个建议都是 1 次 100×8 eval 即可验证（~70 min），未跑过。
+
+### Phase 1+2 总览交付物
+
+- 模板 + 渲染修复（Phase 1）：见上
+- W8A8 残留产物（Phase 2）：见上
+
+### Phase 3 后续 — 9B 跨规模验证 + v2_4 模板
+
+#### 9B v2_3 noenv 100×8 — 与 27B 结论方向相反，**v2_3 全线退化**
+
+| 指标 | T3 9B v1 (5/22, n=8) | T3 9B v2_3 noenv (今, n=8) | Δ |
+|---|---|---|---|
+| compile | 19.5% | 11.4% | **-8.1pp** |
+| correct | 5.5% | 2.0% | **-3.5pp** |
+| fast@1.0 | 4.6% | 1.1% | **-3.5pp** |
+
+同 profile、同 backend id、同 KG server、同模型、同 noenv，只换 first-turn 模板文件。CTX 65k → 32k 不构成因素（两边都 0 truncation）。
+
+**退化机制**（通过错误分类 + 响应模式分析验证）：
+- v2_3 的 C++ minimal example 比 v1 的削去了 6 个 ICHECK 行 + 把 size 参数改成 1D-only `input.shape()[0]`（v1 是 rank-agnostic `input.numel()`）
+- 9B 倾向 verbatim 复制 example：拿到 matmul/conv 等多维 op 时，复制出来的 `input.shape()[0]` 只是 M 维 → 传错 size → 编译/运行失败
+- error category 数据支撑：v2_3 `icheck_use_issue` 比 v1 多 +7.5pp（9B 缺乏可复制的 ICHECK pattern，自己乱写）；v1 `no_matching_function` 比 v2_3 多 +19pp（v1 verbose 30 条指导让 9B 调用错误函数）—— 不同失败模式，但 v2_3 的更致命
+
+**含义**：Phase 1 "ADOPT v2_3 default" **不能直接推广到 9B**。小模型需要 redundancy（verbose example + 多个 ICHECK pattern 可复制），大模型需要 conciseness（减噪音）。
+
+#### v2_4 模板（未测试）
+
+基于 v2_3 的纯精简（**reword/merge/trim only, 零新增 information**）：净 -728 chars / -4 行。改了 11 处：
+- CUDA_KERNELS 段 4→3 bullets（merge "pure CUDA + don't call X" + "real CUDA C++ code"，删 "for APPLY_BINDINGS" 隐含词等）
+- APPLY_BINDINGS 段 7→6 bullets（删 "binding's job ..." duplicate of L22，删 rationale "This keeps shape derivation in Python ..."，inline stream-getting call，shorten ICHECK bullet）
+- MODEL_NEW 段 5→4 bullets（merge "import ext + don't bypass + allocate output + pass into wrapper" 成单条）
+- example 块**完全不动**（C++ + Python 两段 example 与 v2_3 完全一致）
+
+文件：`slime_plugins/drkernel/prompt_templates/backends/tvm_ffi_module_v2_4.jinja`，未 wire 到 yaml profile，未跑 eval。
+
+**注意**：v2_4 没有针对 9B 退化机制做特别修复（没有恢复 v1 example 的 7 ICHECK + numel）。所以预期 9B 在 v2_4 上**仍会退化**（与 v2_3 相近，因为 example 部分没变）。要修 9B 需要单独的 v2_5 / per-model template 选择。
+
+#### 推荐下一步（按 ROI）
+
+1. **v2_4 上 27B 100×8 验证** — 确认精简没引入 regression（context 短 ~728 chars，27B 上预期 fast@1.x 持平甚至略升）。1×70min
+2. **决定 9B 策略**：
+   - (a) `prompts_v1.yaml` 的 `drkernel_v1_tvm_ffi` profile 改回 `tvm_ffi_module.jinja` (v1)，把 v2_3/v2_4 留给 27B 显式 opt-in
+   - (b) `rollout.py` 引入 model-size-aware profile 选择（小模型走 v1，大模型走 v2_4）。维护成本高
+   - (c) v2_5：在 v2_4 基础上把 C++ example 恢复成 v1 的 7-ICHECK + numel 形式，看能否两者都满足
+3. **不再考虑 W8A8** — 见 Phase 2 abandon decision
+
+### 评估精度参考
+
+所有 100×8 (n_samples_per_eval_prompt=8) 运行的精度汇总见 `handoffs/in_progress/HANDOFF_DRKERNEL_EVAL_ACCURACY.md`，含 9B + 27B 全部 8 个有效运行的 per-turn compile / correct / fast@1.0 / fast@1.2 (in_all) 表格 + 模板演化 + 元数据说明。
