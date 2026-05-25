@@ -22,7 +22,6 @@ def build_train_like_args():
         # train.py -> create_rollout_manager -> RolloutManager data source loading
         data_source_path="slime.rollout.data_source.RolloutDataSourceWithBuffer",
         use_dynamic_curriculum=True,
-
         # dataset
         rollout_global_dataset=True,
         prompt_data=str(DATA_PATH),
@@ -32,25 +31,20 @@ def build_train_like_args():
         metadata_key=None,
         tool_key="tools",
         multimodal_keys=None,
-
         # tokenizer / processor / chat template
         apply_chat_template=False,
         apply_chat_template_kwargs={},
         rollout_max_prompt_len=4096,
-
         # rollout sampling
         n_samples_per_prompt=4,
         rollout_seed=42,
         rollout_shuffle=False,
-
         # buffer
         buffer_filter_path=None,
-
         # save/load
         save="./tmp_curriculum/save",
         load=None,
         dump_details=None,
-
         # curriculum
         difficulty_level_key="difficulty_level",
         difficulty_score_key="difficulty_score",

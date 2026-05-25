@@ -444,6 +444,25 @@ def _split_turns_as_sample_groups(group: list[Sample] | list[list[Sample]]) -> l
     return [turn_groups[turn_idx] for turn_idx in sorted_turn_indices]
 
 
+def _get_last_non_pad_turn_group(groups: list[list[Sample]]) -> list[Sample]:
+    """Return each trajectory's last real turn sample, excluding padded turns."""
+    last_turn_group: list[Sample | None] = [None] * len(groups[0])
+    remaining = len(last_turn_group)
+
+    for group in reversed(groups):
+        for i, sample in enumerate(group):
+            if last_turn_group[i] is not None:
+                continue
+            if isinstance(sample.metadata, dict) and sample.metadata.get("is_pad_turn"):
+                continue
+            last_turn_group[i] = sample
+            remaining -= 1
+        if remaining == 0:
+            break
+
+    return [sample if sample is not None else groups[-1][i] for i, sample in enumerate(last_turn_group)]
+
+
 async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     aborted_samples = []
 
@@ -553,7 +572,8 @@ async def generate_rollout_async(
 
             last_turn_dynamic_filter_output = None
             if filter_by_last_turn:
-                last_turn_dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, groups[-1])
+                last_turn_group = _get_last_non_pad_turn_group(groups)
+                last_turn_dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, last_turn_group)
             all_data.extend(groups)
 
             for group in groups:

@@ -114,12 +114,6 @@ def _get_env_state(env_result: dict[str, Any]) -> dict[str, Any]:
     return env_state if isinstance(env_state, dict) else {}
 
 
-def _get_env_config(args) -> dict[str, Any]:
-    env_config = deepcopy(CUDA_AGENT_CONFIGS["env"])
-    env_config["kernel_env_url"] = getattr(args, "kernel_env_url", None)
-    return env_config
-
-
 def _should_log_multiturn(sample: Sample) -> bool:
     if not logger.isEnabledFor(logging.INFO):
         return False
@@ -329,7 +323,6 @@ async def cuda_kernel_env(
     entry_point = _get_label_value(sample, "entry_point")
     if entry_point is None:
         raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
-    env_config = _get_env_config(args)
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
@@ -352,7 +345,7 @@ async def cuda_kernel_env(
         "metadata": sample.metadata,
         "turn_idx": turn_idx,
     }
-    env_result = await run_kernel_eval(args, sample, payload, env_config)
+    env_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
     raw_env_state = _get_env_state(env_result) or env_result
     normalized_env_state = normalize_env_feedback(raw_env_state)
     if do_precheck:

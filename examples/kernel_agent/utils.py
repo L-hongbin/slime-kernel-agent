@@ -521,16 +521,25 @@ def precheck_cuda_tvm_code(
         return message, VALIDATION_ERROR, "failed"
 
 
-def _find_last_complete_section_group(response: str) -> dict[str, str]:
-    complete_groups: list[dict[str, str]] = []
-    current_group: dict[str, str] = {}
-    expected_index = 0
-    section_block_re = re.compile(
-        r"###\s*(CUDA_KERNELS|APPLY_BINDINGS|MODEL_NEW)\s*```(?:cpp|c\+\+|python|py)?\s*\n(.*?)```",
+def _strip_think_blocks(response: str) -> str:
+    return re.sub(r"<think>.*?</think>", "", response or "", flags=re.DOTALL | re.IGNORECASE)
+
+
+def _section_block_pattern() -> re.Pattern[str]:
+    language_pattern = r"(?:cpp|c\+\+|cxx|cuda|cu|python|py)?"
+    return re.compile(
+        rf"###\s*({'|'.join(CUDA_SECTIONS)})\s*```{language_pattern}\s*\n(.*?)```",
         re.DOTALL | re.IGNORECASE,
     )
 
-    for match in section_block_re.finditer(response or ""):
+
+def _find_last_complete_section_group(response: str) -> dict[str, str]:
+    response = _strip_think_blocks(response)
+    complete_groups: list[dict[str, str]] = []
+    current_group: dict[str, str] = {}
+    expected_index = 0
+
+    for match in _section_block_pattern().finditer(response):
         section_name = match.group(1).upper()
         section_body = match.group(2).strip()
 
@@ -556,10 +565,18 @@ def _find_last_complete_section_group(response: str) -> dict[str, str]:
     return complete_groups[-1] if complete_groups else {}
 
 
+def _find_last_sections(response: str) -> dict[str, str]:
+    response = _strip_think_blocks(response)
+    sections: dict[str, str] = {}
+    for match in _section_block_pattern().finditer(response):
+        sections[match.group(1).upper()] = match.group(2).strip()
+    return sections
+
+
 def parse_cuda_agent_response(response: str) -> tuple[dict[str, str], str | None]:
     cuda_sources: dict[str, str] = {}
     model_new_code: str | None = None
-    section_group = _find_last_complete_section_group(response)
+    section_group = _find_last_complete_section_group(response) or _find_last_sections(response)
 
     if "CUDA_KERNELS" in section_group:
         cuda_sources["kernels/generated.cu"] = section_group["CUDA_KERNELS"]
@@ -572,7 +589,7 @@ def parse_cuda_agent_response(response: str) -> tuple[dict[str, str], str | None
 
 
 def extract_cuda_agent_kernel_code(response: str) -> str:
-    section_group = _find_last_complete_section_group(response)
+    section_group = _find_last_complete_section_group(response) or _find_last_sections(response)
     section_lang = {
         "CUDA_KERNELS": "cpp",
         "APPLY_BINDINGS": "cpp",

@@ -16,86 +16,68 @@ from slime.utils.logging_utils import configure_logger
 logger = logging.getLogger(__name__)
 
 
-def _parse_opsm_config(config: str) -> dict[str, Any]:
+def _parse_sequence_mis_args(args) -> None:
+    sequence_mis_config = getattr(args, "sequence_mis_config", None)
+    if sequence_mis_config is None:
+        return
+
     try:
-        parsed = json.loads(config)
+        config = json.loads(sequence_mis_config)
     except json.JSONDecodeError as exc:
         raise ValueError(
-            '--opsm-config must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
+            '--sequence-mis-config must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
         ) from exc
 
-    if not isinstance(parsed, dict):
-        raise ValueError("--opsm-config must parse to a dictionary/object.")
-    return parsed
+    if not isinstance(config, dict):
+        raise ValueError("--sequence-mis-config must parse to a dictionary/object.")
 
+    allowed_keys = {"aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage"}
+    unknown_keys = set(config) - allowed_keys
+    if unknown_keys:
+        raise ValueError(f"Unknown --sequence-mis-config keys: {sorted(unknown_keys)}")
 
-def _parse_opsm_args(args) -> None:
-    opsm_delta_provided = args.opsm_delta is not None
-    opsm_lower_provided = args.opsm_lower is not None
-    opsm_upper_provided = args.opsm_upper is not None
-
-    if args.opsm_config is not None:
-        config = _parse_opsm_config(args.opsm_config)
-        allowed_keys = {"mode", "aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage"}
-        unknown_keys = set(config) - allowed_keys
-        if unknown_keys:
-            raise ValueError(f"Unknown --opsm-config keys: {sorted(unknown_keys)}")
-
-        if "mode" in config:
-            args.opsm_mode = str(config["mode"])
-        if "aggregation" in config:
-            args.opsm_aggregation = str(config["aggregation"])
-        if "delta" in config:
-            if "lower" in config:
-                logger.warning("--opsm-config delta is ignored because lower is also set.")
-            else:
-                args.opsm_lower = float(config["delta"])
-                logger.warning("--opsm-config delta is deprecated; using it as lower.")
+    if "aggregation" in config:
+        args.sequence_mis_aggregation = str(config["aggregation"])
+    if "delta" in config:
         if "lower" in config:
-            args.opsm_lower = float(config["lower"])
-        if "upper" in config:
-            args.opsm_upper = float(config["upper"])
-        if "token_veto_threshold" in config:
-            args.opsm_token_veto_threshold = float(config["token_veto_threshold"])
-        if "use_advantage" in config:
-            args.opsm_use_advantage = bool(config["use_advantage"])
-    elif opsm_delta_provided:
-        if not opsm_lower_provided:
-            args.opsm_lower = args.opsm_delta
-            logger.warning("--opsm-delta is deprecated; using it as --opsm-lower.")
+            logger.warning("--sequence-mis-config delta is ignored because lower is also set.")
         else:
-            logger.warning("--opsm-delta is ignored because --opsm-lower is set.")
+            args.sequence_mis_lower = float(config["delta"])
+            logger.warning("--sequence-mis-config delta is deprecated; using it as lower.")
+    if "lower" in config:
+        args.sequence_mis_lower = float(config["lower"])
+    if "upper" in config:
+        args.sequence_mis_upper = float(config["upper"])
+    if "token_veto_threshold" in config:
+        args.sequence_mis_token_veto_threshold = float(config["token_veto_threshold"])
+    if "use_advantage" in config:
+        if not isinstance(config["use_advantage"], bool):
+            raise ValueError("--sequence-mis-config use_advantage must be a JSON boolean.")
+        args.sequence_mis_use_advantage = config["use_advantage"]
 
-    if args.opsm_upper is None:
-        args.opsm_upper = float("inf")
-        if not opsm_upper_provided:
-            logger.warning("--opsm-upper is not set; using infinity.")
-
-    if args.opsm_lower is None:
-        args.opsm_lower = 1e-4
-        logger.warning("--opsm-lower is not set; using default 1e-4.")
-    args.opsm_delta = args.opsm_lower
-
-    if args.opsm_token_veto_threshold is not None and args.opsm_token_veto_threshold <= 0:
-        raise ValueError(f"--opsm-token-veto-threshold must be positive, got {args.opsm_token_veto_threshold}.")
-    if args.opsm_aggregation not in {"kl", "geometric", "turns_geometric"}:
+    aggregation = getattr(args, "sequence_mis_aggregation", "geometric")
+    if aggregation not in {"kl", "geometric", "turns_geometric"}:
         raise ValueError(
-            "--opsm-aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "
-            f"got {args.opsm_aggregation!r}."
+            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "
+            f"got {aggregation!r}."
         )
-    if args.opsm_aggregation == "turns_geometric" and args.max_turns is None:
-        raise ValueError("--max-turns must be set when --opsm-aggregation=turns_geometric.")
+    if aggregation == "turns_geometric" and args.max_turns is None:
+        raise ValueError("--max-turns must be set when --sequence-mis-config aggregation=turns_geometric.")
+    token_veto_threshold = getattr(args, "sequence_mis_token_veto_threshold", None)
+    if token_veto_threshold is not None and token_veto_threshold <= 0:
+        raise ValueError(
+            "--sequence-mis-config token_veto_threshold must be positive, " f"got {token_veto_threshold}."
+        )
 
     logger.info(
-        "OPSM config resolved: mode=%s, aggregation=%s, lower=%s, upper=%s, "
-        "token_veto_threshold=%s, use_advantage=%s, config=%s",
-        args.opsm_mode,
-        args.opsm_aggregation,
-        args.opsm_lower,
-        args.opsm_upper,
-        args.opsm_token_veto_threshold,
-        args.opsm_use_advantage,
-        args.opsm_config,
+        "Sequence MIS config resolved: aggregation=%s, lower=%s, upper=%s, token_veto_threshold=%s, "
+        "use_advantage=%s, config=%s",
+        aggregation,
+        getattr(args, "sequence_mis_lower", None),
+        getattr(args, "sequence_mis_upper", None),
+        token_veto_threshold,
+        getattr(args, "sequence_mis_use_advantage", False),
+        sequence_mis_config,
     )
 
 
@@ -283,9 +265,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
             )
-            parser.add_argument("--use-dynamic-curriculum", action="store_true", help="是否使用课程学习")
-            parser.add_argument("--difficulty-level-key", type=str, default="difficulty_level", help="level字段")
-            parser.add_argument("--difficulty-score-key", type=str, default="difficulty_score", help="score字段")
 
             return parser
 
@@ -740,6 +719,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Note that this may allocate the different response of the same prompt into different training steps."
                 ),
             )
+            parser.add_argument(
+                "--enable-turns-dp-partitions",
+                action="store_true",
+                default=False,
+                help=(
+                    "Split DP data by complete multi-turn trajectories. Samples are ordered by sample_indices "
+                    "and turn_indices before partitioning; with --balance-data, balancing is done at trajectory granularity."
+                ),
+            )
 
             parser.add_argument(
                 "--use-dynamic-batch-size",
@@ -1104,62 +1092,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opsm-delta",
                 type=float,
-                default=None,
-                help="Deprecated alias for --opsm-lower. Kept for backward compatibility.",
+                default=1e-4,
+                help="Sequence-level KL threshold for Off-Policy Sequence Masking (OPSM).",
             )
             parser.add_argument(
-                "--opsm-mode",
-                type=str,
-                choices=["loop", "batched"],
-                default="loop",
-                help="OPSM mask implementation. 'loop' keeps the existing per-sample computation.",
-            )
-            parser.add_argument(
-                "--opsm-aggregation",
-                type=str,
-                choices=["kl", "geometric", "turns_geometric"],
-                default="kl",
-                help=(
-                    "OPSM rejection sampling aggregation level. 'kl' keeps the existing seq_kl > lower rule; "
-                    "'geometric' uses sequence-level geometric mean of importance ratios; "
-                    "'turns_geometric' uses a geometric mean over each contiguous --max-turns samples."
-                ),
-            )
-            parser.add_argument(
-                "--opsm-lower",
-                type=float,
-                default=None,
-                help="Lower threshold for Off-Policy Sequence Masking (OPSM). Defaults to --opsm-delta.",
-            )
-            parser.add_argument(
-                "--opsm-upper",
-                type=float,
-                default=None,
-                help="Optional upper threshold for custom OPSM modes.",
-            )
-            parser.add_argument(
-                "--opsm-token-veto-threshold",
-                type=float,
-                default=None,
-                help=(
-                    "Optional per-token importance-ratio veto threshold. If any valid token has "
-                    "exp(current_logprob - old_logprob) below this value, the whole sequence is masked."
-                ),
-            )
-            parser.add_argument(
-                "--opsm-no-use-advantage",
-                action="store_false",
-                dest="opsm_use_advantage",
-                default=True,
-                help="Disable negative-advantage gating for OPSM rejection and mask by OPSM thresholds only.",
-            )
-            parser.add_argument(
-                "--opsm-config",
+                "--sequence-mis-config",
                 type=str,
                 default=None,
                 help=(
-                    "Optional OPSM config. Overrides OPSM mode, aggregation, thresholds, and token veto when set. "
-                    'Must be a JSON object, for example \'{"lower":0.999,"upper":1.001}\'.'
+                    "Optional Sequence MIS config for rollout-data postprocess masking. "
+                    "Supports aggregation, lower/upper thresholds, token veto, and use_advantage keys. "
+                    'Must be a JSON object, for example \'{"aggregation":"turns_geometric","lower":0.999,"upper":1.001}\'.'
                 ),
             )
             return parser
@@ -1857,8 +1800,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
-    if args.use_opsm:
-        _parse_opsm_args(args)
+    _parse_sequence_mis_args(args)
+    if getattr(args, "sequence_mis_aggregation", None) == "turns_geometric" and not getattr(
+        args, "enable_turns_dp_partitions", False
+    ):
+        raise ValueError("--enable-turns-dp-partitions must be set when Sequence MIS aggregation is turns_geometric.")
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.use_slime_router:

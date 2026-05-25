@@ -1,3 +1,5 @@
+"""Benchmark the current OPSM mask implementation."""
+
 from __future__ import annotations
 
 import argparse
@@ -10,7 +12,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from slime.utils.ppo_utils import _compute_opsm_mask_batched, _compute_opsm_mask_loop
+from slime.utils.ppo_utils import compute_opsm_mask
 
 
 def _synchronize(device: torch.device) -> None:
@@ -24,11 +26,7 @@ def _build_inputs(
     min_response_len: int,
     max_response_len: int,
     opsm_delta: float,
-    opsm_aggregation: str,
-    opsm_upper: float | None,
-    opsm_token_veto_threshold: float | None,
     advantage_mode: str,
-    force_token_veto: bool,
     device: torch.device,
     seed: int,
 ) -> tuple[Namespace, list[torch.Tensor], list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
@@ -61,28 +59,7 @@ def _build_inputs(
             advantages.append(torch.randn(length, device=device, generator=generator))
         loss_masks.append(loss_mask)
 
-    if force_token_veto:
-        if opsm_token_veto_threshold is None:
-            raise ValueError("--force-token-veto requires --opsm-token-veto-threshold.")
-        full_log_probs[0][0] = (
-            full_old_log_probs[0][0] + torch.log(torch.tensor(opsm_token_veto_threshold, device=device)) - 1.0
-        )
-
-    return (
-        Namespace(
-            opsm_delta=opsm_delta,
-            opsm_lower=opsm_delta,
-            opsm_upper=opsm_upper,
-            opsm_aggregation=opsm_aggregation,
-            opsm_token_veto_threshold=opsm_token_veto_threshold,
-            opsm_use_advantage=True,
-            max_turns=4,
-        ),
-        full_log_probs,
-        full_old_log_probs,
-        advantages,
-        loss_masks,
-    )
+    return Namespace(opsm_delta=opsm_delta), full_log_probs, full_old_log_probs, advantages, loss_masks
 
 
 def _time_fn(fn, *, warmup: int, iters: int, device: torch.device, inputs: tuple) -> float:
@@ -98,15 +75,11 @@ def _time_fn(fn, *, warmup: int, iters: int, device: torch.device, inputs: tuple
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Compare OPSM loop and batched mask implementations.")
+    parser = argparse.ArgumentParser(description="Benchmark the current OPSM mask implementation.")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--min-response-len", type=int, default=128)
     parser.add_argument("--max-response-len", type=int, default=2048)
     parser.add_argument("--opsm-delta", type=float, default=1e-4)
-    parser.add_argument("--opsm-aggregation", choices=["kl", "geometric", "turns_geometric"], default="kl")
-    parser.add_argument("--opsm-upper", type=float, default=None)
-    parser.add_argument("--opsm-token-veto-threshold", type=float, default=None)
-    parser.add_argument("--force-token-veto", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=1234)
@@ -126,44 +99,22 @@ def main() -> None:
         min_response_len=args.min_response_len,
         max_response_len=args.max_response_len,
         opsm_delta=args.opsm_delta,
-        opsm_aggregation=args.opsm_aggregation,
-        opsm_upper=args.opsm_upper,
-        opsm_token_veto_threshold=args.opsm_token_veto_threshold,
         advantage_mode=args.advantage_mode,
-        force_token_veto=args.force_token_veto,
         device=device,
         seed=args.seed,
     )
 
-    loop_mask, loop_clipfrac = _compute_opsm_mask_loop(*inputs)
-    batched_mask, batched_clipfrac = _compute_opsm_mask_batched(*inputs)
-    mask_equal = torch.equal(loop_mask, batched_mask)
-    clipfrac_diff = (loop_clipfrac - batched_clipfrac).abs().item()
-
-    loop_time = _time_fn(_compute_opsm_mask_loop, warmup=args.warmup, iters=args.iters, device=device, inputs=inputs)
-    batched_time = _time_fn(
-        _compute_opsm_mask_batched,
-        warmup=args.warmup,
-        iters=args.iters,
-        device=device,
-        inputs=inputs,
-    )
+    opsm_mask, opsm_clipfrac = compute_opsm_mask(*inputs)
+    opsm_time = _time_fn(compute_opsm_mask, warmup=args.warmup, iters=args.iters, device=device, inputs=inputs)
 
     print(f"device: {device}")
     print(f"batch_size: {args.batch_size}")
     print(f"response_len: [{args.min_response_len}, {args.max_response_len}]")
-    print(f"opsm_aggregation: {args.opsm_aggregation}")
-    print(f"opsm_token_veto_threshold: {args.opsm_token_veto_threshold}")
-    print(f"force_token_veto: {args.force_token_veto}")
+    print(f"opsm_delta: {args.opsm_delta}")
     print(f"advantage_mode: {args.advantage_mode}")
-    print(f"mask_equal: {mask_equal}")
-    print(f"clipfrac_diff: {clipfrac_diff:.8g}")
-    print(f"loop_time_ms: {loop_time * 1000:.3f}")
-    print(f"batched_time_ms: {batched_time * 1000:.3f}")
-    print(f"speedup: {loop_time / batched_time:.3f}x")
-
-    if not mask_equal or clipfrac_diff > 1e-6:
-        raise AssertionError("Batched OPSM mask result differs from loop implementation.")
+    print(f"kept_tokens: {opsm_mask.sum().item():.0f}")
+    print(f"opsm_clipfrac: {opsm_clipfrac.item():.8g}")
+    print(f"opsm_time_ms: {opsm_time * 1000:.3f}")
 
 
 if __name__ == "__main__":

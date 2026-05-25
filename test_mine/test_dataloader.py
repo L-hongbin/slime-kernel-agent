@@ -3,7 +3,6 @@
 
 import argparse
 import json
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,27 +48,21 @@ def build_slime_args(prompt_data: str, hf_checkpoint: str):
         metadata_key="metadata",
         tool_key="tools",
         multimodal_keys=None,
-
         # chat template
         apply_chat_template=True,
         apply_chat_template_kwargs={},
-
         # rollout dataset behavior
         rollout_global_dataset=True,
         rollout_shuffle=False,
         rollout_seed=42,
         rollout_max_prompt_len=4096,
-
         # group sampling
         n_samples_per_prompt=4,
-
         # buffer
         buffer_filter_path=None,
-
         # checkpoint state
         save="./tmp_slime_test_save",
         load=None,
-
         # debug dump
         dump_details=None,
     )
@@ -125,13 +118,13 @@ def main():
         make_demo_jsonl(prompt_data)
         print(f"[OK] wrote demo jsonl: {prompt_data}")
 
-
     if args.test_slime:
         test_real_slime_data_source(
             prompt_data=str(prompt_data),
             hf_checkpoint=args.hf_checkpoint,
             num_prompts=args.num_prompts,
         )
+
 
 """
 python3 test_dataloader.py \

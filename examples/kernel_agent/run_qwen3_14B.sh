@@ -148,12 +148,6 @@ ROLLOUT_ARGS=(
    --balance-data
 )
 
-CURRICULUM_ARGS=(
-   --use-dynamic-curriculum
-   --difficulty-level-key difficulty_level
-   --difficulty-score-key difficulty_score
-)
-
 PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
@@ -174,8 +168,6 @@ PERF_ARGS=(
 RL_ARGS=(
    --advantage-estimator trloo
    --multi-turn-gamma 1.0
-   --use-opsm
-   --opsm-config '{"aggregation":"turns_geometric","token_veto_threshold":1e-4,"lower":0.999,"upper":1.001}'
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
@@ -221,6 +213,7 @@ CUSTOM_ARGS=(
    --custom-rm-path generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path kernel_reward.reward_post_process_by_group
    --dynamic-sampling-filter-path kernel_filter.filter_cuda_kernel_group
+   --rollout-data-postprocess-path kernel_filter.sequence_mis
    --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
 
    # TIS-related args, recommended to enable when using TIS
@@ -238,6 +231,8 @@ KERNEL_AGENT_ARGS=(
    --filter-by-last-turn
    --padding-turns
    --max-turns 3
+   --sequence-mis-config '{"aggregation":"turns_geometric","token_veto_threshold":1e-4,"lower":0.999,"upper":1.001,"use_advantage":true}'
+   --enable-turns-dp-partitions
    --use-coverage-rs
    --coverage-rs-key time_coverage
    --coverage-rs-threshold 0.3
@@ -274,7 +269,6 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \
-   ${CURRICULUM_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${RL_ARGS[@]} \
    ${WANDB_ARGS[@]} \

@@ -19,32 +19,26 @@ def build_args(path: Path):
         rollout_global_dataset=True,
         prompt_data=str(path),
         hf_checkpoint="/nfs/FM/gongoubo/checkpoints/Qwen/Qwen3-4B",
-
         # jsonl keys
         input_key="prompt",
         label_key=None,
         metadata_key=None,
         tool_key="tools",
         multimodal_keys=None,
-
         # tokenizer / processor / chat template
         apply_chat_template=False,
         apply_chat_template_kwargs={},
         rollout_max_prompt_len=4096,
-
         # rollout sampling
         n_samples_per_prompt=4,
         rollout_seed=42,
         rollout_shuffle=False,
-
         # buffer
         buffer_filter_path=None,
-
         # save/load
         save="./tmp_curriculum/save",
         load=None,
         dump_details=None,
-
         # curriculum
         difficulty_level_key="difficulty_level",
         difficulty_score_key="difficulty_score",

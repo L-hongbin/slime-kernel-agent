@@ -359,15 +359,6 @@ class RolloutManager:
         data_source_cls = load_function(self.args.data_source_path)
         self.data_source = data_source_cls(args)
 
-        if getattr(self.args, "use_dynamic_curriculum", False):
-            from slime.rollout.curriculum_data_source import DynamicCurriculumWrapper
-
-            self.data_source = DynamicCurriculumWrapper(
-                args=args,
-                base_data_source=self.data_source,
-            )
-
-
         self.generate_rollout = load_function(self.args.rollout_function_path)
         self.eval_generate_rollout = load_function(self.args.eval_function_path)
         self.custom_reward_post_process_func = None
@@ -731,6 +722,11 @@ class RolloutManager:
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
         }
+        if any(sample.metadata and "turn_idx" in sample.metadata for sample in samples):
+            train_data["turn_indices"] = [
+                sample.metadata["turn_idx"] if sample.metadata and "turn_idx" in sample.metadata else None
+                for sample in samples
+            ]
 
         # loss mask
         # TODO: compress the loss mask
@@ -781,6 +777,76 @@ class RolloutManager:
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
+    def _get_turns_dp_partitions(self, data, total_lengths, dp_size):
+        if "sample_indices" not in data or "turn_indices" not in data:
+            raise ValueError(
+                "--enable-turns-dp-partitions requires train data to include sample_indices and turn_indices."
+            )
+
+        sample_indices = data["sample_indices"]
+        turn_indices = data["turn_indices"]
+
+        seen_turns = set()
+        sorted_items = []
+        for i, (sample_index, turn_idx) in enumerate(zip(sample_indices, turn_indices, strict=True)):
+            if sample_index is None or turn_idx is None:
+                raise ValueError(
+                    "--enable-turns-dp-partitions requires every sample to have non-None sample_index and turn_idx."
+                )
+            key = (int(sample_index), int(turn_idx))
+            if key in seen_turns:
+                raise ValueError(
+                    "--enable-turns-dp-partitions found duplicate turn data for "
+                    f"sample_index={sample_index}, turn_idx={turn_idx}."
+                )
+            seen_turns.add(key)
+            sorted_items.append((int(sample_index), int(turn_idx), i))
+
+        trajectory_indices = []
+        current_sample_index = None
+        current_indices = []
+        for sample_index, _turn_idx, data_index in sorted(sorted_items):
+            if current_sample_index is not None and sample_index != current_sample_index:
+                trajectory_indices.append(current_indices)
+                current_indices = []
+            current_sample_index = sample_index
+            current_indices.append(data_index)
+        if current_indices:
+            trajectory_indices.append(current_indices)
+
+        turns_per_trajectory = len(trajectory_indices[0])
+        if any(len(indices) != turns_per_trajectory for indices in trajectory_indices):
+            raise ValueError(
+                "--enable-turns-dp-partitions requires every trajectory to have the same number of turns. "
+                "For turns_geometric, enable padding turns before training data is split by DP."
+            )
+        if len(trajectory_indices) < dp_size:
+            raise ValueError(
+                "--enable-turns-dp-partitions requires at least one trajectory per DP rank: "
+                f"num_trajectories={len(trajectory_indices)}, dp_size={dp_size}."
+            )
+        if len(trajectory_indices) % dp_size != 0:
+            raise ValueError(
+                "--enable-turns-dp-partitions keeps trajectories unsplit, so the number of trajectories must be "
+                f"divisible by dp_size: num_trajectories={len(trajectory_indices)}, dp_size={dp_size}."
+            )
+
+        if self.args.balance_data:
+            trajectory_lengths = [sum(total_lengths[i] for i in indices) for indices in trajectory_indices]
+            trajectory_partitions = get_seqlen_balanced_partitions(trajectory_lengths, dp_size, equal_size=True)
+            return [
+                [data_index for trajectory_index in partition for data_index in trajectory_indices[trajectory_index]]
+                for partition in trajectory_partitions
+            ]
+        else:
+            trajectories_per_rank = len(trajectory_indices) // dp_size
+            partitions = []
+            for rank in range(dp_size):
+                start = rank * trajectories_per_rank
+                end = start + trajectories_per_rank
+                partitions.append([data_index for indices in trajectory_indices[start:end] for data_index in indices])
+            return partitions
+
     def _split_train_data_by_dp(self, data, dp_size):
         """Split the train data by data parallel size."""
         rollout_data = {}
@@ -791,7 +857,9 @@ class RolloutManager:
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
 
-        if self.args.balance_data:
+        if getattr(self.args, "enable_turns_dp_partitions", False):
+            partitions = self._get_turns_dp_partitions(data, total_lengths, dp_size)
+        elif self.args.balance_data:
             partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
         else:
             partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
@@ -811,6 +879,7 @@ class RolloutManager:
                 "loss_masks",
                 "round_number",
                 "sample_indices",
+                "turn_indices",
                 "rollout_log_probs",
                 "rollout_routed_experts",
                 "prompt",

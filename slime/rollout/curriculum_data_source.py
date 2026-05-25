@@ -96,11 +96,7 @@ class DynamicCurriculumDataSource(RolloutDataSourceWithBuffer):
         return CURRICULUM_SCHEDULE[-1]
 
     def _sample_level(self, stage):
-        available_levels = [
-            level
-            for level in stage["levels"]
-            if len(self.curriculum_buckets.get(level, [])) > 0
-        ]
+        available_levels = [level for level in stage["levels"] if len(self.curriculum_buckets.get(level, [])) > 0]
 
         if not available_levels:
             raise RuntimeError(f"No available curriculum buckets for stage={stage}")
@@ -153,8 +149,7 @@ class DynamicCurriculumDataSource(RolloutDataSourceWithBuffer):
             level_counter[level] += 1
 
         logger.info(
-            f"[DynamicCurriculum] rollout_id={rollout_id}, "
-            f"levels={stage['levels']}, sampled={dict(level_counter)}"
+            f"[DynamicCurriculum] rollout_id={rollout_id}, " f"levels={stage['levels']}, sampled={dict(level_counter)}"
         )
 
         return samples
@@ -226,11 +221,7 @@ class DynamicCurriculumWrapper:
         return CURRICULUM_SCHEDULE[-1]
 
     def _sample_level(self, stage):
-        available_levels = [
-            level
-            for level in stage["levels"]
-            if len(self.curriculum_buckets.get(level, [])) > 0
-        ]
+        available_levels = [level for level in stage["levels"] if len(self.curriculum_buckets.get(level, [])) > 0]
 
         if not available_levels:
             raise RuntimeError(f"No available curriculum buckets for stage={stage}")
@@ -282,8 +273,7 @@ class DynamicCurriculumWrapper:
             level_counter[level] += 1
 
         logger.info(
-            f"[DynamicCurriculum] rollout_id={rollout_id}, "
-            f"levels={stage['levels']}, sampled={dict(level_counter)}"
+            f"[DynamicCurriculum] rollout_id={rollout_id}, " f"levels={stage['levels']}, sampled={dict(level_counter)}"
         )
 
         self.base_data_source.sample_group_index = self.sample_group_index
