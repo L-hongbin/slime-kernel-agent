@@ -8,13 +8,83 @@
 
 **预期收益**：rollout 阶段 ~1.5-2× 加速。Phase 1 一次 100×8 eval ≈ 70 min，最多省 ~35 min/run。
 
-## 当前状态
+## 当前策略（2026-05-25 确定）
 
-**第一次尝试（2026-05-24）**：full-Linear W8A8 量化 + `AutoModelForCausalLM` 加载路径 — 量化成功（28GB compressed-tensors ckpt），但 sglang 加载失败两连击。详见下面 Step 4 + Blocker 1/2。
+**核心约束**：slime 是 colocated train + rollout 框架，**每个 RL step 都要把 BF16 Megatron actor 的权重 push 给 SGLang engine**。这意味着 rollout 量化必须能 on-the-fly 在 weight sync 通路上重做 —— **不能用需要 calibration 数据 + 几小时的 GPTQ / GPTAQ / SpinQuant learned rotation**。
 
-**第二次方案（2026-05-25，待跑）**：in-repo 实现两条 retry 路径（见末尾"重启 Phase 2 的建议路径"）：
-- 路径 A（推荐先试）：`scripts/drkernel/quantize_w8a8.py --multimodal --target mlp` 走多模态加载 + MLP-only 量化，保留 vision tower BF16，`architectures` tag 不变，sglang 不用改
-- 路径 B：默认 mode + apply `scripts/drkernel/sglang_qwen3_5_dense_entry.patch`（已 dry-run 验证 apply 干净）
+slime 现成的 `quantize_params_compressed_tensors`（`fake_int4_quant_cuda`）就是这个 pattern 的 INT4 实现：每 step 拿 BF16 megatron tensor → per-channel min-max scale → INT4 pack → 推送 sglang。我们要做的是把它扩展到 W8A8 INT8。
+
+### 分工：**复杂的全部 offline**，**online 只做最简单的 RTN**
+
+| 阶段 | 工作 | 频次 | 复杂度 |
+|---|---|---|---|
+| **Offline（一次性预处理）** | Hadamard rotation（已完成：`Qwen3.6-27B-rotated-mm-bf16`，R1 fused 进 weights）；同时把 base BF16 ckpt 替换成 rotated 版本作为 Megatron `--ref-load` 起点 | 一次 / model | 高（写 mapping、norm fusion、validate math） |
+| **Online（每 RL step）** | RTN（Round-To-Nearest）per-channel min-max weight 量化 → INT8 pack；activations 用 **per-token dynamic** INT8（sglang 在 forward 自己算 scale，不依赖 slime 传） | 每 step | 极低（一个 CUDA kernel + 一次广播） |
+
+为什么这个分工合理：
+- **Rotation 是 weight-only 的纯线性变换**，offline 算一次后 weights 已经处于 outlier-friendly basis；后续 RTN 量化误差小很多（这是 SpinQuant / QuaRot 等论文的核心 motivation）
+- **per-token dynamic activation quant** 不需要 calibration 数据：sglang 在 forward 时对每个 token 算 absmax 算 scale，开销小（~5% 额外计算），但完全 self-contained
+- **RTN** 比 GPTQ 简单 1000×：单步 `s = w.absmax(dim=in) / 127; q = round(w / s).clip(-128, 127)`，无 Hessian、无 calibration set、无 iterative refinement
+
+### 整条 path 拆解
+
+```
+Offline (one-time, hours):
+  原 BF16 27B
+    → scripts/quantize/rotate_bf16_llmcompressor.py
+    → Qwen3.6-27B-rotated-mm-bf16/  ← Megatron 训起点
+    
+Online (every RL step, milliseconds):
+  Megatron actor BF16 weight
+    → quantize_params_compressed_tensors (slime 现成，目前 INT4)
+      ↓ 扩展为 INT8 path
+    → packed INT8 + scale + zp 广播给 SGLang engines
+    → SGLang compressed_tensors_w8a8_int8 scheme load
+      activations 走 per-token dynamic INT8 path （sglang scheme 内置）
+```
+
+### 还需要做的
+
+1. **扩展 `slime/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py`**：当前 `fake_int4_quant_cuda` 是 INT4-only。要么写 `fake_int8_quant_cuda`，要么改 `pack_layer` 走 num_bits=8 通用路径（INT8 不像 INT4 那样需要 2-nibble 打包，pack 反而简单：直接 `int32` view of 4 `int8`s）。
+2. **slime weight sync 那边判量化方案**：现在固定走 INT4 packing；要看 `quantization_config["config_groups"]["group_0"]["weights"]["num_bits"]` 决定走哪条 kernel。
+3. **rotated ckpt 的 quantization_config 写好**：当前 rotated-mm-bf16 还是纯 BF16，没有 `quantization_config` 字段。要给它加上 `compressed-tensors` 的 W8A8 INT8 config block，告诉 sglang loader 走 `compressed_tensors_w8a8_int8` scheme：
+   ```json
+   "quantization_config": {
+     "quant_method": "compressed-tensors",
+     "format": "int-quantized",
+     "config_groups": {
+       "group_0": {
+         "targets": ["Linear"],
+         "weights": {"num_bits": 8, "type": "int", "symmetric": true,
+                     "strategy": "channel", "dynamic": false},
+         "input_activations": {"num_bits": 8, "type": "int", "symmetric": true,
+                               "strategy": "token", "dynamic": true},
+         "output_activations": null
+       }
+     },
+     "ignore": ["lm_head", "re:.*visual.*", "re:.*mtp.*"]
+   }
+   ```
+   `dynamic=true` for activations = per-token at inference, no scale needs to ship from slime → sglang
+4. **Sglang load 阶段 weights 是 BF16**（rotated ckpt 物理上还是 BF16），不会读 quantization_config 里的 weight scale —— sglang **首次 weight sync** 由 slime 推 INT8 packed weight + scale。这里的细节要核实：sglang 启动时如果 ckpt 是 BF16 但 config 声明 W8A8，会不会拒绝 / 自己量化一次？
+5. **Smoke**：跑通"rotated BF16 ckpt 起 sglang → slime 第一次 weight sync 推 INT8（即便 BF16 actor 也要走 quantize_params 通路）→ 出第一个 rollout"，验证 forward 数值正确。
+
+### 当前进度
+
+- ✅ Hadamard rotation pipeline 完整跑通（`scripts/quantize/rotate_bf16_llmcompressor.py` + sglang multimodal load 验证）
+- ✅ Rotated MM BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-mm-bf16/`，100×1 smoke T3 correct 27%（与 BF16 baseline 同 noise band 内），rotation 数学被证保留
+- ⏳ Rotated MM BF16 100×8 baseline 跑着（验证 rotation 净影响在 n=8 下）
+- ⏸ INT8 RTN 扩展 + slime 训-rollout 闭环 wiring 待做
+
+## 历史路径（已废弃）
+
+之前尝试过的 GPTQ-based 路径都因为离线复杂度而不适合 online update：
+
+- **第一次尝试（2026-05-24）**：full-Linear W8A8 + GPTQ + AutoModelForCausalLM — 量化成功但 sglang dense entry 4 个 bug，详见 Step 4 + Blocker 1-4
+- **第二次方案（2026-05-25）**：`scripts/quantize/quantize_w8a8_llmcompressor.py --multimodal --target mlp`、`quantize_w8_gptqmodel.py` GPTQv2 ckpt — 这些是 GPTQ-based offline ckpt 路径，对纯 eval / inference 可用，但训练循环里每 step 重做 GPTQ 不现实（3-6h calibration / weight）
+- **第三次尝试 路径 E**：SpinQuant offline R1+R2 with GPTQ on top — R1 rotation 部分已被本策略采用为 offline step，但 GPTQ 部分换成 RTN
+
+下面 Step 1-4 + Blocker / Path A-E / GPTQModel 对比等内容保留为参考，**当前主线是上面的 "offline rotation + online RTN" 分工**，不要被旧路径细节误导。
 
 ## 环境（已搭建，可复用）
 
