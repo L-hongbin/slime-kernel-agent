@@ -73,10 +73,18 @@ def parse_args():
 
 
 def build_recipe(target: str):
-    """Return an llmcompressor recipe list. MLP-only matches Qwen SwiGLU triplet
-    via regex; the hybrid linear_attn layers have no .mlp subtree so they're
-    naturally skipped. `ignore=['lm_head']` is redundant under 'mlp' (regex
-    won't match anyway) but kept as defense in depth."""
+    """Return an llmcompressor recipe list.
+
+    target='mlp' matches the Qwen SwiGLU triplet via regex. The hybrid
+    linear_attn layers have no .mlp subtree so they're naturally skipped;
+    so does the multimodal vision tower (vision MLP is named e.g.
+    `visual.merger.mlp.0`, not `gate_proj`/`up_proj`/`down_proj`).
+
+    `ignore` is the standard llmcompressor pattern for multimodal LM-only
+    quantization — exclude vision tower / projector / image processor
+    explicitly even when targets regex already excludes them, so the GPTQ
+    sequential traversal doesn't try to hook them. Covers Qwen-VL,
+    Llama-3.2-Vision, Pixtral, etc. naming conventions defensively."""
     from llmcompressor.modifiers.quantization import GPTQModifier
 
     if target == "mlp":
@@ -85,7 +93,18 @@ def build_recipe(target: str):
         targets = "Linear"
     else:
         raise ValueError(target)
-    return [GPTQModifier(targets=targets, scheme="W8A8", ignore=["lm_head"])]
+
+    ignore = [
+        "lm_head",
+        # Vision / multimodal subgraphs — defensive ignores for the
+        # `--multimodal` load path; harmless on CausalLM load (regex just
+        # finds no matching modules).
+        "re:.*\\.visual\\..*",
+        "re:.*vision_tower.*",
+        "re:.*mm_projector.*",
+        "re:.*\\.audio_tower\\..*",
+    ]
+    return [GPTQModifier(targets=targets, scheme="W8A8", ignore=ignore)]
 
 
 def load_model(model_path: str, multimodal: bool):

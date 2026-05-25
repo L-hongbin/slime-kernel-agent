@@ -215,14 +215,23 @@ Verdict：**AGREE-ABANDON**。
 
 ### 路径 A — `--multimodal` 量化 + 不动 sglang（**推荐先试**）
 
-`quantize_w8a8.py --multimodal` 用 `AutoModelForImageTextToText.from_pretrained` 加载，保留 vision tower 权重 + 不重写 `architectures` tag。
+llmcompressor 官方支持"load 多模态 + 只量化 LM"的 pattern（见 `llmcompressor/examples/multimodal_vision/`，Qwen2-VL / Llama-3.2-Vision / Pixtral 都有示例）。标准做法：
 
-- MLP-only regex `re:.*\.mlp\.(gate_proj|up_proj|down_proj)$` 天然跳过 vision tower（vision 没有 `.mlp.*` 子树）
-- 量化产物：vision tower 全 BF16 + language model 中 attention/embed/lm_head BF16，**只有 MLP 是 W8A8**
-- `architectures` 保持 `Qwen3_5ForConditionalGeneration`，走 sglang 已注册的多模态 entry
-- 无需 sglang 修改
+1. 用多模态 class 加载（`AutoModelForImageTextToText` 或具体 `*ForConditionalGeneration`）
+2. `ignore` 显式排除 vision tower / projector / audio tower 等非 LM 子图
+3. calibration 用纯 text 数据（multimodal forward 在 `pixel_values=None` 时走 text-only path，GPTQ 只对到 LM 层收集 activations）
 
-唯一未验证项：transformers 5.3 上 `AutoModelForImageTextToText` 对 Qwen3.6-27B 是否能直接走通。脚本有 `AutoModel.from_pretrained` 自动 fallback。
+`scripts/drkernel/quantize_w8a8.py --multimodal --target mlp` 就是这个 pattern：
+- 加载用 `AutoModelForImageTextToText.from_pretrained`（fallback 到 `AutoModel`）
+- targets regex `re:.*\.mlp\.(gate_proj|up_proj|down_proj)$` 只匹配 SwiGLU 三件套（vision 的 `visual.merger.mlp.*` 也不匹配，因为命名不是 `gate_proj` 等）
+- `ignore` 显式列出 `re:.*\.visual\..*` / `re:.*vision_tower.*` / `re:.*mm_projector.*` / `re:.*\.audio_tower\..*` 作为防御性 fence（即便 targets 不命中，也让 GPTQ traversal 完全跳过这些子树）
+- 产物：vision tower BF16 + LM attention/embed/lm_head BF16 + **只有 LM MLP 是 W8A8**
+- `architectures` 保持 `Qwen3_5ForConditionalGeneration`，走 sglang 已注册的多模态 entry → 无需 sglang 修改
+
+未验证项（按可能性排序）：
+- transformers 5.3 上 `AutoModelForImageTextToText` 对 Qwen3.6-27B 能否走通（可能要 fallback `AutoModel` 或直接 import `Qwen3_5ForConditionalGeneration`）
+- llmcompressor 的 GPTQ sequential traversal 在 Qwen3.5/3.6 多模态结构上是否有死锁/递归问题（新模型无 `traceable_*` wrapper，可能要看 traversal 报错）
+- multimodal forward 在 calibration 时 `pixel_values=None` 是否正常走 text-only 路径（绝大多数多模态实现都支持，但要核实）
 
 ### 路径 B — `AutoModelForCausalLM` 量化 + sglang 补丁
 
