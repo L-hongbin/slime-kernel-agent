@@ -87,6 +87,60 @@ def build_qwen35_mapping():
     )
 
 
+def build_qwen35_norm_mappings():
+    """NormMappings describe RMSNorm scale fusion targets.
+
+    For SpinQuant to fuse RMSNorm's per-channel scale into the downstream
+    projection (so rotation can be applied cleanly), each NormMapping
+    declares: this norm's output feeds these linears.
+
+    Qwen3.5 hybrid: each of the 64 layers has input_layernorm (feeding
+    attention) and post_attention_layernorm (feeding MLP). The 16
+    self_attn layers' input_layernorm feeds q/k/v_proj; the 48
+    linear_attn layers' input_layernorm feeds in_proj_a/b/qkv/z.
+    Express as two separate NormMapping entries with the same norm
+    pattern but different linear targets — match_modules_set will pair
+    each norm with whichever linear set actually exists in its layer.
+    """
+    from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
+
+    return [
+        # self_attn layers (16): input_layernorm → q/k/v_proj
+        NormMapping(
+            norm=r"re:.*input_layernorm$",
+            linears=[
+                r"re:.*self_attn\.q_proj$",
+                r"re:.*self_attn\.k_proj$",
+                r"re:.*self_attn\.v_proj$",
+            ],
+        ),
+        # linear_attn layers (48): input_layernorm → in_proj_a/b/qkv/z
+        NormMapping(
+            norm=r"re:.*input_layernorm$",
+            linears=[
+                r"re:.*linear_attn\.in_proj_a$",
+                r"re:.*linear_attn\.in_proj_b$",
+                r"re:.*linear_attn\.in_proj_qkv$",
+                r"re:.*linear_attn\.in_proj_z$",
+            ],
+        ),
+        # All 64 layers: post_attention_layernorm → mlp.up/gate_proj
+        NormMapping(
+            norm=r"re:.*post_attention_layernorm$",
+            linears=[
+                r"re:.*mlp\.up_proj$",
+                r"re:.*mlp\.gate_proj$",
+            ],
+        ),
+        # Final norm before lm_head. Use a tight regex so it doesn't
+        # accidentally match linear_attn.norm (internal SSM norm).
+        NormMapping(
+            norm=r"re:.*language_model\.norm$",
+            linears=["lm_head"],
+        ),
+    ]
+
+
 def parse_args():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-path", required=True, help="HF BF16 checkpoint dir to rotate")
@@ -128,11 +182,14 @@ def main():
     # `infer_mapping_from_model` resolves it by class name. Belt-and-braces:
     # we also pass it explicitly via `mappings=` below.
     mapping = build_qwen35_mapping()
+    norm_mappings = build_qwen35_norm_mappings()
     from llmcompressor.modifiers.transform.spinquant import mappings as spinquant_mappings
+    from llmcompressor.modifiers.transform.spinquant import norm_mappings as spinquant_norm_mappings
 
     arch_name = type(model).__name__  # e.g. Qwen3_5ForCausalLM
     spinquant_mappings.SPINQUANT_MAPPING_REGISTRY[arch_name] = mapping
-    print(f"[rotate] registered SpinQuant mapping for {arch_name}", flush=True)
+    spinquant_norm_mappings.NORM_MAPPING_REGISTRY[arch_name] = norm_mappings
+    print(f"[rotate] registered SpinQuant + norm mappings for {arch_name}", flush=True)
 
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform import SpinQuantModifier
@@ -141,6 +198,7 @@ def main():
         rotations=rotations,
         transform_type=args.transform_type,
         mappings=mapping,
+        norm_mappings=norm_mappings,
         transform_block_size=args.transform_block_size,
     )
 
