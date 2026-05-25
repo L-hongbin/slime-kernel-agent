@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 
 import torch
 
@@ -87,58 +88,105 @@ def build_qwen35_mapping():
     )
 
 
-def build_qwen35_norm_mappings():
-    """NormMappings describe RMSNorm scale fusion targets.
+def build_qwen35_norm_mappings(model):
+    """NormMappings as concrete per-layer module paths.
 
-    For SpinQuant to fuse RMSNorm's per-channel scale into the downstream
-    projection (so rotation can be applied cleanly), each NormMapping
-    declares: this norm's output feeds these linears.
+    Why per-layer absolute paths instead of regex: llmcompressor's
+    `match_modules_set` (called from `_fuse_norms`) groups matches by
+    lowest common parent while streaming `model.named_modules()`. For
+    Llama every layer matches every q/k/v pattern, so groups close per
+    layer cleanly. For Qwen3.5 hybrid, regex like `re:.*input_layernorm$`
+    matches in layers without the requested projection family (e.g. a
+    self_attn-targeted mapping hits linear_attn layers' input_layernorm
+    too) — groups never close, norms accumulate across layers, trips
+    `assert len(norm) == 1`. Enumerating absolute paths per layer
+    sidesteps the streaming-group ambiguity entirely.
 
-    Qwen3.5 hybrid: each of the 64 layers has input_layernorm (feeding
-    attention) and post_attention_layernorm (feeding MLP). The 16
-    self_attn layers' input_layernorm feeds q/k/v_proj; the 48
-    linear_attn layers' input_layernorm feeds in_proj_a/b/qkv/z.
-    Express as two separate NormMapping entries with the same norm
-    pattern but different linear targets — match_modules_set will pair
-    each norm with whichever linear set actually exists in its layer.
+    (Diagnosis from codex review of the script, 2026-05-25.)
     """
     from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
 
-    return [
-        # self_attn layers (16): input_layernorm → q/k/v_proj
-        NormMapping(
-            norm=r"re:.*input_layernorm$",
-            linears=[
-                r"re:.*self_attn\.q_proj$",
-                r"re:.*self_attn\.k_proj$",
-                r"re:.*self_attn\.v_proj$",
-            ],
-        ),
-        # linear_attn layers (48): input_layernorm → in_proj_a/b/qkv/z
-        NormMapping(
-            norm=r"re:.*input_layernorm$",
-            linears=[
-                r"re:.*linear_attn\.in_proj_a$",
-                r"re:.*linear_attn\.in_proj_b$",
-                r"re:.*linear_attn\.in_proj_qkv$",
-                r"re:.*linear_attn\.in_proj_z$",
-            ],
-        ),
-        # All 64 layers: post_attention_layernorm → mlp.up/gate_proj
-        NormMapping(
-            norm=r"re:.*post_attention_layernorm$",
-            linears=[
-                r"re:.*mlp\.up_proj$",
-                r"re:.*mlp\.gate_proj$",
-            ],
-        ),
-        # Final norm before lm_head. Use a tight regex so it doesn't
-        # accidentally match linear_attn.norm (internal SSM norm).
-        NormMapping(
-            norm=r"re:.*language_model\.norm$",
-            linears=["lm_head"],
-        ),
-    ]
+    named = dict(model.named_modules())
+    layer_prefixes = sorted(
+        {n.removesuffix(".input_layernorm") for n in named if n.endswith(".input_layernorm")},
+        key=lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)],
+    )
+
+    out: list = []
+    for layer in layer_prefixes:
+        input_norm = f"{layer}.input_layernorm"
+        self_linears = [f"{layer}.self_attn.{p}" for p in ("q_proj", "k_proj", "v_proj")]
+        linear_linears = [f"{layer}.linear_attn.{p}" for p in ("in_proj_a", "in_proj_b", "in_proj_qkv", "in_proj_z")]
+        has_self = all(n in named for n in self_linears)
+        has_linear = all(n in named for n in linear_linears)
+        if has_self == has_linear:
+            raise ValueError(f"{layer}: expected exactly one attention projection family (self xor linear)")
+        out.append(NormMapping(norm=input_norm, linears=self_linears if has_self else linear_linears))
+
+        post_norm = f"{layer}.post_attention_layernorm"
+        mlp_linears = [f"{layer}.mlp.gate_proj", f"{layer}.mlp.up_proj"]
+        missing = [n for n in [post_norm, *mlp_linears] if n not in named]
+        if missing:
+            raise ValueError(f"{layer}: missing modules {missing}")
+        out.append(NormMapping(norm=post_norm, linears=mlp_linears))
+
+    # Final pre-lm_head norm: handle the multimodal-wrapped / flat name variations.
+    final_norm = next((n for n in ("language_model.norm", "model.norm", "norm") if n in named), None)
+    if final_norm is None:
+        candidates = [n for n in named if (n == "norm" or n.endswith(".norm")) and ".layers." not in n]
+        if len(candidates) != 1:
+            raise ValueError(f"could not uniquely identify final pre-lm_head norm: {candidates}")
+        final_norm = candidates[0]
+    out.append(NormMapping(norm=final_norm, linears=["lm_head"]))
+    return out
+
+
+def build_qwen35_r1_transform_config():
+    """Direct R1 transform_config bypassing SpinQuantModifier's mapping inference.
+
+    Why: per codex review, `SpinQuantModifier.on_initialize()` overwrites
+    `self.mappings` and `self.norm_mappings` unless `transform_config` is
+    already provided. Passing explicit `mappings`/`norm_mappings` kwargs
+    without `transform_config` is silently ignored.
+
+    R1 scheme:
+    - weight_output (R applied to row/out axis): embed_tokens (writes
+      residual), self_attn.o_proj + linear_attn.out_proj (write residual),
+      mlp.down_proj (writes residual)
+    - weight_input inverse=True (R.T applied to col/in axis): all attn
+      input projections (self_attn q/k/v, linear_attn in_proj_a/b/qkv/z),
+      mlp.gate/up_proj (read residual), lm_head (reads residual)
+    """
+    from compressed_tensors.transform import TransformArgs, TransformConfig, TransformScheme
+
+    return TransformConfig(
+        config_groups={
+            "R1": TransformScheme(
+                type="random-hadamard",
+                randomize=False,
+                requires_grad=False,
+                head_dim=None,
+                apply=[
+                    TransformArgs(
+                        targets=[
+                            r"re:.*embed_tokens$",
+                            r"re:.*(self_attn\.o_proj|linear_attn\.out_proj)$",
+                            r"re:.*mlp\.down_proj$",
+                        ],
+                        location="weight_output",
+                    ),
+                    TransformArgs(
+                        targets=[
+                            r"re:.*(self_attn\.(q_proj|k_proj|v_proj)|linear_attn\.(in_proj_a|in_proj_b|in_proj_qkv|in_proj_z)|mlp\.(gate_proj|up_proj))$",
+                            "lm_head",
+                        ],
+                        location="weight_input",
+                        inverse=True,
+                    ),
+                ],
+            )
+        }
+    )
 
 
 def parse_args():
@@ -178,18 +226,26 @@ def main():
     )
     print(f"[rotate] model loaded, root dtype={next(model.parameters()).dtype}", flush=True)
 
-    # Register the Qwen3.5 mapping in the SpinQuant registry so internal
-    # `infer_mapping_from_model` resolves it by class name. Belt-and-braces:
-    # we also pass it explicitly via `mappings=` below.
+    # Two pieces needed:
+    # 1) NormMappings as per-layer absolute paths — sidesteps the
+    #    match_modules_set group-closure ambiguity that trips assert
+    #    len(norm) == 1 on hybrid arch with regex-only mappings
+    # 2) transform_config built directly — SpinQuantModifier.on_initialize
+    #    overwrites self.mappings / self.norm_mappings unless
+    #    transform_config is already provided, so explicit mappings/
+    #    norm_mappings kwargs are otherwise silently ignored
     mapping = build_qwen35_mapping()
-    norm_mappings = build_qwen35_norm_mappings()
+    norm_mappings = build_qwen35_norm_mappings(model)
+    transform_config = build_qwen35_r1_transform_config()
     from llmcompressor.modifiers.transform.spinquant import mappings as spinquant_mappings
     from llmcompressor.modifiers.transform.spinquant import norm_mappings as spinquant_norm_mappings
 
     arch_name = type(model).__name__  # e.g. Qwen3_5ForCausalLM
     spinquant_mappings.SPINQUANT_MAPPING_REGISTRY[arch_name] = mapping
     spinquant_norm_mappings.NORM_MAPPING_REGISTRY[arch_name] = norm_mappings
-    print(f"[rotate] registered SpinQuant + norm mappings for {arch_name}", flush=True)
+    print(
+        f"[rotate] registered SpinQuant + norm mappings for {arch_name}, {len(norm_mappings)} NormMappings", flush=True
+    )
 
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform import SpinQuantModifier
@@ -199,6 +255,7 @@ def main():
         transform_type=args.transform_type,
         mappings=mapping,
         norm_mappings=norm_mappings,
+        transform_config=transform_config,
         transform_block_size=args.transform_block_size,
     )
 
