@@ -7,7 +7,14 @@ import pytest
 
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.utils import normalize_env_feedback, precheck_cuda_agent_response, split_think_response
+from examples.kernel_agent.utils import (
+    extract_cuda_agent_kernel_code,
+    normalize_env_feedback,
+    parse_cuda_agent_response,
+    precheck_cuda_agent_response,
+    precheck_tvm_ffi_response,
+    split_think_response,
+)
 from slime.utils.types import Sample
 
 
@@ -65,6 +72,62 @@ class ModelNew(nn.Module):
 
     def forward(self, x):
         return cuda_extension.copy_forward(x)
+```
+"""
+
+
+VALID_TVM_FFI_RESPONSE = """
+### CUDA_KERNELS
+```cpp
+#include <cuda_runtime.h>
+
+__global__ void copy_kernel(float* output, const float* input, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        output[idx] = input[idx];
+    }
+}
+
+extern "C" void copy_kernel_launcher(float* output, const float* input, int size, void* stream_handle) {
+    auto stream = static_cast<cudaStream_t>(stream_handle);
+    copy_kernel<<<(size + 255) / 256, 256, 0, stream>>>(output, input, size);
+}
+```
+
+### APPLY_BINDINGS
+```cpp
+#include <tvm/ffi/tvm_ffi.h>
+#include <tvm/ffi/extra/c_env_api.h>
+
+extern "C" void copy_kernel_launcher(float* output, const float* input, int size, void* stream_handle);
+
+void copy_forward(tvm::ffi::Tensor input, tvm::ffi::Tensor output) {
+    void* stream_handle = TVMFFIEnvGetStream(input.device().device_type, input.device().device_id);
+    copy_kernel_launcher(
+        static_cast<float*>(output.data_ptr()),
+        static_cast<const float*>(input.data_ptr()),
+        input.numel(),
+        stream_handle);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward, copy_forward);
+```
+
+### MODEL_NEW
+```python
+import torch
+import torch.nn as nn
+import tvm_ffi_extension
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        output = torch.empty_like(x)
+        tvm_ffi_extension.copy_forward(x.contiguous(), output)
+        return output
 ```
 """
 
@@ -251,6 +314,72 @@ def _format_feedback_for_test(env_result):
 def test_precheck_accepts_cuda_agent_responses_from_compiled_feedback_cases(request, case):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
     assert precheck_cuda_agent_response(VALID_CUDA_AGENT_RESPONSE, "Model") is None
+
+
+@pytest.mark.unit
+def test_precheck_accepts_tvm_ffi_responses():
+    assert precheck_tvm_ffi_response(VALID_TVM_FFI_RESPONSE, "Model") is None
+
+
+@pytest.mark.unit
+def test_precheck_rejects_tvm_ffi_missing_export():
+    response = VALID_TVM_FFI_RESPONSE.replace(
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward, copy_forward);",
+        "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward_exported, copy_forward);",
+    )
+    result = precheck_tvm_ffi_response(response, "Model")
+    assert result is not None
+    assert "TVM-FFI model calls are not exported: copy_forward" in result["error_message"]
+
+
+@pytest.mark.unit
+def test_parse_cuda_agent_response_uses_last_complete_section_group():
+    response = """
+### CUDA_KERNELS
+```cpp
+...
+```
+
+### APPLY_BINDINGS
+```cpp
+...
+```
+
+### MODEL_NEW
+```python
+...
+```
+
+### CUDA_KERNELS
+```cpp
+extern "C" void real_kernel_launcher(float* output, const float* input, int size, void* stream_handle) {}
+```
+
+### APPLY_BINDINGS
+```cpp
+#include <tvm/ffi/tvm_ffi.h>
+void real_forward(tvm::ffi::Tensor input, tvm::ffi::Tensor output) {}
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(real_forward, real_forward);
+```
+
+### MODEL_NEW
+```python
+import torch.nn as nn
+import tvm_ffi_extension
+
+class ModelNew(nn.Module):
+    def forward(self, x):
+        tvm_ffi_extension.real_forward(x, x)
+        return x
+```
+"""
+    cuda_sources, model_new_code = parse_cuda_agent_response(response)
+    assert "real_kernel_launcher" in cuda_sources["kernels/generated.cu"]
+    assert "real_forward" in cuda_sources["kernels/generated_binding.cpp"]
+    assert "class ModelNew" in model_new_code
+    extracted = extract_cuda_agent_kernel_code(response)
+    assert "..." not in extracted
+    assert "real_kernel_launcher" in extracted
 
 
 @pytest.mark.unit

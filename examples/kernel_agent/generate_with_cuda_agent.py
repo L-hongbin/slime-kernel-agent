@@ -297,7 +297,10 @@ def _extract_env_extra_info(env_result: dict[str, Any]) -> dict[str, Any]:
 
     num_custom_kernels = metadata.get("num_custom_kernels", 0)
     num_total_kernels = metadata.get("num_total_kernels", 0)
-    custom_kernel_time = metadata.get("custom_kernel_time_in_profiling_us", 0)
+    custom_kernel_time = metadata.get(
+        "custom_kernel_cuda_time_in_profiling_us",
+        metadata.get("custom_kernel_time_in_profiling_us", 0),
+    )
     total_kernel_time = metadata.get("total_kernel_run_time_in_profiling_us", 0)
     num_coverage = 0.0
     if float(num_total_kernels) > 0:
@@ -328,7 +331,7 @@ async def cuda_kernel_env(
         raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
     env_config = _get_env_config(args)
     do_precheck = bool(getattr(args, "do_precheck", True))
-    kernel_backend = getattr(args, "kernel_backend", "cuda_agent")
+    kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
     if do_precheck:
         precheck_entry_point = f"{entry_point}New"
@@ -353,7 +356,7 @@ async def cuda_kernel_env(
     raw_env_state = _get_env_state(env_result) or env_result
     normalized_env_state = normalize_env_feedback(raw_env_state)
     if do_precheck:
-        normalized_env_state["precheck"] = "passed"
+        normalized_env_state.setdefault("precheck", "passed")
     return {**env_result, "env_state": normalized_env_state, "reward_extra_info": normalized_env_state}
 
 

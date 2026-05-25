@@ -2,18 +2,28 @@
 set -euo pipefail
 
 MODEL_PATH=${MODEL_PATH:-/nfs/FM/lihongbin/CODE/ms-swift/output/Qwen3.6-27B-32k-sft-full-stage2/v0-20260503-141128/checkpoint-681/}
-SAMPLE_PATH=${SAMPLE_PATH:-/nfs/FM/lihongbin/datasets/CUDA_RL/RL_Data/prompt_v4/drkernel_rl_thinking.parquet}
-SAMPLE_INDEX=${SAMPLE_INDEX:-0}
-PROMPT_KEY=${PROMPT_KEY:-prompt}
+# /nfs/FM/lihongbin/CODE/ms-swift/output/Qwen3.6-27B-32k-sft-full-stage2/v0-20260503-141128/checkpoint-681/
+# /nfs/FM/checkpoints/Qwen/Qwen3.6-27B/
+SAMPLE_PATH=${SAMPLE_PATH:-/nfs/FM/lihongbin/datasets/CUDA_RL/SFT/prompt_v4/parallel_drkernel_minimax_results_sft.parquet}
+# /nfs/FM/lihongbin/datasets/CUDA_RL/SFT/prompt_v4/parallel_drkernel_minimax_results_sft.parquet
+# /nfs/FM/lihongbin/datasets/CUDA_RL/RL_Data/prompt_v4/drkernel_rl_thinking.parquet
+# "/nfs/FM/lihongbin/datasets/CUDA_RL/RL_Data/prompt_tvm/drkernel_rl_thinking.parquet"
+SAMPLE_INDEX=${SAMPLE_INDEX:-1}
+PROMPT_KEY=${PROMPT_KEY:-'messages'}
 GROUND_TRUTH_KEY=${GROUND_TRUTH_KEY:-reward_model.ground_truth}
 ENTRY_POINT_KEY=${ENTRY_POINT_KEY:-extra_info.entry_point}
 UUID_KEY=${UUID_KEY:-extra_info.uuid}
-KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.207.229:8002}
+KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.16.21:20111}
+# http://192.168.207.229:8002
+# http://192.168.16.21:20111
+KERNEL_BACKEND=${KERNEL_BACKEND:-cuda_agent}
+# tvm_ffi
+# cuda_agent
 
 ROLLOUT_HOST=${ROLLOUT_HOST:-127.0.0.1}
 ROLLOUT_PORT=${ROLLOUT_PORT:-30000}
 TP_SIZE=${TP_SIZE:-1}
-MAX_TURNS=${MAX_TURNS:-3}
+MAX_TURNS=${MAX_TURNS:-1}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-8192}
 ROLLOUT_MAX_CONTEXT_LEN=${ROLLOUT_MAX_CONTEXT_LEN:-32768}
 MAX_FEEDBACK_CHARS=${MAX_FEEDBACK_CHARS:-0}
@@ -49,6 +59,7 @@ python examples/kernel_agent/test/run_generate_smoke.py \
   --entry-point-key "${ENTRY_POINT_KEY}" \
   --uuid-key "${UUID_KEY}" \
   --kernel-env-url "${KERNEL_ENV_URL}" \
+  --kernel-backend "${KERNEL_BACKEND}" \
   --rollout-host "${ROLLOUT_HOST}" \
   --rollout-port "${ROLLOUT_PORT}" \
   --max-turns "${MAX_TURNS}" \

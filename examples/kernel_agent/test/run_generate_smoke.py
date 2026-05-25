@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import shlex
 import subprocess
 import sys
@@ -344,10 +345,16 @@ def _init_ray_for_kernel_env(args) -> None:
 
     if ray.is_initialized():
         return
-    if args.ray_address:
-        ray.init(address=args.ray_address, ignore_reinit_error=True)
+    ray_address = args.ray_address or os.environ.get("RAY_ADDRESS")
+    if ray_address:
+        ray.init(address=ray_address, ignore_reinit_error=True)
     else:
-        ray.init(ignore_reinit_error=True, include_dashboard=False, num_cpus=args.ray_num_cpus)
+        try:
+            ray.init(ignore_reinit_error=True, include_dashboard=False, num_cpus=args.ray_num_cpus)
+        except ValueError as exc:
+            if "When connecting to an existing cluster" not in str(exc):
+                raise
+            ray.init(address="auto", ignore_reinit_error=True)
 
 
 def _wait_http_ok(url: str, timeout: float) -> None:
@@ -460,6 +467,7 @@ async def _run(args) -> None:
             multi_turn_prompt_config_path=args.multi_turn_prompt_config_path,
             preserve_history_thinking=args.preserve_history_thinking,
             keep_history_thinking=args.keep_history_thinking,
+            kernel_backend=args.kernel_backend,
             num_gpus_per_node=args.num_gpus_per_node,
             max_turns=args.max_turns,
             use_multi_turn=args.use_multi_turn,
@@ -523,6 +531,7 @@ def parse_args():
     parser.add_argument(
         "--kernel-env-url", default="", help="KernelServer URL, for example http://192.168.16.21:8003."
     )
+    parser.add_argument("--kernel-backend", choices=("cuda_agent", "tvm_ffi", "triton"), default="cuda_agent")
     parser.add_argument("--real-model", action="store_true", help="Use an already running rollout /generate endpoint.")
     parser.add_argument(
         "--start-rollout", action="store_true", help="Start a local SGLang rollout server before generate."
