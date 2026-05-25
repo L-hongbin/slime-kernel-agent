@@ -26,8 +26,21 @@ def parse_args():
     ap.add_argument(
         "--variant",
         default="raw",
-        choices=["raw", "roundtrip_only", "fuse_bf16", "fuse_fp32"],
-        help="weight modification to apply before forward (raw = no modification)",
+        choices=[
+            "raw",
+            "roundtrip_only",
+            "fuse_bf16",
+            "fuse_fp32",
+            "pipeline_fp32",
+            "pipeline_fp64",
+            "raw_fp32",
+            "raw_fp64",
+        ],
+        help="weight modification to apply before forward (raw = no modification). "
+        "raw_fp32/fp64: just cast model to target dtype with NO other modifications "
+        "(control for fp32/fp64 forward arithmetic baseline). "
+        "pipeline_fp32/fp64: cast model to target dtype + apply offset-norm fusion + Hadamard rotation, "
+        "all in target dtype storage. Forward also runs in target dtype.",
     )
     return ap.parse_args()
 
@@ -116,6 +129,82 @@ def apply_fuse(model, fp32_temp: bool):
     )
 
 
+def apply_pipeline(model, target_dtype):
+    """Full pipeline (offset-norm fuse + Hadamard rotation) staying in target_dtype.
+
+    Cast model to target_dtype FIRST, then apply fusion + rotation with no BF16
+    cast anywhere. Tests whether BF16 storage truncation (rather than the
+    operations themselves) is the dominant cost.
+
+    target_dtype: torch.float32 or torch.float64
+    """
+    import math
+    import re
+
+    label = f"pipeline_{str(target_dtype).rsplit('.', 1)[-1]}"
+
+    # Cast all params to target_dtype
+    print(f"[{label}] casting model to {target_dtype}", flush=True)
+    for p in model.parameters():
+        p.data = p.data.to(target_dtype)
+    for b in model.buffers():
+        if b.is_floating_point():
+            b.data = b.data.to(target_dtype)
+
+    # Step 1: offset-norm fusion in target dtype (no BF16 cast)
+    pairs = find_norm_linear_pairs(model)
+    for norm, linears in pairs:
+        w = norm.weight.data.to(target_dtype)
+        s = 1.0 + w
+        for lin in linears:
+            lin.weight.data = lin.weight.data.to(target_dtype) * s.unsqueeze(0)
+        norm.weight.data.zero_()
+    print(f"[{label}] fused {len(pairs)} norm pairs in {target_dtype}", flush=True)
+
+    # Step 2: build Hadamard matrix (always in fp64 internally, then we cast at apply time)
+    from compressed_tensors.transform.utils.hadamard import random_hadamard_matrix
+
+    hidden = model.config.text_config.hidden_size if hasattr(model.config, "text_config") else model.config.hidden_size
+    # Build R on CPU first to avoid device_map allocation surprises, then move per-module
+    gen = torch.Generator(device="cpu").manual_seed(42)
+    R_fp64 = random_hadamard_matrix(hidden, dtype=torch.float64, device=torch.device("cpu"), gen=gen)
+    R_fp64 = R_fp64 / math.sqrt(hidden)  # orthogonalize
+    print(f"[{label}] built Hadamard R of size {hidden}x{hidden} in fp64", flush=True)
+
+    OUT_PATTERNS = [
+        r".*language_model\.embed_tokens$",
+        r".*language_model\.layers\.\d+\.(self_attn\.o_proj|linear_attn\.out_proj)$",
+        r".*language_model\.layers\.\d+\.mlp\.down_proj$",
+    ]
+    IN_PATTERNS = [
+        r".*language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj)|linear_attn\.(in_proj_a|in_proj_b|in_proj_qkv|in_proj_z)|mlp\.(gate_proj|up_proj))$",
+        r"^lm_head$",
+    ]
+
+    n_out = n_in = 0
+    for name, mod in dict(model.named_modules()).items():
+        if isinstance(mod, torch.nn.Embedding):
+            if any(re.match(p, name) for p in OUT_PATTERNS):
+                R = R_fp64.to(device=mod.weight.device)
+                # Embedding weight (vocab, hidden), output side: W @ R
+                W64 = mod.weight.data.to(torch.float64) @ R
+                mod.weight.data = W64.to(target_dtype)
+                n_out += 1
+        elif isinstance(mod, torch.nn.Linear):
+            R = R_fp64.to(device=mod.weight.device)
+            if any(re.match(p, name) for p in OUT_PATTERNS):
+                # Linear weight (out, in), output side: W_new = R.T @ W
+                W64 = R.T @ mod.weight.data.to(torch.float64)
+                mod.weight.data = W64.to(target_dtype)
+                n_out += 1
+            elif any(re.match(p, name) for p in IN_PATTERNS):
+                # Linear weight (out, in), input side inverse: W_new = W @ R
+                W64 = mod.weight.data.to(torch.float64) @ R
+                mod.weight.data = W64.to(target_dtype)
+                n_in += 1
+    print(f"[{label}] rotated {n_out} output-side + {n_in} input-side modules in {target_dtype}", flush=True)
+
+
 def main():
     args = parse_args()
     print(f"[probe] loading {args.model_path} (variant={args.variant})", flush=True)
@@ -143,6 +232,25 @@ def main():
         apply_fuse(model, fp32_temp=False)
     elif args.variant == "fuse_fp32":
         apply_fuse(model, fp32_temp=True)
+    elif args.variant == "pipeline_fp32":
+        apply_pipeline(model, target_dtype=torch.float32)
+    elif args.variant == "pipeline_fp64":
+        apply_pipeline(model, target_dtype=torch.float64)
+    elif args.variant == "raw_fp32":
+        # Control: just upcast, no modifications. Tests pure fp32 forward vs bf16 forward.
+        print("[raw_fp32] casting model to fp32 (no other modifications)", flush=True)
+        for p in model.parameters():
+            p.data = p.data.float()
+        for b in model.buffers():
+            if b.is_floating_point():
+                b.data = b.data.float()
+    elif args.variant == "raw_fp64":
+        print("[raw_fp64] casting model to fp64 (no other modifications)", flush=True)
+        for p in model.parameters():
+            p.data = p.data.double()
+        for b in model.buffers():
+            if b.is_floating_point():
+                b.data = b.data.double()
     elif args.variant == "raw":
         pass
 

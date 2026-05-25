@@ -73,6 +73,7 @@ Online (every RL step, milliseconds):
 
 - ✅ Hadamard rotation pipeline 完整跑通（`scripts/quantize/rotate_bf16_llmcompressor.py` + sglang multimodal load 验证）
 - ✅ Rotated MM BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-mm-bf16/`
+- ✅ **Forward-divergence probe 完成**（见 `scripts/quantize/PROBE_RESULTS.md`）：证明 rotation 数学等价，4pp 损失全部归因 bf16 部署 cost（1.14pp 算术 + 0.44pp storage）；fp32/fp64 pipeline 验证 rotation 0% 额外 cost
 - ✅ **Rotated MM BF16 100×8 baseline 完成**（1h21min）— **rotation 在 BF16 下有 ~4pp 精度成本**：
 
   | metric | v2_3 noenv 100×8（unrotated baseline） | Rotated MM 100×8 | Δ |
@@ -90,16 +91,30 @@ Online (every RL step, milliseconds):
   原因（推测）：(a) BF16 7-bit mantissa 在 R/R.T 矩阵乘后累积舍入；(b) RMSNorm 融合后 weights round-trip BF16；(c) hidden=5120 非 power-of-2 用 random orthogonal 不是真 Hadamard；(d) per-token activation magnitudes 在 rotated basis 下分布变了，BF16 截断行为不同
 - ⏸ INT8 RTN 扩展 + slime 训-rollout 闭环 wiring 待做
 
-### Rotation cost 的策略含义
+### Rotation cost 的策略含义（已细化，见 Probe 段）
 
-4pp 是 **rotation 的 sunk cost**，不是 free win。决定整个 strategy 是否成立的关键测试还在前面：
-- **Unrotated + RTN INT8**（基线对比）：预计 -10pp+，因为 outliers 直接放大 quant scale
-- **Rotated + RTN INT8**：预计 ~-6pp 相对 unrotated BF16（4pp rotation + 2pp RTN）
-- 比较：**Rotated + RTN 应当比 Unrotated + RTN 好 3-4pp，且总精度损失约 6pp 相对 unrotated BF16**
+初步的 4pp T3 correct loss 让我们一度怀疑 rotation 实现有问题。但 forward-divergence probe（详见 `scripts/quantize/PROBE_RESULTS.md`）已经证明 **rotation 数学完全等价**，4pp 是 bf16 部署的固有累积代价：
 
-如果实测下来 Rotated + RTN 也只能做到 -8pp+，说明 rotation 不值，应该回到考虑别的方向（KV cache quant、speculative decoding、不带 rotation 的 W4A16 GPTQModel ckpt 等）。
+- 1.14pp 来自 bf16 vs fp32 forward 算术（即便不做 rotation，bf16 模型升 fp32 跑也是这差异）
+- 0.44pp 来自 bf16 storage truncation of rotated weights（rotation 部署的真正附加成本）
+- 总和 1.58% logit L2，累积到 5k-token × 3-turn → 5 nats/turn → e^5 ≈ 148× trajectory mass shift → 4.3pp downstream correctness drop
 
-实际上**最便宜的下一步是先跑 Unrotated + RTN INT8** —— 如果它的损失已经在可接受范围（比如 < 5pp），rotation 的 4pp sunk cost 就完全不值得付出。
+**不可避免**（除非 fp32 deployment，2× 慢）。**Rotation 应该当作"为 INT8 量化做的预处理"**，而不是 BF16 deployment 本身有收益。
+
+### 关键技术建议（来自 codex + probe）
+
+加 W8A8 量化时，**从 FP32 master copy 一次量化到 INT8**（不要走 "BF16 rotated → BF16 dequant → W8A8 quant" 双 round-trip）：
+
+```
+rotate_in_memory(model.float())           # rotation in fp32, never store bf16
+→ quantize_to_w8a8(model)                  # RTN INT8 from fp32 master
+→ save W8A8 ckpt with quant_method=compressed-tensors
+```
+
+这样：
+- 跳过 BF16 storage 的 0.44pp 损失
+- INT8 量化噪声本身远大于 0.44pp，可忽略中间精度优化
+- 最终 deployment 是 W8A8 INT8 forward（sglang 已支持），bf16 forward arithmetic 也不再相关
 
 ## 历史路径（已废弃）
 

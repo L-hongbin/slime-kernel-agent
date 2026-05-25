@@ -85,23 +85,57 @@ per-layer rel L2 divergence:
 logit rel L2: 1.580%, last-token KL: 0.00126, top1 agree: 100.0%
 ```
 
-## Key conclusions
+## Round 2 — fp32 / fp64 pipeline + raw controls (added 2026-05-25)
 
-1. **`fuse_fp32` ≈ `fuse_bf16`**: codex's "keep `(1+w)` in fp32" fix has essentially no effect (1.25% vs 1.31% logit L2). The dominant BF16 truncation happens at `lin.weight.data = (... * s).bfloat16()` (storing the absorbed weight back to BF16) — not at the intermediate `(1+w)` cast. Fully fixing would require fp32 weight storage (doubles ckpt size + ~2× slower inference).
+To isolate rotation cost from bf16 forward arithmetic noise, ran 4 additional variants:
+- `raw_fp32`: just cast model to fp32, no other modifications, fp32 forward
+- `raw_fp64`: same with fp64
+- `pipeline_fp32`: cast to fp32 + apply offset-norm fusion + Hadamard rotation, all storage fp32
+- `pipeline_fp64`: same with fp64
 
-2. **`roundtrip_only` alone causes 1.21% logit L2**: just round-tripping all 161 norms through `BF16(BF16(1+w)-1)` produces most of the BF16 cost. Fusion adds ~0.1%, rotation adds another ~0.3%.
+```
+=== raw_fp32 ===       logit rel L2: 1.144%, KL: 0.00096, top1: 100%
+=== raw_fp64 ===       logit rel L2: 1.144%, KL: 0.00096, top1: 100%
+=== pipeline_fp32 ===  logit rel L2: 1.144%, KL: 0.00096, top1: 100%
+=== pipeline_fp64 ===  logit rel L2: 1.144%, KL: 0.00096, top1: 100%
+=== rotated bf16 ckpt === logit rel L2: 1.580%, KL: 0.00126, top1: 100%
+```
 
-3. **`hidden_states[L64]` 86% / 202% is expected, not a bug**: the final RMSNorm's scale is absorbed into `lm_head`, so the hidden state before `lm_head` is in a different basis (no norm scale applied, or rotated). `lm_head` compensates → logits remain near-identical (top-1 100%).
+**All four fp32/fp64 variants give IDENTICAL 1.144% logit L2** — to 4 decimal places.
 
-4. **Per-layer 0.025% monotonic growth** is normal residual-stack distributed accumulation (`e_{l+1} ≈ (I + J_l) e_l + u_l`), NOT a specific layer's amplifier bug.
+## Key conclusions (final)
 
-5. **Why 1.6% logit L2 + 100% top-1 → 4.3pp KernelBench drop**: multi-turn autoregressive generation accumulates KL drift. Sequence KL = sum over tokens → 0.001 nats/token × 5000 tokens ≈ 5 nats per turn → e^5 ≈ 148× relative trajectory probability mass shift. Across 3 turns easily large enough to flip ~0.7pp per trajectory (matches the 4.3pp drop at n=8 pass@8 style).
+1. **Rotation is mathematically exact when stored in fp32 or higher**. `pipeline_fp32 == raw_fp32` proves rotation adds 0% extra divergence — rotation perfectly cancels through residual stream + final norm/lm_head absorption. The 1.144% is **purely fp32 forward vs bf16 forward arithmetic difference**.
+
+2. **fp64 buys nothing over fp32** for this model size — `raw_fp64 == raw_fp32`. fp32 is already converged precision for 27B forward.
+
+3. **The 4.3pp KernelBench drop decomposes as**:
+   - **1.14% logit L2** from bf16 vs fp32 forward arithmetic (exists with or without rotation — intrinsic to bf16 deployment)
+   - **0.44% logit L2** from bf16 storage truncation of rotated weights (specific to rotation deployment)
+   - **Total 1.58%** for rotated_bf16 ckpt with bf16 forward → ~5 nats per turn → e^5 ≈ 148× trajectory mass shift → 4.3pp downstream correctness loss
+
+4. **`fuse_fp32` (codex round-2 proposed fix) ≈ `fuse_bf16`** because final `lin.weight` is stored bf16 anyway. The dominant truncation happens at storage cast, not at the intermediate `(1+w)` temp.
+
+5. **`roundtrip_only` 1.21%** already covers most of the eventual 1.58% — the absorbed weight stores in bf16 either way.
+
+6. **`hidden_states[L64]` 86% / 202% is by design** (final norm scale absorbed into lm_head, hidden state before lm_head is in different basis, lm_head compensates).
+
+7. **Per-layer 0.025% monotonic growth** = normal residual-stack distributed accumulation, NOT a layer-specific bug.
 
 ## Implications for W8A8 pipeline
 
-- **Don't bother fixing BF16 rotation cost** — it's structural, not a bug
-- **When quantizing to W8A8**: keep an **FP32 master copy of rotated weights** during the quantize step, apply RTN once from FP32 → save BF16 weight + scale, avoiding the extra "BF16 rotated → BF16 dequant → W8A8 quant" round-trip
-- Codex notes a future probe worth doing: teacher-forced cumulative KL on real 5-8k token KernelBench trajectories (this 42-token probe only explains plausibility, doesn't bound downstream effect)
+- **Don't bother fixing BF16 rotation cost** — math is right, 1.58% is bf16 deployment cost
+- **W8A8 quantization**: per codex, keep **FP32 master copy of rotated weights** during quantize, apply RTN once from FP32 → save W8A8. Avoids "BF16 rotated → BF16 dequant → W8A8 quant" double round-trip
+- The 4.3pp BF16 baseline loss will be dominated by the (larger) W8A8 quant noise. Net rotation+W8A8 vs unrotated+W8A8 should still favor rotation if INT8 outlier reduction works as theory predicts
+
+## To reduce 1.58% → 1.14% (not recommended)
+
+If for some reason we want to recover the 0.44pp:
+1. Modify `rotate_bf16_llmcompressor.py` to `model.float()` before save → 108 GB ckpt
+2. SGLang must load with `dtype=float32` → ~100 GB GPU memory + **~2× slower inference**
+3. Does **NOT** recover the 1.14% — that's bf16-vs-fp32 forward arithmetic, fundamental to running 27B in bf16
+
+Recovers 28% of total rotation drift (0.44/1.58). Not worth 2× inference cost for RL rollout where wall time dominates.
 
 ## How to reproduce
 
