@@ -1,34 +1,32 @@
-"""Apply offline-only SpinQuant rotation to a Qwen3.5/3.6 text-only model.
+"""Apply offline-only SpinQuant rotation to a Qwen3.5/3.6 multimodal model.
 
 Saves BF16 (no quantization). The point of this script is to validate that the
 rotation math is preserved across Qwen3.5's hybrid attention (linear_attn +
-self_attn) BEFORE adding GPTQ W8A8 on top. If the rotated BF16 model produces
-the same KernelBench accuracy as the unrotated BF16 model (within noise), we
-know:
-  - the custom Qwen3.5 SpinQuant mapping correctly enumerates every
-    residual-facing projection (so R1 rotation cancels through every layer)
-  - llmcompressor's fusion of RMSNorm scales into the rotated projections
-    worked for the hybrid architecture
-  - sglang loads the rotated weights correctly (loader ignores
-    transform_config; rotation is already baked into the saved weights)
+self_attn) BEFORE adding GPTQ W8A8 on top.
 
-If accuracy degrades significantly, the mapping is wrong somewhere — most
-likely the linear_attn projections aren't covered correctly. Codex's prior
-audit identified the four residual-facing input projections of linear_attn
-(`in_proj_a`, `in_proj_b`, `in_proj_qkv`, `in_proj_z`) plus `out_proj` as
-the things R1 must propagate through. Internal SSM tensors (conv1d, A_log,
-dt_bias, norm) operate in post-projection basis and must NOT be rotated.
+**Loads via `AutoModelForImageTextToText`** so the vision tower is preserved
+in BF16 and the saved `architectures` tag stays as
+`Qwen3_5ForConditionalGeneration` — the entry sglang has actually registered
+and tested. (The dense `Qwen3_5ForCausalLM` entry has at least four
+independent bugs in current sglang; see W8A8 handoff.)
 
-Loads text-only (`AutoModelForCausalLM.from_pretrained`) so the vision
-tower isn't instantiated. This rewrites `architectures` to
-`Qwen3_5ForCausalLM` in the saved config; sglang load then requires
-`scripts/quantize/sglang_qwen3_5_dense_entry.patch` to be applied.
+R1 rotation is scoped strictly to `model.language_model.*` projections —
+vision tower modules are not touched, so they pass through as BF16.
+- self_attn.q/k/v/o on the 16 full-attention layers
+- linear_attn.in_proj_{a,b,qkv,z} + out_proj on the 48 mamba-style layers
+- mlp.{gate,up,down}_proj on every layer
+- embed_tokens + lm_head (top level)
+
+Codex's prior audit: R1 must propagate through every projection that
+touches the residual stream. Internal SSM tensors (conv1d, A_log, dt_bias,
+norm inside linear_attn) operate in post-projection basis and must NOT be
+rotated.
 
 Usage on .22:
     source /tmp/w8a8-venv/bin/activate
     python scripts/quantize/rotate_bf16_llmcompressor.py \\
         --model-path /nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B \\
-        --output-path /nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-rotated-bf16
+        --output-path /nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-rotated-mm-bf16
 """
 
 from __future__ import annotations
@@ -64,26 +62,35 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
 # Even for full_attention layers the R2 win on W8A8 is small (R2's
 # headline benefit is for low-bit attention quant).
 def build_qwen35_mapping():
-    """Construct the SpinQuantMapping for Qwen3.5/3.6 hybrid arch.
+    """Construct the SpinQuantMapping for Qwen3.5/3.6 hybrid arch (multimodal layout).
+
+    All projection patterns are scoped with `language_model\.` prefix so that
+    the vision tower (`model.visual.*`) and MTP module (`mtp.*`) are
+    completely untouched by rotation — they pass through as BF16.
 
     Done lazily so the script's --help works without llmcompressor installed.
     """
     from llmcompressor.modifiers.transform.spinquant.mappings import SpinQuantMapping
 
     return SpinQuantMapping(
-        embedding="re:.*embed_tokens$",
+        embedding=r"re:.*language_model\.embed_tokens$",
         # Both attention block kinds — llmcompressor walks this to find the
-        # parent module hosting q/k/v/o.
-        attn="re:.*(self_attn|linear_attn)$",
-        # Three "attn input" slots — cram all 5 input projections in:
+        # parent module hosting q/k/v/o. Scope to language_model.
+        attn=r"re:.*language_model\.layers\.\d+\.(self_attn|linear_attn)$",
+        # Three "attn input" slots — cram all 5 input projection families in:
         # self_attn has 3 (q/k/v); linear_attn has 4 (a/b/qkv/z). Distribute:
-        attn_q=r"re:.*(self_attn\.q_proj|linear_attn\.in_proj_qkv)$",
-        attn_k=r"re:.*(self_attn\.k_proj|linear_attn\.in_proj_a|linear_attn\.in_proj_b)$",
-        attn_v=r"re:.*(self_attn\.v_proj|linear_attn\.in_proj_z)$",
+        attn_q=r"re:.*language_model\.layers\.\d+\.(self_attn\.q_proj|linear_attn\.in_proj_qkv)$",
+        attn_k=r"re:.*language_model\.layers\.\d+\.(self_attn\.k_proj|linear_attn\.in_proj_a|linear_attn\.in_proj_b)$",
+        attn_v=r"re:.*language_model\.layers\.\d+\.(self_attn\.v_proj|linear_attn\.in_proj_z)$",
         # One "attn output" slot — covers self_attn.o_proj AND linear_attn.out_proj.
-        attn_o=r"re:.*(self_attn\.o_proj|linear_attn\.out_proj)$",
-        mlp_in=[r"re:.*mlp\.gate_proj$", r"re:.*mlp\.up_proj$"],
-        mlp_out=r"re:.*mlp\.down_proj$",
+        attn_o=r"re:.*language_model\.layers\.\d+\.(self_attn\.o_proj|linear_attn\.out_proj)$",
+        mlp_in=[
+            r"re:.*language_model\.layers\.\d+\.mlp\.gate_proj$",
+            r"re:.*language_model\.layers\.\d+\.mlp\.up_proj$",
+        ],
+        mlp_out=r"re:.*language_model\.layers\.\d+\.mlp\.down_proj$",
+        # lm_head is at the top level of the multimodal model, not nested
+        # under language_model. Hf save_pretrained writes it as just "lm_head".
         lm_head="lm_head",
     )
 
@@ -107,8 +114,15 @@ def build_qwen35_norm_mappings(model):
     from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
 
     named = dict(model.named_modules())
+    # Only consider language_model layers — multimodal vision tower has its
+    # own norm structure (norm1, norm2 inside each visual block) and must
+    # not be rotated.
     layer_prefixes = sorted(
-        {n.removesuffix(".input_layernorm") for n in named if n.endswith(".input_layernorm")},
+        {
+            n.removesuffix(".input_layernorm")
+            for n in named
+            if n.endswith(".input_layernorm") and "language_model" in n
+        },
         key=lambda s: [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", s)],
     )
 
@@ -130,14 +144,17 @@ def build_qwen35_norm_mappings(model):
             raise ValueError(f"{layer}: missing modules {missing}")
         out.append(NormMapping(norm=post_norm, linears=mlp_linears))
 
-    # Final pre-lm_head norm: handle the multimodal-wrapped / flat name variations.
-    final_norm = next((n for n in ("language_model.norm", "model.norm", "norm") if n in named), None)
-    if final_norm is None:
-        candidates = [n for n in named if (n == "norm" or n.endswith(".norm")) and ".layers." not in n]
-        if len(candidates) != 1:
-            raise ValueError(f"could not uniquely identify final pre-lm_head norm: {candidates}")
-        final_norm = candidates[0]
-    out.append(NormMapping(norm=final_norm, linears=["lm_head"]))
+    # Final pre-lm_head norm — for multimodal layout, this is at
+    # `model.language_model.norm`. Vision tower has its own `model.visual.merger.norm`
+    # which must be excluded.
+    final_norm_candidates = [
+        n
+        for n in named
+        if n.endswith(".norm") and "language_model" in n and ".layers." not in n and "linear_attn" not in n
+    ]
+    if len(final_norm_candidates) != 1:
+        raise ValueError(f"could not uniquely identify final language-model norm: {final_norm_candidates}")
+    out.append(NormMapping(norm=final_norm_candidates[0], linears=["lm_head"]))
     return out
 
 
@@ -159,6 +176,9 @@ def build_qwen35_r1_transform_config():
     """
     from compressed_tensors.transform import TransformArgs, TransformConfig, TransformScheme
 
+    # All target patterns are scoped with `language_model\.` so the vision
+    # tower (`model.visual.*`) and MTP module (`mtp.*`) are completely
+    # untouched. lm_head is at the top level — no language_model prefix.
     return TransformConfig(
         config_groups={
             "R1": TransformScheme(
@@ -169,15 +189,15 @@ def build_qwen35_r1_transform_config():
                 apply=[
                     TransformArgs(
                         targets=[
-                            r"re:.*embed_tokens$",
-                            r"re:.*(self_attn\.o_proj|linear_attn\.out_proj)$",
-                            r"re:.*mlp\.down_proj$",
+                            r"re:.*language_model\.embed_tokens$",
+                            r"re:.*language_model\.layers\.\d+\.(self_attn\.o_proj|linear_attn\.out_proj)$",
+                            r"re:.*language_model\.layers\.\d+\.mlp\.down_proj$",
                         ],
                         location="weight_output",
                     ),
                     TransformArgs(
                         targets=[
-                            r"re:.*(self_attn\.(q_proj|k_proj|v_proj)|linear_attn\.(in_proj_a|in_proj_b|in_proj_qkv|in_proj_z)|mlp\.(gate_proj|up_proj))$",
+                            r"re:.*language_model\.layers\.\d+\.(self_attn\.(q_proj|k_proj|v_proj)|linear_attn\.(in_proj_a|in_proj_b|in_proj_qkv|in_proj_z)|mlp\.(gate_proj|up_proj))$",
                             "lm_head",
                         ],
                         location="weight_input",
@@ -214,17 +234,36 @@ def main():
     args = parse_args()
     rotations = [r.strip() for r in args.rotations.split(",") if r.strip()]
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
-    print(f"[rotate] loading text-only model from {args.model_path}", flush=True)
+    print(f"[rotate] loading multimodal model from {args.model_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
+    # Multimodal load preserves the vision tower (passes through as BF16,
+    # SpinQuant regex doesn't match its modules) and keeps the saved
+    # `architectures` tag as Qwen3_5ForConditionalGeneration — the entry
+    # sglang has actually registered + production-tested.
+    try:
+        from transformers import AutoModelForImageTextToText
+
+        model = AutoModelForImageTextToText.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    except Exception as e:
+        print(f"[rotate] AutoModelForImageTextToText failed ({e!r}); falling back to AutoModel.from_pretrained")
+        from transformers import AutoModel
+
+        model = AutoModel.from_pretrained(
+            args.model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+    print(
+        f"[rotate] model loaded, class={type(model).__name__}, root dtype={next(model.parameters()).dtype}", flush=True
     )
-    print(f"[rotate] model loaded, root dtype={next(model.parameters()).dtype}", flush=True)
 
     # Two pieces needed:
     # 1) NormMappings as per-layer absolute paths — sidesteps the
@@ -264,22 +303,9 @@ def main():
     # calibration dataset needed for R1/R2.
     oneshot(model=model, recipe=[modifier])
 
-    # sglang's Qwen3_5ForCausalLM expects `layers_block_type` with values
-    # `attention` / `linear_attention`. HF Qwen3.5 exposes `layer_types` with
-    # values `full_attention` / `linear_attention`. Add the alias here so the
-    # saved config has both, sidestepping the dense-entry naming dead-code in
-    # sglang. (Third bug in the dense path after EntryClass + num_experts;
-    # patched separately in scripts/quantize/sglang_qwen3_5_dense_entry.patch
-    # but cleanest to add the alias on the producer side too.)
-    if not hasattr(model.config, "layers_block_type") and hasattr(model.config, "layer_types"):
-        model.config.layers_block_type = [
-            "attention" if lt == "full_attention" else lt for lt in model.config.layer_types
-        ]
-        print(
-            f"[rotate] added layers_block_type alias ({len(model.config.layers_block_type)} layers) "
-            f"for sglang dense entry compatibility",
-            flush=True,
-        )
+    # Multimodal load preserves the `Qwen3_5ForConditionalGeneration`
+    # architecture tag; no layers_block_type alias hack needed (sglang
+    # multimodal entry handles layer-type dispatch correctly).
 
     print(f"[rotate] saving rotated BF16 to {args.output_path}", flush=True)
     model.save_pretrained(args.output_path)
