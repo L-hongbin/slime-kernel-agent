@@ -297,6 +297,58 @@ llmcompressor 官方支持"load 多模态 + 只量化 LM"的 pattern（见 `llmc
 
 补丁本身很小（1 个 hasattr 守卫 + EntryClass 加 2 项），可以直接提 sglang upstream PR。审核通过后路径 B 的补丁负担消失。**已核实 sglang main 分支至今仍有同样问题**。
 
+### 路径 E — SpinQuant offline rotation 实测（2026-05-25，部分跑通）
+
+按用户 "step by step" 推进路径 E：先做 BF16 + offline R1 rotation 不加 quant，验证 rotation 数学 + sglang load。脚本 `scripts/quantize/rotate_bf16_llmcompressor.py`。
+
+#### Producer 端 — ✅ 完全跑通
+
+依次 debug 出 3 个 llmcompressor SpinQuantModifier 问题，最终成功产出 51GB 旋转 BF16 ckpt at `/nfs/.../Qwen3.6-27B-rotated-bf16/`：
+
+1. **SpinQuantMapping schema 限制**：3 个 `attn_q/k/v` 槽对 Qwen3.5 hybrid（7 个 input projections = 3 self_attn + 4 linear_attn）放不下。Cram via regex disjunction。Codex 验证 R1 only 数学 OK（q/k/v 槽对 R1 都是同一处理 `weight_input, inverse=True`）；R2 不行
+2. **`_fuse_norms` `assert len(norm) == 1`**：`match_modules_set` 按 lowest common parent 流式分组，hybrid layers 缺投影 family 会让 group 不闭合 → norms 跨层累积 → 触发 assert。Fix：枚举每层绝对路径作 NormMapping，绕开 streaming-group 歧义
+3. **`SpinQuantModifier.on_initialize` 覆写**：`mappings` / `norm_mappings` kwargs 在没有 `transform_config` 时被静默覆写。Fix：直接构造 `TransformConfig` + `TransformScheme` + `TransformArgs` 传给 modifier
+
+Codex review 后 R1 transform 在 14 秒内完成，498 个 module 旋转。
+
+#### Consumer 端 — ❌ SGLang dense entry 4 bug 累计，第 4 个无补丁可解
+
+加载 rotated BF16 时连续撞 sglang `Qwen3_5ForCausalLM` 入口的 4 个独立 bug：
+
+| # | bug | 修法 | 状态 |
+|---|---|---|---|
+| 1 | `Qwen3_5ForCausalLM` 不在 `EntryClass` 注册 | `scripts/quantize/sglang_qwen3_5_dense_entry.patch` 加入 + hasattr 守卫 | ✅ 已 patch |
+| 2 | `get_model_config_for_expert_location` 硬编码 `config.num_experts`（dense config 无此字段） | 同上 patch 加 `if not hasattr(config, "num_experts"): return None` | ✅ 已 patch |
+| 3 | `make_layers` 读 `config.layers_block_type` 但 HF Qwen3.5 暴露 `layer_types`；值也错位（`attention` vs `full_attention`） | 在保存的 config.json 里加 `layers_block_type` alias + 值翻译 | ✅ rotate 脚本已加 + patch_config.py 已就地修旧 ckpt |
+| 4 | `RadixLinearAttention.forward` decode 路径调 `forward_batch.attn_backend.forward(layer=, mixed_qkv=, a=, b=)`，但默认 `flash` AttentionBackend 签名要 `q/k/v` 位置参 | sglang 没有为 dense entry 把 `linear_attn` 层 dispatch 到 mamba-aware backend；要正确接 `--linear-attn-backend triton` 通路 | ❌ 非平凡 sglang 改动，无 1-line patch |
+
+Bug 4 的 traceback：
+```
+File ".../sglang/srt/layers/radix_linear_attention.py", line 95, in forward
+    return forward_batch.attn_backend.forward(
+TypeError: AttentionBackend.forward() missing 3 required positional arguments: 'q', 'k', 'v'
+```
+
+发生在 `init_device_graphs` cuda graph capture（decode mode）。即便 `--disable-cuda-graph` 跳过 capture，首次 decode 仍会撞同一签名。结构性 dispatch bug。
+
+#### 结论
+
+- **rotation 数学和 producer 端是 OK 的** —— llmcompressor SpinQuant 加上 Qwen3.5 自定义 mapping + 直接 transform_config 可以稳定产出旋转后的 ckpt
+- **sglang dense entry path 实际是死代码** —— 累计 4 个独立 bug 说明这条路从未被任何人完整跑通过。修 1-3 各只要 1-2 行；修 4 要 sglang attention dispatch 重做
+- **路径 E 短期不可行**。要做 rotation + W8A8，必须改用**多模态 arch tag**（`Qwen3_5ForConditionalGeneration`），走 sglang 已注册路径。多模态 entry 是生产中真在用的（BF16 27B 通过它跑了几百次 eval），attention dispatch 正确
+
+#### 推荐转向
+
+放弃 `AutoModelForCausalLM` 加载 + 写 `Qwen3_5ForCausalLM` arch tag 的方案。改用路径 A 思路：
+1. `AutoModelForImageTextToText.from_pretrained` 加载多模态模型
+2. SpinQuant rotation 只作用在 `model.language_model.*` 子树（vision tower 保 BF16 + 不动 rotation）
+3. 保存时 `architectures=["Qwen3_5ForConditionalGeneration"]` 不变
+4. sglang 走多模态 entry，绕开 4 个 dense entry bug
+
+这条路 producer 端复杂度高一些（要把 SpinQuant mapping 限定到 language_model 子树 + vision tower 不能被 rotation 触及），但 consumer 端零 sglang 改动，工程上更可控。
+
+下次重启 Phase 2 时优先此路径。
+
 ### Path D（codex 最初建议）— 已验证不可行
 
 把 W8A8 ckpt 的 `architectures` 改回 `Qwen3_5ForConditionalGeneration`、保留同份 safetensors，期望 sglang 走 multimodal entry 加载。
