@@ -197,9 +197,11 @@ Verdict：**AGREE-ABANDON**。
 
 | 路径 | 主机 | 大小 | 说明 |
 |---|---|---|---|
-| `scripts/drkernel/build_w8a8_calibration.py` | repo | 2 KB | calibration 抽取脚本（in-repo 版） |
-| `scripts/drkernel/quantize_w8a8.py` | repo | 6 KB | W8A8 量化脚本（in-repo，含 MLP-only target + `--multimodal` mode） |
-| `scripts/drkernel/sglang_qwen3_5_dense_entry.patch` | repo | 2 KB | sglang dense entry 解锁补丁（路径 B 用） |
+| `scripts/quantize/build_calibration.py` | repo | 2 KB | calibration 抽取脚本（通用，两条 quant 路径都用） |
+| `scripts/quantize/quantize_w8a8_llmcompressor.py` | repo | 7 KB | llmcompressor W8A8 量化（含 MLP-only target + `--multimodal` mode） |
+| `scripts/quantize/quantize_w8_gptqmodel.py` | repo | 5 KB | GPTQModel W8 GPTQ_V2 量化（推荐，accuracy ~0.07% degradation） |
+| `scripts/quantize/sglang_qwen3_5_dense_entry.patch` | repo | 2 KB | sglang dense entry 解锁补丁 |
+| `scripts/quantize/README.md` | repo | 3 KB | 两条 quant 路径速查 + 算法对比 + loading caveats |
 | `/tmp/Qwen3.6-27B-W8A8-ct/` | .22 | 28 GB | 旧 full-W8A8 ckpt（CausalLM mode 量化产物，被 sglang load blocker 卡住） |
 | `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-ct/` | NFS | 28 GB | 同上 NFS 持久化 |
 | `/tmp/calibration_drkernel_v2_3_noenv_n4.jsonl` | .22 | ~5 MB | 1200 calibration prompts（已存在，可复用） |
@@ -208,10 +210,42 @@ Verdict：**AGREE-ABANDON**。
 
 ## 重启 Phase 2 的建议路径（按 ROI 排序）
 
-代码已 in-repo：
-- `scripts/drkernel/build_w8a8_calibration.py` — 从 eval_0.pt 抽取 calibration prompts
-- `scripts/drkernel/quantize_w8a8.py` — GPTQ W8A8 量化（默认 MLP-only target + 可选 `--multimodal` load 模式）
-- `scripts/drkernel/sglang_qwen3_5_dense_entry.patch` — sglang dense entry 解锁补丁
+代码已 in-repo（独立 `scripts/quantize/` 文件夹）：
+- `scripts/quantize/build_calibration.py` — 从 eval_0.pt 抽取 calibration prompts
+- `scripts/quantize/quantize_w8a8_llmcompressor.py` — llmcompressor + 香草 GPTQ + W8A8（含 `--multimodal` 模式）
+- `scripts/quantize/quantize_w8_gptqmodel.py` — **GPTQModel + GPTQ_V2 + `act_group_aware=True` + W8 only**（推荐先试，accuracy 损失 ~0.07%，已有公开 ckpt 验证）
+- `scripts/quantize/sglang_qwen3_5_dense_entry.patch` — sglang dense entry 解锁补丁（llmcompressor CausalLM mode 用）
+- `scripts/quantize/README.md` — 两条 quant 路径选型 + loading caveats 速查
+
+### llmcompressor vs GPTQModel — 选型核心点（2026-05-25 核实）
+
+| 维度 | llmcompressor | GPTQModel |
+|---|---|---|
+| **GPTQv2 (FORMAT.GPTQ_V2)** | ❌ | ✅ |
+| **GPTAQ (activation-aware GPTQ, asymmetric calibration)** | ❌ | ✅（`GPTAQConfig` experimental） |
+| **`act_group_aware`**（16k× faster vs `desc_act=True`，同等 quality） | ❌ | ✅（`desc_act=False` 时默认开） |
+| **FOEM (first-order error compensation)** | ❌ | ✅ |
+| **Qwen3.5 explicit model def**（保留多模态 layout `model.language_model.layers.*`） | ❌（fall back generic CausalLM，会重写 architectures） | ✅（`Qwen3_5GPTQ` mirror of `Qwen3_5MoeGPTQ`） |
+| **W8A8 (activation 也量化)** | ✅ | ❌（weights-only） |
+| **W4/W8 weights-only** | ✅ | ✅ |
+| **selective per-module skip** | regex `targets` + `ignore` | `QuantizeConfig.dynamic` negative match (`"-:..."`) |
+
+核实方法：
+- llmcompressor GPTQModifier 源码（`src/llmcompressor/modifiers/gptq/base.py`）只有 4 个 GPTQ-specific 字段：`block_size`、`dampening_frac`、`actorder`、`offload_hessians`。无 GPTQv2/GPTAQ/activation-aware 任何形式
+- GPTQModel README + QuantizeConfig 文档明确列出 `format=FORMAT.GPTQ_V2`、`act_group_aware`、`gptaq=GPTAQConfig(...)`、`foem=FOEMConfig(...)`、`dynamic={...}` 字段
+
+### 公开 W8 ckpt（可直接验证）
+
+[`btbtyler09/Qwen3.6-27B-GPTQ-8bit`](https://huggingface.co/btbtyler09/Qwen3.6-27B-GPTQ-8bit) on HuggingFace：
+
+- GPTQModel v5.7.1 量化，W8 GPTQ_V2，bits=8 group_size=32 sym=True desc_act=False
+- 全部 64 层 text decoder linears 都量化（mlp + self_attn + linear_attn），vision/MTP/embed/lm_head 保 BF16
+- `architectures=["Qwen3_5ForConditionalGeneration"]`（多模态 layout 保留）
+- 大小 32GB（vs BF16 50GB，1.6× 压缩）
+- **wikitext-2 perplexity 7.0697 vs BF16 7.0652，degradation +0.07%（基本无损）**
+- ⚠️ "Neither GPTQModel nor transformers can currently load this model directly. Use vLLM." vLLM 需要小补丁（model card 给了一句 sed），sglang 兼容性未验证
+
+可以直接拉这个 ckpt 跑 sglang smoke 测试 —— 比从头量化省 ~3-6h。recipe 跟 `quantize_w8_gptqmodel.py --target all-linear` 基本一致。
 
 ### 路径 A — `--multimodal` 量化 + 不动 sglang（**推荐先试**）
 
