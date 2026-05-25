@@ -6,16 +6,22 @@ and writes a checkpoint in the GPTQ_V2 format with `act_group_aware=True`
 calibration — ~16k× faster than `desc_act=True` ordering with equal or
 better quality recovery, per GPTQModel docs.
 
-Why GPTQModel instead of llmcompressor:
-- llmcompressor only has vanilla GPTQModifier (block_size / dampening_frac
-  / actorder / offload_hessians); no GPTQv2, no GPTAQ, no
-  activation-aware variant
-- GPTQModel exposes FORMAT.GPTQ_V2, GPTAQConfig (experimental), FOEMConfig,
-  act_group_aware, and an explicit Qwen3.5 model definition that loads
-  the multimodal checkpoint with `model.language_model.layers.*` prefix
-- An existing W8 ckpt from this exact recipe at
-  https://huggingface.co/btbtyler09/Qwen3.6-27B-GPTQ-8bit
-  reports +0.07% wikitext-2 perplexity degradation (effectively lossless)
+Trade-off vs llmcompressor:
+- llmcompressor has W8A8 (activations also INT8 → tensor-core int8 matmul
+  → ~2× decode speedup) but only vanilla GPTQ (no GPTQv2, no GPTAQ, no
+  activation-aware ordering).
+- GPTQModel has GPTQ_V2, GPTAQ, act_group_aware, FOEM, and an explicit
+  Qwen3.5 model definition — but is **weights-only**. GPTQModel's README
+  is explicit: "GGUF and FP8 are weight-only"; there's no `a_bits` or
+  activation calibration anywhere in QuantizeConfig.
+- Pick this script when you want weights-only INT8 with the best
+  algorithm and accept the smaller speedup (memory bandwidth on weights,
+  but math still BF16). Pick `quantize_w8a8_llmcompressor.py` when you
+  need activation INT8 too.
+
+The public ckpt at https://huggingface.co/btbtyler09/Qwen3.6-27B-GPTQ-8bit
+was made with this exact recipe and reports +0.07% wikitext-2 perplexity
+degradation (effectively lossless).
 
 What gets quantized (default = MLP only):
 - LM MLP (`mlp.gate_proj` / `mlp.up_proj` / `mlp.down_proj`) → INT8

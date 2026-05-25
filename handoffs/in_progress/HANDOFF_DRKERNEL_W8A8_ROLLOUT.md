@@ -217,22 +217,35 @@ Verdict：**AGREE-ABANDON**。
 - `scripts/quantize/sglang_qwen3_5_dense_entry.patch` — sglang dense entry 解锁补丁（llmcompressor CausalLM mode 用）
 - `scripts/quantize/README.md` — 两条 quant 路径选型 + loading caveats 速查
 
-### llmcompressor vs GPTQModel — 选型核心点（2026-05-25 核实）
+### llmcompressor vs GPTQModel — 选型核心 trade-off（2026-05-25 核实）
+
+两个工具在对立方向上各有所长：**llmcompressor scheme 灵活 + 算法老；GPTQModel 算法先进 + weights-only**。
 
 | 维度 | llmcompressor | GPTQModel |
 |---|---|---|
-| **GPTQv2 (FORMAT.GPTQ_V2)** | ❌ | ✅ |
+| **W8A8（activations 也 INT8）** | ✅ | ❌ — README 明说 "GGUF and FP8 are weight-only"；QuantizeConfig 无 `a_bits` 或 activation calibration 字段 |
+| W4/W8 weights-only | ✅ | ✅ |
+| FP8 weights | ✅ | ✅（weight-only） |
+| KV cache quant | ✅ | ❌ |
+| **GPTQv2 (`FORMAT.GPTQ_V2`)** | ❌ | ✅ |
 | **GPTAQ (activation-aware GPTQ, asymmetric calibration)** | ❌ | ✅（`GPTAQConfig` experimental） |
-| **`act_group_aware`**（16k× faster vs `desc_act=True`，同等 quality） | ❌ | ✅（`desc_act=False` 时默认开） |
+| **`act_group_aware`** | ❌ | ✅（`desc_act=False` 时默认开，16k× faster vs `desc_act=True` 同等 quality） |
 | **FOEM (first-order error compensation)** | ❌ | ✅ |
-| **Qwen3.5 explicit model def**（保留多模态 layout `model.language_model.layers.*`） | ❌（fall back generic CausalLM，会重写 architectures） | ✅（`Qwen3_5GPTQ` mirror of `Qwen3_5MoeGPTQ`） |
-| **W8A8 (activation 也量化)** | ✅ | ❌（weights-only） |
-| **W4/W8 weights-only** | ✅ | ✅ |
-| **selective per-module skip** | regex `targets` + `ignore` | `QuantizeConfig.dynamic` negative match (`"-:..."`) |
+| **Qwen3.5 explicit model def** | ❌（fall back generic CausalLM，重写 architectures） | ✅（`Qwen3_5GPTQ` mirror of `Qwen3_5MoeGPTQ`，保留多模态 layout） |
+| selective per-module skip | regex `targets` + `ignore` | `QuantizeConfig.dynamic` negative match `"-:..."` |
 
 核实方法：
 - llmcompressor GPTQModifier 源码（`src/llmcompressor/modifiers/gptq/base.py`）只有 4 个 GPTQ-specific 字段：`block_size`、`dampening_frac`、`actorder`、`offload_hessians`。无 GPTQv2/GPTAQ/activation-aware 任何形式
 - GPTQModel README + QuantizeConfig 文档明确列出 `format=FORMAT.GPTQ_V2`、`act_group_aware`、`gptaq=GPTAQConfig(...)`、`foem=FOEMConfig(...)`、`dynamic={...}` 字段
+- GPTQModel README 明确写 "GGUF and FP8 are weight-only"。FORMAT enum 只含 weights-only 方案（GPTQ / GPTQ_V2 / GGUF / FP8 / BITSANDBYTES / MARLIN / BITBLAS / QQQ / EXL3 / GEMM / GEMV / GEMV_FAST / LLM_AWQ / PAROQUANT），无 W*A* 联合方案
+
+### 含义：不存在"全选"工具
+
+| 你想要 | 必选工具 | 算法限制 |
+|---|---|---|
+| **W8A8 max 速度** | llmcompressor | vanilla GPTQ only |
+| **最好的 weights-only INT8**（GPTQv2 + act_group_aware + 多模态保留） | GPTQModel | weights-only，math 仍 BF16 |
+| **两者都要** | 不存在 | 理论上可串联（GPTQModel 量 weights → llmcompressor 加 activation quant），未测试，loader 大概率不兼容 |
 
 ### 公开 W8 ckpt（可直接验证）
 

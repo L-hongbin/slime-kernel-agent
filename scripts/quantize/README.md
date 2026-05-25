@@ -14,22 +14,28 @@ Qwen3.5/3.6 family + W8 / W8A8 INT.
 
 ## Algorithm comparison
 
+The two tools live on opposite sides of a hard trade-off — **llmcompressor
+has flexible schemes but a stale algorithm; GPTQModel has the modern
+algorithms but is weights-only**:
+
 | | llmcompressor | GPTQModel |
 |---|---|---|
-| Quant scheme | W8A8 INT, W4A16, FP8, etc. | W4/W8 INT weights-only |
-| GPTQv2 (FORMAT.GPTQ_V2) | ❌ | ✅ |
+| **Activation quantization** | ✅ (W8A8 INT, FP8 activations, KV cache quant) | ❌ (GPTQModel README explicitly: "GGUF and FP8 are weight-only"; no `a_bits` / activation calibration anywhere) |
+| Weight schemes | W8/W4 INT, FP8, MXFP4 | W4/W8 INT, FP8 (weight-only), AWQ, QQQ, ParoQuant, GGUF, EXL3 |
+| GPTQv2 (`FORMAT.GPTQ_V2`) | ❌ | ✅ |
 | GPTAQ (asymmetric calibration) | ❌ | ✅ (experimental, `GPTAQConfig`) |
-| `act_group_aware` | ❌ | ✅ (default when `desc_act=False`, ~16k× faster than `desc_act=True`) |
+| `act_group_aware` | ❌ | ✅ (default when `desc_act=False`; ~16k× faster than `desc_act=True` with equal quality) |
 | FOEM (first-order error compensation) | ❌ | ✅ |
 | Qwen3.5 explicit model def | ❌ (falls back to generic CausalLM, rewrites `architectures`) | ✅ (`Qwen3_5GPTQ` mirrors `Qwen3_5MoeGPTQ` with dense MLP, preserves multimodal layout) |
-| Activation quantization | ✅ (W8A8 path) | ❌ |
-| Selective per-module quant | ✅ via `targets` + `ignore` regex | ✅ via `QuantizeConfig.dynamic` negative match |
+| Selective per-module quant | regex `targets` + `ignore` | `QuantizeConfig.dynamic` negative match (`"-:..."`) |
 
 ## Which to pick
 
-- **Rollout speedup is the main goal + accuracy is forgiving** → llmcompressor W8A8 (activation INT8 → tensor-core int8 matmul → 2× decode speedup)
-- **Accuracy is critical / multi-turn agent reasoning** → GPTQModel W8 GPTQv2 (memory bandwidth saved on weights, but math stays BF16; ~0.07% wikitext degradation per the public Qwen3.6-27B-GPTQ-8bit ckpt)
-- **First time, smoke test** → start with GPTQModel W8 (the public ckpt at `btbtyler09/Qwen3.6-27B-GPTQ-8bit` confirms the recipe works end-to-end on this model family)
+The choice is dictated by **whether activations need to be quantized**:
+
+- **W8A8 is required** (max rollout speedup — int8 tensor cores, ~2× decode) → **llmcompressor**. You get vanilla GPTQ only. Accept the algorithm tax.
+- **Weights-only is fine** (memory-bandwidth savings + ~1.3-1.5× speedup, but math stays BF16) → **GPTQModel**. You get GPTQv2 + `act_group_aware` + Qwen3.5 explicit model def + the existing public `btbtyler09/Qwen3.6-27B-GPTQ-8bit` ckpt as sanity reference (+0.07% wikitext degradation, effectively lossless).
+- **Both** → not possible with a single tool. Could in principle: run GPTQModel W8 first for best weight quantization, then apply llmcompressor's activation quant on top — untested and probably loader-incompatible.
 
 ## Loading caveats
 
