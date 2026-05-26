@@ -263,11 +263,114 @@ def pack_layer(weight, group_size, sym=True):
     return packed_weight, scale, packed_zp
 
 
+@torch.no_grad()
+def quantize_layer_int8(weight, group_size, strategy, sym=True, scale_dtype=torch.float32):
+    """RTN INT8 quantization producing the `int-quantized` (raw int8) layout.
+
+    Output matches what sglang's `compressed_tensors_w8a8_int8` scheme loads:
+      - weight: torch.int8 (sym) or torch.uint8 (asym), shape (out, in)
+      - weight_scale: scale_dtype, shape depends on strategy
+            "channel": (out, 1)
+            "tensor":  (1,)               <- single global scalar
+            "group":   (out, in/group_size)
+      - weight_zero_point: torch.int32, same shape as weight_scale, or None for sym
+
+    Notes:
+      - SGLang's `compressed_tensors_w8a8_int8` scheme loads per-channel and per-tensor
+        only. Per-group is *not* loadable by that scheme; emit it only for engines that
+        accept compressed-tensors `int-quantized` + group strategy.
+      - Symmetric clamp range is [-127, 127] (not [-128, 127]) to stay consistent with
+        scale = absmax / 127; -128 is unreachable when scale is computed from absmax.
+    """
+    out_features, in_features = weight.shape
+
+    # Reshape via .reshape() since Megatron-side slices may be non-contiguous.
+    w_fp32 = weight.to(torch.float32)
+
+    if strategy == "tensor":
+        # Single global scalar: one absmax/min/max across the whole tensor.
+        if sym:
+            absmax = w_fp32.abs().amax()
+            scale_scalar = (absmax / 127.0).clamp(min=1e-8)
+            q = torch.round(w_fp32 / scale_scalar).clamp(-127, 127).to(torch.int8)
+            scale = scale_scalar.reshape(1).to(scale_dtype).contiguous()
+            return q.contiguous(), scale, None
+        else:
+            wmin = w_fp32.amin()
+            wmax = w_fp32.amax()
+            scale_scalar = ((wmax - wmin) / 255.0).clamp(min=1e-8)
+            zp_f = torch.round(-wmin / scale_scalar).clamp(0, 255)
+            q = (torch.round(w_fp32 / scale_scalar) + zp_f).clamp(0, 255).to(torch.uint8)
+            scale = scale_scalar.reshape(1).to(scale_dtype).contiguous()
+            zp = zp_f.reshape(1).to(torch.int32).contiguous()
+            return q.contiguous(), scale, zp
+
+    if strategy == "channel" or group_size is None or group_size <= 0:
+        eff_group_size = in_features
+    else:
+        if in_features % group_size != 0:
+            raise ValueError(
+                f"in_features={in_features} not divisible by group_size={group_size} "
+                f"(weight shape={tuple(weight.shape)})"
+            )
+        eff_group_size = group_size
+    num_groups = in_features // eff_group_size
+
+    w_grouped = w_fp32.reshape(out_features, num_groups, eff_group_size)
+
+    if sym:
+        absmax = w_grouped.abs().amax(dim=-1, keepdim=True)
+        scale = (absmax / 127.0).clamp(min=1e-8)
+        q = torch.round(w_grouped / scale).clamp(-127, 127).to(torch.int8)
+        q = q.reshape(out_features, in_features).contiguous()
+        scale = scale.reshape(out_features, num_groups).to(scale_dtype).contiguous()
+        return q, scale, None
+    else:
+        wmin = w_grouped.amin(dim=-1, keepdim=True)
+        wmax = w_grouped.amax(dim=-1, keepdim=True)
+        scale = ((wmax - wmin) / 255.0).clamp(min=1e-8)
+        zp_f = torch.round(-wmin / scale).clamp(0, 255)
+        q = (torch.round(w_grouped / scale) + zp_f).clamp(0, 255).to(torch.uint8)
+        q = q.reshape(out_features, in_features).contiguous()
+        scale = scale.reshape(out_features, num_groups).to(scale_dtype).contiguous()
+        zp = zp_f.reshape(out_features, num_groups).to(torch.int32).contiguous()
+        return q, scale, zp
+
+
 def quantize_params_compressed_tensors(converted_named_params, quantization_config):
-    w_cfg = quantization_config["config_groups"]["group_0"]["weights"]
-    group_size = w_cfg["group_size"]
+    group_cfg = quantization_config["config_groups"]["group_0"]
+    w_cfg = group_cfg["weights"]
+    num_bits = w_cfg.get("num_bits", 4)
     is_symmetric = w_cfg["symmetric"]
+    strategy = w_cfg.get("strategy")  # "channel" | "group" | "tensor"
+    group_size = w_cfg.get("group_size")
     ignore_rules = quantization_config.get("ignore", [])
+
+    fmt = quantization_config.get("format")
+    if fmt is None:
+        # INT8 -> raw int8 (`int-quantized`); INT4 -> packed (`pack-quantized`) since
+        # the only wired INT4 path is the WNA16-style CUDA kernel.
+        fmt = "int-quantized" if num_bits == 8 else "pack-quantized"
+
+    if num_bits not in (4, 8):
+        raise NotImplementedError(
+            f"compressed-tensors quantize: unsupported num_bits={num_bits}; only 4 and 8 are wired."
+        )
+
+    use_raw_int8 = num_bits == 8 and fmt == "int-quantized"
+
+    has_input_act_quant = group_cfg.get("input_activations") is not None
+    if use_raw_int8 and strategy == "group" and has_input_act_quant:
+        # SGLang's compressed_tensors_w8a8_int8 only loads per-channel / per-tensor
+        # weight_scale. A per-group `int-quantized` weight + INT8 activations checkpoint
+        # would silently produce shapes the W8A8 loader cannot consume.
+        raise NotImplementedError(
+            "compressed-tensors W8A8 INT8 (input_activations set) does not support "
+            "per-group weight strategy: sglang's compressed_tensors_w8a8_int8 scheme "
+            "registers weight_scale as (output_size, 1) per-channel or "
+            "(num_partitions,) per-tensor only. Use strategy='channel' or 'tensor', "
+            "or drop input_activations for a weight-only WNA16-style config."
+        )
 
     results = []
 
@@ -280,16 +383,29 @@ def quantize_params_compressed_tensors(converted_named_params, quantization_conf
             results.append((name, param))
             continue
 
-        qw, s, zp = pack_layer(param, group_size, is_symmetric)
-        qweight_name = name.replace(".weight", ".weight_packed")
-        scale_name = name.replace(".weight", ".weight_scale")
-        weight_shape = torch.tensor(param.shape, dtype=torch.int32, device="cuda")
-        weight_shape_name = name.replace(".weight", ".weight_shape")
-        if zp is not None:
-            zp_name = name.replace(".weight", ".weight_zero_point")
-            results.append((zp_name, zp))
-        results.append((qweight_name, qw))
-        results.append((scale_name, s))
-        results.append((weight_shape_name, weight_shape))
+        if use_raw_int8:
+            qw, s, zp = quantize_layer_int8(param, group_size, strategy, is_symmetric)
+            results.append((name, qw))
+            results.append((name.replace(".weight", ".weight_scale"), s))
+            if zp is not None:
+                results.append((name.replace(".weight", ".weight_zero_point"), zp))
+        else:
+            # INT4 packed (WNA16) path; CUDA kernel only supports INT4.
+            if num_bits != 4:
+                raise NotImplementedError(
+                    f"compressed-tensors pack-quantized num_bits={num_bits} not supported "
+                    "(fake_int4_quant_cuda kernel is INT4-only; set format='int-quantized' for INT8)"
+                )
+            qw, s, zp = pack_layer(param, group_size, is_symmetric)
+            qweight_name = name.replace(".weight", ".weight_packed")
+            scale_name = name.replace(".weight", ".weight_scale")
+            weight_shape = torch.tensor(param.shape, dtype=torch.int32, device="cuda")
+            weight_shape_name = name.replace(".weight", ".weight_shape")
+            if zp is not None:
+                zp_name = name.replace(".weight", ".weight_zero_point")
+                results.append((zp_name, zp))
+            results.append((qweight_name, qw))
+            results.append((scale_name, s))
+            results.append((weight_shape_name, weight_shape))
 
     return results
