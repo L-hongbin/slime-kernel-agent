@@ -64,12 +64,12 @@ W8A8 unrot 21.00% ≡ 168/800。
 
 ### Efficiency
 
-| variant | host / reward | quantized layers | wall | speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **BF16 baseline** | .22 / .40 | 0 | 1:20:33 | 1.00× | 6436 | 1.25% | 0.252 | 1198 | 1519 |
-| **W8A8 MLP-only** | .64 / .39 | 192 | 1:15:21 | 1.07× | 6387 | 1.00% | 0.245 | 1414 | 1698 |
-| **W8A8 rotated all-linear** | .22 / .40 | 496 | 1:06:28 | 1.21× | 5879 | 1.00% | 0.260 | 1551 | 1762 |
-| **W8A8 all-linear (unrot)** | .64 / .39 | 496 | 1:01:20 | 1.31× | 5275 | 1.38% | 0.263 | 1511 | 1719 |
+| variant | quantized layers | wall | speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| **BF16 baseline** | 0 | 1:20:33 | 1.00× | 6436 | 1.25% | 0.252 | 1198 | 1519 |
+| **W8A8 MLP-only** | 192 | 1:15:21 | 1.07× | 6387 | 1.00% | 0.245 | 1414 | 1698 |
+| **W8A8 rotated all-linear** | 496 | 1:06:28 | 1.21× | 5879 | 1.00% | 0.260 | 1551 | 1762 |
+| **W8A8 all-linear (unrot)** | 496 | 1:01:20 | 1.31× | 5275 | 1.38% | 0.263 | 1511 | 1719 |
 
 Decode tok/s parsed from sglang `Decode batch` lines. The `@ running-req=64`
 column matches the configured max-running batch and is the cleanest
@@ -127,13 +127,15 @@ shape but smaller absolute numbers).
 
 ### Caveat（codex 强调，跨 run 时一定要看）
 
-- BF16 baseline 跑在 host `.22` + reward server `.40`。W8A8 MLP-only
-  和 unrot 跑在 `.64` + `.39`。W8A8 rotated 跑在 `.22` + `.40` —— 同
-  host 同 reward 的 cleanest 对照只有 rotated 这一个。
-- `.39` / `.40` reward servers OpenAPI byte-identical at probe time，
-  但没证明 run-time scoring 完全等价。
-- MLP-only 和 unrot W8A8 是 `.64` 同 host 同 reward，所以 +4.13pp 是
-  apples-to-apples，结论 "attention 量化是主因" 是 robust 的。
+- BF16 baseline 与 W8A8 rotated 跑在同一台 rollout host + reward server
+  组合，所以 rotated vs BF16 是 cleanest 对照。
+- W8A8 MLP-only 与 W8A8 all-linear unrot 跑在另一台 rollout host +
+  另一台 reward server。MLP-only 与 unrot 同 host 同 reward，所以两者
+  之间的 +4.13pp 是 apples-to-apples —— 结论 "attention 量化是主因"
+  robust。
+- 跨 host/reward 的对比（BF16 vs MLP-only、BF16 vs unrot）须留意：两套
+  reward 服务的 OpenAPI byte-identical at probe time，但没证明 run-time
+  scoring 完全等价。
 
 ## Online weight-push sanity attempt（**未通过**）
 
@@ -215,8 +217,7 @@ env-tunable：`HF_W8A8_DIR`、`N_SAMPLES_PER_EVAL_PROMPT`、`EVAL_MAX_RESPONSE_L
 
 ## 环境配置
 
-主操作 host：`ssh -p 23422 root@192.168.16.64` 或 `ssh -p 11116 root@192.168.16.22`。
-两者都是 docker container，8×A800 80GB，`/nfs` mounted。
+任何 docker container with 8×A800 80GB + `/nfs` mounted。
 
 ```bash
 cd /nfs/FM/chenshuailin/projects/kernel_agents/slime
@@ -227,7 +228,7 @@ pip install --no-deps "git+https://github.com/vllm-project/llm-compressor.git@ma
 pip install --no-deps "git+https://github.com/neuralmagic/compressed-tensors.git@main"
 ```
 
-Reward server `.39:20111` 与 `.40` 配置相同。
+KernelGym reward server 任选（两台已知服务实例 OpenAPI byte-identical）。
 
 `set_env.sh` 会 `pip install -e .` 自动；如果用 worktree 想覆盖 slime
 import path，需要再 `pip install -e .` 一次从 worktree path。
@@ -235,14 +236,14 @@ import path，需要再 `pip install -e .` 一次从 worktree path。
 ## Next step recipe
 
 1. **如果 quality 是硬约束（RL rollout 训练用）**：选 **W8A8 MLP-only**。
-   - Ckpt: `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local-mlp/`
+   - Ckpt: `checkpoints/quantized/Qwen3.6-27B-W8A8-RTN-local-mlp/`
    - Eval 通过 codex 25.0% 阈值（201/800 ≡ exactly the bar）。
    - 牺牲掉 quant 加速（1.07×，不是 1.31×）。Attention 仍 BF16 让 hybrid
      model 主导 decode 成本。
 
 2. **如果 speedup 是硬约束（pure eval / inference）**：选 **W8A8
    all-linear (unrot)**。
-   - Ckpt: `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/`
+   - Ckpt: `checkpoints/quantized/Qwen3.6-27B-W8A8-RTN-local/`
    - 1.31× faster vs BF16，−24.7% rel quality。Quality 不可接受 for RL。
 
 3. **关键 deliverable：Online RTN E2E 跑通**。Plumbing 路径未验证，独立
@@ -262,11 +263,10 @@ import path，需要再 `pip install -e .` 一次从 worktree path。
 6. **5-min sanity（强制）任何长 run 前**：
 
    ```bash
-   ssh -p 23422 root@192.168.16.64 \
-     'cd /nfs/FM/chenshuailin/projects/kernel_agents/slime && \
-      DRKERNEL_SMOKE_MAX_PROMPTS=1 N_SAMPLES_PER_EVAL_PROMPT=4 \
-      EVAL_MAX_RESPONSE_LEN=512 DRKERNEL_EVAL_MAX_CONCURRENCY=4 \
-      bash scripts/debug.27b.w8a8.sh 2>&1 | tail -50'
+   cd /nfs/FM/chenshuailin/projects/kernel_agents/slime && \
+     DRKERNEL_SMOKE_MAX_PROMPTS=1 N_SAMPLES_PER_EVAL_PROMPT=4 \
+     EVAL_MAX_RESPONSE_LEN=512 DRKERNEL_EVAL_MAX_CONCURRENCY=4 \
+     bash scripts/debug.27b.w8a8.sh 2>&1 | tail -50
    ```
    Pass = `eval_rollout_single_dataset first sample` + Ray succeeded
    in 5 min。AGENTS.md rule 6 要求。
@@ -361,13 +361,16 @@ FP64 中间计算救不了，最终 BF16 cast 必然 drift。详见
 | `slime/rollout/sglang_rollout.py` | `_cap_sampling_params_by_context` |
 | `slime/utils/eval_config.py` | `max_prompt_len` / `max_context_len` per-dataset |
 | `slime/utils/data.py` | 放宽 processor list-prompt assertion |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/` | **W8A8 all-linear unrot ckpt**（max speedup, quality 不可接受） |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local-mlp/` | **W8A8 MLP-only ckpt（RL rollout 推荐）**，attention BF16 |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-rotated-mm-w8a8-rtn-local/` | W8A8 all-linear rotated ckpt（BF16 storage tax 吃掉收益） |
-| `checkpoints/Qwen3.6-27B/20260524_142451_*_v2_3_env_n8` | **BF16 baseline** (.22/.40, score 0.27875, wall 1:20:33) |
-| `checkpoints/Qwen3.6-27B/20260526_020408_*_w8a8-rtn-local-v2_3_env_n8` | W8A8 all-linear unrot (.64/.39, 0.21000, 1:01:20) |
-| `checkpoints/Qwen3.6-27B/20260526_043626_*_w8a8-rtn-local-rotated-v2_3_env_n8` | W8A8 rotated all-linear (.22/.40, 0.23000, 1:06:28) |
-| `checkpoints/Qwen3.6-27B/20260526_045323_*_w8a8-rtn-local-mlp-v2_3_env_n8-r3` | W8A8 MLP-only (.64/.39, 0.25125, 1:15:21) |
+| `checkpoints/quantized/Qwen3.6-27B-rotated-mm-bf16/` | Rotated BF16 source ckpt（only as W8A8 producer input；不要直接 deploy 部署，BF16 storage tax 是已知问题） |
+| `checkpoints/quantized/Qwen3.6-27B-W8A8-RTN-local/` | **W8A8 all-linear unrot ckpt**（max speedup, quality 不可接受） |
+| `checkpoints/quantized/Qwen3.6-27B-W8A8-RTN-local-mlp/` | **W8A8 MLP-only ckpt（RL rollout 推荐）**，attention BF16 |
+| `checkpoints/quantized/Qwen3.6-27B-rotated-mm-w8a8-rtn-local/` | W8A8 all-linear rotated ckpt（rotation BF16 storage tax 吃掉收益） |
+| `checkpoints/quantized/Qwen3.6-27B-rotated-mm-w8a8-rtn-local-mlp/` | W8A8 rotated MLP-only ckpt（rotation + MLP-only 组合，2026-05-26 新增） |
+| `checkpoints/quantized/Qwen3.6-27B-rotated-mm-w8a8-rtn-local-nonla/` | W8A8 rotated MLP + self_attn ckpt（skip linear_attn / mamba layers，2026-05-26 新增） |
+| `checkpoints/Qwen3.6-27B/20260524_142451_*_v2_3_env_n8` | **BF16 baseline** (score 0.27875, wall 1:20:33) |
+| `checkpoints/Qwen3.6-27B/20260526_020408_*_w8a8-rtn-local-v2_3_env_n8` | W8A8 all-linear unrot (0.21000, 1:01:20) |
+| `checkpoints/Qwen3.6-27B/20260526_043626_*_w8a8-rtn-local-rotated-v2_3_env_n8` | W8A8 rotated all-linear (0.23000, 1:06:28) |
+| `checkpoints/Qwen3.6-27B/20260526_045323_*_w8a8-rtn-local-mlp-v2_3_env_n8-r3` | W8A8 MLP-only (0.25125, 1:15:21) |
 
 ## 历史路径（已废弃 / superseded by 上面 ablation 数据，仅备查）
 
