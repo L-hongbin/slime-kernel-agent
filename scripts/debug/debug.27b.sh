@@ -11,7 +11,7 @@ ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
 EVAL_CONFIG_PATH=scripts/eval_kernelbench_level1.yaml
-MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
+MODEL_DIR=${MODEL_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B}
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}${EXPT_LABEL:+_${EXPT_LABEL}}"
 LOG_DIR="${SAVE_DIR}"
@@ -71,7 +71,7 @@ EVAL_ARGS=(
    --eval-max-prompt-len ${CTX_LEN}
    --eval-max-response-len ${CTX_LEN}
    --eval-max-context-len ${CTX_LEN}
-   --rm-url http://192.168.16.40:20111
+   --rm-url http://${KG_REWARD_HOST:-192.168.16.40}:${KG_REWARD_PORT:-20111}
    --dump-details ${SAVE_DIR}/dumps
 )
 
