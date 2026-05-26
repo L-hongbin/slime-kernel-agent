@@ -3,7 +3,7 @@
 **Branch**: `worktree-w8a8-int8-rtn-rollout` (in worktree at
 `/nfs/FM/chenshuailin/projects/kernel_agents/slime/.claude/worktrees/w8a8-int8-rtn-rollout`)
 
-**Tip commit**: `063e2147 quantize: W8A8 INT8 RTN rollout-accel path (online + offline)`
+**Tip commit**: `8ec4e247 docs: branch handoff for W8A8 INT8 RTN rollout path`
 (branched from `origin/main` at `79989380`).
 
 **Date**: 2026-05-25.
@@ -68,9 +68,14 @@ Default `--multimodal` load (`AutoModelForImageTextToText`) so the saved
 uses its registered multimodal entry. lm_head + `re:.*\.visual\..*` +
 `re:.*\.mtp\..*` ignored.
 
-**Produced ckpt**: `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN/`
-(~30 GB single `model.safetensors`, int8 raw + fp32 scales,
-`format=int-quantized`, `strategy=channel`, `dynamic_activations=token-dynamic`).
+**Do not use the original produced ckpt for rollout**:
+`/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN/`.
+It is syntactically loadable but the saved int8 weights are broken. The
+post-save sanity checker added later rejects it immediately: first layer
+linear-attn tensors have only 3 unique int8 values, `saturated_frac~=0.986`,
+and `rel_l2~=3.32-3.61` against the BF16 source. This explains the garbage
+outputs; it is a checkpoint production/save bug, not normal quantization
+degradation.
 
 **Side fix** required: llmcompressor save drops several non-LM files (the
 multimodal entry needs them). After producing the ckpt, you must copy:
@@ -147,37 +152,357 @@ scripts/debug/debug.27b.w8a8.sh`. Result:
   hit the cap, so this only verifies the *pipeline*, not the *model quality*.
 - Eval dump written, Ray job succeeded, cleanup ran.
 
-So: **the path works end-to-end**. What remains is to run it with a sane
-response cap and get a real KernelBench score for W8A8.
+So: **the path works end-to-end**, but the first full ckpt was invalid and
+needed a real checkpoint sanity check before any rollout result could be
+trusted.
 
 ---
 
-## Open task: 100×4 with BF16-equivalent settings
+## Correction after garbage-output bug (2026-05-25)
 
-The harness as-is on the branch is configured to mirror the BF16 baseline
-(`max-running=64, mem-fraction-static=0.9, --eval-max-response-len=CTX_LEN`)
-plus the two W8A8 safety nets (`PYTORCH_CUDA_ALLOC_CONF=expandable_segments`,
-`DRKERNEL_EVAL_MAX_CONCURRENCY=16`).
+Root cause: the llmcompressor W8A8 RTN save path emitted effectively
+sign-only/ternary int8 weights. Example failure from the added checker:
 
-To launch:
-```bash
-ssh -p 23422 root@192.168.16.64 \
-  'cd /nfs/FM/chenshuailin/projects/kernel_agents/slime && \
-   nohup bash scripts/debug/debug.27b.w8a8.sh > /tmp/w8a8_smoke4.launch.log 2>&1 &'
+```text
+model.language_model.layers.0.linear_attn.in_proj_a.weight:
+  unique=3, saturated_frac=0.9869, rel_l2=3.3239
+model.language_model.layers.0.linear_attn.in_proj_b.weight:
+  unique=3, saturated_frac=0.9859, rel_l2=3.5729
 ```
 
-Expected: ~45 min wall time (BF16 baseline ran 100×4 in ~45 min per
-SPEC.md). If `expandable_segments` does its job, OOM won't recur even at
-`mem-fraction=0.9` (the v1 spike was attributed by PyTorch's own hint to the
-4.33 GiB "reserved but unallocated" fragmentation, which expandable_segments
-coalesces).
+Fix/workaround:
 
-Then check:
-- `eval/kernelbench_level1 = ?` (BF16 baseline on Qwen3.6-27B was 0.27 per
-  the earlier W8A8 handoff)
-- `eval/kernelbench_level1/response_len/mean = ?` (should be in the ~9000
-  range, not capped)
-- Wall time (~45 min) vs BF16 baseline to confirm speedup
+- Added `scripts/quantize/validate_w8a8_rtn_checkpoint.py`, which validates
+  int8 weight/scale tensors against the BF16 checkpoint and rejects ternary,
+  saturated, or high-rel-L2 weights.
+- Added `scripts/quantize/quantize_w8a8_rtn_local.py`, a local offline RTN
+  writer that streams BF16 safetensors and uses the branch's tested
+  `quantize_layer_int8` helper.
+- Added post-save validation to `scripts/quantize/quantize_w8a8_rtn_llmcompressor.py`
+  so a future broken llmcompressor output fails immediately.
+- Produced the corrected local checkpoint:
+  `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/`.
+
+Corrected checkpoint sanity:
+
+```text
+model.language_model.layers.0.linear_attn.in_proj_a.weight:
+  unique=255, saturated=0.000208, rel_l2=0.009300
+model.language_model.layers.0.linear_attn.in_proj_b.weight:
+  unique=254, saturated=0.000203, rel_l2=0.009876
+model.language_model.layers.0.linear_attn.in_proj_qkv.weight:
+  unique=255, saturated=0.000203, rel_l2=0.009338
+```
+
+W8A8-specific targeted tests on `.64`:
+
+```bash
+CUDA_VISIBLE_DEVICES= python3 -m pytest -q \
+  tests/utils/test_validate_w8a8_rtn_checkpoint.py \
+  tests/utils/test_quantize_w8a8_rtn_local.py \
+  tests/utils/test_quantizer_compressed_tensors_int8.py
+# 22 tests after adding the online weight-sync dispatch coverage
+```
+
+Final targeted regression after the 100×8 smoke and online sanity attempt on
+`.64`:
+
+```bash
+CUDA_VISIBLE_DEVICES= python3 -m pytest -q \
+  tests/utils/test_sglang_context_cap.py \
+  tests/utils/test_eval_config.py \
+  tests/utils/test_dataset_text_processor.py \
+  tests/utils/test_validate_w8a8_rtn_checkpoint.py \
+  tests/utils/test_quantize_w8a8_rtn_local.py \
+  tests/utils/test_quantizer_compressed_tensors_int8.py \
+  /nfs/FM/chenshuailin/projects/kernel_agents/slime/tests/utils/test_drkernel_eval_throttle.py
+# 30 passed, 12 warnings in 14.40s
+```
+
+The new W8A8 tests include:
+
+- `quantize_layer_int8` numeric/layout tests, including non-contiguous Megatron
+  slices and the `[-127, 127]` symmetric clamp.
+- `quantize_params_compressed_tensors` tests for raw int8 `.weight` +
+  `.weight_scale` naming, ignore rules, and hard-fail on W8A8 per-group shapes
+  that SGLang cannot load.
+- `processors.quantize_params(..., quant_method="compressed-tensors")`
+  dispatch coverage, which is the entrypoint used by online HF weight sync
+  before tensors are pushed to SGLang.
+- Checkpoint sanity checker tests that reject ternary/saturated/high-error
+  W8A8 checkpoints before rollout.
+
+## Corrected smoke results
+
+The first corrected full smokes below use
+`HF_W8A8_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local`,
+`--eval-max-response-len 65536`, `--sglang-max-running-requests 64`,
+`--sglang-mem-fraction-static 0.9`, and `DRKERNEL_EVAL_MAX_CONCURRENCY=16`.
+
+### 1×4 output sanity
+
+Run: `20260525_131452_ctx65536_n4_summ1600_w8a8-rtn-local-sanity`.
+This used `EVAL_MAX_RESPONSE_LEN=512`, so rewards stayed 0 due to truncation.
+Purpose was output quality only. Dump samples were normal English/code-task
+responses, no garbage.
+
+### 100×4 full smoke
+
+Run: `20260525_133621_ctx65536_n4_summ1600_w8a8-rtn-local-full`.
+Ray job: `raysubmit_UuvT5zYj2LyEqX6N`.
+
+- Completed: `400/400`, Ray succeeded.
+- Wall time: `2:18:25`.
+- Score: `eval/kernelbench_level1 = 0.1675`.
+- Response length: mean `4686.3475`, median `4190.0`, max `62332`, min `0`.
+- `truncated_ratio = 0.01`, `repetition_frac = 0.0075`.
+- Dump sanity: 400 samples, `weird_count=0`; sampled responses were normal
+  English/code-task reasoning. A couple of near-empty samples were plain
+  `<|im_end|>` style early termination, not mojibake.
+
+Why this was much slower than the expected BF16 100×4 45-minute scale:
+
+- The run is not apples-to-apples with the old BF16 baseline because
+  `DRKERNEL_EVAL_MAX_CONCURRENCY=16` is now enabled; the BF16 n=8 baseline
+  did not have this cap. The cap was added to prevent the previous unbounded
+  eval fan-out/KV thrash.
+- Do not reason from weight memory alone. W8A8 frees weight memory, but SGLang
+  reallocates most of that saving to KV cache under the same
+  `mem-fraction-static`, and the int8 `compressed-tensors` kernels do not
+  guarantee higher decode throughput for this model/hardware. The evidence is
+  mixed: old BF16 n=8 noenv logs had much higher median decode throughput, while
+  the same-host `c32/mr128` 20×8 control below gives W8A8 a modest throughput
+  edge but not enough to make long tails disappear.
+- Tail latency matters: logs showed individual long requests decoding around
+  `70 token/s`, which stalls progress even when the job is healthy.
+
+### 100×8 full smoke
+
+Run: `20260525_160342_ctx65536_n8_summ1600_w8a8-rtn-local-full-n8`.
+Ray job: `raysubmit_TCZGmMBpTya8hJK9`.
+
+- Completed: `800/800`, Ray succeeded.
+- Wall time: `4:29:20`.
+- Score: `eval/kernelbench_level1 = 0.1875`.
+- Response length: mean `4573.6525`, median `4323.0`, max `61138`, min `0`.
+- `truncated_ratio = 0.005`, `repetition_frac = 0.00375`.
+- Dump sanity: 800 samples, `weird_count=0`, replacement chars `0`, bad
+  control chars `0`, max non-ASCII count in a response `34`; sampled responses
+  were normal English/code-task reasoning. No mojibake.
+
+### 20×8 high-concurrency sanity
+
+Run: `20260525_210410_ctx65536_n8_summ1600_w8a8-rtn-local-c32-mr128-20x8-r5`.
+Ray job: `raysubmit_rbX5SvYxaQe6ccYv`.
+
+Config changed to `DRKERNEL_EVAL_MAX_CONCURRENCY=32`,
+`SGLANG_MAX_RUNNING_REQUESTS=128`, `SGLANG_MEM_FRACTION_STATIC=0.9`.
+
+- Completed: `160/160`, Ray succeeded.
+- Eval elapsed: `11:00`.
+- Score: `eval/kernelbench_level1 = 0.2`.
+- Response length: mean `5950.41875`, median `6639.5`, max `13028`, min `1`.
+- `truncated_ratio = 0.0`, `repetition_frac = 0.0`.
+- Dump sanity: 160 samples/responses/rewards, score from rewards `0.2`,
+  replacement chars `0`, bad control chars `0`, `weird_count=0`.
+- W8A8 load evidence: `quant=compressed-tensors`, weight memory `14.22 GB`,
+  `max_total_num_tokens=970933`, `max_running_requests=123`.
+
+### BF16 20×8 high-concurrency control
+
+Run: `20260525_224110_ctx65536_n8_summ1600_bf16-c32-mr128-20x8-r1`.
+Ray job: `raysubmit_RfL8rqApTW3mv3JM`.
+
+This used the same `c32/mr128/mem=0.9` knobs as the W8A8 high-concurrency
+20×8 run, but pointed `HF_W8A8_DIR` back to the BF16 checkpoint.
+
+- Completed: `160/160`, Ray succeeded.
+- Eval elapsed: `19:05`.
+- Score: `eval/kernelbench_level1 = 0.3`.
+- Response length: mean `7371.49375`, median `7689.5`, max `14462`, min `1`.
+- `prefix_cache_hit_rate = 0.03892226604253437`,
+  `avg_cached_tokens_per_sample = 52.8`.
+- `truncated_ratio = 0.0`, `repetition_frac = 0.0`.
+- Dump sanity: 160 samples/responses/rewards, score from rewards `0.3`,
+  character mean `23524.1375`, median `25066.0`, max `49154`, min `10`,
+  replacement chars `0`, bad control chars `0`, `weird_count=0`.
+- BF16 load evidence: `quantization=None`, weight memory `25.57 GB`,
+  `max_total_num_tokens=775780`, `max_running_requests=98`,
+  `available_gpu_mem=6.66 GB`.
+- No `400`, `503`, OOM, Traceback, or Ray failure in the successful log.
+
+Interpretation against W8A8 20×8:
+
+- W8A8 had more KV/request headroom (`970933` tokens / `123` requests vs BF16
+  `775780` / `98`) because the weights were smaller.
+- W8A8 completed this 20×8 smoke faster (`11:00` vs `19:05`) despite lower
+  KernelBench score (`0.2` vs `0.3`).
+- Decode-log summaries for the same-host controls: BF16 20×8 median
+  `280.72 token/s`, mean `279.01`; W8A8 20×8 median `314.66 token/s`, mean
+  `384.56`. So the high-concurrency W8A8 path is not intrinsically slower here,
+  but the benefit is much smaller than the weight-size reduction and is still
+  dominated by generated length and tail requests.
+
+### 100×8 high-concurrency smoke
+
+Run: `20260525_211941_ctx65536_n8_summ1600_w8a8-rtn-local-c32-mr128-100x8-r1`.
+Ray job: `raysubmit_yYLg2w5zYHaszd4r`.
+
+This is the required 100×8 run after the 100×4 smoke, using the same
+high-concurrency knobs as the 20×8 sanity (`c32`, `max-running=128`).
+
+- Completed: `800/800`, Ray succeeded.
+- Eval elapsed: `1:00:29`; full job wall roughly `1:03:29`
+  (`21:19:41` to `22:23:10`).
+- Score: `eval/kernelbench_level1 = 0.13625`.
+- Response length: mean `7575.185`, median `7630.0`, max `63924`, min `1`.
+- `prefix_cache_hit_rate = 0.04090071626713038`,
+  `avg_cached_tokens_per_sample = 59.2725`.
+- `truncated_ratio = 0.00125`, `repetition_frac = 0.00125`.
+- Dump sanity: 800 samples/responses/rewards, score from rewards `0.13625`,
+  character mean `25784.39`, median `25885.5`, max `185331`, min `10`,
+  replacement chars `0`, bad control chars `0`, `weird_count=0`.
+- W8A8 load evidence: `quant=compressed-tensors`, weight memory `14.22 GB`,
+  `max_total_num_tokens=970933`, `max_running_requests=123`,
+  `available_gpu_mem=6.53 GB`.
+- No `400`, `503`, OOM, or Traceback in the successful 100×8 log.
+
+### BF16 100×8 high-concurrency control
+
+Run: `20260525_230731_ctx65536_n8_summ1600_bf16-c32-mr128-100x8-r1`.
+Ray job: `raysubmit_FWiM8cAqy9ujtELM`.
+
+This is the apples-to-apples BF16 control for the W8A8 high-concurrency 100×8
+run above: same host `.64`, same `DRKERNEL_EVAL_MAX_CONCURRENCY=32`,
+same `SGLANG_MAX_RUNNING_REQUESTS=128`, same `SGLANG_MEM_FRACTION_STATIC=0.9`.
+
+- Completed: `800/800`, Ray succeeded.
+- Eval elapsed: `1:44:21`; full job wall roughly `1:46:57`
+  (`23:08:02` to `00:54:59`).
+- Score: `eval/kernelbench_level1 = 0.185`.
+- Response length: mean `8602.185`, median `8716.0`, max `63891`, min `1`.
+- `prefix_cache_hit_rate = 0.031173663727073243`,
+  `avg_cached_tokens_per_sample = 45.17625`.
+- `truncated_ratio = 0.00125`, `repetition_frac = 0.0`.
+- Dump sanity: 800 samples/responses/rewards, score from rewards `0.185`,
+  character mean `28943.19125`, median `28913.5`, max `186933`, min `10`,
+  replacement chars `0`, bad control chars `0`, `weird_count=0`.
+- BF16 load evidence: `quantization=None`, weight memory `25.57 GB`,
+  `max_total_num_tokens=775780`, `max_running_requests=98`,
+  `available_gpu_mem=6.66 GB`.
+- No `400`, `503`, OOM, Traceback, or Ray failure in the successful log.
+
+### Direct W8A8/BF16 accuracy and efficiency tables
+
+Accuracy metric definitions match
+`HANDOFF_DRKERNEL_EVAL_ACCURACY.md`: every value is
+`hit_count / total_samples`. `Correct` is `compiled AND correctness AND NOT
+decoy_kernel`. `Fast@p` is `Correct AND speedup >= p`, with the denominator
+still all samples. These successful W8A8/BF16 smoke runs are single-turn evals
+(`samples[*].metadata.turns` is empty), so only T1 is measured; T2/T3 are not
+available from these dumps.
+
+| Run | n | Compile T1 | Compile T2 | Compile T3 | Correct T1 | Correct T2 | Correct T3 | Fast@1.0 in_all T1 | Fast@1.0 in_all T2 | Fast@1.0 in_all T3 | Fast@1.2 in_all T1 | Fast@1.2 in_all T2 | Fast@1.2 in_all T3 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| W8A8 20×8 `c32/mr128` | 160 | 30.63% | N/A | N/A | 20.00% | N/A | N/A | 3.12% | N/A | N/A | 0.00% | N/A | N/A |
+| BF16 20×8 `c32/mr128` | 160 | 37.50% | N/A | N/A | 30.00% | N/A | N/A | 3.12% | N/A | N/A | 0.00% | N/A | N/A |
+| W8A8 100×8 `c32/mr128` | 800 | 23.75% | N/A | N/A | 13.63% | N/A | N/A | 5.75% | N/A | N/A | 2.75% | N/A | N/A |
+| BF16 100×8 `c32/mr128` | 800 | 33.00% | N/A | N/A | 18.50% | N/A | N/A | 7.62% | N/A | N/A | 2.12% | N/A | N/A |
+
+Efficiency summary for the same successful high-concurrency controls:
+
+| Run | Eval elapsed | Full wall | Mean response len | Median response len | Decode tok/s median | Decode tok/s mean | Weight memory | KV token budget | Max running requests |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| W8A8 20×8 `c32/mr128` | 11:00 | n/a | 5950.42 | 6639.50 | 314.66 | 384.56 | 14.22 GB | 970933 | 123 |
+| BF16 20×8 `c32/mr128` | 19:05 | n/a | 7371.49 | 7689.50 | 280.72 | 279.01 | 25.57 GB | 775780 | 98 |
+| W8A8 100×8 `c32/mr128` | 1:00:29 | ~1:03:29 | 7575.19 | 7630.00 | 370.55 | 408.17 | 14.22 GB | 970933 | 123 |
+| BF16 100×8 `c32/mr128` | 1:44:21 | ~1:46:57 | 8602.19 | 8716.00 | 251.25 | 283.77 | 25.57 GB | 775780 | 98 |
+
+Direct W8A8 vs BF16 100×8 interpretation:
+
+- W8A8 has the expected memory/request headroom: weight memory `14.22 GB` vs
+  BF16 `25.57 GB`, KV token budget `970933` vs `775780`, and actual
+  `max_running_requests=123` vs `98`.
+- W8A8 was faster on the direct 100×8 control: `1:00:29` eval vs BF16
+  `1:44:21` eval. That is about `1.73×` faster wall-clock for this run.
+- Decode-log summaries support the same direction: W8A8 100×8 median decode
+  throughput `370.55 token/s`, mean `408.17`; BF16 100×8 median `251.25`,
+  mean `283.77`.
+- W8A8 quality was lower on compile/correct/fast@1.0: Compile T1 `23.75%` vs
+  `33.00%`, Correct T1 `13.63%` vs `18.50%`, Fast@1.0 T1 `5.75%` vs `7.62%`.
+  The Correct T1 gap is `4.875pp`, or about `26.4%` relative to BF16.
+- W8A8 Fast@1.2 T1 was slightly higher (`2.75%` vs `2.12%`), but the absolute
+  count is small (`22/800` vs `17/800`), so the robust quality conclusion is
+  still that plain local RTN W8A8 has a correct/compile drop while buying
+  faster eval wall-clock and more request headroom.
+- Both dumps passed the mojibake sanity check. The remaining difference is not
+  garbage-output corruption; it is a quality/runtime tradeoff plus sampling
+  variance and long-output tails.
+
+Why W8A8 still does not hit the user's original 45-minute expectation:
+
+- The corrected 100×8 high-concurrency run generated 800 responses, with mean
+  response length `7575` tokens and a long tail up to `63924` tokens.
+- The tail matters: the progress bar went from `799/800` at `58:55` to
+  completion at `1:00:29`.
+- The earlier 4h29 100×8 was partly a configuration problem (lower eval
+  concurrency and missing later context/runtime fixes). With `c32/mr128`, the
+  corrected 100×8 is about one hour, not four and a half hours.
+- The direct BF16 100×8 control was even slower (`1:44:21` eval), so the
+  remaining gap to 45 minutes is not a W8A8-only problem; it is dominated by
+  long generations and final-tail latency under this rollout workload.
+
+This confirms the corrected local RTN checkpoint produces normal text at 100×4
+and both 100×8 variants. Garbage output was a bug in checkpoint production and
+is gone after switching to the validated local RTN checkpoint; it was not W8A8
+precision degradation.
+
+## Online weight-push sanity attempt
+
+Important distinction: all successful smokes above used `--debug-rollout-only`,
+so `actor.update_weights()` returns early. They validate the offline W8A8
+checkpoint, SGLang load, generation, eval fan-out cap, and output sanity. They
+do not prove the full Megatron BF16 actor → online RTN INT8 → SGLang push path.
+
+I tried the real online path with one prompt, one eval sample, `CTX_LEN=16384`,
+`SGLANG_MAX_RUNNING_REQUESTS=4`, and `SGLANG_MEM_FRACTION_STATIC=0.25`.
+
+First attempt:
+
+- Run: `20260525_222443_ctx16384_n1_summ1600_w8a8-rtn-local-online-push-sanity`.
+- Failed during SGLang startup with
+  `TorchMemorySaver is disabled ... because expandable_segments is not supported yet`.
+- Cause: the harness always set
+  `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, but the non-debug
+  colocated path enables TorchMemorySaver, and those two are incompatible.
+- Fix: patched `scripts/debug.27b.w8a8.sh` so callers can set
+  `PYTORCH_CUDA_ALLOC_CONF_VALUE=` to disable that env for online sanity.
+
+Second attempt:
+
+- Run:
+  `20260525_222847_ctx16384_n1_summ1600_w8a8-rtn-local-online-push-sanity-noexpand`.
+- Ray job: `raysubmit_vSFF9ZuwcCVfUq9j`.
+- SGLang loaded the corrected W8A8 checkpoint successfully:
+  `quant=compressed-tensors`, weight memory `14.47 GB`,
+  `max_total_num_tokens=89578`, `max_running_requests=4`.
+- Failed before weight push, during Megatron actor DDP buffer allocation:
+  `torch.OutOfMemoryError: Tried to allocate 60.46 GiB`.
+- The log has no `before update_weights` or `after update_weights` line, so
+  this did not reach the online quantization/push call. It is an actor
+  colocate memory failure, not evidence that `quantize_layer_int8` or the push
+  protocol is corrupting weights.
+
+Current coverage for online quantization is therefore unit-test level, not
+full 27B online end-to-end:
+
+- `tests/utils/test_quantizer_compressed_tensors_int8.py` covers the exact
+  `quantize_layer_int8` helper used by online weight sync.
+- The new dispatch test covers `processors.quantize_params`, the entrypoint
+  called by the HF weight iterator before pushing tensors to SGLang.
+- Full online 27B E2E still needs either a non-colocated setup, a smaller actor
+  sanity, or further memory tuning that avoids constructing the full BF16 actor
+  grad buffer next to the SGLang engines.
 
 ---
 
@@ -276,13 +601,18 @@ which still triggers bwrap. The direct-CLI form skips bwrap entirely.
 | Path | Where | Notes |
 |---|---|---|
 | `slime/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py` | worktree (committed) | New `quantize_layer_int8` + dispatch |
-| `tests/utils/test_quantizer_compressed_tensors_int8.py` | worktree (committed) | CPU-runnable INT8 unit tests |
-| `scripts/quantize/quantize_w8a8_rtn_llmcompressor.py` | worktree (committed) | Offline RTN producer |
-| `scripts/debug.27b.w8a8.sh` | worktree (committed) | 100×4 smoke harness (copy lives at scripts/debug/debug.27b.w8a8.sh in dev_csl too) |
+| `tests/utils/test_quantizer_compressed_tensors_int8.py` | worktree (modified) | CPU-runnable INT8 unit tests, including online weight-sync dispatch coverage |
+| `scripts/quantize/quantize_w8a8_rtn_llmcompressor.py` | worktree (modified) | llmcompressor producer now post-save validates |
+| `scripts/quantize/validate_w8a8_rtn_checkpoint.py` | worktree (new) | Rejects ternary/saturated/high-error W8A8 checkpoints |
+| `scripts/quantize/quantize_w8a8_rtn_local.py` | worktree (new) | Local RTN checkpoint writer using tested `quantize_layer_int8` |
+| `tests/utils/test_validate_w8a8_rtn_checkpoint.py` | worktree (new) | Unit tests for the checkpoint sanity checker |
+| `tests/utils/test_quantize_w8a8_rtn_local.py` | worktree (new) | Unit tests for local RTN writer scope/config/output |
+| `scripts/debug.27b.w8a8.sh` | worktree (modified) | Smoke harness now env-tunable for 100×4/100×8 and can disable `PYTORCH_CUDA_ALLOC_CONF` for TorchMemorySaver |
 | `slime_plugins/drkernel/eval_throttle.py` | dev_csl (uncommitted at time of writing) | Codex-added eval fan-out semaphore |
 | `slime_plugins/drkernel/rollout.py` | dev_csl (modified, uncommitted) | Eval-task wrap with semaphore |
 | `tests/utils/test_drkernel_eval_throttle.py` | dev_csl (uncommitted) | Codex-added unit tests |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN/` | NFS | 30 GB W8A8 RTN ckpt + multimodal config copies |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN/` | NFS | Broken llmcompressor W8A8 RTN ckpt; do not use |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/` | NFS | Corrected local RTN ckpt; passed checker and rollout sanity |
 
 The dev_csl uncommitted files are real and Codex verified them with
 `pytest -q tests/utils/test_drkernel_eval_throttle.py`. They need to be
@@ -292,7 +622,7 @@ the worktree pick them up).
 
 ---
 
-## Next step recipe (in order)
+## Next step recipe (current)
 
 1. **Verify the dev_csl uncommitted files are still there** (codex
    wrote them; user may or may not have committed):
@@ -302,44 +632,25 @@ the worktree pick them up).
    git status --short | grep -E "eval_throttle|drkernel/rollout"
    ```
 
-2. **Sanity check (5 min) — required** per AGENTS.md rule 6:
-   ```bash
-   ssh -p 23422 root@192.168.16.64 \
-     'cd /nfs/FM/chenshuailin/projects/kernel_agents/slime && \
-      DRKERNEL_SMOKE_MAX_PROMPTS=1 N_SAMPLES_PER_EVAL_PROMPT=4 \
-      EVAL_MAX_RESPONSE_LEN=512 DRKERNEL_EVAL_MAX_CONCURRENCY=4 \
-      bash scripts/debug/debug.27b.w8a8.sh 2>&1 | tail -50'
-   ```
-   Pass = `eval_rollout_single_dataset first sample` line appears + Ray
-   job ends `succeeded` within ~5 min.
+2. **If continuing this branch, finish online RTN weight-push E2E**:
+   the direct 27B colocated attempt got past SGLang W8A8 load but OOMed while
+   Megatron allocated the BF16 DDP grad buffer, before `before update_weights`.
+   The likely next routes are non-colocated rollout engines, a smaller model
+   sanity that still exercises `processors.quantize_params`, or a dedicated
+   synthetic push harness that does not construct the full training optimizer
+   and grad buffers.
 
-3. **Real 100×4 smoke** (~45 min expected):
-   ```bash
-   ssh -p 23422 root@192.168.16.64 \
-     'cd /nfs/FM/chenshuailin/projects/kernel_agents/slime && \
-      nohup bash scripts/debug/debug.27b.w8a8.sh \
-        > /tmp/w8a8_smoke.run.log 2>&1 &'
-   ```
-   Tail for `eval/kernelbench_level1 =` to surface the score. Watch
-   `/proc/$pid/status` to catch OOM crashes.
-
-4. **Compare**: drop the W8A8 result next to the BF16 baseline
-   (`eval/kernelbench_level1` for Qwen3.6-27B BF16 = 0.27 per
-   `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md`). Acceptable
-   degradation per the strategy doc: model quality should land within
-   noise band of the rotated BF16 baseline (rotation done offline +
-   online RTN is the actual quality strategy; vanilla RTN on un-rotated
-   weights is expected to lose some accuracy).
-
-5. **If OOM**: do NOT lower `max-running` and `mem-fraction` together
+3. **If OOM**: do NOT lower `max-running` and `mem-fraction` together
    reflexively. Investigate the OOM message first:
-   - "X GiB reserved but unallocated" with Y < X free → fragmentation,
-     `expandable_segments` (already on)
+   - "X GiB reserved but unallocated" with Y < X free → fragmentation. For
+     debug-rollout-only, try `expandable_segments`; for non-debug colocated
+     TorchMemorySaver, do not set it unless the TorchMemorySaver incompatibility
+     is fixed.
    - "Y GiB tried to alloc, Z GiB free, Z << Y" → real shortage, drop
      `mem-fraction` by 0.05 at a time (keeping max-running=64) until it
      stops crashing
 
-6. **Online RTN path is NOT exercised in `--debug-rollout-only`**. To
+4. **Online RTN path is NOT exercised in `--debug-rollout-only`**. To
    test the slime-side INT8 quantization (the `quantize_layer_int8` code),
    you need a real training run that goes through `update_weight_from_*`.
    That's a separate task — this branch only verifies the offline RTN
@@ -348,30 +659,56 @@ the worktree pick them up).
 
 ---
 
-## Files modified relative to origin/main (worktree only)
+## Current worktree changes
 
 ```
-slime/backends/megatron_utils/megatron_to_hf/processors/__init__.py       (M, comment)
-slime/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py  (M, +90)
-tests/utils/test_quantizer_compressed_tensors_int8.py                     (A, +220)
-scripts/quantize/quantize_w8a8_rtn_llmcompressor.py                       (A, +190)
-scripts/debug.27b.w8a8.sh                                                 (A, +215)
-slime_plugins/drkernel                                                    (symlink to dev_csl, untracked)
+M  handoffs/in_progress/HANDOFF_W8A8_INT8_RTN_BRANCH.md
+M  scripts/debug.27b.w8a8.sh
+M  scripts/quantize/quantize_w8a8_rtn_llmcompressor.py
+M  slime/rollout/sglang_rollout.py
+M  slime/utils/data.py
+M  slime/utils/eval_config.py
+M  tests/utils/test_quantizer_compressed_tensors_int8.py
+?? checkpoints/
+?? scripts/quantize/quantize_w8a8_rtn_local.py
+?? scripts/quantize/validate_w8a8_rtn_checkpoint.py
+?? tests/utils/test_dataset_text_processor.py
+?? tests/utils/test_eval_config.py
+?? tests/utils/test_quantize_w8a8_rtn_local.py
+?? tests/utils/test_sglang_context_cap.py
+?? tests/utils/test_validate_w8a8_rtn_checkpoint.py
+?? slime_plugins/drkernel
 ```
 
-All in `worktree-w8a8-int8-rtn-rollout` branch at commit `063e2147`.
+`slime_plugins/drkernel` is the symlink to dev_csl described above; do not
+delete it unless you also move/copy the drkernel rollout changes into this
+worktree.
 
 ---
 
 ## Status
 
 - ☑ INT8 RTN slime code: implemented, codex-reviewed, unit-tested
-- ☑ Offline RTN ckpt: produced at `/nfs/.../Qwen3.6-27B-W8A8-RTN/`
+- ☑ Broken offline RTN ckpt root-caused: llmcompressor output was near-ternary
+- ☑ Corrected offline RTN ckpt: produced at `/nfs/.../Qwen3.6-27B-W8A8-RTN-local/`
 - ☑ Smoke harness: written + tuned to BF16-equivalent
-- ☑ Pipeline sanity: verified end-to-end with 1-prompt run in 80s
-- ☐ Real 100×4 smoke: NOT YET RUN with current (BF16-equivalent) config
-  — the previous runs all used over-throttled settings or had no
-  concurrency cap. Launch per step 3 above.
-- ☐ KernelBench score comparison vs BF16: pending the above run.
-- ☐ Online-RTN path (slime `quantize_layer_int8`) end-to-end: needs a
-  real training run, out of scope for this branch.
+- ☑ Pipeline sanity: local corrected ckpt verified end-to-end with 1-prompt run
+- ☑ Real 100×4 smoke: completed, score `0.1675`, wall `2:18:25`, no garbage
+- ☑ Real 100×8 smoke: completed, score `0.1875`, wall `4:29:20`, no garbage
+- ☑ High-concurrency 100×8 smoke: completed, score `0.13625`, eval wall
+  `1:00:29`, no garbage
+- ☑ BF16 high-concurrency 20×8 control: completed, score `0.3`, eval wall
+  `19:05`, no garbage; confirms W8A8 has more KV/request headroom under the
+  same `mem=0.9/c32/mr128` knobs, but does not guarantee proportional speedup.
+- ☑ BF16 high-concurrency 100×8 control: completed, score `0.185`, eval wall
+  `1:44:21`, no garbage; direct same-host comparison shows W8A8 was faster
+  (`1:00:29`) but lower score (`0.13625`).
+- ☑ Tests/sanity coverage: 30 targeted tests passed; W8A8 quantization,
+  checkpoint validation, eval context cap, text-only processor path, and
+  drkernel eval throttle are covered.
+- ☑ KernelBench/runtime comparison vs BF16: W8A8 low-concurrency 100×4 was slow,
+  W8A8 high-concurrency 100×8 is about one hour, and same-host BF16 100×8 is
+  slower but scores higher; see "Corrected smoke results" for concrete numbers.
+- ☐ Online-RTN path full 27B end-to-end: attempted, but actor initialization
+  OOMed before weight push; unit tests now cover the online quantization
+  entrypoint and full E2E needs a different memory setup.

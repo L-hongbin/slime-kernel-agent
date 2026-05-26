@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from pathlib import Path
 
 import torch
 
@@ -84,6 +85,29 @@ def parse_args():
         "`architectures=*ForConditionalGeneration` tag intact so sglang uses its "
         "registered multimodal entry (avoids the dense-entry bugs documented in "
         "handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md).",
+    )
+    ap.add_argument(
+        "--skip-post-save-validation",
+        action="store_true",
+        help="Skip the W8A8 checkpoint sanity check after saving. Use only for debugging broken outputs.",
+    )
+    ap.add_argument(
+        "--validation-max-tensors",
+        type=int,
+        default=32,
+        help="Number of quantized tensors to compare against --model-path after saving.",
+    )
+    ap.add_argument(
+        "--validation-max-saturated-frac",
+        type=float,
+        default=0.20,
+        help="Fail post-save validation if more than this fraction of int8 weights are saturated.",
+    )
+    ap.add_argument(
+        "--validation-max-rel-l2",
+        type=float,
+        default=0.08,
+        help="Fail post-save validation if dequantized weights differ from --model-path by more than this relative L2.",
     )
     return ap.parse_args()
 
@@ -185,6 +209,21 @@ def main():
     print(f"[quantize] saving to {args.output_path}", flush=True)
     model.save_pretrained(args.output_path, save_compressed=True)
     tokenizer.save_pretrained(args.output_path)
+    if not args.skip_post_save_validation:
+        print("[quantize] validating saved W8A8 checkpoint", flush=True)
+        try:
+            from scripts.quantize.validate_w8a8_rtn_checkpoint import check_w8a8_checkpoint
+        except ModuleNotFoundError:
+            from validate_w8a8_rtn_checkpoint import check_w8a8_checkpoint
+
+        checks = check_w8a8_checkpoint(
+            Path(args.output_path),
+            reference_checkpoint=Path(args.model_path),
+            max_tensors=args.validation_max_tensors,
+            max_saturated_frac=args.validation_max_saturated_frac,
+            max_rel_l2=args.validation_max_rel_l2,
+        )
+        print(f"[quantize] validation OK: checked {len(checks)} W8A8 tensors", flush=True)
     print(f"[quantize] done. compressed-tensors W8A8-RTN ckpt at {args.output_path}", flush=True)
 
 

@@ -5,8 +5,8 @@ set -eo pipefail
 # W8A8 INT8 rollout smoke harness — 100x4 default.
 #
 # Differences from `scripts/debug/debug.27b.sh` (BF16 baseline):
-# - `--hf-checkpoint` points at the RTN-quantized W8A8 INT8 ckpt
-#   (`/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN`). Slime reads
+# - `--hf-checkpoint` points at the corrected local RTN W8A8 INT8 ckpt
+#   (`/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local`). Slime reads
 #   the `quantization_config` block from its `config.json` to drive the per-step
 #   weight-sync quantization path (`quantize_layer_int8`). SGLang also boots
 #   its engine from this same ckpt so the int8 layout matches before slime's
@@ -19,17 +19,33 @@ set -eo pipefail
 # Override env vars to retune.
 
 CTX_LEN=${CTX_LEN:-65536}
+NUM_ROLLOUT=${NUM_ROLLOUT:-0}
+DEBUG_ROLLOUT_ONLY=${DEBUG_ROLLOUT_ONLY:-1}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-32}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-8}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-4}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
+EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-${CTX_LEN}}
+DRKERNEL_EVAL_MAX_CONCURRENCY=${DRKERNEL_EVAL_MAX_CONCURRENCY:-16}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
+SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.9}
+SGLANG_DECODE_LOG_INTERVAL=${SGLANG_DECODE_LOG_INTERVAL:-400}
+PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
 EXPT_LABEL=${EXPT_LABEL:-w8a8-rtn}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
-EVAL_CONFIG_PATH=scripts/eval_kernelbench_level1.yaml
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
+# This worktree is intentionally sparse; reuse shared debug/ray/data assets from
+# the main slime checkout unless the caller points at a different copy.
+SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts}
+DATA_ROOT=${DATA_ROOT:-/nfs/FM/chenshuailin/projects/kernel_agents/slime}
+EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml}
+PROMPT_DATA_PATH=${PROMPT_DATA_PATH:-${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet}
 # Original BF16 ckpt — used for Megatron ref-load + render_prompt_check tokenizer.
 MODEL_DIR=${MODEL_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B}
 # RTN W8A8 ckpt — sglang engine boot weights + slime quantization_config source.
-HF_W8A8_DIR=${HF_W8A8_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN}
+HF_W8A8_DIR=${HF_W8A8_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local}
 KG_REWARD_HOST=${KG_REWARD_HOST:-192.168.16.39}
 KG_REWARD_PORT=${KG_REWARD_PORT:-20111}
 
@@ -38,18 +54,27 @@ SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_
 LOG_DIR="${SAVE_DIR}"
 LOG_FILE="${LOG_DIR}/run_log"
 mkdir -p "${LOG_DIR}"
+RESOLVED_EVAL_CONFIG_PATH="${LOG_DIR}/eval_config.resolved.yaml"
+sed "s|path: data/|path: ${DATA_ROOT}/data/|g" "${EVAL_CONFIG_PATH}" > "${RESOLVED_EVAL_CONFIG_PATH}"
 touch "${LOG_FILE}"
 exec > >(tee -a "${LOG_FILE}") 2>&1
 echo "Logging to ${LOG_FILE} (CTX_LEN=${CTX_LEN}, N=${N_SAMPLES_PER_EVAL_PROMPT})"
 echo "HF_W8A8_DIR=${HF_W8A8_DIR}"
 echo "MODEL_DIR=${MODEL_DIR}"
+echo "SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR}"
+echo "PROMPT_DATA_PATH=${PROMPT_DATA_PATH}"
+echo "EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH}"
+echo "RESOLVED_EVAL_CONFIG_PATH=${RESOLVED_EVAL_CONFIG_PATH}"
 echo "Reward server: http://${KG_REWARD_HOST}:${KG_REWARD_PORT}"
+echo "NUM_ROLLOUT=${NUM_ROLLOUT}; DEBUG_ROLLOUT_ONLY=${DEBUG_ROLLOUT_ONLY}"
+echo "Eval response cap: ${EVAL_MAX_RESPONSE_LEN}; eval concurrency cap: ${DRKERNEL_EVAL_MAX_CONCURRENCY}"
+echo "SGLang max-running=${SGLANG_MAX_RUNNING_REQUESTS}; mem-fraction-static=${SGLANG_MEM_FRACTION_STATIC}"
+echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF_VALUE}"
 
 export PYTHONUNBUFFERED=1
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-source "${SCRIPT_DIR}/ray/start_cluster.sh"
-source "${SCRIPT_DIR}/models/qwen3.5-27B.sh"
+source "${SCRIPT_HELPER_DIR}/ray/start_cluster.sh"
+source "${SCRIPT_HELPER_DIR}/models/qwen3.5-27B.sh"
 
 TP=2
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
@@ -67,15 +92,15 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
    --custom-rm-path slime_plugins.drkernel.kernelgym_rm.custom_rm
    --rollout-function-path slime_plugins.drkernel.rollout.generate_rollout
-   --prompt-data data/drkernel-rl-data-0513/train.parquet
+   --prompt-data ${PROMPT_DATA_PATH}
    --input-key ground_truth
    --label-key ground_truth
    --metadata-key extra_info
    --rollout-shuffle
    --rm-type deepscaler
-   --num-rollout 0
-   --rollout-batch-size 32
-   --n-samples-per-prompt 8
+   --num-rollout ${NUM_ROLLOUT}
+   --rollout-batch-size ${ROLLOUT_BATCH_SIZE}
+   --n-samples-per-prompt ${N_SAMPLES_PER_PROMPT}
    --n-samples-per-eval-prompt ${N_SAMPLES_PER_EVAL_PROMPT}
    --rollout-max-prompt-len ${ROLLOUT_MAX_PROMPT_LEN}
    --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN}
@@ -84,15 +109,17 @@ ROLLOUT_ARGS=(
 
    --global-batch-size 256
    --balance-data
-   --debug-rollout-only
 )
+if [ "${DEBUG_ROLLOUT_ONLY}" != "0" ]; then
+   ROLLOUT_ARGS+=(--debug-rollout-only)
+fi
 
 EVAL_ARGS=(
    --eval-interval 20
    --skip-eval-before-train
-   --eval-config "${EVAL_CONFIG_PATH}"
+   --eval-config "${RESOLVED_EVAL_CONFIG_PATH}"
    --eval-max-prompt-len ${CTX_LEN}
-   --eval-max-response-len ${CTX_LEN}
+   --eval-max-response-len ${EVAL_MAX_RESPONSE_LEN}
    --eval-max-context-len ${CTX_LEN}
    --rm-url http://${KG_REWARD_HOST}:${KG_REWARD_PORT}
    --dump-details ${SAVE_DIR}/dumps
@@ -157,9 +184,9 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
    --sglang-context-length ${CTX_LEN}
-   --sglang-max-running-requests 64
-   --sglang-mem-fraction-static 0.9
-   --sglang-decode-log-interval 400
+   --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
+   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
+   --sglang-decode-log-interval ${SGLANG_DECODE_LOG_INTERVAL}
 )
 
 MISC_ARGS=(
@@ -173,11 +200,13 @@ MISC_ARGS=(
 DRKERNEL_SMOKE_MAX_PROMPTS=${DRKERNEL_SMOKE_MAX_PROMPTS:-100}
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/\",
+    \"PYTHONPATH\": \"${REPO_ROOT}:/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\",
-    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\"
+    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\",
+    \"DRKERNEL_EVAL_MAX_CONCURRENCY\": \"${DRKERNEL_EVAL_MAX_CONCURRENCY}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF_VALUE}\"
   }
 }"
 
@@ -192,7 +221,8 @@ _RENDER_CHECK_ARGS=(
 if [ -n "${DRKERNEL_GPU_NAME}" ]; then
    _RENDER_CHECK_ARGS+=(--expected-gpu-words "${DRKERNEL_GPU_NAME}")
 fi
-PYTHONPATH="${SCRIPT_DIR}/.." python3 "${SCRIPT_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
+PYTHONPATH="${REPO_ROOT}:${SCRIPT_HELPER_DIR}/..:${PYTHONPATH:-}" \
+   python3 "${SCRIPT_HELPER_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

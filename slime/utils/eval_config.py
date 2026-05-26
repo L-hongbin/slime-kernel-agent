@@ -33,6 +33,16 @@ DATASET_RUNTIME_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
         "default_keys": ("max_response_len",),
         "arg_attrs": ("eval_max_response_len", "rollout_max_response_len"),
     },
+    "max_prompt_len": {
+        "dataset_keys": ("max_prompt_len",),
+        "default_keys": ("max_prompt_len",),
+        "arg_attrs": ("eval_max_prompt_len", "rollout_max_prompt_len"),
+    },
+    "max_context_len": {
+        "dataset_keys": ("max_context_len",),
+        "default_keys": ("max_context_len",),
+        "arg_attrs": ("eval_max_context_len", "rollout_max_context_len"),
+    },
 }
 
 DATASET_SAMPLE_SPECS: dict[str, dict[str, tuple[str, ...]]] = {
@@ -111,6 +121,8 @@ class EvalDatasetConfig:
     top_p: float | None = None
     top_k: int | None = None
     max_response_len: int | None = None
+    max_prompt_len: int | None = None
+    max_context_len: int | None = None
     stop: list[str] | None = None
     stop_token_ids: list[int] | None = None
     min_new_tokens: int | None = None
@@ -139,6 +151,7 @@ class EvalDatasetConfig:
             self.label_key,
             self.tool_key,
             self.metadata_key,
+            self.max_prompt_len,
         )
 
     def inject_metadata(self, sample_metadata: Any) -> dict[str, Any]:

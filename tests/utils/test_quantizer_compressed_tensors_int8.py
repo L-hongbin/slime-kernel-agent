@@ -6,6 +6,7 @@ Runs on CPU. INT4 path uses a CUDA kernel so it is not exercised here.
 import pytest
 import torch
 
+from slime.backends.megatron_utils.megatron_to_hf.processors import quantize_params
 from slime.backends.megatron_utils.megatron_to_hf.processors.quantizer_compressed_tensors import (
     quantize_layer_int8,
     quantize_params_compressed_tensors,
@@ -220,6 +221,28 @@ def test_quantize_params_w8a8_int8_per_channel():
     assert qw.shape == (64, 128)
     assert s.shape == (64, 1)
     assert s.dtype == torch.float32
+
+
+def test_weight_sync_quantize_params_dispatches_to_w8a8_int8():
+    # Online weight sync calls processors.quantize_params() from the HF weight
+    # iterator before sending tensors to SGLang. Cover that dispatch entrypoint,
+    # not only the lower-level quantizer helper.
+    torch.manual_seed(0)
+    cfg = _make_w8a8_int8_config(strategy="channel", symmetric=True)
+    out = dict(
+        quantize_params(
+            args=None,
+            megatron_name="decoder.layers.0.mlp.linear_fc1.weight",
+            converted_named_params=[
+                ("model.layers.0.mlp.gate_proj.weight", torch.randn(16, 64, dtype=torch.bfloat16))
+            ],
+            quantization_config=cfg,
+        )
+    )
+
+    assert out["model.layers.0.mlp.gate_proj.weight"].dtype == torch.int8
+    assert out["model.layers.0.mlp.gate_proj.weight_scale"].shape == (16, 1)
+    assert "model.layers.0.mlp.gate_proj.weight_packed" not in out
 
 
 def test_quantize_params_w8a8_int8_ignore_lm_head_and_visual():

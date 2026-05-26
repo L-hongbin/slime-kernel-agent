@@ -61,6 +61,19 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     return tokenizer.encode(sample.prompt, add_special_tokens=False)
 
 
+def _cap_sampling_params_by_context(prompt_len: int, sampling_params: dict[str, Any]) -> None:
+    max_context_len = sampling_params.pop("_slime_max_context_len", None)
+    if max_context_len is None:
+        return
+
+    max_new_tokens = sampling_params.get("max_new_tokens")
+    if max_new_tokens is None:
+        return
+
+    capped_max_new_tokens = max(0, min(int(max_new_tokens), int(max_context_len) - int(prompt_len)))
+    sampling_params["max_new_tokens"] = capped_max_new_tokens
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -162,6 +175,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ), f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+    _cap_sampling_params_by_context(len(prompt_ids), sampling_params)
 
     assert (
         sampling_params["max_new_tokens"] >= 0
