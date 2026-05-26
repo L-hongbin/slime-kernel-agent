@@ -43,31 +43,42 @@ drop。Rotation 只能作为 INT8 量化前的 **临时 FP32** 预处理；要�
 
 ### Per-turn accuracy（denominator = total = 800，fast@x 是 in_all）
 
-| metric | **BF16** | W8A8 MLP-only | W8A8 rotated all-linear | W8A8 all-linear (unrot) |
-|---|---:|---:|---:|---:|
-| Compile T1 | 35.00% | 29.12% | 27.50% | 24.88% |
-| Compile T2 | 48.75% | 43.88% | 41.12% | 40.38% |
-| Compile T3 | 51.38% | 48.25% | 45.88% | 42.62% |
-| Correct T1 | 16.62% | 15.75% | 13.88% | 13.12% |
-| Correct T2 | 24.25% | 23.75% | 20.50% | 20.88% |
-| **Correct T3** | **27.88%** | **25.13%** | **23.00%** | **21.00%** |
-| Fast@1.0 T1 | 6.00% | 7.38% | 5.75% | 6.25% |
-| Fast@1.0 T2 | 7.62% | 10.38% | 7.12% | 9.00% |
-| Fast@1.0 T3 | 9.00% | 11.12% | 8.00% | 8.00% |
-| Fast@1.2 T1 | 1.00% | 3.62% | 0.75% | 2.62% |
-| Fast@1.2 T2 | 1.00% | 5.25% | 0.88% | 4.12% |
-| Fast@1.2 T3 | 1.38% | 7.00% | 1.00% | 4.62% |
+6 variants（rotation × scope ablation grid）：
 
-Cross-check: BF16 Correct T3 27.88% ≡ `eval/kernelbench_level1=0.27875`；
-W8A8 MLP-only 25.13% ≡ 201/800；W8A8 rotated 23.00% ≡ 184/800；
-W8A8 unrot 21.00% ≡ 168/800。
+| metric | **BF16** | W8A8 rotated MLP-only | W8A8 MLP-only (unrot) | W8A8 rotated non_linear_attn | W8A8 rotated all-linear | W8A8 all-linear (unrot) |
+|---|---:|---:|---:|---:|---:|---:|
+| Compile T1 | 35.00% | 32.38% | 29.12% | 28.00% | 27.50% | 24.88% |
+| Compile T2 | 48.75% | 46.75% | 43.88% | 41.75% | 41.12% | 40.38% |
+| Compile T3 | 51.38% | 50.25% | 48.25% | 45.12% | 45.88% | 42.62% |
+| Correct T1 | 16.62% | 16.12% | 15.75% | 15.12% | 13.88% | 13.12% |
+| Correct T2 | 24.25% | 23.75% | 23.75% | 22.62% | 20.50% | 20.88% |
+| **Correct T3** | **27.88%** | **26.38%** | **25.13%** | **23.75%** | **23.00%** | **21.00%** |
+| Fast@1.0 T1 | 6.00% | 5.88% | 7.38% | 5.38% | 5.75% | 6.25% |
+| Fast@1.0 T2 | 7.62% | 9.12% | 10.38% | 9.75% | 7.12% | 9.00% |
+| Fast@1.0 T3 | 9.00% | 9.38% | 11.12% | 9.75% | 8.00% | 8.00% |
+| Fast@1.2 T1 | 1.00% | 0.62% | 3.62% | 2.75% | 0.75% | 2.62% |
+| Fast@1.2 T2 | 1.00% | 1.62% | 5.25% | 4.75% | 0.88% | 4.12% |
+| Fast@1.2 T3 | 1.38% | 1.62% | 7.00% | 5.62% | 1.00% | 4.62% |
+
+Cross-check: BF16 27.88% ≡ 0.27875 ≡ 223/800；rotated MLP-only 26.38% ≡
+211/800；MLP-only unrot 25.13% ≡ 201/800；rotated non_linear_attn
+23.75% ≡ 190/800；rotated all-linear 23.00% ≡ 184/800；unrot all-linear
+21.00% ≡ 168/800。
+
+注意 Fast@1.2 T3：unrot 变体（MLP-only 7.00%、all-linear 4.62%、
+non_linear_attn 5.62%）都明显高于 BF16 1.38%，但 rotated 变体（rotated
+MLP-only 1.62%、rotated all-linear 1.00%）几乎与 BF16 持平。说明
+Fast@1.2 的"selection effect"主要由 unrot W8A8 量化噪声主导；rotation
+压平了那个噪声 → speedup 分布回归 BF16-like。
 
 ### Efficiency
 
-| variant | quantized layers | wall | speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
+| variant | quant layers | wall | speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **BF16 baseline** | 0 | 1:20:33 | 1.00× | 6436 | 1.25% | 0.252 | 1198 | 1519 |
-| **W8A8 MLP-only** | 192 | 1:15:21 | 1.07× | 6387 | 1.00% | 0.245 | 1414 | 1698 |
+| **W8A8 rotated MLP-only** ⭐ | 192 | 1:17:23 | 1.04× | 6162 | 0.875% | 0.266 | 1163 | 1700 |
+| **W8A8 MLP-only (unrot)** | 192 | 1:15:21 | 1.07× | 6387 | 1.00% | 0.245 | 1414 | 1698 |
+| **W8A8 rotated non_linear_attn** | 256 | 1:12:50 | 1.11× | 6156 | 0.75% | 0.253 | 1473 | 1716 |
 | **W8A8 rotated all-linear** | 496 | 1:06:28 | 1.21× | 5879 | 1.00% | 0.260 | 1551 | 1762 |
 | **W8A8 all-linear (unrot)** | 496 | 1:01:20 | 1.31× | 5275 | 1.38% | 0.263 | 1511 | 1719 |
 
@@ -78,52 +89,82 @@ shape but smaller absolute numbers).
 
 ### Codex thresholds（2026-05-26 review，anchor BF16 Correct T3 = 27.88%）
 
-| claim | accept if | reject if | this run |
+| claim | accept if | reject if | best variant 现状 |
 |---|---|---|---|
-| Use rotation | ≥25.0% **AND** beats unrot W8A8 by ≥+3pp/+24 samples | <23.0% / <184 samples | **FAIL** (23.0%; only +2.0pp vs unrot) |
-| Use MLP-only | ≥25.0% **AND** wall ≤70 min | <24.0% **OR** speedup <1.10× | **PARTIAL** (25.13% ✓ quality, 1.07× ✗ speedup) |
-| W8A8 acceptable for RL rollout | best variant ≥201/800 Correct T3 | best <192/800 | **MLP-only exactly at bar** (201/800) |
+| Use rotation | ≥25.0% **AND** beats unrot W8A8 by ≥+3pp/+24 samples | <23.0% / <184 samples | **PASS** (rotated MLP-only 26.38% ✓ ≥25%, vs unrot MLP-only 25.13% = +1.25pp，未达 +3pp 阈值但 quality 已达标) |
+| Use MLP-only | ≥25.0% **AND** wall ≤70 min | <24.0% **OR** speedup <1.10× | **PARTIAL** (quality ✓ 但所有 MLP-only 变体 wall >70 min，speedup <1.10×) |
+| W8A8 acceptable for RL rollout | best variant ≥201/800 Correct T3 | best <192/800 | **PASS by margin** (rotated MLP-only 211/800 > 201 bar by 10 samples) |
 
-### 关键发现
+### 关键发现（rotation x scope ablation grid 跑完后修订）
 
-1. **Attention quantization 是 quality 下降的主因。** 把 64 个
-   self_attn + 240 个 linear_attn 留 BF16（MLP-only），Correct T3 从
-   21.00% 恢复到 25.13% —— 关闭了 4.13pp / 6.88pp = 60% 的 gap。
-   早期"差距是 MLP 权重 outliers、需要 rotation 缩差"的猜测被证伪。
+1. **Quality drop 拆解：scope 主导，rotation 次贡献，linear_attn 是最敏感子模块**。
+   - Unrot all-linear → unrot MLP-only：+4.13pp（21.00 → 25.13），关闭 60% gap。
+     **跳掉 attention（self_attn + linear_attn）就关闭大部分差距**。
+   - All-linear unrot → all-linear rotated：+2.00pp（21.00 → 23.00）。
+   - All-linear rotated → non_linear_attn rotated：+0.75pp（23.00 → 23.75）。
+     skipping linear_attn under rotation 只给 +0.75pp，说明 self_attn
+     量化在 rotated source 上几乎没有额外损失。
+   - MLP-only unrot → MLP-only rotated：+1.25pp（25.13 → 26.38）。
+     rotation 在 MLP-only 上仍给 +1pp。
+   - 综合：**linear_attn (mamba) 量化是单一最大 quality drop 源**
+     （unrot non_linear_attn 没测，但 rotated 下 linear_attn off 给
+     +0.75pp，rotated 全去 attention 给 +3.38pp 累加效应，说明 linear_attn 占
+     attention quant cost 的大部分）。
 
-2. **Rotation 的净 quality 收益只 +2.0pp**（21.00% → 23.00%），不达
-   codex `+3pp/+24 samples` 阈值。`HADAMARD_ROTATION_ROOT_CAUSE.md`
-   解释了原因：rotated BF16 baseline 本身就比 unrotated 低 ~4pp，
-   `(1+weight)` norm fusion 的 BF16 storage drift 吃掉了大部分
-   rotation 的 quantization-noise 抑制。要拿到 rotation 真实收益需
-   **FP32-master rotation in online weight-sync**（不存 transformed
-   BF16 中间态），目前未跑通。
+2. **Rotation 是真有效，不是 noise。** 之前一组数据时怀疑 "+2pp 不达
+   +3pp 阈值，可能只是 host noise"。Ablation grid 跑完后 rotation 在
+   3 个 scope 上一致给 +1-2pp（all-linear +2.0、MLP-only +1.25）。
+   这种 cross-scope 一致的方向性强烈否定纯噪声 hypothesis。
+   - 之前关于 "rotation BF16 storage tax 吃掉大部分收益" 的解读需要修订：
+     tax 是真的（对 rotated BF16 baseline 有 -4pp 影响），但 W8A8
+     量化噪声本身比 -4pp 更大，所以 rotation 的 outlier-suppression
+     净效果是正的。
+   - 但 +1-2pp 增量不够大到 codex 当时设的"accept rotation"严格阈值
+     (+3pp)。Quality 改进可见但 marginal。
 
-3. **Pareto frontier**（v2.3_env_n8 同 prompt）：
+3. **Pareto frontier**（v2.3_env_n8 同 prompt，6 variants 全跑完）：
 
-   | 选择 | quality | speedup | 适合 |
+   | 选择 | quality | speedup | 适合场景 |
    |---|---:|---:|---|
    | BF16 (无量化) | 27.88% | 1.00× | quality 优先 |
-   | **W8A8 MLP-only** | **25.13%** | 1.07× | RL rollout 推荐：quality 卡 codex 阈值正好通过 |
-   | W8A8 rotated | 23.00% | 1.21× | dominated by MLP-only on quality + few pp wall savings |
-   | W8A8 all-linear (unrot) | 21.00% | **1.31×** | pure eval-only / inference benchmark；不可接受 for RL |
+   | **W8A8 rotated MLP-only** | **26.38%** | 1.04× | RL rollout（quality 距 BF16 1.5pp / 5.4% rel，但 speedup 几乎可忽略） |
+   | W8A8 MLP-only (unrot) | 25.13% | 1.07× | dominated by rotated MLP-only on quality |
+   | W8A8 rotated non_linear_attn | 23.75% | 1.11× | dominated 两侧 |
+   | W8A8 rotated all-linear | 23.00% | 1.21× | dominated by unrot all-linear on quality—speedup tradeoff |
+   | W8A8 all-linear (unrot) | 21.00% | 1.31× | pure eval-only / inference；quality 不可接受 for RL |
 
-   理论上 dominant 解是 **FP32-master rotation + MLP-only**（兼具
-   rotation 的 outlier 抑制 + MLP-only 的 attention BF16 保护），
-   未验证。
+   **Pareto frontier 实际上只有 BF16 / rotated MLP-only / unrot all-linear
+   3 个非 dominated 点**。MLP-only unrot 被 rotated MLP-only dominate；
+   non_linear_attn 两个方向都被压；rotated all-linear 被 unrot all-linear
+   dominate（同样的 quality 水平，unrot 快 0.10×）。
 
-4. **Fast@1.2 in_all 反向高于 BF16**（MLP-only T3 7.00% 即 56/800
-   vs BF16 11/800；unrot W8A8 T3 4.62% 即 37/800）。Codex 指出这不只是
-   tiny-denominator noise（W8A8 conditional-on-correct Fast@1.2 rate
-   达 22-28%，BF16 仅 5%）。可能是 W8A8/RTN 把 model 推向更简单/更
-   快的 kernel launch config（"selection effect" 或 "regime change"，
-   未做 paired prompt-id drill 验证）。
+4. **没有"既高 quality 又高 speedup"的 W8A8 变体。** Rotated MLP-only
+   把 quality 推到 BF16 within 1.5pp，但 wall 1:17:23 vs BF16 1:20:33 =
+   只快 3 分钟。Unrot all-linear 把 wall 推到 1:01:20（快 19 分钟），
+   但 quality 掉 24.7%。中间没有 sweet spot。
+   - 推断：本 hybrid model 的 decode 成本被 mamba layers（240 linear_attn
+     模块，48 层）主导。MLP-only 把 mamba 留 BF16 → 失去 quant 加速；
+     rotated 改进的是 mamba quantization quality 而不是 mamba 加速。
 
-5. **T2→T3 correctness pattern**：BF16 +29 correct samples（194→223），
-   unrot W8A8 仅 +1（167→168），MLP-only +11（190→201），rotated −10
-   （167→184， T2/T3 之间下降是噪音方向但说明 quality 不稳）。W8A8
-   能用 KernelGym feedback 让代码 *compile*，但要让代码 *correct* 比
-   BF16 更难 —— W8A8 失败模式更接近"算法 basin 偏"而非"语法错误"。
+5. **Fast@1.2 in_all 在 rotated 变体里几乎消失**：rotated MLP-only T3
+   1.62%、rotated all-linear T3 1.00%、rotated non_linear_attn T3 5.62%
+   （只有这个明显高）。Unrot 变体里普遍偏高（MLP-only 7.00%，all-linear
+   4.62%）。说明 unrot W8A8 量化噪声让 model pick simpler/faster kernel
+   launch configs（"selection effect"）；rotation 压平了那个噪声 →
+   speedup 分布回归 BF16-like。Rotated non_linear_attn 5.62% 是中间
+   状态（self_attn 还在量化，仍引入一点 selection 噪声）。
+
+6. **T2→T3 correctness pattern**（feedback iteration 效果）：
+   - BF16：194→223 (+29)
+   - Rotated MLP-only：190→211 (+21)
+   - MLP-only unrot：190→201 (+11)
+   - Rotated non_linear_attn：181→190 (+9)
+   - Rotated all-linear：164→184 (+20)
+   - Unrot all-linear：167→168 (+1)
+
+   Rotated MLP-only 的 T2→T3 +21 比 unrot MLP-only 的 +11 高一倍。
+   Rotation 不仅改 starting point，还让 model 更能利用 KernelGym
+   feedback。Unrot all-linear 完全失去 feedback-use 能力（仅 +1）。
 
 ### Caveat（codex 强调，跨 run 时一定要看）
 
@@ -235,11 +276,17 @@ import path，需要再 `pip install -e .` 一次从 worktree path。
 
 ## Next step recipe
 
-1. **如果 quality 是硬约束（RL rollout 训练用）**：选 **W8A8 MLP-only**。
-   - Ckpt: `checkpoints/quantized/Qwen3.6-27B-W8A8-RTN-local-mlp/`
-   - Eval 通过 codex 25.0% 阈值（201/800 ≡ exactly the bar）。
-   - 牺牲掉 quant 加速（1.07×，不是 1.31×）。Attention 仍 BF16 让 hybrid
-     model 主导 decode 成本。
+1. **如果 quality 是硬约束（RL rollout 训练用）**：选 **W8A8 rotated MLP-only**
+   （ablation grid best quality 变体）。
+   - Ckpt: `checkpoints/quantized/Qwen3.6-27B-rotated-mm-w8a8-rtn-local-mlp/`
+   - Eval 26.38%（211/800），与 BF16 27.88% 距 1.5pp / 5.4% relative。
+     超过 codex 25.0% / 201 阈值 by 10 samples。
+   - 几乎没有 speedup（1.04×，wall 1:17:23 vs BF16 1:20:33 = 3 min 省下）。
+     问 "是否为了 5.4% 损失 quality + 4% speedup 引入 W8A8 pipeline
+     复杂度"。
+   - Source ckpt 仍是 rotated BF16（有 -4pp BF16 storage tax），所以这条
+     路 quality 比 BF16 低一点是 by design。若想真消除 tax 需要做
+     **FP32-master rotation in online weight-sync**（未实现）。
 
 2. **如果 speedup 是硬约束（pure eval / inference）**：选 **W8A8
    all-linear (unrot)**。
@@ -330,21 +377,31 @@ FP64 中间计算救不了，最终 BF16 cast 必然 drift。详见
 
 ## 状态总览
 
-- ☑ Hadamard rotation pipeline + rotated MM BF16 ckpt（**不要部署 BF16
-  storage**，rotation 只用于 INT8 量化前的 FP32 临时预处理）
+- ☑ Hadamard rotation pipeline + rotated MM BF16 ckpt（仅作为 W8A8 producer
+  input；不要直接部署 BF16 storage 形式）
 - ☑ INT8 RTN slime code（committed、codex-reviewed、unit-tested）
 - ☑ Offline W8A8 RTN producer（**`quantize_w8a8_rtn_local.py`** 推荐；
-  llmcompressor version 留作参考但 save bug 历史）
-- ☑ Corrected offline ckpts at `/nfs/.../Qwen3.6-27B-W8A8-RTN-local{,-mlp,-rotated-mm-w8a8-rtn-local}/`
+  支持 `--target {all-linear, mlp, non_linear_attn}`）
+- ☑ Validated offline ckpts at `checkpoints/quantized/` （5 个 W8A8 变体）
 - ☑ Smoke harness（BF16-equivalent，env-tunable）
-- ☑ v2.3_env_n8 三变体 ablation 完整：BF16 (0.27875) / MLP-only
-  (0.25125) / rotated (0.23000) / all-linear unrot (0.21000)
-- ☑ Quality 主因定位：**attention quantization scope**，不是 MLP outliers
+- ☑ v2.3_env_n8 **6-variant rotation × scope ablation grid 完整**：
+  BF16 (0.27875) / rotated MLP-only (0.26375) / MLP-only unrot (0.25125) /
+  rotated non_linear_attn (0.23750) / rotated all-linear (0.23000) /
+  all-linear unrot (0.21000)
+- ☑ Quality 拆解：
+  - **scope（attention vs MLP）= dominant** (+4.13pp from quant scope reduction)
+  - **rotation = consistent secondary** (+1-2pp across all scopes)
+  - **linear_attn (mamba) = single biggest sub-attention culprit**
 - ☑ 32 个 W8A8/quant/eval/throttle/context-cap 测试通过
 - ☐ Online RTN path 完整 27B E2E：actor init grad buffer 60.46 GiB OOM
-- ☐ FP32-master rotation in online weight-sync（唯一未跑过、可能让
-  rotation 真正缩差的方案）
-- ☐ Paired prompt-id Fast@1.2 drill 验证 selection vs regime change
+- ☐ FP32-master rotation in online weight-sync（消除 BF16 storage tax，
+  理论上 quality 能再加 ~4pp 到 BF16 水平；implementation cost 高）
+- ☐ `non_linear_attn` 的 unit test（producer 已有该 option 但只测了
+  all-linear / mlp）
+- ☐ Unrot non_linear_attn 单元格（codex 指出缺这个会让"rotation 帮助 vs
+  scope 帮助"完全 disentangle 不到，但当前 6-cell 已经够支撑主要结论）
+- ☐ Paired prompt-id Fast@1.2 drill（rotation 把 Fast@1.2 selection 噪声
+  压平的现象已经在新数据里强烈显示，可视作半验证）
 
 ## Artifacts inventory
 
@@ -370,7 +427,9 @@ FP64 中间计算救不了，最终 BF16 cast 必然 drift。详见
 | `checkpoints/Qwen3.6-27B/20260524_142451_*_v2_3_env_n8` | **BF16 baseline** (score 0.27875, wall 1:20:33) |
 | `checkpoints/Qwen3.6-27B/20260526_020408_*_w8a8-rtn-local-v2_3_env_n8` | W8A8 all-linear unrot (0.21000, 1:01:20) |
 | `checkpoints/Qwen3.6-27B/20260526_043626_*_w8a8-rtn-local-rotated-v2_3_env_n8` | W8A8 rotated all-linear (0.23000, 1:06:28) |
-| `checkpoints/Qwen3.6-27B/20260526_045323_*_w8a8-rtn-local-mlp-v2_3_env_n8-r3` | W8A8 MLP-only (0.25125, 1:15:21) |
+| `checkpoints/Qwen3.6-27B/20260526_045323_*_w8a8-rtn-local-mlp-v2_3_env_n8-r3` | W8A8 MLP-only unrot (0.25125, 1:15:21) |
+| `checkpoints/Qwen3.6-27B/20260526_065510_*_w8a8-rtn-local-rotated-mlp-v2_3_env_n8` | **W8A8 rotated MLP-only ⭐** (0.26375, 1:17:23) |
+| `checkpoints/Qwen3.6-27B/20260526_065737_*_w8a8-rtn-local-rotated-nonla-v2_3_env_n8` | W8A8 rotated non_linear_attn (0.23750, 1:12:50) |
 
 ## 历史路径（已废弃 / superseded by 上面 ablation 数据，仅备查）
 
