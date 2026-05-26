@@ -326,8 +326,80 @@ N/A）：
 
 **结论**：plain local RTN W8A8（无 rotation）拿到了 ~1.7× wall-clock
 加速 + 更大 request headroom，代价是 Correct/Compile 约 5pp 的下降。
-这与 strategy 段的预期一致 —— 下一步加 online FP32 rotation + RTN
-应能缩小 quality 差距。
+
+**注意**：strategy 段最初猜"加 rotation 应能缩小 quality 差距"。Codex
+review（2026-05-26）指出这是 speculation —— 没有 W8A8+rotation 的实测
+数据支持它。下面 v2.3_env_n8 对照（不同配置、不同 host）也复现 ~25%
+relative 的 Correct 下降，说明 quality 差距在两套 sglang 调度都稳定存在
+（即与 KV/scheduler 调参无关，与 W8A8 量化 scope 强相关）。在投入
+rotation 之前，应优先做更便宜的 falsifying 实验：`--target mlp` 只量化
+MLP 子图（跳过 64 个 self_attn + 240 个 linear_attn 模块），看 quality
+是否大部分恢复。如果恢复，问题在 attention 量化 scope 而不是 outlier，
+rotation 不是正确工具。详见 "Next step recipe" 和"经验教训" 段。
+
+### W8A8 vs BF16 v2.3_env_n8 对照（2026-05-26，baseline-aligned）
+
+这次对照是为了直接对比 W8A8 与 saved BF16 v2.3_env_n8 baseline
+（`20260524_142451_*_v2_3_env_n8`，score 0.27875），不再做新的 BF16
+run。Settings 与 BF16 baseline 完全对齐 —— `max-running=64`、
+`mem-fraction=0.9`、`DRKERNEL_EVAL_MAX_CONCURRENCY=0`（无信号量）、
+`PYTORCH_CUDA_ALLOC_CONF=`（empty）。差异 codex 已 audit：
+
+| CLI 差异 | BF16 baseline | W8A8 对照 | 影响 |
+|---|---|---|---|
+| `--hf-checkpoint` | `Qwen3.6-27B` | `Qwen3.6-27B-W8A8-RTN-local` | SHIFTS-SCORE-BY-DESIGN |
+| `--rm-url` | `192.168.16.40:20111` | `192.168.16.39:20111` | MAY-SHIFT-SCORE（OpenAPI byte-identical at probe time，未证明 run-time 完全等价） |
+| host | `.22` | `.64` | 跨 host wall-time 不严格 same-host |
+| `--eval-config` / `--prompt-data` 路径 | 相对 | 绝对，同文件 | BENIGN |
+
+**Headline**：
+
+| metric | BF16 baseline | W8A8 v2.3_env_n8 | Δ |
+|---|---:|---:|---:|
+| score | 0.27875 | **0.21000** | -0.069 / **-24.66% rel** |
+| eval wall | 1:20:33 | **1:01:20** | **1.31× faster** |
+| mean response | 6436 | 5275 | -18% |
+| median response | 6227 | 5183 | -17% |
+| truncated_ratio | 0.0125 | 0.01375 | ~same |
+| repetition_frac | 0.0075 | 0.0025 | 低 |
+| prefix_cache_hit_rate | 0.2521 | 0.2625 | ~same |
+| avg_cached_tokens/sample | 2606 | 2748 | ~same |
+
+Score 已 cross-check：W8A8 reward sum `168/800=0.21`，BF16 `223/800=0.27875`。
+两个 run 都 Job succeeded，无 Error/Traceback/OOM。
+
+**速度差异分解**（codex 从 `Decode batch` 行解析）：
+
+| running-req | BF16 median (tok/s) | W8A8 median (tok/s) | W8A8/BF16 |
+|---:|---:|---:|---:|
+| 64（满批） | 1518.96 | 1718.51 | **+13.1%** |
+| 1（单流） | 44.53 | 71.235 | **+60%** |
+
+- 满批纯量化吞吐量约 +13%。剩下的 wall 加速来自 W8A8 输出更短
+  （见下）。
+- 单流加速 +60% 说明 INT8 GEMM 在低-batch decode 上加速明显，但生产
+  load 通常跑满批，不能直接外推。
+
+**Response length 下降是两种因素混合**：
+
+- 退化短样本变多：W8A8 `<500 tokens` 总数 89（BF16 51）；`==0` 8（BF16 4）；
+  `<100` 72（BF16 43）。Histogram 显示 W8A8 `[1,100)` bucket 64 vs BF16 39。
+- 但即便去掉 `<500` 退化样本，W8A8 mean 5927 vs BF16 6870 —— 仍短 14%。
+  说明"好样本"也更早 stop（早 14%），不仅是退化样本拖低均值。
+- W8A8 出现一个明显 quant-quality 指纹：sample 5 的 prior turns 都
+  reward=1.0，但 final turn 整个崩成 `<|im_end|>` only + extract_error
+  —— 这种"中途好、最后塌"模式 BF16 没有。
+
+**Caveat（codex 强调）**：
+- BF16 baseline 跑在 host `.22`，W8A8 跑在 `.64` —— 不是 strict
+  same-host 对照。`c32/mr128` 那组（上一节）是同 host `.64`，wall
+  speedup `1.73×`；这次跨 host 的 `1.31×` 更保守。
+- Reward server `.40 → .39` 改了。Probe 时 OpenAPI byte-identical，但
+  没证明 run-time scoring 完全等价。
+
+**结论**：W8A8 score `0.21` 与 c32/mr128 那组 `0.13625` 都低于对应
+BF16，**~25% relative correct drop 稳定复现**。Quality 差距与 sglang
+调度配置无关。下一步看 `--target mlp` 能否缩差。
 
 ### Why W8A8 still not at 45-min expectation
 
@@ -452,11 +524,13 @@ full E2E：
 - ☑ 100×4 full smoke：`score=0.1675`，`wall=2:18:25`，no garbage
 - ☑ 100×8 full smoke（低并发）：`score=0.1875`，`wall=4:29:20`，no garbage
 - ☑ W8A8 100×8 高并发 (`c32/mr128`)：`score=0.13625`，`eval=1:00:29`，no garbage
-- ☑ BF16 100×8 高并发对照：`score=0.185`，`eval=1:44:21` —— **W8A8 快 1.73×**
-- ☑ 30 个 W8A8/quant/eval/throttle 测试通过
-- ☐ Online RTN path 完整 27B E2E：actor init OOM，未到 weight push
-- ☐ 加 online FP32 rotation（Hadamard / R1）以缩小 quality 差距
-- ☐ Quality 缩差量化：W8A8 + rotation vs BF16 100×8 同 host 对照
+- ☑ BF16 100×8 高并发对照：`score=0.185`，`eval=1:44:21` —— **W8A8 快 1.73× 同 host**
+- ☑ W8A8 100×8 v2.3_env_n8（baseline-aligned，跨 host）：`score=0.21000`，`eval=1:01:20` vs saved BF16 `0.27875 / 1:20:33` —— **W8A8 快 1.31×，−24.66% rel correct**
+- ☑ Quality drop ~25% relative 在两套配置下稳定复现 —— 与 sglang 调度无关
+- ☑ 32 个 W8A8/quant/eval/throttle/context-cap 测试通过（含 codex 二审后修复的 `test_sglang_context_cap.py`）
+- ☐ **`--target mlp` ablation**：cheapest falsifier。skip 64 self_attn + 240 linear_attn，看 quality 是否大部分恢复
+- ☐ Online RTN path 完整 27B E2E：actor init OOM 在 grad buffer 60.46 GiB alloc，未到 weight push
+- ☐ Quality 缩差实测（rotation 优先级低于 `--target mlp` ablation）
 
 ## Artifacts inventory
 
@@ -499,11 +573,23 @@ full E2E：
    Pass = `eval_rollout_single_dataset first sample` 行 + Ray job
    `succeeded`，5 min 内。
 
-3. **下一个关键 deliverable**：online FP32 rotation + RTN E2E。
-   - 关键：actor init OOM 必须先解。可能路径：non-colocated 模式、
-     更小 actor sanity、或在 ref-load 路径上跳过完整 grad buffer。
-   - 一旦 online path 跑通，对比 quality 与 BF16 100×8 应缩到
-     <2pp Correct T1。
+3. **下一步 ranked**（codex 二审后调整，priority order）：
+
+   1. **`--target mlp` ablation（cheapest falsifier）**。Skip 64
+      self_attn + 240 linear_attn 模块，只量化 192 MLP。重跑同一
+      v2.3_env_n8 harness。如 quality 大部分恢复 → 问题在 attention
+      量化 scope，rotation 不是答案。如 quality 仍 -25%，问题确实在
+      MLP outliers，rotation 才是下一步。预估：5 min 产 ckpt + ~1h
+      eval。
+   2. **W8A16 weight-only ablation**：进一步隔离 activation 量化
+      的影响。需先确认 sglang 的 wNa16 加载路径在 Qwen3.5 多模态
+      entry 上工作。
+   3. **Online RTN path 完整 27B E2E**。卡在 actor init grad buffer
+      60.46 GiB OOM。Codex 指出非 colocated 模式单靠不够，actor 侧
+      内存必须降（更高 actor TP、或 update-only sanity 跳过 optimizer
+      / grad buffer）。这是 plumbing 验证而非 quality 改进。
+   4. **Online FP32 rotation per-step**（如 #1 表明 outliers 是主因）。
+      最高实现成本，目前 recorded results 最少支持。
 
 4. **OOM 排障**：不要反射性同时降 mem-fraction + max-running。先看
    message：
