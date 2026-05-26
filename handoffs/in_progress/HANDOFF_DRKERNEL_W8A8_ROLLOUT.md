@@ -297,8 +297,6 @@ N/A）：
 
 | Run | n | Compile T1 | Correct T1 | Fast@1.0 T1 | Fast@1.2 T1 |
 |---|---:|---:|---:|---:|---:|
-| W8A8 20×8 `c32/mr128` | 160 | 30.63% | 20.00% | 3.12% | 0.00% |
-| BF16 20×8 `c32/mr128` | 160 | 37.50% | 30.00% | 3.12% | 0.00% |
 | **W8A8 100×8 `c32/mr128`** | **800** | **23.75%** | **13.63%** | **5.75%** | **2.75%** |
 | **BF16 100×8 `c32/mr128`** | **800** | **33.00%** | **18.50%** | **7.62%** | **2.12%** |
 
@@ -306,8 +304,6 @@ N/A）：
 
 | Run | Eval elapsed | Mean resp len | Median resp len | Decode tok/s median | Decode tok/s mean | Weight memory | KV token budget | Max running |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| W8A8 20×8 `c32/mr128` | 11:00 | 5950.42 | 6639.50 | 314.66 | 384.56 | 14.22 GB | 970933 | 123 |
-| BF16 20×8 `c32/mr128` | 19:05 | 7371.49 | 7689.50 | 280.72 | 279.01 | 25.57 GB | 775780 | 98 |
 | **W8A8 100×8** | **1:00:29** | 7575.19 | 7630.00 | **370.55** | **408.17** | 14.22 GB | 970933 | 123 |
 | **BF16 100×8** | **1:44:21** | 8602.19 | 8716.00 | 251.25 | 283.77 | 25.57 GB | 775780 | 98 |
 
@@ -434,6 +430,112 @@ W8A8 Correct T3 `21.00%` ≡ `0.21000`。
 BF16，**~25% relative correct drop 稳定复现**。Quality 差距与 sglang
 调度配置无关。下一步看 `--target mlp` 能否缩差。
 
+### W8A8 v2.3_env_n8 三变体 ablation（2026-05-26，完整对比）
+
+接着 v2.3_env_n8 baseline-aligned 对照，跑完两组 ablation：
+**rotated all-linear** 和 **MLP-only**。所有 W8A8 变体 N=8、3 turns、
+`max-running=64`、`mem-fraction=0.9`、`DRKERNEL_EVAL_MAX_CONCURRENCY=0`、
+`PYTORCH_CUDA_ALLOC_CONF=` 空。
+
+**Headline 4-variant 表**：
+
+| variant | host | reward | n | **Correct T3** | Δ vs BF16 (rel) | eval wall | speedup |
+|---|---|---|---:|---:|---:|---:|---:|
+| BF16 baseline (`v2.3_env_n8`) | .22 | .40 | 800 | **27.88%** | — | 1:20:33 | — |
+| **W8A8 MLP-only** (`mlp`) | .64 | .39 | 800 | **25.13%** | **−9.9%** | 1:15:21 | **1.07×** |
+| W8A8 rotated all-linear | .22 | .40 | 800 | 23.00% | −17.5% | 1:06:28 | 1.21× |
+| W8A8 all-linear (unrotated) | .64 | .39 | 800 | 21.00% | −24.7% | 1:01:20 | **1.31×** |
+
+**Per-turn 全量对比**（denominator=800，fast@x in_all）：
+
+W8A8 MLP-only vs BF16：
+
+| metric | BF16 | W8A8 MLP-only | Δ pp | Δ rel |
+|---|---:|---:|---:|---:|
+| Compile T1 | 35.00% | 29.12% | −5.88 | −16.8% |
+| Compile T2 | 48.75% | 43.88% | −4.88 | −10.0% |
+| Compile T3 | 51.38% | 48.25% | −3.13 | −6.1% |
+| Correct T1 | 16.62% | 15.75% | −0.88 | −5.3% |
+| Correct T2 | 24.25% | 23.75% | −0.50 | −2.1% |
+| **Correct T3** | **27.88%** | **25.13%** | **−2.75** | **−9.9%** |
+| Fast@1.0 T1 | 6.00% | 7.38% | +1.38 | +22.9% |
+| Fast@1.0 T2 | 7.62% | 10.38% | +2.75 | +36.1% |
+| Fast@1.0 T3 | 9.00% | 11.12% | +2.12 | +23.6% |
+| Fast@1.2 T1 | 1.00% | 3.62% | +2.62 | +262.5% |
+| Fast@1.2 T2 | 1.00% | 5.25% | +4.25 | +425.0% |
+| Fast@1.2 T3 | 1.38% | 7.00% | +5.63 | +409.1% |
+
+W8A8 rotated all-linear vs BF16：
+
+| metric | BF16 | W8A8 rotated | Δ pp | Δ rel |
+|---|---:|---:|---:|---:|
+| Compile T1 | 35.00% | 27.50% | −7.50 | −21.4% |
+| Compile T2 | 48.75% | 41.12% | −7.62 | −15.6% |
+| Compile T3 | 51.38% | 45.88% | −5.50 | −10.7% |
+| Correct T1 | 16.62% | 13.88% | −2.75 | −16.5% |
+| Correct T2 | 24.25% | 20.50% | −3.75 | −15.5% |
+| **Correct T3** | **27.88%** | **23.00%** | **−4.88** | **−17.5%** |
+| Fast@1.0 T1 | 6.00% | 5.75% | −0.25 | −4.2% |
+| Fast@1.0 T2 | 7.62% | 7.12% | −0.50 | −6.6% |
+| Fast@1.0 T3 | 9.00% | 8.00% | −1.00 | −11.1% |
+| Fast@1.2 T1 | 1.00% | 0.75% | −0.25 | −25.0% |
+| Fast@1.2 T2 | 1.00% | 0.88% | −0.12 | −12.5% |
+| Fast@1.2 T3 | 1.38% | 1.00% | −0.38 | −27.3% |
+
+**Codex thresholds** (from 2026-05-26 intermediate review, anchor BF16
+Correct T3 = 27.88%)：
+
+| claim | accept if | reject if | this run |
+|---|---|---|---|
+| Use rotation | ≥25.0% Correct T3 **AND** beats unrotated W8A8 by ≥+3pp | <23.0% | **FAIL** (23.0%, +2.0pp) |
+| Use MLP-only | ≥25.0% **AND** wall ≤70 min | <24.0% **OR** speedup <1.10× | **FAIL on wall** (25.13% ✓ but 75:21 / 1.07× ✗) |
+| W8A8 acceptable for RL rollout | best variant ≥201/800 Correct T3 | best <192/800 | **MLP-only = 201/800 == bar exactly** |
+
+**关键发现**：
+
+1. **Attention 量化是 quality 下降的主要原因**。把 64 个 self_attn +
+   240 个 linear_attn 留 BF16（MLP-only），Correct T3 从 21.00%
+   恢复到 25.13% —— 关闭了 60% 的 6.9pp gap（all-linear → MLP-only
+   recovers 4.13pp of 6.88pp drop）。
+   - 这反驳了"差距是 MLP 权重 outliers，rotation 是答案"的早期猜测。
+   - 真相是 **attention（特别是 hybrid mamba-style linear_attn）的
+     量化误差**主导了 RTN W8A8 的 quality 损失。
+
+2. **Rotation 的净效果几乎被 BF16 storage tax 吃完**：
+   - 未旋转 W8A8: Correct T3 = 21.00%
+   - 旋转 W8A8: Correct T3 = 23.00%（+2.00pp）
+   - 但 rotated BF16 baseline 本身就比未旋转 BF16 低 ~4pp（来自
+     `(1+weight)` norm fusion 的 BF16 storage drift；详见
+     `HADAMARD_ROTATION_ROOT_CAUSE.md`）。
+   - 净 quality 与 unrotated_W8A8 几乎相当。要拿到 rotation 真实
+     收益，需要 **FP32-master rotation**（不存 transformed BF16
+     中间态），即 online weight-sync 时在 FP32 tmp 上做 rotate+RTN。
+     那是目前没跑通的硬版本。
+
+3. **Pareto frontier 现状**（v2.3_env_n8 同一 prompt）：
+
+   | 选择 | quality | speedup | 适合 |
+   |---|---:|---:|---|
+   | BF16 (无量化) | 27.88% | 1.00× | quality 优先 |
+   | W8A8 MLP-only | 25.13% (−9.9% rel) | 1.07× | quality + 小幅 speedup |
+   | W8A8 rotated all-linear | 23.00% (−17.5% rel) | 1.21× | quality 与 speedup 都中间 (dominated by MLP-only?) |
+   | W8A8 all-linear (unrotated) | 21.00% (−24.7% rel) | 1.31× | 纯 speedup，quality 不可接受 |
+
+   - MLP-only 在 quality 上几乎压垮 rotated（+2.13pp），但 wall 慢
+     9 min（75:21 vs 66:28）。两个都不严格 dominate 对方。
+   - 真正的 dominant 解需要 FP32-master rotation + MLP-only 组合，
+     未验证。
+
+4. **Fast@1.2 in_all 在 MLP-only 也是高的**（T3 7.00% vs BF16 1.38%
+   = +409% rel；+45 个 samples）。但 MLP-only Correct T3 是 25.13% =
+   201/800，Fast@1.2 T3 是 7.00% = 56/800 —— 28% 的 correct kernels
+   都达到 1.2× speedup。BF16 同口径：1.38% = 11/800，11/223 = 4.9%。
+   So W8A8（MLP-only 或 unrot all-linear）correct-conditional speedup
+   distribution 是真实地更快。说明 W8A8 / rotation / RTN 引入的扰动
+   倾向于把生成出来的 kernel 推向更简单/更快的 launch config。Codex
+   review 建议过 paired prompt-id 分析能彻底确认 selection vs
+   regime-change；本 handoff 仅记录现象，未做更深 drill。
+
 ### Why W8A8 still not at 45-min expectation
 
 - 修正后的 100×8 high-concurrency run 是 800 responses，mean 7575
@@ -558,12 +660,14 @@ full E2E：
 - ☑ 100×8 full smoke（低并发）：`score=0.1875`，`wall=4:29:20`，no garbage
 - ☑ W8A8 100×8 高并发 (`c32/mr128`)：`score=0.13625`，`eval=1:00:29`，no garbage
 - ☑ BF16 100×8 高并发对照：`score=0.185`，`eval=1:44:21` —— **W8A8 快 1.73× 同 host**
-- ☑ W8A8 100×8 v2.3_env_n8（baseline-aligned，跨 host）：`score=0.21000`，`eval=1:01:20` vs saved BF16 `0.27875 / 1:20:33` —— **W8A8 快 1.31×，−24.66% rel correct**
-- ☑ Quality drop ~25% relative 在两套配置下稳定复现 —— 与 sglang 调度无关
-- ☑ 32 个 W8A8/quant/eval/throttle/context-cap 测试通过（含 codex 二审后修复的 `test_sglang_context_cap.py`）
-- ☐ **`--target mlp` ablation**：cheapest falsifier。skip 64 self_attn + 240 linear_attn，看 quality 是否大部分恢复
+- ☑ W8A8 100×8 v2.3_env_n8（baseline-aligned，all-linear unrotated）：`score=0.21000`，`eval=1:01:20`，**1.31× faster vs BF16，−24.7% rel correct**
+- ☑ **W8A8 100×8 v2.3_env_n8 ablation：MLP-only**：`score=0.25125`，`eval=1:15:21`，**1.07× faster vs BF16，−9.9% rel correct**（quality 卡 25.0% 阈值正好通过，但 wall 卡 70min 阈值失败）
+- ☑ **W8A8 100×8 v2.3_env_n8 ablation：rotated all-linear**：`score=0.23000`，`eval=1:06:28`，1.21× faster vs BF16，−17.5% rel correct（vs unrotated W8A8 仅 +2.0pp，failing codex 的 +3pp accept 阈值）
+- ☑ 结论：**Attention 量化是 quality 主因**，rotation 是次要因素（且被 BF16 storage tax 吃掉大部分）
+- ☑ 32 个 W8A8/quant/eval/throttle/context-cap 测试通过
 - ☐ Online RTN path 完整 27B E2E：actor init OOM 在 grad buffer 60.46 GiB alloc，未到 weight push
-- ☐ Quality 缩差实测（rotation 优先级低于 `--target mlp` ablation）
+- ☐ FP32-master rotation（不存 transformed BF16 中间态）在 online weight-sync 通路实施 —— 这是唯一未跑过、可能让 rotation 真正缩差的方案，但实现成本最高
+- ☐ Paired prompt-id drill 验证 Fast@1.2 是 selection-effect vs kernel-launch-regime-change（codex review 建议）
 
 ## Artifacts inventory
 
@@ -581,8 +685,13 @@ full E2E：
 | `slime/utils/eval_config.py` | `max_prompt_len` / `max_context_len` per-dataset 字段 |
 | `slime/utils/data.py` | 放宽 processor list-prompt assertion |
 | `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN/` | **broken**，不要用 |
-| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/` | **推荐 W8A8 ckpt**，通过 validator |
-| `checkpoints/Qwen3.6-27B/20260525_*_w8a8-rtn-local-*` | W8A8 smoke runs（已 rsync 到 dev_csl） |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local/` | W8A8 **all-linear unrotated** ckpt（max speedup, quality 不可接受） |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-W8A8-RTN-local-mlp/` | **W8A8 MLP-only ckpt（推荐 for RL rollout）**，attention 保 BF16 |
+| `/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-rotated-mm-w8a8-rtn-local/` | W8A8 all-linear **rotated** ckpt（rotation 的 BF16 storage tax 吃掉收益） |
+| `checkpoints/Qwen3.6-27B/20260525_*_w8a8-rtn-local-*` | W8A8 smoke runs |
+| `checkpoints/Qwen3.6-27B/20260526_*_w8a8-rtn-local-v2_3_env_n8` | W8A8 all-linear unrot v2.3_env_n8 |
+| `checkpoints/Qwen3.6-27B/20260526_*_w8a8-rtn-local-mlp-v2_3_env_n8-r3` | W8A8 MLP-only v2.3_env_n8 |
+| `checkpoints/Qwen3.6-27B/20260526_*_w8a8-rtn-local-rotated-v2_3_env_n8` | W8A8 rotated all-linear v2.3_env_n8 |
 | `checkpoints/Qwen3.6-27B/20260525_*_bf16-c32-mr128-*` | BF16 高并发对照 runs |
 
 ## Next step recipe
@@ -606,23 +715,29 @@ full E2E：
    Pass = `eval_rollout_single_dataset first sample` 行 + Ray job
    `succeeded`，5 min 内。
 
-3. **下一步 ranked**（codex 二审后调整，priority order）：
+3. **下一步 ranked**（2026-05-26 v2.3_env_n8 三变体 ablation 后更新）：
 
-   1. **`--target mlp` ablation（cheapest falsifier）**。Skip 64
-      self_attn + 240 linear_attn 模块，只量化 192 MLP。重跑同一
-      v2.3_env_n8 harness。如 quality 大部分恢复 → 问题在 attention
-      量化 scope，rotation 不是答案。如 quality 仍 -25%，问题确实在
-      MLP outliers，rotation 才是下一步。预估：5 min 产 ckpt + ~1h
-      eval。
-   2. **W8A16 weight-only ablation**：进一步隔离 activation 量化
-      的影响。需先确认 sglang 的 wNa16 加载路径在 Qwen3.5 多模态
-      entry 上工作。
-   3. **Online RTN path 完整 27B E2E**。卡在 actor init grad buffer
-      60.46 GiB OOM。Codex 指出非 colocated 模式单靠不够，actor 侧
-      内存必须降（更高 actor TP、或 update-only sanity 跳过 optimizer
-      / grad buffer）。这是 plumbing 验证而非 quality 改进。
-   4. **Online FP32 rotation per-step**（如 #1 表明 outliers 是主因）。
-      最高实现成本，目前 recorded results 最少支持。
+   1. **如果 quality 是硬约束（RL rollout 训练用）**：选 **MLP-only**
+      （Correct T3 25.13% 卡 codex 25.0% 阈值正好通过，1.07× 微小
+      speedup 不达 1.10×，但 ckpt 已就绪，可以直接接训练）。
+      Ckpt: `/nfs/.../Qwen3.6-27B-W8A8-RTN-local-mlp/`。
+   2. **如果 speedup 是硬约束（pure eval throughput）**：选
+      **all-linear unrotated W8A8**（1.31× faster，quality 不可接受 for
+      RL，但 eval-only / inference benchmark 可用）。
+   3. **Online RTN E2E 跑通**（plumbing 关键路径，与 quality 改进解耦）：
+      卡在 actor init grad buffer 60.46 GiB OOM。需要 actor 侧降内存
+      （更高 actor TP / update-only sanity 跳过 grad buffer）。
+   4. **FP32-master rotation in online weight-sync**（唯一未跑过、
+      可能让 rotation 真正缩差的路径）：在 weight-sync 时把 BF16 actor
+      tensor 升 FP32，做 rotate+RTN，避开 transformed BF16 storage tax。
+      最高实现成本；目前 W8A8+rotation 实测只 +2pp 没有 dominantly 更优
+      的方案，需要先解 #3。
+   5. **Paired prompt-id 分析 Fast@1.2**：codex 指出 W8A8 (MLP-only +
+      unrot all-linear) 的 Fast@1.2 大幅高于 BF16 是真实信号（不只是
+      tiny-denominator noise）。drill 一下能确认是 W8A8 让 model
+      pick simpler/faster kernel launch configs，还是 selection 效应。
+   6. **W8A16 weight-only ablation**：隔离 activation 量化的影响。
+      需先确认 sglang 的 wNa16 加载路径在 Qwen3.5 多模态 entry 上工作。
 
 4. **OOM 排障**：不要反射性同时降 mem-fraction + max-running。先看
    message：
