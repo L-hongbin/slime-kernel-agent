@@ -368,6 +368,39 @@ run。Settings 与 BF16 baseline 完全对齐 —— `max-running=64`、
 Score 已 cross-check：W8A8 reward sum `168/800=0.21`，BF16 `223/800=0.27875`。
 两个 run 都 Job succeeded，无 Error/Traceback/OOM。
 
+**Per-turn 精度对比**（denominator = n_total = 800；fast@x 是 **in_all**
+口径，与 `HANDOFF_DRKERNEL_EVAL_ACCURACY.md` 一致）：
+
+| metric | BF16 | W8A8 | Δ pp | Δ rel |
+|---|---:|---:|---:|---:|
+| Compile T1 | 35.00% | 24.88% | −10.12pp | **−28.9%** |
+| Compile T2 | 48.75% | 40.38% | −8.38pp | −17.2% |
+| Compile T3 | 51.38% | 42.62% | −8.75pp | −17.0% |
+| Correct T1 | 16.62% | 13.12% | −3.50pp | −21.1% |
+| Correct T2 | 24.25% | 20.88% | −3.38pp | −13.9% |
+| **Correct T3** | **27.88%** | **21.00%** | **−6.88pp** | **−24.7%** |
+| Fast@1.0 T1 | 6.00% | 6.25% | +0.25pp | +4.2% |
+| Fast@1.0 T2 | 7.62% | 9.00% | +1.38pp | +18.0% |
+| Fast@1.0 T3 | 9.00% | 8.00% | −1.00pp | −11.1% |
+| Fast@1.2 T1 | 1.00% | 2.62% | +1.62pp | +162.5% |
+| Fast@1.2 T2 | 1.00% | 4.12% | +3.12pp | +312.5% |
+| Fast@1.2 T3 | 1.38% | 4.62% | +3.25pp | **+236.4%** |
+
+Cross-check: BF16 Correct T3 `27.88%` ≡ reported `eval/kernelbench_level1=0.27875`；
+W8A8 Correct T3 `21.00%` ≡ `0.21000`。
+
+**解读**：
+- **Compile T1 掉得最大（−28.9% rel）** —— 第一轮原始输出对量化最敏感。
+  T2/T3 因为 KernelGym error feedback 让 W8A8 仍能 iterate-and-fix，差距
+  缩到 −17%。
+- **Correct T3 仍 −24.7%** —— 多轮反馈无法关上 quality 差距。
+- **Fast@1.0 in_all 基本打平** —— W8A8 一旦给出 correct kernel，speed-up
+  分布与 BF16 相当。
+- **Fast@1.2 in_all 反向 +236% rel at T3**（W8A8 37 个 vs BF16 11 个）。
+  绝对数小，但持续在 T1/T2/T3 都正向。可能解释：W8A8 correct 数少，但
+  能 correct 的题倾向于更简单/更快的 kernel（selection 效应）。
+  样本量太小不能作为强结论，但值得记录。
+
 **速度差异分解**（codex 从 `Decode batch` 行解析）：
 
 | running-req | BF16 median (tok/s) | W8A8 median (tok/s) | W8A8/BF16 |
