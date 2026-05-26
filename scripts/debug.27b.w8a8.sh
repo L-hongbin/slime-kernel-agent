@@ -30,6 +30,12 @@ DRKERNEL_EVAL_MAX_CONCURRENCY=${DRKERNEL_EVAL_MAX_CONCURRENCY:-16}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
 SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.9}
 SGLANG_DECODE_LOG_INTERVAL=${SGLANG_DECODE_LOG_INTERVAL:-400}
+# Optional. Set to "extra_buffer" to enable overlap scheduling + radix cache
+# for hybrid mamba models; default sglang "auto" -> "no_buffer" disables
+# overlap scheduling whenever radix cache is on. The extra_buffer mode
+# allocates a per-request ping-pong track buffer, so lower
+# SGLANG_MEM_FRACTION_STATIC to ~0.85 to leave room.
+SGLANG_MAMBA_SCHEDULER_STRATEGY=${SGLANG_MAMBA_SCHEDULER_STRATEGY:-}
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
 EXPT_LABEL=${EXPT_LABEL:-w8a8-rtn}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
@@ -188,6 +194,9 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
    --sglang-decode-log-interval ${SGLANG_DECODE_LOG_INTERVAL}
 )
+if [ -n "${SGLANG_MAMBA_SCHEDULER_STRATEGY}" ]; then
+   SGLANG_ARGS+=(--sglang-mamba-scheduler-strategy ${SGLANG_MAMBA_SCHEDULER_STRATEGY})
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0

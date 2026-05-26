@@ -142,9 +142,49 @@ shape but smaller absolute numbers).
    把 quality 推到 BF16 within 1.5pp，但 wall 1:17:23 vs BF16 1:20:33 =
    只快 3 分钟。Unrot all-linear 把 wall 推到 1:01:20（快 19 分钟），
    但 quality 掉 24.7%。中间没有 sweet spot。
-   - 推断：本 hybrid model 的 decode 成本被 mamba layers（240 linear_attn
-     模块，48 层）主导。MLP-only 把 mamba 留 BF16 → 失去 quant 加速；
-     rotated 改进的是 mamba quantization quality 而不是 mamba 加速。
+
+   **为什么 MLP-only 只快 1.07× — weight-share 分析（用户纠正后的版本）**
+
+   用户 push back 的早先错误说法：先前归因是"decode 成本被 mamba layers
+   主导，MLP-only 把 mamba 留 BF16 → 失去 quant 加速"。这个错误。
+   按真实 config + safetensors 测出的 Linear weight 占比：
+
+   | bank | layers | per-layer params | total (B) | BF16 GB | share |
+   |---|---:|---:|---:|---:|---:|
+   | MLP（gate+up+down） | 64 | 267.4M | 17.11 | 34.2 | **70.4%** |
+   | linear_attn（5 projs + conv1d） | 48 | 115.8M | 5.56 | 11.1 | 22.9% |
+   | self_attn（q+k+v+o，GQA num_kv=4） | 16 | 104.9M | 1.68 | 3.4 | 6.9% |
+
+   MLP 占总 Linear 字节的 70%。**MLP-only 已经把"权重带宽"的 70% 包了**。
+   如果 decode 真是 Linear-matmul 带宽 bound、INT8 给 ~2× 带宽，
+   Amdahl 上限 = 1/(0.296 + 0.704/2) ≈ **1.54×**。
+   但实测只 1.07×。差距 1.54×→1.07× 才是要解释的事，**不是 mamba "重"**。
+
+   推断（codex review 中，可能修正）：
+   - **MLP GEMM 在我们这个 batch 下不是带宽 bound 而是 compute bound**。
+     max-running=64 + n=8 → 每 step ~16–32 active decoded tokens。
+     MLP shapes（5120 ↔ 17408）在 batch ≥ ~16 时 BF16 tensor core 已经
+     算力饱和。INT8 主要省带宽，省不了算力 → MLP-only 的 wall 收益
+     远小于字节节省比例。
+   - **Mamba SSM scan 用 fp32 跑，与权重量化完全无关**。
+     `mamba_ssm_dtype: float32`。48 linear_attn 层的耗时主体是 state-space
+     scan，不是 projection matmul；scan 不读量化权重，W8A8 完全不影响。
+   - **per-token dynamic activation quant 额外开销**。
+     producer config `input_activations: {strategy: token, dynamic: true}`：
+     每个 MLP forward 多一次 per-token absmax + quant + dequant 算子。
+     在我们 batch 下会吃掉 INT8 GEMM 的一部分收益。
+   - **heterogeneous backend 的 kernel launch overhead**。
+     MLP-only 让每层 int8 GEMM（MLP）与 bf16 GEMM（attn/mamba）交替。
+     kernel launch 数量翻倍，没有跨层 fusion。
+   - **非 matmul 部分 (~30–40%)**：RMSNorm、rotary、softmax attn（16 层）、
+     65K ctx 的 KV cache 读取、采样、scheduler tick。Weight quant 完全
+     touch 不到。即便 100% 量化也只能压到 ~1.4× —— 这与 all-linear 实测
+     1.31× 对得上。
+
+   推论：MLP-only → all-linear 多出来的 +24% 速度（1.07→1.31），主要来
+   自 quantize 掉 linear_attn + self_attn 的 matmul（不是 mamba SSM scan），
+   并不是"linear_attn 本身字节大"。**MLP-only 只 1.07× 的真正原因是
+   compute-bound + fp32 SSM scan + activation quant overhead + 非 matmul 余项**。
 
 5. **Fast@1.2 in_all 在 rotated 变体里几乎消失**：rotated MLP-only T3
    1.62%、rotated all-linear T3 1.00%、rotated non_linear_attn T3 5.62%
