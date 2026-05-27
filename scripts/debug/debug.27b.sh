@@ -152,6 +152,13 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC:-0.9}
    --sglang-decode-log-interval 400
 )
+# Optional mamba sizing/scheduling knobs, mirror scripts/debug.27b.w8a8.sh.
+if [ -n "${SGLANG_MAMBA_SCHEDULER_STRATEGY:-}" ]; then
+   SGLANG_ARGS+=(--sglang-mamba-scheduler-strategy ${SGLANG_MAMBA_SCHEDULER_STRATEGY})
+fi
+if [ -n "${SGLANG_MAMBA_FULL_MEMORY_RATIO:-}" ]; then
+   SGLANG_ARGS+=(--sglang-mamba-full-memory-ratio ${SGLANG_MAMBA_FULL_MEMORY_RATIO})
+fi
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1

@@ -36,6 +36,10 @@ SGLANG_DECODE_LOG_INTERVAL=${SGLANG_DECODE_LOG_INTERVAL:-400}
 # allocates a per-request ping-pong track buffer, so lower
 # SGLANG_MEM_FRACTION_STATIC to ~0.85 to leave room.
 SGLANG_MAMBA_SCHEDULER_STRATEGY=${SGLANG_MAMBA_SCHEDULER_STRATEGY:-}
+# Mamba full memory ratio: default 0.9 in sglang; observed mamba_usage peaks
+# ~0.30 in our workload so 0.5 reclaims ~0.65 GB/rank to the KV pool with
+# safety margin. Empty = sglang default.
+SGLANG_MAMBA_FULL_MEMORY_RATIO=${SGLANG_MAMBA_FULL_MEMORY_RATIO:-}
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
 EXPT_LABEL=${EXPT_LABEL:-w8a8-rtn}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
@@ -196,6 +200,9 @@ SGLANG_ARGS=(
 )
 if [ -n "${SGLANG_MAMBA_SCHEDULER_STRATEGY}" ]; then
    SGLANG_ARGS+=(--sglang-mamba-scheduler-strategy ${SGLANG_MAMBA_SCHEDULER_STRATEGY})
+fi
+if [ -n "${SGLANG_MAMBA_FULL_MEMORY_RATIO}" ]; then
+   SGLANG_ARGS+=(--sglang-mamba-full-memory-ratio ${SGLANG_MAMBA_FULL_MEMORY_RATIO})
 fi
 
 MISC_ARGS=(
