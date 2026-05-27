@@ -168,13 +168,19 @@ MISC_ARGS=(
 # DRKERNEL_SMOKE_MAX_PROMPTS caps eval to first N prompts in eval_rollout_single_dataset.
 # Unset (or set to 0) for full validation-set eval.
 DRKERNEL_SMOKE_MAX_PROMPTS=${DRKERNEL_SMOKE_MAX_PROMPTS:-100}
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True avoids the fragmentation OOM
+# we hit on sglang 0.5.12 / torch 2.11+cu129 — the alloc reserved ~10 GiB
+# "but unallocated" and refused to satisfy a contiguous 7 GiB request.
+# Mirrors the W8A8 launcher.
+PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
     \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\",
-    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\"
+    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\",
+    \"PYTORCH_CUDA_ALLOC_CONF\": \"${PYTORCH_CUDA_ALLOC_CONF_VALUE}\"
   }
 }"
 
