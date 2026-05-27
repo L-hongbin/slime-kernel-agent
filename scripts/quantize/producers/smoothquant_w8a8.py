@@ -364,46 +364,54 @@ def main() -> None:
             shutil.copy2(src, args.bf16_output_path)
 
     # ------------------------------------------------------------------
-    # Stage 2: RTN-INT8 on top of the smoothed weights
+    # Stage 2: RTN-INT8 on top of the smoothed BF16 ckpt
+    #
+    # Important: we DON'T use llmcompressor's QuantizationModifier here.
+    # On 2026-05-27 we found that the two-stage oneshot pattern
+    # (SmoothQuant -> save BF16 -> QuantizationModifier on in-memory model)
+    # silently produces a BROKEN W8A8 ckpt: int8 weights saturated at
+    # ±127 (std ~126 instead of healthy ~30), scales saved as bf16
+    # instead of fp32, model generates multilingual token salad.
+    # Sglang loads it fine, no exception is raised, no warning emitted.
+    #
+    # Instead we call our proven pure-PyTorch RTN writer on the saved
+    # smoothed-BF16 ckpt. That path is unit-tested
+    # (tests/utils/test_quantize_w8a8_rtn_local.py) and ships with a
+    # built-in saturation/scale-shape validator.
     # ------------------------------------------------------------------
-    from llmcompressor.modifiers.quantization import QuantizationModifier
+    # Free GPU memory before invoking the RTN writer (which reads
+    # safetensors shard-by-shard from disk into CPU and writes new shards).
+    import gc
 
-    quant_targets, quant_ignore = quant_targets_and_ignore(args.target)
+    del model
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    quant_recipe = [
-        QuantizationModifier(
-            targets=quant_targets,
-            scheme="W8A8",
-            ignore=quant_ignore,
-        )
-    ]
+    from scripts.quantize.producers.rtn_w8a8 import quantize_checkpoint
+
     print(
-        f"[smoothquant] stage 2: W8A8 RTN quant on target={args.target} "
-        f"(targets={quant_targets!r}, +{len(quant_ignore) - len(IGNORE_PATTERNS)} target-scope ignores)",
+        f"[smoothquant] stage 2: pure-PyTorch RTN on smoothed-BF16 -> W8A8 "
+        f"(target={args.target}, source={args.bf16_output_path})",
         flush=True,
     )
-
-    oneshot(
-        model=model,
-        processor=tokenizer,
-        dataset=calibration_ds,
-        recipe=quant_recipe,
-        max_seq_length=args.max_seq_length,
-        num_calibration_samples=len(calibration_texts),
-        output_dir=args.w8a8_output_path,
+    quantize_checkpoint(
+        model_path=args.bf16_output_path,
+        output_path=args.w8a8_output_path,
+        target=args.target,
+        force=True,
     )
 
-    print(f"[smoothquant] stage 2 done, saving W8A8 to {args.w8a8_output_path}", flush=True)
-    model.save_pretrained(args.w8a8_output_path, save_compressed=True)
-    tokenizer.save_pretrained(args.w8a8_output_path)
-    for fname in (
-        "chat_template.jinja",
-        "preprocessor_config.json",
-        "video_preprocessor_config.json",
-    ):
-        src = os.path.join(args.model_path, fname)
-        if os.path.exists(src):
-            shutil.copy2(src, args.w8a8_output_path)
+    # Final post-save validation — guard against silent corruption.
+    from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
+
+    check_w8a8_checkpoint(
+        args.w8a8_output_path,
+        reference_checkpoint=args.bf16_output_path,
+        max_tensors=32,
+        max_saturated_frac=0.20,
+        max_rel_l2=0.10,
+    )
 
     print("[smoothquant] all done.", flush=True)
     print(f"  smoothed BF16 -> {args.bf16_output_path}", flush=True)
