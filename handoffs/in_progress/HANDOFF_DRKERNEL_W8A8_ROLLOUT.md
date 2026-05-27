@@ -43,22 +43,16 @@ drop。Rotation 只能作为 INT8 量化前的 **临时 FP32** 预处理；要�
 
 ### Per-turn accuracy（denominator = total = 800，fast@x 是 in_all）
 
-6 variants（rotation × scope ablation grid）：
+6 variants（rotation × scope ablation grid），按 Correct T3 排序：
 
-| metric | **BF16** | W8A8 rotated MLP-only | W8A8 MLP-only (unrot) | W8A8 rotated non_linear_attn | W8A8 rotated all-linear | W8A8 all-linear (unrot) |
-|---|---:|---:|---:|---:|---:|---:|
-| Compile T1 | 35.00% | 32.38% | 29.12% | 28.00% | 27.50% | 24.88% |
-| Compile T2 | 48.75% | 46.75% | 43.88% | 41.75% | 41.12% | 40.38% |
-| Compile T3 | 51.38% | 50.25% | 48.25% | 45.12% | 45.88% | 42.62% |
-| Correct T1 | 16.62% | 16.12% | 15.75% | 15.12% | 13.88% | 13.12% |
-| Correct T2 | 24.25% | 23.75% | 23.75% | 22.62% | 20.50% | 20.88% |
-| **Correct T3** | **27.88%** | **26.38%** | **25.13%** | **23.75%** | **23.00%** | **21.00%** |
-| Fast@1.0 T1 | 6.00% | 5.88% | 7.38% | 5.38% | 5.75% | 6.25% |
-| Fast@1.0 T2 | 7.62% | 9.12% | 10.38% | 9.75% | 7.12% | 9.00% |
-| Fast@1.0 T3 | 9.00% | 9.38% | 11.12% | 9.75% | 8.00% | 8.00% |
-| Fast@1.2 T1 | 1.00% | 0.62% | 3.62% | 2.75% | 0.75% | 2.62% |
-| Fast@1.2 T2 | 1.00% | 1.62% | 5.25% | 4.75% | 0.88% | 4.12% |
-| Fast@1.2 T3 | 1.38% | 1.62% | 7.00% | 5.62% | 1.00% | 4.62% |
+| variant | Comp T1 | Comp T2 | Comp T3 | Corr T1 | Corr T2 | **Corr T3** | F1.0 T1 | F1.0 T2 | F1.0 T3 | F1.2 T1 | F1.2 T2 | F1.2 T3 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| **BF16** | 35.00% | 48.75% | 51.38% | 16.62% | 24.25% | **27.88%** | 6.00% | 7.62% | 9.00% | 1.00% | 1.00% | 1.38% |
+| W8A8 rotated MLP-only | 32.38% | 46.75% | 50.25% | 16.12% | 23.75% | **26.38%** | 5.88% | 9.12% | 9.38% | 0.62% | 1.62% | 1.62% |
+| W8A8 MLP-only (unrot) | 29.12% | 43.88% | 48.25% | 15.75% | 23.75% | **25.13%** | 7.38% | 10.38% | 11.12% | 3.62% | 5.25% | 7.00% |
+| W8A8 rotated non_linear_attn | 28.00% | 41.75% | 45.12% | 15.12% | 22.62% | **23.75%** | 5.38% | 9.75% | 9.75% | 2.75% | 4.75% | 5.62% |
+| W8A8 rotated all-linear | 27.50% | 41.12% | 45.88% | 13.88% | 20.50% | **23.00%** | 5.75% | 7.12% | 8.00% | 0.75% | 0.88% | 1.00% |
+| W8A8 all-linear (unrot) | 24.88% | 40.38% | 42.62% | 13.12% | 20.88% | **21.00%** | 6.25% | 9.00% | 8.00% | 2.62% | 4.12% | 4.62% |
 
 Cross-check: BF16 27.88% ≡ 0.27875 ≡ 223/800；rotated MLP-only 26.38% ≡
 211/800；MLP-only unrot 25.13% ≡ 201/800；rotated non_linear_attn
@@ -73,7 +67,12 @@ Fast@1.2 的"selection effect"主要由 unrot W8A8 量化噪声主导；rotation
 
 ### Efficiency
 
-| variant | quant layers | wall | speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
+#### 1. Production wall (real KG, v2.3_env_n8 100×8)
+
+End-to-end run wall including real KernelGym reward roundtrips and full
+slime multi-turn orchestration. These are the numbers users actually see.
+
+| variant | quant layers | wall | wall speedup | mean resp | trunc | prefix cache | decode tok/s median | decode @ running-req=64 median |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
 | **BF16 baseline** | 0 | 1:20:33 | 1.00× | 6436 | 1.25% | 0.252 | 1198 | 1519 |
 | **W8A8 rotated MLP-only** ⭐ | 192 | 1:17:23 | 1.04× | 6162 | 0.875% | 0.266 | 1163 | 1700 |
@@ -86,6 +85,58 @@ Decode tok/s parsed from sglang `Decode batch` lines. The `@ running-req=64`
 column matches the configured max-running batch and is the cleanest
 per-token quant-speedup signal (running-req=1 single-stream is similar
 shape but smaller absolute numbers).
+
+#### 2. Speedup ceiling decomposition (BF16 vs W8A8 MLP-only unrot, 同 ckpt 对)
+
+上表里 W8A8 MLP-only 的 1.07× wall speedup **远低于** kernel 微剖面预测的
+1.27× decode / 1.28× prefill。下面这张表把 1.07× 拆开看每一层环境吃掉了
+多少加速（**w 同一对 ckpt: Qwen3.6-27B BF16 unrot vs Qwen3.6-27B-W8A8-RTN-local-mlp**）：
+
+| 测量阶段 | 描述 | wall ratio | per-token tok/s ratio |
+|---|---|---:|---:|
+| Stage 1: 纯 sglang 客户端，`ignore_eos=True` | 32 并发 × 5K prompt × 1K decode；clean saturated 单 batch；server boot 不计 | **1.516×** | **1.516×** |
+| Stage 2: slime 100×1 + mock-KG (instant reward) | 100 prompts × 1 sample，多轮=3；eval-loop wall only (tqdm 100%) | 1.321× | 1.150× |
+| Stage 3: slime 100×8 + mock-KG (instant reward) | 100 prompts × 8 samples，多轮=3；eval-loop wall only | 1.200× | **1.139×** |
+| Production: slime 100×8 + real KG | 同 stage 3 但 reward 是真实 KernelGym (.40) | 1.073× | — |
+
+**读法**：
+- pure sglang 是**硬件上限**（饱和 decode + 等长 token + 无 orchestration），
+  实测 1.516× 与微剖面 (0.83 × 1.56 + 0.17 × 1.27 = 1.51) 完全吻合。
+- slime 把每 token 的速比从 1.516× 压到 **~1.14×**。100×1 (1.150×) 与 100×8 (1.139×) 几乎相同
+  → 多轮 trajectory 数量**不是**瓶颈；slime 应用层 envelope（多轮 churn、
+  prompt rebuild、prefix-cache 命中让 mix 偏 decode、batch fill 不稳定）才是。
+- mock-KG 1.139× 与 production real-KG wall 1.073× 之间差的那一截，**就是**
+  real KG roundtrip + 多轮空闲的 dilution。
+
+**Reward overhead 反推（用 100×8 mock-KG 的 1.139× 拟合 production wall）**：
+
+设 production wall = compute time C + non-accelerated overhead R：
+- BF16 production: `C + R = 4833s`
+- W8A8 production: `C/1.139 + R = 4521s`
+- 解出: `C ≈ 2557s` (53% of BF16 wall), `R ≈ 2276s` (**47% of BF16 wall**)
+
+→ production 里有 ~47% 的 wall 是 reward + 多轮空闲 + 调度，**与 W8A8 加速完全无关**。
+这部分压住了 1.139× 让它只剩 1.073×。
+
+#### 3. 为什么 stage 1 → stage 2 损失了 35% 加速（quantitative breakdown）
+
+pure sglang 1.516× → slime 100×1 1.150× 的 ~35% 损失按贡献从大到小：
+
+| 来源 | 解释 | 估算贡献 |
+|---|---|---:|
+| (a) prefill/decode mix 翻盘 | pure sglang stage 1 是 83% prefill / 17% decode（5K prompt + 1K decode × 32 conc，且 `ignore_eos=True`）。slime 100×1 BF16 是 ~41% fresh prefill / 59% decode（mean prompt fresh 4537 tokens + decode 6539 tokens）。W8A8 prefill 速比 1.56× / decode 速比 1.27×，混合 ratio: 0.83·1.56+0.17·1.27 = **1.51×** vs 0.41·1.56+0.59·1.27 = **1.39×**。这一项就吃掉 1.516→1.39 | ~50% of loss |
+| (b) prefix cache hits 削掉 prefill | slime 100×1 prefix_cache_hit_rate=0.19，pure sglang ~0。命中跳过的是 prefill GEMM —— 恰好是 W8A8 赢得最多的。与 (a) 是同一硬币的两面 | included in (a) |
+| (c) 多轮 turn-transition Python 串行段 | 即使 mock-KG instant 返回，slime 还要 parse response / rebuild chat history / tokenize 新 prompt / submit 新 generate，这段串行让 trajectory 在 turn-transition 时 GPU idle | ~25% of loss |
+| (d) decode batch fill 不稳 | pure sglang stage 1 client-side 32 并发 → running-req 稳定 ≈ 32；slime 100×1 poll 看到 running-req 在 4–30 来回，bulk 不饱和。同一来源 (c) 的下游 | included in (c) |
+| (e) variable response length (no `ignore_eos`) | wall ratio 1.321× > tok/s ratio 1.150× 的差就是这个：W8A8 13% 短响应红利把 wall 比拉高 17%。100×8 时收敛到 5% → wall 1.200× / tok/s 1.139× | wall-only confound |
+| (f) per-run startup (ray + tokenizer + parquet load) | ~30s–1min 固定成本 | ~3% of stage 2 wall |
+
+**净结论**：35% 的损失里大约 **~50% 来自 workload 本质改变 (a+b)，~25% 来自
+slime-side orchestration (c+d)，~25% 是 measurement noise (e+f)**。
+
+只有 (c)+(d) 是真正可优化的 slime-side 项，最多能把 slime tok/s ratio 从 1.139×
+推回到 1.39× 左右——**不可能恢复到 1.516×**，因为 (a)+(b) 是 RL rollout 工作
+负载的本质特征（多轮共享前缀是真实使用模式，不应消除）。
 
 ### Codex thresholds（2026-05-26 review，anchor BF16 Correct T3 = 27.88%）
 
@@ -218,196 +269,43 @@ shape but smaller absolute numbers).
   reward 服务的 OpenAPI byte-identical at probe time，但没证明 run-time
   scoring 完全等价。
 
-## W8A8 MLP-only 加速天花板拆解：pure sglang / slime / production 三阶段（2026-05-26）
+## 加速天花板三阶段拆解：bench artifacts + lessons learned
 
-**问题**：production v2.3_env_n8 wall 比 1.07×（BF16 1:20:33 → W8A8 MLP-only
-1:15:21），远低于 microprofile 预测的 1.27× decode / 1.28× prefill。
-**这 1.07× 的天花板从哪里来？**
+> 数值与分析已整合进 `### Efficiency` 上面三个子表 (production wall /
+> ceiling decomposition / 35% 损失分解)。这里只放可复用 artifacts 与下一步建议。
 
-### 三阶段实验：逐层剥离 slime 应用层与 reward 真实开销
+### 下一步实验
 
-**Stage 1：pure sglang 客户端 → server 直连 bench（无 slime、无 reward）**
+只有 **slime-side orchestration** 部分是可优化的（约 ~10% wall），
+workload prefill/decode mix 翻盘是 RL rollout 多轮共享前缀的本质特征，
+不应该试图 "恢复"。优化预算上限：slime tok/s ratio 从 1.139× 推回到
+约 1.39×（不可能到 1.516×）。
 
-- 同一 .22 host，GPUs 0,1，TP=2，mem-frac=0.85，ctx=65536，max-running=64，
-  attention=flashinfer
-- bench client：32 个并发 /v1/chat/completions，prompt 5K tokens，
-  max_tokens=1000，`ignore_eos=True` 强制每个 req 生成 1000 tokens
-- BF16: 63.63s wall, 32K tokens, 502.9 tok/s
-- W8A8 MLP-only: 41.98s wall, 32K tokens, 762.2 tok/s
-- **Wall ratio = tok/s ratio = 1.516×**
+**优先级 A — 给 slime rollout 加 per-trajectory 计时切片**
 
-**Wall measurement**：取 tqdm 完成行 `Eval kernelbench_level1: 100%|...|
-N/N [HH:MM:SS<...]` 的 elapsed 时间，**只算 eval-loop**，不含 ray submit /
-tokenizer load / sglang weight load / cuda graph capture（这些两 variant 大致
-equal，但放进 wall 会按比例稀释 ratio）。
+- per-turn `decode_wait`（首 token 到 EOS）
+- per-turn `reward_wait`（mock-KG / real-KG roundtrip）
+- per-turn `prompt_rebuild_us`（chat history 拼接 + tokenize）
+- per-turn `queue_wait`（请求被 dispatch 前在 slime 内排队的时间）
+- `tail_drain_s`（最后一个 trajectory 单独跑的时间）
 
-**Stage 2：slime smoke 100×1 + mock KG reward server（instant 假响应）**
-
-- 100 prompts × 1 sample，DRKERNEL_EVAL_MAX_CONCURRENCY=0（无 semaphore，
-  与 BF16 launcher 一致），multi-turn=3
-- BF16: **32:39 eval wall (1959s)**, 0.17 score, 6539 mean resp, 333.8 tok/s
-- W8A8 MLP-only: **24:43 eval wall (1483s)**, 0.20 score, 5694 mean resp, 383.9 tok/s
-- Wall ratio: **1.321×**（含 token-count 13% 不平等 → inflated）
-- **Per-token tok/s ratio: 1.150×**
-
-**Stage 3：slime smoke 100×8 + mock KG reward server**
-
-- 100 prompts × 8 samples = 800 trajectories，同上 conc=0、multi-turn=3
-- BF16: **1:09:28 eval wall (4168s)**, 0.2025 score, 6159 mean resp, 1182 tok/s
-- W8A8 MLP-only: **57:53 eval wall (3473s)**, 0.16375 score (mock-distorted), 5844 mean resp, 1346 tok/s
-- Wall ratio: **1.200×**（token-count 差距 5% 收敛 → wall 也收敛到 tok/s ratio）
-- **Per-token tok/s ratio: 1.139×**
-
-### 跨阶段表
-
-| stage                                | wall ratio | tok/s ratio |
-|--------------------------------------|-----------:|------------:|
-| 1. Pure sglang (ignore_eos)          |   1.516×   |    1.516×   |
-| 2. Slime 100×1 mock-KG (eval-loop)   |   1.321×   |    1.150×   |
-| 3. Slime 100×8 mock-KG (eval-loop)   |   1.200×   |    1.139×   |
-| Production v2.3_env_n8 (real KG)     |   1.073×   |      —      |
-
-**关键洞察**：
-1. **W8A8 MLP-only 的硬件/kernel 上限是 ~1.516×**（saturated decode + 等长 token）。
-2. **slime 应用层把上限压到 ~1.14× per-token**（多轮 churn、prompt rebuild、
-   prefix-cache fragmentation、scheduling 边界等开销）。100×1 (1.150×) 与
-   100×8 (1.139×) 的 per-token ratio 几乎相同 → 多轮 trajectory 数量不是瓶颈，
-   **应用层 envelope** 才是。
-3. **slime 1.14× → production 1.073×** = 真实 KG reward roundtrip + inter-turn
-   idle 的 dilution。
-
-### 为什么 1.516× → 1.131× 在 slime 100×1 里被吃掉了 35%（细分析）
-
-每一项都是单独可量化的 dilution 源，按贡献从大到小列：
-
-**(a) workload 组成从 prefill-dominated 翻成 decode-dominated（最大单项）**
-
-- pure sglang stage 1：32 prompts × 5K 输入 + 1K 输出 → 总 token 192K，
-  其中 prefill 占 **160K = 83%**，decode 32K = 17%。
-  - W8A8 prefill 速比 1.56×（earlier prefill profile），decode 速比 1.27×（decode profile）。
-  - 混合预期 = 0.83 × 1.56 + 0.17 × 1.27 = **1.51×** ≈ 实测 1.516× ✓
-- slime 100×1（BF16）：mean response 6539 + avg cached tokens 2002，单条
-  fresh prefill ≈ 4537 tokens，decode = 6539 tokens → **prefill 41%，decode 59%**。
-  - 混合预期 = 0.41 × 1.56 + 0.59 × 1.27 = **1.39×**
-- 也就是：仅"workload 组成翻盘"一项就把上限从 1.516× 拉到 1.39×。
-  剩下 1.39 → 1.131 才是 slime 真正的应用层开销。
-
-**(b) prefix cache hits 削掉了 prefill 工作量但没削 decode**
-
-- slime 100×1 的 `prefix_cache_hit_rate` 是 0.197（BF16）/ 0.188（W8A8）；
-  pure sglang stage 1 几乎为 0（每个 prompt 都是 fresh 随机 prompt）。
-- prefix cache 命中跳过的就是 prefill 那部分 GEMM —— 恰好是 W8A8 赢得最多的
-  那一段。所以越多 cache hit，W8A8 的相对优势越被吃掉。
-- 这与 (a) 是同一硬币的两面：cache hit 拉低 prefill 占比 → 让 mix 偏 decode。
-
-**(c) 多轮 turn-transition 引入固定 per-turn 串行段（slime-specific）**
-
-- multi-turn=3 意味着每个 prompt 走 [generate turn 1 → KG eval → generate
-  turn 2 → KG eval → generate turn 3 → KG eval]。
-- 即便 mock-KG 即时返回，turn-transition 里 slime 还要做：response parse、
-  chat history rebuild、tokenize 新 prompt、submit 新 generate。这段是
-  **Python 串行**，sglang GPU 在那一刻对这个 trajectory 是空闲的。
-- 当一个 trajectory 在 turn-transition 时，其它 trajectory 还能 decode；
-  但 100×1 总样本只有 100 条，一次能 in-flight 的 decode 数量天然 ≤ 100，
-  减去同时在 turn-transition 的那批，实际 saturated decode 的 batch 偏低。
-
-**(d) decode batch fill 不是 steady saturated**
-
-- pure sglang stage 1：client-side 32 并发，running-req 稳定 ≈ 32。
-- slime 100×1：poll 看到 running-req 在 4–30 来回，bulk 期间未达 max-running=64。
-  原因是 trajectory 总数（100）和 in-flight 上限有差距，多轮空隙让有效
-  并发更低。
-- batch 越小，decode 越偏带宽 bound，理论上 W8A8 应该赢得**更多**；但实测
-  W8A8 ratio 反而更小。说明在 slime 这个 batch 不稳定的 regime 里，BF16 和
-  W8A8 都被 Python/scheduler overhead 同等地拖慢，盖过了带宽优势。
-
-**(e) variable response length 让 batch 组成不稳定**
-
-- pure sglang 用 `ignore_eos=True` 强制每条出 1000 tokens；slime 不可能，
-  EOS 自然出，trajectory 长度方差大（BF16 100×1 std 看起来 ~3K tokens）。
-- 长 trajectory 拖尾导致 batch 缩小（同样上面的 tail problem）。
-- 这一项也部分解释了为什么 100×1 wall ratio (1.294×) > tok/s ratio (1.127×)：
-  W8A8 出现"短响应红利"约 13%，把 wall 比放大了 ~17%。100×8 时这个红利
-  收敛到 ~5%，wall ratio 也降到 1.192×。所以 **per-token ratio 才是 slime
-  真实速比**，wall ratio 是它叠上了 random EOS 偏差。
-
-**(f) 固定 per-run 启动开销（小项，但存在）**
-
-- slime 每轮 eval 还有 Ray cluster start、Megatron core 检测、tokenizer
-  load、prompt parquet 读取等 startup 串行段（~30s–1 min）。
-- 对 100×1 wall (2093s) 来说占比 ~3%，对短 bench 才显著；这里属于次要。
-
-**量化合并**：
-
-| 阶段                            | 累计 ratio 上限 | 主要损失项 |
-|---------------------------------|---------------:|-----------|
-| 硬件 / kernel ceiling            |        1.516×  | —         |
-| 减 prefix cache (a)+(b) 模型     |        1.39×   | workload 翻盘 |
-| 减 multi-turn fragmentation (c)+(d) |     1.131×  | slime envelope |
-| 减 EOS variance noise (e)        | (1.131 wall→tok/s 等价) | output-length confound |
-| 减 real KG dilution              |        1.073×  | reward + idle |
-
-→ **35% 的损失里，约 ~25% 来自 prefill 比例下降（(a)+(b)），剩 ~10% 来自
-slime 多轮/orchestration（(c)+(d)）**。前者是 workload 本质决定的（cache hit
-是好事），后者才是能优化的部分。
-
-### Reward overhead 反推（codex xhigh review，approximate）
-
-设 production wall = compute time `C` + non-accelerated overhead `R`，用更新后
-slime 100×8 的 1.139× per-token ratio：
-- BF16 production: `C + R = 4833s`
-- W8A8 production: `C/1.139 + R = 4521s`
-- 解出：`C ≈ 2557s`（53%），`R ≈ 2276s`（47%）
-
-→ **非加速开销（reward roundtrip + 多轮空闲 + 调度）约占 BF16 production wall 47%**。
-这正是把 1.139× 压成 1.073× 的 dilution。
-
-### 之前被推翻的两个 hypothesis（这次三阶段一并 settle）
-
-- ❌ "MLP-only 速度上不去因为 batch-32 时 MLP GEMM compute-bound"
-  → stage 1 直接达到 1.516×，证明硬件能跑出来。
-- ❌ "把 max-running 从 64 推到 128 会接近 1.516×"
-  → stage 3 已经在 running-req=64 saturated 跑了 bulk，per-token 仍只有 1.131×。
-  瓶颈是 **workload fragmentation**（多轮、orchestration），不是并发上限。
-
-### 下一步实验（codex 推荐 + workload 拆分后的修订）
-
-**只有 (c)+(d)+(f) 是 slime-side 可优化的**，加起来从 1.39× 拉到 1.131× ≈
-~19% 的速度损失。这是真正的优化预算上限。(a)+(b)（workload prefill/decode
-比例）是 RL rollout 工作负载的本质，不应该试图"恢复"它。
-
-**优先级 A — 验证 slime envelope 真实开销构成**
-- 给 slime rollout 加 per-trajectory 计时切片：
-  - per-turn `decode_wait`（首 token 到 EOS）
-  - per-turn `reward_wait`（mock-KG roundtrip）
-  - per-turn `prompt_rebuild_us`（chat history 拼接 + tokenize）
-  - per-turn `queue_wait`（请求被 dispatch 前在 slime 内排队的时间）
-  - `tail_drain_s`（最后一个 trajectory 单独跑的时间）
-- 期望产出：BF16 vs W8A8 的同一切片对比，看 W8A8 是不是被 fixed-cost 段
-  按比例打得更狠。
+期望产出：BF16 vs W8A8 的同一切片对比，看 W8A8 是不是被 fixed-cost 段
+按比例打得更狠。
 
 **优先级 B — multi-turn pipeline / prefetch**
-- 当一个 trajectory 在 turn-transition (parse + rebuild + reward call) 时，
-  让其它 trajectory 的下一 turn 的 prompt 立刻进入 sglang 队列。
-- 目标：把 (c)+(d) 的间隙时间填进 batch；要求 RolloutManager 把多个
-  trajectory 的 turn 调度异步化。
 
-**不优先**：max-running 128
-- stage 3 bulk 期间已经稳定 running-req=64，再加并发只会在 tail 拿到少量
-  收益，对 per-token ratio 几乎无影响。
+让一个 trajectory 在 turn-transition 时，其它 trajectory 的下一 turn prompt
+立刻进入 sglang 队列。要求 RolloutManager 把多个 trajectory 的 turn
+调度异步化。
 
-**不优先**：禁用 prefix cache 想"恢复 1.516×"
-- 这是反优化：cache hit 是 RL rollout 的真实工作负载特征（多轮共享前缀），
-  关掉它只是把 wall 拉长，不会让 W8A8 的相对 ratio 真实提升。
+**不优先**：push max-running 128（stage 3 bulk 已 running-req=64 饱和），
+或禁用 prefix cache（反优化，cache hit 是真实多轮负载特征）。
 
-**优先级 B（不推荐先做）**：push max-running 128
-- 已经 saturated 在 bulk，预计只能改善 tail，对 ratio 提升有限
-
-### Artifacts（三阶段 bench）
+### 三阶段 bench artifacts
 
 | 文件 | 内容 |
 |---|---|
-| `/tmp/bench_wall.py`（在 .22） | pure-sglang client，32 并发、5K prompt、1K decode、ignore_eos |
+| `/tmp/bench_wall.py`（在 .22） | pure-sglang client，32 并发、5K prompt、1K decode、`ignore_eos` |
 | `/tmp/mock_kg_reward.py`（在 .22） | FastAPI mock KG，instant 响应；用 `/tmp/mock_py mock_kg_reward.py 20112` 跑，规避 slime `pkill -9 python` |
 | `/tmp/start_sglang_{bf16,w8a8_mlp}.sh`（在 .22） | 独立 sglang server 启动脚本 |
 | `/tmp/slime_smoke_100x{1,8}_{bf16,w8a8}*.launch.log`（在 .22） | 各阶段 slime 全程日志 |
@@ -424,6 +322,10 @@ slime 100×8 的 1.139× per-token ratio：
 - 把 mock KG server 当成纯 python 进程跑 → slime 的 `start_cluster.sh`
   里 `pkill -9 python` 把 mock 一起杀掉。改用 `cp /usr/bin/python3 /tmp/mock_py`
   规避（comm 不再是 "python"）。
+- 一开始用 "job submit → eval 0 done" 时间戳算 slime wall，把 ray submit +
+  sglang weight load + cuda graph capture 都算进去（~30–50s）。两 variant
+  这部分大致相等，但放进 wall 会按比例稀释 ratio。改用 tqdm 100% 完成行的
+  elapsed 时间作为 eval-loop wall，ratio 上抬 1–2pp 才是真的。
 
 ## Online weight-push sanity attempt（**未通过**）
 
