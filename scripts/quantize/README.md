@@ -1,54 +1,96 @@
 # scripts/quantize/
 
-Quantization tooling for slime rollout acceleration. Currently scoped to
-Qwen3.5/3.6 family + W8 / W8A8 INT.
+W8A8 INT8 quantization tooling for slime rollout acceleration. Scoped to
+the Qwen3.5/3.6 hybrid (Mamba + softmax attention) family.
 
-## Files
+## Layout
 
-| File | Purpose |
-|---|---|
-| `build_calibration.py` | Extract prompt strings from a prior `eval_0.pt` into a JSONL for GPTQ calibration |
-| `quantize_w8a8_llmcompressor.py` | llmcompressor + GPTQ, W8A8 (weights + activations INT8). Vanilla GPTQ only — llmcompressor doesn't expose GPTQv2 / GPTAQ / activation-aware variants |
-| `quantize_w8_gptqmodel.py` | GPTQModel + GPTQ_V2 + `act_group_aware=True`, W8 (weights-only INT8). Activation precision stays BF16 |
-| `sglang_qwen3_5_dense_entry.patch` | sglang patch that registers `Qwen3_5ForCausalLM` and guards its expert-location method against dense configs. Needed when llmcompressor's CausalLM load path rewrites `architectures` to the dense entry |
+```
+scripts/quantize/
+├── producers/                         # output a W8A8 ckpt
+│   ├── rtn_w8a8.py                    # ★ production: pure-PyTorch RTN, no calibration
+│   ├── gptq_w8a8.py                   # llmcompressor + GPTQ + calibration
+│   └── smoothquant_w8a8.py            # llmcompressor + SmoothQuant (+optional GPTQ)
+├── rotation/                          # Hadamard rotation pipeline + probes
+│   ├── rotate_bf16.py                 # apply Hadamard rotation to BF16 ckpt
+│   ├── probe.py                       # forward-divergence probe
+│   ├── probe_compare.py               # diff two probe runs
+│   ├── run_probe_all.sh               # sweep wrapper
+│   └── PROBE_RESULTS.md               # rotation diagnostic writeup
+├── utils/
+│   ├── build_calibration.py           # extract calibration prompts from eval_0.pt
+│   └── validate_checkpoint.py         # post-save sanity checker for INT8 ckpts
+└── patches/
+    └── sglang_qwen3_5_dense_entry.patch # legacy sglang patch (kept for reference)
+```
 
-## Algorithm comparison
+## Producers — which to pick
 
-The two tools live on opposite sides of a hard trade-off — **llmcompressor
-has flexible schemes but a stale algorithm; GPTQModel has the modern
-algorithms but is weights-only**:
+| producer | algorithm | calibration needed | use when |
+|---|---|---|---|
+| **`rtn_w8a8.py`** | Round-To-Nearest (no calibration) | No | Default. Production-validated. Supports `--target {all-linear, mlp, non_linear_attn}`. |
+| `gptq_w8a8.py` | GPTQ (Hessian-aware) | Yes (~512 prompts) | When RTN quality is insufficient. ~+1pp Correct T3 over RTN on quality-sensitive scopes. Slower (5–10× calibration time). |
+| `smoothquant_w8a8.py` | SmoothQuant pre-shift + RTN/GPTQ | Yes (~128 prompts) | To suppress activation outliers (Qwen3.5 has known outlier channels). Produces both smoothed-BF16 and W8A8 outputs. |
 
-| | llmcompressor | GPTQModel |
-|---|---|---|
-| **Activation quantization** | ✅ (W8A8 INT, FP8 activations, KV cache quant) | ❌ (GPTQModel README explicitly: "GGUF and FP8 are weight-only"; no `a_bits` / activation calibration anywhere) |
-| Weight schemes | W8/W4 INT, FP8, MXFP4 | W4/W8 INT, FP8 (weight-only), AWQ, QQQ, ParoQuant, GGUF, EXL3 |
-| GPTQv2 (`FORMAT.GPTQ_V2`) | ❌ | ✅ |
-| GPTAQ (asymmetric calibration) | ❌ | ✅ (experimental, `GPTAQConfig`) |
-| `act_group_aware` | ❌ | ✅ (default when `desc_act=False`; ~16k× faster than `desc_act=True` with equal quality) |
-| FOEM (first-order error compensation) | ❌ | ✅ |
-| Qwen3.5 explicit model def | ❌ (falls back to generic CausalLM, rewrites `architectures`) | ✅ (`Qwen3_5GPTQ` mirrors `Qwen3_5MoeGPTQ` with dense MLP, preserves multimodal layout) |
-| Selective per-module quant | regex `targets` + `ignore` | `QuantizeConfig.dynamic` negative match (`"-:..."`) |
+All three emit `compressed-tensors` format (raw INT8 + per-channel FP32 scale)
+loadable by sglang 0.5.10.post1+ via `quant_method=compressed-tensors`.
 
-## Which to pick
+## Workflow
 
-The choice is dictated by **whether activations need to be quantized**:
+1. **(Optional) Build calibration data** — only needed for GPTQ / SmoothQuant:
+   ```
+   python scripts/quantize/utils/build_calibration.py \
+       --eval-pt path/to/eval_0.pt --output /tmp/calib.jsonl
+   ```
 
-- **W8A8 is required** (max rollout speedup — int8 tensor cores, ~2× decode) → **llmcompressor**. You get vanilla GPTQ only. Accept the algorithm tax.
-- **Weights-only is fine** (memory-bandwidth savings + ~1.3-1.5× speedup, but math stays BF16) → **GPTQModel**. You get GPTQv2 + `act_group_aware` + Qwen3.5 explicit model def + the existing public `btbtyler09/Qwen3.6-27B-GPTQ-8bit` ckpt as sanity reference (+0.07% wikitext degradation, effectively lossless).
-- **Both** → not possible with a single tool. Could in principle: run GPTQModel W8 first for best weight quantization, then apply llmcompressor's activation quant on top — untested and probably loader-incompatible.
+2. **(Optional) Hadamard rotation** — if you want rotation pre-treatment:
+   ```
+   python scripts/quantize/rotation/rotate_bf16.py \
+       --model-path /path/Qwen3.6-27B --output-path /path/Qwen3.6-27B-rotated-mm-bf16
+   ```
 
-## Loading caveats
+3. **Quantize**:
+   ```
+   # production RTN (no calibration):
+   python scripts/quantize/producers/rtn_w8a8.py \
+       --model-path /path/Qwen3.6-27B \
+       --output-path /path/Qwen3.6-27B-w8a8-rtn \
+       --target mlp
 
-Both paths produce checkpoints that mainstream loaders may not handle out of the box:
+   # GPTQ (calibration required):
+   source /tmp/w8a8-venv/bin/activate
+   python scripts/quantize/producers/gptq_w8a8.py \
+       --model-path /path/Qwen3.6-27B \
+       --calibration-path /tmp/calib.jsonl \
+       --output-path /path/Qwen3.6-27B-w8a8-gptq --multimodal
 
-- **llmcompressor W8A8 + CausalLM mode**: `architectures` gets rewritten to `Qwen3_5ForCausalLM`; sglang's dense entry is unregistered (Blocker 1) and the registered code path has a hardcoded `num_experts` access (Blocker 2). Apply `sglang_qwen3_5_dense_entry.patch` to unblock. Or use `--multimodal` mode to preserve the multimodal arch tag.
-- **GPTQModel W8 GPTQ_V2**: vLLM works after a small config-loader patch (see public ckpt's model card for the one-liner). sglang support is unverified — may need analogous patching.
+   # SmoothQuant (calibration required):
+   source /tmp/w8a8-venv/bin/activate
+   python scripts/quantize/producers/smoothquant_w8a8.py \
+       --model-path /path/Qwen3.6-27B \
+       --calibration-path /tmp/calib.jsonl \
+       --bf16-output-path /path/Qwen3.6-27B-smooth-bf16 \
+       --w8a8-output-path /path/Qwen3.6-27B-smooth-w8a8 \
+       --multimodal
+   ```
 
-See `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md` for full investigation log.
+4. **Validate**:
+   ```
+   python scripts/quantize/utils/validate_checkpoint.py \
+       --checkpoint /path/Qwen3.6-27B-w8a8-rtn \
+       --reference-checkpoint /path/Qwen3.6-27B
+   ```
 
-## Calibration data
+## Quality ablation results (production v2.3_env_n8 100×8)
 
-`build_calibration.py` extracts rendered first-turn prompts from any
-prior DrKernel eval dump (one with the current production template).
-Both quantize scripts consume the same JSONL format (one line =
-`{"text": <prompt>, ...}`).
+See `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md` `### Per-turn
+accuracy` for the full 6-variant rotation × scope ablation grid (BF16 → unrot
+all-linear, Correct T3 0.279 → 0.210).
+
+## Legacy notes
+
+Removed 2026-05-27 in the refactor (no behavioral impact):
+- `quantize_w8a8_rtn_llmcompressor.py` — llmcompressor RTN path, had a broken
+  save flow; superseded by `producers/rtn_w8a8.py` (pure PyTorch).
+- `quantize_w8_gptqmodel.py` — alternative W8-weights-only GPTQModel path;
+  never used in production.

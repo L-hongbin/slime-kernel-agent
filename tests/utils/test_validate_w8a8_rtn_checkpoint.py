@@ -1,7 +1,7 @@
 import pytest
 import torch
 from safetensors.torch import save_file
-from scripts.quantize.validate_w8a8_rtn_checkpoint import check_w8a8_checkpoint
+from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
 
 from slime.backends.megatron_utils.megatron_to_hf.processors.quantizer_compressed_tensors import quantize_layer_int8
 

@@ -33,6 +33,12 @@ def parse_args():
             "fuse_fp32",
             "pipeline_fp32",
             "pipeline_fp64",
+            "pipeline_fused_bf16",
+            "pipeline_fused_fp64_to_bf16",
+            "pipeline_restore_norm_bf16",
+            "pipeline_restore_norm_fp32",
+            "pipeline_restore_norm_fp64",
+            "pipeline_restore_norm_fp64_to_bf16",
             "raw_fp32",
             "raw_fp64",
         ],
@@ -40,7 +46,13 @@ def parse_args():
         "raw_fp32/fp64: just cast model to target dtype with NO other modifications "
         "(control for fp32/fp64 forward arithmetic baseline). "
         "pipeline_fp32/fp64: cast model to target dtype + apply offset-norm fusion + Hadamard rotation, "
-        "all in target dtype storage. Forward also runs in target dtype.",
+        "all in target dtype storage. Forward also runs in target dtype. "
+        "pipeline_fused_bf16: apply the fp32 fusion+rotation pipeline, then cast to bf16 for forward. "
+        "pipeline_fused_fp64_to_bf16: same fused pipeline using fp64 intermediates, then cast to bf16. "
+        "pipeline_restore_norm_bf16: apply the fp32 fusion+rotation pipeline, inverse-fuse original "
+        "Qwen offset-norm weights back into the RMSNorm modules, then cast to bf16 for forward. "
+        "pipeline_restore_norm_fp32/fp64: same inverse-fuse layout, kept in fp32/fp64 for forward. "
+        "pipeline_restore_norm_fp64_to_bf16: inverse-fuse using fp64 intermediates, then cast to bf16.",
     )
     return ap.parse_args()
 
@@ -205,6 +217,57 @@ def apply_pipeline(model, target_dtype):
     print(f"[{label}] rotated {n_out} output-side + {n_in} input-side modules in {target_dtype}", flush=True)
 
 
+def apply_pipeline_restore_norm(model, target_dtype, final_dtype=None):
+    """Rotate, then inverse-fuse Qwen offset norms before forward.
+
+    This tests the proposed checkpoint layout:
+      1. keep the original Qwen3_5RMSNorm residual weights near zero,
+      2. compensate every directly following Linear by dividing its input
+         columns by the same scale, and
+      3. store/run the final model in target_dtype or final_dtype.
+
+    A naive "put the norm weights back" would double-apply the scale. The
+    inverse-fuse step below keeps the transformed model algebraically equivalent
+    to the fused rotated pipeline before any final storage cast.
+    """
+
+    label = f"pipeline_restore_norm_{str(final_dtype or target_dtype).rsplit('.', 1)[-1]}"
+    print(f"[{label}] stashing original fused norm weights", flush=True)
+    pairs = find_norm_linear_pairs(model)
+    original_norm_weights = {id(norm): norm.weight.data.to(target_dtype).clone() for norm, _ in pairs}
+
+    apply_pipeline(model, target_dtype=target_dtype)
+
+    print(f"[{label}] inverse-fusing original norms into rotated linears", flush=True)
+    for norm, linears in pairs:
+        w = original_norm_weights[id(norm)].to(norm.weight.device)
+        s = 1.0 + w
+        for lin in linears:
+            lin.weight.data = lin.weight.data.to(target_dtype) / s.to(lin.weight.device).unsqueeze(0)
+        norm.weight.data = w.to(norm.weight.device)
+
+    if final_dtype is None:
+        return
+
+    print(f"[{label}] casting restored model to {final_dtype}", flush=True)
+    for p in model.parameters():
+        if p.is_floating_point():
+            p.data = p.data.to(final_dtype)
+    for b in model.buffers():
+        if b.is_floating_point():
+            b.data = b.data.to(final_dtype)
+
+
+def cast_model_bf16(model, label):
+    print(f"[{label}] casting model to bf16", flush=True)
+    for p in model.parameters():
+        if p.is_floating_point():
+            p.data = p.data.bfloat16()
+    for b in model.buffers():
+        if b.is_floating_point():
+            b.data = b.data.bfloat16()
+
+
 def main():
     args = parse_args()
     print(f"[probe] loading {args.model_path} (variant={args.variant})", flush=True)
@@ -236,6 +299,20 @@ def main():
         apply_pipeline(model, target_dtype=torch.float32)
     elif args.variant == "pipeline_fp64":
         apply_pipeline(model, target_dtype=torch.float64)
+    elif args.variant == "pipeline_fused_bf16":
+        apply_pipeline(model, target_dtype=torch.float32)
+        cast_model_bf16(model, "pipeline_fused_bf16")
+    elif args.variant == "pipeline_fused_fp64_to_bf16":
+        apply_pipeline(model, target_dtype=torch.float64)
+        cast_model_bf16(model, "pipeline_fused_fp64_to_bf16")
+    elif args.variant == "pipeline_restore_norm_bf16":
+        apply_pipeline_restore_norm(model, target_dtype=torch.float32, final_dtype=torch.bfloat16)
+    elif args.variant == "pipeline_restore_norm_fp32":
+        apply_pipeline_restore_norm(model, target_dtype=torch.float32)
+    elif args.variant == "pipeline_restore_norm_fp64":
+        apply_pipeline_restore_norm(model, target_dtype=torch.float64)
+    elif args.variant == "pipeline_restore_norm_fp64_to_bf16":
+        apply_pipeline_restore_norm(model, target_dtype=torch.float64, final_dtype=torch.bfloat16)
     elif args.variant == "raw_fp32":
         # Control: just upcast, no modifications. Tests pure fp32 forward vs bf16 forward.
         print("[raw_fp32] casting model to fp32 (no other modifications)", flush=True)

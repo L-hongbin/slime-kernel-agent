@@ -568,9 +568,12 @@ FP64 中间计算救不了，最终 BF16 cast 必然 drift。详见
 |---|---|
 | `slime/backends/megatron_utils/megatron_to_hf/processors/quantizer_compressed_tensors.py` | `quantize_layer_int8` + INT4/INT8 dispatch |
 | `tests/utils/test_quantizer_compressed_tensors_int8.py` | INT8 unit tests + online dispatch coverage |
-| `scripts/quantize/quantize_w8a8_rtn_local.py` | **推荐 local RTN writer**（支持 `--target {all-linear,mlp}`） |
-| `scripts/quantize/quantize_w8a8_rtn_llmcompressor.py` | llmcompressor producer（known save bug，留作参考） |
-| `scripts/quantize/validate_w8a8_rtn_checkpoint.py` | Post-save ckpt sanity checker |
+| `scripts/quantize/producers/rtn_w8a8.py` | **推荐 local RTN writer**（支持 `--target {all-linear,mlp,non_linear_attn}`） |
+| `scripts/quantize/producers/gptq_w8a8.py` | llmcompressor + GPTQ 路径 (calibration-based) |
+| `scripts/quantize/producers/smoothquant_w8a8.py` | llmcompressor + SmoothQuant + RTN，输出 smoothed BF16 + smoothed W8A8 两份 ckpt |
+| `scripts/quantize/utils/validate_checkpoint.py` | Post-save INT8 ckpt sanity checker |
+| `scripts/quantize/utils/build_calibration.py` | Calibration JSONL builder from eval_0.pt |
+| `scripts/quantize/rotation/rotate_bf16.py` + `rotation/probe.py` | Hadamard 旋转 + 诊断 probe |
 | `tests/utils/test_validate_w8a8_rtn_checkpoint.py` + `test_quantize_w8a8_rtn_local.py` | 上面两个的 unit tests |
 | `scripts/debug.27b.w8a8.sh` | env-tunable smoke harness |
 | `slime_plugins/drkernel/eval_throttle.py` + `tests/utils/test_drkernel_eval_throttle.py` | Eval fan-out semaphore |

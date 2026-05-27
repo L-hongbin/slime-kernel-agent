@@ -18,11 +18,11 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.quantize.validate_w8a8_rtn_checkpoint import check_w8a8_checkpoint
+from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
 
 from slime.backends.megatron_utils.megatron_to_hf.processors.quantizer_compressed_tensors import quantize_layer_int8
 

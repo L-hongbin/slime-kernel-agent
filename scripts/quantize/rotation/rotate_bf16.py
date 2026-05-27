@@ -24,7 +24,7 @@ rotated.
 
 Usage on .22:
     source /tmp/w8a8-venv/bin/activate
-    python scripts/quantize/rotate_bf16_llmcompressor.py \\
+    python scripts/quantize/rotation/rotate_bf16.py \\
         --model-path /nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B \\
         --output-path /nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-rotated-mm-bf16
 """

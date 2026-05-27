@@ -4,8 +4,8 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-from scripts.quantize.quantize_w8a8_rtn_local import quantize_checkpoint, should_quantize_weight
-from scripts.quantize.validate_w8a8_rtn_checkpoint import check_w8a8_checkpoint
+from scripts.quantize.producers.rtn_w8a8 import quantize_checkpoint, should_quantize_weight
+from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
 
 
 def test_should_quantize_weight_matches_text_side_linear_scope():

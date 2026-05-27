@@ -103,6 +103,31 @@ To isolate rotation cost from bf16 forward arithmetic noise, ran 4 additional va
 
 **All four fp32/fp64 variants give IDENTICAL 1.144% logit L2** — to 4 decimal places.
 
+## Round 3 — restoring fused norm weights after rotation (added 2026-05-25)
+
+Tested the proposed mitigation "put Qwen RMSNorm weights back after Hadamard transform" with exact inverse-fuse compensation:
+
+- `pipeline_fused_bf16`: FP32 fuse + R1 rotation, then cast fused rotated model to BF16
+- `pipeline_restore_norm_bf16`: same FP32 fuse + R1 rotation, then restore original norm weights and divide each consuming Linear input column by `(1 + weight)`, then cast BF16
+- `pipeline_fused_fp64_to_bf16`: same fused layout, but transformation computed in FP64 before BF16 cast
+- `pipeline_restore_norm_fp64_to_bf16`: same restored layout, but transformation computed in FP64 before BF16 cast
+
+```
+=== pipeline_fused_bf16 ===         logit rel L2: 1.559%, KL: 0.00142, top1: 100%
+=== pipeline_restore_norm_bf16 ===  logit rel L2: 1.656%, KL: 0.00138, top1: 100%
+=== pipeline_fused_fp64_to_bf16 ===         logit rel L2: 1.575%, KL: 0.00186, top1: 100%
+=== pipeline_restore_norm_fp64_to_bf16 ===  logit rel L2: 1.605%, KL: 0.00203, top1: 100%
+```
+
+Pure FP64 confirms the inverse-fuse layout is mathematically equivalent:
+
+```
+=== pipeline_fp64 vs pipeline_restore_norm_fp64 ===
+logit rel L2: 1.22e-7, max abs logit diff: 5.72e-6
+```
+
+So the restored layout is algebraically valid, but final BF16 storage still does **not** improve. Since the norm scale `D` and Hadamard `R` do not commute, the restored layout stores `W D R D^-1` in the Linear instead of `W D R`; this changes the BF16 rounding surface rather than eliminating it, and it was slightly worse on logits.
+
 ## Key conclusions (final)
 
 1. **Rotation is mathematically exact when stored in fp32 or higher**. `pipeline_fp32 == raw_fp32` proves rotation adds 0% extra divergence — rotation perfectly cancels through residual stream + final norm/lm_head absorption. The 1.144% is **purely fp32 forward vs bf16 forward arithmetic difference**.
@@ -143,5 +168,5 @@ Recovers 28% of total rotation drift (0.44/1.58). Not worth 2× inference cost f
 ssh -p 11116 root@192.168.16.22
 source /tmp/w8a8-venv/bin/activate
 cd /nfs/FM/chenshuailin/projects/kernel_agents/slime
-bash scripts/quantize/run_probe_all.sh    # ~30min, runs all 5 variants
+bash scripts/quantize/rotation/run_probe_all.sh    # ~30min, runs all 5 variants
 ```
