@@ -70,56 +70,101 @@ IGNORE_PATTERNS = [
     "re:.*\\.mtp\\..*",
 ]
 
-# MLP smoothing mapping — gate + up share post_attention_layernorm.
-# down_proj is intentionally NOT smoothed (its input is silu(gate)*up, not a
-# clean layernorm output; SmoothQuant identity doesn't apply).
-_MAPPING_MLP = [
-    [
-        r"re:model\.language_model\.layers\.\d+\.mlp\.gate_proj$",
-        r"re:model\.language_model\.layers\.\d+\.mlp\.up_proj$",
-    ],
-    r"re:model\.language_model\.layers\.\d+\.post_attention_layernorm$",
-]
 
-# Full-attention QKV share input_layernorm.
-_MAPPING_SELF_ATTN = [
-    [
-        r"re:model\.language_model\.layers\.\d+\.self_attn\.q_proj$",
-        r"re:model\.language_model\.layers\.\d+\.self_attn\.k_proj$",
-        r"re:model\.language_model\.layers\.\d+\.self_attn\.v_proj$",
-    ],
-    r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
-]
+def _layer_indices_by_type(model_path: str) -> tuple[list[int], list[int]]:
+    """Return (full_attn_indices, linear_attn_indices) from the model config.
 
-# Linear-attention / Mamba: in_proj_* share input_layernorm of the linear_attn
-# layer (same name as self_attn's input_layernorm but different layer indices —
-# Qwen3.5 hybrid uses input_layernorm in both layer families).
-_MAPPING_LINEAR_ATTN = [
-    [
-        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_a$",
-        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_b$",
-        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_qkv$",
-        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_z$",
-    ],
-    r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
-]
+    Qwen3.5 hybrid lists `text_config.layer_types` with `full_attention` or
+    `linear_attention` per layer. SmoothQuant's mapping resolver pairs
+    layernorm-to-projection by layer index, so we must restrict the layernorm
+    regex to ONLY the layer indices that have the corresponding projection
+    family — otherwise the resolver finds 64 input_layernorms but only 16
+    self_attn.q_projs and refuses to resolve.
+
+    Asserts the layout matches the expected Qwen3.5 27B hybrid (16 full +
+    48 linear = 64 layers) so a mismatched config fails fast here instead of
+    later inside the SmoothQuant resolver with a confusing error.
+    """
+    cfg = json.load(open(f"{model_path}/config.json"))
+    layer_types = cfg.get("text_config", cfg).get("layer_types") or []
+    full_attn = [i for i, t in enumerate(layer_types) if t == "full_attention"]
+    linear_attn = [i for i, t in enumerate(layer_types) if t == "linear_attention"]
+    n_total = len(layer_types)
+    n_other = n_total - len(full_attn) - len(linear_attn)
+    if n_other:
+        raise ValueError(
+            f"unexpected layer_types in {model_path}/config.json: "
+            f"{n_other} entries are neither 'full_attention' nor 'linear_attention'"
+        )
+    if not full_attn:
+        raise ValueError(
+            f"no full_attention layers in {model_path}/config.json; "
+            f"non_linear_attn / all-linear targets need at least one full-attn layer"
+        )
+    if not linear_attn:
+        raise ValueError(
+            f"no linear_attention layers in {model_path}/config.json; "
+            f"this script assumes a Qwen3.5-style hybrid layout"
+        )
+    return full_attn, linear_attn
 
 
-def mappings_for_target(target: str) -> list:
-    """Return SmoothQuant mappings scoped to the target.
+def _idx_regex(indices: list[int]) -> str:
+    """`[3,7,11]` -> `(3|7|11)` (non-grouping not supported in SmoothQuant's regex parser)."""
+    return "(" + "|".join(str(i) for i in indices) + ")"
+
+
+def build_mappings_for_target(target: str, model_path: str) -> list:
+    """Return SmoothQuant mappings scoped to the target's layer set.
 
     We only smooth modules that we plan to quantize — smoothing a layer that
     stays BF16 just slightly perturbs its weights without any quantization
-    benefit. So for `non_linear_attn` target (MLP + self_attn, skip mamba), we
-    drop the linear_attn mapping; for `mlp` target we drop both attention
-    mappings.
+    benefit. We also restrict each layernorm regex to the layer indices that
+    actually have the corresponding projection family (full_attention layers
+    for self_attn, linear_attention layers for linear_attn/Mamba), so the
+    SmoothQuant resolver can pair layernorm-to-proj exactly.
+
+    MLP mapping covers all 64 layers (every layer has MLP).
     """
+    full_attn, linear_attn = _layer_indices_by_type(model_path)
+    all_layers_re = r"\d+"
+
+    # MLP — gate + up share post_attention_layernorm. Every layer has MLP.
+    mapping_mlp = [
+        [
+            rf"re:model\.language_model\.layers\.{all_layers_re}\.mlp\.gate_proj$",
+            rf"re:model\.language_model\.layers\.{all_layers_re}\.mlp\.up_proj$",
+        ],
+        rf"re:model\.language_model\.layers\.{all_layers_re}\.post_attention_layernorm$",
+    ]
+    # Full-attention QKV share input_layernorm — only the full-attention layers.
+    full_idx = _idx_regex(full_attn)
+    mapping_self_attn = [
+        [
+            rf"re:model\.language_model\.layers\.{full_idx}\.self_attn\.q_proj$",
+            rf"re:model\.language_model\.layers\.{full_idx}\.self_attn\.k_proj$",
+            rf"re:model\.language_model\.layers\.{full_idx}\.self_attn\.v_proj$",
+        ],
+        rf"re:model\.language_model\.layers\.{full_idx}\.input_layernorm$",
+    ]
+    # Linear-attention / Mamba in_proj_* — only the linear-attention layers.
+    lin_idx = _idx_regex(linear_attn)
+    mapping_linear_attn = [
+        [
+            rf"re:model\.language_model\.layers\.{lin_idx}\.linear_attn\.in_proj_a$",
+            rf"re:model\.language_model\.layers\.{lin_idx}\.linear_attn\.in_proj_b$",
+            rf"re:model\.language_model\.layers\.{lin_idx}\.linear_attn\.in_proj_qkv$",
+            rf"re:model\.language_model\.layers\.{lin_idx}\.linear_attn\.in_proj_z$",
+        ],
+        rf"re:model\.language_model\.layers\.{lin_idx}\.input_layernorm$",
+    ]
+
     if target == "mlp":
-        return [_MAPPING_MLP]
+        return [mapping_mlp]
     if target == "non_linear_attn":
-        return [_MAPPING_MLP, _MAPPING_SELF_ATTN]
+        return [mapping_mlp, mapping_self_attn]
     if target == "all-linear":
-        return [_MAPPING_MLP, _MAPPING_SELF_ATTN, _MAPPING_LINEAR_ATTN]
+        return [mapping_mlp, mapping_self_attn, mapping_linear_attn]
     raise ValueError(f"unknown target {target!r}")
 
 
@@ -281,7 +326,7 @@ def main() -> None:
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 
-    smooth_mappings = mappings_for_target(args.target)
+    smooth_mappings = build_mappings_for_target(args.target, args.model_path)
     smooth_recipe = [
         SmoothQuantModifier(
             smoothing_strength=args.smoothing_strength,
