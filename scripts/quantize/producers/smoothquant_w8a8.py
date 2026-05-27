@@ -409,7 +409,12 @@ def main() -> None:
         args.w8a8_output_path,
         reference_checkpoint=args.bf16_output_path,
         max_tensors=32,
-        max_saturated_frac=0.20,
+        # 0.05 saturated_frac threshold per codex review 2026-05-27. The
+        # broken llmcompressor pipeline produced ~99% saturated; tightening
+        # to 5% (was 20%) catches less-extreme corruption too. A correctly-
+        # quantized RTN ckpt has well under 1% saturation, so 5% has plenty
+        # of headroom for the per-channel max → ±127 boundary case.
+        max_saturated_frac=0.05,
         max_rel_l2=0.10,
     )
 
