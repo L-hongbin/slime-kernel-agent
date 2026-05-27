@@ -149,7 +149,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
    --sglang-context-length ${CTX_LEN}
    --sglang-max-running-requests 64
-   --sglang-mem-fraction-static 0.9
+   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC:-0.9}
    --sglang-decode-log-interval 400
 )
 
