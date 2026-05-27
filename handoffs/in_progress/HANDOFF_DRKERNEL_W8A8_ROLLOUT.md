@@ -236,39 +236,44 @@ shape but smaller absolute numbers).
 - W8A8 MLP-only: 41.98s wall, 32K tokens, 762.2 tok/s
 - **Wall ratio = tok/s ratio = 1.516×**
 
+**Wall measurement**：取 tqdm 完成行 `Eval kernelbench_level1: 100%|...|
+N/N [HH:MM:SS<...]` 的 elapsed 时间，**只算 eval-loop**，不含 ray submit /
+tokenizer load / sglang weight load / cuda graph capture（这些两 variant 大致
+equal，但放进 wall 会按比例稀释 ratio）。
+
 **Stage 2：slime smoke 100×1 + mock KG reward server（instant 假响应）**
 
 - 100 prompts × 1 sample，DRKERNEL_EVAL_MAX_CONCURRENCY=0（无 semaphore，
   与 BF16 launcher 一致），multi-turn=3
-- BF16: 34:53 wall, 0.17 score, 6539 mean resp, 312 tok/s
-- W8A8 MLP-only: 26:57 wall, 0.20 score, 5694 mean resp, 352 tok/s
-- Wall ratio: 1.294×（含 token-count 13% 不平等 → inflated）
-- **Per-token tok/s ratio: 1.127×**
+- BF16: **32:39 eval wall (1959s)**, 0.17 score, 6539 mean resp, 333.8 tok/s
+- W8A8 MLP-only: **24:43 eval wall (1483s)**, 0.20 score, 5694 mean resp, 383.9 tok/s
+- Wall ratio: **1.321×**（含 token-count 13% 不平等 → inflated）
+- **Per-token tok/s ratio: 1.150×**
 
 **Stage 3：slime smoke 100×8 + mock KG reward server**
 
 - 100 prompts × 8 samples = 800 trajectories，同上 conc=0、multi-turn=3
-- BF16: 71:47 wall, 0.2025 score, 6159 mean resp, 1144 tok/s
-- W8A8 MLP-only: 60:13 wall, 0.16375 score (mock-distorted), 5844 mean resp, 1294 tok/s
-- Wall ratio: 1.192×（token-count 差距 5% 收敛 → wall 也收敛到 tok/s ratio）
-- **Per-token tok/s ratio: 1.131×**
+- BF16: **1:09:28 eval wall (4168s)**, 0.2025 score, 6159 mean resp, 1182 tok/s
+- W8A8 MLP-only: **57:53 eval wall (3473s)**, 0.16375 score (mock-distorted), 5844 mean resp, 1346 tok/s
+- Wall ratio: **1.200×**（token-count 差距 5% 收敛 → wall 也收敛到 tok/s ratio）
+- **Per-token tok/s ratio: 1.139×**
 
 ### 跨阶段表
 
 | stage                                | wall ratio | tok/s ratio |
 |--------------------------------------|-----------:|------------:|
 | 1. Pure sglang (ignore_eos)          |   1.516×   |    1.516×   |
-| 2. Slime 100×1 mock-KG               |   1.294×   |    1.127×   |
-| 3. Slime 100×8 mock-KG               |   1.192×   |    1.131×   |
+| 2. Slime 100×1 mock-KG (eval-loop)   |   1.321×   |    1.150×   |
+| 3. Slime 100×8 mock-KG (eval-loop)   |   1.200×   |    1.139×   |
 | Production v2.3_env_n8 (real KG)     |   1.073×   |      —      |
 
 **关键洞察**：
 1. **W8A8 MLP-only 的硬件/kernel 上限是 ~1.516×**（saturated decode + 等长 token）。
-2. **slime 应用层把上限压到 ~1.131× per-token**（多轮 churn、prompt rebuild、
-   prefix-cache fragmentation、scheduling 边界等开销）。100×1 与 100×8 的
-   per-token ratio 几乎相同 → 多轮 trajectory 数量不是瓶颈，**应用层 envelope**
-   才是。
-3. **slime 1.131× → production 1.073×** = 真实 KG reward roundtrip + inter-turn
+2. **slime 应用层把上限压到 ~1.14× per-token**（多轮 churn、prompt rebuild、
+   prefix-cache fragmentation、scheduling 边界等开销）。100×1 (1.150×) 与
+   100×8 (1.139×) 的 per-token ratio 几乎相同 → 多轮 trajectory 数量不是瓶颈，
+   **应用层 envelope** 才是。
+3. **slime 1.14× → production 1.073×** = 真实 KG reward roundtrip + inter-turn
    idle 的 dilution。
 
 ### 为什么 1.516× → 1.131× 在 slime 100×1 里被吃掉了 35%（细分析）
@@ -348,13 +353,14 @@ slime 多轮/orchestration（(c)+(d)）**。前者是 workload 本质决定的�
 
 ### Reward overhead 反推（codex xhigh review，approximate）
 
-设 production wall = compute time `C` + non-accelerated overhead `R`：
+设 production wall = compute time `C` + non-accelerated overhead `R`，用更新后
+slime 100×8 的 1.139× per-token ratio：
 - BF16 production: `C + R = 4833s`
-- W8A8 production: `C/1.13 + R = 4521s`
-- 解出：`C ≈ 2710s`（56%），`R ≈ 2120s`（44%）
+- W8A8 production: `C/1.139 + R = 4521s`
+- 解出：`C ≈ 2557s`（53%），`R ≈ 2276s`（47%）
 
-→ **非加速开销（reward roundtrip + 多轮空闲 + 调度）约占 BF16 production wall 44%，
-W8A8 production wall 47%**。这正是把 1.131× 压成 1.073× 的 dilution。
+→ **非加速开销（reward roundtrip + 多轮空闲 + 调度）约占 BF16 production wall 47%**。
+这正是把 1.139× 压成 1.073× 的 dilution。
 
 ### 之前被推翻的两个 hypothesis（这次三阶段一并 settle）
 
@@ -634,15 +640,16 @@ FP64 中间计算救不了，最终 BF16 cast 必然 drift。详见
   - **rotation = consistent secondary** (+1-2pp across all scopes)
   - **linear_attn (mamba) = single biggest sub-attention culprit**
 - ☑ 32 个 W8A8/quant/eval/throttle/context-cap 测试通过
-- ☑ **加速天花板三阶段拆解（2026-05-26）**：
+- ☑ **加速天花板三阶段拆解（2026-05-26，eval-loop walls）**：
   - pure sglang ignore_eos: 1.516× wall = tok/s（硬件 / kernel 上限）
-  - slime 100×1 mock-KG: 1.127× per-token tok/s
-  - slime 100×8 mock-KG: 1.131× per-token tok/s
+  - slime 100×1 mock-KG: 1.150× per-token tok/s (1.321× wall)
+  - slime 100×8 mock-KG: 1.139× per-token tok/s (1.200× wall)
   - production real KG: 1.073× wall
-  - → slime 应用层 envelope 把 1.516× 压到 ~1.13×；real KG 再压到 1.07×
-  - → reward overhead 反推 ≈ 44–47% of production wall（codex xhigh）
+  - → slime 应用层 envelope 把 1.516× 压到 ~1.14×；real KG 再压到 1.07×
+  - → reward overhead 反推 ≈ 47% of production wall（codex xhigh）
 - ☐ Multi-turn pipeline / inter-turn idle 消除（**当前 highest-leverage** —
-  推预测能把 slime wall ratio 从 1.13× 推向 1.516×；先加 per-trajectory 计时）
+  优化预算 ~1.14× → ~1.39× per-token，无法到 1.516×，因为 workload 本身
+  prefill 占比从 83% 降到 41%）
 - ☐ Online RTN path 完整 27B E2E：actor init grad buffer 60.46 GiB OOM
 - ☐ FP32-master rotation in online weight-sync（消除 BF16 storage tax，
   理论上 quality 能再加 ~4pp 到 BF16 水平；implementation cost 高）
