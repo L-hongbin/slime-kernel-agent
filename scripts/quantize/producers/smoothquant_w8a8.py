@@ -60,38 +60,6 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
 #
 # down_proj is deliberately omitted: its input is silu(gate) * up, not a clean
 # layernorm output, so the SmoothQuant identity doesn't apply cleanly.
-QWEN35_HYBRID_MAPPINGS = [
-    # MLP: gate + up share post_attention_layernorm
-    [
-        [
-            r"re:model\.language_model\.layers\.\d+\.mlp\.gate_proj$",
-            r"re:model\.language_model\.layers\.\d+\.mlp\.up_proj$",
-        ],
-        r"re:model\.language_model\.layers\.\d+\.post_attention_layernorm$",
-    ],
-    # Full-attention QKV share input_layernorm
-    [
-        [
-            r"re:model\.language_model\.layers\.\d+\.self_attn\.q_proj$",
-            r"re:model\.language_model\.layers\.\d+\.self_attn\.k_proj$",
-            r"re:model\.language_model\.layers\.\d+\.self_attn\.v_proj$",
-        ],
-        r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
-    ],
-    # Linear-attention / Mamba: all in_proj_* share input_layernorm of the
-    # linear_attn layer (same naming convention as self_attn but different
-    # layer indices — Qwen3.5 hybrid uses input_layernorm in both).
-    [
-        [
-            r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_a$",
-            r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_b$",
-            r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_qkv$",
-            r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_z$",
-        ],
-        r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
-    ],
-]
-
 # Always-ignore for multimodal vision tower / projector / audio.
 IGNORE_PATTERNS = [
     "lm_head",
@@ -101,6 +69,78 @@ IGNORE_PATTERNS = [
     "re:.*\\.audio_tower\\..*",
     "re:.*\\.mtp\\..*",
 ]
+
+# MLP smoothing mapping — gate + up share post_attention_layernorm.
+# down_proj is intentionally NOT smoothed (its input is silu(gate)*up, not a
+# clean layernorm output; SmoothQuant identity doesn't apply).
+_MAPPING_MLP = [
+    [
+        r"re:model\.language_model\.layers\.\d+\.mlp\.gate_proj$",
+        r"re:model\.language_model\.layers\.\d+\.mlp\.up_proj$",
+    ],
+    r"re:model\.language_model\.layers\.\d+\.post_attention_layernorm$",
+]
+
+# Full-attention QKV share input_layernorm.
+_MAPPING_SELF_ATTN = [
+    [
+        r"re:model\.language_model\.layers\.\d+\.self_attn\.q_proj$",
+        r"re:model\.language_model\.layers\.\d+\.self_attn\.k_proj$",
+        r"re:model\.language_model\.layers\.\d+\.self_attn\.v_proj$",
+    ],
+    r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
+]
+
+# Linear-attention / Mamba: in_proj_* share input_layernorm of the linear_attn
+# layer (same name as self_attn's input_layernorm but different layer indices —
+# Qwen3.5 hybrid uses input_layernorm in both layer families).
+_MAPPING_LINEAR_ATTN = [
+    [
+        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_a$",
+        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_b$",
+        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_qkv$",
+        r"re:model\.language_model\.layers\.\d+\.linear_attn\.in_proj_z$",
+    ],
+    r"re:model\.language_model\.layers\.\d+\.input_layernorm$",
+]
+
+
+def mappings_for_target(target: str) -> list:
+    """Return SmoothQuant mappings scoped to the target.
+
+    We only smooth modules that we plan to quantize — smoothing a layer that
+    stays BF16 just slightly perturbs its weights without any quantization
+    benefit. So for `non_linear_attn` target (MLP + self_attn, skip mamba), we
+    drop the linear_attn mapping; for `mlp` target we drop both attention
+    mappings.
+    """
+    if target == "mlp":
+        return [_MAPPING_MLP]
+    if target == "non_linear_attn":
+        return [_MAPPING_MLP, _MAPPING_SELF_ATTN]
+    if target == "all-linear":
+        return [_MAPPING_MLP, _MAPPING_SELF_ATTN, _MAPPING_LINEAR_ATTN]
+    raise ValueError(f"unknown target {target!r}")
+
+
+def quant_targets_and_ignore(target: str) -> tuple:
+    """Return (targets, ignore) for the QuantizationModifier matching the smoothing scope."""
+    mlp_re = r"re:.*\.mlp\.(gate_proj|up_proj|down_proj)$"
+    self_attn_re = r"re:.*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
+    base_ignore = list(IGNORE_PATTERNS)
+    if target == "mlp":
+        targets = [mlp_re]
+        # leave attention BF16
+        base_ignore += [r"re:.*\.self_attn\..*", r"re:.*\.linear_attn\..*"]
+    elif target == "non_linear_attn":
+        targets = [mlp_re, self_attn_re]
+        # leave linear_attn (mamba) BF16
+        base_ignore += [r"re:.*\.linear_attn\..*"]
+    elif target == "all-linear":
+        targets = "Linear"
+    else:
+        raise ValueError(f"unknown target {target!r}")
+    return targets, base_ignore
 
 
 def parse_args() -> argparse.Namespace:
@@ -144,9 +184,15 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--target",
-        choices=["mlp", "all-linear"],
-        default="mlp",
-        help="Which Linear modules to quantize after smoothing. 'mlp' (default) only quantizes the MLP triplet. 'all-linear' quantizes every Linear except lm_head/visual/audio. Smoothing mappings always cover MLP + attention regardless.",
+        choices=["mlp", "non_linear_attn", "all-linear"],
+        default="non_linear_attn",
+        help=(
+            "Which Linear modules to quantize after smoothing. "
+            "'mlp' = MLP triplet only (192 modules); "
+            "'non_linear_attn' (default) = MLP + self_attn QKVO, skip mamba/linear_attn (256 modules); "
+            "'all-linear' = every Linear except lm_head/visual/audio (496 modules). "
+            "The smoothing mappings are scoped to match the target — modules left BF16 are not smoothed either."
+        ),
     )
     ap.add_argument(
         "--multimodal",
@@ -235,14 +281,18 @@ def main() -> None:
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
 
+    smooth_mappings = mappings_for_target(args.target)
     smooth_recipe = [
         SmoothQuantModifier(
             smoothing_strength=args.smoothing_strength,
-            mappings=QWEN35_HYBRID_MAPPINGS,
+            mappings=smooth_mappings,
             ignore=IGNORE_PATTERNS,
         )
     ]
-    print(f"[smoothquant] stage 1: smoothing with {len(QWEN35_HYBRID_MAPPINGS)} mappings", flush=True)
+    print(
+        f"[smoothquant] stage 1: target={args.target}, smoothing with {len(smooth_mappings)} mapping group(s)",
+        flush=True,
+    )
 
     oneshot(
         model=model,
@@ -273,19 +323,20 @@ def main() -> None:
     # ------------------------------------------------------------------
     from llmcompressor.modifiers.quantization import QuantizationModifier
 
-    if args.target == "mlp":
-        targets = [r"re:.*\.mlp\.(gate_proj|up_proj|down_proj)$"]
-    else:
-        targets = "Linear"
+    quant_targets, quant_ignore = quant_targets_and_ignore(args.target)
 
     quant_recipe = [
         QuantizationModifier(
-            targets=targets,
+            targets=quant_targets,
             scheme="W8A8",
-            ignore=IGNORE_PATTERNS,
+            ignore=quant_ignore,
         )
     ]
-    print(f"[smoothquant] stage 2: W8A8 RTN quant on target={args.target}", flush=True)
+    print(
+        f"[smoothquant] stage 2: W8A8 RTN quant on target={args.target} "
+        f"(targets={quant_targets!r}, +{len(quant_ignore) - len(IGNORE_PATTERNS)} target-scope ignores)",
+        flush=True,
+    )
 
     oneshot(
         model=model,
