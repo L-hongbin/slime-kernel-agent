@@ -24,6 +24,11 @@ The repository's top-level harness files are the stable operational documents th
 1. For any artifact, behavior, or result that can be practically manually reviewed, inspect representative real examples in addition to automated checks. When useful, dump reviewable prompts, data samples, logs, model outputs, scored examples, or other concrete artifacts to text files so the user can inspect the same evidence.
 2. Do not use eager mode when deploying models unless it is for temporary debugging.
 3. Treat `/nfs` and `/ms` as shared filesystems.
+4. Before launching any long-running job, run a sanity check that verifies the critical configuration and recently modifications. After the run finishes, dispatch a codex review (xhigh effort) of the results before drawing conclusions.
+5. For substantial code or design changes, dispatch a codex review (xhigh effort) before treating the change as final.
+6. When changing behavior-sensitive logic, add a unit test. If a unit test is impractical, replace it with an explicit sanity check that exercises the changed path on a real input.
+7. Do not blindly trust that a dispatched job will auto-return. A progress-based job notification is not enough — periodically poll status to catch unexpected situations (broker wedges, sandbox failures, silent stalls, processes stuck in D-state on NFS).
+8. Avoid heavy `find` invocations (full-FS scans like `find / -name X 2>/dev/null`). They can take hours on shared NFS and pin filesystem caches. Prefer (a) checking known paths directly, (b) `ls` / `glob` of specific directories, (c) `locate` / `mlocate` if available. If a broad `find` is genuinely necessary, ask the user for approval first.
 
 ## Execution Policy
 
