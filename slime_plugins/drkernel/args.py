@@ -43,15 +43,6 @@ def add_custom_arguments(parser):
         ),
     )
     parser.add_argument(
-        "--preserve-history-thinking",
-        action="store_true",
-        default=False,
-        help=(
-            "Preserve previous assistant <think> blocks when rendering multi-turn prompts. Custom generate "
-            "functions should pass this through to tokenizer.apply_chat_template when supported."
-        ),
-    )
-    parser.add_argument(
         "--multi-turn-gamma",
         type=float,
         default=1.0,

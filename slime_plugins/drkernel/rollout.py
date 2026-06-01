@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import logging
-import os
 import re
 from argparse import Namespace
 from collections.abc import Callable, Iterable
@@ -27,6 +26,8 @@ from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.misc import load_function
 from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.types import Sample
+
+from .eval_throttle import get_positive_int_env, run_eval_coro
 
 logger = logging.getLogger(__name__)
 
@@ -769,6 +770,18 @@ async def generate_multi_turn_eval_sample(
             ), "generate_multi_turn_eval_sample does not support generate_and_rm returning multi-sample lists."
             sample = sample[0]
 
+        kg = (sample.metadata.get("kernelgym") or {}).get("response") or {}
+        logger.info(
+            "multi_turn sample=%s turn=%d/%d reward=%s resp_len=%d compiled=%s correct=%s",
+            getattr(sample, "index", "?"),
+            turn_idx + 1,
+            max_turns,
+            sample.reward,
+            sample.response_length,
+            kg.get("compiled"),
+            kg.get("correctness"),
+        )
+
         turns_log.append(
             {
                 "turn_idx": turn_idx,
@@ -779,7 +792,7 @@ async def generate_multi_turn_eval_sample(
                 "prompt_snapshot": sample.prompt,
                 # Raw decoded response from SGLang for this turn (no tokenizer post-processing).
                 "response": sample.response,
-                "kernelgym": (sample.metadata.get("kernelgym") or {}).get("response"),
+                "kernelgym": kg,
             }
         )
 
@@ -846,6 +859,9 @@ async def eval_rollout_single_dataset(
 
     renderer = _get_prompt_renderer(args.hf_checkpoint)
     cache_key = dataset_cfg.cache_key + (args.hf_checkpoint, args.apply_chat_template)
+    eval_max_prompt_len = dataset_cfg.max_prompt_len
+    if eval_max_prompt_len is None:
+        eval_max_prompt_len = getattr(args, "eval_max_prompt_len", None)
     if cache_key not in EVAL_PROMPT_DATASET:
         processor = (
             load_processor(args.hf_checkpoint, trust_remote_code=True) if args.multimodal_keys is not None else None
@@ -854,7 +870,7 @@ async def eval_rollout_single_dataset(
             path=dataset_cfg.path,
             tokenizer=renderer.tokenizer,
             processor=processor,
-            max_length=dataset_cfg.max_prompt_len,
+            max_length=eval_max_prompt_len,
             prompt_key=dataset_cfg.input_key,
             label_key=dataset_cfg.label_key,
             multimodal_keys=args.multimodal_keys,
@@ -874,7 +890,14 @@ async def eval_rollout_single_dataset(
     # prompts that creep into the (context - 5, context - 1) range get 400'd. This
     # avoids touching slime upstream and adds no extra tokenize work.
     _SGLANG_INPUT_RESERVE = 32
-    eval_max_context_len = max(1, int(dataset_cfg.max_context_len) - _SGLANG_INPUT_RESERVE)
+    eval_context_len = dataset_cfg.max_context_len
+    if eval_context_len is None:
+        eval_context_len = getattr(args, "eval_max_context_len", None) or getattr(
+            args, "rollout_max_context_len", None
+        )
+    if eval_context_len is None:
+        raise ValueError("eval max context length is required for DrKernel eval rollout")
+    eval_max_context_len = max(1, int(eval_context_len) - _SGLANG_INPUT_RESERVE)
     base_sampling_params = dict(
         temperature=dataset_cfg.temperature,
         top_p=dataset_cfg.top_p,
@@ -891,17 +914,29 @@ async def eval_rollout_single_dataset(
     tasks = []
     # do multiple samples for eval prompts
     sample_index = 0
-    # Smoke knob: cap the eval dataset to the first N prompts when DRKERNEL_SMOKE_MAX_PROMPTS
-    # is set in the runtime env. Production runs leave it unset for full coverage.
-    smoke_limit = int(os.environ.get("DRKERNEL_SMOKE_MAX_PROMPTS", "0") or 0)
-    eval_samples = dataset.samples[:smoke_limit] if smoke_limit > 0 else dataset.samples
-    if smoke_limit > 0:
+    eval_samples = dataset.samples
+    eval_max_concurrency = get_positive_int_env("DRKERNEL_EVAL_MAX_CONCURRENCY")
+    concurrency_source = "DRKERNEL_EVAL_MAX_CONCURRENCY env"
+    if eval_max_concurrency == 0:
+        # Default: ~1.2x the total sglang in-flight request capacity, so engines
+        # stay saturated while leaving some slack for multi-turn samples that
+        # are between sglang turns (waiting on KernelGym reward).
+        max_running = int(getattr(args, "sglang_max_running_requests", 0) or 0)
+        gpus_per_engine = int(getattr(args, "rollout_num_gpus_per_engine", 0) or 0)
+        gpus_per_node = int(getattr(args, "num_gpus_per_node", 0) or 0)
+        num_nodes = int(getattr(args, "actor_num_nodes", 1) or 1)
+        if max_running > 0 and gpus_per_engine > 0 and gpus_per_node > 0:
+            engines_per_node = max(1, gpus_per_node // gpus_per_engine)
+            num_engines = engines_per_node * num_nodes
+            eval_max_concurrency = int(max_running * num_engines * 2)
+            concurrency_source = f"auto (max_running={max_running} x engines={num_engines} x 2)"
+    eval_semaphore = asyncio.Semaphore(eval_max_concurrency) if eval_max_concurrency > 0 else None
+    if eval_max_concurrency > 0:
         logger.info(
-            "DRKERNEL_SMOKE_MAX_PROMPTS=%d capping %s to %d/%d prompts",
-            smoke_limit,
+            "DRKERNEL_EVAL_MAX_CONCURRENCY=%d (%s) limiting %s eval sample concurrency",
+            eval_max_concurrency,
+            concurrency_source,
             dataset_cfg.name,
-            len(eval_samples),
-            len(dataset.samples),
         )
     for _i, prompt_sample in enumerate(eval_samples):
         for j in range(dataset_cfg.n_samples_per_eval_prompt):
@@ -916,20 +951,26 @@ async def eval_rollout_single_dataset(
                 sampling_params["sampling_seed"] = args.rollout_seed + j
             renderer.apply_to_sample(args, sample, rollout_id)
             if getattr(args, "use_multi_turn", False) and int(getattr(args, "max_turns", 1) or 1) > 1:
-                coro = generate_multi_turn_eval_sample(
-                    args,
-                    sample,
-                    sampling_params=sampling_params,
-                    renderer=renderer,
-                )
+
+                def coro_factory(sample=sample, sampling_params=sampling_params):
+                    return generate_multi_turn_eval_sample(
+                        args,
+                        sample,
+                        sampling_params=sampling_params,
+                        renderer=renderer,
+                    )
+
             else:
-                coro = generate_and_rm(
-                    args,
-                    sample,
-                    sampling_params=sampling_params,
-                    evaluation=True,
-                )
-            tasks.append(asyncio.create_task(coro))
+
+                def coro_factory(sample=sample, sampling_params=sampling_params):
+                    return generate_and_rm(
+                        args,
+                        sample,
+                        sampling_params=sampling_params,
+                        evaluation=True,
+                    )
+
+            tasks.append(asyncio.create_task(run_eval_coro(coro_factory, eval_semaphore)))
 
     data = []
     do_print = True
