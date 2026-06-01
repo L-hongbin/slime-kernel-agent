@@ -31,6 +31,7 @@ _LEGACY_FIRST_TURN = {
     "pybind11_module": _TEMPLATE_ROOT / "legacy" / "first_turn" / "pybind11_module.jinja",
     "tvm_ffi_module": _TEMPLATE_ROOT / "legacy" / "first_turn_tvm_ffi" / "tvm_ffi_module.jinja",
 }
+_LEGACY_TVM_FFI_V2_3 = _TEMPLATE_ROOT / "legacy" / "first_turn_tvm_ffi" / "tvm_ffi_module_v2_3.jinja"
 _ACTIVE_FIRST_TURN = {key: value for key, value in _LEGACY_FIRST_TURN.items() if key != "lhb_v4"}
 
 
@@ -50,6 +51,11 @@ def _wrap_problem_for_prompt(problem: str) -> str:
 def _load_drkernel_v1_profile():
     config = yaml.safe_load((_TEMPLATE_ROOT / "prompts_v1.yaml").read_text(encoding="utf-8"))
     return config["profiles"]["drkernel_v1"]
+
+
+def _load_drkernel_v1_tvm_ffi_profile():
+    config = yaml.safe_load((_TEMPLATE_ROOT / "prompts_v1.yaml").read_text(encoding="utf-8"))
+    return config["profiles"]["drkernel_v1_tvm_ffi"]
 
 
 @lru_cache(maxsize=1)
@@ -232,6 +238,40 @@ def test_drkernel_legacy_equivalence_is_covered_by_tests(template_id, role_id):
     legacy_path = _LEGACY_FIRST_TURN[template_id]
     legacy_rendered = _render_template(
         legacy_path.read_text(encoding="utf-8"),
+        problem=_wrap_problem_for_prompt(problem),
+    )
+
+    assert _normalize_whitespace(rendered) == _normalize_whitespace(legacy_rendered)
+
+
+@pytest.mark.unit
+def test_drkernel_tvm_ffi_v2_3_legacy_matches_active_profile():
+    profile = _load_drkernel_v1_tvm_ffi_profile()
+    layout = (_TEMPLATE_ROOT / profile["layout"]).read_text(encoding="utf-8")
+
+    role_candidate = next(
+        candidate for candidate in profile["role"]["candidates"] if candidate["id"] == "optimize_correctness"
+    )
+    backend_candidate = profile["backend"]["candidates"][0]
+
+    assert backend_candidate["id"] == "tvm_ffi_module"
+    assert backend_candidate["first_turn_text_path"] == "backends/tvm_ffi_module_v2_3.jinja"
+
+    role = (_TEMPLATE_ROOT / role_candidate["text_path"]).read_text(encoding="utf-8")
+    backend = (_TEMPLATE_ROOT / backend_candidate["first_turn_text_path"]).read_text(encoding="utf-8")
+    problem = "def example_problem(x):\n    return x + 1\n"
+
+    rendered = _render_template(
+        layout,
+        role=role,
+        backend=backend,
+        problem=problem,
+        compiler_name=None,
+        gpu_name=None,
+        extra_environment=None,
+    )
+    legacy_rendered = _render_template(
+        _LEGACY_TVM_FFI_V2_3.read_text(encoding="utf-8"),
         problem=_wrap_problem_for_prompt(problem),
     )
 

@@ -228,7 +228,7 @@ custom rollout 负责最终 prompt 渲染和 chat template，因此不要在 Dat
 注意事项：
 
 - **跨轮 `apply_chat_template_kwargs` 必须保持一致**，否则 token 化前缀漂移，SGLang prefix-cache 失效。
-- assistant 历史里可能带 `<think>...</think>`；是否在下轮被 tokenizer 剥除，由 `--preserve-history-thinking` 翻译成的 `apply_chat_template_kwargs` 决定。不要在 Python 端手动剥。
+- assistant 历史里可能带 `<think>...</think>`；是否在下轮被 tokenizer 剥除，由 `apply_chat_template_kwargs` 决定（Qwen3 模板默认剥除非最新轮的 think，会让 radix prefix 在 assistant 边界断裂、生成段 0% 复用）。要保留并恢复 cache 命中，用 `--apply-chat-template-kwargs '{"preserve_thinking": true}'`（已实测前缀命中 0/155 → 155/155）。不要在 Python 端手动剥。
 - 当 sample 是 `--padding-turns` 模式补出来的占位 turn 时，需要把 `metadata["is_padding"]=True` 标好，下游训练阶段据此打 loss mask。
 
 ## CLI 参数
@@ -244,9 +244,11 @@ DrKernel plugin 端参数（`slime_plugins/drkernel/args.py`）：
 --use-multi-turn
 --max-turns 3
 --padding-turns
---preserve-history-thinking
 --multi-turn-gamma 1.0
 --filter-by-last-turn
+
+# 保留历史 think 以恢复 prefix-cache 命中（slime 核心 arg，非 plugin）
+--apply-chat-template-kwargs '{"preserve_thinking": true}'
 ```
 
 `--max-turns` 不在 YAML profile 里设上限。同一份 `drkernel_v1_tvm_ffi` profile 既支持单轮（不开 `--use-multi-turn`）也支持任意多轮。
