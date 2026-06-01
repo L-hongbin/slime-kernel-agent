@@ -43,3 +43,6 @@ The repository's top-level harness files are the stable operational documents th
    - state whether the gap still exists in the skill after the task
 4. In final summaries, prefer a combined "problem and resolution" structure instead of separating "problems" and "adjustments".
 5. Don’t fight errors. Whenever you encounter the same error twice, research the web and find 3-5 possible ways to fix it. Then choose the most efficient solution and implement it.
+6. Treat surprising results as bugs until the evidence says otherwise. Do not start by explaining why an anomaly may be reasonable. First ask: what would make this result impossible, misleading, or caused by a bad measurement?
+7. Close the causal chain before closing the task. Do not wait for the user to name the next obvious check.
+8. Separate workaround from root cause. A workaround can unblock progress, but it must be recorded as such. Do not convert "use the safer path" into "the unsafe path is naturally bad" without proving it.
