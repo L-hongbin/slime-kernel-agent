@@ -200,4 +200,5 @@ tmp.md
 checkpoints/
 .vscode/
 uv.lock
-.claude
+.claude/
+.antigravitycli
