@@ -17,7 +17,7 @@ Two model-load modes (pick via `--multimodal`):
   `<X>ForCausalLM`. For Qwen3.5/3.6 this breaks sglang load (the dense
   causal entry is unregistered and the registered code path has a
   hardcoded `num_experts` access — see
-  `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md`). Apply the
+  `handoffs/in_progress/handoff_drkernel_w8a8_rollout.md`). Apply the
   sglang patch in this dir to unlock load.
 - `--multimodal`: load via `Qwen3_5ForConditionalGeneration` (or the
   AutoModelForImageTextToText path). Vision tower weights are loaded
@@ -163,11 +163,22 @@ def main():
 
     print(f"[quantize] loading calibration from {args.calibration_path}", flush=True)
     calibration_texts = []
+    domain_adapted_markers = 0
     with open(args.calibration_path) as f:
         for line in f:
-            calibration_texts.append(json.loads(line)["text"])
+            row = json.loads(line)
+            if "problem_id" in row or row.get("source") in {"drkernel", "kernelbench"}:
+                domain_adapted_markers += 1
+            calibration_texts.append(row["text"])
             if len(calibration_texts) >= args.num_calibration_samples:
                 break
+    if domain_adapted_markers:
+        print(
+            "[quantize] WARNING: calibration file appears to come from "
+            "DrKernel/KernelBench eval dumps. This is domain-adapted calibration "
+            "and must not be used for general quality claims.",
+            flush=True,
+        )
     print(f"[quantize] using {len(calibration_texts)} calibration prompts", flush=True)
 
     from datasets import Dataset

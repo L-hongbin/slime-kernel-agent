@@ -1,14 +1,15 @@
-"""Extract rendered DrKernel prompts from a prior eval dump for W8A8 calibration.
+"""Extract rendered DrKernel prompts from a prior eval dump for diagnostics.
 
 Reads `<run>/dumps/rollout_data/eval_0.pt`, pulls every turn's
 `prompt_snapshot` field, and emits a JSONL where each line is
 `{"text": <prompt>, "turn": <int>, "problem_id": <id>}`. The output is
-consumed by `quantize_w8a8.py --calibration-path` for GPTQ calibration.
+can be consumed by calibration-based quantizers, but this should be treated as
+domain-adapted calibration rather than a fair held-out evaluation setup.
 
-Source dump should be representative of the production rollout
-distribution (same prompt template + same model family + same KG
-backend). v2_3 / current default template eval dumps are good
-candidates.
+Do not use KernelBench/DrKernel eval dumps for claims about general W8A8
+quality or lossless SmoothQuant behavior: the calibration prompts overlap the
+target evaluation distribution and can hide domain-specific artifacts.  Prefer
+`build_ultrachat_calibration.py` for generic calibration.
 """
 
 from __future__ import annotations

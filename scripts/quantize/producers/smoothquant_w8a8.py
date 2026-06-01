@@ -41,10 +41,16 @@ import argparse
 import json
 import os
 import shutil
+import sys
+from pathlib import Path
 
 import torch
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # -----------------------------------------------------------------------------
 # Qwen3.5/3.6 hybrid SmoothQuant mappings
@@ -61,13 +67,23 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
 # down_proj is deliberately omitted: its input is silu(gate) * up, not a clean
 # layernorm output, so the SmoothQuant identity doesn't apply cleanly.
 # Always-ignore for multimodal vision tower / projector / audio.
-IGNORE_PATTERNS = [
+BASE_IGNORE_PATTERNS = [
     "lm_head",
     "re:.*\\.visual\\..*",
     "re:.*vision_tower.*",
     "re:.*mm_projector.*",
     "re:.*\\.audio_tower\\..*",
-    "re:.*\\.mtp\\..*",
+]
+
+MTP_IGNORE_PATTERNS = [
+    # MTP / EAGLE draft head must stay BF16. sglang builds the draft model with
+    # prefix "mtp", so its Linear modules are named `mtp.layers.0.*` (mtp at the
+    # START, no leading dot). sglang matches ignore via re.match (anchored), so a
+    # `\.mtp\.` pattern never matches and every draft Linear would wrongly get
+    # the W8A8 scheme with no weight_scale -> garbage draft logits, ~0.1 accept
+    # rate. `.*mtp\.` matches `mtp.layers...` while leaving the target body
+    # `model.language_model.layers...` (no `mtp.` substring) quantized.
+    "re:.*mtp\\..*",
 ]
 
 
@@ -124,7 +140,9 @@ def build_mappings_for_target(target: str, model_path: str) -> list:
     for self_attn, linear_attention layers for linear_attn/Mamba), so the
     SmoothQuant resolver can pair layernorm-to-proj exactly.
 
-    MLP mapping covers all 64 layers (every layer has MLP).
+    MLP mapping covers all 64 target-model layers (every layer has MLP). The
+    explicit *_mtp targets add the single MTP draft layer to the same smoothing
+    and quantization scope.
     """
     full_attn, linear_attn = _layer_indices_by_type(model_path)
     all_layers_re = r"\d+"
@@ -158,11 +176,30 @@ def build_mappings_for_target(target: str, model_path: str) -> list:
         ],
         rf"re:model\.language_model\.layers\.{lin_idx}\.input_layernorm$",
     ]
+    mapping_mtp_mlp = [
+        [
+            r"re:mtp\.layers\.\d+\.mlp\.gate_proj$",
+            r"re:mtp\.layers\.\d+\.mlp\.up_proj$",
+        ],
+        r"re:mtp\.layers\.\d+\.post_attention_layernorm$",
+    ]
+    mapping_mtp_self_attn = [
+        [
+            r"re:mtp\.layers\.\d+\.self_attn\.q_proj$",
+            r"re:mtp\.layers\.\d+\.self_attn\.k_proj$",
+            r"re:mtp\.layers\.\d+\.self_attn\.v_proj$",
+        ],
+        r"re:mtp\.layers\.\d+\.input_layernorm$",
+    ]
 
     if target == "mlp":
         return [mapping_mlp]
+    if target == "mlp_mtp":
+        return [mapping_mlp, mapping_mtp_mlp]
     if target == "non_linear_attn":
         return [mapping_mlp, mapping_self_attn]
+    if target == "non_linear_attn_mtp":
+        return [mapping_mlp, mapping_self_attn, mapping_mtp_mlp, mapping_mtp_self_attn]
     if target == "all-linear":
         return [mapping_mlp, mapping_self_attn, mapping_linear_attn]
     raise ValueError(f"unknown target {target!r}")
@@ -172,12 +209,16 @@ def quant_targets_and_ignore(target: str) -> tuple:
     """Return (targets, ignore) for the QuantizationModifier matching the smoothing scope."""
     mlp_re = r"re:.*\.mlp\.(gate_proj|up_proj|down_proj)$"
     self_attn_re = r"re:.*\.self_attn\.(q_proj|k_proj|v_proj|o_proj)$"
-    base_ignore = list(IGNORE_PATTERNS)
-    if target == "mlp":
+    base_ignore = list(BASE_IGNORE_PATTERNS)
+    if target not in ("mlp_mtp", "non_linear_attn_mtp"):
+        base_ignore += MTP_IGNORE_PATTERNS
+    else:
+        base_ignore.append(r"re:^mtp\.fc(\..*)?$")
+    if target in ("mlp", "mlp_mtp"):
         targets = [mlp_re]
         # leave attention BF16
         base_ignore += [r"re:.*\.self_attn\..*", r"re:.*\.linear_attn\..*"]
-    elif target == "non_linear_attn":
+    elif target in ("non_linear_attn", "non_linear_attn_mtp"):
         targets = [mlp_re, self_attn_re]
         # leave linear_attn (mamba) BF16
         base_ignore += [r"re:.*\.linear_attn\..*"]
@@ -229,12 +270,14 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--target",
-        choices=["mlp", "non_linear_attn", "all-linear"],
+        choices=["mlp", "mlp_mtp", "non_linear_attn", "non_linear_attn_mtp", "all-linear"],
         default="non_linear_attn",
         help=(
             "Which Linear modules to quantize after smoothing. "
             "'mlp' = MLP triplet only (192 modules); "
+            "'mlp_mtp' = MLP triplet plus MTP draft-head MLP; "
             "'non_linear_attn' (default) = MLP + self_attn QKVO, skip mamba/linear_attn (256 modules); "
+            "'non_linear_attn_mtp' = non_linear_attn plus MTP draft-head MLP + self_attn; "
             "'all-linear' = every Linear except lm_head/visual/audio (496 modules). "
             "The smoothing mappings are scoped to match the target — modules left BF16 are not smoothed either."
         ),
@@ -289,12 +332,54 @@ def load_model(model_path: str, multimodal: bool):
 
 def load_calibration(path: str, n_max: int) -> list[str]:
     texts: list[str] = []
+    domain_adapted_markers = 0
     with open(path) as f:
         for line in f:
-            texts.append(json.loads(line)["text"])
+            row = json.loads(line)
+            if "problem_id" in row or row.get("source") in {"drkernel", "kernelbench"}:
+                domain_adapted_markers += 1
+            texts.append(row["text"])
             if len(texts) >= n_max:
                 break
+    if domain_adapted_markers:
+        print(
+            "[smoothquant] WARNING: calibration file appears to come from "
+            "DrKernel/KernelBench eval dumps. This is domain-adapted calibration "
+            "and must not be used for general quality or lossless-SmoothQuant claims.",
+            flush=True,
+        )
     return texts
+
+
+def patch_llmcompressor_transformers5() -> None:
+    """Provide the Transformers <=4 init hook name expected by llmcompressor."""
+    import transformers.modeling_utils as modeling_utils
+
+    if hasattr(modeling_utils, "TORCH_INIT_FUNCTIONS"):
+        return
+    names = (
+        "uniform_",
+        "normal_",
+        "xavier_uniform_",
+        "xavier_normal_",
+        "kaiming_uniform_",
+        "kaiming_normal_",
+        "orthogonal_",
+    )
+    modeling_utils.TORCH_INIT_FUNCTIONS = {
+        name: getattr(torch.nn.init, name) for name in names if hasattr(torch.nn.init, name)
+    }
+
+
+def patch_transformers5_no_split_modules(model) -> None:
+    """Backfill the Transformers <=4 method that llmcompressor still calls."""
+    if hasattr(model, "_get_no_split_modules"):
+        return
+
+    def _get_no_split_modules(device_map=None):
+        return list(getattr(model, "_no_split_modules", []) or [])
+
+    model._get_no_split_modules = _get_no_split_modules
 
 
 def main() -> None:
@@ -305,6 +390,7 @@ def main() -> None:
         flush=True,
     )
     model, tokenizer = load_model(args.model_path, args.multimodal)
+    patch_transformers5_no_split_modules(model)
     print(
         f"[smoothquant] model loaded, root dtype={next(model.parameters()).dtype}",
         flush=True,
@@ -323,15 +409,19 @@ def main() -> None:
     # ------------------------------------------------------------------
     # Stage 1: SmoothQuant only (produces the smoothed BF16 ckpt)
     # ------------------------------------------------------------------
+    patch_llmcompressor_transformers5()
     from llmcompressor import oneshot
     from llmcompressor.modifiers.transform.smoothquant import SmoothQuantModifier
+    from scripts.quantize.patches.llmcompressor_qwen3_5_smoothquant import patch_smoothquant_qwen3_5_rmsnorm
+
+    patch_smoothquant_qwen3_5_rmsnorm()
 
     smooth_mappings = build_mappings_for_target(args.target, args.model_path)
     smooth_recipe = [
         SmoothQuantModifier(
             smoothing_strength=args.smoothing_strength,
             mappings=smooth_mappings,
-            ignore=IGNORE_PATTERNS,
+            ignore=quant_targets_and_ignore(args.target)[1],
         )
     ]
     print(
@@ -362,6 +452,14 @@ def main() -> None:
         src = os.path.join(args.model_path, fname)
         if os.path.exists(src):
             shutil.copy2(src, args.bf16_output_path)
+
+    from scripts.quantize.utils.mtp_checkpoint import inject_mtp_tensors
+
+    injected = inject_mtp_tensors(args.bf16_output_path, args.model_path)
+    print(
+        f"[smoothquant] restored {injected} MTP tensor(s) into smoothed BF16 checkpoint",
+        flush=True,
+    )
 
     # ------------------------------------------------------------------
     # Stage 2: RTN-INT8 on top of the smoothed BF16 ckpt
@@ -406,8 +504,8 @@ def main() -> None:
     from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
 
     check_w8a8_checkpoint(
-        args.w8a8_output_path,
-        reference_checkpoint=args.bf16_output_path,
+        Path(args.w8a8_output_path),
+        reference_checkpoint=Path(args.bf16_output_path),
         max_tensors=32,
         # 0.05 saturated_frac threshold per codex review 2026-05-27. The
         # broken llmcompressor pipeline produced ~99% saturated; tightening

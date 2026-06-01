@@ -1,0 +1,75 @@
+Subject: [PATCH] sglang: keep separate Qwen3_5 MTP lm_head when checkpoint provides one
+
+QuaRot fuses the target final RMSNorm into the target `lm_head`, but Qwen3.5/3.6
+MTP has a different `mtp.norm.weight`. Sharing the target head with the draft
+model is therefore not mathematically valid after R1 rotation. A rotated
+checkpoint can instead provide `mtp.lm_head.weight`, where the MTP final norm is
+fused into a separate draft head.
+
+This patch teaches `Qwen3_5ForCausalLMMTP` to load that optional tensor and to
+keep it when speculative workers call `set_embed_and_head(embed, head)`. The
+embedding is still shared with the target model; only the draft lm_head is kept
+separate when the checkpoint explicitly provides it.
+
+Apply (sglang repo root, e.g. /sgl-workspace/sglang on .22):
+    cd /sgl-workspace/sglang && patch -p1 < /path/to/sglang_qwen3_5_mtp_separate_lm_head.patch
+
+To revert:
+    cd /sgl-workspace/sglang && patch -p1 -R < /path/to/sglang_qwen3_5_mtp_separate_lm_head.patch
+
+---
+ python/sglang/srt/models/qwen3_5_mtp.py | 25 +++++++++++++++++++++----
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/python/sglang/srt/models/qwen3_5_mtp.py b/python/sglang/srt/models/qwen3_5_mtp.py
+--- a/python/sglang/srt/models/qwen3_5_mtp.py
++++ b/python/sglang/srt/models/qwen3_5_mtp.py
+@@ -106,6 +106,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+                 )
+ 
+         self.logits_processor = LogitsProcessor(config)
++        self._has_separate_mtp_lm_head = False
+ 
+     @classmethod
+     def get_model_config_for_expert_location(cls, config):
+@@ -121,11 +122,15 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+ 
+     def set_embed_and_head(self, embed, head):
+         del self.model.embed_tokens.weight
+-        if not self.config.tie_word_embeddings:
+-            del self.lm_head.weight
+-
+         self.model.embed_tokens.weight = embed
+-        self.lm_head.weight = head
++        if not self.config.tie_word_embeddings:
++            if self._has_separate_mtp_lm_head:
++                logger.info(
++                    "Keeping checkpoint-provided separate MTP lm_head instead of sharing target lm_head"
++                )
++            else:
++                del self.lm_head.weight
++                self.lm_head.weight = head
+         torch.cuda.empty_cache()
+         torch.cuda.synchronize()
+ 
+@@ -261,6 +266,20 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
+             if "rotary_emb.inv_freq" in name:
+                 continue
+ 
++            if name == "mtp.lm_head.weight":
++                if self.config.tie_word_embeddings:
++                    logger.warning_once("Skip mtp.lm_head.weight because tie_word_embeddings=True")
++                    continue
++                param = params_dict.get("lm_head.weight")
++                if param is None:
++                    logger.warning_once("Parameter lm_head.weight not found for mtp.lm_head.weight, skip loading")
++                    continue
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                weight_loader(param, loaded_weight)
++                loaded_params.add("lm_head.weight")
++                self._has_separate_mtp_lm_head = True
++                continue
++
+             # Only process MTP branch weights
+             if "mtp" not in name:
+                 continue

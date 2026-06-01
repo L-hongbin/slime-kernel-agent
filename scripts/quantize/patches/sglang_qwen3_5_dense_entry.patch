@@ -19,7 +19,7 @@ path rewrites the saved `architectures` field from
 patch, sglang refuses to load such checkpoints (Blocker 1) and even when
 the EntryClass guard is bypassed, EPLB init crashes with
 `AttributeError: 'Qwen3_5TextConfig' object has no attribute 'num_experts'`
-(Blocker 2). See `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md`.
+(Blocker 2). See `handoffs/in_progress/handoff_drkernel_w8a8_rollout.md`.
 
 Apply (sglang repo root, e.g. /sgl-workspace/sglang on .22):
     cd /sgl-workspace/sglang && patch -p1 < /path/to/sglang_qwen3_5_dense_entry.patch

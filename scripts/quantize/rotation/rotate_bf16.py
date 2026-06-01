@@ -36,11 +36,46 @@ import os
 import re
 
 import torch
+
+
+def patch_llmcompressor_transformers5():
+    """Provide the Transformers <=4 init hook name expected by llmcompressor."""
+    import transformers.modeling_utils as modeling_utils
+
+    if hasattr(modeling_utils, "TORCH_INIT_FUNCTIONS"):
+        return
+    names = (
+        "uniform_",
+        "normal_",
+        "xavier_uniform_",
+        "xavier_normal_",
+        "kaiming_uniform_",
+        "kaiming_normal_",
+        "orthogonal_",
+    )
+    modeling_utils.TORCH_INIT_FUNCTIONS = {
+        name: getattr(torch.nn.init, name) for name in names if hasattr(torch.nn.init, name)
+    }
+
+
+patch_llmcompressor_transformers5()
+
 from llmcompressor.modifiers.transform.spinquant.mappings import SpinQuantMapping
 from llmcompressor.modifiers.transform.spinquant.norm_mappings import NormMapping
 from transformers import AutoTokenizer
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "warning")
+
+
+def patch_transformers5_no_split_modules(model):
+    """Backfill the Transformers <=4 method that llmcompressor still calls."""
+    if hasattr(model, "_get_no_split_modules"):
+        return
+
+    def _get_no_split_modules(device_map=None):
+        return list(getattr(model, "_no_split_modules", []) or [])
+
+    model._get_no_split_modules = _get_no_split_modules
 
 
 # Qwen3.5/3.6 hybrid arch mapping. Layout (verified against
@@ -159,7 +194,43 @@ def build_qwen35_norm_mappings(model):
     return out
 
 
-def build_qwen35_r1_transform_config():
+def _get_child_module(model, path: str):
+    module = model
+    for part in path.split("."):
+        if hasattr(module, part):
+            module = getattr(module, part)
+        else:
+            module = module._modules[part]
+    return module
+
+
+def prepare_qwen35_gemma_norms_for_fusion(model, norm_mappings) -> list[str]:
+    """Make llmcompressor fuse Qwen3.5/Gemma effective RMSNorm scales.
+
+    Qwen3.5/Gemma RMSNorm applies ``1 + weight``. llmcompressor's generic norm
+    fusion reads ``weight`` directly and later writes a standard-RMSNorm identity
+    of ones. For Qwen3.5 the correct fused scale is ``1 + weight`` and the
+    post-fusion identity weight is zero. This helper mutates the loaded model so
+    the generic fusion sees the effective scale; ``zero_qwen35_fused_gemma_norms``
+    must be called after the modifier runs.
+    """
+
+    norm_paths = sorted({mapping.norm for mapping in norm_mappings})
+    for path in norm_paths:
+        module = _get_child_module(model, path)
+        if not hasattr(module, "weight"):
+            raise ValueError(f"{path} has no weight to prepare for Gemma RMSNorm fusion")
+        module.weight.data.add_(1.0)
+    return norm_paths
+
+
+def zero_qwen35_fused_gemma_norms(model, norm_paths: list[str]) -> None:
+    for path in norm_paths:
+        module = _get_child_module(model, path)
+        module.weight.data.zero_()
+
+
+def build_qwen35_r1_transform_config(transform_type: str = "random-hadamard"):
     """Direct R1 transform_config bypassing SpinQuantModifier's mapping inference.
 
     Why: per codex review, `SpinQuantModifier.on_initialize()` overwrites
@@ -183,7 +254,7 @@ def build_qwen35_r1_transform_config():
     return TransformConfig(
         config_groups={
             "R1": TransformScheme(
-                type="random-hadamard",
+                type=transform_type,
                 randomize=False,
                 requires_grad=False,
                 head_dim=None,
@@ -226,12 +297,36 @@ def parse_args():
         help="Hidden_size=5120 for Qwen3.6-27B is not a power of 2, so plain hadamard may need block_size. random-hadamard is the safest default.",
     )
     ap.add_argument("--transform-block-size", type=int, default=None, help="Override hidden_size auto-selection")
+    ap.add_argument(
+        "--mtp-mode",
+        default="rotate",
+        choices=["rotate", "copy"],
+        help=(
+            "How to preserve source mtp.* tensors after HF save_pretrained. "
+            "'rotate' applies the same R1 residual-basis transform and emits a separate mtp.lm_head; "
+            "'copy' restores unrotated tensors only for debugging/checkpoint completeness."
+        ),
+    )
+    ap.add_argument(
+        "--mtp-final-norm-mode",
+        default="separate-lm-head",
+        choices=["separate-lm-head", "ratio", "ones", "keep"],
+        help=(
+            "MTP final norm handling when --mtp-mode=rotate. "
+            "Use separate-lm-head for QuaRot+EAGLE correctness with the SGLang MTP patch."
+        ),
+    )
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
     rotations = [r.strip() for r in args.rotations.split(",") if r.strip()]
+    if args.mtp_mode == "rotate":
+        if rotations != ["R1"]:
+            raise ValueError(f"MTP rotation currently supports rotations=['R1'] only, got {rotations}")
+        if args.transform_type not in {"random-hadamard", "hadamard"}:
+            raise ValueError(f"MTP rotation does not support transform_type={args.transform_type!r}")
 
     print(f"[rotate] loading multimodal model from {args.model_path}", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -261,6 +356,14 @@ def main():
     print(
         f"[rotate] model loaded, class={type(model).__name__}, root dtype={next(model.parameters()).dtype}", flush=True
     )
+    patch_transformers5_no_split_modules(model)
+    text_config = getattr(model.config, "text_config", model.config)
+    hidden_size = int(text_config.hidden_size)
+    if args.mtp_mode == "rotate" and args.transform_block_size not in (None, hidden_size):
+        raise ValueError(
+            "MTP rotation sanity checks only support a full hidden-size R1 transform; "
+            f"got transform_block_size={args.transform_block_size}, hidden_size={hidden_size}"
+        )
 
     # Two pieces needed:
     # 1) NormMappings as per-layer absolute paths — sidesteps the
@@ -272,7 +375,9 @@ def main():
     #    norm_mappings kwargs are otherwise silently ignored
     mapping = build_qwen35_mapping()
     norm_mappings = build_qwen35_norm_mappings(model)
-    transform_config = build_qwen35_r1_transform_config()
+    fused_gemma_norm_paths = prepare_qwen35_gemma_norms_for_fusion(model, norm_mappings)
+    transform_config = build_qwen35_r1_transform_config(args.transform_type)
+    patch_llmcompressor_transformers5()
     from llmcompressor.modifiers.transform.spinquant import mappings as spinquant_mappings
     from llmcompressor.modifiers.transform.spinquant import norm_mappings as spinquant_norm_mappings
 
@@ -283,7 +388,6 @@ def main():
         f"[rotate] registered SpinQuant + norm mappings for {arch_name}, {len(norm_mappings)} NormMappings", flush=True
     )
 
-    from llmcompressor import oneshot
     from llmcompressor.modifiers.transform import SpinQuantModifier
 
     # llmcompressor's SpinQuantModifier.on_start unconditionally calls
@@ -316,8 +420,14 @@ def main():
 
     print(f"[rotate] running SpinQuant rotations={rotations} type={args.transform_type}", flush=True)
     # SpinQuant rotation is deterministic (or random-hadamard seeded); no
-    # calibration dataset needed for R1/R2.
-    oneshot(model=model, recipe=[modifier])
+    # calibration dataset needed for R1/R2. Call the modifier directly instead
+    # of llmcompressor.oneshot: llmcompressor 0.10's sequential pipeline now
+    # insists on a dataloader even for data-free SpinQuant.
+    state = type("_State", (), {"model": model})()
+    modifier.on_initialize(state)
+    modifier.on_start(state, None)
+    modifier.on_finalize(state)
+    zero_qwen35_fused_gemma_norms(model, fused_gemma_norm_paths)
 
     # Multimodal load preserves the `Qwen3_5ForConditionalGeneration`
     # architecture tag; no layers_block_type alias hack needed (sglang
@@ -349,6 +459,34 @@ def main():
         if s.is_file() and not d.is_file():
             shutil.copy2(s, d)
             print(f"[rotate] copied multimodal config: {fname}", flush=True)
+
+    from scripts.quantize.utils.mtp_checkpoint import (
+        build_quarot_r1_transform,
+        inject_mtp_tensors,
+        inject_rotated_mtp_tensors,
+    )
+
+    if args.mtp_mode == "copy":
+        injected = inject_mtp_tensors(dst, src)
+        print(
+            f"[rotate] restored {injected} unrotated MTP tensor(s) into rotated BF16 checkpoint. "
+            "This is only checkpoint-complete; QuaRot+EAGLE requires --mtp-mode=rotate.",
+            flush=True,
+        )
+    else:
+        final_norm_mode = args.mtp_final_norm_mode.replace("-", "_")
+        transform = build_quarot_r1_transform(hidden_size, transform_type=args.transform_type)
+        injected = inject_rotated_mtp_tensors(
+            dst,
+            src,
+            transform=transform,
+            final_norm_mode=final_norm_mode,
+        )
+        print(
+            f"[rotate] restored {injected} R1-rotated MTP tensor(s) into rotated BF16 checkpoint "
+            f"(final_norm_mode={final_norm_mode}). Run check_mtp_rotation.py before full eval.",
+            flush=True,
+        )
 
     print("[rotate] done", flush=True)
 
