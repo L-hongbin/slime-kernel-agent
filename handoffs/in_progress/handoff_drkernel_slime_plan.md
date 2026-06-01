@@ -52,7 +52,7 @@
 | Eval path 需要 prompt、response、prompt+response 都限制到 32768 | 原 eval config 只覆盖 response 长度，不够表达统一 context 上限 | `slime/utils/eval_config.py` 增加 `max_prompt_len`、`max_context_len`；`slime/rollout/sglang_rollout.py` 在发请求前根据 `_slime_max_context_len` cap `max_new_tokens`；`scripts/eval_kernelbench_level1.yaml` 设置三者为 `32768` | SGLang 日志显示 `context_len=32768` |
 | SGLang ready check 看起来卡住 | 需要用生成路径健康检查，且缺少周期日志时不清楚在等什么 | `slime/backends/sglang_utils/sglang_engine.py::_wait_server_healthy()` 使用 `/health_generate`，设置 HTTP timeout，周期性打印等待信息 | 保持 `/health_generate`，启动可观测 |
 | SGLang router 出现 `503/no_available_workers/all circuits open` | 服务端 `--sglang-max-running-requests 64` 生效，但客户端 semaphore 仍可能按更高 `sglang_server_concurrency` 发太多并发 | `slime/rollout/sglang_rollout.py::GenerateState` 和 `slime/utils/http_utils.py` 当前将客户端并发限制为 `int(min(args.sglang_server_concurrency * 1.5, args.sglang_max_running_requests)) * num_engines`；未设置 max-running 时退化为 `int(args.sglang_server_concurrency * 1.5) * num_engines` | 待用该更小改动重跑确认；上一版更严格 cap 已跑通 |
-| `--sglang-context-length 32768` 后 KV/Mamba 预分配仍很大 | Qwen3.5/GDN 模型的 SGLang Mamba cache 与 KV pool 预分配不只由普通 context len 线性决定 | 已记录现象到 `SPEC.md`；未继续改 SGLang 内部 | 当前通过限制并发跑通，显存行为仍需后续专门分析 |
+| `--sglang-context-length 32768` 后 KV/Mamba 预分配仍很大 | Qwen3.5/GDN 模型的 SGLang Mamba cache 与 KV pool 预分配不只由普通 context len 线性决定 | 实验现象留在 handoff/log 中；不再放入 `RUNTIME.md` | 当前通过限制并发跑通，显存行为仍需后续专门分析 |
 | Eval-only 初始化时 `train_iters=0` 可能影响 scheduler | slime `num_rollout=0` eval-only 仍会初始化 actor 和 optimizer scheduler，以便加载权重并推给 rollout | 只保留 `model.py` 中 `scheduler_train_iters = max(args.train_iters, 1)` 的最小保护；不再跳过 optimizer、不关闭训练 actor、不特殊禁用 ref | 对源代码保持更小改动；正式是否加载 ref 仍由 `--use-kl-loss` / `kl_coef` 控制 |
 | KernelBench eval metadata 没有统一 `uuid` / `entry_point` | converted train/eval parquet metadata 字段不完全一致 | `slime_plugins/drkernel/kernelgym_rm.py::_get_uuid()` 读取 `uuid`，否则 `problem_id/name`；`_get_entry_point()` 默认 `"Model"`；eval config 注入 `entry_point: Model`、`is_valid: true` | `KeyError: entry_point` 未复现 |
 | 模型输出可能包含 reasoning 或不完整 submission | KernelGym CUDA-Agent 后端只应吃完整三段 markdown submission | `slime_plugins/drkernel/extract.py` 去掉 think 区域，只接受最后一个完整 `CUDA_KERNELS -> APPLY_BINDINGS -> MODEL_NEW` 组；缺失时返回 `None`，reward 为 `0.0` | 单轮 eval 可跑通，后续多轮要基于该失败语义生成反馈 |
@@ -128,7 +128,7 @@ slime_plugins/drkernel/
 | Sample 到训练 batch | 默认不设；只有默认转换不够时用 `--custom-convert-samples-to-train-data-path` | 默认转换会消费 `tokens`、`response_length`、`reward`、`loss_mask` 等 | 旧多轮训练字段和 turn 统计参考：`drkernel/kernel/main_grading.py` 的 `global_turn_indices`、`turn_token_stats` 相关逻辑 | custom rollout 先直接填好 `loss_mask` / `metadata.round_number`，尽量走默认转换；如果默认转换无法表达多轮训练字段，再补 custom converter | 可选 `slime_plugins/drkernel/train_data.py` |
 | 数据加载验证 | 无训练 arg；smoke 脚本直接调用 | slime 没有 drkernel 专用 smoke | 旧 parquet 数据路径解析参考：`drkernel/kernel/scripts/rl/train_rl_common.sh::format_dataset_paths()`；训练加载参考：`drkernel/kernel/kernel_trainer.py` | 加载 3 条已转换 parquet/jsonl，dump 实际 `Sample.prompt` 和 `Sample.metadata`，确认字段没有丢 | `scripts/drkernel/smoke_slime_data_loading.py` |
 | reward 验证 | 无训练 arg；smoke 脚本模拟 `--custom-rm-path` | slime 没有 KernelGYM reward smoke | 旧离线 smoke/reward 批处理参考：`drkernel/run_cuda_reward_dir.py`；KernelGYM API contract：`kernelgym/server/api/models.py` | 用 2-4 条样本和手写回答跑 `/evaluate`，产出可人工 review 的 request/response/reward | `scripts/drkernel/smoke_kernelgym_reward.py` |
-| checkpoint/log/Ray | run 脚本参数；可选 `--custom-rollout-log-function-path` | slime 现有训练脚本模式和 `scripts/ray/start_cluster.sh` 可复用 | KernelGYM 作为独立 HTTP 服务；历史 endpoint 线索来自 handoff：直连 `http://192.168.16.39:8111`，relay `http://127.0.0.1:18111` | 增加 drkernel 专用 run 脚本参数，记录 `--rm-url`，小规模验证 checkpoint | `scripts/run-drkernel-*.sh`、`SPEC.md` |
+| checkpoint/log/Ray | run 脚本参数；可选 `--custom-rollout-log-function-path` | slime 现有训练脚本模式和 `scripts/ray/start_cluster.sh` 可复用 | KernelGYM 作为独立 HTTP 服务；历史 endpoint 线索来自 handoff：直连 `http://192.168.16.39:8111`，relay `http://127.0.0.1:18111` | 增加 drkernel 专用 run 脚本参数，记录 `--rm-url`，小规模验证 checkpoint | `scripts/run-drkernel-*.sh`、`RUNTIME.md` |
 | 多轮反馈 | `--rollout-function-path slime_plugins.drkernel.rollout.generate_rollout` | `--rollout-function-path` 支持自定义 rollout | 旧多轮/反馈语义需要从 drkernel 历史 prompt、messages、KernelGYM response artifacts 对齐；HTTP workflow 可参考 `kernelgym/server/api/server.py` 的 `/workflow/*` 路由 | 实现编译/正确性/性能反馈进入下一轮 user message、turn 控制、stop reason、loss mask | `slime_plugins/drkernel/rollout.py` |
 
 建议第一版 run 参数：
@@ -489,7 +489,7 @@ speedup shaping 和多轮 best-of-turn 聚合暂不接入，避免 reward 语义
 --rollout-function-path slime_plugins.drkernel.rollout.generate_rollout
 ```
 
-交付物：`scripts/run-drkernel-*.sh`、SPEC 中记录当前 KernelGYM endpoint、一次小规模 checkpoint 保存验证。
+交付物：`scripts/run-drkernel-*.sh`、`RUNTIME.md` 中记录稳定 KernelGYM endpoint、一次小规模 checkpoint 保存验证。
 
 ## 第 7 步：评估、对齐和扩展
 
@@ -668,4 +668,4 @@ Codex 给出 top-3 候选（按预期 wall-time win × 命中概率）：
 
 ### 评估精度参考
 
-所有 100×8 (n_samples_per_eval_prompt=8) 运行的精度汇总见 `handoffs/in_progress/HANDOFF_DRKERNEL_EVAL_ACCURACY.md`，含 9B + 27B 全部 8 个有效运行的 per-turn compile / correct / fast@1.0 / fast@1.2 (in_all) 表格 + 模板演化 + 元数据说明。
+所有 100×8 (n_samples_per_eval_prompt=8) 运行的精度汇总见 `handoffs/in_progress/handoff_drkernel_eval_accuracy.md`，含 9B + 27B 全部 8 个有效运行的 per-turn compile / correct / fast@1.0 / fast@1.2 (in_all) 表格 + 模板演化 + 元数据说明。

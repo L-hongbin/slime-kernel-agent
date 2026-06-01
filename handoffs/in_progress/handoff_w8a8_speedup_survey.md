@@ -1,8 +1,9 @@
 # Speedup survey: Qwen3.6-27B hybrid on A800-80GB (2026-05-27)
 
-Companion to `handoffs/in_progress/HANDOFF_DRKERNEL_W8A8_ROLLOUT.md`. Captures
+Companion to `handoffs/in_progress/handoff_drkernel_w8a8_rollout.md`. Captures
 a research-agent literature scan + a ranked decision matrix for techniques we
-have NOT yet tried. Anchor: current production wall 1:20:33 BF16 / 1:15:21
+have NOT yet tried or that are not already covered by a dedicated completed
+handoff. Anchor: current production wall 1:20:33 BF16 / 1:15:21
 W8A8 MLP-only = **1.07× wall** (per-token tok/s ~1.13× in slime, 1.52× in pure
 sglang ignore_eos).
 
@@ -22,10 +23,6 @@ sglang ignore_eos).
   Mean response ~6 K tokens. Real reward (KernelGym) takes seconds-to-minutes
   per call. **Reward + idle = ~47 % of production wall** (mock-KG
   decomposition, see W8A8_ROLLOUT.md §Efficiency).
-- **Already deployed / tried**: W8A8 INT8 RTN (1.07–1.31× wall); Hadamard
-  rotation pre-processor (+1–2 pp quality); SmoothQuant non_linear_attn
-  (accuracy run in progress); `--mamba-scheduler-strategy extra_buffer`
-  (regression).
 
 ## Ranked recommendations
 
@@ -33,83 +30,87 @@ Ranked by **ROI × low implementation cost × low risk** for this exact setup.
 
 ### Tier 1 — first to try
 
-#### 1. MTP / NEXTN speculative decoding in sglang
+These came from `docs/en/advanced/sglang-config.md`, the short PD
+disaggregation note, and the fully-async rollout example. They are mostly
+orthogonal to W8A8/spec-decoding: they change how requests are scheduled and how GPUs are
+partitioned, not the kernel math itself.
 
-Qwen3.6/Qwen3.5/Qwen3-Next models ship a native multi-token-prediction
-head that shares embedding + lm_head with the main model. sglang exposes
-the verifier via `--speculative-algorithm NEXTN --speculative-num-steps 3
---speculative-eagle-topk N --speculative-num-draft-tokens 4`.
+#### 1. PD disaggregation / heterogeneous SGLang server groups
 
-Crucially, the NEXTN path handles GDN/Mamba SSM-state rollback after
-rejected drafts — which is what breaks naive ngram speculative decoding on
-hybrid models (open vllm bug #39273: "Output token count abnormally
-increases on Qwen3-Next with ngram speculative"). Co-trained MTP head =
-no separate draft model to keep in sync with the policy.
+`--sglang-config` can launch different server groups for `prefill` and
+`decode`, with per-group GPU counts, TP sizes, and overrides. The docs
+explicitly recommend PD disaggregation for multi-turn/agentic RL because
+prefill is compute-heavy while decode is memory-bandwidth-heavy; one fixed
+regular engine shape is often not optimal for both.
 
-**Estimated wall gain**: 1.25–1.6× pure decode (lower than published
-H100 numbers because temperature sampling reduces accept rate at our RL
-rollout temperature). Stacked on W8A8's 1.27× decode → **roughly
-1.6–2.0× combined decode**, diluted to **~1.3–1.5× wall** by the 47 %
-reward dilution.
+For this run, the conservative interpretation is **experiment, not guaranteed
+win**. We are already at regular DP×TP=4×2 across the 8-GPU box, so a same-8GPU
+PD layout must trade off fewer regular decode engines against better
+prefill/decode specialization. The main cases where it can still help:
 
-**Implementation cost**: low. Few-hour spike to add the flags.
-**Caveats** to verify on a smoke before flipping production:
-- sglang's compressed-tensors loader must accept W8A8 on the MTP head
-  weights. If not, MTP forward stays BF16 and verifier savings shrink.
-- RL rollout uses temperature sampling (not greedy); paper claims
-  "preserving identical training curves" but verify on a 20×8 smoke.
+- prompts or turn histories get longer, making prefill/KV growth a bigger
+  fraction of wall;
+- scaling beyond 8 rollout GPUs, where prefill and decode can be sized
+  independently instead of cloning the same TP=2 engine;
+- current all-at-once eval floods SGLang with long multi-turn requests, so
+  decode engines stay occupied while prefill work queues behind them.
 
-**Sources**:
-- [Qwen3-Next sglang docs](https://docs.sglang.io/basic_usage/qwen3.html)
-- [sglang Qwen3-Next/Qwen3.5 tracking issue #18590](https://github.com/sgl-project/sglang/issues/18590)
-- [vllm ngram-on-GDN bug #39273](https://github.com/vllm-project/vllm/issues/39273)
-- [sglang NEXTN PR #3582](https://github.com/sgl-project/sglang/pull/3582)
-- [EAGLE-3 lmsys blog](https://www.lmsys.org/blog/2025-12-01-eagle3-vertex/)
-- [Qwen3.6 MTP GB10 benchmark](https://docai.hu/en/blog/qwen36-mtp-gb10)
+Candidate smoke configs:
 
-#### 2. Reward prefetch / inter-turn pipelining
+```yaml
+sglang:
+  - name: actor
+    model_path: /path/to/Qwen3.6-27B-W8A8
+    server_groups:
+      - worker_type: prefill
+        num_gpus: 2
+        num_gpus_per_engine: 2
+        overrides:
+          chunked_prefill_size: 4096
+      - worker_type: decode
+        num_gpus: 6
+        num_gpus_per_engine: 2
+        overrides:
+          context_length: 65536
+          max_running_requests: 64
+```
 
-Pipeline `reward(N) || decode(N+1)` instead of serializing them. The 47 %
-non-inference wall is our largest single dilution source; even partial
-overlap recovers meaningful wall.
+Also test the inverse if decode remains dominant: keep all 8 GPUs as regular
+TP=2 engines and only move to PD when extra rollout GPUs are available.
 
-If reward+idle is 47 % and we can hide reward behind the next turn's
-decode for ~half the turns (turns 1 and 2 can prefetch; turn 3's reward
-can't), recover **~30 % of the reward wall = 1.15–1.25× wall**. Stacks
-multiplicatively with #1.
+**Estimated gain**: same-8GPU likely **0.95–1.15× wall** depending on prompt
+length and queueing; with extra rollout GPUs, PD is a cleaner scaling path than
+blindly increasing TP. Treat as a scheduling/topology smoke test.
 
-**Implementation cost**: low-medium. Refactor lives almost entirely
-inside `slime_plugins/drkernel/rollout.py`. The slime async scaffolding
-exists; need to verify whether the multi-turn drkernel rollout currently
-issues `reward.await()` before next turn (likely yes — pipelining is the
-fix).
+#### 2. Fully-async rollout across train/rollout boundaries
 
-**Risk**: None semantically. Changes timing only. Reproducibility seeds
-behave the same.
+`examples/fully_async` uses `train_async.py` plus
+`slime.rollout.fully_async_rollout.generate_rollout_fully_async`. A background
+worker keeps up to `args.sglang_server_concurrency * num_engines` groups in
+flight and returns completed groups to training, so the next rollout does not
+wait on the slowest trajectories from the previous one.
 
-**Sources**:
-- [AReaL parallel-reward-service paper](https://arxiv.org/html/2505.24298v1)
-- [ROLL Flash](https://arxiv.org/html/2510.11345v1)
+This is most useful for production training loops, not standalone eval: the
+example currently says no evaluation mode. It fits DrKernel because custom
+generate/RM hooks still go through the standard plug-in paths.
+
+**Estimated gain**: can recover idle train/rollout gaps and long-tail waits;
+for pure eval it is not directly applicable.
+
+#### 3. Per-group overrides: smaller context where safe
+
+`sglang-config` allows overrides per model/server group, so prefill/decode
+groups can use different `context_length`, `mem_fraction_static`,
+`chunked_prefill_size`, and CUDA-graph settings. This matters because the
+recent BF16/SmoothQuant run lost KV capacity mainly from larger resident
+weights and lower `mem_fraction_static`; any avoidable context reservation
+directly reduces the maximum token pool.
+
+Do not globally cut `ctx=65536` until we have a prompt+response length
+histogram. But if eval/train splits have different tails, serve them with
+separate configs instead of forcing the worst-case context on every request.
 
 ### Tier 2 — fallbacks if Tier 1 blocked
-
-#### 3. DAS suffix-tree drafter (only if MTP blocked)
-
-Training-free spec-decode drafter from a sliding window of recent
-rollouts, with length-aware budget (more drafting on long trajectories).
-RL-friendly because the drafter auto-tracks policy drift; no head retrain
-needed. Up to 50 % rollout-time reduction on math/code reasoning per the
-paper.
-
-**Use when**: MTP/NEXTN path doesn't work (e.g. compressed-tensors loader
-rejects W8A8 on MTP head weights). Otherwise prefer #1.
-
-**Cost**: medium-high. No sglang integration exists; ~3–5 days to wire a
-suffix-tree drafter into sglang's NEXTN draft interface.
-
-**Sources**:
-- [DAS paper](https://arxiv.org/html/2511.13841)
-- [Together AI blog on DAS](https://www.together.ai/blog/distribution-aware-speculative-decoding)
 
 #### 4. INT4 W4A16 (AWQ-Marlin) for MLP only
 
@@ -190,11 +191,16 @@ is limited; QServe ships its own runtime. Multi-week integration. Defer.
 
 #### 8. sglang piecewise CUDA graph
 
-+0.5–8.2 % decode wall in published numbers. For our batch=32 regime,
-likely 1.02–1.05× decode → ~1.00–1.03× wall after reward dilution.
+SGLang's piecewise CUDA graph is mainly an extend/prefill optimization, while
+our DrKernel rollout wall is dominated by long decode plus KernelGym reward and
+queueing. For this workload, expect **0–3 % wall** unless the run is visibly
+prefill/extend-bound. Prefer first ensuring ordinary CUDA graph batch coverage
+with `--sglang-cuda-graph-bs 1 2 4 8 $(seq 16 8 256)`.
+
 **Known correctness bug on Qwen3-Next** (sglang issue #17330: "Output
 token count abnormally increases when --enable-piecewise-cuda-graph is
-set"). Do not enable on Qwen3.6 without a token-count regression smoke.
+set"). Do not enable `--sglang-enable-piecewise-cuda-graph` on Qwen3.6 without
+a token-count regression smoke and KernelBench score check.
 
 **Source**: [sglang PCG bug #17330](https://github.com/sgl-project/sglang/issues/17330)
 
@@ -209,39 +215,25 @@ eval semantics; requires correctness validation.
 
 | | reason |
 |---|---|
-| **DP × TP refactor** | We're already at DP=4 × TP=2 across 8 GPUs (4 engines × 2 GPUs each); no further DP gain. |
+| **Plain DP × TP refactor** | We're already at DP=4 × TP=2 across 8 GPUs (4 engines × 2 GPUs each); no further plain DP gain. `--sglang-config` PD disaggregation is a separate topology experiment because it changes prefill/decode allocation. |
 | **Per-group W8A8** | sglang's `compressed_tensors_w8a8_int8` scheme is per-channel/per-tensor only; we explicitly hard-fail on per-group. Defer until sglang adds it. |
 | **FP8 weight/activation tensor cores** | A800 = SM 8.0, no FP8 hardware. Software FP8 is slower than INT8. |
-| **LayerSkip / SkipDecode** | Requires layer-dropout fine-tune step on the 27B; MTP head ships in the ckpt already (use #1 instead). |
+| **LayerSkip / SkipDecode** | Requires layer-dropout fine-tune step on the 27B; lower-cost SpecDec routes are tracked in `handoff_specdec_drkernel.md`. |
 | **TP=4 instead of TP=2** | Our profile shows allreduce at ~5 % of W8A8 step. TP=4 doubles allreduce; net loss for decode latency. |
 | **TP=1** | Model weights (54 GB BF16 or 30 GB W8A8) + scratch + KV does not fit per A800-80GB. |
 
-## Stacked expectation if Tier 1 lands
-
-If both **#1 (MTP/NEXTN)** and **#2 (reward prefetch)** land cleanly:
-**~1.5–1.8× wall over current W8A8 production** (BF16 → 1.07× → ~1.6–1.9×),
-with no quality regression beyond what MTP introduces for sampled
-decoding.
-
 ## Action items / next steps
 
-1. **Verify MTP head + W8A8 ckpt compatibility** in sglang's
-   compressed-tensors loader. Either load the Qwen3.6-27B-W8A8-RTN-local-mlp
-   ckpt with `--speculative-algorithm NEXTN` and see if it boots, or
-   read the loader source to confirm the MTP weights are NOT in the
-   `ignore` list (they should NOT be, since they're not under `mlp.`,
-   `self_attn.`, or `linear_attn.`).
-2. **20×8 smoke** with NEXTN enabled vs the current W8A8 baseline.
-   Compare:
-   - Wall and per-token tok/s (decode speedup ratio)
-   - Correct T3 score (quality preserved)
-   - Acceptance rate from the sglang decode log
-3. **Audit `slime_plugins/drkernel/rollout.py`** for the multi-turn
-   loop: where the reward await blocks the next-turn generate submit.
-   That's the seam to add async prefetch.
-4. After #1 and #2 land, **revisit FP8 KV cache** (item #5). The bigger
-   KV pool + speculative decode together push effective concurrency
-   higher than either alone.
+1. **Try one PD-disaggregation config**:
+   start with 2 GPUs prefill TP=2 and 6 GPUs decode TP=2, then compare against
+   regular DP×TP=4×2 on completed samples/min and SGLang full-token usage.
+2. For production training, **evaluate fully-async rollout** with
+   `train_async.py` and
+   `--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async`.
+   Do not use it for standalone eval yet; the example documents no eval mode.
+3. If PD/async changes raise effective decode concurrency, **revisit FP8 KV
+   cache** (item #5). The bigger KV pool could matter more under higher
+   concurrency.
 
 ## Sources
 
@@ -249,18 +241,11 @@ decoding.
 
 | topic | URL |
 |---|---|
-| MTP / NEXTN on Qwen3.5+ | https://docs.sglang.io/basic_usage/qwen3.html |
-| Qwen3-Next sglang tracking | https://github.com/sgl-project/sglang/issues/18590 |
-| ngram-on-GDN bug | https://github.com/vllm-project/vllm/issues/39273 |
-| sglang NEXTN PR | https://github.com/sgl-project/sglang/pull/3582 |
-| EAGLE-3 / lmsys | https://www.lmsys.org/blog/2025-12-01-eagle3-vertex/ |
-| Qwen3.6 MTP GB10 | https://docai.hu/en/blog/qwen36-mtp-gb10 |
-| DAS paper | https://arxiv.org/html/2511.13841 |
-| Together AI DAS blog | https://www.together.ai/blog/distribution-aware-speculative-decoding |
-| AReaL | https://arxiv.org/html/2505.24298v1 |
-| ROLL Flash | https://arxiv.org/html/2510.11345v1 |
 | RollPacker | https://arxiv.org/html/2509.21009v1 |
 | APRIL (slime-integrated) | https://arxiv.org/html/2509.18521v1 |
+| slime sglang-config | `docs/en/advanced/sglang-config.md` |
+| slime PD disaggregation | `docs/en/advanced/pd-disaggregation.md` |
+| slime fully-async rollout | `examples/fully_async/README.md`, `slime/rollout/fully_async_rollout.py` |
 | Marlin | https://arxiv.org/abs/2408.11743 |
 | Red Hat Marlin | https://developers.redhat.com/articles/2024/04/17/how-marlin-pushes-boundaries-mixed-precision-llm-inference |
 | AutoAWQ | https://github.com/casper-hansen/AutoAWQ |
