@@ -56,6 +56,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
+        self._is_sleeping = False
 
         init(args)
 
@@ -156,7 +157,13 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if self._is_sleeping:
+            logger.info("sleep() called on already-paused actor; skipping")
+            return
 
+        # Keep all ranks aligned before tearing down NCCL state and pausing
+        # torch_memory_saver-managed CUDA mappings.
+        dist.barrier(group=get_gloo_group())
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
         if (
@@ -167,20 +174,29 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
+        clear_memory(clear_host_memory=True)
+        dist.barrier(group=get_gloo_group())
 
         torch_memory_saver.pause()
+        self._is_sleeping = True
 
         print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+        if not self._is_sleeping:
+            logger.info("wake_up() called on already-active actor; skipping")
+            return
+
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
 
+        dist.barrier(group=get_gloo_group())
         clear_memory()
         reload_process_groups()
+        self._is_sleeping = False
         print_memory("after wake_up model")
 
     def _get_rollout_data(self, rollout_data_ref: Box) -> RolloutBatch:
@@ -374,6 +390,8 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
+
+        del rollout_data
 
         if self.args.offload_train:
             self.sleep()
