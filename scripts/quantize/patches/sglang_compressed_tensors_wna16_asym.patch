@@ -1,0 +1,12 @@
+diff --git a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+index b8cfe41..3ccaa19 100644
+--- a/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
++++ b/python/sglang/srt/layers/quantization/compressed_tensors/compressed_tensors.py
+@@ -522,6 +522,7 @@ class CompressedTensorsConfig(QuantizationConfig):
+                 return CompressedTensorsWNA16(
+                     num_bits=weight_quant.num_bits,
+                     strategy=weight_quant.strategy,
++                    symmetric=weight_quant.symmetric,
+                     group_size=weight_quant.group_size,
+                     actorder=weight_quant.actorder,
+                 )
