@@ -17,6 +17,8 @@
 - “G128 量化损失应该小于 per-channel”这个前提在当前实现里不成立。全 263 个量化矩阵对 BF16 反量化 rel-L2：per-channel mean/median/max 为 `0.01037/0.01010/0.01804`，G128 为 `0.01348/0.01245/0.02628`。G128 在 `attn.k/o/v` 和部分 `mlp.down/gate` 上明显更差。原因是当前 SGLang `blockwise_int8` 的 scale 是 `128x128` block 共用（例如 `attn.k` scale `(8,40)`），不是每输出通道一条独立 scale；per-channel 压缩格式则是 row scale（例如 `attn.k` scale `(1024,1)`）。所以 G128 的长尾不是“更低量化损失下反而更差”的悖论，而是一个更粗 scale 方案在输出格式/停止倾向上放大误差的可疑失败。
 - 2026-06-01 按要求重做 SmoothQuant + W8A8-G64：checkpoint 为 `checkpoints/quantized/SmoothQuant/Qwen3.6-27B-SQ-W8A8-G64-RTN-nonla-mtp-a0p5-ultrachat`，`linear_attn` 和 `mtp.fc` 保持 BF16，EAGLE 开启，`.22` 上补齐并验证 G64 SGLang blockwise-int8 configs。第一份 G64 eval 因缺 G64 configs 被停掉，只作 diagnostic；有效 tuned run 成功但不胜出：score `0.37500`，wall `1:35:25`，srv tok/s `2597`，accept `3.244`。这不是 EAGLE collapse，也不是 missing-config/OOM；它仍有明显长输出病态，且 high-concurrency decode 本身低于 BF16/per-channel/G128。
 - G64+SmoothQuant 比 G128 改善了总生成量但没有解决 wall：G64 全 turn `27.23M` tokens，低于 G128 `30.27M`，但仍高于 per-channel `26.47M` 和 BF16 `26.56M`；turn1 `>32768` 为 `104`，低于 G128 `168`，但仍有 `14` 个 `>60k`。更关键的是 G64 full-run `req>=80` median decode 只有 `2597 tok/s`，低于 G128 `2767`、BF16 `2994`、per-channel `3162`。所以 G64+SQ 不是可接受替代，后续若继续看 blockwise，需要单独做 fixed-output kernel/long-context audit，而不能只看 full eval wall。
+- 2026-06-01 又按要求补了 RTN W8A8-G64（不加 SmoothQuant）：checkpoint 为 `checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-G64-RTN-nonla-mtp`，同样 `linear_attn` 和 `mtp.fc` 保持 BF16，EAGLE 开启，沿用 `.22` tuned G64 configs + `mem82/cp4096`。full eval 成功但仍不胜出：score `0.38125`，wall `1:39:02`，srv tok/s `2611`，accept `3.239`。fallback/OOM/error 扫描为 0，Ray job 成功；外层 wrapper 仍是终端状态查询 `unknown` 导致 `rc=1`。
+- RTN-G64 也不是解决 G128 的方向：全 turn `27.55M` tokens，低于 G128 `30.27M`，但高于 per-channel/BF16；turn1 `>32768=109`、`>60000=15`，尾部出现 sample 727/774 这类 `64k` turn1，部分后续 turn 直接空或继续长输出。它的 wall 几乎等于 G128 (`1:39:02` vs `1:39:56`)，说明问题不是 SmoothQuant 单独引入，也不是 EAGLE collapse；blockwise G64/G128 的输出分布和 high-concurrency decode 都不如当前 per-channel RTN Non-LA。
 - W4A16 AWQ 已拆到独立 handoff：`handoffs/in_progress/handoff_w4a16_awq.md`。这里不再维护 W4 细节，避免两份文档分叉。
 
 缩写：`SQ` = SmoothQuant；`MLP` = 只量化 MLP；`Non-LA` = `MLP+self_attn`，不量化 `linear_attn`；`all` = 全 Linear。
@@ -31,6 +33,7 @@
 | BF16 | - | - | 39.8 / 62.1 / 65.4 | 23.2 / 34.6 / 38.8 | 9.6 / 12.6 / 14.6 | 4.9 / 7.5 / 9.9 |
 | W8A8 | RTN | Non-LA | 34.0 / 60.5 / 62.5 | 19.6 / 32.6 / 40.8 | 8.2 / 15.0 / 17.0 | 4.0 / 8.1 / 9.6 |
 | W8A8-G128 | RTN | Non-LA | 46.5 / 65.6 / 67.8 | 27.0 / 34.9 / 39.2 | 11.2 / 15.1 / 15.4 | 6.4 / 8.0 / 7.2 |
+| W8A8-G64 | RTN | Non-LA | 43.1 / 65.0 / 68.2 | 24.9 / 35.1 / 38.6 | 10.2 / 12.6 / 15.2 | 5.2 / 6.4 / 8.9 |
 | W8A8-G64 | SQ+RTN | Non-LA | 39.6 / 61.6 / 67.4 | 24.2 / 33.1 / 38.2 | 9.8 / 14.8 / 17.2 | 4.5 / 8.0 / 9.9 |
 | W8A8 | QuaRot+RTN | Non-LA | 36.4 / 66.4 / 65.8 | 21.9 / 33.2 / 37.5 | 9.5 / 13.9 / 16.6 | 3.5 / 6.8 / 8.5 |
 | W8A8 | SQ+RTN | Non-LA | 34.2 / 61.5 / 65.0 | 18.8 / 28.9 / 35.4 | 7.6 / 12.4 / 15.8 | 3.1 / 7.1 / 8.9 |
@@ -40,6 +43,7 @@
 
 - RTN Non-LA 的 T3 Correct / Fast 不差，但 T1/T2 低于 BF16。
 - G128 的 T1/T2 指标仍偏高，但修复后最终 score `0.38875` 仍低于 per-channel RTN Non-LA 的 `0.40750`，且 wall 仍更慢；只有在明确优先 G128 质量信号时才值得继续看。
+- RTN-G64 的 per-turn Correct 看起来接近 G128，但最终 score 只有 `0.38125`，wall `1:39:02`，且 long-tail/吞吐都没有超过 per-channel；不能用 T1/T2 表面指标替代端到端判断。
 - G64+SmoothQuant 的 per-turn 指标不差，但最终 score 只有 `0.37500`，wall `1:35:25`，比 BF16/per-channel 都慢；不能用 per-turn 表掩盖端到端长尾和吞吐问题。
 - QuaRot+RTN Non-LA 修复后 T3 Correct `37.5%`，没有旧 accept-collapse，但低于 RTN Non-LA 的 `40.8%`；T3 Fast@1.0/1.2 为 `16.6%/8.5%`，也低于 RTN 的 `17.0%/9.6%`。
 - SQ+RTN MLP 明显好于 SQ+RTN Non-LA，但仍没有超过 RTN Non-LA；当前不值得继续扩 SmoothQuant。
@@ -72,6 +76,7 @@
 | BF16 | - | - | 4 | 16 | 1:24:37 | 2994 | 3.24 | 74.6% |
 | W8A8 | RTN | Non-LA | 4 | 16 | 1:16:12 | 3162 | 3.22 | 74.2% |
 | W8A8-G128 | RTN | Non-LA | 4 | 16 | 1:39:56 | 2767 | 3.23 | 74.2% |
+| W8A8-G64 | RTN | Non-LA | 4 | 16 | 1:39:02 | 2611 | 3.24 | 74.6% |
 | W8A8-G64 | SQ+RTN | Non-LA | 4 | 16 | 1:35:25 | 2597 | 3.24 | 74.8% |
 | W8A8 | SmoothQuant | Non-LA | 4 | 16 | 1:16:47 | 3169 | 3.24 | 74.6% |
 | W8A8 | SmoothQuant | MLP | 4 | 16 | 1:17:55 | 3160 | 3.23 | 74.4% |
@@ -92,8 +97,10 @@ G128 相对 per-channel 也不是同样的长度分布：per-channel 全 turn `2
 
 G64+SmoothQuant 的有效 tuned run 不含 missing-config/OOM：G64 configs 已为 `8704x5120`, `5120x4352`, `3584x5120`, `5120x1536` 调好，startup 使用 tuned config，没有 `Using default W8A8` 警告。第一份未调 config 的 run 在约 43% 被停掉，只能说明 G64+SQ 也有长度病态，不能作生产数。有效 run 的全 turn tokens `27.23M`，比 G128 少 `3.03M`，但 wall 仍 `1:35:25`，只比 G128 快 `4:31`，比 BF16 慢 `10:48`，比 per-channel 慢 `19:13`。原因不是 EAGLE 坏掉：accept len `3.244`。更像是两件事叠加：一是仍有长输出长尾（turn1 `>32768=104`, `>60000=14`，turn2/turn3 也有 `>32k`），二是 G64 full-run high-concurrency decode median 只有 `2597 tok/s`，低于 G128 的 `2767` 和 per-channel 的 `3162`。所以 G64+SQ 不能替代 RTN Non-LA；如果继续追，需要单独固定输出/长上下文 microbench 判断 G64 blockwise kernel 是否本身慢。
 
+RTN-G64 的有效 tuned run 同样不含 missing-config/OOM/fallback：`quantization_config.weight_block_size=[64,64]`，263 个 INT8 Linear，`linear_attn_scale_inv_count=0`，MTP 7 个 INT8，`mtp.fc` BF16。full eval 的全 turn tokens `27.55M`，turn1 `13.71M`，turn1 `>32768=109`、`>60000=15`；score `0.38125`，wall `1:39:02`，比 G64+SQ 更准但更慢，且几乎等于 G128 fixed 的 wall。decode 侧 `req>=80` median `2611 tok/s`，仍明显低于 BF16 `2994` 和 per-channel `3162`。所以 RTN-G64 也不能替代 per-channel RTN Non-LA；当前更像 blockwise-int8 G64/G128 共同存在输出停止/格式服从长尾和高并发吞吐问题。
+
 对比 QuaRot no-EAGLE 时，不能直接用 G128+EAGLE 的 `srv tok/s` 判定端到端 wall：QuaRot no-draft 没有 draft/MTP 显存和 speculative verify 开销，token pool 也更大 (`2,000,958`)；G128+EAGLE 修复后仍是更小 token pool、三轮 multi-turn、reward 和 tail 的组合指标。修复后 G128 wall 从旧 diagnostic 的 `1:55:24` 降到 `1:39:56`，但仍慢于 per-channel RTN Non-LA+EAGLE 的 `1:16:12`。
-SQ 两行的 wrapper `rc=1` 来自 Ray 状态收尾，`eval 0` 和 `eval_0.pt` 都完整，按完成记录。
+SQ 两行和 RTN-G64 的 wrapper `rc=1` 来自 Ray 状态收尾/终端状态查询，`eval 0` 和 `eval_0.pt` 都完整，按完成记录。
 G128 fixed run 的 Ray job 成功；外层 wrapper 因终端状态查询返回 `unknown` 退出 `rc=1`，但 `Job 'raysubmit_gFWnazLJUabafytt' succeeded`、`eval 0` 和 `eval_0.pt` 都完整。旧 G128 `20260531_110823` 仅保留为 diagnostic：它有 OOM/router error，不再作为生产对比数。
 旧 QuaRot 20260530 Non-LA/MLP 是 early-stop 失败摘要：`accept=1.00`，0/800；对应旧量化目录和 eval 目录已按要求删除，不再作为可复跑对象。
 
@@ -146,6 +153,12 @@ G128 fixed run 的 Ray job 成功；外层 wrapper 因终端状态查询返回 `
 | G128 pathology examples | `checkpoints/Qwen3.6-27B/g128_length_analysis_20260601/length_pathology_examples.md` |
 | G128 old diagnostic eval | `checkpoints/Qwen3.6-27B-W8A8-G128-RTN-nonla-mtp/20260531_110823_w8a8.g128.nonla_mtp.100x8.eagle_ctx65536_n8_summ1600` |
 | G128 fixed eval | `checkpoints/Qwen3.6-27B-W8A8-G128-RTN-nonla-mtp/20260531_150558_w8a8.g128.nonla_mtp.sglcfg.mem82.cp4096.100x8.eagle_ctx65536_n8_summ1600` |
+| RTN G64 W8A8 ckpt | `checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-G64-RTN-nonla-mtp` |
+| RTN G64 static scope | `checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-G64-RTN-nonla-mtp/static_scope_summary.txt` |
+| RTN G64 reference validation | `checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-G64-RTN-nonla-mtp/validation_32tensor.txt` |
+| RTN G64 tuned eval | `checkpoints/Qwen3.6-27B-W8A8-G64-RTN-nonla-mtp/20260601_032830_rtn.g64.nonla_mtp.sglcfg64.mem82.cp4096.100x8.eagle.rm16_ctx65536_n8_summ1600` |
+| RTN G64 length analysis | `checkpoints/Qwen3.6-27B/rtn_g64_length_analysis_20260601/` |
+| RTN G64 quant/smoke logs | `checkpoints/quantized/RTN/logs/rtn_w8a8_g64_nonla_mtp_20260601_111700.log`, `checkpoints/quantized/RTN/logs/sgl_engine_smoke_rtn_w8a8_g64_eagle_20260601_112000.log` |
 | SQ G64 W8A8 ckpt | `checkpoints/quantized/SmoothQuant/Qwen3.6-27B-SQ-W8A8-G64-RTN-nonla-mtp-a0p5-ultrachat` |
 | SQ G64 static scope | `checkpoints/quantized/SmoothQuant/Qwen3.6-27B-SQ-W8A8-G64-RTN-nonla-mtp-a0p5-ultrachat/static_scope_summary.txt` |
 | SQ G64 tuned eval | `checkpoints/Qwen3.6-27B-SQ-W8A8-G64-RTN-nonla-mtp-a0p5-ultrachat/20260601_013236_smooth.g64.nonla_mtp.sglcfg64.mem82.cp4096.100x8.eagle.rm16_ctx65536_n8_summ1600` |
@@ -156,7 +169,7 @@ G128 fixed run 的 Ray job 成功；外层 wrapper 因终端状态查询返回 `
 
 ## 下一步
 
-1. 当前可用基线继续用 W8A8 RTN Non-LA + EAGLE；G128 fixed 已无 OOM，score `0.38875`，但 wall `1:39:56` 仍慢于 per-channel RTN Non-LA 的 `1:16:12`，所以不替换基线。后续如再跑 G128，必须沿用 tuned SGLang configs + `mem82/cp4096`。
-2. SmoothQuant 暂停扩展：MLP 精度接近 BF16，但没有超过 RTN Non-LA；G64+SQ 也没有解决 wall，score `0.37500`、wall `1:35:25`，且 high-concurrency decode median `2597 tok/s` 偏低。
+1. 当前可用基线继续用 W8A8 RTN Non-LA + EAGLE；G128 fixed 已无 OOM，score `0.38875`，但 wall `1:39:56` 仍慢于 per-channel RTN Non-LA 的 `1:16:12`，所以不替换基线。后续如再跑 G128/G64，必须沿用 tuned SGLang configs + `mem82/cp4096`，并先做 fixed-output/long-context microbench。
+2. SmoothQuant 暂停扩展；G64+SQ 没有解决 wall，score `0.37500`、wall `1:35:25`，且 high-concurrency decode median `2597 tok/s` 偏低。RTN-G64 也不胜出，score `0.38125`、wall `1:39:02`、median decode `2611 tok/s`，不能替代 per-channel RTN Non-LA。
 3. QuaRot Non-LA EAGLE/no-EAGLE 都已完整跑完但不胜出；先做 logit/KL 与 draft-target agreement 小样本 sanity，再决定是否补 MLP。旧 20260530 QuaRot W8A8 不要再跑 full eval。
 4. W4A16 AWQ 后续只维护在 `handoffs/in_progress/handoff_w4a16_awq.md`；不要在本文继续追加 W4 细节。
