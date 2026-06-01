@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import random
 import time
 from copy import deepcopy
@@ -28,6 +29,12 @@ except ImportError:
     from utils import normalize_env_feedback, postprocess_turn_samples, precheck_response, split_think_response
 
 logger = logging.getLogger(__name__)
+
+KERNEL_AGENT_GENERATE_GUARD_SEC = int(os.environ.get("KERNEL_AGENT_GENERATE_GUARD_SEC", "0") or 0) or (
+    int(CUDA_AGENT_CONFIGS["env"].get("kernel_eval_client_timeout", 2400))
+    + int(CUDA_AGENT_CONFIGS["env"].get("kernel_eval_task_timeout", 300))
+    + 300
+)
 
 
 if ray is not None:
@@ -128,6 +135,36 @@ def _should_log_multiturn(sample: Sample) -> bool:
     if sample_rate >= 1:
         return True
     return random.random() < sample_rate
+
+
+def _update_sample_progress(
+    sample: Sample,
+    turn_logs: list[dict[str, Any]],
+    finish_reason: str,
+    *,
+    abort_reason: str | None = None,
+    elapsed_sec: float | None = None,
+) -> dict[str, Any]:
+    total_model_time = sum(float(item.get("model_time", 0.0)) for item in turn_logs)
+    total_env_time = sum(float(item.get("env_time", 0.0)) for item in turn_logs)
+    total_request_time = total_model_time + total_env_time
+    if elapsed_sec is not None:
+        total_request_time = max(total_request_time, float(elapsed_sec))
+
+    metadata = dict(sample.metadata or {})
+    metadata.update(
+        {
+            "finish_reason": finish_reason,
+            "total_request_time": total_request_time,
+            "num_turns_completed": len(turn_logs),
+            "total_model_time": total_model_time,
+            "total_env_time": total_env_time,
+        }
+    )
+    if abort_reason is not None:
+        metadata["abort_reason"] = abort_reason
+    sample.metadata = metadata
+    return metadata
 
 
 async def _is_slowest_multiturn(args, sample: Sample, total_request_time: float) -> bool:
@@ -372,6 +409,7 @@ def _sample_for_turn(
     turn_sample.rollout_log_probs = log_probs
     turn_sample.reward = reward
     turn_sample.status = status
+    turn_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
     turn_sample.loss_mask = [1] * len(response_ids)
     turn_sample.metadata = dict(turn_sample.metadata or {})
     turn_sample.metadata.update(
@@ -412,6 +450,7 @@ def _pad_turn_samples(
         fake_sample.rollout_log_probs = [0.0]
         fake_sample.reward = 0.0
         fake_sample.status = Sample.Status.COMPLETED
+        fake_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
         fake_sample.loss_mask = [0]
         fake_sample.remove_sample = True
         fake_sample.metadata = dict(fake_sample.metadata or {})
@@ -427,7 +466,100 @@ def _pad_turn_samples(
     return sorted(padded_samples, key=lambda sample: int(sample.metadata["turn_idx"]))
 
 
+def _get_abort_padding(args) -> tuple[int | None, int | None, str | None]:
+    if not bool(getattr(args, "use_multi_turn", False) and getattr(args, "padding_turns", False)):
+        return None, None, None
+
+    max_turns = getattr(args, "max_turns", None)
+    if max_turns is None:
+        return None, None, None
+    max_turns = int(max_turns)
+
+    try:
+        state = GenerateState(args)
+        pad_token_id = state.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = state.tokenizer.eos_token_id
+        pad_token = state.tokenizer.pad_token or state.tokenizer.eos_token
+        if pad_token_id is None:
+            pad_token_id = 0
+        if pad_token is None:
+            pad_token = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("CUDA agent abort padding fell back to token 0: %s", exc)
+        pad_token_id = 0
+        pad_token = ""
+
+    return max_turns, pad_token_id, pad_token
+
+
+def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -> Sample | list[Sample]:
+    metadata = dict(sample.metadata or {})
+    num_turns_completed = int(metadata.get("num_turns_completed", 0) or 0)
+    total_model_time = float(metadata.get("total_model_time", 0.0) or 0.0)
+    total_env_time = float(metadata.get("total_env_time", 0.0) or 0.0)
+    progress = {
+        "finish_reason": "aborted",
+        "abort_reason": abort_reason,
+        "total_request_time": max(float(elapsed_sec), total_model_time + total_env_time),
+        "num_turns_completed": num_turns_completed,
+        "total_model_time": total_model_time,
+        "total_env_time": total_env_time,
+    }
+
+    aborted = deepcopy(sample)
+    aborted.tokens = [0, 0]
+    aborted.response = ""
+    aborted.response_length = 1
+    aborted.rollout_log_probs = [0.0]
+    aborted.reward = 0.0
+    aborted.status = Sample.Status.ABORTED
+    aborted.group_id = sample.group_id if sample.group_id is not None else sample.index
+    aborted.loss_mask = [0]
+    aborted.remove_sample = True
+    max_turns_for_abort = getattr(args, "max_turns", None)
+    if max_turns_for_abort is not None:
+        turn_idx = min(num_turns_completed, max(0, int(max_turns_for_abort) - 1))
+    else:
+        turn_idx = max(num_turns_completed, 0)
+    aborted.metadata = {**metadata, **progress, "turn_idx": turn_idx, "remove_reason": "aborted"}
+
+    if not getattr(args, "use_multi_turn", False):
+        return aborted
+
+    output_samples = [aborted]
+    max_turns, pad_token_id, pad_token = _get_abort_padding(args)
+    if max_turns is not None:
+        output_samples = _pad_turn_samples(
+            output_samples,
+            aborted,
+            max_turns=max_turns,
+            pad_token_id=pad_token_id,
+            pad_token=pad_token,
+        )
+    return postprocess_turn_samples(args, output_samples, finish_reason="aborted")
+
+
 async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+    started_at = time.monotonic()
+    try:
+        async with asyncio.timeout(KERNEL_AGENT_GENERATE_GUARD_SEC):
+            return await _generate_impl(args, sample, sampling_params)
+    except asyncio.TimeoutError:
+        elapsed_sec = time.monotonic() - started_at
+        logger.warning(
+            "CUDA agent generate timed out after %.1fs (guard=%ss)",
+            elapsed_sec,
+            KERNEL_AGENT_GENERATE_GUARD_SEC,
+        )
+        return _abort_result(args, sample, "wall_clock_timeout", elapsed_sec)
+    except Exception as exc:  # noqa: BLE001
+        elapsed_sec = time.monotonic() - started_at
+        logger.exception("CUDA agent generate failed after %.1fs: %s", elapsed_sec, exc)
+        return _abort_result(args, sample, f"exception:{type(exc).__name__}", elapsed_sec)
+
+
+async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     """Generate CUDA-kernel multi-turn rollouts.
 
     This follows the drkernel-style structure: each assistant turn becomes one
@@ -488,6 +620,7 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         if finish_type == "abort":
             sample.status = Sample.Status.ABORTED
             finish_reason = "model_abort"
+            _update_sample_progress(sample, turn_logs, finish_reason, abort_reason=finish_reason)
             _log_multiturn_messages(sample, messages, turn_logs, finish_reason)
             if padding_turns:
                 output_samples = _pad_turn_samples(
@@ -555,6 +688,7 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         }
         turn_logs.append(turn_log)
         output_samples.append(turn_sample)
+        _update_sample_progress(sample, turn_logs, "running")
 
         messages.append(
             {
@@ -575,6 +709,7 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
     total_request_time = sum(
         float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs
     )
+    _update_sample_progress(sample, turn_logs, finish_reason)
     is_slowest = await _is_slowest_multiturn(args, sample, total_request_time) if turn_logs else False
     if should_log or is_slowest:
         _log_multiturn_messages(

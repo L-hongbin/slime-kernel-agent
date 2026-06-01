@@ -705,7 +705,11 @@ def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
     factor = None if factor is None else float(factor)
 
     for sample in output_samples:
-        if sample.remove_sample:
+        if (
+            sample.remove_sample
+            or sample.status == Sample.Status.ABORTED
+            or (sample.loss_mask is not None and sum(sample.loss_mask) == 0)
+        ):
             continue
         env_extra_info = sample.metadata.get("env_extra_info") if isinstance(sample.metadata, dict) else None
         if not isinstance(env_extra_info, dict):
@@ -726,6 +730,58 @@ def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
             _mark_remove_sample(sample, "coverage_rs")
 
 
+def _apply_rollout_progress_metadata(output_samples: list[Sample], finish_reason: str) -> None:
+    total_model_time = 0.0
+    total_env_time = 0.0
+    num_turns_completed = 0
+    abort_reason = None
+    existing_total_model_time = 0.0
+    existing_total_env_time = 0.0
+    existing_num_turns_completed = 0
+
+    for sample in output_samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if abort_reason is None and metadata.get("abort_reason") is not None:
+            abort_reason = metadata.get("abort_reason")
+        existing_total_model_time = max(existing_total_model_time, float(metadata.get("total_model_time", 0.0) or 0.0))
+        existing_total_env_time = max(existing_total_env_time, float(metadata.get("total_env_time", 0.0) or 0.0))
+        existing_num_turns_completed = max(
+            existing_num_turns_completed, int(metadata.get("num_turns_completed", 0) or 0)
+        )
+        if metadata.get("is_pad_turn"):
+            continue
+        total_model_time += float(metadata.get("model_time", 0.0) or 0.0)
+        total_env_time += float(metadata.get("env_time", 0.0) or 0.0)
+        if sample.status != Sample.Status.ABORTED:
+            num_turns_completed += 1
+
+    total_model_time = max(total_model_time, existing_total_model_time)
+    total_env_time = max(total_env_time, existing_total_env_time)
+    num_turns_completed = max(num_turns_completed, existing_num_turns_completed)
+
+    total_request_time = total_model_time + total_env_time
+    for sample in output_samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        total_request_time = max(total_request_time, float(metadata.get("total_request_time", 0.0) or 0.0))
+
+    progress = {
+        "finish_reason": finish_reason,
+        "total_request_time": total_request_time,
+        "num_turns_completed": num_turns_completed,
+        "total_model_time": total_model_time,
+        "total_env_time": total_env_time,
+    }
+    if abort_reason is not None:
+        progress["abort_reason"] = abort_reason
+    elif finish_reason == "model_abort":
+        progress["abort_reason"] = "model_abort"
+    elif finish_reason == "aborted":
+        progress["abort_reason"] = "aborted"
+
+    for sample in output_samples:
+        sample.metadata = {**(sample.metadata or {}), **progress}
+
+
 def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: str) -> list[Sample]:
     """Postprocess turn samples.
 
@@ -737,6 +793,8 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
 
     if not output_samples:
         return []
+
+    _apply_rollout_progress_metadata(output_samples, finish_reason)
 
     for sample in output_samples:
         if sample.remove_sample:

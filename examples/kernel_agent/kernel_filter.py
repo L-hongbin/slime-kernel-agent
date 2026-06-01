@@ -70,7 +70,7 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         )
         return DynamicFilterOutput(
             keep=False,
-            reason=f"group_size_lt_min_{len(valid_samples)}_{min_group_size}",
+            reason=f"group_size_lt_min_{min_group_size}",
         )
 
     if reject_low_variance_groups:

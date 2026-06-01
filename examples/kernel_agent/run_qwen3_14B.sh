@@ -209,11 +209,11 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_cuda_agent.generate
-   --custom-rm-path generate_with_cuda_agent.reward_func
-   --custom-reward-post-process-path kernel_reward.reward_post_process_by_group
-   --dynamic-sampling-filter-path kernel_filter.filter_cuda_kernel_group
-   --rollout-data-postprocess-path kernel_filter.sequence_mis
+   --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
+   --custom-rm-path examples.kernel_agent.reward_func
+   --custom-reward-post-process-path examples.kernel_agent.reward_post_process_by_group
+   --dynamic-sampling-filter-path examples.kernel_agent.filter_cuda_kernel_group
+   --rollout-data-postprocess-path examples.kernel_agent.sequence_mis
    --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
 
    # TIS-related args, recommended to enable when using TIS
