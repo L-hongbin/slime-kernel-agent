@@ -22,6 +22,7 @@ class TensorCheck:
     name: str
     shape: tuple[int, ...]
     dtype: str
+    scale_name: str
     scale_shape: tuple[int, ...]
     unique_count: int
     saturated_frac: float
@@ -52,7 +53,59 @@ def _get_tensor(weight_map: dict[str, Path], name: str) -> torch.Tensor:
         return f.get_tensor(name)
 
 
-def _dequant_symmetric_int8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _load_block_size(checkpoint_dir: Path) -> tuple[int, int] | None:
+    config_path = checkpoint_dir / "config.json"
+    if not config_path.exists():
+        return None
+    cfg = json.loads(config_path.read_text())
+    qcfg = cfg.get("quantization_config") or {}
+    if qcfg.get("quant_method") != "blockwise_int8":
+        return None
+    block_size = qcfg.get("weight_block_size")
+    if not isinstance(block_size, list) or len(block_size) != 2:
+        return None
+    return int(block_size[0]), int(block_size[1])
+
+
+def _scale_name_for_weight(weight_map: dict[str, Path], weight_name: str) -> str | None:
+    for suffix in (".weight_scale", ".weight_scale_inv"):
+        scale_name = weight_name.replace(".weight", suffix)
+        if scale_name in weight_map:
+            return scale_name
+    return None
+
+
+def _dequant_blockwise_int8(q: torch.Tensor, scale: torch.Tensor, block_size: tuple[int, int]) -> torch.Tensor:
+    block_n, block_k = block_size
+    out_features, in_features = q.shape
+    expected = ((out_features + block_n - 1) // block_n, (in_features + block_k - 1) // block_k)
+    if tuple(scale.shape) != expected:
+        raise ValueError(
+            f"unsupported W8A8 block scale shape {tuple(scale.shape)} for q shape {tuple(q.shape)} "
+            f"and block_size={block_size}; expected {expected}"
+        )
+    deq = q.to(torch.float32).clone()
+    scale_fp32 = scale.to(torch.float32)
+    for row_block in range(scale.shape[0]):
+        row_start = row_block * block_n
+        row_end = min(row_start + block_n, out_features)
+        for col_block in range(scale.shape[1]):
+            col_start = col_block * block_k
+            col_end = min(col_start + block_k, in_features)
+            deq[row_start:row_end, col_start:col_end] *= scale_fp32[row_block, col_block]
+    return deq
+
+
+def _dequant_symmetric_int8(
+    q: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    scale_name: str,
+    block_size: tuple[int, int] | None = None,
+) -> torch.Tensor:
+    if scale_name.endswith(".weight_scale_inv") and block_size is not None:
+        return _dequant_blockwise_int8(q, scale, block_size)
+
     q_fp32 = q.to(torch.float32)
     scale_fp32 = scale.to(torch.float32)
     if scale.numel() == 1:
@@ -81,18 +134,23 @@ def check_w8a8_checkpoint(
 ) -> list[TensorCheck]:
     q_map = _load_weight_map(quantized_checkpoint)
     ref_map = _load_weight_map(reference_checkpoint) if reference_checkpoint is not None else None
+    block_size = _load_block_size(quantized_checkpoint)
 
     quantized_weight_names = sorted(
-        name for name in q_map if name.endswith(".weight") and name.replace(".weight", ".weight_scale") in q_map
+        name for name in q_map if name.endswith(".weight") and _scale_name_for_weight(q_map, name)
     )
     if not quantized_weight_names:
-        raise AssertionError(f"No int8 weights with .weight_scale found in {quantized_checkpoint}")
+        raise AssertionError(f"No int8 weights with .weight_scale/.weight_scale_inv found in {quantized_checkpoint}")
 
     checks: list[TensorCheck] = []
     failures: list[str] = []
     for name in quantized_weight_names[:max_tensors]:
         q = _get_tensor(q_map, name)
-        scale = _get_tensor(q_map, name.replace(".weight", ".weight_scale"))
+        scale_name = _scale_name_for_weight(q_map, name)
+        if scale_name is None:
+            failures.append(f"{name}: missing .weight_scale/.weight_scale_inv")
+            continue
+        scale = _get_tensor(q_map, scale_name)
 
         if q.dtype not in (torch.int8, torch.uint8):
             failures.append(f"{name}: expected int8/uint8 weight, got {q.dtype}")
@@ -112,7 +170,7 @@ def check_w8a8_checkpoint(
         rel_l2 = None
         if ref_map is not None and name in ref_map:
             ref = _get_tensor(ref_map, name).to(torch.float32)
-            deq = _dequant_symmetric_int8(q, scale)
+            deq = _dequant_symmetric_int8(q, scale, scale_name=scale_name, block_size=block_size)
             if tuple(deq.shape) != tuple(ref.shape):
                 failures.append(f"{name}: dequant shape {tuple(deq.shape)} != reference shape {tuple(ref.shape)}")
             else:
@@ -123,6 +181,7 @@ def check_w8a8_checkpoint(
                 name=name,
                 shape=tuple(q.shape),
                 dtype=str(q.dtype),
+                scale_name=scale_name,
                 scale_shape=tuple(scale.shape),
                 unique_count=unique_count,
                 saturated_frac=float(saturated),
@@ -166,7 +225,7 @@ def main() -> None:
         rel = "n/a" if check.rel_l2 is None else f"{check.rel_l2:.6f}"
         print(
             f"{check.name}: shape={check.shape} dtype={check.dtype} "
-            f"scale={check.scale_shape} unique={check.unique_count} "
+            f"scale_name={check.scale_name} scale={check.scale_shape} unique={check.unique_count} "
             f"saturated={check.saturated_frac:.6f} zero={check.zero_frac:.6f} rel_l2={rel}"
         )
 

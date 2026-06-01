@@ -1,9 +1,9 @@
-"""Offline RTN W8A8-INT8 checkpoint writer using slime's local quantizer.
+"""Offline RTN W8A8-INT8 checkpoint writer using the repo-local INT8 helper.
 
 This avoids the llmcompressor save path for W8A8 RTN. It streams the source HF
-safetensors shard-by-shard, quantizes text-side Linear weights with the same
-`quantize_layer_int8` helper used by online Megatron -> SGLang weight sync, and
-then validates the saved checkpoint against the BF16 source before returning.
+safetensors shard-by-shard, quantizes text-side Linear weights via
+`scripts.quantize.utils.int8_quantization`, and validates the saved checkpoint
+against the BF16 source before returning.
 """
 
 from __future__ import annotations
@@ -22,9 +22,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.quantize.utils.int8_quantization import quantize_layer_int8
 from scripts.quantize.utils.validate_checkpoint import check_w8a8_checkpoint
-
-from slime.backends.megatron_utils.megatron_to_hf.processors.quantizer_compressed_tensors import quantize_layer_int8
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,13 +32,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-path", required=True, type=Path, help="Destination W8A8 checkpoint directory")
     parser.add_argument(
         "--target",
-        choices=["all-linear", "mlp", "non_linear_attn"],
+        choices=["all-linear", "mlp", "mlp_mtp", "non_linear_attn", "non_linear_attn_mtp"],
         default="all-linear",
         help=(
             "Text-side Linear weights to quantize. "
             "'all-linear' = MLP + self_attn + linear_attn (496 modules). "
             "'mlp' = MLP only (192 modules). "
-            "'non_linear_attn' = MLP + self_attn, skip mamba-style linear_attn (256 modules)."
+            "'mlp_mtp' = same as mlp but ALSO quantizes the MTP draft head's mlp. "
+            "'non_linear_attn' = MLP + self_attn, skip mamba-style linear_attn (256 modules); "
+            "keeps the MTP/EAGLE draft head in BF16. "
+            "'non_linear_attn_mtp' = same as non_linear_attn but ALSO quantizes the "
+            "MTP draft head's mlp + self_attn (mtp.fc and mamba linear_attn stay BF16)."
         ),
     )
     parser.add_argument("--force", action="store_true", help="Remove an existing output directory before writing")
@@ -71,7 +74,24 @@ def _load_weight_map(checkpoint_dir: Path) -> tuple[dict[str, str], list[str]]:
 def should_quantize_weight(name: str, shape: tuple[int, ...], target: str) -> bool:
     if not name.endswith(".weight") or len(shape) != 2:
         return False
-    if not name.startswith("model.language_model.layers."):
+    is_body = name.startswith("model.language_model.layers.")
+    # MTP / EAGLE draft head weights are stored under `mtp.layers.*` (plus the
+    # standalone `mtp.fc` / `mtp.norm` / `mtp.pre_fc_norm_*`). Only the
+    # *_mtp targets quantize the corresponding draft-head scope; everything
+    # else keeps it BF16.
+    is_mtp_layer = name.startswith("mtp.layers.")
+    if target == "mlp_mtp":
+        if not (is_body or is_mtp_layer):
+            return False
+        return ".mlp." in name
+    if target == "non_linear_attn_mtp":
+        # MLP + self_attn for BOTH the model body and the MTP draft layer; skip
+        # linear_attn (mamba) and mtp.fc (the [embed;hidden] projection, which is
+        # neither mlp nor self_attn).
+        if not (is_body or is_mtp_layer):
+            return False
+        return ".mlp." in name or ".self_attn." in name
+    if not is_body:
         return False
     if target == "mlp":
         return ".mlp." in name
@@ -96,9 +116,14 @@ def build_quantization_config(target: str) -> dict:
     self_attn_target_re = r"re:.*\.self_attn\.(q_proj|k_proj|v_proj|o_proj|qkv_proj)$"
     if target == "all-linear":
         targets = ["Linear"]
-    elif target == "mlp":
+    elif target in ("mlp", "mlp_mtp"):
         targets = [mlp_target_re]
-    elif target == "non_linear_attn":
+    elif target in ("non_linear_attn", "non_linear_attn_mtp"):
+        # Both quantize MLP + self_attn. The mtp variant differs only in NOT
+        # ignoring the draft head below: the same `mlp_target_re` /
+        # `self_attn_target_re` already match the draft modules `mtp.layers.0.
+        # mlp.gate_up_proj` / `mtp.layers.0.self_attn.qkv_proj` (sglang builds
+        # the draft layer with a `self_attn` prefix), so no extra target needed.
         targets = [mlp_target_re, self_attn_target_re]
     else:
         raise ValueError(f"Unknown target {target!r}")
@@ -113,17 +138,36 @@ def build_quantization_config(target: str) -> dict:
         "re:.*vision_tower.*",
         "re:.*mm_projector.*",
         "re:.*\\.audio_tower\\..*",
-        "re:.*\\.mtp\\..*",
     ]
-    if target == "mlp":
+    if target not in ("mlp_mtp", "non_linear_attn_mtp"):
+        # MTP / EAGLE draft head must stay BF16 for all targets EXCEPT
+        # the explicit *_mtp targets. sglang builds the draft model with prefix "mtp"
+        # (see Qwen3_5ForCausalLMMTP), so its quant-aware Linear modules are
+        # named `mtp.layers.0.*` -- mtp at the START with no leading dot. sglang
+        # matches ignore via re.match (anchored), so a pattern requiring
+        # `\.mtp\.` never matches `mtp.layers...` and every draft Linear would
+        # wrongly get the W8A8 scheme with no weight_scale in the ckpt,
+        # producing garbage draft logits and ~0.1 accept rate. Use `.*mtp\.`
+        # (no required leading dot) so `mtp.layers...` matches while the target
+        # body `model.language_model.layers...` (no `mtp.` substring) does not.
+        ignore.append("re:.*mtp\\..*")
+    if target in ("mlp", "mlp_mtp"):
         ignore.extend(
             [
                 "re:.*\\.self_attn\\..*",
                 "re:.*\\.linear_attn\\..*",
             ]
         )
+        if target == "mlp_mtp":
+            ignore.append("re:^mtp\\.fc(\\..*)?$")
     elif target == "non_linear_attn":
         ignore.append("re:.*\\.linear_attn\\..*")
+    elif target == "non_linear_attn_mtp":
+        # Quantize body + MTP mlp/self_attn; skip only mamba linear_attn. The
+        # draft head is intentionally NOT in `ignore` here so its mlp/self_attn
+        # get the W8A8 scheme (the ckpt now carries their weight_scale).
+        ignore.append("re:.*\\.linear_attn\\..*")
+        ignore.append("re:^mtp\\.fc(\\..*)?$")
     return {
         "quant_method": "compressed-tensors",
         "format": "int-quantized",
@@ -185,9 +229,9 @@ def _copy_non_weight_files(model_path: Path, output_path: Path, target: str) -> 
 
 
 @torch.no_grad()
-def quantize_checkpoint(model_path: Path, output_path: Path, target: str, force: bool = False) -> int:
-    model_path = model_path.resolve()
-    output_path = output_path.resolve()
+def quantize_checkpoint(model_path: str | Path, output_path: str | Path, target: str, force: bool = False) -> int:
+    model_path = Path(model_path).resolve()
+    output_path = Path(output_path).resolve()
     if output_path == model_path:
         raise ValueError("--output-path must be different from --model-path")
     if output_path.exists():
