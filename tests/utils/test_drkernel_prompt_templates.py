@@ -168,7 +168,7 @@ def _render_review_sample(
         metadata=metadata,
     )
 
-    renderer = _new_prompt_renderer()
+    renderer = _new_prompt_renderer_with_profile("drkernel_v1")
     result = renderer.render_sample(args, sample, rollout_id=0)
     return result.chosen, result.prompt, sample.metadata
 
@@ -300,7 +300,7 @@ def test_drkernel_prompt_renderer_applies_template_allowed_and_records_metadata(
         },
     )
 
-    renderer = _new_prompt_renderer()
+    renderer = _new_prompt_renderer_with_profile("drkernel_v1")
     renderer.apply_to_sample(args, sample, rollout_id=3)
 
     assert sample.metadata["raw_problem"] == "class Model:\n    pass\n"
@@ -338,7 +338,7 @@ def test_drkernel_prompt_renderer_cycles_candidates_without_allowed_list():
         metadata={},
     )
 
-    renderer = _new_prompt_renderer()
+    renderer = _new_prompt_renderer_with_profile("drkernel_v1")
     result = renderer.render_sample(args, sample, rollout_id=3)
 
     assert result.chosen == {
@@ -402,7 +402,7 @@ def test_drkernel_apply_to_sample_applies_chat_template_after_prompt_rendering(f
         tokens=[1, 2, 3],
     )
 
-    renderer = _new_prompt_renderer()
+    renderer = _new_prompt_renderer_with_profile("drkernel_v1")
     renderer.apply_to_sample(args, sample, rollout_id=3)
     rendered_user_prompt = sample.metadata["drkernel_user_prompt"]
 
