@@ -146,17 +146,12 @@ MISC_ARGS=(
    --attention-backend flash
 )
 
-# Build the runtime environment JSON with proper variable substitution.
-# DRKERNEL_SMOKE_MAX_PROMPTS caps eval to first N prompts in eval_rollout_single_dataset.
-# Unset (or set to 0) for full validation-set eval.
-DRKERNEL_SMOKE_MAX_PROMPTS=${DRKERNEL_SMOKE_MAX_PROMPTS:-100}
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\",
-    \"DRKERNEL_SMOKE_MAX_PROMPTS\": \"${DRKERNEL_SMOKE_MAX_PROMPTS}\"
+    \"SLIME_TENSOR_BACKUP_PIN_MEMORY\": \"0\"
   }
 }"
 

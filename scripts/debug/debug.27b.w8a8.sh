@@ -7,10 +7,11 @@ CTX_LEN=${CTX_LEN:-65536}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-${CTX_LEN}}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-48}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
+SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.9}
 
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
-EXPT_LABEL=nonla_emfrac09_newSlimeKG_hicachev2
+EXPT_LABEL=w8a8_nonla_emfrac09_noexpand
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
@@ -21,9 +22,9 @@ SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agen
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
 EVAL_CONFIG_PATH=${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml
 PROMPT_DATA_PATH=${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet
-MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
-REF_LOAD_DIR=${MODEL_DIR}
-HF_W8A8_DIR=${MODEL_DIR}
+MODEL_DIR=checkpoints/quantized/Qwen3.6-27B-smooth-bf16-nonla
+# RTN W8A8 ckpt — sglang engine boot weights + slime quantization_config source.
+HF_W8A8_DIR=checkpoints/quantized/Qwen3.6-27B-smooth-w8a8-nonla
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}_${EXPT_LABEL}"
@@ -44,7 +45,7 @@ SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 
 CKPT_ARGS=(
    --hf-checkpoint ${HF_W8A8_DIR}
-   --ref-load ${REF_LOAD_DIR}/torch_dist
+   --ref-load ${MODEL_DIR}/torch_dist
    --save ${SAVE_DIR}/
    --load ${SAVE_DIR}/
    --save-interval ${SAVE_INTERVAL}
@@ -141,21 +142,14 @@ WANDB_ARGS=(
    # --wandb-key ${WANDB_KEY}
 )
 
-# for --sglang-mem-fraction-static, 0.9 will OOM
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
    --sglang-context-length ${CTX_LEN}
    --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
-   --sglang-mem-fraction-static 0.85
+   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
    --sglang-decode-log-interval 400
    --sglang-mamba-scheduler-strategy extra_buffer
-   --router-policy consistent_hashing
-   --sglang-enable-hierarchical-cache
-   --sglang-page-size 64
-   --sglang-hicache-ratio 1.5
-   --sglang-hicache-io-backend kernel
-   --sglang-hicache-mem-layout page_first
-   --sglang-enable-cache-report
+   --sglang-mamba-full-memory-ratio 0.9
 )
 
 MISC_ARGS=(

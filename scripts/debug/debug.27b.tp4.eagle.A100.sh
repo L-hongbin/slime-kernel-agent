@@ -7,10 +7,10 @@ CTX_LEN=${CTX_LEN:-65536}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-${CTX_LEN}}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-48}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
 
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
-EXPT_LABEL=nonla_emfrac09_newSlimeKG_hicachev2
+EXPT_LABEL=newSlimeKG.tp4.eagle.rm16.C${SGLANG_MAX_RUNNING_REQUESTS}.A100
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
@@ -21,12 +21,13 @@ SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agen
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
 EVAL_CONFIG_PATH=${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml
 PROMPT_DATA_PATH=${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet
+# MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
 REF_LOAD_DIR=${MODEL_DIR}
 HF_W8A8_DIR=${MODEL_DIR}
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}_${EXPT_LABEL}"
+SAVE_DIR=checkpoints/${MODEL_DIR##*/}/${RUN_TS}_${EXPT_LABEL}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}
 LOG_FILE="${SAVE_DIR}/run.log"
 mkdir -p "${SAVE_DIR}"
 RESOLVED_EVAL_CONFIG_PATH="${SAVE_DIR}/eval_config.resolved.yaml"
@@ -39,7 +40,7 @@ export PYTHONUNBUFFERED=1
 source "${SCRIPT_HELPER_DIR}/ray/start_cluster.sh"
 source "${SCRIPT_HELPER_DIR}/models/qwen3.5-27B.sh"
 
-TP=2
+TP=4
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 
 CKPT_ARGS=(
@@ -150,12 +151,18 @@ SGLANG_ARGS=(
    --sglang-decode-log-interval 400
    --sglang-mamba-scheduler-strategy extra_buffer
    --router-policy consistent_hashing
-   --sglang-enable-hierarchical-cache
-   --sglang-page-size 64
-   --sglang-hicache-ratio 1.5
-   --sglang-hicache-io-backend kernel
-   --sglang-hicache-mem-layout page_first
-   --sglang-enable-cache-report
+   --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
+   --sglang-disable-custom-all-reduce
+   --sglang-speculative-algorithm EAGLE \
+   --sglang-speculative-num-steps 3 \
+   --sglang-speculative-eagle-topk 1 \
+   --sglang-speculative-num-draft-tokens 4 \
+   # --sglang-enable-hierarchical-cache
+   # --sglang-page-size 64
+   # --sglang-hicache-ratio 1.2
+   # --sglang-hicache-io-backend kernel
+   # --sglang-hicache-mem-layout page_first
+   # --sglang-enable-cache-report
 )
 
 MISC_ARGS=(
@@ -164,6 +171,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+   # --apply-chat-template-kwargs '{"preserve_thinking":true}'
 )
 
 RUNTIME_ENV_JSON="{
@@ -195,14 +203,14 @@ submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    -- python3 train.py \
    --actor-num-gpus-per-node 8 \
    --colocate \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
    "${DRKERNEL_PLUGIN_ARGS[@]}"
