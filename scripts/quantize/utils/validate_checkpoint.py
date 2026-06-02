@@ -84,8 +84,12 @@ def _dequant_blockwise_int8(q: torch.Tensor, scale: torch.Tensor, block_size: tu
             f"unsupported W8A8 block scale shape {tuple(scale.shape)} for q shape {tuple(q.shape)} "
             f"and block_size={block_size}; expected {expected}"
         )
-    deq = q.to(torch.float32).clone()
     scale_fp32 = scale.to(torch.float32)
+    if out_features % block_n == 0 and in_features % block_k == 0:
+        deq_view = q.to(torch.float32).reshape(expected[0], block_n, expected[1], block_k).permute(0, 2, 1, 3)
+        return (deq_view * scale_fp32[:, :, None, None]).permute(0, 2, 1, 3).reshape(out_features, in_features)
+
+    deq = q.to(torch.float32).clone()
     for row_block in range(scale.shape[0]):
         row_start = row_block * block_n
         row_end = min(row_start + block_n, out_features)
