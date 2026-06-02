@@ -7,31 +7,27 @@ CTX_LEN=${CTX_LEN:-65536}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-${CTX_LEN}}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-96}
-SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.85}
-SGLANG_CHUNKED_PREFILL_SIZE=${SGLANG_CHUNKED_PREFILL_SIZE:-}
-SGLANG_MAX_PREFILL_TOKENS=${SGLANG_MAX_PREFILL_TOKENS:-}
-RM_URL=${RM_URL:-http://192.168.16.40:20111}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
 
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
-EXPT_LABEL=${EXPT_LABEL:-newSlimeKG.tp4.eagle.rm16}
+EXPT_LABEL=newSlimeKG.tp4.eagle.rm16.C${SGLANG_MAX_RUNNING_REQUESTS}.A100
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
-# This worktree is intentionally sparse; reuse shared debug/ray/data assets from
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+# This worktree is intentionally sparse; reuse shared eval_drkernel/ray/data assets from
 # the main slime checkout unless the caller points at a different copy.
 SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts}
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
-EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml}
+EVAL_CONFIG_PATH=${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml
 PROMPT_DATA_PATH=${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet
 # MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
 MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
 REF_LOAD_DIR=${MODEL_DIR}
-HF_W8A8_DIR=${HF_W8A8_DIR:-checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-RTN-nonla-mtp}
+HF_W8A8_DIR=${MODEL_DIR}
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR=checkpoints/${HF_W8A8_DIR##*/}/${RUN_TS}_${EXPT_LABEL}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}
+SAVE_DIR=checkpoints/${MODEL_DIR##*/}/${RUN_TS}_${EXPT_LABEL}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}
 LOG_FILE="${SAVE_DIR}/run.log"
 mkdir -p "${SAVE_DIR}"
 RESOLVED_EVAL_CONFIG_PATH="${SAVE_DIR}/eval_config.resolved.yaml"
@@ -88,7 +84,7 @@ EVAL_ARGS=(
    --eval-max-prompt-len ${CTX_LEN}
    --eval-max-response-len ${EVAL_MAX_RESPONSE_LEN}
    --eval-max-context-len ${CTX_LEN}
-   --rm-url ${RM_URL}
+   --rm-url http://192.168.16.39:20111
    --dump-details ${SAVE_DIR}/dumps
 )
 
@@ -151,7 +147,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
    --sglang-context-length ${CTX_LEN}
    --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
-   --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
+   --sglang-mem-fraction-static 0.85
    --sglang-decode-log-interval 400
    --sglang-mamba-scheduler-strategy extra_buffer
    --router-policy consistent_hashing
@@ -168,12 +164,6 @@ SGLANG_ARGS=(
    # --sglang-hicache-mem-layout page_first
    # --sglang-enable-cache-report
 )
-if [ -n "${SGLANG_CHUNKED_PREFILL_SIZE}" ]; then
-   SGLANG_ARGS+=(--sglang-chunked-prefill-size ${SGLANG_CHUNKED_PREFILL_SIZE})
-fi
-if [ -n "${SGLANG_MAX_PREFILL_TOKENS}" ]; then
-   SGLANG_ARGS+=(--sglang-max-prefill-tokens ${SGLANG_MAX_PREFILL_TOKENS})
-fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -206,7 +196,7 @@ if [ -n "${DRKERNEL_GPU_NAME}" ]; then
    _RENDER_CHECK_ARGS+=(--expected-gpu-words "${DRKERNEL_GPU_NAME}")
 fi
 PYTHONPATH="${REPO_ROOT}:${SCRIPT_HELPER_DIR}/..:${PYTHONPATH:-}" \
-   python3 "${SCRIPT_HELPER_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
+   python3 "${SCRIPT_HELPER_DIR}/eval_drkernel/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

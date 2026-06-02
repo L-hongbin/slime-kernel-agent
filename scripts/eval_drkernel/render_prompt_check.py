@@ -11,7 +11,7 @@ Designed to be the LAST guard before launching a 50-min eval — exits non-zero
 if anything looks wrong so the run script can `set -e` out.
 
 Usage (from debug.27b.sh, after building DRKERNEL_PLUGIN_ARGS):
-    python3 scripts/debug/render_prompt_check.py \\
+    python3 scripts/eval_drkernel/render_prompt_check.py \\
         --hf-checkpoint "${MODEL_DIR}" \\
         --drkernel-gpu-name "${DRKERNEL_GPU_NAME:-}" \\
         --drkernel-compiler-name "${DRKERNEL_COMPILER_NAME:-}" \\

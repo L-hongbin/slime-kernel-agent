@@ -23,7 +23,7 @@
 
 <!-- 注意：两 run 的 `mem-fraction`（0.85 vs 0.9）不完全受控，不是严格 A/B，但同模型/同数据/同 800-eval，方向可信。decode tput 均值因 batch 混杂噪声大，以 wall 为准。 -->
 
-<!-- 脚本：`scripts/debug/debug.27b.tp4.eagle.sh`（链式：EAGLE, num-steps=3, eagle-topk=1, num-draft-tokens=4）。 -->
+<!-- 脚本：`scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.tp4.eagle.sh`（链式：EAGLE, num-steps=3, eagle-topk=1, num-draft-tokens=4）。 -->
 
 <!-- Run 路径：
 - EAGLE: `20260529_075505_*.tp4.eagle`

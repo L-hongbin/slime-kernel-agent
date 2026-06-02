@@ -1,25 +1,30 @@
-# scripts/debug
+# scripts/eval_drkernel
 
-调试启动脚本和一次性证据脚本入口。启动脚本可能拉起 Ray/SGLang/KernelGym；
+DrKernel eval/debug 启动脚本和一次性证据脚本入口。启动脚本可能拉起 Ray/SGLang/KernelGym；
 运行前按 `RUNTIME.md` 和对应 handoff 做配置 sanity check。
 
-## Eval Wrappers
+## 目录结构
+
+- `rollout_speedup_ablation/`: rollout speedup ablation 的 eval/debug launcher（`debug*.sh`）。
+- `analysis/`: 对应的离线分析/诊断脚本（`analyze_*` / `probe_*` / `bench_*`）。
+- `render_prompt_check.py`: 被 launcher 在运行时调用的 prompt sanity helper，顶层共享。
+
+## Eval Wrappers (`rollout_speedup_ablation/`)
 
 - `debug.9b.sh`: Qwen3.5-9B DrKernel eval/debug wrapper。
 - `debug.27b.sh`: Qwen3.6-27B BF16 baseline wrapper。
 - `debug.27b.tp4.eagle.sh`: Qwen3.6-27B TP4 + EAGLE wrapper。
 - `debug.27b.tp4.eagle.A100.sh`: A100 对照 wrapper。
-- `debug.27b.w8a8.sh`: W8A8 RTN smoke/eval wrapper。
 - `debug.27b.tp4.eagle.w8a8.sh`: W8A8 + EAGLE full-eval wrapper。
 - `debug.27b.tp4.eagle.awq_w4a16.sh`: AWQ W4A16 + EAGLE wrapper，包含
-  pre-eval checkpoint/runtime gate。
+  pre-eval checkpoint/runtime gate（gate 通过后 `exec` 到上面的 w8a8 wrapper）。
 
-## Fixed-Shape Benches
+## Fixed-Shape Benches (`analysis/`)
 
 - `bench_sglang_wall.py`: 固定请求形状的 SGLang HTTP wall benchmark。
 - `bench_w8a8_spec_components.py`: W8A8 + EAGLE component-cost microbench。
 
-## INT8 / Blockwise Diagnostics
+## INT8 / Blockwise Diagnostics (`analysis/`)
 
 - `analyze_g128_lengths.py`: paired BF16/per-channel/B128 eval dump 长度分析；
   历史文件名中的 `g128` 对应 blockwise B128。
@@ -28,7 +33,7 @@
 - `probe_blockwise_format_logits.py`: target-only first-token logprob probe，用于定位
   blockwise early-basin shift。
 
-## W4A16 AWQ Diagnostics
+## W4A16 AWQ Diagnostics (`analysis/`)
 
 - `analyze_w4_awq_eval_gap.py`: 汇总 W4A16 full-eval 与中间指标 gap。
 - `probe_w4_awq_error_propagation.py`: W4 hidden/error propagation probe。
@@ -41,6 +46,7 @@
 ## Prompt Sanity
 
 - `render_prompt_check.py`: 渲染并检查 DrKernel prompt 模板，适合改模板后做人工复核。
+  由 `rollout_speedup_ablation/` 下的 launcher 在 pre-launch 阶段调用。
 
 ## 结论入口
 

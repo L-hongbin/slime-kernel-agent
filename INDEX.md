@@ -25,7 +25,7 @@
 
 ## Scripts
 
-- `scripts/debug/README.md`: eval/debug launch wrappers, fixed-shape benches, and
+- `scripts/eval_drkernel/README.md`: eval/debug launch wrappers, fixed-shape benches, and
   one-off low-precision evidence probes.
 - `scripts/analysis/README.md`: offline eval dump, run-log, concurrency, and
   prefix-cache analysis scripts.

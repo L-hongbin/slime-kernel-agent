@@ -14,8 +14,8 @@ EXPT_LABEL=newSlimeKG.tp4.eagle.rm16.C${SGLANG_MAX_RUNNING_REQUESTS}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
-# This worktree is intentionally sparse; reuse shared debug/ray/data assets from
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+# This worktree is intentionally sparse; reuse shared eval_drkernel/ray/data assets from
 # the main slime checkout unless the caller points at a different copy.
 SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts}
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
@@ -196,7 +196,7 @@ if [ -n "${DRKERNEL_GPU_NAME}" ]; then
    _RENDER_CHECK_ARGS+=(--expected-gpu-words "${DRKERNEL_GPU_NAME}")
 fi
 PYTHONPATH="${REPO_ROOT}:${SCRIPT_HELPER_DIR}/..:${PYTHONPATH:-}" \
-   python3 "${SCRIPT_HELPER_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
+   python3 "${SCRIPT_HELPER_DIR}/eval_drkernel/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \

@@ -89,4 +89,4 @@
 | B64/B128 structure analysis | `checkpoints/Qwen3.6-27B/blockwise_length_logic_20260601/` |
 | B128 length analysis | `checkpoints/Qwen3.6-27B/g128_length_analysis_20260601/` |
 | B64 RTN length analysis | `checkpoints/Qwen3.6-27B/rtn_g64_length_analysis_20260601/` |
-| first-token logprob probe | `scripts/debug/probe_blockwise_format_logits.py` |
+| first-token logprob probe | `scripts/eval_drkernel/analysis/probe_blockwise_format_logits.py` |

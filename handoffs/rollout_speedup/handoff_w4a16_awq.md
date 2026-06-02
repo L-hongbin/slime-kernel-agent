@@ -19,7 +19,7 @@
 | eval run | `checkpoints/Qwen3.6-27B-AWQ-W4A16-asym-mlp/20260531_233411_awq.w4a16.asym_mlp.sglzpfix.100x8.eagle.rm39_ctx65536_n8_summ1600` |
 | rollout / reward | `.16` rollout，`.39` KernelGym reward；8 GPU worker + 24 CPU worker |
 | SGLang patch | `scripts/quantize/patches/sglang_compressed_tensors_wna16_asym.patch` |
-| eval wrapper | `scripts/debug/debug.27b.tp4.eagle.awq_w4a16.sh` |
+| eval wrapper | `scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.tp4.eagle.awq_w4a16.sh` |
 
 重跑 W4 ASYM 前必须检查 `.16` live SGLang 是否仍有 `symmetric=weight_quant.symmetric` 传参；镜像重装曾丢 patch。
 
@@ -113,14 +113,14 @@ Paired transition: W8A8 MLP T1 correct -> W4 wrong `149`，反向 `66`；W8A8 ML
 |---|---|
 | producer | `scripts/quantize/producers/awq_w4a16.py` |
 | checkpoint gate | `scripts/quantize/utils/check_awq_w4a16.py` |
-| eval wrapper | `scripts/debug/debug.27b.tp4.eagle.awq_w4a16.sh` |
+| eval wrapper | `scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.tp4.eagle.awq_w4a16.sh` |
 | SGLang ASYM patch | `scripts/quantize/patches/sglang_compressed_tensors_wna16_asym.patch` |
-| W4/W8 saved eval gap analyzer | `scripts/debug/analyze_w4_awq_eval_gap.py` |
-| error propagation probe | `scripts/debug/probe_w4_awq_error_propagation.py` |
-| zero-point sensitivity | `scripts/debug/probe_w4_asym_zp_sensitivity.py` |
-| runtime fidelity | `scripts/debug/probe_sglang_wna16_runtime_fidelity.py` |
-| code-domain KL probe | `scripts/debug/probe_w4_codedomain_metric_kl.py` |
-| trajectory compounding probe | `scripts/debug/probe_w4_trajectory_compounding.py` |
+| W4/W8 saved eval gap analyzer | `scripts/eval_drkernel/analysis/analyze_w4_awq_eval_gap.py` |
+| error propagation probe | `scripts/eval_drkernel/analysis/probe_w4_awq_error_propagation.py` |
+| zero-point sensitivity | `scripts/eval_drkernel/analysis/probe_w4_asym_zp_sensitivity.py` |
+| runtime fidelity | `scripts/eval_drkernel/analysis/probe_sglang_wna16_runtime_fidelity.py` |
+| code-domain KL probe | `scripts/eval_drkernel/analysis/probe_w4_codedomain_metric_kl.py` |
+| trajectory compounding probe | `scripts/eval_drkernel/analysis/probe_w4_trajectory_compounding.py` |
 | code fake-quant loss artifacts | `checkpoints/quantized/analysis/real_code_quant_loss_20260602/` |
 | long-context artifacts | `checkpoints/quantized/analysis/real_code_quant_loss_{longctx_20260602,position_20260602,64k_20260602}/` |
 | runtime/metric artifacts | `checkpoints/quantized/analysis/w4_asym_zp_sensitivity/` |

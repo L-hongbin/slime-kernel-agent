@@ -24,9 +24,10 @@ echo "Logging to ${LOG_FILE} (CTX_LEN=${CTX_LEN}, N_SAMPLES_PER_EVAL_PROMPT=${N_
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-# debug.9b.sh lives in scripts/debug/; ray/ and models/ are siblings of debug/.
-source "${SCRIPT_DIR}/../ray/start_cluster.sh"
-source "${SCRIPT_DIR}/../models/qwen3.5-9B.sh"
+# debug.9b.sh lives in scripts/eval_drkernel/rollout_speedup_ablation/;
+# ray/ and models/ are siblings of eval_drkernel/ under scripts/.
+source "${SCRIPT_DIR}/../../ray/start_cluster.sh"
+source "${SCRIPT_DIR}/../../models/qwen3.5-9B.sh"
 
 TP=4
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
@@ -158,7 +159,7 @@ RUNTIME_ENV_JSON="{
 # Pre-launch sanity check: render the first-turn prompt with the current
 # profile (drkernel_v1_tvm_ffi → v2_3 cleanup template) and assert no jinja
 # markers leaked. No --expected-gpu-words check since this script runs noenv.
-PYTHONPATH="${SCRIPT_DIR}/../.." python3 "${SCRIPT_DIR}/render_prompt_check.py" \
+PYTHONPATH="${SCRIPT_DIR}/../../.." python3 "${SCRIPT_DIR}/../render_prompt_check.py" \
    --hf-checkpoint "${MODEL_DIR}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \

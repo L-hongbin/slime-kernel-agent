@@ -2,7 +2,7 @@
 
 set -eo pipefail
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." &>/dev/null && pwd)"
 SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-${REPO_ROOT}/scripts}
 MODEL_DIR=${MODEL_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B}
 PYTHON_BIN=${PYTHON_BIN:-${REPO_ROOT}/.venv_llmcompressor/bin/python}
@@ -39,4 +39,4 @@ export HF_W8A8_DIR="${HF_W4A16_DIR}"
 export EXPT_LABEL=${EXPT_LABEL:-awq.w4a16.mlp.100x8.eagle}
 export EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml}
 
-exec bash "${REPO_ROOT}/scripts/debug/debug.27b.tp4.eagle.w8a8.sh"
+exec bash "${REPO_ROOT}/scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.tp4.eagle.w8a8.sh"

@@ -8,7 +8,7 @@ narrative marker tokens.
 
 Run this on the SGLang node, for example:
 
-    python3 scripts/debug/probe_blockwise_format_logits.py --models per_channel,b128 --samples-per-target 4
+    python3 scripts/eval_drkernel/analysis/probe_blockwise_format_logits.py --models per_channel,b128 --samples-per-target 4
 """
 
 from __future__ import annotations

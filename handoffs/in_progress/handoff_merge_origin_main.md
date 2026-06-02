@@ -173,7 +173,7 @@ contended and stalled/poisoned subsequent runs. Clean isolated runs pass.
 - Run the CPU/unit test subset (incl. the new `tests/test_*` and
   `tests/utils/*`) to catch import/API breakage from the 191-file delta.
 - Run the DrKernel prompt-template + eval-throttle unit tests (no GPU needed).
-- A short DrKernel eval smoke on `.22` (e.g. `scripts/debug/debug.27b.sh`
+- A short DrKernel eval smoke on `.22` (e.g. `scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.sh`
   scaled down) to confirm rollout → reward → loss path still runs and
   loss/metric aggregation is sane under the new group_id path.
 - Dispatch a codex xhigh review of the merge diff focused on the model.py

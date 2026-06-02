@@ -28,7 +28,7 @@ import torch
 
 REPO = Path("/nfs/FM/chenshuailin/projects/kernel_agents/slime")
 sys.path.insert(0, str(REPO))
-from scripts.debug.probe_w4_metric_stage_kl import patch
+from scripts.eval_drkernel.analysis.probe_w4_metric_stage_kl import patch
 from scripts.quantize.utils.compare_mlp_quant_loss import load_weight_map, text_config
 
 SRC = Path("/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B")

@@ -122,7 +122,7 @@ via `quant_method=compressed-tensors`.
 5. **Run AWQ W4A16 eval**:
    ```
    HF_W4A16_DIR=/path/Qwen3.6-27B-awq-w4a16-mlp \
-     bash scripts/debug/debug.27b.tp4.eagle.awq_w4a16.sh
+     bash scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.tp4.eagle.awq_w4a16.sh
    ```
 
 ## Quality ablation results (production v2.3_env_n8 100×8)

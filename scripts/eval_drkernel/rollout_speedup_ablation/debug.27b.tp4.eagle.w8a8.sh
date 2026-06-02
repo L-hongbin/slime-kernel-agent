@@ -7,27 +7,31 @@ CTX_LEN=${CTX_LEN:-65536}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
 EVAL_MAX_RESPONSE_LEN=${EVAL_MAX_RESPONSE_LEN:-${CTX_LEN}}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
-SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.9}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-96}
+SGLANG_MEM_FRACTION_STATIC=${SGLANG_MEM_FRACTION_STATIC:-0.85}
+SGLANG_CHUNKED_PREFILL_SIZE=${SGLANG_CHUNKED_PREFILL_SIZE:-}
+SGLANG_MAX_PREFILL_TOKENS=${SGLANG_MAX_PREFILL_TOKENS:-}
+RM_URL=${RM_URL:-http://192.168.16.40:20111}
 
 PYTORCH_CUDA_ALLOC_CONF_VALUE=${PYTORCH_CUDA_ALLOC_CONF_VALUE-expandable_segments:True}
-EXPT_LABEL=w8a8_nonla_emfrac09_noexpand
+EXPT_LABEL=${EXPT_LABEL:-newSlimeKG.tp4.eagle.rm16}
 ROLLOUT_MAX_PROMPT_LEN=$((CTX_LEN - 1))
 ROLLOUT_MAX_RESPONSE_LEN=$((CTX_LEN - 1))
 
-REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
-# This worktree is intentionally sparse; reuse shared debug/ray/data assets from
+REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
+# This worktree is intentionally sparse; reuse shared eval_drkernel/ray/data assets from
 # the main slime checkout unless the caller points at a different copy.
 SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts}
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
-EVAL_CONFIG_PATH=${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml
+EVAL_CONFIG_PATH=${EVAL_CONFIG_PATH:-${SCRIPT_HELPER_DIR}/eval_kernelbench_level1.yaml}
 PROMPT_DATA_PATH=${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet
-MODEL_DIR=checkpoints/quantized/Qwen3.6-27B-smooth-bf16-nonla
-# RTN W8A8 ckpt — sglang engine boot weights + slime quantization_config source.
-HF_W8A8_DIR=checkpoints/quantized/Qwen3.6-27B-smooth-w8a8-nonla
+# MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
+MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
+REF_LOAD_DIR=${MODEL_DIR}
+HF_W8A8_DIR=${HF_W8A8_DIR:-checkpoints/quantized/RTN/Qwen3.6-27B-W8A8-RTN-nonla-mtp}
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR="checkpoints/${MODEL_DIR##*/}/${RUN_TS}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}_${EXPT_LABEL}"
+SAVE_DIR=checkpoints/${HF_W8A8_DIR##*/}/${RUN_TS}_${EXPT_LABEL}_ctx${CTX_LEN}_n${N_SAMPLES_PER_EVAL_PROMPT}_summ${KERNELGYM_ERROR_SUMMARY_CHARS}
 LOG_FILE="${SAVE_DIR}/run.log"
 mkdir -p "${SAVE_DIR}"
 RESOLVED_EVAL_CONFIG_PATH="${SAVE_DIR}/eval_config.resolved.yaml"
@@ -40,12 +44,12 @@ export PYTHONUNBUFFERED=1
 source "${SCRIPT_HELPER_DIR}/ray/start_cluster.sh"
 source "${SCRIPT_HELPER_DIR}/models/qwen3.5-27B.sh"
 
-TP=2
+TP=4
 SAVE_INTERVAL=${SAVE_INTERVAL:-1}
 
 CKPT_ARGS=(
    --hf-checkpoint ${HF_W8A8_DIR}
-   --ref-load ${MODEL_DIR}/torch_dist
+   --ref-load ${REF_LOAD_DIR}/torch_dist
    --save ${SAVE_DIR}/
    --load ${SAVE_DIR}/
    --save-interval ${SAVE_INTERVAL}
@@ -84,7 +88,7 @@ EVAL_ARGS=(
    --eval-max-prompt-len ${CTX_LEN}
    --eval-max-response-len ${EVAL_MAX_RESPONSE_LEN}
    --eval-max-context-len ${CTX_LEN}
-   --rm-url http://192.168.16.39:20111
+   --rm-url ${RM_URL}
    --dump-details ${SAVE_DIR}/dumps
 )
 
@@ -142,6 +146,7 @@ WANDB_ARGS=(
    # --wandb-key ${WANDB_KEY}
 )
 
+# for --sglang-mem-fraction-static, 0.9 will OOM
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine ${TP}
    --sglang-context-length ${CTX_LEN}
@@ -149,8 +154,26 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
    --sglang-decode-log-interval 400
    --sglang-mamba-scheduler-strategy extra_buffer
-   --sglang-mamba-full-memory-ratio 0.9
+   --router-policy consistent_hashing
+   --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
+   --sglang-disable-custom-all-reduce
+   --sglang-speculative-algorithm EAGLE \
+   --sglang-speculative-num-steps 3 \
+   --sglang-speculative-eagle-topk 1 \
+   --sglang-speculative-num-draft-tokens 4 \
+   # --sglang-enable-hierarchical-cache
+   # --sglang-page-size 64
+   # --sglang-hicache-ratio 1.2
+   # --sglang-hicache-io-backend kernel
+   # --sglang-hicache-mem-layout page_first
+   # --sglang-enable-cache-report
 )
+if [ -n "${SGLANG_CHUNKED_PREFILL_SIZE}" ]; then
+   SGLANG_ARGS+=(--sglang-chunked-prefill-size ${SGLANG_CHUNKED_PREFILL_SIZE})
+fi
+if [ -n "${SGLANG_MAX_PREFILL_TOKENS}" ]; then
+   SGLANG_ARGS+=(--sglang-max-prefill-tokens ${SGLANG_MAX_PREFILL_TOKENS})
+fi
 
 MISC_ARGS=(
    --attention-dropout 0.0
@@ -158,6 +181,7 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+   # --apply-chat-template-kwargs '{"preserve_thinking":true}'
 )
 
 RUNTIME_ENV_JSON="{
@@ -182,21 +206,21 @@ if [ -n "${DRKERNEL_GPU_NAME}" ]; then
    _RENDER_CHECK_ARGS+=(--expected-gpu-words "${DRKERNEL_GPU_NAME}")
 fi
 PYTHONPATH="${REPO_ROOT}:${SCRIPT_HELPER_DIR}/..:${PYTHONPATH:-}" \
-   python3 "${SCRIPT_HELPER_DIR}/debug/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
+   python3 "${SCRIPT_HELPER_DIR}/eval_drkernel/render_prompt_check.py" "${_RENDER_CHECK_ARGS[@]}"
 
 submit_ray_job --address="${RAY_JOB_ADDRESS}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --actor-num-gpus-per-node 8 \
    --colocate \
-   ${MODEL_ARGS[@]} \
-   ${CKPT_ARGS[@]} \
-   ${ROLLOUT_ARGS[@]} \
-   ${OPTIMIZER_ARGS[@]} \
-   ${GRPO_ARGS[@]} \
-   ${WANDB_ARGS[@]} \
-   ${PERF_ARGS[@]} \
-   ${EVAL_ARGS[@]} \
-   ${SGLANG_ARGS[@]} \
-   ${MISC_ARGS[@]} \
+   "${MODEL_ARGS[@]}" \
+   "${CKPT_ARGS[@]}" \
+   "${ROLLOUT_ARGS[@]}" \
+   "${OPTIMIZER_ARGS[@]}" \
+   "${GRPO_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
+   "${PERF_ARGS[@]}" \
+   "${EVAL_ARGS[@]}" \
+   "${SGLANG_ARGS[@]}" \
+   "${MISC_ARGS[@]}" \
    "${DRKERNEL_PLUGIN_ARGS[@]}"

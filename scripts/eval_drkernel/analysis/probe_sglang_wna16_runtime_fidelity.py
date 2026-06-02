@@ -29,7 +29,7 @@ REPO = Path("/nfs/FM/chenshuailin/projects/kernel_agents/slime")
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, "/sgl-workspace/sglang/python")
 
-import scripts.debug.probe_w4_asym_zp_sensitivity as P
+import scripts.eval_drkernel.analysis.probe_w4_asym_zp_sensitivity as P
 from scripts.quantize.utils.compare_mlp_quant_loss import dequant_w4, load_tensor, load_weight_map
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import CompressedTensorsWNA16
 
