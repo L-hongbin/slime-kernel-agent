@@ -112,31 +112,7 @@ separate configs instead of forcing the worst-case context on every request.
 
 ### Tier 2 — fallbacks if Tier 1 blocked
 
-#### 4. INT4 W4A16 (AWQ-Marlin) for MLP only
-
-MLP is 70 % of Linear bytes / 17.1 GB W8A8 → ~8.6 GB W4A16. Frees ~8 GB
-weight memory per rank which sglang re-allocates to KV cache. Marlin
-kernel holds near-ideal 3.87–4× speedup at batch 16–32 (our regime).
-
-**Estimated gain**: **1.15–1.30× decode over current W8A8 baseline**
-(combined ~1.5–1.7× over BF16). Edge narrows as batch grows.
-
-**Implementation cost**: medium. AWQ calibration (~1 day script). sglang
-already loads via compressed-tensors. Restrict to MLP-only initially —
-**AWQ on hybrid Mamba's GDN projection matrices has no published
-benchmark**; quality risk if we extend to non-MLP.
-
-**Quality risk**: AWQ on Qwen3 reports 1.8 % average accuracy drop vs 2.7 %
-for GPTQ-INT4 (ACL 2025 "Give me BF16" paper). Adds 1–2 pp on top of our
-current 1–2 pp from Hadamard.
-
-**Sources**:
-- [AutoAWQ](https://github.com/casper-hansen/AutoAWQ)
-- [Marlin paper](https://arxiv.org/abs/2408.11743)
-- [Red Hat Marlin writeup](https://developers.redhat.com/articles/2024/04/17/how-marlin-pushes-boundaries-mixed-precision-llm-inference)
-- [ACL 2025 "Give me BF16"](https://aclanthology.org/2025.acl-long.1304.pdf)
-
-#### 5. FP8 KV cache (`--kv-cache-dtype fp8_e5m2`)
+#### 4. FP8 KV cache (`--kv-cache-dtype fp8_e5m2`)
 
 flashinfer supports `fp8_e5m2` KV cache on SM 7.5+, so A800-compatible.
 Halves the KV cache footprint → bigger KV pool at the same
@@ -158,7 +134,7 @@ undocumented**. Must self-test on a smoke before assuming it works.
 
 ### Tier 3 — research-grade / high cost
 
-#### 6. FlashQLA GDN kernels (Alibaba, 2026-04)
+#### 5. FlashQLA GDN kernels (Alibaba, 2026-04)
 
 TileLang-based replacement for fla-org/flash-linear-attention's Triton
 kernels on Qwen3-Next/Qwen3.5/Qwen3.6. Reports 2–3× forward / 2× backward
@@ -174,7 +150,7 @@ sub-1.05×. **Plausibly no measurable wall gain on A800.**
 - [Alibaba blog](https://www.alibabacloud.com/blog/603084)
 - [MarkTechPost coverage](https://www.marktechpost.com/2026/04/29/qwen-team-releases-flashqla-a-high-performance-linear-attention-kernel-library-that-achieves-up-to-3x-speedup-on-nvidia-hopper-gpus/)
 
-#### 7. W4A8 QServe / LiquidGEMM
+#### 6. W4A8 QServe / LiquidGEMM
 
 A800 sweet spot in theory: 4-bit weights (Marlin-class bandwidth) + 8-bit
 activations (INT8 tensor cores). QServe reports 2.4× over TRT-LLM on
@@ -189,7 +165,7 @@ is limited; QServe ships its own runtime. Multi-week integration. Defer.
 
 ### Tier 4 — small or risky
 
-#### 8. sglang piecewise CUDA graph
+#### 7. sglang piecewise CUDA graph
 
 SGLang's piecewise CUDA graph is mainly an extend/prefill optimization, while
 our DrKernel rollout wall is dominated by long decode plus KernelGym reward and
@@ -204,7 +180,7 @@ a token-count regression smoke and KernelBench score check.
 
 **Source**: [sglang PCG bug #17330](https://github.com/sgl-project/sglang/issues/17330)
 
-#### 9. Prompt-side compression
+#### 8. Prompt-side compression
 
 Cut KernelGym problem statements from ~5683 → ~4000 tokens. Reduces
 prefill + KV pressure. **Gain modest (1.02–1.05× wall)** because
@@ -232,7 +208,7 @@ eval semantics; requires correctness validation.
    `--rollout-function-path slime.rollout.fully_async_rollout.generate_rollout_fully_async`.
    Do not use it for standalone eval yet; the example documents no eval mode.
 3. If PD/async changes raise effective decode concurrency, **revisit FP8 KV
-   cache** (item #5). The bigger KV pool could matter more under higher
+   cache** (item #4). The bigger KV pool could matter more under higher
    concurrency.
 
 ## Sources

@@ -1,0 +1,57 @@
+Per-turn compile/correct/fast + token accounting, from dumps/rollout_data/eval_0.pt (authoritative).
+Reader: scripts/analysis/per_turn_acc_nopt.py (torch-free). in_all denominator=800. Generated 2026-06-02.
+Backends: A100/A800 = triton, H20 = flashinfer (flashqla not yet in SGLang).
+Old H20 runs (20260601_083536 triton / 20260601_231948 flashinfer) dropped; 20260601_231948 hit a reward-server outage.
+
+# A100 (C64) triton  N=800  reach#=800/786/786
+           T1     T2     T3
+  Comp      41.6   62.9   65.8
+  Corr      25.2   34.9   37.9
+  F1.0       9.8   13.2   15.0
+  F1.2       5.1    7.8    8.2
+  conditional T3 correct = 38.5%
+
+# A800 (C64) triton  N=800  reach#=800/800/798
+           T1     T2     T3
+  Comp      40.1   63.2   65.2
+  Corr      24.8   36.6   38.4
+  F1.0       9.4   15.0   15.5
+  F1.2       5.1    8.1    9.6
+  conditional T3 correct = 38.5%
+
+# A800 (C96) triton  N=800  reach#=800/800/800
+           T1     T2     T3
+  Comp      39.8   62.1   65.4
+  Corr      23.2   34.6   38.8
+  F1.0       9.6   12.6   14.6
+  F1.2       4.9    7.5    9.9
+  conditional T3 correct = 38.8%
+
+# H20 (C96) flashinfer  N=800  reach#=800/800/800
+           T1     T2     T3
+  Comp      45.4   70.0   71.9
+  Corr      24.2   36.8   38.6
+  F1.0       9.9   13.8   16.4
+  F1.2       4.9    7.2    9.6
+  conditional T3 correct = 38.6%
+
+== Token accounting (Σ per-turn response_length, dump) ==
+                   run | turns reachT3 | tot tok |  wall | true tok/s | compile blend
+     A100 (C64) triton |  2372     786 | 26.36M |  6421 |      4105 | 1362/2372 = 57.4%
+     A800 (C64) triton |  2398     798 | 26.40M |  6608 |      3995 | 1349/2398 = 56.3%
+     A800 (C96) triton |  2400     800 | 26.56M |  5077 |      5231 | 1338/2400 = 55.8%
+  H20 (C96) flashinfer |  2400     800 | 23.59M |  4746 |      4970 | 1498/2400 = 62.4%
+
+== reward per-stage timing (from kernelgym.metadata.kg_stage_completed_s; reward runs on shared RTX 4090 pool) ==
+# A800 (C96) triton (eval turns=2384)
+    kernel.compile_and_load    N=1636 mean=0.171s median=0.164s
+    kernel.correctness         N=1351 mean=0.656s median=0.327s
+    kernel.performance         N=1338 mean=7.629s median=3.899s
+    setup(5 stages)            N=2384 mean=0.006s median=0.004s
+    per-turn TOTAL reward      N=2384 mean=4.777s median=0.311s  aggregate=11388s
+# H20 (C96) flashinfer (eval turns=2390)
+    kernel.compile_and_load    N=1743 mean=0.161s median=0.157s
+    kernel.correctness         N=1519 mean=0.688s median=0.326s
+    kernel.performance         N=1498 mean=6.431s median=2.446s
+    setup(5 stages)            N=2390 mean=0.005s median=0.004s
+    per-turn TOTAL reward      N=2390 mean=4.591s median=0.371s  aggregate=10972s
