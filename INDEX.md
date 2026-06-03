@@ -21,11 +21,11 @@
 
 - `slime_plugins/drkernel/README.md`: DrKernel custom rollout plugin code,
   prompt templates, KernelGym RM, extraction, and design docs.
-- `scripts/drkernel/README.md`: KernelGym eval artifact summarizer and review dumps.
 
 ## Scripts
 
-- `scripts/eval_drkernel/README.md`: eval/debug launch wrappers, fixed-shape benches, and
+- `scripts/eval_drkernel/README.md`: eval/debug launch wrappers (incl. H20 + summarizer,
+  merged from former `scripts/debug/` and `scripts/drkernel/`), fixed-shape benches, and
   one-off low-precision evidence probes.
 - `scripts/analysis/README.md`: offline eval dump, run-log, concurrency, and
   prefix-cache analysis scripts.

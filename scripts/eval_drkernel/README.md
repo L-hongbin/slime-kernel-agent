@@ -8,6 +8,7 @@ DrKernel eval/debug 启动脚本和一次性证据脚本入口。启动脚本可
 - `rollout_speedup_ablation/`: rollout speedup ablation 的 eval/debug launcher（`debug*.sh`）。
 - `analysis/`: 对应的离线分析/诊断脚本（`analyze_*` / `probe_*` / `bench_*`）。
 - `render_prompt_check.py`: 被 launcher 在运行时调用的 prompt sanity helper，顶层共享。
+- `summarize_kernelgym_eval.py`: KernelGym eval 产物汇总工具（原 `scripts/drkernel/`，已并入）。
 
 ## Eval Wrappers (`rollout_speedup_ablation/`)
 
@@ -15,6 +16,8 @@ DrKernel eval/debug 启动脚本和一次性证据脚本入口。启动脚本可
 - `debug.27b.sh`: Qwen3.6-27B BF16 baseline wrapper。
 - `debug.27b.tp4.eagle.sh`: Qwen3.6-27B TP4 + EAGLE wrapper。
 - `debug.27b.tp4.eagle.A100.sh`: A100 对照 wrapper。
+- `debug.27b.tp4.eagle.H20.sh`: H20 节点 TP4 + EAGLE wrapper（原 `scripts/debug/`，已并入）。
+- `debug.27b.tp4.eagle.H20.fp8.sh`: H20 节点 TP4 + EAGLE + FP8 rollout wrapper（原 `scripts/debug/`，已并入）。
 - `debug.27b.tp4.eagle.w8a8.sh`: W8A8 + EAGLE full-eval wrapper。
 - `debug.27b.tp4.eagle.awq_w4a16.sh`: AWQ W4A16 + EAGLE wrapper，包含
   pre-eval checkpoint/runtime gate（gate 通过后 `exec` 到上面的 w8a8 wrapper）。
