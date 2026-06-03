@@ -8,5 +8,6 @@ if [[ ! "$N" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+git push
 git rev-parse --verify "HEAD~${N}" >/dev/null
 git bundle create "latest_${N}.bundle" "HEAD~${N}..HEAD"
