@@ -9,20 +9,16 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # MODEL CONFIG
 source "${SCRIPT_DIR}/../../scripts/models/qwen3.5-27B.sh"
 # NODE CONFIG
-MASTER_ADDR="192.168.112.36"
+MASTER_ADDR=""
 REMOTE_HOSTS=(
-   "192.168.112.48"
-   "192.168.112.67"
-   "192.168.112.12"
-   "192.168.112.8"
-   "192.168.112.22"
+   ""
+   ""
+   ""
 )
 REMOTE_PORTS=(
-   17025
-   19797
-   19797
-   28460
-   28460
+   ""
+   ""
+   ""
 )
 if [ "${#REMOTE_PORTS[@]}" -ne "${#REMOTE_HOSTS[@]}" ]; then
    echo "REMOTE_PORTS length (${#REMOTE_PORTS[@]}) must match REMOTE_HOSTS length (${#REMOTE_HOSTS[@]})."
