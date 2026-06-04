@@ -13,8 +13,8 @@
 | :--- | :---: | :--- |
 | **多轮 Eval 闭环 (Multi-turn Eval)** | ✅ 已完成 | 已打通多轮 Eval 闭环 (Qwen3.6-27B / KernelBench L1) |
 | **单轮训练 Rollout (Single-turn Training)** | ✅ 已完成 | 基础单轮 rollout 与训练链路正常运作 |
-| **多轮训练 Rollout (Multi-turn Training)** | 📐 方案已细化 / 待开发 | 选型已定：per-turn 拆分 + 全插件 + core 零改动（见下「细化方案」§0–§5）；`generate_rollout_async` 仍为单轮，待按方案 fan-out |
-| **训练 Loss Masking & 跨轮 Reward 聚合** | 📐 方案已细化 / 待开发 | delta-tokenization 构 loss_mask；GRPO 归一走上游 hook `--custom-reward-post-process-path`，首跑 per-turn binary、不上 gamma |
+| **多轮训练 Rollout (Multi-turn Training)** | 📐 方案已细化 / 待开发 | 选型已定：per-turn 拆分 + 全插件 + core 零改动（见「剩余工作」Milestone B1）；`generate_rollout_async` 仍为单轮，待按方案 fan-out |
+| **训练 Loss Masking & trloo 过滤/loss 适配** | 📐 方案已细化 / 待开发 | delta-tok 构 loss_mask；移植 dev_lhb trloo bundle（reward 中心化+RLOO+gamma 折叠+序列 MIS 过滤）为 plugin hook，core 最多 2 行——见「细化方案」Milestone B |
 | **GRPO 多轮训练首跑 (First GRPO Run)** | ⏳ 待开发 | GRPO 多轮训练的端到端验证与 checkpoint 保存待测试 |
 
 ---
@@ -23,117 +23,120 @@
 
 ## ⚙️ 运行与环境配置 (Runtime Pointers)
 
-我们不在本文档中维护过时的端口和路径。关于集群节点、共享路径、数据路径和 Endpoint 等动态事实，请统一参考 **[RUNTIME.md](file:///nfs/FM/chenshuailin/projects/kernel_agents/slime/RUNTIME.md)**。
-
-### 📌 当前主线测试配置
-
-*   **基座模型**：Qwen3.6-27B
-*   **计算节点**：
-    *   A800 节点 `.22` (SGLang 端口: `16834`)
-    *   A100 节点 `.16` (SGLang 端口: `23422`)
-*   **Reward 服务 (KernelGYM)**：地址端口为 `.40:20111` 或 `.39:8111`
-*   **关键参数**：
-    *   多轮评估参数：`--use-multi-turn --max-turns <N>`
-    *   上下文长度限制：`65536`，生成样本数 `n_samples = 8`
-*   **运行脚本**：
-    *   多轮评测与环境变量覆盖：[eval_drkernel_example.sh](file:///nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts/eval_drkernel_example.sh)
-    *   训练/评测快速调试：[debug.sh](file:///nfs/FM/chenshuailin/projects/kernel_agents/slime/scripts/debug.sh)
-
-### ⚠️ 工程避坑指南 (Eng Warnings)
-1.  **最小迭代保护**：在 eval-only 阶段，确保 [model.py](file:///nfs/FM/chenshuailin/projects/kernel_agents/slime/slime/backends/megatron_utils/model.py#L165) 中的 `scheduler_train_iters = max(args.train_iters, 1)` 逻辑完好，以避免零迭代报错。
-2.  **SGLang 503 错误**：客户端并发量必须 $\le$ `--sglang-max-running-requests`，否则会触发路由器的 `503 / no_available_workers / all circuits open` 保护。
-3.  **Cuda Graph Capture 崩溃**：当开启 `expandable_segments:True` 且 $TP \ge 4$ 时，自定义 All-Reduce 会在 cuda-graph 捕获时崩溃。必须附加 `--sglang-disable-custom-all-reduce` 参数。
+集群节点、共享路径、数据路径、Endpoint、以及 SGLang/CUDA-graph 等运行时避坑事项，统一参考 **[RUNTIME.md](file:///nfs/FM/chenshuailin/projects/kernel_agents/slime/RUNTIME.md)**。
 
 ---
 
 ## 🚀 剩余工作：多轮 GRPO 训练 (Next Steps: Multi-turn Training)
 
-要打通多轮 GRPO 训练，必须按以下步骤推进：
+### 选型 TL;DR
+
+**per-turn 拆分 + 全插件实现。** 每个 turn = 一个 `Sample`（同轨迹各 turn 共享 `group_id`，走上游 compact 契约）。
+dev_lhb `kernel_agent` 的多轮**数学**（loss mask / reward 中心化 / RLOO / 序列 MIS 过滤，即它的 `trloo` 那套）**照搬**，
+但落在**上游 hook**（`--custom-reward-post-process-path` / `--rollout-data-postprocess-path` / `--dynamic-sampling-filter-path`）里，
+而非像 dev_lhb 那样 patch `slime/` core。编排放在我们已独占的 `--rollout-function-path`（`generate_rollout_async`）内。
+**core diff 目标为 0**（trloo 是否注册为同名 estimator 是唯一可能的 ≤2 行增量，见 Milestone B），以免与上游分叉、增加 merge 成本。
+
+### 路线图
 
 ```mermaid
-graph TD
-    A[1. 多轮 Rollout 采样] --> B[2. 训练 Token Loss Masking]
-    B --> C[3. 跨轮 Advantage 聚合]
-    C --> D[4. 数据表达验证与转换]
-    D --> E[5. 首跑与 Sanity Check]
-    E --> F[6. 吞吐性能优化]
+graph LR
+    A["A · 单轮训练跑通<br/>(post-merge 回归)"] --> B["B · 多轮 rollout<br/>+ trloo 过滤/loss 适配<br/>(核心，不可省)"] --> C["C · 首个多轮训练跑通"]
 ```
 
-> [!IMPORTANT]
-> **方案选型（已定）**：采用 **per-turn 拆分（上游 compact `group_id` 契约）+ 全插件实现 + core 零改动**。
-> 表达层与 dev_lhb `kernel_agent` 收敛（每 turn 一个 `Sample`、共享 `group_id`、`group_id→group_mask_sums` 损失分母），
-> 但**不照搬 dev_lhb 的 core 改动**（`--custom-generate-function-path` + patch `sglang_rollout.py` + `trloo` estimator + core 注入 `turn_indices`）。
-> 冲突一律 prefer 上游：编排放在我们已独占的 `--rollout-function-path`（`generate_rollout_async`）内，
-> GRPO 归一改用上游 hook `--custom-reward-post-process-path`，`--advantage-estimator` 保持 `grpo`。
-> 最终 diff 仅落在 `slime_plugins/drkernel/`，避免 `slime/` core 与上游分叉、降低后续 merge 成本。
+---
 
-### 实施分期 (Staging) — 先单轮、框架预留多轮
+### Milestone A — 单轮训练跑通（当前）
 
-逐步推进：**先把 single-turn 训练在「多轮就绪」的框架上跑起来**（同时是 post-merge 训练链路的回归验证 —— merge 后训练路径尚未 smoke），多轮专有逻辑往后放。
+> 目的：在「多轮就绪」的框架上先跑通单轮训练，**同时回归 post-merge 训练链路**（merge 后训练路径尚未 smoke）。
+> 不碰任何多轮专有件。
 
-**Milestone A（当前）：single-turn 训练跑通**
-*   `generate_rollout_async` 维持标准 depth-2 输出（每条轨迹 = 1 个 `Sample`）；把「单轨迹 → 训练样本」收敛到一个**接缝函数**（如 `generate_trajectory_samples`），单轮返回单元素，作为将来插入 turn-loop 的唯一改点。
-*   **显式维护** Sample 字段：`tokens` / `response_length` / `loss_mask` / `status` / `reward`（单轮 `loss_mask` 全 1 即可，无需 delta-tokenization）。
-*   `group_id` 留 `None`（回退 `index`，每样本自成一组）；reward 用现有 `kernelgym_rm` per-sample binary。
-*   **不需要任何多轮专有件**：stock GRPO 按 `n_samples` reshape 归一 + 上游 `group_mask_sums` 直接可用，**无需自定义 reward post-process**。
-*   产出：小规模 GRPO 单轮跑通（loss 动 / advantage 非零 / checkpoint 存盘），Sanity + Codex xhigh review。
+*   **接缝**：把「单轨迹 → 训练样本」收敛成一个函数 `generate_trajectory_samples`，单轮返回单元素列表、输出维持标准 depth-2（每轨迹 1 个 `Sample`）。这是将来插入 turn-loop 的**唯一**改点。
+*   **Sample 字段**：显式维护 `tokens`/`response_length`/`loss_mask`/`status`/`reward`；单轮 `loss_mask` 全 1（或留 `None` 由上游补），无需 delta-tokenization。
+*   **分组/奖励**：`group_id` 留 `None`（回退 `index`）；reward 用现有 `kernelgym_rm` per-sample binary。stock GRPO 按 `n_samples` reshape 归一即可，**无需任何自定义 hook**。
+*   **不开** `--use-multi-turn`。
+*   **产出**：小规模单轮跑通（loss 动 / advantage 非零 / checkpoint 存盘）；启动前 Sanity，跑完 Codex xhigh review。
 
-**Milestone B（后续）：多轮专有件**（仅在确认单轮 OK 后再做，对应下文 §1–§3 标注 [MT] 的条目）
-*   per-turn fan-out → depth-3 + `group_id` 契约；delta-tokenization 交错 loss_mask；
-*   `kernelgym_reward_post_process.py` 按 `(group_index, turn_idx)` 分组；
-*   成功即停的 turn-loop、`--multi-turn-gamma` 折现、`--padding-turns` / `--filter-by-last-turn`（均插件内实现）。
+---
 
-> 下文 §1–§5 为多轮目标态全景；其中标 **[MT]** 的为 Milestone B 专有、当前不实现，标 **[A]** 的为单轮即需。
+### Milestone B — 多轮 rollout + trloo 过滤/loss 适配（核心，不可省）
 
-### 0. 与 dev_lhb 的「同 / 异」对照（落地依据）
+> 从「单轮」到「能**正确**训练多轮」的 correctness-critical 中间环节，dev_lhb 已完整实现。**不是可选项**。
+> 关键洞察：dev_lhb `loss.py` 里 `trloo` 与 `grpo` **走同一分支**（都 `get_grpo_returns` 广播），
+> 真正的 trloo 数学全在 plugin hook 里 → 这一步**几乎 plugin-only**。
 
-**完全照搬 dev_lhb（与上游不冲突）**：
-*   每 turn 一个 `Sample`：`tokens = prompt_ids(含历史) + resp_ids`，维护 `response_length` / `loss_mask` / `status` / per-turn `reward`。
-*   同一轨迹各 turn 共享 `Sample.group_id`；`group_index` 仍 = prompt id。
-*   损失分母 `group_id → group_mask_sums`（上游 `slime/ray/rollout.py` 与 dev_lhb 逐字相同，**直接复用，不改 core**）。
-*   reward post-process 按 `(group_index, turn_idx)` 分组中心化（对标 dev_lhb `kernel_reward.reward_post_process_by_group`）。
+**B1. 多轮 rollout 数据生产**（改 `rollout.py`）
+*   复用现有多轮 eval loop（`generate_multi_turn_eval_sample`）的 messages 累积 / feedback 渲染 / 每轮 KernelGym reward，抽出训练版 `generate_multi_turn_train_sample`，**每轮产出一个 `Sample`**：`tokens = prompt_ids(含历史)+resp_ids`、`metadata['turn_idx']=k`、共享 `group_id`、per-turn `reward`。
+*   **loss_mask（delta-tokenization）**：逐条消息增量编码，assistant delta 置 1、prompt/feedback delta 置 0，严格 `len(loss_mask)==response_length`（对标 tau-bench `_get_token_delta`）。
+*   **turn-loop 语义**：训练侧**成功即停**（reward=1 即终止该轨迹；与 eval「跑满 max_turns」不一致，已接受）。首跑**不开 padding**（`(prompt,turn_idx)` 分组天然支持变长组），`--padding-turns` 待 MIS/packing 需要定长时再开。
+*   **输出形状**：`generate_rollout_async` 由 `list[list[Sample]]` 变为 `list[list[list[Sample]]]`（prompt × n_samples × turns），命中上游 `_validate_group_id_annotated`（depth≥2 且 len>1 → 要求同组共享 `group_id`）。
 
-**刻意偏离 dev_lhb（prefer 上游）**：
-| 维度 | dev_lhb | 本方案 |
-| :--- | :--- | :--- |
-| 编排位置 | `--custom-generate-function-path` + **patch core** `sglang_rollout.py` | 全在插件 `generate_rollout_async`，**core 零 diff** |
-| filter-by-last-turn / padding | core `sglang_rollout.py`（`_get_last_non_pad_turn_group`） | 上游无；首跑**不做 padding**（变长组天然支持），需要时在插件内实现 |
-| advantage estimator | 新增 core `trloo`，读 `metadata['multi_turn_reward']` | 保持 `grpo`，RLOO 缩放（如需）折进 post-process，不引入 `trloo` |
-| `turn_indices` | patch core `_convert_samples_to_train_data` | 不需要；post-process 直接读 `sample.metadata['turn_idx']` |
+**B2. trloo bundle（移植 dev_lhb 的数学为 plugin hook，4 件）**
+1.  **gamma 折叠**（rollout 内，对标 `_set_multi_turn_rewards`）：反向 `mtr[t]=r[t]+γ·mtr[t+1]` → `metadata['multi_turn_reward']`。`γ` 由 `--multi-turn-gamma` 控制（`γ=0` ⇒ 每轮独立 binary；`γ=1` ⇒ 跨轮累计）。
+2.  **reward post-process**（新增 `kernelgym_reward_post_process.py`，挂 `--custom-reward-post-process-path`，对标 `reward_post_process_by_group`）：按 `(group_index, turn_idx)` 分组、排除 `remove_sample`、mean(±std) 中心化、RLOO 缩放 `×g/(g-1)`；trloo 时改读 `multi_turn_reward`。
+3.  **序列级 MIS 样本过滤**（新增 `kernelgym_sequence_mis.py`，挂 `--rollout-data-postprocess-path`，对标 `kernel_filter.sequence_mis`）：用 actor/rollout log-prob 比值，对整条 response 的 `loss_mask` 置零（`turns_geometric`：跨 `max_turns` 取几何平均、整组共用一个比值）。
+4.  **dynamic filter + filter-by-last-turn**（`--dynamic-sampling-filter-path` + 插件内）：按最后一非 pad turn 决定整条轨迹去留。
 
-### 1. 多轮训练 Rollout 采样（插件内）
-*   **[A] 接缝**：把「单轨迹 → 训练样本」收敛为 `generate_trajectory_samples`，单轮返回单元素列表、输出维持 depth-2，作为将来插入 turn-loop 的唯一改点。
-*   **[MT] 现状**：`generate_rollout_async`（`rollout.py:266`）为单轮，复用 `generate_and_rm_group`。
-*   **改造**：复用现有多轮 eval loop（`generate_multi_turn_eval_sample`）的 messages 累积 / feedback 渲染 / 每轮 KernelGym reward，抽出**训练版** `generate_multi_turn_train_sample`，每轮产出一个 `Sample`：
-    *   `tokens = prompt_ids(含历史) + resp_ids`，`response_length = len(resp_ids)`；
-    *   `group_id` = 轨迹唯一 id（同轨迹各 turn 相同），`metadata['turn_idx'] = k`，per-turn binary `reward`；
-    *   **训练侧成功即停**（reward=1 即终止该轨迹，避免「已通过还硬续一轮」的退化语义；注意与 eval「跑满 max_turns」行为不一致，已接受）；
-    *   **首跑不做 padding**：按 `(prompt, turn_idx)` 字典分组天然支持变长组；`--padding-turns` 留到 Phase 2b（MIS/packing 需要定长时）再开。
-*   **输出形状**：`generate_rollout_async` 返回从 `list[list[Sample]]`（prompt × n_samples）变为 `list[list[list[Sample]]]`（prompt × n_samples × turns），命中上游 `_validate_group_id_annotated`（depth≥2 且 len>1 → 要求同组共享 `group_id`）。
+**B3. core 决策（唯一可能动 core 的地方）**
+*   **(a) 走 `grpo`，core 零 diff**（推荐，干净 merge）：上述 plugin hook 已算出最终 advantage，`loss.py` 照常广播。
+*   **(b) 加 2 行增量 core 注册 `trloo`**：`arguments.py` choices + `loss.py` 分支各并入 `trloo`，与 dev_lhb 同名、`if est=="trloo"` gate 直接照搬。
+*   两者**训练数学完全等价**（因 loss.py trloo==grpo）。
 
-### 2. 训练 Token Loss Masking（delta tokenization）
-*   **[A] 单轮**：仅一段 assistant response，`loss_mask` 全 1（或留 `None` 让上游补 1），prompt 由 `response_length` 边界天然屏蔽，**无需 delta-tokenization**。
-*   **[MT] 核心**：只训练 Assistant 自身生成的 token；屏蔽首轮 prompt 头部、各轮 User/KernelGym 反馈 token、（后续）padding turn。
-*   **实现**：用 **delta tokenization**（对标 tau-bench `_get_token_delta`）逐条消息增量编码——assistant delta 上 `loss_mask=1`，prompt/feedback delta 上 `=0`，严格保证 `len(loss_mask) == response_length`（上游 `rollout.py` 有 `assert`）。
-*   **验证**：loss_mask 对齐单测 + dump 1~2 条训练 batch 的 token+mask 可视化做人工复核（见风险表「梯度/Loss 计算偏差」）。
+**B4. 移植对照清单（dev_lhb `kernel_agent` 实跑配置，来源 `run_qwen3.6_27B.sh` 等，HEAD `ad956da`）**
 
-### 3. 跨轮 Reward 聚合与 Advantage（上游 hook，分两步）
-*   **[A] 单轮**：stock GRPO 按 `n_samples` reshape 归一即可，**无需自定义 reward post-process**。
-*   **[MT] Phase 2a（首跑）：per-turn 独立 binary。** 每个 turn 用自身那轮的 `1.0/0.0`（reward 映射保持下文锁定的极简版），按 `(group_index, turn_idx)` 组做 GRPO 中心化 → 每轮相对「兄弟轨迹的同一轮」得到 advantage；**不跨轮折现**（等价 gamma=0）。
-*   **实现**：新增 `slime_plugins/drkernel/kernelgym_reward_post_process.py`，按 `(group_index, turn_idx)` 分组、排除 `remove_sample`、做 mean(±std) 中心化；挂 `--custom-reward-post-process-path`，`--advantage-estimator grpo`。
-*   **Phase 2b（闭环验证后再加）**：可选 `--multi-turn-gamma` 反向折现（插件内标量级 backward fold，dev_lhb `_set_multi_turn_rewards` 思路，同一个 post-process 消费）+ 可选 `--padding-turns` / `--filter-by-last-turn`（插件内实现）。best-of-turn / speedup 塑造按 handoff 继续排除。
+*样本过滤方式*
 
-### 4. 训练数据格式转换
-*   **结论**：**无需自定义 converter**。每个 turn 已是标准 `Sample`，上游 `_convert_samples_to_train_data`（flatten depth-3 → 读 `tokens`/`response_length`/`loss_mask`/`group_id` → 算 `group_mask_sums`）可直接复用。仅需 sanity 校验：契约能过 `_validate_group_id_annotated`、`group_mask_sums` 对每轨迹只计一次。
+| 机制 | hook / arg | 作用层 | 判据 / 逻辑 | 多轮处理 | 我们是否对齐 |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Dynamic sampling filter**（DAPO） | `--dynamic-sampling-filter-path` | rollout 期 · 组级 | 剔除零方差（全过/全挂）组。**slime 内置** `check_reward_nonzero_std`（`std>1e-6`）即此；dev_lhb 自建 `filter_cuda_kernel_group` 只多两件**多轮/padding 专属**护栏：可配阈值 `1e-3` + small-group 拒绝（`<min_group_size`）+ 排除 `remove_sample`(pad) | 自建版配 filter-by-last-turn 作用在最后一非 pad turn 组 | 🟡 单轮用 slime 内置（**已挂** `check_reward_nonzero_std` + `--over-sampling-batch-size`）；自建 `filter_cuda_kernel_group` 仅多轮+padding 才需要（待 B） |
+| **Filter by last turn** `--filter-by-last-turn` | arg + core `_get_last_non_pad_turn_group` | rollout 期 · 轨迹级 | 用每条轨迹最后一非 pad turn 的组跑 dynamic filter，keep/drop 整条轨迹 | 多轮专用；反向跳过 `is_pad_turn` | ❌ 未（多轮专用，待 B；core 也无 `_get_last_non_pad_turn_group`） |
+| **Sequence-level MIS** `sequence_mis` | `--rollout-data-postprocess-path` + `--sequence-mis-config` | 训练期（DP 切分前）· 改 `loss_mask` | actor/rollout log-prob 比值；聚合后越界（`<lower`/`>upper`）或 `token_veto`（逐 token 超 `token_veto_threshold`）→ 整条 response 的 `loss_mask` 置零；`use_advantage` 保护正优势样本 | `aggregation` ∈ `kl`/`geometric`/**`turns_geometric`**（跨 `max_turns` 几何平均、整组共用比值）→ 需 `--enable-turns-dp-partitions` | ❌ 未（待 B；插件无 `kernelgym_sequence_mis.py`） |
+| **Padding turns** `--padding-turns` | arg | rollout 期 | 不足 `max_turns` 补 `is_pad_turn` 占位（`loss_mask=0`、`remove_sample=True`）。非丢弃，是定长对齐+屏蔽 | 多轮专用（给 turns_geometric / turns-DP 提供定长组） | ❌ 未（多轮专用，待 B） |
 
-### 5. 首次 GRPO 训练小规模验证
-*   **改动清单（仅 `slime_plugins/drkernel/`）**：①`rollout.py` 新增 `generate_multi_turn_train_sample` + 改 `generate_rollout_async` fan-out；②新增 `kernelgym_reward_post_process.py`；③复用现有 args（`--use-multi-turn` / `--max-turns` / 后续 `--multi-turn-gamma` 等）。
-*   **观察项**：Loss 变化、Advantage 是否恒为 0、Checkpoint 能否保存。
-*   **执行准则**：启动前 Sanity Check（loss_mask 对齐 + group_id 契约 + 配置校验）；为**行为敏感改动补单测**（loss_mask 构造、group 分组）；跑完导出 logs 并由 **Codex review (xhigh)** 再下结论（substantial change 规则）。
+> 27B 实跑：`--sequence-mis-config '{"aggregation":"turns_geometric","token_veto_threshold":1e-4,"lower":0.999,"upper":1.001,"use_advantage":true}'`（lower/upper 极窄带 0.999/1.001 → 强 off-policy 一致性约束）。
 
-### 6. Reward 吞吐瓶颈分析
-*   KernelGYM `/evaluate` 为同步请求，长尾任务的编译和运行可能极其耗时。
-*   在大规模训练下评估是否需要引入 Batch/Group 请求、异步提交/轮询机制或限流，防止 Rollout 进程被 Reward 服务彻底阻塞。
+*loss*
+
+| 维度 | 设置 | 说明 | 我们是否对齐 |
+| :--- | :--- | :--- | :--- |
+| 优势估计 | `--advantage-estimator trloo` | 按 `(group_index, turn_idx)` 组内 leave-one-out；`loss.py` 中 `trloo`==`grpo`/`gspo`/`rloo` 同分支 → `get_grpo_returns` 广播到 token | 🟡 单轮已（**rloo == 单轮 trloo**，已移植进 core：`arguments.py` choices + `loss.py` 分支 + `group_normalize_rewards`）；多轮 trloo（gamma+turn 分组）待 B |
+| reward → advantage | `reward_post_process_by_group`（`--custom-reward-post-process-path`） | 按 `(group_index, turn_idx)` 分组、排除 `remove_sample`、`mean(±std)` 中心化、RLOO 缩放 `×g/(g-1)`；trloo 读 `multi_turn_reward` | 🟡 单轮 LOO 缩放 `×g/(g-1)`（按 prompt 分组）已在 core `group_normalize_rewards`；`(prompt,turn_idx)` 分组 + `multi_turn_reward` 待 B |
+| 多轮折扣 | `--multi-turn-gamma 1.0` | `_set_multi_turn_rewards` 反向折叠 `mtr[t]=r[t]+γ·mtr[t+1]` | ❌ 未（待 B） |
+| 策略损失 | PPO clipped surrogate；`--eps-clip 0.2 --eps-clip-high 0.28` | 非对称 clip（DAPO clip-higher） | ✅ 已对齐（单轮脚本已设 `eps-clip 0.2/0.28`，上游原生支持） |
+| KL | 未开 | run script 未设 `--kl-coef`/`--use-kl-loss`/`--kl-loss-coef`（默认 0） | ✅ 对齐（我们同样未开） |
+| Entropy | `--entropy-coef 0.00` | 关 | ✅ 对齐（脚本 `--entropy-coef 0.00`） |
+| TIS | `# --use-tis`（注释） | 关 | ✅ 对齐（未开） |
+| loss 归约 | `--calculate-per-token-loss`；分母 `group_mask_sums` | per-token 归一；`group_mask_sums` 保证一条轨迹只计一次 | 🟡 `group_mask_sums` 上游已有（单轮 `group_id=None` 退化为 per-sample）；但单轮脚本**未设** `--calculate-per-token-loss`（默认 per-sample-mean）→ 此点**未对齐** |
+| loss_mask 归零来源 | sequence-MIS veto + `remove_sample`(pad) | 被 veto / pad 的 token 不进 loss | ❌ 未（MIS / pad 均待 B） |
+
+> 对齐图例：✅ 已对齐 · 🟡 部分（单轮已 / 多轮待 B）· ❌ 未实现（待 Milestone B）。截至当前进度：单轮 rloo+clip-higher 已落地（core+脚本+单测），多轮 rollout 与全部样本过滤未开始。
+
+---
+
+### Milestone C — 首个多轮训练跑通
+
+*   **改动清单（全部落 `slime_plugins/drkernel/`）**：① `rollout.py`（B1）；② `kernelgym_reward_post_process.py`（B2.2）；③ `kernelgym_sequence_mis.py`（B2.3）；④ dynamic filter（B2.4）。args 复用现有 `--use-multi-turn/--max-turns/--padding-turns/--multi-turn-gamma/--filter-by-last-turn`。core 按 B3 二选一。
+*   **观察项**：Loss 变化、Advantage 是否恒为 0、loss_mask veto 比例、Checkpoint 能否保存。
+*   **准则**：启动前 Sanity（loss_mask 对齐 + `group_id` 契约 + `(group_index,turn_idx)` 分组 + MIS veto 抽样可视化 + 配置校验）；**行为敏感改动补单测**（loss_mask 构造、reward 分组中心化、sequence-MIS veto）；跑完导出 logs 由 **Codex xhigh** review 再下结论。
+
+---
+
+### 设计要点（一次讲清，供上文引用）
+
+*   **Sample 形状契约**：每 turn 一个标准 `Sample`；同轨迹各 turn 共享 `group_id`，`group_index` 仍 = prompt id。
+*   **损失分母**：上游 `group_id → group_mask_sums`（`slime/ray/rollout.py`，与 dev_lhb 逐字相同）保证「一条轨迹只计一次」，**直接复用，不改 core**。
+*   **数据转换**：**无需自定义 converter**。上游 `_convert_samples_to_train_data` flatten depth-3 → 读 `tokens`/`response_length`/`loss_mask`/`group_id` → 算 `group_mask_sums`，直接可用。
+*   **与 dev_lhb 的差异（仅编排，不涉及数学）**：
+
+    | 维度 | dev_lhb | 本方案 |
+    | :--- | :--- | :--- |
+    | 编排位置 | `--custom-generate-function-path` + patch core `sglang_rollout.py` | 全在插件 `generate_rollout_async`，**core 零 diff** |
+    | trloo 过滤/loss 适配 | plugin + patch core（`sglang_rollout.py` / 可选 estimator） | **数学照搬**为 plugin hook；core 最多 2 行或干脆走 `grpo` |
+    | `turn_indices` | patch core `_convert_samples_to_train_data` | 不需要；hook 直接读 `metadata['turn_idx']` |
+
+### 后续：Reward 吞吐瓶颈
+
+KernelGYM `/evaluate` 为同步请求，长尾编译/运行可能极慢。大规模训练下评估是否需要 Batch/Group 请求、异步提交-轮询或限流，防止 rollout 被 reward 服务阻塞、GPU 空置。
 
 ---
 
