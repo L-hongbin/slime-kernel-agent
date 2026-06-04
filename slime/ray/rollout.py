@@ -357,6 +357,43 @@ class RolloutServer:
         return ray.get(handles) if handles else []
 
 
+def group_normalize_rewards(args, raw_rewards: list[float]) -> list[float] | None:
+    """Group-normalized advantages for grpo / gspo / rloo / reinforce++_baseline.
+
+    Rewards are grouped per prompt (``n_samples_per_prompt`` contiguous samples) and
+    mean-centered. Then:
+      - grpo / gspo: divide by group std (when ``grpo_std_normalization``);
+      - rloo: RLOO leave-one-out scaling ``A_i = (r_i - mean) * g/(g-1)`` (no std-norm;
+        singleton group -> 0). Equivalent to dev_lhb ``reward_post_process_by_group``.
+
+    Returns a flat list of normalized rewards, or ``None`` when normalization does not
+    apply (caller falls back to raw rewards). Module-level + pure so it is unit-testable
+    without instantiating the ray-remote RolloutManager.
+    """
+    if not (
+        args.advantage_estimator in ["grpo", "gspo", "rloo", "reinforce_plus_plus_baseline"]
+        and args.rewards_normalization
+    ):
+        return None
+    rewards = torch.tensor(raw_rewards, dtype=torch.float)
+    if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
+        rewards = rewards.reshape(-1, args.n_samples_per_prompt)
+    else:
+        # when samples count are not equal in each group
+        rewards = rewards.view(-1, rewards.shape[-1])
+    mean = rewards.mean(dim=-1, keepdim=True)
+    rewards = rewards - mean
+
+    if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+        std = rewards.std(dim=-1, keepdim=True)
+        rewards = rewards / (std + 1e-6)
+    elif args.advantage_estimator == "rloo":
+        group_size = rewards.shape[-1]
+        rewards = rewards * group_size / (group_size - 1) if group_size > 1 else rewards * 0.0
+
+    return rewards.flatten().tolist()
+
+
 @ray.remote
 class RolloutManager:
     """The class to run rollout and convert rollout data to training data."""
@@ -631,25 +668,9 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
-        if (
-            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
-            and self.args.rewards_normalization
-        ):
-            # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
-            else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
-            mean = rewards.mean(dim=-1, keepdim=True)
-            rewards = rewards - mean
-
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                rewards = rewards / (std + 1e-6)
-
-            return raw_rewards, rewards.flatten().tolist()
+        normalized = group_normalize_rewards(self.args, raw_rewards)
+        if normalized is not None:
+            return raw_rewards, normalized
 
         return raw_rewards, raw_rewards
 

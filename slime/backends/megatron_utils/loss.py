@@ -632,7 +632,9 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         custom_adv_fn(args, rollout_data)
         advantages, returns = rollout_data["advantages"], rollout_data["returns"]
 
-    elif args.advantage_estimator in ["grpo", "gspo"]:
+    elif args.advantage_estimator in ["grpo", "gspo", "rloo"]:
+        # rloo: the leave-one-out advantage is already computed in _post_process_rewards
+        # (center + g/(g-1) scaling); here we just broadcast the scalar to response tokens.
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
         # TODO: is the copy necessary?
