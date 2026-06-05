@@ -147,7 +147,7 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
-        attrs = get_tensor_model_parallel_attrs(param)
+        attrs = get_tensor_model_parallel_attrs(param, name=name)
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,

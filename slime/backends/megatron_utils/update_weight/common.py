@@ -22,7 +22,7 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     if "expert_bias" in name:
         return param
 
-    attrs = get_tensor_model_parallel_attrs(param)
+    attrs = get_tensor_model_parallel_attrs(param, name=name)
     if not attrs["tensor_model_parallel"] or attrs["parallel_mode"] == "duplicated":
         return param.data
 
@@ -32,6 +32,9 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     else:
         tp_size = mpu.get_tensor_model_parallel_world_size()
         tp_group = mpu.get_tensor_model_parallel_group()
+
+    if tp_size == 1:
+        return param.data
 
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
@@ -67,7 +70,7 @@ def all_gather_params_async(
 
     for info, param in param_infos_and_params:
         # Prepare async all_gather
-        attrs = get_tensor_model_parallel_attrs(param)
+        attrs = get_tensor_model_parallel_attrs(param, name=info.name)
         if "expert_bias" in info.name:
             gather_tasks.append((info, param, None, None, None))
             handles.append(None)
@@ -82,6 +85,11 @@ def all_gather_params_async(
             else:
                 tp_size = mpu.get_tensor_model_parallel_world_size()
                 tp_group = mpu.get_tensor_model_parallel_group()
+
+            if tp_size == 1:
+                gather_tasks.append((info, param.data, None, None, None))
+                handles.append(None)
+                continue
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
             handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
