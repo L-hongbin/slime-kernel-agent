@@ -159,10 +159,10 @@ SGLANG_ARGS=(
    --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
    --sglang-disable-custom-all-reduce
    --sglang-linear-attn-backend flashinfer
-   --sglang-speculative-algorithm EAGLE \
-   --sglang-speculative-num-steps 3 \
-   --sglang-speculative-eagle-topk 1 \
-   --sglang-speculative-num-draft-tokens 4 \
+   --sglang-speculative-algorithm EAGLE
+   --sglang-speculative-num-steps 3
+   --sglang-speculative-eagle-topk 1
+   --sglang-speculative-num-draft-tokens 4
    # --sglang-enable-hierarchical-cache
    # --sglang-page-size 64
    # --sglang-hicache-ratio 1.2
