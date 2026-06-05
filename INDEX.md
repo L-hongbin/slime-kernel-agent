@@ -33,6 +33,8 @@
   patches, calibration builders, and quantization evidence utilities.
 - `scripts/data/convert_verl_to_slime.py`: VERL parquet to slime
   `ground_truth`/`extra_info` converter.
+- `scripts/convert/qwen3.6-27B-tp4-pp1.sh`: offline Qwen3.6-27B HF to
+  Megatron `torch_dist` conversion for TP4/PP1 init/resume experiments.
 
 ## Run Configs
 
