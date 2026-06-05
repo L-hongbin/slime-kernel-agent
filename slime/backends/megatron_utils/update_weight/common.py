@@ -11,6 +11,8 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
 
+from .tp_attrs import get_tensor_model_parallel_attrs
+
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     """
@@ -20,8 +22,8 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
     if "expert_bias" in name:
         return param
 
-    assert hasattr(param, "tensor_model_parallel"), f"{name} does not have tensor_model_parallel attribute"
-    if not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+    attrs = get_tensor_model_parallel_attrs(param)
+    if not attrs["tensor_model_parallel"] or attrs["parallel_mode"] == "duplicated":
         return param.data
 
     if ".experts." in name:
@@ -33,9 +35,10 @@ def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:
 
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
-    partition_dim = param.partition_dim
-    assert param.partition_stride == 1 or (
-        param.partition_stride == 2 and "linear_fc1" in name
+    partition_dim = attrs["partition_dim"]
+    partition_stride = attrs["partition_stride"]
+    assert partition_stride == 1 or (
+        partition_stride == 2 and "linear_fc1" in name
     ), "partition_stride != 1 is not supported"
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
@@ -64,10 +67,11 @@ def all_gather_params_async(
 
     for info, param in param_infos_and_params:
         # Prepare async all_gather
+        attrs = get_tensor_model_parallel_attrs(param)
         if "expert_bias" in info.name:
             gather_tasks.append((info, param, None, None, None))
             handles.append(None)
-        elif not param.tensor_model_parallel or getattr(param, "parallel_mode", None) == "duplicated":
+        elif not attrs["tensor_model_parallel"] or attrs["parallel_mode"] == "duplicated":
             gather_tasks.append((info, param.data, None, None, None))
             handles.append(None)
         else:
@@ -81,7 +85,7 @@ def all_gather_params_async(
 
             param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
             handle = dist.all_gather(param_partitions, param.data, group=tp_group, async_op=True)
-            gather_tasks.append((info, None, handle, param_partitions, param.partition_dim))
+            gather_tasks.append((info, None, handle, param_partitions, attrs["partition_dim"]))
             handles.append(handle)
 
     # Phase 2: Wait for ALL async operations to complete at once

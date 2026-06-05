@@ -14,6 +14,7 @@ from ..megatron_to_hf import convert_to_hf
 from ..sglang import monkey_patch_torch_reductions
 from .common import all_gather_params_async, named_params_and_buffers
 from .hf_weight_iterator_base import HfWeightIteratorBase
+from .tp_attrs import get_tensor_model_parallel_attrs
 
 
 class HfWeightIteratorDirect(HfWeightIteratorBase):
@@ -146,16 +147,12 @@ def _get_megatron_local_param_infos(args: Namespace, model: Sequence[torch.nn.Mo
     param_infos = {}
     rank = dist.get_rank()
     for name, param in named_params_and_buffers(args, model):
+        attrs = get_tensor_model_parallel_attrs(param)
         param_infos[name] = ParamInfo(
             name=name,
             dtype=param.dtype,
             shape=param.shape,
-            attrs={
-                "tensor_model_parallel": getattr(param, "tensor_model_parallel", False),
-                "partition_dim": getattr(param, "partition_dim", -1),
-                "partition_stride": getattr(param, "partition_stride", 1),
-                "parallel_mode": getattr(param, "parallel_mode", None),
-            },
+            attrs=attrs,
             size=param.numel() * param.element_size(),
             src_rank=rank,
         )
