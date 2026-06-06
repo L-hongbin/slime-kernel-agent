@@ -72,6 +72,28 @@ detect_num_gpus() {
     echo "NUM_GPUS: ${NUM_GPUS}"
 }
 
+# Disable automatic NUMA balancing for training hosts.
+# Root cause (2026-06-05, see handoffs/in_progress/handoff_sglang_dual_engine_startup_slow.md):
+# kernel.numa_balancing=1 thrashes the SHARED mmap'd checkpoint page-cache across sockets
+# (1.8B pages migrated / 844M failed) when two engines on different NUMA nodes touch it,
+# turning weight-load minor-faults into blocking migration_entry_wait. This made the GPU0-3
+# (NUMA node0) SGLang engine ~4x slower to load weights (80-104s vs 20-24s). Disabling it makes
+# both engines symmetric (~30s). Opt out with SLIME_DISABLE_NUMA_BALANCING=0.
+tune_host_numa_balancing() {
+    [[ "${SLIME_DISABLE_NUMA_BALANCING:-1}" == "1" ]] || return 0
+    local cur
+    cur=$(cat /proc/sys/kernel/numa_balancing 2>/dev/null || echo "?")
+    if [[ "${cur}" == "1" ]]; then
+        if echo 0 > /proc/sys/kernel/numa_balancing 2>/dev/null; then
+            echo "tune_host: disabled kernel.numa_balancing (was 1; avoids cross-NUMA page-cache thrash slowing weight load)"
+        else
+            echo "tune_host: WARNING kernel.numa_balancing=1 but could not disable (no permission); GPU0-3 engine weight-load may be ~4x slow"
+        fi
+    else
+        echo "tune_host: kernel.numa_balancing=${cur} (no change)"
+    fi
+}
+
 detect_nvlink() {
     local nvlink_count
 
@@ -295,6 +317,7 @@ start_ray_cluster() {
     stop_ray_processes
     clean_ray_session_dirs
     detect_num_gpus
+    tune_host_numa_balancing
     detect_nvlink
 
     local port_preseed_pid=""
