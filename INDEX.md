@@ -16,10 +16,9 @@
   等方向。
 - `handoffs/complete/handoff_bf16_baseline_jump_root_cause.md`: May24→May28
   BF16 baseline jump root cause; resolved by the SGLang Qwen3.5 GDN stride fix.
-- `handoffs/in_progress/handoff_sglang_dual_engine_startup_slow.md`: 同节点两个 SGLang 引擎同时启动，
-  绑 GPU0-3（node0）的引擎权重加载慢 ~3-4x 的根因排查。**✅ 已解决**：根因 = 宿主内核自动 NUMA balancing
-  在双引擎并发时引发跨 socket 页迁移风暴；修复 `echo 0 > /proc/sys/kernel/numa_balancing`（已固化进
-  `scripts/ray/start_cluster.sh`）。含完整证伪过程。
+- `handoffs/complete/handoff_launch_speedup.md`: **训练启动慢排查（已完成）**。根因 = 宿主中挖矿
+  病毒占满 CPU；清理后启动 ~24min→~4min。含干净机器耗时分解、`numa_balancing=0` 必须保留的实验依据
+  （附录）、启动前宿主健康检查脚本 `check_host_health.sh`。已合并原 NUMA 子文档。
 
 ## DrKernel Plugin
 

@@ -73,12 +73,14 @@ detect_num_gpus() {
 }
 
 # Disable automatic NUMA balancing for training hosts.
-# Root cause (2026-06-05, see handoffs/in_progress/handoff_sglang_dual_engine_startup_slow.md):
+# Root cause (2026-06-05, see handoffs/complete/handoff_launch_speedup.md):
 # kernel.numa_balancing=1 thrashes the SHARED mmap'd checkpoint page-cache across sockets
 # (1.8B pages migrated / 844M failed) when two engines on different NUMA nodes touch it,
 # turning weight-load minor-faults into blocking migration_entry_wait. This made the GPU0-3
-# (NUMA node0) SGLang engine ~4x slower to load weights (80-104s vs 20-24s). Disabling it makes
-# both engines symmetric (~30s). Opt out with SLIME_DISABLE_NUMA_BALANCING=0.
+# (NUMA node0) SGLang engine ~4x slower (80-104s vs 20-24s). NOTE: those magnitudes were measured
+# under host CPU saturation (malware incident, 2026-06-06). A controlled A/B on an IDLE host shows
+# numa on/off BOTH ~6-7s; the thrash only bites when CPU is contended — but colocate training
+# itself contends CPU, so keep this disabled. Opt out with SLIME_DISABLE_NUMA_BALANCING=0.
 tune_host_numa_balancing() {
     [[ "${SLIME_DISABLE_NUMA_BALANCING:-1}" == "1" ]] || return 0
     local cur
@@ -316,6 +318,17 @@ start_ray_cluster() {
 
     stop_ray_processes
     clean_ray_session_dirs
+    # Pre-launch host health check (CPU saturation / runaway / possible malware).
+    # BLOCKS launch by default; set SLIME_REQUIRE_HOST_HEALTH=0 to downgrade to warn-only.
+    # Motivated by 2026-06-06: a crypto-miner saturated all cores (invisible to container ps)
+    # and inflated launch ~6x. See handoffs/complete/handoff_launch_speedup.md.
+    if ! bash "$(dirname "${BASH_SOURCE[0]}")/check_host_health.sh"; then
+        if [[ "${SLIME_REQUIRE_HOST_HEALTH:-1}" == "1" ]]; then
+            echo "start_cluster: ABORT — host health check failed (host CPU loaded). Set SLIME_REQUIRE_HOST_HEALTH=0 to override."
+            return 1
+        fi
+        echo "start_cluster: host health WARN — SLIME_REQUIRE_HOST_HEALTH=0, continuing despite loaded host."
+    fi
     detect_num_gpus
     tune_host_numa_balancing
     detect_nvlink
@@ -331,6 +344,7 @@ start_ray_cluster() {
             --node-ip-address "${MASTER_ADDR}" \
             --port "${RAY_PORT}" \
             --num-gpus "${NUM_GPUS}" \
+            --num-cpus "${RAY_NUM_CPUS:-64}" \
             --object-store-memory "${RAY_OBJECT_STORE_MEMORY}" \
             --disable-usage-stats \
             --dashboard-host=0.0.0.0 \
@@ -353,6 +367,7 @@ start_ray_cluster() {
             --address "${MASTER_ADDR}:${RAY_PORT}" \
             --node-ip-address "${NODE_ADDR}" \
             --num-gpus "${NUM_GPUS}" \
+            --num-cpus "${RAY_NUM_CPUS:-64}" \
             --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
             --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
             --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
