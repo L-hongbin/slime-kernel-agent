@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
+import slime_plugins.drkernel.kernelgym_rm as krm
 from slime_plugins.drkernel.extract import MISSING_COMPLETE_SUBMISSION_ERROR
 from slime_plugins.drkernel.kernelgym_rm import (
     KERNELGYM_CLIENT_TIMEOUT_S,
@@ -22,7 +23,9 @@ from slime_plugins.drkernel.kernelgym_rm import (
     KernelGymClient,
     KernelGymRequestError,
     _get_rm_url,
+    _get_shared_client,
     build_evaluation_request,
+    custom_rm,
     evaluate_sample,
     kernelgym_result_to_reward,
 )
@@ -298,6 +301,173 @@ def test_kernelgym_result_to_reward_requires_compile_correct_and_not_decoy():
     assert kernelgym_result_to_reward({"compiled": False, "correctness": True, "decoy_kernel": False}) == 0.0
     assert kernelgym_result_to_reward({"compiled": True, "correctness": False, "decoy_kernel": False}) == 0.0
     assert kernelgym_result_to_reward({"compiled": True, "correctness": True, "decoy_kernel": True}) == 0.0
+
+
+class _CompleteSubmission:
+    """Stand-in for a fully extracted kernel submission (kernels + model)."""
+
+    code = "kernel code"
+    backend = "cuda"
+    sections = {"CUDA_KERNELS", "MODEL"}
+
+
+@pytest.fixture
+def reset_shared_client():
+    """The shared client is process-global; isolate each test from the others.
+
+    Also swap in a fresh ``asyncio.Lock`` so a lock bound to one test's
+    ``asyncio.run`` loop can't leak loop state into the next test.
+    """
+
+    krm._shared_client = None
+    krm._shared_client_loop = None
+    krm._shared_client_lock = asyncio.Lock()
+    yield
+    krm._shared_client = None
+    krm._shared_client_loop = None
+    krm._shared_client_lock = asyncio.Lock()
+
+
+@pytest.mark.unit
+def test_shared_client_health_checked_once_across_many_rm_calls(reset_shared_client):
+    """30 RM calls (3 turns x 10 samples) must probe /health exactly once.
+
+    This is the whole point of the process-wide shared client: before it, every
+    ``custom_rm`` call created+closed a fresh client and re-ran ``/health``, so a
+    single training step fired hundreds of redundant health probes.
+    """
+
+    health = {"n": 0}
+    evals = {"n": 0}
+
+    async def fake_check_health(self):
+        health["n"] += 1
+
+    async def fake_evaluate(self, request):
+        evals["n"] += 1
+        return {"compiled": True, "correctness": True, "decoy_kernel": False}
+
+    async def run():
+        args = SimpleNamespace(rm_url="http://kernelgym")
+        for _turn in range(3):
+            for _ in range(10):
+                await custom_rm(args, _Sample())
+
+    with (
+        patch.object(KernelGymClient, "_check_health", fake_check_health),
+        patch.object(KernelGymClient, "evaluate", fake_evaluate),
+        patch.object(krm, "extract_kernel_submission", lambda response: _CompleteSubmission()),
+    ):
+        asyncio.run(run())
+
+    assert health["n"] == 1
+    assert evals["n"] == 30
+    assert krm._shared_client is not None
+
+
+@pytest.mark.unit
+def test_shared_client_built_once_under_concurrent_first_callers(reset_shared_client):
+    """Concurrent first callers (as in generate_and_rm_group) build one client.
+
+    The lazy init is guarded by an asyncio.Lock with a double-check; without it,
+    a burst of concurrent ``custom_rm`` calls would each build a client and probe
+    ``/health`` before any of them populated the cache.
+    """
+
+    health = {"n": 0}
+
+    async def fake_check_health(self):
+        await asyncio.sleep(0.01)  # widen the race window so the lock is exercised
+        health["n"] += 1
+
+    async def fake_evaluate(self, request):
+        return {"compiled": True, "correctness": True, "decoy_kernel": False}
+
+    async def run():
+        args = SimpleNamespace(rm_url="http://kernelgym")
+        await asyncio.gather(*(custom_rm(args, _Sample()) for _ in range(50)))
+
+    with (
+        patch.object(KernelGymClient, "_check_health", fake_check_health),
+        patch.object(KernelGymClient, "evaluate", fake_evaluate),
+        patch.object(krm, "extract_kernel_submission", lambda response: _CompleteSubmission()),
+    ):
+        asyncio.run(run())
+
+    assert health["n"] == 1
+
+
+@pytest.mark.unit
+def test_shared_client_not_cached_when_health_check_fails(reset_shared_client):
+    """A failed first health check must fail-fast and NOT cache a broken client.
+
+    ``_get_shared_client`` only stores the client after ``_check_health`` returns,
+    so the next RM call retries the probe instead of reusing a dead client.
+    """
+
+    calls = {"n": 0}
+
+    async def flaky_check_health(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise KernelGymRequestError("health down")
+
+    async def fake_evaluate(self, request):
+        return {"compiled": True, "correctness": True, "decoy_kernel": False}
+
+    async def run():
+        args = SimpleNamespace(rm_url="http://kernelgym")
+        with pytest.raises(KernelGymRequestError, match="health down"):
+            await custom_rm(args, _Sample())
+        assert krm._shared_client is None  # broken client not cached
+
+        await custom_rm(args, _Sample())  # retries the probe, now succeeds
+        assert krm._shared_client is not None
+
+    with (
+        patch.object(KernelGymClient, "_check_health", flaky_check_health),
+        patch.object(KernelGymClient, "evaluate", fake_evaluate),
+        patch.object(krm, "extract_kernel_submission", lambda response: _CompleteSubmission()),
+    ):
+        asyncio.run(run())
+
+    assert calls["n"] == 2
+
+
+@pytest.mark.unit
+def test_shared_client_closes_session_when_health_check_fails(reset_shared_client):
+    """A failed first health probe must close the aiohttp session it opened.
+
+    ``_check_health`` lazily creates the session before issuing the request; if the
+    probe then fails, ``_get_shared_client`` must close that session so a flapping
+    server doesn't leak one connector per (caught) failure.
+    """
+
+    closed = {"n": 0}
+    real_close = KernelGymClient.close
+
+    async def counting_close(self):
+        closed["n"] += 1
+        await real_close(self)
+
+    async def failing_check_health(self):
+        # Exercise the real session creation path, then fail like a 5xx /health.
+        self._get_session()
+        raise KernelGymRequestError("health down")
+
+    async def run():
+        args = SimpleNamespace(rm_url="http://kernelgym")
+        with pytest.raises(KernelGymRequestError, match="health down"):
+            await _get_shared_client(args)
+
+    with (
+        patch.object(KernelGymClient, "_check_health", failing_check_health),
+        patch.object(KernelGymClient, "close", counting_close),
+    ):
+        asyncio.run(run())
+
+    assert closed["n"] == 1
+    assert krm._shared_client is None
 
 
 @pytest.mark.unit

@@ -83,7 +83,7 @@ class KernelGymClient:
                 "GET",
                 "/health",
                 timeout_s=5,
-                max_retries=0,
+                max_retries=3,
             )
         except KernelGymRequestError as exc:
             raise KernelGymRequestError(f"KernelGym health check failed for {self.base_url}: {exc}") from exc
@@ -303,6 +303,59 @@ def kernelgym_result_to_reward(result: dict[str, Any]) -> float:
     return 1.0 if compiled and correctness and not decoy_kernel else 0.0
 
 
+# Process-wide shared client. Created lazily on the first RM call so ``/health``
+# is probed exactly once per process instead of once per sample/turn.
+#
+# INVARIANT: the RM runs inside a single Ray actor (``RolloutManager``) on one
+# persistent asyncio loop, so the cached client and its aiohttp session always run
+# on the loop they were created on. Full loop-swap support is intentionally NOT
+# provided: both the cached session AND ``_shared_client_lock`` are bound to the
+# loop they were first used on, and the old session can't be closed from a new loop
+# (its loop is gone). The loop key only lets us notice a swap; a rebuild would still
+# leak the old session and may even fail acquiring the stale lock. All of this is
+# unreachable under the single-loop invariant above.
+_shared_client: KernelGymClient | None = None
+_shared_client_loop: asyncio.AbstractEventLoop | None = None
+_shared_client_lock = asyncio.Lock()
+
+
+async def _get_shared_client(args: Any) -> KernelGymClient:
+    """Return the process-wide :class:`KernelGymClient`, probing ``/health`` once.
+
+    The client (and its connection pool) is reused across every RM call in this
+    process; the one-time health check fails fast with a clear error if KernelGym
+    is unreachable on first use. The shared client is intentionally never closed —
+    it lives for the lifetime of the process.
+    """
+
+    global _shared_client, _shared_client_loop
+    loop = asyncio.get_running_loop()
+    if _shared_client is not None and _shared_client_loop is loop:
+        return _shared_client
+
+    async with _shared_client_lock:
+        # Re-check under the lock so concurrent first-callers build only one client.
+        if _shared_client is not None and _shared_client_loop is loop:
+            return _shared_client
+
+        client = KernelGymClient(
+            _get_rm_url(args),
+            max_retries=int(_get_arg(args, "kernelgym_max_retries", 2)),
+        )
+        # ``_check_health`` opens the aiohttp session; if it fails, close that
+        # session before propagating so a flapping server (whose error the
+        # multi-turn loop catches per-sample) doesn't leak a connector each retry.
+        try:
+            await client._check_health()
+        except BaseException:
+            await client.close()
+            raise
+        _shared_client = client
+        _shared_client_loop = loop
+        logger.info("KernelGym shared client created and health-checked once for %s", client.base_url)
+        return _shared_client
+
+
 async def evaluate_sample(
     args: Any,
     sample: Sample,
@@ -330,18 +383,12 @@ async def evaluate_sample(
 
     request = build_evaluation_request(args, sample, kernel_code=kernel_code)
 
-    owns_client = client is None
+    # Reuse the process-wide shared client (health-checked once) unless a caller
+    # passes its own; never close it here — it is owned by the process.
     if client is None:
-        client = await KernelGymClient.create(
-            _get_rm_url(args),
-            max_retries=int(_get_arg(args, "kernelgym_max_retries", 2)),
-        )
+        client = await _get_shared_client(args)
 
-    try:
-        result = await client.evaluate(request)
-    finally:
-        if owns_client:
-            await client.close()
+    result = await client.evaluate(request)
 
     reward = kernelgym_result_to_reward(result)
     metadata["kernelgym"] = {
@@ -356,15 +403,9 @@ async def custom_rm(args: Any, sample_or_samples: Sample | list[Sample], **_: An
     """Optional single-turn slime custom RM wrapper for KernelGym smoke tests."""
 
     samples = sample_or_samples if isinstance(sample_or_samples, list) else [sample_or_samples]
-    client = await KernelGymClient.create(
-        _get_rm_url(args),
-        max_retries=int(_get_arg(args, "kernelgym_max_retries", 2)),
-    )
+    client = await _get_shared_client(args)
 
-    try:
-        outputs = await asyncio.gather(*(evaluate_sample(args, sample, client=client) for sample in samples))
-    finally:
-        await client.close()
+    outputs = await asyncio.gather(*(evaluate_sample(args, sample, client=client) for sample in samples))
 
     rewards = [float(output["reward"]) for output in outputs]
     if isinstance(sample_or_samples, list):
