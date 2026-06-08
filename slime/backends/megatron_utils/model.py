@@ -662,10 +662,11 @@ def train(
     config.grad_scale_func = optimizer.scale_loss
     config.timers = None
     if isinstance(model[0], DDP) and args.overlap_grad_reduce:
-        assert config.no_sync_func is None, (
-            "When overlap_grad_reduce is True, config.no_sync_func must be None; "
-            "a custom no_sync_func is not supported when overlapping grad-reduce"
-        )
+        # slime re-enters train() for every rollout, and colocate/offload may
+        # reload process groups between calls. Rebuild the DDP sync hooks for
+        # the current model state instead of reusing stale callables.
+        config.no_sync_func = None
+        config.grad_sync_func = None
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
