@@ -263,6 +263,14 @@ def _get_prompt_renderer(hf_checkpoint: str) -> DrKernelPromptRenderer:
     return DrKernelPromptRenderer(hf_checkpoint)
 
 
+def _train_sglang_context_len_for_sampling(args: Namespace) -> int:
+    context_len = int(args.rollout_max_context_len)
+    draft_tokens = 0
+    if getattr(args, "sglang_speculative_algorithm", None):
+        draft_tokens = int(getattr(args, "sglang_speculative_num_draft_tokens", 0) or 0)
+    return max(1, context_len - draft_tokens)
+
+
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Any]]]
 ) -> Any:
@@ -277,6 +285,7 @@ async def generate_rollout_async(
 
     renderer = _get_prompt_renderer(args.hf_checkpoint)
     state = GenerateState(args)
+    state.sampling_params["_slime_max_context_len"] = _train_sglang_context_len_for_sampling(args)
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
     )
