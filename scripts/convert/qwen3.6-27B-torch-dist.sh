@@ -5,10 +5,15 @@ set -eo pipefail
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." &>/dev/null && pwd)"
 
 MODEL_DIR=${MODEL_DIR:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B}
-SAVE_DIR=${SAVE_DIR:-${MODEL_DIR}/torch_dist_tp4_pp1}
-MEGATRON_LM_PATH=${MEGATRON_LM_PATH:-/root/Megatron-LM}
 TP=${TP:-4}
 PP=${PP:-1}
+# Qwen3.6-27B ships an MTP (Multi-Token Prediction) head (mtp_num_hidden_layers=1
+# in config.json, 15 mtp.* weights in the HF checkpoint). Without --mtp-num-layers
+# the Megatron model is built without the MTP block and those weights are silently
+# dropped, producing an incomplete torch_dist checkpoint. Keep this at 1.
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
+SAVE_DIR=${SAVE_DIR:-${MODEL_DIR}/torch_dist_tp${TP}_pp${PP}}
+MEGATRON_LM_PATH=${MEGATRON_LM_PATH:-/root/Megatron-LM}
 NPROC_PER_NODE=${NPROC_PER_NODE:-$((TP * PP))}
 MASTER_PORT=${MASTER_PORT:-12355}
 FORCE=${FORCE:-0}
@@ -55,6 +60,7 @@ echo "  MODEL_DIR=${MODEL_DIR}"
 echo "  SAVE_DIR=${SAVE_DIR}"
 echo "  TP=${TP}"
 echo "  PP=${PP}"
+echo "  MTP_NUM_LAYERS=${MTP_NUM_LAYERS}"
 echo "  NPROC_PER_NODE=${NPROC_PER_NODE}"
 echo "  MEGATRON_LM_PATH=${MEGATRON_LM_PATH}"
 echo "  CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS}"
@@ -73,6 +79,7 @@ PYTHONPATH="${MEGATRON_LM_PATH}" torchrun \
   --ckpt-format torch_dist \
   --tensor-model-parallel-size "${TP}" \
   --pipeline-model-parallel-size "${PP}" \
+  --mtp-num-layers "${MTP_NUM_LAYERS}" \
   --no-save-rng \
   2>&1 | tee "${LOG_FILE}"
 
