@@ -21,8 +21,14 @@ logger = logging.getLogger(__name__)
 _TASK_COUNTER = count(1)
 KERNELGYM_WORKFLOW = "kernelbench"
 KERNELGYM_USE_REFERENCE_CACHE = True
-KERNELGYM_CLIENT_TIMEOUT_S = 1800.0
-KERNELGYM_TASK_TIMEOUT_S = 90
+# Client-side HTTP timeout for a single /evaluate request (covers KernelGym-side
+# queueing + compile + benchmark). Kept well above the per-task budget
+# (KERNELGYM_TASK_TIMEOUT_S=90s) to absorb queueing, but bounded so a wedged /
+# saturated KernelGym server fails fast and retries instead of pinning a request
+# for half an hour. Lowered 1800s -> 600s after a gbs=128 run where a saturated
+# server left tail /evaluate calls hanging the full 30min before timing out.
+KERNELGYM_CLIENT_TIMEOUT_S = 600.0
+KERNELGYM_TASK_TIMEOUT_S = 180
 KERNELGYM_VERBOSE_ERRORS = True
 KERNELGYM_ENABLE_PROFILING = True
 KERNELGYM_DETECT_DECOY_KERNEL = True
@@ -178,10 +184,12 @@ class KernelGymClient:
                     break
                 delay = self.retry_base_delay_s * (2**attempt)
                 logger.info(
-                    "KernelGym %s %s failed with %s; retrying in %.1fs (%d/%d)",
+                    "KernelGym %s %s failed with %s; detail=%s; request=%s; retrying in %.1fs (%d/%d)",
                     method,
                     path,
                     type(exc).__name__,
+                    _format_error_detail(exc),
+                    _summarize_request(json),
                     delay,
                     attempt + 1,
                     retry_limit,
@@ -189,6 +197,32 @@ class KernelGymClient:
                 await asyncio.sleep(delay)
 
         raise KernelGymRequestError(f"KernelGym {method} {path} failed after retries: {last_error}") from last_error
+
+
+def _format_error_detail(exc: Exception) -> str:
+    detail = str(exc)
+    if not detail:
+        detail = repr(exc)
+    return detail.replace("\n", "\\n")[:1200]
+
+
+def _summarize_request(request: dict[str, Any] | None) -> dict[str, Any]:
+    if not request:
+        return {}
+    return {
+        key: request.get(key)
+        for key in (
+            "task_id",
+            "uuid",
+            "entry_point",
+            "workflow",
+            "timeout",
+            "num_correct_trials",
+            "num_perf_trials",
+            "num_warmup",
+        )
+        if key in request
+    }
 
 
 def _get_arg(args: Any, name: str, default: Any = None) -> Any:

@@ -262,6 +262,9 @@ def test_rm_url_is_required():
 @pytest.mark.unit
 def test_kernelgym_client_default_timeout_is_hardcoded():
     assert KernelGymClient("http://kernelgym").timeout_s == KERNELGYM_CLIENT_TIMEOUT_S
+    # Pinned to 10min: a wedged/saturated server must fail fast + retry, not pin a
+    # request for 30min (see gbs=128 run where tail /evaluate hung the full 1800s).
+    assert KERNELGYM_CLIENT_TIMEOUT_S == 600.0
 
 
 @pytest.mark.unit
