@@ -122,6 +122,7 @@ PERF_ARGS=(
 
    --use-dynamic-batch-size
    --max-tokens-per-gpu 9216
+   --log-probs-max-tokens-per-gpu 16384
 )
 
 GRPO_ARGS=(
