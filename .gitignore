@@ -198,6 +198,9 @@ data/
 tmp.md
 *.bundle
 checkpoints/
+hostfile
+mpi_hostfile
+*.hostfile
 .vscode/
 uv.lock
 .claude/

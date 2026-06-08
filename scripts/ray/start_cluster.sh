@@ -38,10 +38,14 @@ stop_ray_processes() {
     sleep 3
     ray stop --force || true
     pkill -9 ray || true
-    pkill -9 python || true
+    if [[ "${SLIME_RAY_KILL_PYTHON_ON_START:-1}" == "1" ]]; then
+        pkill -9 python || true
+    fi
     sleep 3
     pkill -9 ray || true
-    pkill -9 python || true
+    if [[ "${SLIME_RAY_KILL_PYTHON_ON_START:-1}" == "1" ]]; then
+        pkill -9 python || true
+    fi
 }
 
 clean_ray_session_dirs() {
@@ -372,7 +376,6 @@ start_ray_cluster() {
             --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
             --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
             --metrics-export-port "${RAY_METRICS_EXPORT_PORT}" \
-            --system-config "${RAY_SYSTEM_CONFIG}" \
             --disable-usage-stats; then
             [[ -z "${port_preseed_pid}" ]] || kill "${port_preseed_pid}" 2>/dev/null || true
             dump_ray_logs
@@ -389,4 +392,6 @@ start_ray_cluster() {
     export RAY_JOB_ADDRESS
 }
 
-start_ray_cluster
+if [[ "${SLIME_RAY_START_CLUSTER_ON_SOURCE:-1}" == "1" ]]; then
+    start_ray_cluster
+fi
