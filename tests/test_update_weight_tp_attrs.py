@@ -93,6 +93,8 @@ def test_tensor_model_parallel_attrs_map_mcore_duplicate_to_parallel_mode():
         "module.module.decoder.layers.0.self_attention.linear_qkv.bias",
         "module.module.decoder.layers.0.mlp.linear_fc1.weight",
         "module.module.decoder.layers.0.mlp.linear_fc1.bias",
+        # MTP eh_proj projection (ColumnParallelLinear sharded on the output dim).
+        "module.module.mtp.layers.0.eh_proj.weight",
     ],
 )
 def test_tensor_model_parallel_attrs_infer_column_parallel_from_megatron_name(name):

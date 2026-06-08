@@ -5,6 +5,9 @@ _COLUMN_PARALLEL_PARAM_SUFFIXES = (
     "self_attention.linear_qkv.bias",
     "mlp.linear_fc1.weight",
     "mlp.linear_fc1.bias",
+    # MTP (Multi-Token Prediction) eh_proj: ColumnParallelLinear sharded on the
+    # output dim (e.g. mtp.layers.0.eh_proj.weight -> SGLang mtp.fc.weight).
+    "eh_proj.weight",
 )
 
 _ROW_PARALLEL_PARAM_SUFFIXES = (
