@@ -12,22 +12,26 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import sglang_router
 import yaml
 from jinja2 import Environment
+from packaging.version import parse
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
-from slime.rollout.sglang_rollout import GenerateState, abort, generate_and_rm
+from slime.rollout.sglang_rollout import GenerateState, generate_and_rm
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
+from slime.utils.http_utils import get, get_sglang_client_concurrency, post
 from slime.utils.misc import load_function
 from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.types import Sample
 
 from .eval_throttle import get_positive_int_env, run_eval_coro
+from .kernelgym_rm import cancel_inflight
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +61,7 @@ def _get_arg(args: Namespace, name: str, default: Any = None) -> Any:
 
 def ensure_no_pre_chat_template(args: Namespace) -> None:
     if args.apply_chat_template:
-        raise ValueError(
-            "DrKernel rollout applies tokenizer chat template after dynamic prompt rendering; remove --apply-chat-template from the run args."
-        )
+        raise ValueError("DrKernel rollout applies tokenizer chat template after dynamic prompt rendering; remove --apply-chat-template from the run args.")
 
 
 class DrKernelPromptRenderer:
@@ -93,9 +95,7 @@ class DrKernelPromptRenderer:
 
         problem = sample.prompt
         if not isinstance(problem, str):
-            raise TypeError(
-                "DrKernel prompt renderer expects a raw string problem. Do not apply chat template before custom rollout."
-            )
+            raise TypeError("DrKernel prompt renderer expects a raw string problem. Do not apply chat template before custom rollout.")
 
         role_candidate = self._select_candidate(
             rollout_id=rollout_id,
@@ -170,17 +170,11 @@ class DrKernelPromptRenderer:
         chosen = sample.metadata.get("chosen_prompt_slots") or {}
         backend_id = chosen.get("backend")
         if not backend_id:
-            raise RuntimeError(
-                "render_tool_response_message requires render_first_turn_messages to have run first; "
-                "chosen_prompt_slots['backend'] is missing."
-            )
+            raise RuntimeError("render_tool_response_message requires render_first_turn_messages to have run first; chosen_prompt_slots['backend'] is missing.")
         candidate = self._lookup_candidate("backend", backend_id)
         tool_path = candidate.get("tool_response_text_path")
         if not tool_path:
-            raise KeyError(
-                f"Profile {self.profile_name!r} backend candidate {backend_id!r} "
-                "is missing 'tool_response_text_path'; multi-turn rendering is not configured for it."
-            )
+            raise KeyError(f"Profile {self.profile_name!r} backend candidate {backend_id!r} is missing 'tool_response_text_path'; multi-turn rendering is not configured for it.")
         body = self._render_template(self._load_fragment(tool_path), feedback=feedback)
         return {"role": "user", "content": body}
 
@@ -238,9 +232,7 @@ class DrKernelPromptRenderer:
             known = {candidate["id"] for candidate in candidates}
             unknown = sorted(allowed - known)
             if unknown:
-                raise ValueError(
-                    f"Unknown DrKernel prompt candidates for {slot_name}: {unknown}. Known: {sorted(known)}"
-                )
+                raise ValueError(f"Unknown DrKernel prompt candidates for {slot_name}: {unknown}. Known: {sorted(known)}")
             candidates = [candidate for candidate in candidates if candidate["id"] in allowed]
 
         select_mode = slot_cfg.get("select", "fixed")
@@ -271,9 +263,53 @@ def _train_sglang_context_len_for_sampling(args: Namespace) -> int:
     return max(1, context_len - draft_tokens)
 
 
-async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Any]]]
-) -> Any:
+async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
+    aborted_samples = []
+
+    state = GenerateState(args)
+    assert not state.aborted
+    state.aborted = True
+
+    if parse(sglang_router.__version__) <= parse("0.2.1"):
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+        urls = response["urls"]
+    else:
+        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+        urls = [worker["url"] for worker in response["workers"]]
+
+    logger.info(f"Abort request for {urls}")
+    abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
+    abort_results = await asyncio.gather(*abort_tasks, return_exceptions=True)
+    for url, result in zip(urls, abort_results, strict=False):
+        if isinstance(result, Exception):
+            logger.warning(f"Failed to abort worker at {url}: {result}")
+
+    await cancel_inflight(args)
+
+    # make sure all the pending tasks are finished
+    count = 0
+    while state.pendings:
+        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
+
+        if not args.partial_rollout:
+            continue
+
+        # for partial rollout, collect the partial samples into the data buffer
+        for task in done:
+            group = task.result()
+            for sample in group:
+                if sample.response and "start_rollout_id" not in sample.metadata:
+                    sample.metadata["start_rollout_id"] = rollout_id
+            aborted_samples.append(group)
+            count += len(group)
+
+    if args.partial_rollout:
+        logger.info(f"Collected {count} partial samples into the data buffer")
+
+    return aborted_samples
+
+
+async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Any]]]) -> Any:
     """Minimal single-turn DrKernel rollout example.
 
     This shows how dynamic prompts plug into slime without rewriting SGLang
@@ -286,9 +322,7 @@ async def generate_rollout_async(
     renderer = _get_prompt_renderer(args.hf_checkpoint)
     state = GenerateState(args)
     state.sampling_params["_slime_max_context_len"] = _train_sglang_context_len_for_sampling(args)
-    dynamic_filter = (
-        load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
-    )
+    dynamic_filter = load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
     metric_gatherer = MetricGatherer()
 
     # target_data_size is the total number of valid samples to get
@@ -355,9 +389,7 @@ async def generate_rollout_async(
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
-    all_samples = sorted(
-        all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index
-    )
+    all_samples = sorted(all_data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
 
     # reset the global state to prevent effects on the next rollout or eval.
     state.reset()
@@ -529,11 +561,7 @@ def summarize_diagnostic_text(text: Any, limit: int = DEFAULT_KERNELGYM_ERROR_SU
             oom_text = oom_text[: sentinel.start()]
         return oom_text.strip()
 
-    compiler_error_lines = _dedupe_preserve_order(
-        line.strip()
-        for line in cleaned.splitlines()
-        if line.strip() and (" error:" in line.lower() or line.strip().lower().startswith("error:"))
-    )
+    compiler_error_lines = _dedupe_preserve_order(line.strip() for line in cleaned.splitlines() if line.strip() and (" error:" in line.lower() or line.strip().lower().startswith("error:")))
     if compiler_error_lines:
         return _truncate_text("\n".join(compiler_error_lines[:4]), limit)
 
@@ -548,11 +576,7 @@ def summarize_diagnostic_text(text: Any, limit: int = DEFAULT_KERNELGYM_ERROR_SU
     if exception_lines:
         return _truncate_text("\n".join(exception_lines[-3:]), limit)
 
-    signal_lines = _dedupe_preserve_order(
-        line.strip()
-        for line in cleaned.splitlines()
-        if line.strip() and any(token in line.lower() for token in ("failed", "error", "exception", "timeout"))
-    )
+    signal_lines = _dedupe_preserve_order(line.strip() for line in cleaned.splitlines() if line.strip() and any(token in line.lower() for token in ("failed", "error", "exception", "timeout")))
     if signal_lines:
         return _truncate_text("\n".join(signal_lines[-3:]), limit)
 
@@ -717,16 +741,10 @@ async def generate_multi_turn_eval_sample(
 
     # Resolve the per-turn feedback summary budget from args; falls back to the
     # library default if the plugin args are not wired up.
-    error_summary_chars = int(
-        getattr(args, "kernelgym_error_summary_chars", DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS)
-        or DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS
-    )
+    error_summary_chars = int(getattr(args, "kernelgym_error_summary_chars", DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS) or DEFAULT_KERNELGYM_ERROR_SUMMARY_CHARS)
 
     messages = sample.metadata.get("messages")
-    assert isinstance(messages, list) and len(messages) >= 1, (
-        "generate_multi_turn_eval_sample requires renderer.render_first_turn_messages "
-        "to have populated sample.metadata['messages']."
-    )
+    assert isinstance(messages, list) and len(messages) >= 1, "generate_multi_turn_eval_sample requires renderer.render_first_turn_messages to have populated sample.metadata['messages']."
 
     turns_log: list[dict[str, Any]] = sample.metadata.setdefault("turns", [])
 
@@ -755,9 +773,7 @@ async def generate_multi_turn_eval_sample(
             sample.status = Sample.Status.FAILED
             if sample.reward is None:
                 sample.reward = 0.0
-            sample.metadata.setdefault("multi_turn_errors", []).append(
-                {"turn_idx": turn_idx, "exc_type": type(exc).__name__, "exc_msg": str(exc)[:1000]}
-            )
+            sample.metadata.setdefault("multi_turn_errors", []).append({"turn_idx": turn_idx, "exc_type": type(exc).__name__, "exc_msg": str(exc)[:1000]})
             turns_log.append(
                 {
                     "turn_idx": turn_idx,
@@ -774,9 +790,7 @@ async def generate_multi_turn_eval_sample(
         # DrKernel multi-turn keeps a 1:1 turn-to-sample shape; fan-out via custom_generate
         # is not used here, so unwrap defensively if we ever see a list.
         if isinstance(sample, list):
-            assert (
-                len(sample) == 1
-            ), "generate_multi_turn_eval_sample does not support generate_and_rm returning multi-sample lists."
+            assert len(sample) == 1, "generate_multi_turn_eval_sample does not support generate_and_rm returning multi-sample lists."
             sample = sample[0]
 
         kg = (sample.metadata.get("kernelgym") or {}).get("response") or {}
@@ -852,9 +866,7 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     return RolloutFnEvalOutput(data=results), []
 
 
-async def eval_rollout_single_dataset(
-    args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig
-) -> dict[str, dict[str, list[Any]]]:
+async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig) -> dict[str, dict[str, list[Any]]]:
     """An example to implement the eval_rollout function for an rule based rm rollout generation.
 
     Args:
@@ -872,9 +884,7 @@ async def eval_rollout_single_dataset(
     if eval_max_prompt_len is None:
         eval_max_prompt_len = getattr(args, "eval_max_prompt_len", None)
     if cache_key not in EVAL_PROMPT_DATASET:
-        processor = (
-            load_processor(args.hf_checkpoint, trust_remote_code=True) if args.multimodal_keys is not None else None
-        )
+        processor = load_processor(args.hf_checkpoint, trust_remote_code=True) if args.multimodal_keys is not None else None
         EVAL_PROMPT_DATASET[cache_key] = Dataset(
             path=dataset_cfg.path,
             tokenizer=renderer.tokenizer,
@@ -901,9 +911,7 @@ async def eval_rollout_single_dataset(
     _SGLANG_INPUT_RESERVE = 32
     eval_context_len = dataset_cfg.max_context_len
     if eval_context_len is None:
-        eval_context_len = getattr(args, "eval_max_context_len", None) or getattr(
-            args, "rollout_max_context_len", None
-        )
+        eval_context_len = getattr(args, "eval_max_context_len", None) or getattr(args, "rollout_max_context_len", None)
     if eval_context_len is None:
         raise ValueError("eval max context length is required for DrKernel eval rollout")
     eval_max_context_len = max(1, int(eval_context_len) - _SGLANG_INPUT_RESERVE)

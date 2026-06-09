@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
+from slime.rollout.sglang_rollout import GenerateState
 
 import aiohttp
 
@@ -37,6 +38,7 @@ KERNELGYM_NUM_PERF_TRIALS = 50
 KERNELGYM_NUM_WARMUP = 30
 KERNELGYM_PERF_TRIM_COUNT = 5
 KERNELGYM_REFERENCE_BACKEND = "pytorch"
+
 
 __all__ = [
     "KernelGymClient",
@@ -153,6 +155,21 @@ class KernelGymClient:
         timeout_s: float | None = None,
         max_retries: int | None = None,
     ) -> dict[str, Any]:
+        """Make a request to the KernelGym API and return the JSON response.
+
+        Args:
+            method: The HTTP method to use.
+            path: The path to the API endpoint.
+            json: The JSON payload to send.
+            timeout_s: The timeout in seconds.
+            max_retries: The maximum number of retries.
+
+        Returns:
+            The JSON response from the KernelGym API.
+
+        Raises:
+            KernelGymRequestError: If the request fails.
+        """
         session = self._get_session()
         url = f"{self.base_url}{path}"
         last_error: Exception | None = None
@@ -164,19 +181,13 @@ class KernelGymClient:
                 async with session.request(method, url, json=json, timeout=request_timeout) as response:
                     text = await response.text()
                     if response.status >= 400:
-                        raise KernelGymRequestError(
-                            f"KernelGym {method} {path} failed with status {response.status}: {text[:1000]}"
-                        )
+                        raise KernelGymRequestError(f"KernelGym {method} {path} failed with status {response.status}: {text[:1000]}")
                     try:
                         payload = await response.json()
                     except Exception as exc:
-                        raise KernelGymRequestError(
-                            f"KernelGym {method} {path} returned non-JSON payload: {text[:1000]}"
-                        ) from exc
+                        raise KernelGymRequestError(f"KernelGym {method} {path} returned non-JSON payload: {text[:1000]}") from exc
                     if not isinstance(payload, dict):
-                        raise KernelGymRequestError(
-                            f"KernelGym {method} {path} returned {type(payload).__name__}, expected object"
-                        )
+                        raise KernelGymRequestError(f"KernelGym {method} {path} returned {type(payload).__name__}, expected object")
                     return payload
             except (aiohttp.ClientError, asyncio.TimeoutError, KernelGymRequestError) as exc:
                 last_error = exc
@@ -197,6 +208,62 @@ class KernelGymClient:
                 await asyncio.sleep(delay)
 
         raise KernelGymRequestError(f"KernelGym {method} {path} failed after retries: {last_error}") from last_error
+
+    async def cancel(self, task_id: str) -> dict[str, Any]:
+        return await self._request_json("DELETE", f"/tasks/{task_id}", max_retries=0)
+
+
+_inflight_task_ids: set[str] = set()
+_inflight_lock = asyncio.Lock()
+
+
+async def _register_inflight(task_id: str) -> None:
+    async with _inflight_lock:
+        _inflight_task_ids.add(task_id)
+
+
+async def _unregister_inflight(task_id: str) -> None:
+    async with _inflight_lock:
+        _inflight_task_ids.discard(task_id)
+
+
+async def snapshot_inflight_task_ids() -> set[str]:
+    async with _inflight_lock:
+        return _inflight_task_ids.copy()
+
+
+async def cancel_inflight(args):
+    task_ids = sorted(await snapshot_inflight_task_ids())
+    if not task_ids:
+        logger.info("KernelGym cancel_inflight: no in-flight tasks")
+        return
+
+    client = await _get_shared_client(args)
+    results = await asyncio.gather(*(client.cancel(task_id) for task_id in task_ids), return_exceptions=True)
+
+    failure_counts: dict[str, int] = {}
+    for result in results:
+        if isinstance(result, BaseException):
+            error_name = type(result).__name__
+            failure_counts[error_name] = failure_counts.get(error_name, 0) + 1
+
+    attempted = len(task_ids)
+    failed = sum(failure_counts.values())
+    succeeded = attempted - failed
+    if failed:
+        logger.warning(
+            "KernelGym cancel_inflight: attempted=%d succeeded=%d failed=%d failures=%s",
+            attempted,
+            succeeded,
+            failed,
+            failure_counts,
+        )
+    else:
+        logger.info(
+            "KernelGym cancel_inflight: attempted=%d succeeded=%d failed=0",
+            attempted,
+            succeeded,
+        )
 
 
 def _format_error_detail(exc: Exception) -> str:
@@ -398,6 +465,9 @@ async def evaluate_sample(
     client: KernelGymClient | None = None,
 ) -> dict[str, Any]:
     """Extract/build/evaluate one sample and store review metadata on the sample."""
+    state = GenerateState(args)
+    if state.aborted:
+        return {"reward": 0.0, "extract_error": "aborted"}
 
     metadata = sample.metadata
 
@@ -422,7 +492,12 @@ async def evaluate_sample(
     if client is None:
         client = await _get_shared_client(args)
 
-    result = await client.evaluate(request)
+    task_id = request["task_id"]
+    await _register_inflight(task_id)
+    try:
+        result = await client.evaluate(request)
+    finally:
+        await _unregister_inflight(task_id)
 
     reward = kernelgym_result_to_reward(result)
     metadata["kernelgym"] = {

@@ -43,6 +43,14 @@ class _Sample:
         }
 
 
+@pytest.fixture(autouse=True)
+def fake_generate_state():
+    """Keep KernelGym RM tests independent of rollout tokenizer state."""
+
+    with patch.object(krm, "GenerateState", lambda args: SimpleNamespace(aborted=False)):
+        yield
+
+
 @pytest.mark.unit
 def test_build_evaluation_request_uses_sample_label_as_reference_code():
     request = build_evaluation_request(
@@ -471,6 +479,32 @@ def test_shared_client_closes_session_when_health_check_fails(reset_shared_clien
 
     assert closed["n"] == 1
     assert krm._shared_client is None
+
+
+@pytest.mark.unit
+def test_evaluate_sample_short_circuits_when_rollout_aborted():
+    sample = _Sample()
+
+    def fail_extract_kernel_submission(response):
+        raise AssertionError("aborted evaluate_sample must not extract a submission")
+
+    async def fail_get_shared_client(args):
+        raise AssertionError("aborted evaluate_sample must not create a KernelGym client")
+
+    async def fail_register_inflight(task_id):
+        raise AssertionError("aborted evaluate_sample must not register KernelGym tasks")
+
+    with (
+        patch.object(krm, "GenerateState", lambda args: SimpleNamespace(aborted=True)),
+        patch.object(krm, "extract_kernel_submission", fail_extract_kernel_submission),
+        patch.object(krm, "_get_shared_client", fail_get_shared_client),
+        patch.object(krm, "_register_inflight", fail_register_inflight),
+    ):
+        output = asyncio.run(evaluate_sample(SimpleNamespace(), sample))
+
+    assert output == {"reward": 0.0, "extract_error": "aborted"}
+    assert "kernelgym" not in sample.metadata
+    assert "kernel_submission" not in sample.metadata
 
 
 @pytest.mark.unit
