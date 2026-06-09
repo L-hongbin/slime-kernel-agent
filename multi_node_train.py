@@ -174,6 +174,65 @@ def quote_env(name: str, value: str) -> str:
     return shlex.quote(f"{name}={value}")
 
 
+def scp_opts_from_ssh_opts(ssh_opts: list[str]) -> list[str]:
+    scp_opts: list[str] = []
+    idx = 0
+    while idx < len(ssh_opts):
+        opt = ssh_opts[idx]
+        if opt == "-p":
+            scp_opts.append("-P")
+            if idx + 1 < len(ssh_opts):
+                scp_opts.append(ssh_opts[idx + 1])
+                idx += 2
+            else:
+                idx += 1
+            continue
+        if opt.startswith("-p") and opt != "-p":
+            scp_opts.append("-P" + opt[2:])
+            idx += 1
+            continue
+        scp_opts.append(opt)
+        idx += 1
+    return scp_opts
+
+
+def scp_opts_from_env(ssh_opts: list[str]) -> list[str]:
+    explicit = os.environ.get("MULTI_NODE_SCP_OPTS")
+    if explicit is not None:
+        return shlex.split(explicit)
+    return scp_opts_from_ssh_opts(ssh_opts)
+
+
+def env_flag_enabled(name: str, default: str = "1") -> bool:
+    value = os.environ.get(name, default).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def kernelgym_health_command(repo_root: Path) -> list[str]:
+    return [
+        "python3",
+        str(repo_root / "scripts/check_kernelgym_health.py"),
+        "--url",
+        os.environ.get("KERNELGYM_URL", "http://127.0.0.1:20391"),
+        "--timeout",
+        os.environ.get("KERNELGYM_HEALTH_TIMEOUT", "5"),
+        "--attempts",
+        os.environ.get("KERNELGYM_HEALTH_ATTEMPTS", "3"),
+        "--interval",
+        os.environ.get("KERNELGYM_HEALTH_INTERVAL", "2"),
+    ]
+
+
+def check_kernelgym_health(repo_root: Path, label: str) -> None:
+    if not env_flag_enabled("MULTI_NODE_KERNELGYM_HEALTH_CHECK", "1"):
+        print(f"multi_node_train: skipping KernelGym health check for {label}")
+        return
+
+    command = kernelgym_health_command(repo_root)
+    print(f"multi_node_train: checking KernelGym health for {label}: {' '.join(shlex.quote(arg) for arg in command)}")
+    subprocess.run(command, check=True)
+
+
 def forwarded_env(base: dict[str, str]) -> list[str]:
     optional_names = [
         "RAY_PORT",
@@ -184,8 +243,14 @@ def forwarded_env(base: dict[str, str]) -> list[str]:
         "RAY_METRICS_EXPORT_PORT",
         "RAY_NUM_CPUS",
         "RAY_TMPDIR",
+        "RAY_JOB_NO_FOLLOW",
         "SLIME_REQUIRE_HOST_HEALTH",
         "SLIME_RAY_KILL_PYTHON_ON_START",
+        "MULTI_NODE_KERNELGYM_HEALTH_CHECK",
+        "KERNELGYM_URL",
+        "KERNELGYM_HEALTH_TIMEOUT",
+        "KERNELGYM_HEALTH_ATTEMPTS",
+        "KERNELGYM_HEALTH_INTERVAL",
     ]
     env = [quote_env(name, value) for name, value in base.items()]
     env.extend(quote_env(name, os.environ[name]) for name in optional_names if name in os.environ)
@@ -224,7 +289,7 @@ def sync_file_to_worker(host: Host, local_path: Path, remote_path: Path, ssh_opt
         ["ssh", *ssh_opts, host.ssh_target, f"mkdir -p {shlex.quote(str(remote_path.parent))}"],
         check=True,
     )
-    subprocess.run(["scp", *ssh_opts, str(local_path), f"{host.ssh_target}:{remote_path}"], check=True)
+    subprocess.run(["scp", *scp_opts_from_env(ssh_opts), str(local_path), f"{host.ssh_target}:{remote_path}"], check=True)
 
 
 def sync_worker_inputs(host: Host, script: Path, train_script: Path, hostfile: Path, repo_root: Path, ssh_opts: list[str]) -> None:
@@ -232,6 +297,7 @@ def sync_worker_inputs(host: Host, script: Path, train_script: Path, hostfile: P
         script,
         hostfile,
         train_script,
+        repo_root / "scripts/check_kernelgym_health.py",
         repo_root / "scripts/ray/start_cluster.sh",
     ):
         sync_file_to_worker(host, path, path, ssh_opts)
@@ -286,6 +352,7 @@ def ray_job_address() -> str:
 
 
 def start_ray_cluster(role: str, node_addr: str, repo_root: Path) -> None:
+    check_kernelgym_health(repo_root, f"{role} {node_addr}")
     env = os.environ.copy()
     env["RAY_ROLE"] = role
     env["NODE_ADDR"] = node_addr

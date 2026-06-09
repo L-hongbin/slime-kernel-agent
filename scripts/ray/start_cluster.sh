@@ -224,6 +224,11 @@ submit_ray_job() {
                 return 1
             fi
 
+            if [[ "${RAY_JOB_NO_FOLLOW:-0}" =~ ^(1|true|TRUE|yes|YES|on|ON)$ ]]; then
+                echo "Ray job ${submission_id} submitted; not following logs because RAY_JOB_NO_FOLLOW=${RAY_JOB_NO_FOLLOW}."
+                return 0
+            fi
+
             set +e
             follow_ray_job_logs "${submission_id}"
             follow_exit_code=$?
