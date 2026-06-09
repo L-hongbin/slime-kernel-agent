@@ -292,14 +292,29 @@ def sync_file_to_worker(host: Host, local_path: Path, remote_path: Path, ssh_opt
     subprocess.run(["scp", *scp_opts_from_env(ssh_opts), str(local_path), f"{host.ssh_target}:{remote_path}"], check=True)
 
 
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def sync_project_to_worker(host: Host, repo_root: Path) -> None:
+    sync_script = repo_root / "scripts/sync/rsync_project.sh"
+    if not sync_script.is_file():
+        raise FileNotFoundError(f"project sync script not found: {sync_script}")
+
+    print(f"Syncing project {repo_root} -> {host.ssh_target}:{repo_root}")
+    subprocess.run([str(sync_script), host.ssh_target, str(repo_root)], check=True)
+
+
 def sync_worker_inputs(host: Host, script: Path, train_script: Path, hostfile: Path, repo_root: Path, ssh_opts: list[str]) -> None:
-    for path in (
-        script,
-        hostfile,
-        train_script,
-        repo_root / "scripts/check_kernelgym_health.py",
-        repo_root / "scripts/ray/start_cluster.sh",
-    ):
+    sync_project_to_worker(host, repo_root)
+
+    for path in (script, hostfile, train_script):
+        if is_relative_to(path, repo_root):
+            continue
         sync_file_to_worker(host, path, path, ssh_opts)
 
 
