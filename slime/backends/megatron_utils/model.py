@@ -247,19 +247,62 @@ def enable_forward_pre_hook(model_chunks: Sequence[DDP]) -> None:
     """
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
+        if _forward_pre_hook_enabled(model_chunk) and _forward_pre_hook_handles_are_complete(model_chunk):
+            continue
+        _clear_forward_pre_hook_handles(model_chunk)
         model_chunk.enable_forward_pre_hook()
 
 
-def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = True) -> None:
+def disable_forward_pre_hook(model_chunks: Sequence[DDP], param_sync: bool = True) -> bool:
     """Disable forward pre-hooks for provided DDP-wrapped model chunks.
 
     Args:
         model_chunks (Sequence[DDP]): Sequence of DDP modules to disable hooks on.
         param_sync (bool): Whether to synchronize parameters when disabling.
+
+    Returns:
+        Whether at least one model chunk had hooks disabled by this call.
     """
+    disabled_any = False
     for model_chunk in model_chunks:
         assert isinstance(model_chunk, DDP)
-        model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+        if not _forward_pre_hook_enabled(model_chunk):
+            continue
+        if _forward_pre_hook_handles_are_complete(model_chunk):
+            model_chunk.disable_forward_pre_hook(param_sync=param_sync)
+        else:
+            _clear_forward_pre_hook_handles(model_chunk)
+            if param_sync:
+                model_chunk.start_param_sync(force_sync=True)
+        disabled_any = True
+    return disabled_any
+
+
+def _forward_pre_hook_enabled(model_chunk: DDP) -> bool:
+    handles = getattr(model_chunk, "remove_forward_pre_hook_handles", None)
+    return bool(handles)
+
+
+def _forward_pre_hook_handles_are_complete(model_chunk: DDP) -> bool:
+    handles = getattr(model_chunk, "remove_forward_pre_hook_handles", None)
+    if not handles:
+        return False
+    module = getattr(model_chunk, "module", None)
+    if module is None or not hasattr(module, "modules"):
+        return all(handle is not None for handle in handles.values())
+    return len(handles) == sum(1 for _ in module.modules()) and all(
+        handle is not None for handle in handles.values()
+    )
+
+
+def _clear_forward_pre_hook_handles(model_chunk: DDP) -> None:
+    handles = getattr(model_chunk, "remove_forward_pre_hook_handles", None)
+    if not handles:
+        return
+    for handle in list(handles.values()):
+        if handle is not None:
+            handle.remove()
+    handles.clear()
 
 
 @torch.no_grad()
@@ -864,8 +907,9 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     args = get_args()
+    disabled_forward_pre_hook = False
     if should_disable_forward_pre_hook(args):
-        disable_forward_pre_hook(model)
+        disabled_forward_pre_hook = disable_forward_pre_hook(model)
     save_checkpoint(
         iteration,
         model,
@@ -876,7 +920,7 @@ def save(
         train_data_iterator=None,
         preprocess_common_state_dict_fn=None,
     )
-    if should_disable_forward_pre_hook(args):
+    if disabled_forward_pre_hook:
         enable_forward_pre_hook(model)
 
 
