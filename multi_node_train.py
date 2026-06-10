@@ -19,6 +19,14 @@ class Host:
     node_addr: str
 
 
+@dataclass
+class GpuProcess:
+    gpu_uuid: str
+    pid: str
+    process_name: str
+    used_memory_mib: str
+
+
 def strip_user(host: str) -> str:
     host = host.split("@", 1)[-1]
     return host.removeprefix("[").removesuffix("]")
@@ -233,6 +241,87 @@ def check_kernelgym_health(repo_root: Path, label: str) -> None:
     subprocess.run(command, check=True)
 
 
+def gpu_occupancy_command() -> list[str]:
+    return [
+        "nvidia-smi",
+        "--query-compute-apps=gpu_uuid,pid,process_name,used_memory",
+        "--format=csv,noheader,nounits",
+    ]
+
+
+def parse_gpu_occupancy(stdout: str) -> list[GpuProcess]:
+    processes: list[GpuProcess] = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = [field.strip() for field in line.split(",", 3)]
+        fields.extend([""] * (4 - len(fields)))
+        processes.append(
+            GpuProcess(
+                gpu_uuid=fields[0],
+                pid=fields[1],
+                process_name=fields[2],
+                used_memory_mib=fields[3],
+            )
+        )
+    return processes
+
+
+def format_gpu_occupancy(processes: list[GpuProcess]) -> str:
+    return "\n".join(
+        f"  gpu={proc.gpu_uuid} pid={proc.pid} process={proc.process_name} used_memory_mib={proc.used_memory_mib}"
+        for proc in processes
+    )
+
+
+def run_gpu_occupancy_probe(label: str, command: list[str]) -> None:
+    result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        detail = f": {stderr}" if stderr else ""
+        raise RuntimeError(f"GPU occupancy check failed for {label}{detail}")
+
+    processes = parse_gpu_occupancy(result.stdout)
+    if processes:
+        raise RuntimeError(f"GPU occupied on {label}; aborting before launch:\n{format_gpu_occupancy(processes)}")
+
+    print(f"multi_node_train: GPU occupancy check passed for {label}")
+
+
+def check_local_gpu_free(label: str) -> None:
+    run_gpu_occupancy_probe(label, gpu_occupancy_command())
+
+
+def check_current_node_gpu_free(label: str) -> None:
+    if not env_flag_enabled("MULTI_NODE_GPU_OCCUPANCY_CHECK", "1"):
+        print("multi_node_train: skipping GPU occupancy check")
+        return
+    check_local_gpu_free(label)
+
+
+def remote_gpu_occupancy_command() -> str:
+    return " ".join(shlex.quote(arg) for arg in gpu_occupancy_command())
+
+
+def check_remote_gpu_free(host: Host, label: str, ssh_opts: list[str]) -> None:
+    run_gpu_occupancy_probe(label, ["ssh", *ssh_opts, host.ssh_target, remote_gpu_occupancy_command()])
+
+
+def check_gpu_free_for_hosts(hosts: list[Host], node_idx: int) -> None:
+    if not env_flag_enabled("MULTI_NODE_GPU_OCCUPANCY_CHECK", "1"):
+        print("multi_node_train: skipping GPU occupancy check")
+        return
+
+    ssh_opts = shlex.split(os.environ.get("MULTI_NODE_SSH_OPTS", ""))
+    for idx, host in enumerate(hosts):
+        label = f"node {idx} {host.ssh_target} ({host.node_addr})"
+        if idx == node_idx:
+            check_local_gpu_free(label)
+        else:
+            check_remote_gpu_free(host, label, ssh_opts)
+
+
 def forwarded_env(base: dict[str, str]) -> list[str]:
     optional_names = [
         "RAY_PORT",
@@ -246,6 +335,7 @@ def forwarded_env(base: dict[str, str]) -> list[str]:
         "RAY_JOB_NO_FOLLOW",
         "SLIME_REQUIRE_HOST_HEALTH",
         "SLIME_RAY_KILL_PYTHON_ON_START",
+        "MULTI_NODE_GPU_OCCUPANCY_CHECK",
         "MULTI_NODE_KERNELGYM_HEALTH_CHECK",
         "KERNELGYM_URL",
         "KERNELGYM_HEALTH_TIMEOUT",
@@ -479,6 +569,11 @@ def main(argv: list[str]) -> int:
             head_or_worker = "head" if idx == 0 else "worker"
             print(f"  [{idx}] ssh={host.ssh_target} node_addr={host.node_addr} {head_or_worker}")
         return 0
+
+    if role == "head":
+        check_gpu_free_for_hosts(hosts, node_idx)
+    else:
+        check_current_node_gpu_free(f"node {node_idx} {hosts[node_idx].ssh_target} ({hosts[node_idx].node_addr})")
 
     if role == "worker":
         return start_worker_cluster(repo_root)
