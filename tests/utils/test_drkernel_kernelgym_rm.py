@@ -270,9 +270,24 @@ def test_rm_url_is_required():
 @pytest.mark.unit
 def test_kernelgym_client_default_timeout_is_hardcoded():
     assert KernelGymClient("http://kernelgym").timeout_s == KERNELGYM_CLIENT_TIMEOUT_S
-    # Pinned to 10min: a wedged/saturated server must fail fast + retry, not pin a
-    # request for 30min (see gbs=128 run where tail /evaluate hung the full 1800s).
-    assert KERNELGYM_CLIENT_TIMEOUT_S == 600.0
+    # Default pinned to 10min: a wedged/saturated server must fail fast + retry, not
+    # pin a request for 30min (see gbs=128 run where tail /evaluate hung the full
+    # 1800s). Multi-node parallel evals raise it via the env override instead.
+    assert krm._positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S_UNSET_FOR_TEST", 600.0) == 600.0
+
+
+@pytest.mark.unit
+def test_kernelgym_client_timeout_env_override():
+    with patch.dict("os.environ", {"KERNELGYM_CLIENT_TIMEOUT_S": "7200"}):
+        assert krm._positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S", 600.0) == 7200.0
+    with patch.dict("os.environ", {"KERNELGYM_CLIENT_TIMEOUT_S": ""}):
+        assert krm._positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S", 600.0) == 600.0
+    with patch.dict("os.environ", {"KERNELGYM_CLIENT_TIMEOUT_S": "abc"}):
+        with pytest.raises(ValueError):
+            krm._positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S", 600.0)
+    with patch.dict("os.environ", {"KERNELGYM_CLIENT_TIMEOUT_S": "-1"}):
+        with pytest.raises(ValueError):
+            krm._positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S", 600.0)
 
 
 @pytest.mark.unit

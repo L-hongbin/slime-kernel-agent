@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 from dataclasses import dataclass, field
 from itertools import count
 from typing import TYPE_CHECKING, Any
@@ -28,7 +29,26 @@ KERNELGYM_USE_REFERENCE_CACHE = True
 # saturated KernelGym server fails fast and retries instead of pinning a request
 # for half an hour. Lowered 1800s -> 600s after a gbs=128 run where a saturated
 # server left tail /evaluate calls hanging the full 30min before timing out.
-KERNELGYM_CLIENT_TIMEOUT_S = 600.0
+# Overridable via the KERNELGYM_CLIENT_TIMEOUT_S env var: multi-node parallel
+# evals against the shared KernelGym backend push queue wait far beyond 600s
+# (the aiohttp total timeout also counts local connection-pool wait), and the
+# timeout->retry path re-POSTs duplicate tasks that amplify the overload.
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return value
+
+
+KERNELGYM_CLIENT_TIMEOUT_S = _positive_float_env("KERNELGYM_CLIENT_TIMEOUT_S", 600.0)
 KERNELGYM_TASK_TIMEOUT_S = 180
 KERNELGYM_VERBOSE_ERRORS = True
 KERNELGYM_ENABLE_PROFILING = True
