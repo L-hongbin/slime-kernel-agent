@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import count
 from typing import TYPE_CHECKING, Any
@@ -58,6 +59,10 @@ KERNELGYM_NUM_PERF_TRIALS = 50
 KERNELGYM_NUM_WARMUP = 30
 KERNELGYM_PERF_TRIM_COUNT = 5
 KERNELGYM_REFERENCE_BACKEND = "pytorch"
+# Speedup cutoffs for the rollout-accuracy ``fast@x`` metrics. ``fast@x`` is the
+# fraction of *all* rollout samples that are correct AND run at least ``x`` times
+# faster than the PyTorch reference (matches the KernelBench fast_p convention).
+KERNELGYM_FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0)
 
 
 __all__ = [
@@ -65,6 +70,7 @@ __all__ = [
     "KernelGymError",
     "KernelGymRequestError",
     "build_evaluation_request",
+    "compute_kernelgym_metrics",
     "custom_rm",
     "evaluate_sample",
     "kernelgym_result_to_reward",
@@ -422,6 +428,94 @@ def kernelgym_result_to_reward(result: dict[str, Any]) -> float:
     correctness = bool(result.get("correctness"))
     decoy_kernel = bool(result.get("decoy_kernel")) if result.get("decoy_kernel") is not None else False
     return 1.0 if compiled and correctness and not decoy_kernel else 0.0
+
+
+def _sample_kernelgym_response(sample: Any) -> dict[str, Any]:
+    """Return the KernelGym ``/evaluate`` response dict stored on a rollout sample.
+
+    ``evaluate_sample`` stashes it at ``sample.metadata['kernelgym']['response']``.
+    A sample whose RM short-circuited (extract error, abort) has no ``response``;
+    return ``{}`` so the caller counts it as not-compiled / not-correct.
+
+    The signal fields (``compiled`` / ``correctness`` / ``decoy_kernel`` /
+    ``speedup``) are read at the top level — the exact shape
+    :func:`kernelgym_result_to_reward` scores, so ``correctness`` stays equal to
+    the mean scalar reward. (The nested ``env_state`` wrapper handled in
+    rollout.py's feedback path is a defensive fallback that production training
+    responses do not use; reading it here would desync metrics from the reward.)
+    """
+    metadata = getattr(sample, "metadata", None)
+    if not isinstance(metadata, dict):
+        return {}
+    kernelgym = metadata.get("kernelgym")
+    response = kernelgym.get("response") if isinstance(kernelgym, dict) else None
+    return response if isinstance(response, dict) else {}
+
+
+def _coerce_speedup(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _format_threshold(threshold: float) -> str:
+    return f"{threshold:g}"
+
+
+def compute_kernelgym_metrics(
+    samples: Iterable[Any],
+    *,
+    prefix: str = "",
+    fast_thresholds: Iterable[float] = KERNELGYM_FAST_THRESHOLDS,
+) -> dict[str, float]:
+    """Aggregate KernelGym accuracy metrics (compile / correctness / fast@x) over samples.
+
+    The denominator is every sample passed in: a sample whose RM short-circuited
+    (no ``response``) counts as not-compiled and not-correct, which is the correct
+    accounting for rollout precision. ``correctness`` uses the same definition as
+    the scalar reward (compiled AND correct AND not a decoy kernel), so it equals
+    the mean reward. ``fast@x`` is the fraction of all samples that are correct and
+    achieve ``speedup >= x`` vs. the PyTorch reference. ``speedup_mean`` /
+    ``speedup_max`` are computed over the correct subset only (``0`` correct ->
+    those keys are omitted). Returns an empty dict when ``samples`` is empty.
+    """
+    thresholds = tuple(fast_thresholds)
+    total = 0
+    compiled_count = 0
+    correct_count = 0
+    fast_counts = {threshold: 0 for threshold in thresholds}
+    correct_speedups: list[float] = []
+    for sample in samples:
+        total += 1
+        response = _sample_kernelgym_response(sample)
+        is_compiled = bool(response.get("compiled"))
+        is_correct = is_compiled and bool(response.get("correctness")) and not bool(response.get("decoy_kernel"))
+        compiled_count += int(is_compiled)
+        correct_count += int(is_correct)
+        if is_correct:
+            speedup = _coerce_speedup(response.get("speedup"))
+            correct_speedups.append(speedup)
+            for threshold in thresholds:
+                if speedup >= threshold:
+                    fast_counts[threshold] += 1
+    if total == 0:
+        return {}
+
+    metrics: dict[str, float] = {
+        "num_evaluated": float(total),
+        "compilation": compiled_count / total,
+        "correctness": correct_count / total,
+    }
+    for threshold in thresholds:
+        metrics[f"fast@{_format_threshold(threshold)}"] = fast_counts[threshold] / total
+    if correct_speedups:
+        metrics["speedup_mean"] = sum(correct_speedups) / len(correct_speedups)
+        metrics["speedup_max"] = max(correct_speedups)
+
+    if prefix:
+        return {f"{prefix}{key}": value for key, value in metrics.items()}
+    return metrics
 
 
 # Process-wide shared client. Created lazily on the first RM call so ``/health``

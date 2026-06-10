@@ -31,7 +31,7 @@ from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.types import Sample
 
 from .eval_throttle import get_positive_int_env, run_eval_coro
-from .kernelgym_rm import cancel_inflight
+from .kernelgym_rm import cancel_inflight, compute_kernelgym_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,20 @@ class PromptRenderResult:
 
 def _get_arg(args: Namespace, name: str, default: Any = None) -> Any:
     return getattr(args, name, default)
+
+
+def _flatten_samples(groups: Iterable[Any]) -> list[Sample]:
+    """Flatten the nested rollout output (list[group] where a group is a Sample,
+    list[Sample], or list[list[Sample]]) into a flat list of samples."""
+    flat: list[Sample] = []
+    stack = list(groups)
+    while stack:
+        item = stack.pop()
+        if isinstance(item, list):
+            stack.extend(item)
+        else:
+            flat.append(item)
+    return flat
 
 
 def ensure_no_pre_chat_template(args: Namespace) -> None:
@@ -402,7 +416,13 @@ async def generate_rollout_async(args: Namespace, rollout_id: int, data_source: 
         process_func = load_function(args.rollout_all_samples_process_path)
         process_func(args, all_samples, data_source)
 
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
+    # Log KernelGym rollout accuracy (compilation / correctness / fast@x) to wandb.
+    # Computed over the selected training `data` so it matches the other
+    # ``rollout/*`` per-sample metrics in `_log_rollout_data`.
+    metrics = metric_gatherer.collect()
+    metrics.update(compute_kernelgym_metrics(_flatten_samples(data), prefix="rollout/kernel/"))
+
+    return RolloutFnTrainOutput(samples=data, metrics=metrics), aborted_samples
 
 
 # ---------------------------------------------------------------------------
@@ -863,7 +883,17 @@ async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict
     results = {}
     for r in results_list:
         results.update(r)
-    return RolloutFnEvalOutput(data=results), []
+
+    # Log per-dataset KernelGym eval accuracy (compilation / correctness / fast@x)
+    # to wandb. These flow through `_log_eval_rollout_data` as extra metrics and
+    # sit alongside the generic ``eval/{dataset}/*`` keys it computes.
+    eval_metrics: dict[str, Any] = {}
+    for name, info in results.items():
+        samples = info.get("samples")
+        if samples:
+            eval_metrics.update(compute_kernelgym_metrics(samples, prefix=f"eval/{name}/kernel/"))
+
+    return RolloutFnEvalOutput(data=results, metrics=eval_metrics or None), []
 
 
 async def eval_rollout_single_dataset(args: Namespace, rollout_id: int, dataset_cfg: EvalDatasetConfig) -> dict[str, dict[str, list[Any]]]:

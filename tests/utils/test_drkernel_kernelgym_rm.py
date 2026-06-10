@@ -25,10 +25,19 @@ from slime_plugins.drkernel.kernelgym_rm import (
     _get_rm_url,
     _get_shared_client,
     build_evaluation_request,
+    compute_kernelgym_metrics,
     custom_rm,
     evaluate_sample,
     kernelgym_result_to_reward,
 )
+
+
+def _kg_sample(response):
+    """Build a minimal sample carrying a KernelGym response (or None) in metadata."""
+    metadata = {}
+    if response is not None:
+        metadata["kernelgym"] = {"response": response}
+    return SimpleNamespace(metadata=metadata)
 
 
 class _Sample:
@@ -535,3 +544,70 @@ def test_evaluate_sample_returns_zero_reward_for_incomplete_submission():
         "reward": 0.0,
     }
     assert "kernel_submission" not in sample.metadata
+
+
+@pytest.mark.unit
+def test_compute_kernelgym_metrics_empty_returns_empty():
+    assert compute_kernelgym_metrics([]) == {}
+
+
+@pytest.mark.unit
+def test_compute_kernelgym_metrics_basic_rates_and_fast_at_x():
+    samples = [
+        # correct + 3x speedup -> counts toward every fast@x bucket
+        _kg_sample({"compiled": True, "correctness": True, "speedup": 3.0}),
+        # correct + 1.3x speedup -> fast@1 and fast@1.2 only (below 1.5 and 2.0)
+        _kg_sample({"compiled": True, "correctness": True, "speedup": 1.3}),
+        # compiled but incorrect -> compile only
+        _kg_sample({"compiled": True, "correctness": False, "speedup": 9.0}),
+        # decoy kernel does not count as correct even though flags pass
+        _kg_sample({"compiled": True, "correctness": True, "decoy_kernel": True, "speedup": 9.0}),
+        # short-circuited RM (no response) -> not compiled, not correct
+        _kg_sample(None),
+    ]
+
+    metrics = compute_kernelgym_metrics(samples)
+
+    assert metrics["num_evaluated"] == 5.0
+    assert metrics["compilation"] == pytest.approx(4 / 5)
+    assert metrics["correctness"] == pytest.approx(2 / 5)
+    # thresholds (1.0, 1.2, 1.5, 2.0): 3.0 clears all, 1.3 clears only 1.0 and 1.2
+    assert metrics["fast@1"] == pytest.approx(2 / 5)
+    assert metrics["fast@1.2"] == pytest.approx(2 / 5)
+    assert metrics["fast@1.5"] == pytest.approx(1 / 5)
+    assert metrics["fast@2"] == pytest.approx(1 / 5)
+    # speedup stats over the correct subset only (3.0 and 1.3)
+    assert metrics["speedup_mean"] == pytest.approx((3.0 + 1.3) / 2)
+    assert metrics["speedup_max"] == pytest.approx(3.0)
+
+
+@pytest.mark.unit
+def test_compute_kernelgym_metrics_prefix_and_no_correct_omits_speedup():
+    samples = [_kg_sample({"compiled": False, "correctness": False})]
+
+    metrics = compute_kernelgym_metrics(samples, prefix="rollout/kernel/")
+
+    assert metrics["rollout/kernel/compilation"] == 0.0
+    assert metrics["rollout/kernel/correctness"] == 0.0
+    assert metrics["rollout/kernel/fast@1"] == 0.0
+    assert "rollout/kernel/speedup_mean" not in metrics
+    assert "rollout/kernel/speedup_max" not in metrics
+
+
+@pytest.mark.unit
+def test_compute_kernelgym_metrics_matches_scalar_reward_definition():
+    # correctness must equal the mean of kernelgym_result_to_reward over the same
+    # responses, so it reads the top-level shape the reward scores (not a nested
+    # env_state wrapper, which would desync metrics from reward).
+    responses = [
+        {"compiled": True, "correctness": True, "speedup": 2.5},
+        {"compiled": True, "correctness": True, "decoy_kernel": True},
+        {"compiled": True, "correctness": False},
+        {"env_state": {"compiled": True, "correctness": True}},  # nested -> not scored as correct
+    ]
+    samples = [_kg_sample(r) for r in responses]
+
+    metrics = compute_kernelgym_metrics(samples)
+    expected_mean_reward = sum(kernelgym_result_to_reward(r) for r in responses) / len(responses)
+
+    assert metrics["correctness"] == pytest.approx(expected_mean_reward)
