@@ -52,6 +52,8 @@
   converted; without it the 15 `mtp.*` HF weights are silently dropped.
 - `scripts/train_drkernel/check_kernelgym_health.py`: standalone KernelGym
   `/health` preflight for DrKernel training runs.
+- `tools/summarize_run_perf.py`: parse slime `run.log` perf dicts and print
+  ASCII-table average/median/max for step time, actor train TFLOPS, and rollout time.
 
 ## Run Configs
 
