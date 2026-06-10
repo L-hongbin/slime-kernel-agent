@@ -10,6 +10,12 @@ DrKernel eval/debug 启动脚本和一次性证据脚本入口。启动脚本可
 - `render_prompt_check.py`: 被 launcher 在运行时调用的 prompt sanity helper，顶层共享。
 - `summarize_kernelgym_eval.py`: KernelGym eval 产物汇总工具（原 `scripts/drkernel/`，已并入）。
 
+## Trained-Checkpoint Eval
+
+- `eval.27b.t1.tp4.eagle.H20.sh`: single-turn KernelBench L1 eval of a trained HF
+  checkpoint，`EVAL_HF_CKPT=.../hf/iter_N` 指定被测 ckpt；多节点时每个节点跑一个
+  ckpt 并行（node64/62/69/70）。
+
 ## Eval Wrappers (`rollout_speedup_ablation/`)
 
 - `debug.9b.sh`: Qwen3.5-9B DrKernel eval/debug wrapper。
