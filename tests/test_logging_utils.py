@@ -1,0 +1,186 @@
+from types import SimpleNamespace
+
+import pytest
+
+from slime.utils import logging_utils
+
+
+class _RemoteMethod:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _ActorHandle:
+    def __init__(self, actor):
+        self._actor = actor
+
+    def __getattr__(self, name):
+        attr = getattr(self._actor, name)
+        if callable(attr):
+            return _RemoteMethod(attr)
+        return attr
+
+
+class _RemoteClass:
+    def __init__(self, ray, cls):
+        self._ray = ray
+        self._cls = cls
+        self._name = None
+
+    def options(self, name=None, **kwargs):
+        self._name = name
+        return self
+
+    def remote(self, *args, **kwargs):
+        handle = _ActorHandle(self._cls(*args, **kwargs))
+        if self._name is not None:
+            self._ray.actors[self._name] = handle
+        return handle
+
+
+class _FakeRay:
+    def __init__(self):
+        self.actors = {}
+        self.killed = []
+
+    def remote(self, *args, **kwargs):
+        if args and isinstance(args[0], type):
+            return _RemoteClass(self, args[0])
+
+        def decorate(cls):
+            return _RemoteClass(self, cls)
+
+        return decorate
+
+    def get(self, value):
+        return value
+
+    def get_actor(self, name):
+        return self.actors[name]
+
+    def kill(self, actor):
+        self.killed.append(actor)
+
+    def get_runtime_context(self):
+        return SimpleNamespace(get_node_id=lambda: "node-1")
+
+
+class _FakeWandb:
+    def __init__(self):
+        self.logged = []
+        self.finished = 0
+        self.run = object()
+
+    def log(self, metrics):
+        self.logged.append(metrics)
+
+    def finish(self):
+        self.finished += 1
+
+
+@pytest.fixture
+def reset_tracking_globals():
+    old_actor = logging_utils._TRACKING_ACTOR
+    old_owns = logging_utils._OWNS_TRACKING_ACTOR
+    logging_utils._TRACKING_ACTOR = None
+    logging_utils._OWNS_TRACKING_ACTOR = False
+    try:
+        yield
+    finally:
+        logging_utils._TRACKING_ACTOR = old_actor
+        logging_utils._OWNS_TRACKING_ACTOR = old_owns
+
+
+def _args(**overrides):
+    values = {
+        "use_wandb": True,
+        "use_tensorboard": False,
+        "wandb_centralized": True,
+        "wandb_run_id": None,
+        "tracking_actor_name": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.unit
+def test_centralized_primary_initializes_single_tracking_actor(monkeypatch, reset_tracking_globals):
+    fake_ray = _FakeRay()
+    init_calls = []
+
+    def init_primary(args):
+        init_calls.append(args)
+        args.wandb_run_id = "run-123"
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", fake_ray)
+    monkeypatch.setattr(logging_utils.wandb_utils, "init_wandb_primary", init_primary)
+
+    args = _args()
+    logging_utils.init_tracking(args, primary=True)
+
+    assert args.wandb_run_id == "run-123"
+    assert args.tracking_actor_name.startswith("slime-tracking-")
+    assert list(fake_ray.actors) == [args.tracking_actor_name]
+    assert init_calls
+
+
+@pytest.mark.unit
+def test_centralized_secondary_does_not_init_wandb(monkeypatch, reset_tracking_globals):
+    init_secondary_calls = []
+
+    monkeypatch.setattr(logging_utils.wandb_utils, "init_wandb_secondary", lambda *args, **kwargs: init_secondary_calls.append(args))
+
+    logging_utils.init_tracking(_args(wandb_run_id="run-123", tracking_actor_name="tracker"), primary=False)
+
+    assert init_secondary_calls == []
+    assert logging_utils._TRACKING_ACTOR is None
+
+
+@pytest.mark.unit
+def test_centralized_log_is_forwarded_to_tracking_actor(monkeypatch, reset_tracking_globals):
+    fake_ray = _FakeRay()
+    fake_wandb = _FakeWandb()
+
+    def init_primary(args):
+        args.wandb_run_id = "run-123"
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", fake_ray)
+    monkeypatch.setattr(logging_utils, "wandb", fake_wandb)
+    monkeypatch.setattr(logging_utils.wandb_utils, "init_wandb_primary", init_primary)
+
+    args = _args()
+    logging_utils.init_tracking(args, primary=True)
+    logging_utils.log(args, {"train/loss": 1.5, "train/step": 7}, step_key="train/step")
+
+    assert fake_wandb.logged == [{"train/loss": 1.5, "train/step": 7}]
+
+
+@pytest.mark.unit
+def test_centralized_finish_only_kills_from_owner(monkeypatch, reset_tracking_globals):
+    fake_ray = _FakeRay()
+    fake_wandb = _FakeWandb()
+
+    def init_primary(args):
+        args.wandb_run_id = "run-123"
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", fake_ray)
+    monkeypatch.setattr(logging_utils, "wandb", fake_wandb)
+    monkeypatch.setattr(logging_utils.wandb_utils, "init_wandb_primary", init_primary)
+
+    owner_args = _args()
+    logging_utils.init_tracking(owner_args, primary=True)
+    actor = logging_utils._TRACKING_ACTOR
+
+    logging_utils._OWNS_TRACKING_ACTOR = False
+    logging_utils.finish_tracking(_args(wandb_run_id="run-123", tracking_actor_name=owner_args.tracking_actor_name))
+    assert fake_ray.killed == []
+    assert fake_wandb.finished == 0
+
+    logging_utils._OWNS_TRACKING_ACTOR = True
+    logging_utils._TRACKING_ACTOR = actor
+    logging_utils.finish_tracking(owner_args)
+    assert fake_ray.killed == [actor]
+    assert fake_wandb.finished == 1

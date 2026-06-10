@@ -1131,6 +1131,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--wandb-centralized",
+                action="store_true",
+                default=False,
+                help=(
+                    "Log W&B/TensorBoard metrics through one Ray tracking actor instead of "
+                    "using W&B shared mode from multiple Ray processes."
+                ),
+            )
+            parser.add_argument(
                 "--log-multi-turn",
                 action="store_true",
                 default=False,
