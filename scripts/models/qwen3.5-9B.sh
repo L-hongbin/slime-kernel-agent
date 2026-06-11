@@ -23,6 +23,6 @@ MODEL_ARGS=(
 
    --rotary-base 10000000
 
-   # qwen3.5 specific
+   # Qwen3.5 specific
    --attention-output-gate
 )
