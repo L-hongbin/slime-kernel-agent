@@ -5,6 +5,9 @@
 - `AGENTS.md`: repository-level rules and collaboration policy.
 - `RUNTIME.md`: stable runtime facts for nodes, endpoints, shared paths, data paths,
   and common run entrypoints; experiment-specific settings stay in handoffs.
+- `WRITING.md`: writing requirements for handoffs and engineering notes; emphasizes
+  reader-facing conclusions, direct logic chains, hidden debug details, and concise
+  evidence.
 
 ## Handoff Hubs
 

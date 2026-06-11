@@ -7,6 +7,7 @@ The repository's top-level harness files are the stable operational documents th
 - `AGENTS.md` records repository-level principles and stable collaboration rules.
 - `SPEC.md` records specific run details such as environments, service endpoints, model paths, dataset paths, hyperparameters, and other experiment-specific configuration.
 - `INDEX.md` is the index for important documents, logs, scripts, and code entry points so key references are easy to locate.
+- `WRITING.md` records writing requirements for handoffs, debugging conclusions, experiment summaries, and long-lived engineering docs; follow it when producing those documents.
 - `CONFIRMATION_GATES.md` records additional confirmation gates that the user explicitly asked to write down. It is not an exhaustive list of every situation that may require confirmation; the agent may still ask the user to confirm other actions when judgment, risk, or ambiguity makes confirmation necessary. After confirmation, delete the item or mark the confirmed result as appropriate.
 - `AGENTS.md` is not a routine scratchpad; do not update it proactively. Change it only when the user explicitly asks for an instruction or policy update.
 
