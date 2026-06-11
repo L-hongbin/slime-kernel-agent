@@ -14,18 +14,10 @@
 - `handoffs/rollout_speedup/handoff_rollout_speedup.md`: rollout 加速总入口；
   归档 prefix cache、low precision、SpecDec、reward concurrency、device efficiency
   等方向。
-- `handoffs/in_progress/handoff_train_step_efficiency.md`: colocate RL step 端到端
-  效率瓶颈分析（权威 run：20260609_134303 bf16+gradf32+TIS+RLOO，41 step 稳态，
-  step median ~15.7min：actor train 8.3min、rollout/wait 7min）；abort/drain 已基本消失
-  （median 1s），新暴露 checkpoint save 每 10 step ~384s；hash 问题独立成章（历史 FP8 A/B）。
-- `handoffs/in_progress/handoff_checkpoint_save_efficiency.md`: save step ~384s 尾巴拆解
-  （torch_dist ~285s + HF ~90s + ~9s wrapper）；2026-06-10 9B TP4×CP2×PP1×DP1 A/B 已验证
-  persistent-worker 才能启用 async，且 `dp_reshardable` 首次前台 save 7.6s vs fully+worker 139.5s；
-  27B 脚本已切默认 dp_reshardable，并新增 `LOAD_DIR` 支持从旧 fully ckpt resume 后转存新 dp ckpt。
-- `handoffs/in_progress/handoff_megatron_train_accel.md`: Megatron 训练加速开关清单（含 TL;DR 决策表）；
-  已开（overlap-param-gather/async-save/save-hf）、待评估（PP 气泡 VPP/layout 最有潜力、recompute 放松、
-  manual-gc 收益边际需实测）、实验项（FP8 `--fp8-format`/CUDA-graph）；
-  结论 **TP comm overlap 与 slime always-varlen 不兼容，搁置**；cross-entropy fusion/MoE overlap 不适用。
+- `handoffs/train_speedup/handoff_train_speedup.md`: 训练加速总入口；归档单步效率瓶颈
+  分析（actor train 8.3min + rollout 6.5min 主导，offload/weightsync 仅 2.3%）、Megatron
+  加速开关清单（PP 气泡最有潜力、TP comm overlap 与 varlen 不兼容搁置、recompute 已放松）、
+  checkpoint save 效率（`dp_reshardable` 前台 save 7.6s vs fully 139.5s）等方向。
 - `handoffs/complete/handoff_bf16_baseline_jump_root_cause.md`: May24→May28
   BF16 baseline jump root cause; resolved by the SGLang Qwen3.5 GDN stride fix.
 - `handoffs/in_progress/handoff_lora_support.md`: slime LoRA 训练支持评估；结论

@@ -11,7 +11,7 @@
 | `--overlap-param-gather` | ✅ 已开 | 中 | 保持；smoke 校验数值正确性即可 |
 | `--async-save` / `--save-hf` | ✅ 本轮加 | 中（长跑） | 保持；先验证 FP8 HF 导出可加载 |
 | PP 气泡（VPP / layout / defer-wgrad） | ⏳ 待评估 | **中高** | **最有潜力**，与 varlen 兼容，见 §3.A |
-| 重计算放松（recompute） | ⏳ 待评估 | 中高 | 先量峰值显存，有余量就减重计算，见 §3.B |
+| 重计算放松（recompute） | ✅ 已完成 | 中高 | 已量峰值显存并放松 recompute，见 §3.B |
 | `--manual-gc` | ⏳ 可选 | **边际** | 低风险但 RL 体制收益小，**实测再决定**，见 §3.C |
 | FP8 训练 / 训练期 CUDA graph | 🧪 实验 | 高/未知 | 高风险，仅长期实验，见 §3.D |
 | `--tp-comm-overlap` | ❌ 搁置 | — | 与 slime varlen **不兼容**，见 §4 |
@@ -111,7 +111,7 @@ PP=2 + 末段背负大词表输出层 + 交叉熵 + MTP head，是当前结构�
 ## 5. 待办
 
 1. [ ] **PP 气泡（§3.A，最高潜力）**：评估 `--num-virtual-stages-per-pipeline-rank`（优先，避开 decoder 断言）或 `--pipeline-model-parallel-layout` 替代写死的 34/30，量气泡收益。
-2. [ ] **核训练峰值显存 → 放松 recompute（§3.B）**：与 step-efficiency handoff 瓶颈 2 同一动作。
+2. [x] **核训练峰值显存 → 放松 recompute（§3.B）**：已完成。
 3. [ ] **`--manual-gc`（§3.C，可选）**：smoke 实测 `actor_train` 时间分布再决定是否常开。
 4. [ ] FP8 / 训练期 CUDA graph（§3.D）：仅长期实验，先验稳定性。
 5. [x] `--overlap-param-gather` 已开；`--async-save`/`--save-hf` 本轮落地；TP comm overlap 搁置（§4）。
