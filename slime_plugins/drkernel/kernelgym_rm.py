@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import count
@@ -64,6 +65,20 @@ KERNELGYM_REFERENCE_BACKEND = "pytorch"
 # faster than the PyTorch reference (matches the KernelBench fast_p convention).
 KERNELGYM_FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0)
 
+# Custom-kernel CUDA-time coverage = fraction of total profiled CUDA time spent in
+# the model's custom kernels. KernelGym emits these perf fields ONLY when the kernel
+# compiled AND passed correctness; they sit either at the /evaluate response top
+# level or nested under ``metadata`` (build_prompt_feedback_payload reads both via
+# ``metadata.get(key, state.get(key))``), and under ``metrics`` once rendered into a
+# feedback payload. ``custom_kernel_cuda_time_coverage`` is a human-readable STRING
+# (e.g. "Custom kernel CUDA time: 93174.91us / Total CUDA time: 93174.91us,
+# Coverage: 100.00%"), so coverage is computed from the numeric ``*_us`` fields and
+# the string is parsed only as a fallback.
+KERNELGYM_CUSTOM_TIME_KEY = "custom_kernel_cuda_time_in_profiling_us"
+KERNELGYM_TOTAL_TIME_KEY = "total_kernel_cuda_time_in_profiling_us"
+KERNELGYM_COVERAGE_STRING_KEY = "custom_kernel_cuda_time_coverage"
+_COVERAGE_PERCENT_RE = re.compile(r"Coverage:\s*([0-9]+(?:\.[0-9]+)?)\s*%")
+
 
 __all__ = [
     "KernelGymClient",
@@ -71,6 +86,7 @@ __all__ = [
     "KernelGymRequestError",
     "build_evaluation_request",
     "compute_kernelgym_metrics",
+    "compute_time_coverage",
     "custom_rm",
     "evaluate_sample",
     "kernelgym_result_to_reward",
@@ -457,6 +473,64 @@ def _coerce_speedup(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _coerce_optional_float(value: Any) -> float | None:
+    """Like :func:`_coerce_speedup` but returns ``None`` (not ``0.0``) on failure.
+
+    Coverage needs to distinguish "field absent" from a genuine ``0.0`` value, so a
+    failed coercion must not collapse to ``0.0``.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lookup_kernelgym_metric(result: dict[str, Any], key: str) -> Any:
+    """Look up a KernelGym perf metric that may live at the response top level or be
+    nested under ``metadata`` (raw /evaluate response) or ``metrics`` (rendered
+    feedback payload). Returns the first non-``None`` hit, else ``None``."""
+    value = result.get(key)
+    if value is not None:
+        return value
+    for container_key in ("metrics", "metadata"):
+        container = result.get(container_key)
+        if isinstance(container, dict):
+            nested = container.get(key)
+            if nested is not None:
+                return nested
+    return None
+
+
+def compute_time_coverage(result: dict[str, Any]) -> float | None:
+    """Fraction of total profiled CUDA time spent in the model's custom kernels.
+
+    ``coverage = custom_kernel_cuda_time_in_profiling_us / total_kernel_cuda_time_in_profiling_us``
+
+    This matches the percentage KernelGym reports in its human-readable
+    ``custom_kernel_cuda_time_coverage`` string (e.g. "... Coverage: 100.00%"). The
+    numeric ``*_us`` fields are preferred; the string is parsed only as a fallback.
+    A low coverage flags a kernel that offloads little of the work to custom code (a
+    common decoy / speedup-gaming pattern), so it is the signal a coverage
+    reward-shaping term keys on.
+
+    Returns a value in ``[0, 1]``, or ``None`` when the profiling fields are absent
+    (KernelGym omits perf metrics unless the kernel compiled AND was correct) or the
+    total time is non-positive.
+    """
+    custom_us = _coerce_optional_float(_lookup_kernelgym_metric(result, KERNELGYM_CUSTOM_TIME_KEY))
+    total_us = _coerce_optional_float(_lookup_kernelgym_metric(result, KERNELGYM_TOTAL_TIME_KEY))
+    if custom_us is not None and total_us is not None and total_us > 0.0:
+        return max(0.0, min(custom_us / total_us, 1.0))
+
+    # Fallback: parse the percentage out of the human-readable coverage string.
+    coverage_str = _lookup_kernelgym_metric(result, KERNELGYM_COVERAGE_STRING_KEY)
+    if isinstance(coverage_str, str):
+        match = _COVERAGE_PERCENT_RE.search(coverage_str)
+        if match:
+            return max(0.0, min(float(match.group(1)) / 100.0, 1.0))
+    return None
 
 
 def _format_threshold(threshold: float) -> str:

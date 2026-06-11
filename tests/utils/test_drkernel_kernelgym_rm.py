@@ -26,6 +26,7 @@ from slime_plugins.drkernel.kernelgym_rm import (
     _get_shared_client,
     build_evaluation_request,
     compute_kernelgym_metrics,
+    compute_time_coverage,
     custom_rm,
     evaluate_sample,
     kernelgym_result_to_reward,
@@ -611,3 +612,90 @@ def test_compute_kernelgym_metrics_matches_scalar_reward_definition():
     expected_mean_reward = sum(kernelgym_result_to_reward(r) for r in responses) / len(responses)
 
     assert metrics["correctness"] == pytest.approx(expected_mean_reward)
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_from_top_level_numeric_fields():
+    # 100% coverage case from design-docs/feedback_summarization.md example (a).
+    result = {
+        "custom_kernel_cuda_time_in_profiling_us": 93174.91,
+        "total_kernel_cuda_time_in_profiling_us": 93174.91,
+    }
+    assert compute_time_coverage(result) == pytest.approx(1.0)
+
+    # Partial coverage: custom kernels account for half the total CUDA time.
+    partial = {
+        "custom_kernel_cuda_time_in_profiling_us": 50.0,
+        "total_kernel_cuda_time_in_profiling_us": 200.0,
+    }
+    assert compute_time_coverage(partial) == pytest.approx(0.25)
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_reads_nested_metadata_and_metrics():
+    # Raw /evaluate response can nest perf fields under ``metadata``.
+    under_metadata = {
+        "metadata": {
+            "custom_kernel_cuda_time_in_profiling_us": 30.0,
+            "total_kernel_cuda_time_in_profiling_us": 120.0,
+        }
+    }
+    assert compute_time_coverage(under_metadata) == pytest.approx(0.25)
+
+    # Rendered feedback payload nests them under ``metrics``.
+    under_metrics = {
+        "metrics": {
+            "custom_kernel_cuda_time_in_profiling_us": 90.0,
+            "total_kernel_cuda_time_in_profiling_us": 120.0,
+        }
+    }
+    assert compute_time_coverage(under_metrics) == pytest.approx(0.75)
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_falls_back_to_coverage_string():
+    # No numeric *_us fields, only the human-readable string KernelGym returns.
+    result = {
+        "custom_kernel_cuda_time_coverage": (
+            "Custom kernel CUDA time: 100.00us / Total CUDA time: 250.00us, Coverage: 40.00%"
+        ),
+    }
+    assert compute_time_coverage(result) == pytest.approx(0.4)
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_prefers_numeric_over_string():
+    # When both are present the numeric fields win (the string is only a fallback).
+    result = {
+        "custom_kernel_cuda_time_in_profiling_us": 25.0,
+        "total_kernel_cuda_time_in_profiling_us": 100.0,
+        "custom_kernel_cuda_time_coverage": "... Coverage: 99.00%",
+    }
+    assert compute_time_coverage(result) == pytest.approx(0.25)
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_returns_none_when_unavailable():
+    # Failed / incorrect kernels carry no perf metrics -> coverage is unknown (None),
+    # which the caller must distinguish from a genuine 0.0 coverage.
+    assert compute_time_coverage({"compiled": False, "correctness": False}) is None
+    # Non-positive total time is not a valid denominator.
+    assert (
+        compute_time_coverage(
+            {
+                "custom_kernel_cuda_time_in_profiling_us": 0.0,
+                "total_kernel_cuda_time_in_profiling_us": 0.0,
+            }
+        )
+        is None
+    )
+
+
+@pytest.mark.unit
+def test_compute_time_coverage_clamps_to_unit_interval():
+    # Float rounding could push custom slightly above total; clamp to 1.0.
+    result = {
+        "custom_kernel_cuda_time_in_profiling_us": 100.0001,
+        "total_kernel_cuda_time_in_profiling_us": 100.0,
+    }
+    assert compute_time_coverage(result) == pytest.approx(1.0)
