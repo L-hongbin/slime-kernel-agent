@@ -1,176 +1,232 @@
-# 训练 RL step 效率瓶颈分析
+# 训练 RL Step 效率结论与下一步
 
-> **阅读指南**
-> 本文分析 **colocate 模式下单个 RL step 的端到端效率**（rollout 生成 + 训练前反向），
-> 区分 **结构性瓶颈（放大规模仍存在）** 与 **smoke 产物（故意调小的配置）**。
-> Rollout/推理侧的加速方向详见
-> [../rollout_speedup/handoff_rollout_speedup.md](../rollout_speedup/handoff_rollout_speedup.md)。
+<!-- > 面向同事快速接手：先读「关键结论」。后面的表格是支撑证据；
+> 更细的配置、源码路径和历史 A/B 放在「技术注释」里，保留但不打断主线。 -->
 
----
+## 关键结论
 
-## 背景
+<!-- 当前权威数据来自 bf16 主 run： -->
+**数据来源**：[`checkpoints/Qwen3.6-27B/20260609_134303.t1.27B.bf16.TP4.PP2.CP2.tis.eagle.colocate.offload.ctx16384.gradf32.H20/run.log`](https://wandb.ai/shuailin_chen/slime/runs/ttl1ctxe?nw=nwuser1106982578)
 
-- **模型**：Qwen3.6-27B（dense, 64 层, hidden 5120）+ MTP head（`--enable-mtp-training`, 1 层）
-- **硬件**：8× H20-96GB（单机），colocate
-- **并行**：TP4 × CP2 × PP1，**DP=1**；rollout = 2× TP4 engine
-- **推理**：SGLang + EAGLE（draft=4, steps=3, topk=1）
-- **数据来源 run**：`checkpoints/Qwen3.6-27B/20260607_035845_t1.TP4.CP2.eagle.bf16.H20_ctx16384/run.log`
-- **启动脚本**：`scripts/train_drkernel/debug.t1.27b.bf16.tp4.cp2.eagle.sh`
-- ⚠️ **这是 smoke 测试**：`num_rollout=3`、`rollout_batch_size=4`、`n_samples_per_prompt=8`
-  （gbs=32）、`CTX_LEN=16384`。部分配置故意调小，下文已标注。
+**训练配置**：TP4 x PP2 x CP2 x DP2，colocate + `--optimizer-cpu-offload`
 
----
+<!-- 这是 `round_robin` router 下的 41 个完整 train step（step 0..40），比旧 FP8 step-0 分析可靠得多。 -->
+**主要结论**：
+<!-- 1. **稳态非 save step 约 15.7 分钟。**
+   非 save step 的 `step_time` median/mean 为 **943s / 953s** -->
 
-## 单步时间分解（rollout 0）
+1. **当前主要瓶颈是两个大块：actor train 和 rollout。**
+   - actor train：**约 498s（8.3 分钟）**，现在是最大单项
+   - rollout：**约 390s（6.5 分钟）**，是 `train_wait_time` 的主体
 
-RL step = `train_wait` + `train`，colocate 下两者**完全串行**
-（`offload_train=True` / `offload_rollout=True`，生成时 8 张训练卡 idle，训练时推理引擎已 offload）。
+<!-- 2. **checkpoint save 是新的周期性尾巴。**
+   `--save-interval 10` 的 save step（10/20/30/40）会多出约 **384s** 的 `save_model_time`，
+   并计入 `train_wait_time`。save step 的 `step_time` median/mean 为 **1315s / 1385s** -->
 
-| 阶段 | 耗时 | 占比 | 来源 |
-| --- | ---: | ---: | --- |
-| update_weights（权重推到 SGLang） | 4.0s | 0.6% | `timer.py` update_weights |
-| **rollout 生成** | **281.7s** | **44%** | `perf/rollout_time` |
-| sleep/wake_up/preprocess（offload 切换） | ~2.1s | 0.3% | `timer.py` |
-| **actor_train（前反向, 32 微批）** | **353.8s** | **55%** | `timer.py` actor_train |
-| **合计 / step** | **~645s ≈ 10.75 min** | 100% | rollout:train ≈ 45:55 |
+2. **offload / 权重同步不是大头。**
+   - sleep/offload + update_weights + wake_up + data_preprocess 合计约 **22s**，只占 step_time 的 **约 2.3%**
+   - 因此，async 模式的收益更多来自于 rollout 和 train 的 overlap，而不是 offload/weightsync开销的减少
 
-> 两半各占一半且串行 —— 见瓶颈 4。
+<!-- 5. **router 继续固定用 `round_robin`。**
+   历史 FP8 A/B 已显示 `consistent_hashing` 会放大 backlog、502、disconnect 和 drain；
+   本轮 bf16 `round_robin` 全程 0 个 502 / router server error / disconnect。 -->
 
----
+## 单步时间分解
 
-## 瓶颈排序（含证据与可调项）
+`perf/step_time = perf/train_wait_time + perf/train_time`。
 
-### 🔴 1. Rollout 长尾：>60% 的生成时间在排空 1–7 条 straggler（结构性）
+`train_wait_time` 包含 rollout 等待、abort/drain、权重同步、rollout engine offload、
+train model wake-up、data_preprocess，以及 save step 上的 checkpoint save 阻塞。
 
-SGLang decode 日志：
-- **满批阶段** `#running-req: 29`，吞吐 2500–2725 tok/s/engine（双引擎 ~5000+），仅持续约前 90s。
-- **长尾阶段** `04:08:05 → 04:10:59`（约 **174s，占生成 63%**），`#running-req` 一路 7→2→1，
-  吞吐崩到 **230–510 tok/s**，GPU 近乎空转。
+| 指标 | 全部 41 step median / mean | 非 save step 37 个 median / mean | save step 4 个 median / mean | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| **step_time** | **949s / 995s** | **943s / 953s** | **1315s / 1385s** | 端到端 RL step |
+| train_wait_time | 430s / 495s | 420s / 453s | 827s / 885s | rollout 是主体；save step 含 ckpt 阻塞 |
+| rollout_time | 390s / 425s | 390s / 421s | 410s / 465s | rollout perf 可按 step 对齐；save step 10 rollout 长尾明显 |
+| actor_train_time | **498s / 500s** | **498s / 500s** | 498s / 499s | 最大单项 |
+| actor_train_tflops | 30.5 / 30.4 | 30.5 / 30.4 | 30.4 / 30.5 | 稳态但偏低 |
+| actor_train_tok_per_s | 5929 / 5911 | 5929 / 5910 | 5918 / 5917 | 稳态 |
+| save_model_time | - | 0 | **385s / 384s** | 每 10 step 周期性尾巴 |
 
-佐证指标（`perf 0`）：
-- `truncated_ratio = 0.25`（25% 样本打满 16383 被截断 —— 即 straggler）
-- `longest_sample_tokens_per_sec = 53.4` vs `tokens_per_gpu_per_sec = 179.8`（最长样本每 token 慢 3.4×）
+## Checkpoint Save 尾巴
 
-**根因**：同 prompt 内 8 个 sample 长度方差极大，少数超长（被截断）样本拖住整组 batch。
-**这是最高 ROI 的优化点。**
-可调：partial rollout、组内可判定后提前 abort 剩余样本、over-sampling 比例与 dynamic-filter 联动、
-动态/更短 `max_response_len`、长度惩罚。
+<!-- `--save-interval 10` 的 save step 被 checkpoint 明显拉高。`rollout_time` 本身在这些 step 也有日志；
+上一版表里写 `-` 只是没有按 save/non-save 拆开，不是没有这个指标。 -->
 
-> ✅ **现成杠杆（首选试这个）= partial rollout（`--partial-rollout`）**，上游 slime 已原生实现（即 APRIL
-> [RLsys-Foundation/APRIL](https://github.com/RLsys-Foundation/APRIL) 的开关，非 fork）。**本 run `partial_rollout=False`
-> （args dump line 664），当前是关的。**
->
-> **原理（slime 源码）**：over-sampling 调度收够 `rollout_batch_size` 个有效 group 后，`abort()`
-> 给所有 SGLang worker 发 `/abort_request{abort_all}` 杀掉在飞的长尾请求（`sglang_rollout.py:379-420`）。
-> - 关：被 abort 的半成品**直接丢弃**（`:405 if not args.partial_rollout: continue`），已生成的几千 token 算力白烧。
-> - 开：半成品收进 `aborted_samples` → `data_source.add_samples()`（`:657-659`）塞回 buffer，下一步从
->   `sample.tokens`（prompt+已生成）**断点续写**（`:238`），并打 `start_rollout_id` 标记。净效果：长尾样本切成几段
->   跨 step 接力完成，算力都留住 → 敢更激进 over-provision + 提早 abort 削墙钟。
-> - ⚠️ **off-policy 取舍**：续写那段是旧权重生成的。默认全当 on-policy（接受 staleness）；加
->   `--mask-offpolicy-in-partial-rollout`（`:274-275`）把旧段 `loss_mask=0`、只对新生成 token 计 loss（严格 on-policy 但丢旧段梯度）。
-> - 它**不是单独把长尾变快**：本步要的 group 仍需各自 8 个样本全跑完（`:474`）；价值是让"提早 abort + 多 over-provision"不浪费。
-> - 官方报告 rollout 吞吐 +17–35%、收敛快 15–20%、精度 +2–5%。⚠️ 3 步 smoke 看不出（跨 step 接力），要多步真实训练里量。
+| step | rollout_time | step_time | train_wait_time | save_model_time |
+| ---: | ---: | ---: | ---: | ---: |
+| 10 | 664s | 1636s | 1089s | 385s |
+| 20 | 430s | 1301s | 846s | 382s |
+| 30 | 377s | 1273s | 797s | 384s |
+| 40 | 391s | 1328s | 808s | 386s |
 
-### 🔴 2. 训练 full activation recompute —— 纯开销 ~+33% compute（结构性）
+<!-- 判断：`--async-save` 名义上异步，但 `save_model_time ~= 384s` 仍然计入 save step 的
+`train_wait_time`。这说明主循环仍在某个阶段等待 checkpoint 相关工作完成。
 
-脚本：`--recompute-granularity full --recompute-method uniform --recompute-num-layers 1`
-→ **每层全量重算**，反向额外重跑一遍前向。
+step 10 尤其差：`train_wait_time=1089s`，除 save 本身外，abort 后还多等约 119s。
+这更像首个 save 与异步落盘/上一轮后台任务叠加，不应归因给常规 abort/drain。 -->
 
-粗算训练 MFU **~20–23%**（≈448k tokens / 354s / 8×H20，27B dense，含 recompute 的 ~8N FLOP/token；
-H20 BF16 峰值 ~148 TFLOPS）。
+## Offload / 权重同步
 
-为何开着：**`DP=1` 时 `--use-distributed-optimizer` 不分片**（ZeRO 需 DP>1），优化器状态全副本压每卡，
-内存紧 → 用 full recompute 换显存。
-**待验证**：先量训练峰值显存；若有余量改 **selective recompute / 只重算部分层**，可直接砍训练时间一大块。
-> ⚠️ 量峰值显存的开关有坑：Megatron 的 `--log-memory-interval` / `--log-device-memory-used`（会打 `max allocated`）
-> 只在 Megatron 自己的 `training_log` 里触发，而 **slime 用自己的训练循环、不走那条路，这两个开关在 slime 里不生效**。
-> slime 自带的 `print_memory`（`slime/utils/memory_utils.py`）只在 offload/wake_up/update_weights 等空闲边界打印、
-> 且只报瞬时 `allocated/reserved`、不报峰值。可行手段：① 训练阶段外部 `nvidia-smi -l 1` 看 `memory.used`（注意 colocate
-> 时序，要在 `actor_train` 窗口看）；② 给 `actor.py:train_actor` 反向后加一行 `torch.cuda.max_memory_allocated()`
-> 峰值日志（最准，需小改代码 + sanity check）。
-> **上游核对（2026-06-07）**：拉 `THUDM/slime@main` 的 `memory_utils.py` 与 `megatron_utils/actor.py` 比对，
-> 上游 `available_memory()` 同样只报瞬时值、训练循环内同样无内存日志 —— **上游也没有此能力，无可拉取**，要峰值得自己加（手段 ②）。
+非 save step 上可明确归因的切换与同步开销很小：
 
-### 🟠 3. 微批太"薄" + torch.dynamo 反复重编译退回 eager（结构性）
+| 项 | median 时间 | 占典型 step_time（约 949s） |
+| --- | ---: | ---: |
+| sleep/offload | 3.8s | 0.40% |
+| update_weights | 16.1s | 1.71% |
+| wake_up | 1.7s | 0.18% |
+| data_preprocess | 0.4s | 0.04% |
+| **合计** | **约 22s** | **约 2.3%** |
 
-- `--max-tokens-per-gpu 9216`，样本均长 ~14k token、CP=2 后每 rank ~7k → **基本一条样本一个微批 = 32 微批**，
-  GEMM 的 M 维很小，GPU 利用率低。
-- 日志多次 `torch._dynamo hit config.recompile_limit (8)`（`bias_dropout_add_fused_train`），
-  动态 shape 触发反复重编译、超限后**退回 eager**，融合 kernel 失效。
-- 体现在微批曲线：前 8 个微批 24.9→18.5→14.4→…→10s 的 warmup 尾巴，**每个 step 重交一次学费**。
+判断：这条线即使完全优化掉，收益也明显小于 actor train、rollout 和 checkpoint save。
 
-可调：提高/分桶 dynamo recompile limit、对动态 shape 做 padding/bucketing、评估提高 `max-tokens-per-gpu`
-（需先解决瓶颈 2 的显存）。
+**因此，async模式的收益更多来自于rollout和train的overlap，而不是offload/weightsync开销的减少。**
 
-### 🟠 4. Colocate 串行 —— 两半互不重叠（结构性，框架固有）
+## Rollout 状态
 
-生成 282s 内训练卡全 idle；训练 354s 内推理引擎 offload。当前 `rollout_batch_size=4`（smoke）下 rollout 本身很小，
-**长尾**把这半段拉得不成比例。
+41 个 rollout 的稳态指标：
 
-### 🟡 5. 启动一次性开销 ~6 min（smoke 占比大，长跑可摊薄）
+| 指标 | median | mean | min / max |
+| --- | ---: | ---: | ---: |
+| rollout_time | 390.3s | 424.9s | 266.9 / 699.9 |
+| tokens_per_gpu_per_sec | 209.6 | 203.4 | 116.2 / 290.2 |
+| longest_sample_tokens_per_sec | 38.4 | 37.7 | 21.5 / 56.4 |
+| response_len mean | 10205 | 10170 | 9106 / 11671 |
+| response_len median | 10221 | 10069 | 8918 / 11783 |
+| response_len max | 15024 | 15026 | 14881 / 15143 |
+| truncated_ratio | 3% | 约 4% | 1% / 19% |
+| prefix_cache_hit_rate | 0.57 | 0.56 | 0.34 / 0.71 |
+| avg_cached_tokens_per_sample | 766.6 | 759.9 | 460.8 / 963.0 |
+| spec_accept_length | 3.24 | 3.24 | 3.15 / 3.31 |
+| spec_accept_rate | 0.75 | 0.75 | 0.72 / 0.77 |
 
-`Capture cuda graph end. Time elapsed: 184–199 s`（主图）+ draft 图 + 模型加载，启动到首步 ~6 min。
-对 3 步 smoke 占比巨大。smoke 想快可缩小 `--sglang-cuda-graph-max-bs` 捕获的 bs 列表。
+<!-- Router 健康度：
 
-### 🟡 6. 其它观察（待核）
+| 事件 / 队列 | bf16 主 run |
+| --- | ---: |
+| `502 Bad Gateway` | 0 |
+| router `server error` | 0 |
+| `circuit_breaker` warning | 0 |
+| `Request is disconnected` | 0 |
+| max `queue-req` | 25 |
+| max `pending-token` | 12123 | -->
 
-- `rollout/spec_accept_rate = 0.0` 但 `spec_accept_length = 3.10`、decode accept len 2.6–3.5
-  → **EAGLE 实际有效**（~3× draft 接受），`spec_accept_rate` 字段疑似指标 bug，需单独核对。
-- `prefix_cache_hit_rate = 0.318`、`avg_cached_tokens_per_sample = 428`，而 prompt 长 ~4400–5100、
-  同 prompt 8 sample 本应高度共享前缀 → 命中率偏低，`consistent_hashing` 路由 + 前缀缓存可能没吃满。
+<!-- 判断：`round_robin` 下 router 健康。`run.log` 中没有搜到实际 `circuit_breaker` warning；
+只出现了 router 参数里的 `disable_circuit_breaker=False`。rollout 仍有长尾（max 700s），但当前主要不是 router 错误导致。 -->
 
----
+## 训练侧状态
 
-## 建议优先级（待办）
+| 指标 | 稳态 median / mean |
+| --- | ---: |
+| actor_train_time | 498s / 500s |
+| train_time | 498s / 500s |
+| actor_train_tflops | 30.5 / 30.4 |
+| actor_train_tok_per_s | 5929 / 5911 |
+| save_model_time（save step） | 约 384s（每 10 step） |
 
-1. [ ] **治 rollout 长尾**（瓶颈 1）—— 投入产出最高，砍 generation 的 ~60% 尾部空转。
-2. [ ] **核训练峰值显存（外部 nvidia-smi 或给 train 循环加峰值日志；`--log-memory-interval` 在 slime 不生效），放松 full recompute**（瓶颈 2）。
-3. [ ] **缓解 dynamo 退回 + 评估提高 `max-tokens-per-gpu`**（瓶颈 3）。
-4. [ ] 核对 `spec_accept_rate=0.0` 是否指标 bug；排查 prefix 命中率偏低（瓶颈 6）。
+<!-- actor train 现在稳定占 8.3 分钟。step 0 的 581s 是 warmup outlier，不应代表稳态。
 
-## 可生成的证据（按需）
+日志中还有 26 次：
 
-- 同 prompt 8 样本逐条响应长度 / 截断分布 dump → 量化长尾。
-- 量训练峰值显存（外部 `nvidia-smi -l 1` 看 `actor_train` 窗口，或给 `train_actor` 加 `max_memory_allocated` 日志）
-  → 判断能否降 recompute。（注：`--log-memory-interval` 在 slime 训练循环不触发，见瓶颈 2 的 ⚠️。）
-- 按 `CLAUDE.md` 流程派 codex（xhigh）复核本结论。
+```text
+recompute_method == 'block' is not supported for MTP yet. Skipping recompute.
+```
 
----
+这表示 MTP 模块跳过 block recompute；普通 transformer 层仍按 `block` 重算。
+当前 125 microbatches、`max-tokens-per-gpu 8192`、`recompute full block 25 层` 偏保守。
+要提升训练吞吐，应该先测 actor train 峰值显存，再决定能否减少 recompute 或增大 token batch。
 
-## slime 内置加速手段速查（doc 调研 2026-06-07）
+注意：日志里的 `Memory-Usage before/after offload/wake_up/update_weights` 是边界瞬时值，不是训练峰值。
+测 actor train 峰值应外部用 `nvidia-smi -l 1` 对齐 actor_train 窗口，或在训练循环里打
+`torch.cuda.max_memory_allocated()`。 -->
 
-> 来源：`docs/zh/advanced/{speculative-decoding,pd-disaggregation,sglang-config,delta-weight-sync,megatron-config}.md`、
-> `docs/zh/get_started/{usage,qa}.md` + `slime/utils/arguments.py`。按"对哪个瓶颈有用"归类，标注本 run 现状。
+## 技术注释
 
-### 训练侧（瓶颈 2/3）
+<details>
+<summary>主 run 配置</summary>
 
-| 手段 | 开关 | 本 run 现状 | 说明 / 取舍 |
-|---|---|---|---|
-| 降重计算 | `--recompute-granularity selective` | full（全重算） | usage.md：selective 少重算一些；显存够就换，直接省训练时间。先量峰值显存（见瓶颈 2 ⚠️）。 |
-| 增大训练微批 | `--max-tokens-per-gpu` ↑ | 9216（≈ `max_resp/cp` 保守地板） | qa.md：先按 `max_response_len/cp_size` 防 OOM，稳定后调大提效。需配合降重计算腾显存。 |
-| log-prob 前向用更大批 | `--log-probs-max-tokens-per-gpu` ↑ | 9216（=训练批） | log-prob 前向无 backward、显存更省，可设得比训练批大 → ref/old-actor 两趟前向的微批更少更快。 |
-| 跳过 old log-prob 前向 | `--use-rollout-logprobs`（+`--use-tis`） | 关 | 直接用 sglang 生成时的 logprob 当 IS 比，省掉一整趟 Megatron 前向。⚠️ sglang↔megatron logprob 有数值差，需 TIS 做 off-policy 校正。进阶项，先验证。 |
+- 启动脚本：`scripts/train_drkernel/t1.27b.bf16.tis.tp4.cp2.pp2.eagle.colocate.offload.gradf32.sh`
+- 运行区间：`2026-06-09 13:43:39` 到 `2026-06-10 01:27:08`，约 11h43m
+- 模型 / 精度：Qwen3.6-27B，bf16 权重，`--accumulate-allreduce-grads-in-fp32`
+- MTP：`--enable-mtp-training`、`--mtp-num-layers 1`、`--mtp-loss-scaling-factor 0.2`
+- 解码：EAGLE 投机解码
+- 算法：`--advantage-estimator rloo` + `--use-tis`
+- 硬件 / 拓扑：4 节点 H20，TP4 x PP2 x CP2 x DP2，colocate + `--optimizer-cpu-offload`
+- 训练批次：`rollout_batch_size=16`、`n_samples_per_prompt=16`、`global_batch_size=256`、`over_sampling_batch_size=32`
+- 上下文：`--rollout-max-context-len 16384`，prompt/response 上限各 16383
+- Rollout：8 个 SGLang engine，每 engine 4 GPU，`SGLANG_MAX_RUNNING_REQUESTS=32`
+- Router：`--router-policy round_robin`
+- 重计算：`--recompute-granularity full --recompute-method block --recompute-num-layers 25`
+- PP layout：`--decoder-last-pipeline-num-layers 31`
+- Token batch：`--max-tokens-per-gpu 8192`、`--log-probs-max-tokens-per-gpu 16384`
+- Checkpoint：`--save-interval 10` + `--async-save`
 
-### Rollout 侧（瓶颈 1/4/6）
+复核工具：
 
-| 手段 | 开关 | 本 run 现状 | 说明 / 取舍 |
-|---|---|---|---|
-| partial rollout | `--partial-rollout` | 关 | 见瓶颈 1：回收被 abort 的长尾半成品续跑（首选）。 |
-| 投机采样 + 在线 MTP | `--sglang-speculative-algorithm EAGLE` + `--enable-mtp-training` | **已开** | speculative-decoding.md：RL 中在线训 MTP，draft 随 policy 更新、接受率不衰减。本 run accept_len~3.1 有效，保持。 |
-| PD 分离 | `--prefill-num-servers` / `--sglang-config` | 关 | decode 主导、长 context、多轮时收益大；本 run 单轮单机 8 卡 colocate 收益有限，优先级低。 |
-| 低精度 rollout | W8A8 / FP8 | 关 | 提 decode 吞吐。详见 [低精度 handoff](../rollout_speedup/handoff_low_precision.md) / [W8A8 综述](../rollout_speedup/handoff_w8a8_speedup_survey.md)。 |
-| 路由 prefix 命中 | `consistent_hashing`（已用）/ `--router-balance-abs-threshold` | hit 0.32 | 见瓶颈 6。强制均衡（threshold 0）会伤 prefix 命中，需权衡。 |
+```bash
+python tools/summarize_run_perf.py checkpoints/Qwen3.6-27B/20260609_134303.t1.27B.bf16.TP4.PP2.CP2.tis.eagle.colocate.offload.ctx16384.gradf32.H20/run.log
+```
 
-### 不适用 / 已排除
+</details>
 
-- **Delta 权重同步**（`--update-weight-mode delta`）：doc 明确 **colocate 下被参数校验拒绝**（CUDA IPC 只传 ~64B 句柄，
-  delta 的 wire 节省为零、簿记纯亏）。本 run update_weights 仅 4s，无需。
-- **`--megatron-config-path`**：目前只支持 PPO 的 actor/critic 角色覆盖，GRPO/rloo 不适用。
+<details>
+<summary>为什么 rollout_time 不是进度条 100% 的时间</summary>
 
----
+`perf/rollout_time` 不只到进度条 100%。它包含 `Finish rollout` 之后等待 pending generate tasks 结束的时间。
+因此旧 FP8 run 中 `Finish rollout -> rollout perf` 的长 gap 会被统计进 rollout 侧等待。
 
-## 关联文档
+源码上的 drain 点仍在 `slime/rollout/sglang_rollout.py::abort()`：
+`while state.pendings` 等所有 pending `generate_and_rm_group` 完成。
 
-- [../rollout_speedup/handoff_rollout_speedup.md](../rollout_speedup/handoff_rollout_speedup.md) —— rollout/推理加速总入口
-- [../rollout_speedup/handoff_rollout_device_efficiency.md](../rollout_speedup/handoff_rollout_device_efficiency.md) —— 推理设备利用率
-- [handoff_drkernel_slime_plan.md](./handoff_drkernel_slime_plan.md) —— DrKernel-on-slime 计划/状态 hub
+本轮 bf16 run 只是 pending 长尾很短，所以这条路径不再是瓶颈。若日后 response 又变长或 truncated_ratio 又升高，
+这段可能重新出现，届时再考虑 partial rollout 或给 `abort()` 加 pending/done/分段日志。
+
+</details>
+
+<details>
+<summary>consistent_hashing 的历史 A/B 结论</summary>
+
+这部分来自更早的 FP8 run，只用于解释为什么训练固定用 `round_robin`。
+
+| 指标 | consistent_hashing rollout 0 | round_robin rollout 0 |
+| --- | ---: | ---: |
+| rollout_time | 860.6s | **458.0s** |
+| tokens_per_gpu_per_sec | 104.6 | **204.6** |
+| prefix_cache_hit_rate | **0.866** | 0.669 |
+| `502 Bad Gateway` | 9 | **0** |
+| `circuit_breaker` warning | 146 | **2** |
+| `Request is disconnected` | 178 | **0** |
+| max `queue-req` | 97 | **25** |
+| max `pending-token` | 130037 | **5477** |
+
+`consistent_hashing` 慢的根因不是随机 hash 不均匀。256 个随机 UUID 均匀打到 8 个 worker，
+单 worker 期望约 32、标准差约 5.3，不该自然到 90+。
+
+更可能的根因是它不按实时负载改路由：某 key 一旦映射到某 worker，router 不会因为该 worker 队列高、
+pending token 高、长样本堆积或 circuit breaker 抖动而转走请求，于是局部 backlog 放大为
+circuit breaker / 502 / disconnect / drain。
+
+源码路径：`slime/rollout/sglang_rollout.py` 给每个 sample 分配唯一 UUID `session_id`，
+仅在 `router_policy == "consistent_hashing"` 时作为 `X-SMG-Routing-Key` 传给 router。
+
+DrKernel 是大批单轮长生成，不是真正的稳定多轮 session，因此亲和路由反而有害。
+除非 workload 变成真正多轮 agent 且需要稳定 session prefix cache，否则不要再用 `consistent_hashing`。
+
+</details>
+
+<details>
+<summary>训练效果指标只作健康度参考</summary>
+
+41 个 rollout 的 kernel 评测每 step `num_evaluated=256`。
+
+稳态均值：
+
+- correctness：约 0.52
+- fast@1：约 0.21
+- fast@1.5：约 0.09
+- fast@2：约 0.04
+- speedup_mean：约 1.22
+
+这些是训练效果指标，不是效率瓶颈指标。
+
+</details>
