@@ -14,6 +14,9 @@
 - `handoffs/in_progress/handoff_drkernel_slime_plan.md`: DrKernel-on-slime
   plan/status hub; links the active template, quantization, rollout, and training
   follow-ups.
+- `handoffs/in_progress/handoff_entropy_collapse_debug.md`: DrKernel entropy-collapse
+  排查手记；固定 `--entropy-coef 0.00`，先证明指标有效和行为真坍缩，再查
+  reward/filter、RLOO、PPO/TIS mismatch、rollout sampling 和 loss-mask 因果链。
 - `handoffs/rollout_speedup/handoff_rollout_speedup.md`: rollout 加速总入口；
   归档 prefix cache、low precision、SpecDec、reward concurrency、device efficiency
   等方向。
@@ -60,6 +63,12 @@
   Megatron `torch_dist` conversion, parametric over TP/PP (`TP`/`PP` env →
   `torch_dist_tp${TP}_pp${PP}`). Passes `--mtp-num-layers 1` so the MTP head is
   converted; without it the 15 `mtp.*` HF weights are silently dropped.
+- `scripts/sync/gather_convert_ckpt.sh`: gather a 4-node-sharded fully-reshardable
+  torch_dist checkpoint onto one node + convert to HF (`CONVERTER=parallel|single`,
+  `METADATA_FALLBACK_ITER` to borrow a sibling iter's `.metadata` — UNSAFE, can
+  corrupt tensors; `KEEP_SCRATCH=1`). Loads model weights only (no OOM), converts MTP.
+- `scripts/sync/rm_across_hosts.sh`: batch-delete a path across hostfile nodes
+  (DRY-RUN default, `APPLY=1` to delete; refuses non-checkpoints/ or dangerous paths).
 - `scripts/check_kernelgym_health.py`: standalone KernelGym
   `/health` preflight for DrKernel training runs.
 - `tools/summarize_run_perf.py`: parse slime `run.log` perf dicts and print
@@ -82,9 +91,7 @@
 - `scripts/eval_kernelbench_level1.yaml`: slime eval config for converted
   KernelBench L1 validation data.
 
-## Tests And Review Artifacts
+## Tests
 
 - `tests/utils/`: unit coverage for data conversion, eval config, DrKernel prompt
   rendering/extraction/RM/throttle, SGLang context caps, and quantization utilities.
-- `checkpoints/drkernel_prompt_debug/formatted_prompt_examples.txt`: generated
-  real-data prompt examples for manual review after prompt-template changes.
