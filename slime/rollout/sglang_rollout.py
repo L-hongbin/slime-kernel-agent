@@ -15,7 +15,7 @@ from packaging.version import parse
 from tqdm import tqdm
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
-from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter, drain_pending_groups
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
@@ -158,6 +158,10 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size = 0
         self.pendings = set()
         self.aborted = False
+        # populated by abort(): groups/response-tokens drained from in-flight tasks
+        # after enough valid groups were collected (i.e. wasted oversampling decode).
+        self.last_abort_groups = 0
+        self.last_abort_response_tokens = 0
 
     def submit_generate_tasks(self, samples: list[list[Sample]]) -> None:
         for group in samples:
@@ -397,25 +401,17 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
         if isinstance(result, Exception):
             logger.warning(f"Failed to abort worker at {url}: {result}")
 
-    # make sure all the pending tasks are finished
-    count = 0
-    while state.pendings:
-        done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
-
-        if not args.partial_rollout:
-            continue
-
-        # for partial rollout, collect the partial samples into the data buffer
-        for task in done:
-            group = task.result()
-            for sample in group:
-                if sample.response and "start_rollout_id" not in sample.metadata:
-                    sample.metadata["start_rollout_id"] = rollout_id
-            aborted_samples.append(group)
-            count += len(group)
-
-    if args.partial_rollout:
-        logger.info(f"Collected {count} partial samples into the data buffer")
+    # make sure all the pending tasks are finished, and account the drained in-flight
+    # groups as wasted oversampling decode (counts every drained group, even failed ones).
+    aborted_group_count, aborted_response_tokens = await drain_pending_groups(
+        state.pendings,
+        partial_rollout=args.partial_rollout,
+        rollout_id=rollout_id,
+        aborted_samples=aborted_samples,
+    )
+    state.pendings = set()
+    state.last_abort_groups = aborted_group_count
+    state.last_abort_response_tokens = aborted_response_tokens
 
     return aborted_samples
 
@@ -458,6 +454,7 @@ async def generate_rollout_async(
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
             state.submit_generate_tasks(samples)
+            metric_gatherer.on_oversampling_submit(len(samples))
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -473,6 +470,7 @@ async def generate_rollout_async(
 
             assert len(group) == args.n_samples_per_prompt
             all_data.append(group)
+            metric_gatherer.on_group_finished()
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
@@ -493,6 +491,7 @@ async def generate_rollout_async(
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)
+    metric_gatherer.on_abort(state.last_abort_groups, state.last_abort_response_tokens)
 
     assert len(data) == args.rollout_batch_size, f"Got {len(data)} samples, expected {args.rollout_batch_size}"
     data = sorted(data, key=lambda group: group[0][0].index if isinstance(group[0], list) else group[0].index)
