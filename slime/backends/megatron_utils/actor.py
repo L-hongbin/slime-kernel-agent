@@ -59,6 +59,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         monkey_patch_torch_dist()
         super().init(args, role, with_ref, with_opd_teacher)
+        self._offload_sleeping = False
 
         init(args)
 
@@ -189,6 +190,9 @@ class MegatronTrainRayActor(TrainRayActor):
     @timer
     def sleep(self) -> None:
         assert self.args.offload_train
+        if self._offload_sleeping:
+            logger.info("sleep() called on already-paused actor; skipping")
+            return
 
         clear_memory(clear_host_memory=True)
         print_memory("before offload model")
@@ -200,17 +204,23 @@ class MegatronTrainRayActor(TrainRayActor):
         ):
             self.weight_updater.disconnect_rollout_engines()
         destroy_process_groups()
+        clear_memory()
 
         torch_memory_saver.pause()
+        self._offload_sleeping = True
 
         print_memory("after offload model")
 
     @timer
     def wake_up(self) -> None:
         assert self.args.offload_train
+        if not self._offload_sleeping:
+            logger.info("wake_up() called on active actor; skipping")
+            return
         print_memory("before wake_up model")
 
         torch_memory_saver.resume()
+        self._offload_sleeping = False
 
         clear_memory()
         reload_process_groups()

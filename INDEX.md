@@ -17,7 +17,10 @@
 - `handoffs/train_speedup/handoff_train_speedup.md`: 训练加速总入口；归档单步效率瓶颈
   分析（actor train 8.3min + rollout 6.5min 主导，offload/weightsync 仅 2.3%）、Megatron
   加速开关清单（PP 气泡最有潜力、TP comm overlap 与 varlen 不兼容搁置、recompute 已放松）、
-  checkpoint save 效率（`dp_reshardable` 前台 save 7.6s vs fully 139.5s）等方向。
+  checkpoint save 效率与 offload/TMS 保存安全等方向。
+- `handoffs/train_speedup/handoff_checkpoint_save_efficiency.md`: checkpoint save
+  效率与 offload/TMS 保存安全；含 `dp_reshardable` vs fully save time、坏 checkpoint
+  的核心逻辑链、actor sleep/wake 修复和 9B train-only 验证结果。
 - `handoffs/complete/handoff_bf16_baseline_jump_root_cause.md`: May24→May28
   BF16 baseline jump root cause; resolved by the SGLang Qwen3.5 GDN stride fix.
 - `handoffs/in_progress/handoff_lora_support.md`: slime LoRA 训练支持评估；结论
