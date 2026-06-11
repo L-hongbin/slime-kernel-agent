@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Milestone A — single-turn DrKernel GRPO TRAINING smoke (Qwen3.6-27B BF16).
+# Milestone A — single-turn DrKernel GRPO TRAINING smoke (Qwen3.5-9B BF16).
 #
 # Goal: validate the post-merge TRAINING plumbing (loss moves / advantage != 0 /
 # checkpoint saves), NOT quality. Single-turn only (no --use-multi-turn).
@@ -19,27 +19,23 @@ set -eo pipefail
 
 TP=4
 CP=2
-PP=2
+PP=1
 
 CTX_LEN=${CTX_LEN:-16384}                          # [A] smoke: 16384 (eval used 65536)
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}        # [A] prompts/step (eval used 32)
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}     # GRPO group size
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
+NUM_ROLLOUT=${NUM_ROLLOUT:-9999}
 KERNELGYM_ERROR_SUMMARY_CHARS=${KERNELGYM_ERROR_SUMMARY_CHARS:-1600}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-32}
-DEBUG_TRAIN_ONLY=${DEBUG_TRAIN_ONLY:-0}
-if [[ "${DEBUG_TRAIN_ONLY}" == "1" ]]; then
-   # debug_train_only skips SGLang startup; without replayed rollout data, keep
-   # this as a checkpoint/load smoke instead of entering the rollout loop.
-   NUM_ROLLOUT=${NUM_ROLLOUT:-0}
-else
-   NUM_ROLLOUT=${NUM_ROLLOUT:-9999}
-fi
-# Multi-node: TP4 x PP2 x CP2 = 16 GPUs = 2 nodes x slime's default 8 GPUs/node,
-# so 2 nodes are REQUIRED for PP2/CP2.
-ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-2}
+# Single-node: TP4 x PP1 x CP2 = 8 GPUs = DP1 on slime's default 8 GPUs/node.
+ACTOR_NUM_NODES=${ACTOR_NUM_NODES:-1}
 
-EXPT_LABEL=t1.27B.bf16.TP${TP}.PP${PP}.CP${CP}.tis.eagle.colocate.offload.ctx${CTX_LEN}.gradf32.H20
+EXPT_LABEL=debug.t1.9B.bf16.TP${TP}.PP${PP}.CP${CP}.tis.eagle.colocate.offload.ctx${CTX_LEN}.gradf32.H20
+EXPT_SUFFIX=${EXPT_SUFFIX:-}
+if [[ -n "${EXPT_SUFFIX}" ]]; then
+   EXPT_LABEL="${EXPT_LABEL}.${EXPT_SUFFIX}"
+fi
 ROLLOUT_MAX_PROMPT_LEN=${ROLLOUT_MAX_PROMPT_LEN:-$((CTX_LEN - 1))}
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-$((CTX_LEN - 1))}
 MASTER_ADDR=${MASTER_ADDR:-10.11.2.164}              # node64 host-network IP
@@ -50,23 +46,11 @@ SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 SCRIPT_HELPER_DIR=${SCRIPT_HELPER_DIR:-${REPO_ROOT}/scripts}
 DATA_ROOT=/nfs/FM/chenshuailin/projects/kernel_agents/slime
 PROMPT_DATA_PATH=${PROMPT_DATA_PATH:-${DATA_ROOT}/data/drkernel-rl-data-0513/train.parquet}
-MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
-# MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B-FP8
-REF_LOAD_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B
-
-abs_path() {
-   case "$1" in
-      /*) printf '%s\n' "$1" ;;
-      *) printf '%s/%s\n' "${REPO_ROOT}" "$1" ;;
-   esac
-}
+MODEL_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
+REF_LOAD_DIR=/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.5-9B
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-SAVE_DIR=${SAVE_DIR:-checkpoints/${MODEL_DIR##*/}/${RUN_TS}.${EXPT_LABEL}}
-SAVE_DIR="$(abs_path "${SAVE_DIR}")"
-LOAD_DIR=${LOAD_DIR:-${SAVE_DIR}}
-LOAD_DIR="$(abs_path "${LOAD_DIR}")"
-CKPT_STEP=${CKPT_STEP:-}
+SAVE_DIR=checkpoints/${MODEL_DIR##*/}/${RUN_TS}.${EXPT_LABEL}
 LOG_FILE="${SAVE_DIR}/run.log"
 mkdir -p "${SAVE_DIR}"
 touch "${LOG_FILE}"
@@ -75,6 +59,23 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 ulimit -n 1048576
 export PYTHONUNBUFFERED=1
 export SLIME_DEBUG_TP_ATTRS=${SLIME_DEBUG_TP_ATTRS:-linear_qkv.weight}
+
+bool_enabled() {
+   case "${1:-}" in
+      1|true|TRUE|yes|YES|on|ON) return 0 ;;
+      *) return 1 ;;
+   esac
+}
+
+SAVE_INTERVAL=${SAVE_INTERVAL:-10}
+USE_FULLY_RESHARDABLE=${USE_FULLY_RESHARDABLE:-1}
+USE_FULLY_RESHARDABLE_MEM_EFFICIENT=${USE_FULLY_RESHARDABLE_MEM_EFFICIENT:-${USE_FULLY_RESHARDABLE}}
+USE_ASYNC_SAVE=${USE_ASYNC_SAVE:-1}
+USE_PERSISTENT_CKPT_WORKER=${USE_PERSISTENT_CKPT_WORKER:-1}
+CKPT_ASSUME_CONSTANT_STRUCTURE=${CKPT_ASSUME_CONSTANT_STRUCTURE:-0}
+LOAD_DEBUG_ROLLOUT_DATA=${LOAD_DEBUG_ROLLOUT_DATA:-}
+ENABLE_WANDB=${ENABLE_WANDB:-1}
+DYNAMIC_SAMPLING_FILTER_PATH=${DYNAMIC_SAMPLING_FILTER_PATH-slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std}
 
 # W&B: load the API key from a file OUTSIDE the repo (never hardcode the secret in
 # this tracked script). The key reaches the primary Ray actor via runtime_env below,
@@ -108,23 +109,32 @@ else
    export RAY_JOB_ADDRESS
 fi
 
-source "${SCRIPT_HELPER_DIR}/models/qwen3.5-27B.sh"
+source "${SCRIPT_HELPER_DIR}/models/qwen3.5-9B.sh"
 
 
 CKPT_ARGS=(
    --hf-checkpoint ${MODEL_DIR}
    --ref-load ${REF_LOAD_DIR}/torch_dist_tp${TP}_pp${PP}
    --save ${SAVE_DIR}/
-   --load ${LOAD_DIR}/
-   --save-interval 10
+   --load ${SAVE_DIR}/
+   --save-interval ${SAVE_INTERVAL}
 
-   --async-save
-   --use-persistent-ckpt-worker
-   
    # --save-hf ${SAVE_DIR}/hf/iter_{rollout_id}
 )
-if [[ -n "${CKPT_STEP}" ]]; then
-   CKPT_ARGS+=(--ckpt-step "${CKPT_STEP}")
+if bool_enabled "${USE_FULLY_RESHARDABLE}"; then
+   CKPT_ARGS+=(--dist-ckpt-optim-fully-reshardable)
+   if bool_enabled "${USE_FULLY_RESHARDABLE_MEM_EFFICIENT}"; then
+      CKPT_ARGS+=(--distrib-optim-fully-reshardable-mem-efficient)
+   fi
+fi
+if bool_enabled "${USE_ASYNC_SAVE}"; then
+   CKPT_ARGS+=(--async-save)
+fi
+if bool_enabled "${USE_PERSISTENT_CKPT_WORKER}"; then
+   CKPT_ARGS+=(--use-persistent-ckpt-worker)
+fi
+if bool_enabled "${CKPT_ASSUME_CONSTANT_STRUCTURE}"; then
+   CKPT_ARGS+=(--ckpt-assume-constant-structure)
 fi
 
 ROLLOUT_ARGS=(
@@ -144,18 +154,17 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len ${CTX_LEN}
    --rollout-temperature 1
 
-   # [A] DAPO dynamic sampling: drop zero-variance (all-pass/all-fail) groups.
-   # Use slime's BUILT-IN filter (no custom code); dev_lhb's filter_cuda_kernel_group
-   # only adds multi-turn/padding guards we don't need single-turn.
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
    --over-sampling-batch-size $((ROLLOUT_BATCH_SIZE * 2))
 
    --global-batch-size ${GLOBAL_BATCH_SIZE}         # [A] was 256
    --balance-data
    # [A] NO --debug-rollout-only  -> real training (ref load + backward + checkpoint)
 )
-if [[ "${DEBUG_TRAIN_ONLY}" == "1" ]]; then
-   ROLLOUT_ARGS+=(--debug-train-only)
+if [[ -n "${DYNAMIC_SAMPLING_FILTER_PATH}" ]]; then
+   ROLLOUT_ARGS+=(--dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER_PATH}")
+fi
+if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+   ROLLOUT_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
 fi
 
 EVAL_ARGS=(
@@ -182,7 +191,6 @@ PERF_ARGS=(
    # cross-entropy + MTP head, so give it fewer transformer layers. PP=2 only.
    # With block recompute=25, 64 layers -> first 33 / last 31 reduces the PP0
    # activation peak seen with first 34 / last 30.
-   --decoder-last-pipeline-num-layers 31
    --context-parallel-size ${CP}
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
@@ -208,6 +216,9 @@ PERF_ARGS=(
    --init-model-with-meta-device
    --qwen-gdn-backend flashqla
 )
+if [[ "${PP}" -gt 1 ]]; then
+   PERF_ARGS+=(--decoder-last-pipeline-num-layers 31)
+fi
 
 
 # [A] rloo + clip-higher. Single-turn rloo == dev_lhb trloo (gamma-fold of 1 turn is
@@ -244,16 +255,15 @@ OPTIMIZER_ARGS=(
 
 # W&B online logging. API key comes from WANDB_API_KEY (injected into runtime_env),
 # NOT --wandb-key, so the secret never appears in the actor argv / `ps` output.
-WANDB_ARGS=(
-   --use-wandb
-   --wandb-project slime
-   --wandb-group ${WANDB_GROUP}
-   --disable-wandb-random-suffix
-   --wandb-centralized
-   --wandb-always-use-train-step
-)
-if [[ "${DEBUG_TRAIN_ONLY}" == "1" ]]; then
-   WANDB_ARGS=()
+WANDB_ARGS=()
+if bool_enabled "${ENABLE_WANDB}"; then
+   WANDB_ARGS+=(
+      --use-wandb
+      --wandb-project slime
+      --wandb-group ${WANDB_GROUP}
+      --disable-wandb-random-suffix
+      --wandb-centralized
+   )
 fi
 
 # [A] Keep EAGLE speculative decoding. Without it, FlashInfer GDN T=1 decode
@@ -273,7 +283,7 @@ SGLANG_ARGS=(
    --sglang-speculative-num-steps 3
    --sglang-speculative-eagle-topk 1
    --sglang-speculative-num-draft-tokens 4
-   
+
 )
 
 MISC_ARGS=(
