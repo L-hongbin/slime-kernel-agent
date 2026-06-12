@@ -21,6 +21,7 @@ from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.utils.async_utils import run
+from slime.utils.http_utils import get_sglang_client_concurrency
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
@@ -86,16 +87,29 @@ def _get_last_non_pad_turn_group(groups: list[RolloutGroup]) -> RolloutGroup:
     return [sample if sample is not None else groups[-1][i] for i, sample in enumerate(last_turn_group)]
 
 
+def _get_group_concurrency(args, client_concurrency: int) -> int:
+    n_samples_per_prompt = max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1))
+    client_concurrency = max(1, int(client_concurrency))
+    return max(1, client_concurrency // n_samples_per_prompt)
+
+
 def _get_global_worker(args, data_buffer) -> KernelAgentAsyncRolloutWorker:
     global _global_worker
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             logger.info("starting kernel-agent fully-async rollout worker")
-            num_engines = max(1, args.rollout_num_gpus // args.rollout_num_gpus_per_engine)
+            client_concurrency = get_sglang_client_concurrency(args)
+            group_concurrency = _get_group_concurrency(args, client_concurrency)
+            logger.info(
+                "kernel-agent fully-async concurrency: client=%d, n_samples_per_prompt=%d, groups=%d",
+                client_concurrency,
+                max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1)),
+                group_concurrency,
+            )
             _global_worker = KernelAgentAsyncRolloutWorker(
                 args,
                 data_buffer,
-                concurrency=args.sglang_server_concurrency * num_engines,
+                concurrency=group_concurrency,
             )
             _global_worker.start()
         return _global_worker
@@ -155,12 +169,12 @@ class KernelAgentAsyncRolloutWorker:
 
     def stats(self) -> dict[str, int]:
         return {
-            "active": self.active_count,
-            "submitted": self.submitted_count,
-            "completed": self.completed_count,
-            "aborted": self.aborted_count,
-            "exceptions": self.exception_count,
-            "queue": self.queue_size(),
+            "active_groups": self.active_count,
+            "submitted_groups": self.submitted_count,
+            "completed_groups": self.completed_count,
+            "aborted_groups": self.aborted_count,
+            "exception_groups": self.exception_count,
+            "queued_groups": self.queue_size(),
         }
 
     def _thread_main(self) -> None:
@@ -210,16 +224,37 @@ class KernelAgentAsyncRolloutWorker:
                 await asyncio.sleep(1)
 
         if active_tasks:
-            logger.info("kernel-agent fully-async: waiting for %d in-flight tasks to drain", len(active_tasks))
+            logger.info("kernel-agent fully-async: cancelling %d in-flight tasks during shutdown", len(active_tasks))
+            for task in active_tasks:
+                task.cancel()
             try:
-                await asyncio.wait(active_tasks, timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
+                results = await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=5,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("kernel-agent fully-async: timed out while cancelling in-flight tasks")
+            else:
+                errors = [
+                    result
+                    for result in results
+                    if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError)
+                ]
+                if errors:
+                    logger.warning("kernel-agent fully-async: %d task(s) errored during shutdown", len(errors))
+            self.active_count = 0
 
     def _make_done_cb(self, gid: int, original_group: RolloutGroup):
         def _cb(done_task: asyncio.Task) -> None:
             try:
                 result = done_task.result()
+            except asyncio.CancelledError:
+                if self.running:
+                    self.exception_count += 1
+                    logger.warning("kernel-agent fully-async: process task was cancelled while running")
+                else:
+                    logger.info("kernel-agent fully-async: process task cancelled during shutdown")
+                return
             except Exception:  # noqa: BLE001
                 self.exception_count += 1
                 logger.exception("kernel-agent fully-async: process task raised")

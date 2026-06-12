@@ -410,7 +410,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
 
     env_result = asyncio.run(
         generate_with_cuda_agent.cuda_kernel_env(
-            SimpleNamespace(),
+            SimpleNamespace(kernel_backend="cuda_agent", do_precheck=False),
             sample,
             VALID_CUDA_AGENT_RESPONSE,
             turn_idx=0,
@@ -431,10 +431,10 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     if not case["feedback_compiled"]:
         assert env_state["error"] == "COMPILATION_ERROR"
         assert env_state["correctness"] is None
-        assert env_state["decoy_kernel"] is None
-        assert env_state["reference_runtime"] is None
-        assert env_state["kernel_runtime"] is None
-        assert env_state["speedup"] is None
+        assert env_state["decoy_kernel"] is False
+        assert env_state["reference_runtime"] == case["env_state"]["reference_runtime"]
+        assert env_state["kernel_runtime"] == case["env_state"]["kernel_runtime"]
+        assert env_state["speedup"] == case["env_state"]["speedup"]
         assert "Compilation failed. Compiler output:" in env_state["error_message"]
         assert "nvcc fatal: syntax error" in env_state["error_message"]
         assert "compile_only" not in env_state["metadata"]
@@ -486,7 +486,8 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     assert "[cuda_agent][multi_turn][slowest]" in caplog.text
     assert "total_request_time=1.000s" in caplog.text
     assert f"compiled={case['feedback_compiled']}" in caplog.text
-    assert "reward=-0.2" in caplog.text
+    expected_reward = 1.2456140350877192 if case["feedback_compiled"] else 0.0
+    assert f"reward={expected_reward}" in caplog.text
     assert case["uuid"] in caplog.text
     assert "format_feedback" in caplog.text
     assert format_feedback in caplog.text
@@ -505,6 +506,26 @@ def test_split_think_response_handles_generation_prompt_prefilled_think():
     response_think, response_content = split_think_response(response)
     assert response_think == "reasoning from model"
     assert response_content.startswith("### CUDA_KERNELS")
+
+
+@pytest.mark.unit
+def test_cuda_agent_sampling_params_reserve_context_for_eagle():
+    args = SimpleNamespace(
+        rollout_max_context_len=16384,
+        sglang_speculative_algorithm="EAGLE",
+        sglang_speculative_num_draft_tokens=4,
+    )
+    sampling_params = {"max_new_tokens": 16384, "temperature": 1.0}
+
+    adjusted = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        args,
+        sampling_params,
+        prompt_token_count=10000,
+    )
+
+    assert adjusted["max_new_tokens"] == 6380
+    assert adjusted["temperature"] == 1.0
+    assert sampling_params["max_new_tokens"] == 16384
 
 
 @pytest.mark.integration
@@ -544,7 +565,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
 
     env_result = asyncio.run(
         generate_with_cuda_agent.cuda_kernel_env(
-            SimpleNamespace(),
+            SimpleNamespace(kernel_backend="cuda_agent", do_precheck=False),
             sample,
             case["response"],
             turn_idx=0,

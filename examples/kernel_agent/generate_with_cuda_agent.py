@@ -35,6 +35,7 @@ KERNEL_AGENT_GENERATE_GUARD_SEC = int(os.environ.get("KERNEL_AGENT_GENERATE_GUAR
     + int(CUDA_AGENT_CONFIGS["env"].get("kernel_eval_task_timeout", 300))
     + 300
 )
+KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))
 
 
 if ray is not None:
@@ -237,12 +238,13 @@ def _log_multiturn_messages(
         if reward is None:
             reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
         logger.info(
-            "[cuda_agent][turn %s] model_time=%.3fs env_time=%.3fs prompt_tokens=%s response_tokens=%s "
+            "[cuda_agent][turn %s] model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s response_tokens=%s "
             "finish_type=%s status=%s error=%s speedup=%s correctness=%s compiled=%s reward=%s",
             item.get("turn_idx"),
             float(item.get("model_time", 0.0)),
             float(item.get("env_time", 0.0)),
             item.get("prompt_tokens"),
+            item.get("max_new_tokens"),
             item.get("response_tokens"),
             item.get("finish_type"),
             env_state.get("status"),
@@ -299,6 +301,29 @@ def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
             if key in env_state:
                 return bool(env_state[key])
     return False
+
+
+def _sampling_params_for_prompt_context(
+    args,
+    sampling_params: dict[str, Any],
+    prompt_token_count: int,
+) -> dict[str, Any]:
+    turn_sampling_params = sampling_params.copy()
+    max_context_len = getattr(args, "rollout_max_context_len", None)
+    if max_context_len is None:
+        return turn_sampling_params
+
+    draft_token_reserve = 0
+    if getattr(args, "sglang_speculative_algorithm", None):
+        draft_token_reserve = max(0, int(getattr(args, "sglang_speculative_num_draft_tokens", 0) or 0))
+    remaining_context = int(max_context_len) - int(prompt_token_count) - draft_token_reserve
+    configured_max_new_tokens = turn_sampling_params.get("max_new_tokens")
+    if configured_max_new_tokens is None:
+        max_new_tokens = remaining_context
+    else:
+        max_new_tokens = min(int(configured_max_new_tokens), remaining_context)
+    turn_sampling_params["max_new_tokens"] = max(0, max_new_tokens)
+    return turn_sampling_params
 
 
 def _get_label_value(sample: Sample, key: str) -> Any:
@@ -569,7 +594,6 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     """
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     messages = _as_messages(sample.prompt)
     max_turns = getattr(args, "max_turns", None)
     if max_turns is None:
@@ -607,14 +631,26 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             finish_reason = "prompt_truncated"
             logger.warning("CUDA agent prompt exceeds context length at turn %s: %s", turn_idx, len(prompt_ids))
             break
+        turn_sampling_params = _sampling_params_for_prompt_context(args, sampling_params, len(prompt_ids))
+        if int(turn_sampling_params.get("max_new_tokens", 0) or 0) <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            finish_reason = "response_budget_exhausted"
+            logger.warning(
+                "CUDA agent response budget exhausted at turn %s: prompt_tokens=%s max_context_len=%s",
+                turn_idx,
+                len(prompt_ids),
+                max_context_len,
+            )
+            break
 
         payload = {
             "input_ids": prompt_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
-        output = await post(url, payload)
+        output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
         model_time = time.monotonic() - model_started_at
         finish_type = output["meta_info"]["finish_reason"]["type"]
         if finish_type == "abort":
@@ -677,6 +713,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "model_time": model_time,
             "env_time": env_time,
             "prompt_tokens": len(prompt_ids),
+            "max_new_tokens": turn_sampling_params.get("max_new_tokens"),
             "response_tokens": len(response_ids),
             "finish_type": finish_type,
             "prompt": prompt_text,
