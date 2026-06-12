@@ -115,8 +115,34 @@ def _wrap_ipv6(host):
         return host
 
 
+_PROXY_ENV_VARS = ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+
+
+def scrub_proxy_env() -> None:
+    """Remove HTTP(S) proxy variables from the current process environment.
+
+    The sglang router only talks to rollout engines inside the cluster, but its
+    Rust HTTP client (reqwest) honors proxy env vars by default and NO_PROXY
+    rarely covers every worker IP. A cluster egress proxy (e.g. clash) kills
+    tunneled connections that stay silent for ~60s, which aborts every long
+    non-streaming /generate in flight: engines log client disconnects, the
+    router circuit breaker opens on the resulting failures, and all new
+    requests get 503 no_available_workers.
+
+    Set SLIME_SCRUB_PROXY=0 for deployments that intentionally proxy
+    router-to-worker traffic.
+    """
+    if os.environ.get("SLIME_SCRUB_PROXY", "1") == "0":
+        return
+    removed = [key for key in _PROXY_ENV_VARS if os.environ.pop(key, None) is not None]
+    if removed:
+        logger.debug(f"Scrubbed proxy env vars for router process: {removed}")
+
+
 def run_router(args):
     try:
+        # Must happen before launch_router builds the reqwest client.
+        scrub_proxy_env()
         from sglang_router.launch_router import launch_router
 
         router = launch_router(args)
