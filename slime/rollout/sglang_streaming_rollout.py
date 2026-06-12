@@ -106,8 +106,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     call_log_probs: list[float] = []
     call_text: str = ""
 
-    client = http_utils._http_client
-    assert client is not None, "http client not initialized; call init_http_client first"
+    client = http_utils.get_http_client()
 
     with trace_span(
         sample, "sglang_generate_stream", attrs={"max_new_tokens": sampling_params["max_new_tokens"]}

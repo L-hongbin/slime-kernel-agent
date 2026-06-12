@@ -22,7 +22,7 @@ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_fil
 from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
-from slime.utils.http_utils import get, post
+from slime.utils.http_utils import get, get_sglang_client_concurrency, post
 from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
@@ -109,9 +109,7 @@ class GenerateState(metaclass=SingletonMeta):
             getattr(args, "multi_turn_prompt_config_path", None)
         )
 
-        self.semaphore = asyncio.Semaphore(
-            args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-        )
+        self.semaphore = asyncio.Semaphore(get_sglang_client_concurrency(args))
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,

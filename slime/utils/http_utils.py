@@ -6,6 +6,7 @@ import multiprocessing
 import os
 import random
 import socket
+import weakref
 
 import httpx
 
@@ -145,12 +146,68 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
 
 
 _http_client: httpx.AsyncClient | None = None
+_http_clients_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
 _client_concurrency: int = 0
 
 # Optional Ray-based distributed POST dispatch
 _distributed_post_enabled: bool = False
 _post_actors: list[object] = []
 _post_actor_idx: int = 0
+
+
+def get_rollout_num_engines(args) -> int:
+    """Return the number of rollout HTTP engines behind the router."""
+    if (num_engines := getattr(args, "rollout_num_engines", None)) is not None:
+        return int(num_engines)
+
+    rollout_num_gpus = getattr(args, "rollout_num_gpus", None) or 0
+    rollout_num_gpus_per_engine = getattr(args, "rollout_num_gpus_per_engine", None) or 1
+    if rollout_num_gpus <= 0:
+        return 0
+    return max(1, rollout_num_gpus // rollout_num_gpus_per_engine)
+
+
+def get_sglang_client_concurrency(args) -> int:
+    """Return client-side SGLang concurrency capped per engine by max-running."""
+    num_engines = get_rollout_num_engines(args)
+    per_engine_concurrency = args.sglang_server_concurrency
+    max_running_requests = getattr(args, "sglang_max_running_requests", None)
+    if max_running_requests is None:
+        per_engine_concurrency = int(per_engine_concurrency * 1.5)
+    else:
+        per_engine_concurrency = int(min(per_engine_concurrency * 1.5, max_running_requests))
+    return max(1, per_engine_concurrency) * num_engines
+
+
+def _make_http_client(max_connections: int | None = None) -> httpx.AsyncClient:
+    concurrency = max(1, int(max_connections or _client_concurrency or 1))
+    return httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=concurrency),
+        timeout=httpx.Timeout(None),
+        trust_env=False,  # internal SGLang comm only — never route through system proxy
+    )
+
+
+def get_http_client(max_connections: int | None = None) -> httpx.AsyncClient:
+    """Return an AsyncClient scoped to the current asyncio event loop."""
+    global _http_client
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = _make_http_client(max_connections)
+        return _http_client
+
+    client = _http_clients_by_loop.get(loop)
+    if client is None or client.is_closed:
+        client = _make_http_client(max_connections)
+        _http_clients_by_loop[loop] = client
+
+    _http_client = client
+    return client
 
 
 def _next_actor():
@@ -201,16 +258,16 @@ async def _post(client, url, payload, max_retries=60, headers=None):
 def init_http_client(args):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
-    if not args.rollout_num_gpus:
+    if get_rollout_num_engines(args) <= 0:
         return
 
-    _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
-            trust_env=False,  # internal SGLang comm only — never route through system proxy
-        )
+    _client_concurrency = get_sglang_client_concurrency(args)
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        _http_client = None
+    else:
+        get_http_client(_client_concurrency)
 
     # Optionally initialize distributed POST via Ray without changing interfaces
     if args.use_distributed_post:
@@ -240,15 +297,10 @@ def _init_ray_distributed_post(args):
     @ray.remote
     class _HttpPosterActor:
         def __init__(self, concurrency: int):
-            # Lazy creation to this actor's event loop
-            self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(None),
-                trust_env=False,  # internal SGLang comm only — never route through system proxy
-            )
+            self._concurrency = max(1, int(concurrency))
 
         async def do_post(self, url, payload, max_retries=60, headers=None):
-            return await _post(self._client, url, payload, max_retries, headers=headers)
+            return await _post(get_http_client(self._concurrency), url, payload, max_retries, headers=headers)
 
     # Create actors per node
     created = []
@@ -290,11 +342,11 @@ async def post(url, payload, max_retries=60, headers=None):
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries, headers=headers)
+    return await _post(get_http_client(), url, payload, max_retries, headers=headers)
 
 
 async def get(url):
-    response = await _http_client.get(url)
+    response = await get_http_client().get(url)
     response.raise_for_status()
     content = await response.aread()
     output = json.loads(content)
