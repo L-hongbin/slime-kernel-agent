@@ -6,7 +6,7 @@ trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
-
+ulimit -n 1048576 || true
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # MODEL CONFIG
@@ -26,20 +26,15 @@ if [ "${#REMOTE_PORTS[@]}" -ne "${#REMOTE_HOSTS[@]}" ]; then
    exit 1
 fi
 NUM_NODES=$((1 + ${#REMOTE_HOSTS[@]}))
-GPUS_PER_NODE=8
-NUM_GPUS=$((NUM_NODES * GPUS_PER_NODE))
+NUM_GPUS=$((NUM_NODES * 8))
 ACTOR_NUM_NODES=2
-ACTOR_NUM_GPUS_PER_NODE=8
-ACTOR_GPUS=$((ACTOR_NUM_NODES*ACTOR_NUM_GPUS_PER_NODE))
+ACTOR_GPUS=$((ACTOR_NUM_NODES*8))
 ROLLOUT_GPUS=$((NUM_GPUS-ACTOR_GPUS))
 echo "ACTOR_GPUS ${ACTOR_GPUS} ROLLOUT_GPUS ${ROLLOUT_GPUS}"
 # EXP CONFIG
 MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-16384}
-EAGLE_DRAFT_TOKENS=${EAGLE_DRAFT_TOKENS:-4}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-32}
-SGLANG_WATCHDOG_TIMEOUT=${SGLANG_WATCHDOG_TIMEOUT:-1200}
-ROUTER_QUEUE_TIMEOUT_SECS=${ROUTER_QUEUE_TIMEOUT_SECS:-1200}
 DEBUG_ROLLOUT_ONLY=${DEBUG_ROLLOUT_ONLY:-0}
 if [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
    NUM_ROLLOUT=${NUM_ROLLOUT:-1}
@@ -48,7 +43,7 @@ else
 fi
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}
+GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 MODEL_NAME="Qwen3.6-27B"
 KERNEL_BACKEND="tvm_ffi"
 KERNEL_ENV_URL="http://127.0.0.1:20211"
@@ -56,32 +51,18 @@ KERNEL_ENV_URL="http://127.0.0.1:20211"
 
 HF_MODEL_PATH="/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B"
 MEGATRON_MODEL_PATH="/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B/torch_dist_tp4_pp2"
-      
-echo "HF_MODEL_PATH=${HF_MODEL_PATH}"
-echo "MEGATRON_MODEL_PATH=${MEGATRON_MODEL_PATH}"
-
-
 RL_DATA="/ms/FM/lihongbin/dataset/CUDA_RL/cuda_rl/prompt_tvm_v2/drkernel_rl_thinking.parquet"
 
-case "${KERNEL_BACKEND}" in
-   tvm_ffi)
-      KERNEL_BACKEND_LABEL="TVM"
-      ;;
-   cuda_agent)
-      KERNEL_BACKEND_LABEL="CUDA"
-      ;;
-   *)
-      KERNEL_BACKEND_LABEL="${KERNEL_BACKEND^^}"
-      KERNEL_BACKEND_LABEL="${KERNEL_BACKEND_LABEL//_/.}"
-      ;;
-esac
-EXP_NAME="FAsync.${KERNEL_BACKEND_LABEL}.${MODEL_NAME}.CTX${MAX_CONTEXT_LEN}"
+
+EXP_NAME="FAsync.${KERNEL_BACKEND}.${MODEL_NAME}.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 
-export TENSORBOARD_DIR="${EXP_ROOT}/tensorboard"
-DEBUG_DUMP_DIR="${EXP_ROOT}/debug"
-echo "TENSORBOARD_DIR ${TENSORBOARD_DIR}"
-echo "DEBUG_DUMP_DIR ${DEBUG_DUMP_DIR}"
+WANDB_KEY_FILE=${WANDB_KEY_FILE:-${HOME}/.config/wandb/slime.key}
+if [[ -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
+   WANDB_API_KEY="$(tr -d '[:space:]' < "${WANDB_KEY_FILE}")"
+fi
+export WANDB_API_KEY
+WANDB_GROUP=${WANDB_GROUP:-${EXP_NAME}}
 
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
 LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-bond0}"
@@ -101,60 +82,18 @@ RAY_TEMP_DIR="/tmp/ray"
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 RAY_WAIT_TIMEOUT=${RAY_WAIT_TIMEOUT:-300}
-KERNELGYM_HEALTH_TIMEOUT=${KERNELGYM_HEALTH_TIMEOUT:-5}
-KERNELGYM_HEALTH_ATTEMPTS=${KERNELGYM_HEALTH_ATTEMPTS:-3}
-KERNELGYM_HEALTH_INTERVAL=${KERNELGYM_HEALTH_INTERVAL:-2}
-MIN_CPUS_PER_NODE=${MIN_CPUS_PER_NODE:-64}
-CPU_HEALTH_CHECK=${CPU_HEALTH_CHECK:-1}
-GPU_OCCUPANCY_CHECK=${GPU_OCCUPANCY_CHECK:-1}
-CPU_LOAD_MAX_RATIO=${CPU_LOAD_MAX_RATIO:-0.7}
-CPU_IDLE_MIN_PERCENT=${CPU_IDLE_MIN_PERCENT:-50}
-CPU_IDLE_WINDOW_SECONDS=${CPU_IDLE_WINDOW_SECONDS:-1}
 
 # LOG CONFIG
-LOG_DATE="$(date +%Y%m%d)"
 LOG_STAMP="$(date +%Y%m%d.%H%M%S)"
 LOG_DIR="${EXP_ROOT}/logs"
-PREFLIGHT_DIR="${EXP_ROOT}/preflight"
 LOG_PATH="${LOG_DIR}/${LOG_STAMP}.log"
 echo "Logging to ${LOG_PATH}"
 
-mkdir -p "${LOG_DIR}" "${TENSORBOARD_DIR}" "${DEBUG_DUMP_DIR}" "${PREFLIGHT_DIR}"
+mkdir -p "${LOG_DIR}"
 exec >> "${LOG_PATH}" 2>&1
 
 HAS_NVLINK="${HAS_NVLINK:-1}"
-echo "HAS_NVLINK: $HAS_NVLINK"
-echo "DEBUG_ROLLOUT_ONLY ${DEBUG_ROLLOUT_ONLY}"
-echo "NUM_ROLLOUT ${NUM_ROLLOUT}"
-echo "ROLLOUT_BATCH_SIZE ${ROLLOUT_BATCH_SIZE}"
-echo "N_SAMPLES_PER_PROMPT ${N_SAMPLES_PER_PROMPT}"
-echo "GLOBAL_BATCH_SIZE ${GLOBAL_BATCH_SIZE}"
-echo "MAX_CONTEXT_LEN ${MAX_CONTEXT_LEN}"
-echo "MAX_RESPONSE_LEN ${MAX_RESPONSE_LEN}"
 
-if [[ -n "${SGLANG_WATCHDOG_TIMEOUT}" ]] && (( SGLANG_WATCHDOG_TIMEOUT < 600 )); then
-   echo "SGLANG_WATCHDOG_TIMEOUT=${SGLANG_WATCHDOG_TIMEOUT} is too low for 16k kernel-agent rollouts." >&2
-   exit 1
-fi
-if (( ROUTER_QUEUE_TIMEOUT_SECS < 600 )); then
-   echo "ROUTER_QUEUE_TIMEOUT_SECS=${ROUTER_QUEUE_TIMEOUT_SECS} is too low for saturated 16k kernel-agent rollouts." >&2
-   exit 1
-fi
-echo "SGLANG_WATCHDOG_TIMEOUT ${SGLANG_WATCHDOG_TIMEOUT}"
-echo "ROUTER_QUEUE_TIMEOUT_SECS ${ROUTER_QUEUE_TIMEOUT_SECS}"
-
-echo "Checking KernelGym health at ${KERNEL_ENV_URL}"
-KERNELGYM_HEALTH_LOG="${PREFLIGHT_DIR}/kernelgym_health.${LOG_DATE}.$(date +%H%M%S).log"
-if ! "${PYTHON_BIN}" "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
-   --url "${KERNEL_ENV_URL}" \
-   --timeout "${KERNELGYM_HEALTH_TIMEOUT}" \
-   --attempts "${KERNELGYM_HEALTH_ATTEMPTS}" \
-   --interval "${KERNELGYM_HEALTH_INTERVAL}" > "${KERNELGYM_HEALTH_LOG}" 2>&1; then
-   echo "KernelGym health check failed. Output from ${KERNELGYM_HEALTH_LOG}:"
-   cat "${KERNELGYM_HEALTH_LOG}"
-   exit 1
-fi
-cat "${KERNELGYM_HEALTH_LOG}"
 
 run_ssh() {
    local host="$1"
@@ -167,22 +106,18 @@ shell_quote() {
    printf "%q" "$1"
 }
 
+# Every node has a local KernelGym entry on 127.0.0.1:20211, so the health
+# check runs on all nodes. /nfs/FM (this repo) is per-node local disk, so the
+# health script is streamed to remote nodes over ssh before the check.
 host_resource_check_args() {
    local -n args_ref=$1
+   local health_script_path="${2:-${REPO_ROOT}/scripts/check_kernelgym_health.py}"
    args_ref=(
-      --expected-gpus "${GPUS_PER_NODE}"
-      --min-cpus "${MIN_CPUS_PER_NODE}"
-      --load-max-ratio "${CPU_LOAD_MAX_RATIO}"
-      --idle-min-percent "${CPU_IDLE_MIN_PERCENT}"
-      --cpu-window "${CPU_IDLE_WINDOW_SECONDS}"
+      --expected-gpus "8"
+      --kernelgym-url "${KERNEL_ENV_URL}"
+      --kernelgym-health-script "${health_script_path}"
+      --python-bin "${PYTHON_BIN}"
    )
-
-   if [[ "${CPU_HEALTH_CHECK}" != "1" ]]; then
-      args_ref+=(--skip-cpu-health)
-   fi
-   if [[ "${GPU_OCCUPANCY_CHECK}" != "1" ]]; then
-      args_ref+=(--skip-gpu-occupancy)
-   fi
 }
 
 check_local_host_resources() {
@@ -200,14 +135,17 @@ check_remote_host_resources() {
    local port="$2"
    local label="$3"
    local args=()
+   local remote_health_script="/tmp/slime_check_kernelgym_health.py"
 
-   host_resource_check_args args
+   run_ssh "${host}" "${port}" "cat > ${remote_health_script}" \
+      < "${REPO_ROOT}/scripts/check_kernelgym_health.py"
+   host_resource_check_args args "${remote_health_script}"
    run_ssh "${host}" "${port}" bash -s -- --label "${label}" "${args[@]}" \
       < "${REPO_ROOT}/scripts/check_host_resources.sh"
 }
 
 check_all_host_resources() {
-   echo "Checking CPU/GPU resources before Ray start"
+   echo "Checking KernelGym and CPU/GPU resources before Ray start"
    check_local_host_resources "head-${MASTER_ADDR}"
    for i in "${!REMOTE_HOSTS[@]}"; do
       check_remote_host_resources \
@@ -267,16 +205,16 @@ sleep 3
 
 check_all_host_resources
 
-TENSORBOARD_ARGS=(
-   --use-tensorboard
+WANDB_ARGS=(
+   --use-wandb
+   --wandb-project slime
+   --wandb-group ${WANDB_GROUP}
+   --disable-wandb-random-suffix
+   --wandb-always-use-train-step
 )
 
 LOGGING_ARGS=(
-   --log-multi-turn
-   --log-memory-to-tensorboard
-   --log-timers-to-tensorboard
    --log-throughput
-   --log-throughput-to-tensorboard
    --log-progress
    --log-device-memory-used
 )
@@ -284,9 +222,15 @@ LOGGING_ARGS=(
 CKPT_ARGS=(
    --hf-checkpoint ${HF_MODEL_PATH}
    --ref-load ${MEGATRON_MODEL_PATH}
-   # --load /root/Qwen2.5-3B_slime/
-   # --save /root/Qwen2.5-3B_slime/
-   # --save-interval 20
+   # /nfs/FM is per-node local disk: ranks write shards to their own node;
+   # gather with scripts/sync/gather_convert_ckpt.sh afterwards.
+   --save ${EXP_ROOT}/checkpoints
+   --save-interval 20
+   # async save overlaps disk writes with the next train step; the worker
+   # flag is required or Megatron disables --async-save. Keep the default
+   # dp_reshardable optimizer format (do NOT add fully-reshardable).
+   --async-save
+   --use-persistent-ckpt-worker
 )
 
 ROLLOUT_ARGS=(
@@ -338,7 +282,7 @@ PERF_ARGS=(
 
    --recompute-granularity full
    --recompute-method block
-   --recompute-num-layers 25
+   --recompute-num-layers 29
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
@@ -384,17 +328,15 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.7
    --sglang-decode-log-interval 400
    --router-policy round_robin
-   --router-queue-timeout-secs ${ROUTER_QUEUE_TIMEOUT_SECS}
    --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
    --sglang-disable-custom-all-reduce
    --sglang-speculative-algorithm EAGLE
    --sglang-speculative-num-steps 3
    --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens ${EAGLE_DRAFT_TOKENS}
+   --sglang-speculative-num-draft-tokens 4
    --sglang-linear-attn-backend flashinfer
    --sglang-mamba-scheduler-strategy extra_buffer
 )
-SGLANG_ARGS+=(--sglang-watchdog-timeout ${SGLANG_WATCHDOG_TIMEOUT})
 
 MISC_ARGS=(
    # default dropout in megatron is 0.1
@@ -424,9 +366,7 @@ CUSTOM_ARGS=(
    # --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
 
-DEBUG_ARGS=(
-   --dump-details "${DEBUG_DUMP_DIR}"
-)
+DEBUG_ARGS=()
 if [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
    DEBUG_ARGS+=(--debug-rollout-only)
 fi
@@ -457,14 +397,14 @@ GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
    --port ${RAY_PORT} \
    --dashboard-host 0.0.0.0 \
    --dashboard-port $RAY_DASHBOARD_PORT \
-   --num-gpus ${GPUS_PER_NODE} \
+   --num-gpus 8 \
    --disable-usage-stats \
    --temp-dir=$RAY_TEMP_DIR
 
 for i in "${!REMOTE_HOSTS[@]}"; do
    echo "Starting Ray worker on ${REMOTE_HOSTS[$i]}"
    run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
-      "GLOO_SOCKET_IFNAME=${REMOTE_GLOO_SOCKET_IFNAMES[$i]} ray start --address ${RAY_HEAD_ADDR} --num-gpus ${GPUS_PER_NODE} --disable-usage-stats"
+      "GLOO_SOCKET_IFNAME=${REMOTE_GLOO_SOCKET_IFNAMES[$i]} ray start --address ${RAY_HEAD_ADDR} --num-gpus 8 --disable-usage-stats"
 done
 
 wait_for_cluster
@@ -482,11 +422,12 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "NO_PROXY": "${NO_PROXY_LIST}",
     "NCCL_SOCKET_IFNAME": "${NCCL_SOCKET_IFNAME}",
     "MASTER_ADDR": "${MASTER_ADDR}",
+    "WANDB_API_KEY": "${WANDB_API_KEY}",
     "PYTHONPATH": ".:/root/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "CUDA_AGENT_LOG_MULTI_TURN_TEXT": "0",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
-    "NCCL_DEBUG": "WARN",
-    "TENSORBOARD_DIR": "${TENSORBOARD_DIR}"
+    "NCCL_DEBUG": "WARN"
   }
 }
 EOF_JSON
@@ -496,7 +437,7 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
    --actor-num-nodes ${ACTOR_NUM_NODES} \
-   --actor-num-gpus-per-node ${ACTOR_NUM_GPUS_PER_NODE} \
+   --actor-num-gpus-per-node 8 \
    --rollout-num-gpus "${ROLLOUT_GPUS}" \
    "${MODEL_ARGS[@]}" \
    "${CKPT_ARGS[@]}" \
@@ -504,7 +445,7 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${CURRICULUM_ARGS[@]}" \
    "${OPTIMIZER_ARGS[@]}" \
    "${RL_ARGS[@]}" \
-   "${TENSORBOARD_ARGS[@]}" \
+   "${WANDB_ARGS[@]}" \
    "${LOGGING_ARGS[@]}" \
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \

@@ -14,6 +14,9 @@ import aiohttp
 
 
 DEFAULT_KERNELGYM_URL = "http://127.0.0.1:20211"
+DEFAULT_TIMEOUT = 5.0
+DEFAULT_ATTEMPTS = 3
+DEFAULT_INTERVAL = 2.0
 
 
 class KernelGymRequestError(RuntimeError):
@@ -216,16 +219,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--url",
         default=os.environ.get("KERNELGYM_URL", DEFAULT_KERNELGYM_URL),
-        help="KernelGym base URL. Defaults to KERNELGYM_URL or http://127.0.0.1:20391.",
+        help=f"KernelGym base URL. Defaults to KERNELGYM_URL or {DEFAULT_KERNELGYM_URL}.",
     )
-    parser.add_argument("--timeout", type=float, default=5.0, help="Per-request timeout in seconds.")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds.")
     parser.add_argument(
         "--attempts",
         type=int,
-        default=1,
+        default=DEFAULT_ATTEMPTS,
         help="Number of health attempts. Use >1 to wait for a starting service.",
     )
-    parser.add_argument("--interval", type=float, default=1.0, help="Sleep seconds between attempts.")
+    parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="Sleep seconds between attempts.")
     parser.add_argument(
         "--workers-status",
         action="store_true",

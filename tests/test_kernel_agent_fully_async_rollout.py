@@ -243,20 +243,23 @@ def test_kernel_agent_http_client_does_not_cancel_slow_posts():
     assert SlowJsonHandler.broken_pipes == 0
 
 
-def test_full_async_kernel_agent_script_sets_long_timeouts_and_disables_router_retries():
+def test_full_async_kernel_agent_script_guards_critical_config():
     script = Path("examples/kernel_agent/run.t1.qwen3.6.27B.full-async.sh").read_text()
 
-    assert "SGLANG_WATCHDOG_TIMEOUT=${SGLANG_WATCHDOG_TIMEOUT:-1200}" in script
-    assert "ROUTER_QUEUE_TIMEOUT_SECS=${ROUTER_QUEUE_TIMEOUT_SECS:-1200}" in script
-    assert 'if [[ -n "${SGLANG_WATCHDOG_TIMEOUT}" ]] && (( SGLANG_WATCHDOG_TIMEOUT < 600 )); then' in script
-    assert "if (( ROUTER_QUEUE_TIMEOUT_SECS < 600 )); then" in script
-    assert "--sglang-watchdog-timeout ${SGLANG_WATCHDOG_TIMEOUT}" in script
-    assert "--router-queue-timeout-secs ${ROUTER_QUEUE_TIMEOUT_SECS}" in script
+    # Router retries/circuit-breaker must stay enabled (matches reference runs).
     assert "--router-disable-retries" not in script
     assert "--router-disable-circuit-breaker" not in script
-    assert "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))}" in script
-    assert "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}" in script
+    # In-cluster HTTP must bypass the egress proxy in BOTH spellings.
+    assert '"no_proxy": "${NO_PROXY_LIST}"' in script
+    assert '"NO_PROXY": "${NO_PROXY_LIST}"' in script
+    # Async checkpointing requires the persistent worker or Megatron disables it.
+    assert "--async-save" in script
+    assert "--use-persistent-ckpt-worker" in script
+    assert "--save-interval" in script
+    assert "--save " in script or "--save $" in script
+    # Qwen thinking must stay on for prompt_tvm_v2 data.
     assert "--apply-chat-template-kwargs '{\"enable_thinking\":true}'" in script
+    assert "MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}" in script
     assert '"${ROLLOUT_ARGS[@]}"' in script
 
 

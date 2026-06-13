@@ -5,12 +5,16 @@ set -euo pipefail
 
 label="$(hostname 2>/dev/null || echo unknown)"
 expected_gpus=0
-min_cpus=1
+min_cpus=64
 check_cpu_health=1
 check_gpu_occupancy=1
 load_max_ratio="0.7"
 idle_min_percent=50
 cpu_window=1
+check_kernelgym_health=1
+kernelgym_url="${KERNELGYM_URL:-http://127.0.0.1:20211}"
+kernelgym_health_script=""
+python_bin="${PYTHON_BIN:-python3}"
 
 usage() {
     cat <<'EOF'
@@ -23,8 +27,12 @@ Options:
   --load-max-ratio R           Fail if 1m loadavg is greater than R * nproc.
   --idle-min-percent N         Fail if sampled CPU idle percent is below N.
   --cpu-window SECONDS         Sampling window for CPU idle percent.
+  --kernelgym-url URL          KernelGym base URL for /health preflight.
+  --kernelgym-health-script P  Path to scripts/check_kernelgym_health.py.
+  --python-bin PATH            Python interpreter used for KernelGym health.
   --skip-cpu-health            Only check CPU count, not current load/idle.
   --skip-gpu-occupancy         Check GPU count, but allow existing GPU processes.
+  --skip-kernelgym-health      Skip KernelGym /health preflight.
 EOF
 }
 
@@ -54,12 +62,28 @@ while [[ $# -gt 0 ]]; do
             cpu_window="$2"
             shift 2
             ;;
+        --kernelgym-url)
+            kernelgym_url="$2"
+            shift 2
+            ;;
+        --kernelgym-health-script)
+            kernelgym_health_script="$2"
+            shift 2
+            ;;
+        --python-bin)
+            python_bin="$2"
+            shift 2
+            ;;
         --skip-cpu-health)
             check_cpu_health=0
             shift
             ;;
         --skip-gpu-occupancy)
             check_gpu_occupancy=0
+            shift
+            ;;
+        --skip-kernelgym-health)
+            check_kernelgym_health=0
             shift
             ;;
         --help|-h)
@@ -171,7 +195,48 @@ check_gpu() {
     echo "resource-check: ${label}: GPU occupancy check passed"
 }
 
+resolve_kernelgym_health_script() {
+    local source_path script_dir
+
+    if [[ -n "${kernelgym_health_script}" ]]; then
+        echo "${kernelgym_health_script}"
+        return
+    fi
+
+    source_path="${BASH_SOURCE[0]:-}"
+    if [[ -n "${source_path}" && -f "${source_path}" ]]; then
+        script_dir="$(cd -- "$(dirname -- "${source_path}")" >/dev/null 2>&1 && pwd)"
+        if [[ -f "${script_dir}/check_kernelgym_health.py" ]]; then
+            echo "${script_dir}/check_kernelgym_health.py"
+            return
+        fi
+    fi
+
+    echo "scripts/check_kernelgym_health.py"
+}
+
+check_kernelgym() {
+    local health_script
+
+    if [[ "${check_kernelgym_health}" != "1" ]]; then
+        echo "resource-check: ${label}: KernelGym health check skipped"
+        return
+    fi
+
+    health_script="$(resolve_kernelgym_health_script)"
+    if [[ ! -f "${health_script}" ]]; then
+        fail "${label}: KernelGym health script not found: ${health_script}"
+        return
+    fi
+
+    echo "resource-check: ${label}: checking KernelGym health at ${kernelgym_url}"
+    if ! "${python_bin}" "${health_script}" --url "${kernelgym_url}"; then
+        fail "${label}: KernelGym health check failed"
+    fi
+}
+
 echo "resource-check: checking ${label}"
+check_kernelgym
 check_cpu
 check_gpu
 
