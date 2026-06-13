@@ -1286,6 +1286,9 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
+    if args.wandb_always_use_train_step:
+        log_dict["train/step"] = step
+        log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
@@ -1306,6 +1309,8 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
+    if args.wandb_always_use_train_step:
+        log_dict["train/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
 
 

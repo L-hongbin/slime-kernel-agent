@@ -51,4 +51,8 @@ def log_perf_data_raw(
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
+    if args.wandb_always_use_train_step:
+        # Both axes share train-step units; carry both keys so a single
+        # workspace-wide x-axis works for every metric section.
+        log_dict["train/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")

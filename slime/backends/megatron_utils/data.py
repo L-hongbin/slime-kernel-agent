@@ -207,6 +207,8 @@ def gather_log_data(
     # Calculate step once to avoid duplication
     step = compute_rollout_step(args, rollout_id)
     reduced_log_dict["rollout/step"] = step
+    if args.wandb_always_use_train_step:
+        reduced_log_dict["train/step"] = step
     logging_utils.log(args, reduced_log_dict, step_key="rollout/step")
     return reduced_log_dict
 
