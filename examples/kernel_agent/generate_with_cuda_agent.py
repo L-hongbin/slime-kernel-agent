@@ -38,6 +38,13 @@ KERNEL_AGENT_GENERATE_GUARD_SEC = int(os.environ.get("KERNEL_AGENT_GENERATE_GUAR
 KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))
 
 
+def _log_multiturn_full_text_enabled() -> bool:
+    value = os.environ.get("CUDA_AGENT_LOG_MULTI_TURN_TEXT")
+    if value is not None:
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(CUDA_AGENT_CONFIGS.get("log_multi_turn_full_text", True))
+
+
 if ray is not None:
 
     @ray.remote
@@ -229,6 +236,8 @@ def _log_multiturn_messages(
         total_model_time,
         total_env_time,
     )
+    if not _log_multiturn_full_text_enabled():
+        return
 
     log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
 
