@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -345,6 +346,29 @@ def _get_label_value(sample: Sample, key: str) -> Any:
     return None
 
 
+def _reference_cache_uuid(ground_truth: Any, entry_point: Any) -> str | None:
+    """Collision-resistant key for KernelGym's reference-timing cache.
+
+    Derived purely from the reference identity (reference code + entry point) and
+    NOT from any dataset-supplied id: same reference -> same key, different
+    reference -> different key (modulo the negligible 64-bit truncation collision),
+    so it cannot false-share a cached baseline across datasets on a shared
+    KernelGym the way a bare per-problem id like "1" would. Returns None when
+    there is no reference to hash, which leaves the cache disabled.
+
+    Safety note: the cached baseline is only valid because KernelBench references
+    use fixed-shape get_inputs(); a dataset with randomized reference inputs must
+    NOT enable use_reference_cache.
+    """
+    if not ground_truth:
+        return None
+    if not isinstance(ground_truth, str):
+        ground_truth = str(ground_truth)
+    # 64 bits (16 hex) — collision-safe for realistic problem counts (~1e3-1e4).
+    digest = hashlib.sha256(f"{entry_point}\n{ground_truth}".encode()).hexdigest()[:16]
+    return f"ref_{digest}"
+
+
 def _require_env_value(mapping: dict[str, Any], key: str, path: str) -> Any:
     if key not in mapping:
         raise KeyError(f"env_result missing required field for env_extra_info: {path}.{key}")
@@ -405,13 +429,19 @@ async def cuda_kernel_env(
             precheck_result.setdefault("decoy_kernel", None)
             return {"env_state": precheck_result, "reward_extra_info": precheck_result}
 
+    ground_truth = _get_label_value(sample, "ground_truth")
     payload = {
         "response": response,
-        "ground_truth": _get_label_value(sample, "ground_truth"),
+        "ground_truth": ground_truth,
         "kernel_backend": kernel_backend,
         "reference_backend": reference_backend,
         "entry_point": entry_point,
-        "uuid": (sample.metadata or {}).get("uuid"),
+        # Reference-timing cache key: a hash of the reference identity, NOT any
+        # dataset-supplied id — a bare problem_id/name (or a non-unique explicit
+        # uuid) would false-share a wrong cached baseline across datasets on a
+        # shared KernelGym. See _reference_cache_uuid.
+        "uuid": _reference_cache_uuid(ground_truth, entry_point),
+        "use_reference_cache": bool(getattr(args, "use_reference_cache", False)),
         "return_full_state": True,
         "metadata": sample.metadata,
         "turn_idx": turn_idx,

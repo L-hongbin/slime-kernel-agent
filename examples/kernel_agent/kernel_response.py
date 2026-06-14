@@ -254,6 +254,13 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
     }
     if payload.get("uuid"):
         task_payload["uuid"] = payload["uuid"]
+    # Reference-timing cache (KernelGym use_reference_cache) is keyed by uuid, so
+    # only request it when a stable uuid is present, otherwise KernelGym cannot
+    # share the cached baseline across attempts of the same problem.
+    if task_payload.get("uuid") and payload.get(
+        "use_reference_cache", _kernel_eval_param(args, config, "use_reference_cache", False)
+    ):
+        task_payload["use_reference_cache"] = True
     if payload.get("split_compile_and_execute", _kernel_eval_param(args, config, "split_compile_and_execute", True)):
         task_payload["split_compile_and_execute"] = True
     if payload.get(

@@ -1482,6 +1482,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether the kernel agent should run client-side precheck before env execution.",
             )
             parser.add_argument(
+                "--use-reference-cache",
+                action="store_true",
+                default=False,
+                help=(
+                    "Ask KernelGym to reuse cached reference timing (KernelGym /evaluate "
+                    "use_reference_cache). The cache key is derived from the reference identity "
+                    "(entry_point + ground_truth hash), so a reference is timed once instead of "
+                    "on every kernel attempt. Only safe for fixed-input references."
+                ),
+            )
+            parser.add_argument(
                 "--finalize-mode",
                 type=str,
                 choices=["none", "positive", "improve"],

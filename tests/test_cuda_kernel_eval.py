@@ -420,7 +420,9 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     env_state = env_result["env_state"]
     format_feedback = _format_feedback_for_test(env_result)
     print(f"\n[cuda_agent][test][format_feedback][{case['uuid']}]\n{format_feedback}")
-    assert captured_payload["uuid"] == case["uuid"]
+    # uuid is the reference-cache key: a hash of (entry_point, ground_truth),
+    # not the dataset's metadata uuid.
+    assert captured_payload["uuid"] == generate_with_cuda_agent._reference_cache_uuid("class Model: pass", "Model")
     assert captured_payload["turn_idx"] == 0
     assert captured_payload["response"] == VALID_CUDA_AGENT_RESPONSE
     assert env_state["compiled"] is case["feedback_compiled"]
