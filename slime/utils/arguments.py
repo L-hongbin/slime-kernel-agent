@@ -1267,6 +1267,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--wandb-centralized",
+                action="store_true",
+                default=False,
+                help=(
+                    "Route W&B and TensorBoard logging through a single Ray actor on the driver node. "
+                    "This avoids multiple Ray actors writing to the same W&B run."
+                ),
+            )
+            parser.add_argument(
                 "--log-multi-turn",
                 action="store_true",
                 default=False,

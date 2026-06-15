@@ -211,6 +211,7 @@ WANDB_ARGS=(
    --wandb-group ${WANDB_GROUP}
    --disable-wandb-random-suffix
    --wandb-always-use-train-step
+   --wandb-centralized
 )
 
 LOGGING_ARGS=(
