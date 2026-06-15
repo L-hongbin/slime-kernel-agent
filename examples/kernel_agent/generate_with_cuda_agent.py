@@ -346,6 +346,13 @@ def _get_label_value(sample: Sample, key: str) -> Any:
     return None
 
 
+def _get_entry_point(sample: Sample) -> Any:
+    entry_point = _get_label_value(sample, "entry_point")
+    if entry_point is not None:
+        return entry_point
+    return "Model"
+
+
 def _reference_cache_uuid(ground_truth: Any, entry_point: Any) -> str | None:
     """Collision-resistant key for KernelGym's reference-timing cache.
 
@@ -415,9 +422,7 @@ async def cuda_kernel_env(
     response: str,
     turn_idx: int,
 ) -> dict[str, Any]:
-    entry_point = _get_label_value(sample, "entry_point")
-    if entry_point is None:
-        raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
+    entry_point = _get_entry_point(sample)
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")

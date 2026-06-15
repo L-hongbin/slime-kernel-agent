@@ -503,6 +503,36 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
 
 
 @pytest.mark.unit
+def test_cuda_kernel_env_defaults_missing_entry_point_to_model(monkeypatch):
+    captured_payload = {}
+
+    async def fake_run_kernel_eval(args, sample, payload, config):
+        captured_payload.update(payload)
+        env_state = normalize_env_feedback({"compiled": True, "correctness": True, "speedup": 1.0})
+        return {"env_state": env_state, "reward_extra_info": env_state}
+
+    monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
+
+    sample = Sample(
+        prompt="Write a CUDA implementation.",
+        label={"ground_truth": "class Model: pass"},
+        metadata={"problem_id": 1},
+    )
+
+    asyncio.run(
+        generate_with_cuda_agent.cuda_kernel_env(
+            SimpleNamespace(kernel_backend="cuda_agent", do_precheck=False),
+            sample,
+            VALID_CUDA_AGENT_RESPONSE,
+            turn_idx=0,
+        )
+    )
+
+    assert captured_payload["entry_point"] == "Model"
+    assert captured_payload["uuid"] == generate_with_cuda_agent._reference_cache_uuid("class Model: pass", "Model")
+
+
+@pytest.mark.unit
 def test_split_think_response_handles_generation_prompt_prefilled_think():
     response = "reasoning from model\n</think>\n### CUDA_KERNELS\n```cpp\ncode\n```"
     response_think, response_content = split_think_response(response)
