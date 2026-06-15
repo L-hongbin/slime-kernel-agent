@@ -24,6 +24,7 @@ Usage: python3 examples/kernel_agent/summarize_eval.py <EVAL_DIR | dump.pt> [--f
 import argparse
 import glob
 import os
+import sys
 import warnings
 
 import torch
@@ -170,6 +171,7 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
 
     overall = _empty_counts(fast_thresholds)
     by_turn = {turn_count: _empty_counts(fast_thresholds) for turn_count in range(1, max_turns + 1)}
+    by_turn_present = {turn_count: 0 for turn_count in range(1, max_turns + 1)}
     missing = 0
 
     for trajectory_samples in trajectories.values():
@@ -189,9 +191,14 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             missing += 1
 
         turn_metrics.sort(key=lambda item: item[0])
+        # Per-turn (single turn) metrics: turn_count k looks only at turn index k-1,
+        # with its own denominator (trajectories that actually produced that turn).
         for turn_count, counts in by_turn.items():
-            visible = [metrics for turn_idx, metrics in turn_metrics if turn_idx < turn_count]
-            _add_best_counts(counts, visible, fast_thresholds)
+            this_turn = [metrics for turn_idx, metrics in turn_metrics if turn_idx == turn_count - 1]
+            if this_turn:
+                by_turn_present[turn_count] += 1
+                _add_best_counts(counts, this_turn, fast_thresholds)
+        # Overall "best" stays cumulative over the whole trajectory (all turns).
         _add_best_counts(overall, [metrics for _, metrics in turn_metrics], fast_thresholds)
 
     total = len(trajectories)
@@ -213,20 +220,26 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
         out[f"BestFast@{t:g}"] = rate(overall["fast"][t])
         out[f"best_fast@{t:g}_count"] = overall["fast"][t]
 
-    out["best_by_turn"] = {}
+    out["per_turn"] = {}
     for turn_count, counts in by_turn.items():
+        present = by_turn_present[turn_count]
+
+        def prate(n, d=present):
+            return n / d if d else 0.0
+
         turn_out = {
+            "present": present,
             "compile_count": counts["compiled"],
-            "Compile": rate(counts["compiled"]),
+            "Compile": prate(counts["compiled"]),
             "correct_count": counts["correct"],
-            "Correct": rate(counts["correct"]),
+            "Correct": prate(counts["correct"]),
         }
         if counts["speedup"]:
             turn_out["SpeedupMean"] = sum(counts["speedup"]) / len(counts["speedup"])
         for t in fast_thresholds:
-            turn_out[f"Fast@{t:g}"] = rate(counts["fast"][t])
+            turn_out[f"Fast@{t:g}"] = prate(counts["fast"][t])
             turn_out[f"fast@{t:g}_count"] = counts["fast"][t]
-        out["best_by_turn"][turn_count] = turn_out
+        out["per_turn"][turn_count] = turn_out
     return out
 
 
@@ -314,11 +327,93 @@ def summarize_with_best(samples, fast_thresholds, max_turns=None, dump_best_metr
     return out
 
 
+def _detected_turns(samples) -> int:
+    turn_idxs = [t for t in (_turn_idx(s) for s in samples) if t is not None]
+    return max(turn_idxs) + 1 if turn_idxs else 1
+
+
+def _print_debug_header(dumps, samples, base, group, args):
+    print(f"dumps: {len(dumps)} -> {dumps}")
+    print(f"samples: {base['total']}  (missing env_result: {base['missing_env_result']})")
+    configured = "auto" if args.max_turns is None else str(args.max_turns)
+    print(f"turns: configured max-turns={configured}, detected={_detected_turns(samples)}")
+    if group is not None:
+        print(
+            f"trajectories (group_id): {group['trajectory_total']}  "
+            f"(missing env_result: {group['trajectory_missing_env_result']})"
+        )
+        per_turn = group.get("per_turn", {})
+        if per_turn:
+            counts = "  ".join(f"T{k}={per_turn[k]['present']}" for k in sorted(per_turn))
+            print(f"per-turn records (Tk denominator): {counts}")
+    else:
+        print("trajectories (group_id): n/a (single-turn or no group_id; table shows overall rates only)")
+    print()
+
+
+def _print_oneline_table(group, base, fast_thresholds):
+    """Single-row table: percentages laid out as compile, correct, then each fast
+    threshold; within every metric block the columns are the per-turn accuracy at
+    each individual turn (T1..TN = turn 1..N alone) followed by `best` (cumulative
+    best over the whole trajectory / all turns)."""
+    col_w = 6
+
+    def fast_label(t):
+        s = f"{t:g}"
+        return f"fast@{s}" if "." in s else f"fast@{s}.0"
+
+    if group is not None:
+        turns = sorted(group["per_turn"].keys())
+        labels = [f"T{k}" for k in turns] + ["best"]
+        n = group["trajectory_total"]
+        n_label = "traj"
+
+        def turn_vals(metric_key, best_key):
+            return [group["per_turn"][k][metric_key] for k in turns] + [group[best_key]]
+
+        metric_groups = [
+            ("compile", turn_vals("Compile", "BestCompile")),
+            ("correct", turn_vals("Correct", "BestCorrect")),
+        ]
+        for t in fast_thresholds:
+            metric_groups.append((fast_label(t), turn_vals(f"Fast@{t:g}", f"BestFast@{t:g}")))
+    else:
+        labels = ["all"]
+        n = base["total"]
+        n_label = "all"
+        metric_groups = [
+            ("compile", [base["Compile"]]),
+            ("correct", [base["Correct"]]),
+        ]
+        for t in fast_thresholds:
+            metric_groups.append((fast_label(t), [base[f"Fast@{t:g}"]]))
+
+    def cell(s):
+        return f"{s:>{col_w}}"
+
+    blocks = [("n", cell(n_label), cell(str(n)))]
+    for title, vals in metric_groups:
+        sub = " ".join(cell(lab) for lab in labels)
+        val = " ".join(cell(f"{v * 100:.2f}") for v in vals)
+        blocks.append((title, sub, val))
+
+    sep = " | "
+    title_line, sub_line, val_line = [], [], []
+    for title, sub, val in blocks:
+        width = max(len(title), len(sub), len(val))
+        title_line.append(f"{title:^{width}}")
+        sub_line.append(f"{sub:>{width}}")
+        val_line.append(f"{val:>{width}}")
+    print(sep.join(title_line))
+    print(sep.join(sub_line))
+    print(sep.join(val_line))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("path", help="EVAL_DIR (…/dumps/rollout_data) or an eval_*.pt file")
     ap.add_argument("--fast", type=float, nargs="+", default=list(FAST_DEFAULT))
-    ap.add_argument("--max-turns", type=int, default=None, help="Maximum turns for BestByTurn output.")
+    ap.add_argument("--max-turns", type=int, default=None, help="Maximum turns for the per-turn table columns.")
     args = ap.parse_args()
 
     dumps = _find_dumps(args.path)
@@ -326,65 +421,23 @@ def main():
         raise SystemExit(f"no eval_*.pt found under {args.path}")
 
     samples = []
-    dump_best_metrics = {}
     for d in dumps:
         obj = torch.load(d, weights_only=False)
-        dump_best_metrics.update(_extract_dump_best_metrics(obj))
         samples.extend(obj.get("samples", []) if isinstance(obj, dict) else obj)
 
-    res = summarize_with_best(
-        samples,
-        tuple(args.fast),
-        max_turns=args.max_turns,
-        dump_best_metrics=dump_best_metrics,
-    )
-    print(f"dumps: {dumps}")
-    print(f"total samples: {res['total']}  (missing env_result: {res['missing_env_result']})")
-    print(f"Compile   : {res['Compile']:.4f}  ({res['compile_count']}/{res['total']})")
-    print(f"Correct   : {res['Correct']:.4f}  ({res['correct_count']}/{res['total']})")
-    for t in args.fast:
-        print(f"Fast@{t:g}  : {res[f'Fast@{t:g}']:.4f}  ({res[f'fast@{t:g}_count']}/{res['total']})")
-
-    if res.get("best_source") == "skipped_single_turn":
-        print("Best metrics: skipped (single-turn eval)")
-        return
-    if res.get("best_source") == "skipped_no_group":
-        print("Best metrics: skipped (no group_id in dump)")
-        return
-    if res.get("best_source") == "dump":
-        print("Best metrics: read from dump")
-        for key, value in sorted(res["dump_best_metrics"].items()):
-            print(f"  {key}: {value:.6g}")
-        return
-
-    print(
-        f"trajectory samples: {res['trajectory_total']}  "
-        f"(missing env_result: {res['trajectory_missing_env_result']})"
-    )
-    print(f"BestCompile: {res['BestCompile']:.4f}  ({res['best_compile_count']}/{res['trajectory_total']})")
-    print(f"BestCorrect: {res['BestCorrect']:.4f}  ({res['best_correct_count']}/{res['trajectory_total']})")
-    for t in args.fast:
-        print(
-            f"BestFast@{t:g}: {res[f'BestFast@{t:g}']:.4f}  "
-            f"({res[f'best_fast@{t:g}_count']}/{res['trajectory_total']})"
-        )
-    if "BestSpeedupMean" in res:
-        print(f"BestSpeedupMean: {res['BestSpeedupMean']:.4f}")
-    if len(res["best_by_turn"]) > 1:
-        print("BestByTurn:")
-        for turn_count, turn_res in sorted(res["best_by_turn"].items()):
+    fast_thresholds = tuple(args.fast)
+    base = summarize(samples, fast_thresholds)
+    group = None
+    if not _is_single_turn(samples, max_turns=args.max_turns):
+        group = _summarize_group_best(samples, fast_thresholds, max_turns=args.max_turns)
+        if group is None:
             print(
-                f"  turn<={turn_count}: "
-                f"Compile={turn_res['Compile']:.4f} ({turn_res['compile_count']}/{res['trajectory_total']})  "
-                f"Correct={turn_res['Correct']:.4f} ({turn_res['correct_count']}/{res['trajectory_total']})"
+                "note: multi-turn dump but no group_id found; per-turn/best columns unavailable.",
+                file=sys.stderr,
             )
-            for t in args.fast:
-                print(
-                    f"    Fast@{t:g}={turn_res[f'Fast@{t:g}']:.4f} "
-                    f"({turn_res[f'fast@{t:g}_count']}/{res['trajectory_total']})"
-                )
-            if "SpeedupMean" in turn_res:
-                print(f"    SpeedupMean={turn_res['SpeedupMean']:.4f}")
+
+    _print_debug_header(dumps, samples, base, group, args)
+    _print_oneline_table(group, base, fast_thresholds)
 
 
 if __name__ == "__main__":

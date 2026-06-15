@@ -32,7 +32,7 @@ KERNEL_BACKEND="${KERNEL_BACKEND:-tvm_ffi}"
 REFERENCE_BACKEND="${REFERENCE_BACKEND:-torch}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-8}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-36000}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-10000}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-16384}"
 MAX_TURNS="${MAX_TURNS:-3}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-16}"
 SGLANG_WATCHDOG_TIMEOUT="${SGLANG_WATCHDOG_TIMEOUT:-2400}"
@@ -119,7 +119,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_tvm_ffi_short.yaml"
 )
 
 KERNEL_AGENT_ARGS=(
@@ -138,7 +138,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.85
    --sglang-decode-log-interval 400
    --router-policy round_robin
    --router-queue-timeout-secs "${ROUTER_QUEUE_TIMEOUT_SECS}"
