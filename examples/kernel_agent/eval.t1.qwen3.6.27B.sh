@@ -187,5 +187,7 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}"
 
-echo "=== eval submitted; dumps -> ${DUMP_DIR} ==="
-echo "summarize: python3 ${REPO_ROOT}/examples/kernel_agent/summarize_eval.py ${EVAL_DIR}"
+SUMMARY_PATH="${EVAL_DIR}/summary.${LOG_STAMP}.txt"
+python3 "${REPO_ROOT}/examples/kernel_agent/summarize_eval.py" "${EVAL_DIR}" --max-turns 1 | tee "${SUMMARY_PATH}"
+echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
+echo "summary -> ${SUMMARY_PATH}"
