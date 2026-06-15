@@ -21,7 +21,7 @@ if [[ ! -f "${HF_MODEL_PATH}/config.json" ]]; then
    exit 1
 fi
 
-EVAL_DATA="${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/eval_with_entry_point.parquet}"
+EVAL_DATA="${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}"
 if [[ ! -f "${EVAL_DATA}" ]]; then
    echo "EVAL_DATA does not exist: ${EVAL_DATA}" >&2
    exit 1

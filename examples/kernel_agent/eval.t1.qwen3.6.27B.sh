@@ -29,7 +29,7 @@ if [ ! -f "${EVAL_HF_CKPT}/config.json" ]; then
    echo "error: EVAL_HF_CKPT is not an HF checkpoint (no config.json): ${EVAL_HF_CKPT}" >&2
    exit 1
 fi
-EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/eval_with_entry_point.parquet}
+EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}
 KERNELGYM_PORT=${KERNELGYM_PORT:-20211}
 KERNEL_ENV_URL="http://127.0.0.1:${KERNELGYM_PORT}"
 KERNEL_BACKEND="tvm_ffi"
