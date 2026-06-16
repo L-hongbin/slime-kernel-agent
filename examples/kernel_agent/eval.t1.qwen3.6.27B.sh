@@ -36,7 +36,7 @@ KERNEL_BACKEND="tvm_ffi"
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-16384}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
-SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-32}
+SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
 EVAL_TAG=${EVAL_TAG:-$(basename "${EVAL_HF_CKPT}")}
 
 MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
@@ -124,7 +124,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
    --sglang-context-length ${MAX_CONTEXT_LEN}
    --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
-   --sglang-mem-fraction-static 0.7
+   --sglang-mem-fraction-static 0.85
    --sglang-decode-log-interval 400
    --router-policy round_robin
    --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
