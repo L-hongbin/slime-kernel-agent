@@ -235,4 +235,4 @@ RUNTIME.md
 .rayignore
 hostfile
 gpu_mem_trend.png
-last*.bundle
+*.bundle
