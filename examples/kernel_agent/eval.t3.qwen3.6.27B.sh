@@ -5,6 +5,10 @@ trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: $
 trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 export PYTHONUNBUFFERED=1
+# Bypass the cluster clash proxy for loopback/in-cluster traffic; otherwise the
+# preflight health check to 127.0.0.1 gets black-holed by the proxy and times out.
+export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR:-192.168.112.24},192.168.112.2"
+export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"

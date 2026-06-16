@@ -1,19 +1,4 @@
-#!/bin/bash
-#
-# Single-node eval-only of a trained kernel-agent checkpoint, FAITHFUL to
-# training: same generate fn (generate_with_cuda_agent.generate), tvm_ffi
-# backend, multi_turn_cuda_kernel prompt. examples/kernel_agent/summarize_eval.py
-# turns the dumped env_result.env_state into Compile / Correct / Fast@1.0 /
-# Fast@1.2 (in_all). NOTE: the sibling summarize_kernelgym_eval.py does NOT read
-# this dump schema (it expects metadata.kernelgym); use summarize_eval.py.
-#
-# Eval-only mechanism: train.py runs `rollout_manager.eval()` once when
-# --num-rollout 0 and --eval-interval is set, then exits. --debug-rollout-only
-# skips the megatron backend, so all 8 GPUs serve SGLang (2 engines, TP4).
-#
-# Usage:
-#   EVAL_HF_CKPT=.../hf/iter_39 \
-#     bash examples/kernel_agent/eval.t1.qwen3.6.27B.sh
+
 set -Eex
 trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
 
@@ -37,7 +22,7 @@ EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/tr
 KERNEL_ENV_URL="http://127.0.0.1:20211"
 KERNEL_BACKEND="tvm_ffi"
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
-MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-16384}
+MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-32768}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
 EVAL_TAG=${EVAL_TAG:-$(basename "${EVAL_HF_CKPT}")}
@@ -45,14 +30,14 @@ EVAL_TAG=${EVAL_TAG:-$(basename "${EVAL_HF_CKPT}")}
 MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
 HF_MODEL_PATH=${HF_MODEL_PATH:-${EVAL_HF_CKPT}}
 
-EXP_NAME="EvalFAsync.${KERNEL_BACKEND}.Qwen3.6-27B.CTX${MAX_CONTEXT_LEN}"
+EXP_NAME="EvalFAsync.${KERNEL_BACKEND}.MusaCoder-27B.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 EVAL_DIR="${EXP_ROOT}/${EVAL_TAG}"
 DUMP_DIR="${EVAL_DIR}/dumps"
 mkdir -p "${EVAL_DIR}"
 
-RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8266}
-RAY_PORT=${RAY_PORT:-6380}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-8268}
+RAY_PORT=${RAY_PORT:-6382}
 RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_eval}
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
 # Gloo needs the interface that actually holds MASTER_ADDR's IP — it differs per
@@ -73,8 +58,23 @@ echo "KERNEL_ENV_URL=${KERNEL_ENV_URL}"
 echo "DUMP_DIR=${DUMP_DIR}"
 
 # preflight: KernelGym health on this node/port
-if ! curl -s --max-time 5 "${KERNEL_ENV_URL}/health" -o /dev/null -w '%{http_code}' | grep -q 200; then
-   echo "KernelGym health check failed at ${KERNEL_ENV_URL}" >&2
+health_ok=0
+for health_attempt in $(seq 1 30); do
+   # Truncate first: curl leaves -o untouched on a timeout/connection failure, so
+   # a stale body from a prior successful probe would otherwise be printed below.
+   : > /tmp/kernelgym-health.out
+   health_code=$(curl -sS --max-time 8 "${KERNEL_ENV_URL}/health" -o /tmp/kernelgym-health.out -w '%{http_code}' || true)
+   if [ "${health_code}" = "200" ]; then
+      health_ok=1
+      break
+   fi
+   echo "KernelGym health attempt ${health_attempt}/30 failed at ${KERNEL_ENV_URL}: code=${health_code}" >&2
+   head -c 300 /tmp/kernelgym-health.out >&2 2>/dev/null || true
+   echo >&2
+   sleep 2
+done
+if [ "${health_ok}" != "1" ]; then
+   echo "KernelGym health check failed at ${KERNEL_ENV_URL} after 30 attempts" >&2
    exit 1
 fi
 
