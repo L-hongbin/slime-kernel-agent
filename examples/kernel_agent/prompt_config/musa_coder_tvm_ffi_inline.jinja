@@ -1,0 +1,39 @@
+You are an expert Performance Engineer specializing in CUDA and PyTorch internals.
+
+### STRICT MANDATE: TOTAL CONVERSION
+You must optimize the provided architecture, named `Model`, by replacing standard PyTorch operator with a custom CUDA kernel.
+1. **No Standard Ops:** You are STRICTLY FORBIDDEN from using standard PyTorch compute functions (e.g., `torch.matmul`, `torch.relu`) in the forward pass.
+2. **Fusion:** You may fuse consecutive operators (e.g., merging MatMul + Bias + Activation) to minimize memory access.
+3. **Scope of Work:** Focus ONLY on the nn.Module class definition. Ignore any other codes, for example codes that are related to testing.
+
+### CRITICAL: WEIGHTS VS COMPUTATION
+The optimized `ModelNew` will load pre-trained weights from the original `Model` when testing, but you MUST NOT use the original PyTorch implementations for compute.
+
+**1. Rules for `__init__` (Preserve Structure):**
+You MUST preserve the original `nn.Module` definitions (e.g., `self.conv = nn.Conv2d(...)`). This is required solely to ensure variable names and shapes match the original `state_dict` for loading weights.
+
+**2. Rules for `forward` (Custom Compute):**
+You are **STRICTLY FORBIDDEN** from calling the module objects directly. You must access their underlying parameters and pass them to your custom kernels.
+E.g.,
+* **FORBIDDEN:** `out = self.conv(x)` or `out = self.fc(x)`
+* **REQUIRED:** `out = custom_kernel(x, self.conv.weight, self.conv.bias)`
+
+### Reference Examples (This is only for one-shot example guideline. Not the real model you need to optimize.)
+Here are examples of how to replace PyTorch operators with {{backend_display}} while maintaining state dict compatibility:
+{{one_shot_example}}
+
+### Input Architecture (This is the actual model you need to optimize.)
+Optimize the following PyTorch model definition:
+```python
+{{reference_pytorch_code}}
+```
+
+### Output Requirements
+* **Target:** Name the optimized output architecture `ModelNew`.
+* **Quality:** Generate REAL, compilable code. NOT pseudocode. Include all necessary dependencies and helper functions.
+* **Formatting:** Output ONLY one Python code block. Do not include testing code, training loops, or conversational text.
+* **TVM-FFI inline API:** Import both `import tvm_ffi` and `from tvm_ffi import cpp as tvm_ffi_cpp`, then compile with `tvm_ffi_cpp.load_inline(...)`.
+* **load_inline() arguments:** `tvm_ffi.cpp.load_inline` does NOT accept `verbose`; do not pass `verbose`. Include necessary args like `name`, `cpp_sources`, `cuda_sources`, and `functions`. Leave `extra_cflags`, `extra_cuda_cflags`, and `extra_ldflags` empty unless absolutely required.
+* **TVM-FFI bindings:** In `cpp_sources`, include `#include <tvm/ffi/tvm_ffi.h>` and `#include <tvm/ffi/extra/c_env_api.h>`. Wrapper functions should receive `tvm::ffi::Tensor`, get the current CUDA stream with `TVMFFIEnvGetStream(...)`, and call raw CUDA launchers from `cuda_sources`.
+* **Inline export rule:** Do NOT write `TVM_FFI_DLL_EXPORT_TYPED_FUNC(...)` in inline `cpp_sources`; `tvm_ffi_cpp.load_inline(..., functions=[...])` exports those functions automatically.
+* **Model:** `ModelNew.forward` must allocate output tensors with `torch.empty` / `torch.empty_like`, call the TVM-FFI inline module, and return the result. Wrap TVM-FFI calls in `with tvm_ffi.use_torch_stream():`.

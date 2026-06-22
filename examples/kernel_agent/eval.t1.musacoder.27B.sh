@@ -18,10 +18,18 @@ if [ ! -f "${EVAL_HF_CKPT}/config.json" ]; then
    echo "error: EVAL_HF_CKPT is not an HF checkpoint (no config.json): ${EVAL_HF_CKPT}" >&2
    exit 1
 fi
-EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}
-KERNEL_ENV_URL="http://127.0.0.1:20211"
-KERNEL_BACKEND="tvm_ffi"
+# Default to the load_inline-format dataset (MusaCoder paper prompt). The older
+# `kernelbench-level1-validation-musa-coder/` parquet is the cuda_agent
+# three-section format and must NOT be used for the MusaCoder reproduction.
+EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-musa-coder-load-inline/train.parquet}
+KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://127.0.0.1:20211}
+KERNEL_BACKEND=${KERNEL_BACKEND:-cuda_agent}
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
+# MusaCoder paper eval decoding: temperature 0.7, top_p 0.95. These drive the
+# eval sampling (resolved via eval_temperature/eval_top_p in eval_config.py),
+# independent of the dummy --rollout-temperature below.
+EVAL_TEMPERATURE=${EVAL_TEMPERATURE:-0.7}
+EVAL_TOP_P=${EVAL_TOP_P:-0.95}
 MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-32768}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-64}
@@ -89,6 +97,8 @@ EVAL_ARGS=(
    --eval-input-key prompt
    --eval-label-key reward_model
    --n-samples-per-eval-prompt ${N_SAMPLES_PER_EVAL_PROMPT}
+   --eval-temperature ${EVAL_TEMPERATURE}
+   --eval-top-p ${EVAL_TOP_P}
    --debug-rollout-only
    --dump-details "${DUMP_DIR}"
 )
@@ -132,11 +142,11 @@ SGLANG_ARGS=(
    --router-policy round_robin
    --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
    --sglang-disable-custom-all-reduce
-   --sglang-speculative-algorithm EAGLE
-   --sglang-speculative-num-steps 3
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 4
-   --sglang-linear-attn-backend flashinfer
+   # --sglang-speculative-algorithm EAGLE
+   # --sglang-speculative-num-steps 3
+   # --sglang-speculative-eagle-topk 1
+   # --sglang-speculative-num-draft-tokens 4
+   # --sglang-linear-attn-backend flashinfer
    --sglang-mamba-scheduler-strategy extra_buffer
 )
 
