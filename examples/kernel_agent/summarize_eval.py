@@ -13,7 +13,13 @@ Metric denominators are ALL evaluated samples (in_all):
   Fast@1.0  = (correct and speedup >= 1.0) / total
   Fast@1.2  = (correct and speedup >= 1.2) / total
 
-For multi-turn dumps, Best* metrics are read from dump-level metrics when present.
+For multi-turn dumps, every per-turn rate (T1..TN) and the cumulative Best* column
+share ONE denominator: the trajectory total (number of group_ids). Tk counts the
+trajectories whose turn k satisfied the metric; best counts trajectories where any
+turn satisfied it. Both divide by the same trajectory total, so the columns are
+directly comparable.
+
+Best* metrics are read from dump-level metrics when present.
 If the dump does not contain Best* metrics, this script warns and falls back to
 group_id-based trajectory aggregation. If there is no group_id, Best* metrics are
 not computed.
@@ -191,8 +197,9 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             missing += 1
 
         turn_metrics.sort(key=lambda item: item[0])
-        # Per-turn (single turn) metrics: turn_count k looks only at turn index k-1,
-        # with its own denominator (trajectories that actually produced that turn).
+        # Per-turn (single turn) metrics: turn_count k looks only at turn index k-1.
+        # The denominator is the full trajectory total (same as Best*), NOT the count
+        # of trajectories that produced that turn; `present` is tracked only for info.
         for turn_count, counts in by_turn.items():
             this_turn = [metrics for turn_idx, metrics in turn_metrics if turn_idx == turn_count - 1]
             if this_turn:
@@ -224,7 +231,9 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
     for turn_count, counts in by_turn.items():
         present = by_turn_present[turn_count]
 
-        def prate(n, d=present):
+        # Unified denominator: every per-turn rate uses the full trajectory total,
+        # so Tk and best are directly comparable on the same denominator.
+        def prate(n, d=total):
             return n / d if d else 0.0
 
         turn_out = {
@@ -345,7 +354,7 @@ def _print_debug_header(dumps, samples, base, group, args):
         per_turn = group.get("per_turn", {})
         if per_turn:
             counts = "  ".join(f"T{k}={per_turn[k]['present']}" for k in sorted(per_turn))
-            print(f"per-turn records (Tk denominator): {counts}")
+            print(f"per-turn records (Tk produced; all rates use traj total as denom): {counts}")
     else:
         print("trajectories (group_id): n/a (single-turn or no group_id; table shows overall rates only)")
     print()
