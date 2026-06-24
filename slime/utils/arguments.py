@@ -713,6 +713,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
+            # Extra kwargs forwarded to AutoTokenizer.from_pretrained when loading the rollout
+            # tokenizer, e.g. '{"fix_mistral_regex": true}' for Mistral-lineage tokenizers
+            # (stepfun Step-3.x) that otherwise drop whitespace under transformers v5.
+            parser.add_argument("--tokenizer-load-kwargs", type=json.loads, default="{}")
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
