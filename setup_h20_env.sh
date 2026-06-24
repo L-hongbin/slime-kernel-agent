@@ -18,6 +18,8 @@ fi
 
 cd "${REPO_ROOT}"
 
+CUTLASS_DSL_VERSION="4.5.2"
+
 # Install the repo itself without disturbing the carefully pinned runtime deps.
 python3 -m pip install -e . --no-deps --break-system-packages
 python3 -m pip install debugpy --break-system-packages
@@ -53,18 +55,43 @@ print("FlashInfer GDN dependency check passed")
 PY
 }
 
+verify_cutlass_dsl_version() {
+    python3 - "${CUTLASS_DSL_VERSION}" <<'PY'
+import importlib.metadata
+import sys
+
+expected = sys.argv[1]
+packages = ("nvidia-cutlass-dsl", "nvidia-cutlass-dsl-libs-base")
+for package in packages:
+    try:
+        actual = importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        print(f"CUTLASS DSL version check failed: {package} is not installed", file=sys.stderr)
+        raise SystemExit(1)
+    if actual != expected:
+        print(
+            f"CUTLASS DSL version check failed: {package}={actual}, expected {expected}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+print(f"CUTLASS DSL version check passed: {expected}")
+PY
+}
+
 # FlashInfer GDN kernels need the CUTLASS DSL package to expose the `cutlass`
 # Python module. If the wheel metadata exists but files are missing, SGLang can
 # later fail with `run_pretranspose_decode` being None during CUDA graph capture.
-if ! verify_flashinfer_gdn; then
+if ! verify_flashinfer_gdn || ! verify_cutlass_dsl_version; then
     python3 -m pip install \
         --break-system-packages \
         --force-reinstall \
         --no-cache-dir \
         --no-deps \
-        "nvidia-cutlass-dsl==4.5.1" \
-        "nvidia-cutlass-dsl-libs-base==4.5.1"
+        "nvidia-cutlass-dsl==${CUTLASS_DSL_VERSION}" \
+        "nvidia-cutlass-dsl-libs-base==${CUTLASS_DSL_VERSION}"
     verify_flashinfer_gdn
+    verify_cutlass_dsl_version
 fi
 
 # Optional local path compatibility symlinks.
