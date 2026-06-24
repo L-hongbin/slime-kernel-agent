@@ -19,7 +19,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "${script_dir}/../.." && pwd)
 HOSTFILE=${HOSTFILE:-${repo_root}/hostfile}
-SSH_PORT=${SSH_PORT:-23422}
+SSH_PORT=${SSH_PORT:-23522}
 APPLY=${APPLY:-0}
 ssh_base=(-p "${SSH_PORT}" -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new ${MULTI_NODE_SSH_OPTS:-})
 
@@ -36,7 +36,7 @@ for p in "$@"; do
     *..*) echo "REFUSE path containing '..': $p" >&2; exit 3;;
   esac
   [[ "$p" = /* ]] || { echo "REFUSE non-absolute path: $p (pass absolute paths)" >&2; exit 3; }
-  [[ "$p" == *checkpoints/* ]] || { echo "REFUSE path not under a checkpoints/ dir: $p" >&2; exit 3; }
+  [[ "$p" == *checkpoints/* || "$p" == *experiments/* ]] || { echo "REFUSE path not under checkpoints/ or experiments/: $p" >&2; exit 3; }
 done
 
 # --- local node IPs, to run locally instead of ssh ---
