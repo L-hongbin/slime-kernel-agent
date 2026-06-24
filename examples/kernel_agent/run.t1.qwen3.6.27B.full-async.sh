@@ -13,13 +13,18 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen3.5-27B.sh"
 # NODE CONFIG
 MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
+if ! ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${MASTER_ADDR}"; then
+   echo "This script must run on the Ray head node (${MASTER_ADDR}); local node IPs are:"
+   ip -o -4 addr show | awk '{print "  " $2, $4}'
+   exit 1
+fi
 REMOTE_HOSTS=(
    "10.11.2.169"
    "10.11.2.170"
 )
 REMOTE_PORTS=(
-   "23422"
-   "23422"
+   "23522"
+   "23522"
 )
 if [ "${#REMOTE_PORTS[@]}" -ne "${#REMOTE_HOSTS[@]}" ]; then
    echo "REMOTE_PORTS length (${#REMOTE_PORTS[@]}) must match REMOTE_HOSTS length (${#REMOTE_HOSTS[@]})."
@@ -82,6 +87,12 @@ RAY_TEMP_DIR="/tmp/ray"
 
 PYTHON_BIN=${PYTHON_BIN:-python3}
 RAY_WAIT_TIMEOUT=${RAY_WAIT_TIMEOUT:-300}
+CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
+CUDA_PATH="${CUDA_PATH:-${CUDA_HOME}}"
+CUDA_BIN_DIR="${CUDA_HOME}/bin"
+CUDA_LIB_DIR="${CUDA_HOME}/lib64"
+RUNTIME_PATH="${CUDA_BIN_DIR}:${PATH}"
+RUNTIME_LD_LIBRARY_PATH="${CUDA_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
 # LOG CONFIG
 LOG_STAMP="$(date +%Y%m%d.%H%M%S)"
@@ -104,6 +115,104 @@ run_ssh() {
 
 shell_quote() {
    printf "%q" "$1"
+}
+
+read -r -d '' TILELANG_CUDA_ATOMIC_CHECK_PY <<'PY' || true
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+
+label = sys.argv[1]
+nvcc = sys.argv[2]
+cuda_home = sys.argv[3]
+
+if not os.path.exists(nvcc):
+    nvcc = shutil.which("nvcc") or nvcc
+if not os.path.exists(nvcc):
+    raise SystemExit(f"{label}: nvcc not found: {nvcc}")
+
+cuda_include = os.path.join(cuda_home, "include")
+required_headers = [
+    os.path.join(cuda_include, "cuda", "atomic"),
+    os.path.join(cuda_include, "nv", "target"),
+]
+missing = [path for path in required_headers if not os.path.exists(path)]
+if missing:
+    raise SystemExit(f"{label}: missing CUDA 12.9 CCCL/libcu++ headers: {missing}")
+
+import tilelang.contrib.nvcc as tl_nvcc
+
+tl_compiler = tl_nvcc.get_nvcc_compiler()
+if os.path.realpath(tl_compiler) != os.path.realpath(nvcc):
+    raise SystemExit(f"{label}: TileLang selected {tl_compiler}, expected {nvcc}")
+
+source = (
+    "#include <cuda/atomic>\n"
+    "extern \"C\" __global__ void k(int* out) {\n"
+    "  cuda::atomic_ref<int, cuda::thread_scope_device> r(*out);\n"
+    "  r.store(1);\n"
+    "}\n"
+)
+with tempfile.TemporaryDirectory(prefix="tilelang_cuda_atomic_") as tmpdir:
+    src = os.path.join(tmpdir, "test.cu")
+    cubin = os.path.join(tmpdir, "test.cubin")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(source)
+    cmd = [
+        nvcc,
+        "--cubin",
+        "-O3",
+        "-arch=sm_90a",
+        "-std=c++17",
+        "-o",
+        cubin,
+        src,
+    ]
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        raise SystemExit(f"{label}: TileLang CUDA atomic compile check failed")
+    print(f"{label}: TileLang CUDA atomic compile check passed with {nvcc}")
+PY
+
+check_local_tilelang_cuda_headers() {
+   local label="$1"
+   echo "Checking TileLang CUDA headers on ${label}"
+   CUDA_HOME="${CUDA_HOME}" CUDA_PATH="${CUDA_PATH}" PATH="${RUNTIME_PATH}" LD_LIBRARY_PATH="${RUNTIME_LD_LIBRARY_PATH}" \
+      "${PYTHON_BIN}" - "${label}" "${CUDA_BIN_DIR}/nvcc" "${CUDA_HOME}" \
+      <<<"${TILELANG_CUDA_ATOMIC_CHECK_PY}"
+}
+
+check_remote_tilelang_cuda_headers() {
+   local host="$1"
+   local port="$2"
+   local label="$3"
+   local quoted_python quoted_label quoted_cuda_home quoted_cuda_path quoted_path quoted_ld_library_path
+
+   quoted_python="$(shell_quote "${PYTHON_BIN}")"
+   quoted_label="$(shell_quote "${label}")"
+   quoted_cuda_home="$(shell_quote "${CUDA_HOME}")"
+   quoted_cuda_path="$(shell_quote "${CUDA_PATH}")"
+   quoted_path="$(shell_quote "${RUNTIME_PATH}")"
+   quoted_ld_library_path="$(shell_quote "${RUNTIME_LD_LIBRARY_PATH}")"
+
+   echo "Checking TileLang CUDA headers on ${label}"
+   run_ssh "${host}" "${port}" \
+      "CUDA_HOME=${quoted_cuda_home} CUDA_PATH=${quoted_cuda_path} PATH=${quoted_path} LD_LIBRARY_PATH=${quoted_ld_library_path} ${quoted_python} - ${quoted_label} ${quoted_cuda_home}/bin/nvcc ${quoted_cuda_home}" \
+      <<<"${TILELANG_CUDA_ATOMIC_CHECK_PY}"
+}
+
+check_all_tilelang_cuda_headers() {
+   check_local_tilelang_cuda_headers "head-${MASTER_ADDR}"
+   for i in "${!REMOTE_HOSTS[@]}"; do
+      check_remote_tilelang_cuda_headers \
+         "${REMOTE_HOSTS[$i]}" \
+         "${REMOTE_PORTS[$i]}" \
+         "worker-${REMOTE_HOSTS[$i]}"
+   done
 }
 
 # Every node has a local KernelGym entry on 127.0.0.1:20211, so the health
@@ -204,6 +313,7 @@ done
 sleep 3
 
 check_all_host_resources
+check_all_tilelang_cuda_headers
 
 WANDB_ARGS=(
    --use-wandb
@@ -226,6 +336,10 @@ CKPT_ARGS=(
    # /nfs/FM is per-node local disk: ranks write shards to their own node;
    # gather with scripts/sync/gather_convert_ckpt.sh afterwards.
    --save ${EXP_ROOT}/checkpoints
+   # Resume from the latest finalized checkpoint in --save (iter_119); slime
+   # derives start_rollout_id from it when --start-rollout-id is unset. Loading
+   # the same dir we save to makes restarts continue instead of restart at 0.
+   --load ${EXP_ROOT}/checkpoints
    --save-interval 20
    # async save overlaps disk writes with the next train step; the worker
    # flag is required or Megatron disables --async-save. Keep the default
@@ -237,6 +351,7 @@ CKPT_ARGS=(
 ROLLOUT_ARGS=(
    --rollout-function-path examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async
    --update-weights-interval 1
+   --keep-old-actor
    --prompt-data ${RL_DATA}
    --input-key prompt
    --label-key reward_model
@@ -377,12 +492,13 @@ KERNEL_AGENT_ARGS=(
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck
+   --use-reference-cache
    --finalize-mode positive
    --use-multi-turn
    --filter-by-last-turn
    --padding-turns
    --max-turns 1
-   --sequence-mis-config '{"aggregation":"turns_geometric","token_veto_threshold":1e-4,"lower":0.999,"upper":1.001,"use_advantage":true}'
+   --sequence-mis-config '{"aggregation":"turns_geometric","token_veto_threshold":1e-4,"lower":0.999,"upper":1.001,"use_advantage":false}'
    --enable-turns-dp-partitions
    --use-coverage-rs
    --coverage-rs-key time_coverage
@@ -424,6 +540,10 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "NCCL_SOCKET_IFNAME": "${NCCL_SOCKET_IFNAME}",
     "MASTER_ADDR": "${MASTER_ADDR}",
     "WANDB_API_KEY": "${WANDB_API_KEY}",
+    "CUDA_HOME": "${CUDA_HOME}",
+    "CUDA_PATH": "${CUDA_PATH}",
+    "PATH": "${RUNTIME_PATH}",
+    "LD_LIBRARY_PATH": "${RUNTIME_LD_LIBRARY_PATH}",
     "PYTHONPATH": ".:/root/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "CUDA_AGENT_LOG_MULTI_TURN_TEXT": "0",
