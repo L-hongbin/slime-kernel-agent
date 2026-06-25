@@ -20,6 +20,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
+from .fp32_lm_head import enable_fp32_lm_head
+
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
 class LinearForLastLayer(torch.nn.Linear):
@@ -55,6 +57,11 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def _maybe_enable_fp32_lm_head(model: GPTModel, args: argparse.Namespace, role: str, post_process: bool) -> None:
+    if post_process and role != "critic" and getattr(args, "fp32_lm_head", False):
+        enable_fp32_lm_head(model)
+
+
 def _get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -77,6 +84,7 @@ def _get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
+            _maybe_enable_fp32_lm_head(model, args, role, post_process)
             return model
 
         return wrapped_model_provider
@@ -117,6 +125,15 @@ def _get_model_provider_func(
 
             return _critic_provide
 
+        if getattr(args, "fp32_lm_head", False):
+
+            def _actor_provide(pre_process=True, post_process=True, vp_stage=None):
+                model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                _maybe_enable_fp32_lm_head(model, args, role, post_process)
+                return model
+
+            return _actor_provide
+
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -150,6 +167,7 @@ def _get_model_provider_func(
                         model.output_layer = LinearForLastLayer(
                             input_size=config.hidden_size, output_size=1, config=config
                         )
+                    _maybe_enable_fp32_lm_head(model, args, role, post_process)
                     return model
                 transformer_layer_spec = result
         else:
@@ -233,6 +251,7 @@ def _get_model_provider_func(
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+        _maybe_enable_fp32_lm_head(model, args, role, post_process)
 
         return model
 

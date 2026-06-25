@@ -185,6 +185,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="GDN implementation backend for Qwen linear-attention layers.",
             )
             parser.add_argument(
+                "--fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Run the final LM-head (output_layer) matmul in float32: upcast the hidden states and "
+                    "the output_layer weight to fp32 for the vocab projection only. The transformer/MTP "
+                    "blocks stay in bf16. Mirrors SGLang's --enable-fp32-lm-head so train- and rollout-time "
+                    "log-probs are computed at the same precision, reducing train/infer logits mismatch."
+                ),
+            )
+            parser.add_argument(
                 "--train-env-vars",
                 type=json.loads,
                 default="{}",
