@@ -470,6 +470,8 @@ def _sample_for_turn(
     status: Sample.Status,
     turn_idx: int,
     env_result: dict[str, Any],
+    args: Any = None,
+    meta_info: dict[str, Any] | None = None,
 ) -> Sample:
     turn_sample = deepcopy(base_sample)
     turn_sample.tokens = prompt_ids + response_ids
@@ -488,6 +490,15 @@ def _sample_for_turn(
             "env_extra_info": _extract_env_extra_info(env_result),
         }
     )
+    # Populate speculative-decoding / prefix-cache stats from the engine meta_info
+    # so rollout/spec_accept_rate and rollout/prefix_cache_hit_rate are not silently 0.
+    # Only the stat sub-updates are applied here (not the full update_from_meta_info)
+    # so the turn's own status logic above is preserved. .add() accumulates across
+    # turns, matching partial-rollout semantics.
+    if meta_info is not None:
+        if getattr(args, "sglang_speculative_algorithm", None):
+            turn_sample.spec_info.add(meta_info=meta_info)
+        turn_sample.prefix_cache_info.add(meta_info=meta_info)
     return turn_sample
 
 
@@ -747,6 +758,8 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             status=status,
             turn_idx=turn_idx,
             env_result=env_result,
+            args=args,
+            meta_info=output["meta_info"],
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time

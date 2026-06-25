@@ -2,7 +2,7 @@
 """Check sequence_mis loop and batch modes on deterministic tensors.
 
 Run from the repository root:
-    python examples/kernel_agent/test/check_sequence_mis_consistency.py
+    python slime/tests/test_sequence_mis_consistency.py
 """
 
 from __future__ import annotations
@@ -39,7 +39,8 @@ def _install_megatron_stub_if_needed() -> None:
 
 def _import_kernel_filter():
     _install_megatron_stub_if_needed()
-    repo_root = Path(__file__).resolve().parents[3]
+    # slime/tests/<file>.py -> parents[2] is the repo root.
+    repo_root = Path(__file__).resolve().parents[2]
     kernel_agent_dir = repo_root / "examples" / "kernel_agent"
     for item in (repo_root, kernel_agent_dir):
         item_str = str(item)
@@ -216,6 +217,61 @@ def test_sequence_mis_use_advantage_protects_positive_advantage() -> None:
             raise AssertionError(f"use_advantage should still reject negative-advantage sample in {mode} mode")
 
 
+def test_sequence_mis_reports_mismatch_stats() -> None:
+    """sequence_mis returns raw mismatch magnitude + effective-batch counts."""
+    sequence_mis = _import_targets()
+    # Two samples: one fully on-policy (|log_ratio|=0), one with a uniform 0.3
+    # gap on 4 valid tokens; a third sequence with an all-zero mask contributes
+    # no valid tokens. Geometric ratio exp(0.3) ~= 1.35 > upper(1.1) -> rejected.
+    train_log_probs = [
+        torch.zeros(3, dtype=torch.float32),
+        torch.full((4,), 0.3, dtype=torch.float32),
+        torch.zeros(2, dtype=torch.float32),
+    ]
+    rollout_log_probs = [torch.zeros_like(t) for t in train_log_probs]
+    loss_masks = [
+        torch.ones(3, dtype=torch.float32),
+        torch.ones(4, dtype=torch.float32),
+        torch.zeros(2, dtype=torch.float32),
+    ]
+
+    for mode in ("loop", "batch"):
+        args = Namespace(
+            sequence_mis_aggregation="geometric",
+            sequence_mis_lower=0.9,
+            sequence_mis_upper=1.1,
+            sequence_mis_token_veto_threshold=None,
+            sequence_mis_mode=mode,
+            sequence_mis_batch_size=8,
+            n_samples_per_prompt=2,
+            max_turns=3,
+        )
+        rollout_data = {
+            "log_probs": [t.clone() for t in train_log_probs],
+            "rollout_log_probs": [t.clone() for t in rollout_log_probs],
+            "loss_masks": [t.clone() for t in loss_masks],
+            "total_lengths": [len(t) for t in loss_masks],
+            "response_lengths": [len(t) for t in loss_masks],
+        }
+        stats = sequence_mis(args, rollout_id=0, rollout_data=rollout_data)
+
+        # 7 valid tokens (3 + 4); sample-3 masked out contributes nothing.
+        assert stats["valid_tokens"] == 7.0, stats
+        # Only the 4 tokens of sample-2 carry |log_ratio| = 0.3.
+        assert abs(stats["abs_log_ratio_sum"] - 4 * 0.3) < 1e-5, stats
+        assert abs(stats["abs_log_ratio_max"] - 0.3) < 1e-5, stats
+        # The 4 sample-2 tokens (|log_ratio|=0.3) exceed both 0.02 and 0.05.
+        assert stats["tok_exceed_0.02"] == 4.0, stats
+        assert stats["tok_exceed_0.05"] == 4.0, stats
+        # Sample-2 rejected -> only sample-1's 3 tokens survive.
+        assert int(stats["rejected"]) == 1, stats
+        survived = sum(float(m.sum().item()) for m in rollout_data["loss_masks"])
+        assert survived == 3.0, (survived, mode)
+        # wandb scalars injected for cross-run comparison.
+        assert "mis_reject_rate" in rollout_data, rollout_data.keys()
+        assert "mis_mean_abs_log_ratio" in rollout_data, rollout_data.keys()
+
+
 def _build_benchmark_inputs(
     *,
     num_groups: int = 48,
@@ -374,9 +430,11 @@ def main() -> None:
     test_sequence_mis_loop_matches_batch()
     test_sequence_mis_token_veto_without_aggregation()
     test_sequence_mis_use_advantage_protects_positive_advantage()
+    test_sequence_mis_reports_mismatch_stats()
     print(
         "sequence_mis loop/batch modes match for kl, geometric, turns_geometric, "
-        "batch mode supports token-veto-only mode, and use_advantage protects positive advantages."
+        "batch mode supports token-veto-only mode, use_advantage protects positive advantages, "
+        "and mismatch/effective-batch stats are reported consistently."
     )
     benchmark_loop_vs_batch()
 
