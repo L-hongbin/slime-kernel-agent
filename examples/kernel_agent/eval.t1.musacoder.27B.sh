@@ -65,7 +65,14 @@ echo "EVAL_DATA=${EVAL_DATA}"
 echo "KERNEL_ENV_URL=${KERNEL_ENV_URL}"
 echo "DUMP_DIR=${DUMP_DIR}"
 
-# preflight: KernelGym health on this node/port
+# preflight: KernelGym health on this node/port.
+# SKIP_KERNELGYM_HEALTH=1 bypasses the gate: for load_inline the cuda_agent
+# client precheck rejects the response and never calls KernelGym during rollout
+# (reward=0 by design; scoring is done afterwards via rescore), so a live reward
+# node is not required just to generate the dump.
+if [ "${SKIP_KERNELGYM_HEALTH:-0}" = "1" ]; then
+   echo "Skipping KernelGym health check (SKIP_KERNELGYM_HEALTH=1); KERNEL_ENV_URL=${KERNEL_ENV_URL} will not be required for rollout."
+else
 health_ok=0
 for health_attempt in $(seq 1 30); do
    # Truncate first: curl leaves -o untouched on a timeout/connection failure, so
@@ -84,6 +91,7 @@ done
 if [ "${health_ok}" != "1" ]; then
    echo "KernelGym health check failed at ${KERNEL_ENV_URL} after 30 attempts" >&2
    exit 1
+fi
 fi
 
 # clean any prior ray on this eval cluster

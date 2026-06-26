@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -166,13 +165,24 @@ def to_arrow_table(rows: list[dict[str, Any]]) -> pa.Table:
 
 
 def write_samples(rows: list[dict[str, Any]], sample_output: Path, num_samples: int) -> None:
+    # Plain-text, human-reviewable dump: render the prompt content with real
+    # newlines (not a JSON-escaped one-liner) so it can be read directly.
     sample_output.parent.mkdir(parents=True, exist_ok=True)
     with sample_output.open("w", encoding="utf-8") as f:
         for index, row in enumerate(rows[:num_samples]):
+            extra_info = row.get("extra_info") or {}
+            ident = ", ".join(f"{k}={extra_info[k]}" for k in ("problem_id", "name") if k in extra_info)
             f.write("=" * 72 + "\n")
-            f.write(f"sample {index}\n")
+            f.write(f"sample {index}" + (f"  [{ident}]" if ident else "") + "\n")
+            f.write(f"data_source={row.get('data_source')}  ability={row.get('ability')}\n")
             f.write("=" * 72 + "\n")
-            f.write(json.dumps(row, ensure_ascii=False, indent=2))
+            for msg in row.get("prompt") or []:
+                f.write(f"---- prompt (role={msg.get('role')}) ----\n")
+                f.write((msg.get("content") or "").rstrip() + "\n")
+            ground_truth = (row.get("reward_model") or {}).get("ground_truth")
+            if ground_truth is not None:
+                f.write("---- reward_model.ground_truth ----\n")
+                f.write(ground_truth.rstrip() + "\n")
             f.write("\n\n")
 
 
