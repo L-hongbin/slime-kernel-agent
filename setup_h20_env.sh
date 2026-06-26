@@ -18,6 +18,15 @@ fi
 
 cd "${REPO_ROOT}"
 
+# Some node container images (e.g. node62) ship without iproute2, so `ip` is
+# missing and the run scripts' head-node IP check fails. Install it here. Kept
+# non-fatal so the rest of setup still runs when apt is unavailable/offline
+# (the run scripts also fall back to `hostname -I`).
+if ! command -v ip >/dev/null 2>&1; then
+    (apt-get update -qq && apt-get install -y --no-install-recommends iproute2) \
+        || echo "[warn] iproute2 install failed; run scripts fall back to 'hostname -I'"
+fi
+
 CUTLASS_DSL_VERSION="4.5.2"
 
 # Install the repo itself without disturbing the carefully pinned runtime deps.
