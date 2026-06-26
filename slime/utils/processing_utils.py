@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, ProcessorMixin
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, PreTrainedTokenizerFast, ProcessorMixin
 
 logger = logging.getLogger(__name__)
 
@@ -13,10 +13,63 @@ logger = logging.getLogger(__name__)
 # Note: Qwen3-VL uses 16, Qwen2.5-VL uses 14
 # Reference: https://github.com/QwenLM/Qwen3-VL/blob/main/qwen-vl-utils/README.md
 DEFAULT_PATCH_SIZE = 14
+_TOKENIZER_ROUNDTRIP_PROBE = "N = 2048 * 2\nreturn torch.matmul(A, B)"
+
+
+def _roundtrip_preserves_code_text(tokenizer) -> bool:
+    try:
+        token_ids = tokenizer(_TOKENIZER_ROUNDTRIP_PROBE, add_special_tokens=False)["input_ids"]
+        decoded = tokenizer.decode(token_ids, skip_special_tokens=False)
+    except Exception:
+        return True
+    return decoded == _TOKENIZER_ROUNDTRIP_PROBE
+
+
+def _tokenizer_config_requests_fast(name_or_path: str) -> bool:
+    config_path = Path(name_or_path) / "tokenizer_config.json"
+    tokenizer_json_path = Path(name_or_path) / "tokenizer.json"
+    if not config_path.exists() or not tokenizer_json_path.exists():
+        return False
+    try:
+        with config_path.open(encoding="utf-8") as f:
+            tokenizer_class = str((json.load(f) or {}).get("tokenizer_class") or "")
+    except (OSError, json.JSONDecodeError):
+        return False
+    return tokenizer_class.endswith("Fast")
+
+
+def _try_load_fast_tokenizer(name_or_path: str, **kwargs):
+    if not _tokenizer_config_requests_fast(name_or_path):
+        return None
+    try:
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(name_or_path, **kwargs)
+    except Exception as e:
+        logger.warning("Failed to load fast tokenizer from %s: %s", name_or_path, e)
+        return None
+    if not _roundtrip_preserves_code_text(tokenizer):
+        logger.warning("Fast tokenizer from %s still fails code-text roundtrip; keeping AutoTokenizer.", name_or_path)
+        return None
+    return tokenizer
 
 
 def load_tokenizer(name_or_path: str, **kwargs):
-    return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    if _roundtrip_preserves_code_text(tokenizer):
+        return tokenizer
+
+    fast_tokenizer = _try_load_fast_tokenizer(name_or_path, **kwargs)
+    if fast_tokenizer is None:
+        logger.warning(
+            "Tokenizer from %s does not preserve code-text roundtrip and no fast fallback was usable.",
+            name_or_path,
+        )
+        return tokenizer
+
+    logger.warning(
+        "AutoTokenizer for %s does not preserve code-text roundtrip; using PreTrainedTokenizerFast fallback.",
+        name_or_path,
+    )
+    return fast_tokenizer
 
 
 def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:
