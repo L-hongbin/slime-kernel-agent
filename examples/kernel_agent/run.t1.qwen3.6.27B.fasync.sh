@@ -12,15 +12,19 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 # MODEL CONFIG
 source "${SCRIPT_DIR}/../../scripts/models/qwen3.5-27B.sh"
 # NODE CONFIG
-MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
-if ! ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1 | grep -Fxq "${MASTER_ADDR}"; then
+MASTER_ADDR="${MASTER_ADDR:-10.11.2.170}"
+# Use `hostname -I` (not `ip`, which is absent in some node containers, e.g. node62)
+# to enumerate local IPv4s and confirm we are on the Ray head node.
+if ! hostname -I 2>/dev/null | tr ' ' '\n' | grep -Fxq "${MASTER_ADDR}"; then
    echo "This script must run on the Ray head node (${MASTER_ADDR}); local node IPs are:"
-   ip -o -4 addr show | awk '{print "  " $2, $4}'
+   hostname -I 2>/dev/null
    exit 1
 fi
+# head node = 10.11.2.170 (quiet host; 162's container has a flaky ray-head GCS
+# startup so it is demoted to a worker). Cluster = 170(head) + 169 + 162.
 REMOTE_HOSTS=(
    "10.11.2.169"
-   "10.11.2.170"
+   "10.11.2.162"
 )
 REMOTE_PORTS=(
    "23522"
@@ -72,7 +76,9 @@ WANDB_GROUP=${WANDB_GROUP:-${EXP_NAME}}
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
 LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-bond0}"
 REMOTE_GLOO_SOCKET_IFNAMES=(
-   "enp76s0f0np0"
+   # 10.11.2.169: enp76s0f0np0 is a bond slave of bond0 (no own IP); the IP lives
+   # on bond0, so gloo must bind bond0 (matches the other nodes).
+   "bond0"
    "bond0"
 )
 if [ "${#REMOTE_GLOO_SOCKET_IFNAMES[@]}" -ne "${#REMOTE_HOSTS[@]}" ]; then
@@ -110,7 +116,9 @@ run_ssh() {
    local host="$1"
    local port="$2"
    shift 2
-   ssh -p "${port}" "${host}" "$@"
+   # accept-new: auto-add unseen host keys (fresh head/remote pairs) without a
+   # prompt, but still reject changed keys. Avoids "Host key verification failed".
+   ssh -p "${port}" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 "${host}" "$@"
 }
 
 shell_quote() {
@@ -223,6 +231,11 @@ host_resource_check_args() {
    local health_script_path="${2:-${REPO_ROOT}/scripts/check_kernelgym_health.py}"
    args_ref=(
       --expected-gpus "8"
+      # Default CPU-idle gate relaxed 50 -> 40: the node62 host runs sustained
+      # ~49% idle from other tenants outside this container (container-visible
+      # R=1), which still leaves ~110 of 224 cores free for this run. Override
+      # via RESOURCE_IDLE_MIN_PERCENT.
+      --idle-min-percent "${RESOURCE_IDLE_MIN_PERCENT:-40}"
       --kernelgym-url "${KERNEL_ENV_URL}"
       --kernelgym-health-script "${health_script_path}"
       --python-bin "${PYTHON_BIN}"
@@ -450,7 +463,12 @@ SGLANG_ARGS=(
    --sglang-speculative-num-steps 3
    --sglang-speculative-eagle-topk 1
    --sglang-speculative-num-draft-tokens 4
-   --sglang-linear-attn-backend flashinfer
+   # triton (NOT flashinfer): the flashinfer GDN decode kernel diverges ~2e-3/layer
+   # from the megatron chunkwise recompute on real inputs, compounding across the 48
+   # GDN layers into a per-token logprob mismatch that collapses sequence_mis
+   # (reject 96.5% -> 0% after switching to triton). Root cause = sglang#20791
+   # (flashinfer GDN in-place state-pool aliasing); triton is the correct reference.
+   --sglang-linear-attn-backend triton
    --sglang-mamba-scheduler-strategy extra_buffer
 )
 
@@ -506,22 +524,57 @@ KERNEL_AGENT_ARGS=(
    --coverage-rs-factor 0.1
 )
 
-# launch the master node of ray in container
+# launch the master node of ray in container.
+# `ray start --head` intermittently fails with "node timed out during startup /
+# GCS overloaded" on these containers (GCS startup race; host is actually idle),
+# so retry with a clean slate between attempts. Override count via RAY_HEAD_START_ATTEMPTS.
 export MASTER_ADDR
-GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
-   --head \
-   --node-ip-address ${MASTER_ADDR} \
-   --port ${RAY_PORT} \
-   --dashboard-host 0.0.0.0 \
-   --dashboard-port $RAY_DASHBOARD_PORT \
-   --num-gpus 8 \
-   --disable-usage-stats \
-   --temp-dir=$RAY_TEMP_DIR
+ray_head_attempts="${RAY_HEAD_START_ATTEMPTS:-4}"
+for attempt in $(seq 1 "${ray_head_attempts}"); do
+   if GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
+      --head \
+      --node-ip-address ${MASTER_ADDR} \
+      --port ${RAY_PORT} \
+      --dashboard-host 0.0.0.0 \
+      --dashboard-port $RAY_DASHBOARD_PORT \
+      --num-gpus 8 \
+      --disable-usage-stats \
+      --temp-dir=$RAY_TEMP_DIR; then
+      echo "ray head started on attempt ${attempt}/${ray_head_attempts}"
+      break
+   fi
+   echo "ray head start failed (attempt ${attempt}/${ray_head_attempts}); cleaning up and retrying"
+   ray stop --force || true
+   pkill -9 -x gcs_server 2>/dev/null || true
+   pkill -9 -x raylet 2>/dev/null || true
+   rm -rf "${RAY_TEMP_DIR}"
+   if [[ "${attempt}" -eq "${ray_head_attempts}" ]]; then
+      echo "ray head failed to start after ${ray_head_attempts} attempts" >&2
+      exit 1
+   fi
+   sleep 5
+done
 
+worker_attempts="${RAY_WORKER_START_ATTEMPTS:-4}"
 for i in "${!REMOTE_HOSTS[@]}"; do
    echo "Starting Ray worker on ${REMOTE_HOSTS[$i]}"
-   run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
-      "GLOO_SOCKET_IFNAME=${REMOTE_GLOO_SOCKET_IFNAMES[$i]} ray start --address ${RAY_HEAD_ADDR} --num-gpus 8 --disable-usage-stats"
+   # Worker `ray start --address` hits the same intermittent "node timed out
+   # during startup / GCS overloaded" race as the head, so retry with cleanup.
+   for wattempt in $(seq 1 "${worker_attempts}"); do
+      if run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
+         "GLOO_SOCKET_IFNAME=${REMOTE_GLOO_SOCKET_IFNAMES[$i]} ray start --address ${RAY_HEAD_ADDR} --num-gpus 8 --disable-usage-stats"; then
+         echo "ray worker ${REMOTE_HOSTS[$i]} joined on attempt ${wattempt}/${worker_attempts}"
+         break
+      fi
+      echo "ray worker ${REMOTE_HOSTS[$i]} join failed (attempt ${wattempt}/${worker_attempts}); cleaning up and retrying"
+      run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
+         "ray stop --force >/dev/null 2>&1 || true; pkill -9 -x raylet 2>/dev/null || true; rm -rf /tmp/ray" || true
+      if [[ "${wattempt}" -eq "${worker_attempts}" ]]; then
+         echo "ray worker ${REMOTE_HOSTS[$i]} failed to join after ${worker_attempts} attempts" >&2
+         exit 1
+      fi
+      sleep 5
+   done
 done
 
 wait_for_cluster
