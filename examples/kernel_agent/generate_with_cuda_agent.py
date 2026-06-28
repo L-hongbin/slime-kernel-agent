@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from copy import deepcopy
 from typing import Any
@@ -88,6 +89,41 @@ def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
     if isinstance(prompt, list):
         return deepcopy(prompt)
     return [{"role": "user", "content": str(prompt)}]
+
+
+# gpt-oss (harmony) responses come back with literal channel control tokens
+# (skip_special_tokens=False), e.g.
+#   <|channel|>analysis<|message|>...<|end|><|start|>assistant<|channel|>final<|message|>ANSWER<|end|>
+# Feeding such text straight back as an assistant message crashes the harmony
+# chat template ("message containing <|channel|> tags in the content field") when
+# the NEXT turn's prompt is rendered, which aborts every multi-turn rollout. Reduce
+# the assistant turn we replay to just its final-channel answer. This is a strict
+# no-op for any response without <|channel|> (qwen / musacoder / plain markdown).
+_HARMONY_CTRL_RE = re.compile(r"<\|[^|>]*\|>")
+_HARMONY_FINAL_RE = re.compile(
+    r"<\|channel\|>final<\|message\|>(.*?)(?=<\|(?:end|return|channel|start)\|>|$)",
+    re.DOTALL,
+)
+
+
+def _sanitize_assistant_history_content(text: str) -> str:
+    """Make a generated assistant turn safe to replay through apply_chat_template.
+
+    Returns ``text`` unchanged unless it carries harmony ``<|channel|>`` control
+    tokens, in which case it returns the last final-channel message (falling back
+    to the control-token-stripped text when no final channel is present, e.g. a
+    response truncated mid-analysis).
+    """
+    if "<|channel|>" not in text:
+        return text
+    final_text = ""
+    for match in _HARMONY_FINAL_RE.finditer(text):
+        candidate = match.group(1).strip()
+        if candidate:
+            final_text = candidate  # keep the last non-empty final channel
+    if final_text:
+        return final_text
+    return _HARMONY_CTRL_RE.sub("", text).strip()
 
 
 def _get_tool_response_template(state: GenerateState) -> str:
@@ -787,7 +823,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         messages.append(
             {
                 "role": "assistant",
-                "content": response,
+                "content": _sanitize_assistant_history_content(response),
             }
         )
 
