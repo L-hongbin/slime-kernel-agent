@@ -1,0 +1,35 @@
+{# DeepSeek-V4-Flash chat template (kernel-agent eval).
+   V4-Flash ships NO HF jinja chat_template (it expects formatting via the bundled
+   encoding/encoding_dsv4.py). slime calls tokenizer.apply_chat_template, so this
+   template reproduces encode_messages() output BYTE-EXACT for plain chat:
+     - thinking 1st turn : <bos><User>{q}<Assistant><think>
+     - prior assistant   : <Assistant></think>{answer}<eos>   (reasoning dropped)
+   It self-strips prior-turn reasoning (everything up to the FIRST </think>, the
+   structural reasoning terminator) and only a TERMINAL <eos> from the replayed
+   assistant content, so the multi-turn harness can append the raw
+   skip_special_tokens=False response unchanged. No-op concern for other models:
+   this file is only loaded for the V4-Flash checkpoint.
+   Installed (auto-loaded) at: <ckpt>/chat_template.jinja. Validated byte-exact vs
+   encoding_dsv4.encode_messages for thinking/chat x {1,sys+1,2-turn,3-turn}.
+   INVARIANTS (hold in the kernel-agent loop; outside them this is NOT a general
+   encode_messages replacement): messages strictly alternate user/assistant and
+   always end with a user turn before a generation prompt. A thinking-mode response
+   truncated mid-reasoning (no </think>) is replayed verbatim as the answer (rare;
+   non-fatal degraded context). #}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- set et = enable_thinking if enable_thinking is defined else true -%}
+{%- for m in messages -%}
+  {%- if m['role'] == 'system' -%}
+    {{- m['content'] -}}
+  {%- elif m['role'] == 'user' -%}
+    {{- '<｜User｜>' + m['content'] -}}
+  {%- elif m['role'] == 'assistant' -%}
+    {%- set a = m['content'] -%}
+    {%- if '</think>' in a -%}{%- set a = a.split('</think>', 1)[-1] -%}{%- endif -%}
+    {%- if a.endswith('<｜end▁of▁sentence｜>') -%}{%- set a = a[:a.rfind('<｜end▁of▁sentence｜>')] -%}{%- endif -%}
+    {{- '<｜Assistant｜></think>' + a + '<｜end▁of▁sentence｜>' -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {%- if et -%}{{- '<｜Assistant｜><think>' -}}{%- else -%}{{- '<｜Assistant｜></think>' -}}{%- endif -%}
+{%- endif -%}
