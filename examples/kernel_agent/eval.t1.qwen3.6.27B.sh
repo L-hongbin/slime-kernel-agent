@@ -136,7 +136,8 @@ SGLANG_ARGS=(
    --sglang-speculative-num-steps 3
    --sglang-speculative-eagle-topk 1
    --sglang-speculative-num-draft-tokens 4
-   --sglang-linear-attn-backend flashinfer
+   # NOTE: do NOT use flashinfer GDN backend — it is numerically inaccurate for
+   # Qwen3.x GatedDeltaNet (see handoff/train run); omit to use the sglang default (triton).
    --sglang-mamba-scheduler-strategy extra_buffer
 )
 
