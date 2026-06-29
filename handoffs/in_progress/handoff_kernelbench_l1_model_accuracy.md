@@ -10,12 +10,12 @@
 |---|---|---|---:|---:|---:|---:|
 | Qwen3.6-27B(slime RL,kernel-agent full-async) | iter_39(HF) | tvm_ffi / 16384 / **1** / 8 | **59.75%** | **35.00%** | **5.62%** | **4.38%** |
 | **Step-3.7-Flash**(198B MoE VLM,language-only) | base(未训练) | tvm_ffi / 32768 / **3(best)** / 8 / high + MTP | **31.25%** | **18.88%** | **5.12%** | **4.12%** |
-| **gpt-oss-120b**(117B MoE,base 未训练,mxfp4) | base | tvm_ffi / 32768 / **3(best)** / 8 | **49.75%** | **39.62%** | **12.75%** | **7.75%** |
-| DeepSeek-V4-Flash(MoE,fp8) | base | tvm_ffi / 32768 / 3 / 8 | — | — | — | — |
+| **gpt-oss-120b**(117B MoE,base 未训练,mxfp4) | base @H20(TP8) | tvm_ffi / 32768 / **3(best)** / 8 | **53.87%** | **42.88%** | **14.12%** | **8.00%** |
+| **DeepSeek-V4-Flash**(MoE,fp8) | base @H20(TP4+MTP+marlin) | tvm_ffi / 32768 / **3(best)** / 8 | **86.00%** | **65.12%** | **29.12%** | **14.25%** |
 
 > **不可直接横比**:Qwen iter_39 是 **单轮**(max-turns=1);Step-3.7-Flash 与 gpt-oss-120b 是 **3 轮取最好**。turns/ctx 不同,只看绝对水平。
-> **gpt-oss-120b 口径注意**:表内为 n=800(含 144 个 wall-clock 超时 trajectory 记 0)的**保守**口径;剔除超时(分母≈656)为 compile 60.7 / correct 48.3 / fast@1.0 15.5 / fast@1.2 9.5。超时是 mxfp4 在 Ampere 上解码慢所致,非质量问题(见明细)。
-> **DeepSeek-V4-Flash 无结果**:sglang `deepseek_v4` 是 Hopper(sm90)专用,A800 跑不起来;脚本/模板/投机已就绪,待上 H20(见明细)。
+> **gpt-oss / DeepSeek 均为 H20 干净口径**:两者在 A800 都跑不动(mxfp4 / `deepseek_v4` 均需 sm90,见各自明细);DeepSeek 靠 `--moe-runner-backend marlin` 跑通。
+> **复核**:gpt-oss 与 DeepSeek 的 H20 结果经 codex(gpt-5.5,xhigh)对抗式复核,均判 **TRUSTWORTHY**(从 `eval_0.pt` dump 逐 trajectory 重算 = summary;无 correct-but-not-compiled、无空 kernel 误判、无 reference 抄答、decoy 正确剔除)。
 
 ---
 
@@ -90,57 +90,61 @@ RolloutManager 内部指标(口径与 summarize 略不同,供参考):综合分 `
 
 ## gpt-oss-120b(117B MoE,base 未训练,mxfp4)
 
-### Takeaway
-- best-of-3:**compile 49.75% / correct 39.62% / fast@1.0 12.75% / fast@1.2 7.75%**(n=800 含 abort 的保守口径)。逐轮单调上升(correct 7.0→23.0→28.75%),**多轮显著有效**。
-- 未训练基座里成绩偏高(correct best 39.62% > Step-3.7-Flash 18.88%),能产出高质量 kernel(单样本 speedup 达 **7.07×**);harmony 响应解析无问题(env 正确抽 `### CUDA_KERNELS`/`### MODEL_NEW`)。
-- **本次跑得极慢,但不影响质量数**:mxfp4 在 A800(sm80)无硬件支持,解码 ~15 token/s,致 18% trajectory 撞 50min 看门狗被记 0(压低 800 口径)。修复见下。
+### Takeaway(H20,best-of-3)
+- **compile 53.87 / correct 42.88 / fast@1.0 14.12 / fast@1.2 8.00**(node164 8×H20,TP8 单引擎,800 traj;codex gpt-5.5/xhigh 复核 **TRUSTWORTHY**)。逐轮单调上升(correct 11.1→23.8→29.8→best 42.9),多轮显著有效。
+- 未训练基座里偏高(correct best 42.9% > Step-3.7-Flash 18.88%),能产出高质量 kernel(单样本 speedup 达 7×+);harmony 响应解析无问题(env 正确抽 `### CUDA_KERNELS`/`### MODEL_NEW`)。
 
-### 精度(summarize_eval.py,800 traj = 100 题 × 8,max-turns=3;Tk 与 best 均以 800 为分母)
+### 精度(summarize_eval.py,800 traj = 100 题 × 8,max-turns=3;Tk/best 均以 800 为分母)
 
-| 指标 | T1 | T2 | T3 | best |
+| 指标 | T1 | T2 | T3 | **best** |
 |---|---:|---:|---:|---:|
-| compile | 12.88 | 33.50 | 38.88 | **49.75** |
-| correct | 7.00 | 23.00 | 28.75 | **39.62** |
-| fast@1.0 | 1.88 | 5.62 | 10.75 | **12.75** |
-| fast@1.2 | 1.62 | 3.62 | 6.50 | **7.75** |
+| compile | 17.75 | 35.50 | 41.88 | **53.87** |
+| correct | 11.12 | 23.75 | 29.75 | **42.88** |
+| fast@1.0 | 3.25 | 6.88 | 11.25 | **14.12** |
+| fast@1.2 | 2.12 | 4.00 | 6.25 | **8.00** |
 
-- **非截断口径(剔除 144 个 abort trajectory,分母≈656)**:compile 60.7 / correct 48.3 / fast@1.0 15.5 / fast@1.2 9.5。
-- RolloutManager 综合分 `eval/kb_l1_val`=**0.3225**;response_len mean 2798;reward max 2.5;470/2106 turn-sample reward>0。
+### 关键坑与修复
+- **A800 跑不动,只能上 H20**:mxfp4(4-bit)要 compute capability ≥ 9.0;A800=sm80 无 fp4 硬件,sglang 走未优化 triton mxfp4 MoE(~15 tok/s,应 100+),18% trajectory 撞 50min 看门狗记 0、拿不到干净数(Marlin 在 A800 也不行——MXFP4 Marlin 同样要 sm90)。H20 上 mxfp4 原生快、无超时,故只保留 H20 结果。
+- **必须 TP=8 单引擎**(`GPUS_PER_ENGINE=8`):脚本默认 TP=4=双引擎会触发 **harmony 编码并发加载 race**(`pyo3_runtime.PanicException: Encoder and decoder must be of equal length`,`harmony_utils.py:get_encoding`)→ 一引擎崩 → 整个 eval **挂起零产出**(不报错,易误判"在跑")。**验证 eval 真在跑要看 GPU util + decode 日志 + KernelGym total_processed**,别只看"无报错"。
+- **harmony 多轮修复(behavior-sensitive,有单测)**:响应带字面 `<|channel|>`(skip_special_tokens=False),直接回填 assistant 历史会让下轮 `apply_chat_template` 抛 `TemplateError`、结果全 0。修复 `generate_with_cuda_agent.py:_sanitize_assistant_history_content`(回填前抽 final-channel、剥 eos,非 harmony 严格 no-op);单测 `examples/kernel_agent/test/test_sanitize_harmony_history.py`。
+- **EAGLE3 可选提速**:草稿 `lmsys/EAGLE3-gpt-oss-120b-bf16`,`USE_EAGLE3=1 SPEC_DRAFT_PATH=<dir>`(脚本已加 env 门控);本次未带(求稳先拿结果)。
 
-### 已知问题与修复
-- **慢的根因 = mxfp4 在 Ampere 无优化(非配置问题)**:gpt-oss 是 mxfp4(4-bit),官方要求 compute capability ≥ 9.0(H100/B100);A800=sm80 无 fp4 硬件,sglang 用未优化的 `triton_kernels` mxfp4 MoE(启动印 `mxfp4 quantization is not fully optimized yet`),单序列 ~15 tok/s(应 100+)。**Marlin 救不了**——sglang 的 MXFP4 Marlin 同样要 sm90(`mxfp4.py`:`raise RuntimeError("MXFP4 Marlin requires Hopper/SM90 or above.")`)。
-  - **修复 = 转 bf16**:`tools/preprocess_gpt_oss.py --input <ckpt> --output <ckpt>-bf16`(反量化,数值等价、质量不变),用 **TP=8**(bf16≈240GB)跑,native bf16 张量核快 5–10×、abort 基本消失。可叠加 **EAGLE3 投机**(公开草稿 `lmsys/EAGLE3-gpt-oss-120b-bf16`,`--speculative-algorithm EAGLE3 --speculative-num-steps 3 --speculative-eagle-topk 1`)再 ~2–3×。
-- **144 个 abort 全是 wall_clock_timeout**:guard=`KERNEL_AGENT_GENERATE_GUARD_SEC`=client_timeout(2400)+task(300)+300=**3000s(50min)**;143 个跑完 2 轮卡在第 3 轮。时间 99% 花在生成(total_model_time 均值 2272s),KernelGym 仅 ~16s(env_time 中位 1.8s,p99 196s)——慢在生成,不在评测。
-- **harmony 多轮修复(behavior-sensitive,已加单测)**:gpt-oss 响应带字面 `<|channel|>`(skip_special_tokens=False),直接回填 assistant 历史会让下一轮 `apply_chat_template` 抛 `TemplateError`、每个样本第 2 轮崩、结果全 0。修复 `generate_with_cuda_agent.py:_sanitize_assistant_history_content`(回填前抽 final-channel、剥 eos,非 harmony 为严格 no-op);单测 `examples/kernel_agent/test/test_sanitize_harmony_history.py`(10 例,过 codex review)。
-- **EAGLE3 本次未启用(疏漏)**:误判 gpt-oss 无草稿而删了投机;实际有公开 EAGLE3 草稿(见上),应启用。
-
-### 复现配置
-- 脚本:`examples/kernel_agent/eval.gpt-oss-120b.sh`;模型 args `scripts/models/gpt-oss-120b.sh`(`--debug-rollout-only` 下仅解析、不建 Megatron)。
-- 运行:**.22(192.168.16.22)**,8×A800-80G,本次**单引擎 TP=8**(脚本现默认 TP=4——mxfp4 仅 ~63GB;**若改 bf16 必须回 TP=8**);KernelGym 在 **.21(192.168.16.21:20111,tvm_ffi)**;gloo iface `ens22f0np0`;loopback notify 网关在 .53。
-- 关键参数:`ctx=resp=32768`、`max-turns=3`、`n=8`、`enable_thinking`(gpt-oss 忽略 → 默认 medium reasoning);去掉 Qwen 专属 sglang flag(EAGLE/linear-attn/mamba)。
-
-<!-- 评测产物(.22, root): experiments/Eval.TVMFFI.gpt-oss-120b.gpt-oss-120b.ctx32768.resp32768.turn3.n8/gpt-oss-120b/{summary.manual.txt, 20260627.040957.log, dumps/rollout_data/eval_0.pt}
-     分析快照(.53): /nfs/FM/chenshuailin/tmp_eval_preflight/{gptoss_summary.txt, gptoss_samples.txt, abort_*.py} -->
+### 复现(H20)
+- 脚本 `examples/kernel_agent/eval.gpt-oss-120b.sh` + 模型 args `scripts/models/gpt-oss-120b.sh`(`--debug-rollout-only` 仅解析、不建 Megatron)。
+- node164 8×H20,TP8 单引擎;env `MASTER_ADDR=10.11.2.164 KERNEL_ENV_URL=http://127.0.0.1:20211 LOCAL_GLOO_SOCKET_IFNAME=bond0 GPUS_PER_ENGINE=8`;`ctx=resp=32768`、`max-turns=3`、`n=8`。
+- **reasoning_effort = medium(默认)**:脚本传的 `enable_thinking=true` 被 gpt-oss harmony 模板**忽略**(它只读 `reasoning_effort`,未设则默认 `medium`,见 `chat_template.jinja:203-206`)。即本结果是 **medium effort**,非 high;跑 high 需 `--apply-chat-template-kwargs '{"reasoning_effort":"high"}'`,数值大概率更高。
+- 产物 `experiments/Eval.TVMFFI.gpt-oss-120b.gpt-oss-120b.ctx32768.resp32768.turn3.n8/gpt-oss-120b/summary.20260628.111822.txt`(node164)。
 
 ---
 
-## DeepSeek-V4-Flash(MoE,fp8)— 无结果:.22(A800)跑不了,需 Hopper
+## DeepSeek-V4-Flash(MoE,fp8)— H20 marlin 跑通(2026-06-28,node164,8×H20/sm90)
 
-### 结论
-sglang 的 `deepseek_v4` 实现是 **Hopper(sm90)专用**,在 A800(sm80)上无法启动。两道硬件墙:
+### Takeaway
+**KernelBench-L1 最强未训练基座**:best-of-3 **compile 86.0 / correct 65.1 / fast@1.0 29.1 / fast@1.2 14.25**,大幅领先 gpt-oss-120b(53.9/42.9/14.1/8.0)。逐轮单调上升(correct 27→37.5→48.75→best 65.1),多轮极有效。MTP 投机生效(accept rate ~0.5,gen ~1600 tok/s)。
 
-| 墙 | 位置 | 能否在 Ampere 绕过 |
-|---|---|---|
-| MoE top-k 簇 kernel(`__cluster_dims__`/`this_cluster`) | `jit_kernel/csrc/deepseek_v4/topk_v2.cuh` | **能**:env `SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0` / `SGLANG_OPT_USE_TOPK_V2=0` 走非簇回退 |
-| DeepGEMM HC-prenorm GEMM(V4 hash-compress 层) | `deepseek_v4.py` hc_pre→`mhc.py` mhc_pre→`tf32_hc_prenorm_gemm`(DeepGEMM,sm90-only) | **不能**:cuda graph 捕获即崩 |
+### 精度(summarize_eval.py,800 traj = 100 题 × 8,max-turns=3;Tk 与 best 均以 800 为分母)
 
-> mxfp4/fp8 的 Hopper 依赖是 V4 的设计内核,非配置问题。`deep_gemm` 包能 import,但其 kernel 仅 sm90。
+| 指标 | T1 | T2 | T3 | **best** |
+|---|---:|---:|---:|---:|
+| compile | 39.00 | 64.75 | 75.88 | **86.00** |
+| correct | 27.00 | 37.50 | 48.75 | **65.12** |
+| fast@1.0 | 8.25 | 14.25 | 23.25 | **29.12** |
+| fast@1.2 | 5.50 | 6.62 | 12.12 | **14.25** |
 
-### 已就绪(只差 Hopper 硬件)
-- **chat template**:V4 checkpoint 不带 jinja chat_template(只有 `encoding/encoding_dsv4.py`),手写模板与官方 `encode_messages` **逐字节一致**,装到 `<ckpt>/chat_template.jinja`(AutoTokenizer 自动加载);仓库副本 `examples/kernel_agent/prompt_config/deepseek_v4_chat_template.jinja`,单测 `test/test_deepseek_v4_chat_template.py`(15 例,过 codex review)。多轮历史由模板自剥 reasoning+eos,不动 harness、不影响其他模型。
-- **eval 脚本** `examples/kernel_agent/eval.deepseek-v4-flash.sh`:TP=4(fp8 权重约 147GB,实测 ~37GB/卡,fp8 不解包);**MTP 投机已开**(EAGLE 3/1/4,源码核实:V4 hook 要求 algo==EAGLE 字面、topk==1、num-steps 显式,draft 从主 ckpt 自动加载、**无需 draft path**);`AMPERE_TOPK_FALLBACK=1` 控制 topk env 回退(上 H20 设 0)。
-- **下一步(待用户定)**:在 H20(Hopper,如 `10.11.2.x-H20`)节点重跑;确认 KernelGym(.21:20111)从 H20 可达,或在 H20 侧另起 KernelGym。
+### 修复:默认 triton MoE 后端 → marlin(关键)
+- **症状**:默认(triton fused_moe)在 V4 fp8 上 sglang 启动即崩 `AssertionError: Hidden size mismatch`(`triton_utils/fused_moe.py:fused_experts_impl` 的 `hidden_states.shape[1] == w1.shape[2] - padded_size` 断言,在 cuda-graph 捕获/forward 处)。**MTP-off / TP=4 / TP=8 / eager(--disable-cuda-graph)全崩**——非 TP/投机/graph 问题,是默认 triton MoE 与 V4 fp8 权重形状不兼容。
+- **解**:`--sglang-moe-runner-backend marlin`(sglang cookbook 官方 DeepSeek-V4 部署参数;Hopper 上 V4 原始 FP4 走 W4A16 Marlin MoE kernel)。脚本 `eval.deepseek-v4-flash.sh` 已加 `MOE_RUNNER_BACKEND` env 门控(`MOE_RUNNER_BACKEND=marlin`)。
+- **复现**:`MASTER_ADDR=10.11.2.164 KERNEL_ENV_URL=http://127.0.0.1:20211 LOCAL_GLOO_SOCKET_IFNAME=bond0 AMPERE_TOPK_FALLBACK=0 MOE_RUNNER_BACKEND=marlin bash examples/kernel_agent/eval.deepseek-v4-flash.sh`(TP4+MTP)。产物 `experiments/Eval.TVMFFI.deepseek-v4-flash.DeepSeek-V4-Flash.ctx32768.resp32768.turn3.n8/DeepSeek-V4-Flash/summary.20260628.123236.txt`(node164)。
+- **DeepGEMM JIT 慢**:V4 hash-compress 的 `TF32_HC_PRENORM_GEMM` 每个新 GEMM shape 现编(10-20min),首跑 ETA ~2h、shape 缓存后 ~1h。可选 `sglang.compile_deep_gemm` 预编译。
+- **多 eval 互斥坑(已踩)**:Qwen iter-eval 流水线 `eval.t1.*.sh` 启动时 `ray stop --force` 会**误杀**同机正在跑的 deepseek eval(首跑被 iter139 杀在 7/800)。新模型 eval 必须与 Qwen eval **串行**,用 `/tmp/eval164.busy` 锁(Qwen 监控见锁让步),且全程持锁防中途插入。
 
-<!-- 失败证据(.53): /nfs/FM/chenshuailin/tmp_eval_preflight/deepseek.launch{,.v2}.log(topk_v2 sm90 报错 / DeepGEMM NameError 全栈) -->
+### A800 跑不了(只能 H20)
+sglang 的 `deepseek_v4` 是 **Hopper(sm90)专用**:MoE top-k 簇 kernel(`topk_v2.cuh` 的 `__cluster_dims__`)+ DeepGEMM HC-prenorm GEMM(`tf32_hc_prenorm_gemm`,V4 hash-compress 层)都要 sm90,在 A800(sm80)上 cuda graph 捕获即崩。(topk 可用 `AMPERE_TOPK_FALLBACK=1` 走非簇回退,但 DeepGEMM 那道墙绕不过。)
+
+### 配置要点
+- **chat template**:V4 不带 jinja chat_template,手写模板与官方 `encode_messages` **逐字节一致**,需装到 `<ckpt>/chat_template.jinja`(AutoTokenizer 自动加载);仓库副本 `examples/kernel_agent/prompt_config/deepseek_v4_chat_template.jinja`,单测 `test/test_deepseek_v4_chat_template.py`(过 codex review;本次 eval 经 codex 复核确认字节匹配)。
+- **MTP 投机**:`USE_MTP_SPEC=1`(默认开,EAGLE 3/1/4,draft 从主 ckpt 自动加载、无需 draft path);lossless,只提速。
+- **thinking = ON**:`enable_thinking=true` → 模板 emit `<think>`(`chat_template.jinja:20,34`);DeepSeek 无 low/med/high 分级,只 on/off,本结果是 thinking-on。与 gpt-oss 的 medium effort **不在同一轴,不可直接横比 effort**。
+- **H20 覆盖**:`AMPERE_TOPK_FALLBACK=0`(非 Ampere)、TP=4(fp8 ~37GB/卡)。
 
 <!-- 名词:trajectory = 一个 (题, sample) 的完整多轮轨迹;turn = agent 的一轮生成+评测。 -->

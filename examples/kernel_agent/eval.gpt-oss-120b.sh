@@ -1,9 +1,10 @@
 #!/bin/bash
 # Eval gpt-oss-120b on the KernelBench-L1 TVM-FFI agent harness (sglang-only,
-# --debug-rollout-only). Rollout runs on .22 (8x A800-80G); KernelGym already up
-# on .21 (http://192.168.16.21:20111). Megatron is never built in this mode; the
-# sourced model config is parsed only. sglang loads the HF mxfp4 checkpoint and
-# auto-detects quantization.
+# --debug-rollout-only). Defaults reproduce the eval-of-record on node164
+# (8x H20/sm90, TP=8 single engine), KernelGym at 127.0.0.1:20211. mxfp4 runs
+# native on H20 (no Ampere fp4-emulation slowdown). Megatron is never built in
+# this mode; the sourced model config is parsed only. sglang loads the HF mxfp4
+# checkpoint and auto-detects quantization.
 
 set -Eeo pipefail
 trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
@@ -30,36 +31,36 @@ if [[ ! -f "${EVAL_DATA}" ]]; then
    exit 1
 fi
 
-KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://192.168.16.21:20111}"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://127.0.0.1:20211}"
 KERNEL_BACKEND="${KERNEL_BACKEND:-tvm_ffi}"
 REFERENCE_BACKEND="${REFERENCE_BACKEND:-torch}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-8}"
 MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-32768}"
 MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-32768}"
 MAX_TURNS="${MAX_TURNS:-3}"
-# TP=4 -> two engines on 8 GPUs. gpt-oss-120b is native mxfp4 (w4a16) and sglang
-# keeps the weights packed on A800 (triton_kernels MOE, ~11GB/GPU at TP=8 observed),
-# so ~16GB/GPU at TP=4 leaves ample room for the 32k-ctx KV cache while giving 2x
-# rollout concurrency. (The first run used TP=8 out of caution before confirming
-# mxfp4 stays packed.)
-GPUS_PER_ENGINE="${GPUS_PER_ENGINE:-4}"
+# TP=8 single engine (REQUIRED). TP=4 (two engines) hits a harmony-encoding
+# concurrent-load race (pyo3 PanicException "Encoder and decoder must be of equal
+# length" in harmony_utils.get_encoding) that crashes one engine and hangs the
+# whole eval with zero output (no error exit). One engine = one harmony load = no
+# race. mxfp4 is ~63GB so TP=8 has ample room for the 32k-ctx KV cache.
+GPUS_PER_ENGINE="${GPUS_PER_ENGINE:-8}"
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-64}"
 SGLANG_WATCHDOG_TIMEOUT="${SGLANG_WATCHDOG_TIMEOUT:-2400}"
 ROUTER_QUEUE_TIMEOUT_SECS="${ROUTER_QUEUE_TIMEOUT_SECS:-2400}"
 SGLANG_MEM_FRACTION_STATIC="${SGLANG_MEM_FRACTION_STATIC:-0.85}"
 
-MASTER_ADDR="${MASTER_ADDR:-192.168.16.22}"
+MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_PORT="${RAY_PORT:-6379}"
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray}"
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
-# .22 has no `ip` cmd; ens22f0np0 holds 192.168.16.22.
-LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-ens22f0np0}"
+# node164 (head) holds MASTER_ADDR on bond0; gloo needs that iface.
+LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-bond0}"
 
-# Bypass the cluster proxy for loopback + in-cluster traffic (KernelGym on .21).
-export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR},192.168.16.21"
+# Bypass the cluster proxy for loopback + in-cluster traffic (KernelGym on loopback).
+export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 
@@ -158,6 +159,23 @@ SGLANG_ARGS=(
    --sglang-watchdog-timeout "${SGLANG_WATCHDOG_TIMEOUT}"
 )
 
+# Optional EAGLE3 speculative decoding. gpt-oss-120b has a public EAGLE3 draft
+# (lmsys/EAGLE3-gpt-oss-120b-bf16); pass USE_EAGLE3=1 SPEC_DRAFT_PATH=<draft dir>.
+# Lossless: only speeds up decode. On H20 mxfp4 is already native-fast, so this
+# is a bonus, not required; if it fails to load, rerun with USE_EAGLE3=0.
+USE_EAGLE3="${USE_EAGLE3:-0}"
+SPEC_DRAFT_PATH="${SPEC_DRAFT_PATH:-}"
+if [[ "${USE_EAGLE3}" == "1" ]]; then
+   SGLANG_ARGS+=(
+      --sglang-speculative-algorithm EAGLE3
+      --sglang-speculative-num-steps "${SPEC_NUM_STEPS:-3}"
+      --sglang-speculative-eagle-topk "${SPEC_EAGLE_TOPK:-1}"
+      --sglang-speculative-num-draft-tokens "${SPEC_NUM_DRAFT_TOKENS:-4}"
+   )
+   [[ -n "${SPEC_DRAFT_PATH}" ]] && SGLANG_ARGS+=(--sglang-speculative-draft-model-path "${SPEC_DRAFT_PATH}")
+   echo "EAGLE3 speculative: draft=${SPEC_DRAFT_PATH:-<none>}"
+fi
+
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
@@ -176,7 +194,7 @@ GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
    --disable-usage-stats \
    --temp-dir="${RAY_TEMP_DIR}"
 
-NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR},192.168.16.21"
+NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR}"
 RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 {
   "env_vars": {

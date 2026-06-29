@@ -1,9 +1,11 @@
 #!/bin/bash
 # Eval DeepSeek-V4-Flash on the KernelBench-L1 TVM-FFI agent harness (sglang-only,
-# --debug-rollout-only). Rollout runs on .22 (8x A800-80G); KernelGym already up
-# on .21 (http://192.168.16.21:20111). Megatron is never built in this mode; the
-# sourced model config is parsed only. sglang loads the HF fp8 checkpoint and
-# auto-detects quantization.
+# --debug-rollout-only). Defaults reproduce the eval-of-record on node164
+# (8x H20/sm90, TP=4), KernelGym at 127.0.0.1:20211. REQUIRES Hopper (sm90): the
+# deepseek_v4 MoE top-k cluster kernel + DeepGEMM HC-prenorm GEMM are sm90-only,
+# and the default triton MoE runner crashes on V4 fp8 ("Hidden size mismatch") so
+# we force `--moe-runner-backend marlin`. Megatron is never built in this mode;
+# the sourced model config is parsed only. sglang loads the HF fp8 checkpoint.
 
 set -Eeo pipefail
 trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
@@ -24,13 +26,21 @@ if [[ ! -f "${HF_MODEL_PATH}/config.json" ]]; then
    exit 1
 fi
 
+# DeepSeek-V4 ships no jinja chat_template; install the repo's byte-exact one so a
+# default run reproduces the eval (AutoTokenizer auto-loads <ckpt>/chat_template.jinja).
+DSV4_CHAT_TEMPLATE="${SCRIPT_DIR}/prompt_config/deepseek_v4_chat_template.jinja"
+if [[ ! -s "${HF_MODEL_PATH}/chat_template.jinja" && -f "${DSV4_CHAT_TEMPLATE}" ]]; then
+   cp "${DSV4_CHAT_TEMPLATE}" "${HF_MODEL_PATH}/chat_template.jinja"
+   echo "installed chat_template.jinja -> ${HF_MODEL_PATH}/chat_template.jinja"
+fi
+
 EVAL_DATA="${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}"
 if [[ ! -f "${EVAL_DATA}" ]]; then
    echo "EVAL_DATA does not exist: ${EVAL_DATA}" >&2
    exit 1
 fi
 
-KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://192.168.16.21:20111}"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://127.0.0.1:20211}"
 KERNEL_BACKEND="${KERNEL_BACKEND:-tvm_ffi}"
 REFERENCE_BACKEND="${REFERENCE_BACKEND:-torch}"
 N_SAMPLES_PER_EVAL_PROMPT="${N_SAMPLES_PER_EVAL_PROMPT:-8}"
@@ -41,8 +51,8 @@ MAX_TURNS="${MAX_TURNS:-3}"
 # (no native fp8 on sm80) sglang dequantizes to bf16 (~110GB), which fits in TP=4
 # (4x80=320GB) with ample headroom for 32k ctx, while giving 2x rollout concurrency.
 GPUS_PER_ENGINE="${GPUS_PER_ENGINE:-4}"
-# Conservative for the first-ever deepseek_v4 fp8+MTP run on A800 (dequant memory
-# is uncertain; bump after confirming headroom). cuda-graph-max-bs follows this.
+# Conservative max batch for V4 fp8+MTP; bump after confirming headroom.
+# cuda-graph-max-bs follows this.
 SGLANG_MAX_RUNNING_REQUESTS="${SGLANG_MAX_RUNNING_REQUESTS:-32}"
 SGLANG_WATCHDOG_TIMEOUT="${SGLANG_WATCHDOG_TIMEOUT:-2400}"
 ROUTER_QUEUE_TIMEOUT_SECS="${ROUTER_QUEUE_TIMEOUT_SECS:-2400}"
@@ -63,18 +73,23 @@ SPEC_EAGLE_TOPK="${SPEC_EAGLE_TOPK:-1}"
 SPEC_NUM_DRAFT_TOKENS="${SPEC_NUM_DRAFT_TOKENS:-4}"
 SPEC_DRAFT_PATH="${SPEC_DRAFT_PATH:-}"
 
-MASTER_ADDR="${MASTER_ADDR:-192.168.16.22}"
+# MoE runner backend. The default (triton fused_moe) crashes on V4 fp8 with
+# AssertionError "Hidden size mismatch" (TP4/TP8/eager all fail); marlin (W4A16
+# MoE, the sglang DeepSeek-V4 cookbook backend, Hopper-only) is required.
+MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-marlin}"
+
+MASTER_ADDR="${MASTER_ADDR:-10.11.2.164}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-64}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
 RAY_PORT="${RAY_PORT:-6379}"
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray}"
 NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-^lo,docker0}"
-# .22 has no `ip` cmd; ens22f0np0 holds 192.168.16.22.
-LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-ens22f0np0}"
+# node164 (head) holds MASTER_ADDR on bond0; gloo needs that iface.
+LOCAL_GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME:-bond0}"
 
-# Bypass the cluster proxy for loopback + in-cluster traffic (KernelGym on .21).
-export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR},192.168.16.21"
+# Bypass the cluster proxy for loopback + in-cluster traffic (KernelGym on loopback).
+export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR}"
 export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 
@@ -171,6 +186,7 @@ SGLANG_ARGS=(
    --sglang-cuda-graph-max-bs "${SGLANG_MAX_RUNNING_REQUESTS}"
    --sglang-disable-custom-all-reduce
    --sglang-watchdog-timeout "${SGLANG_WATCHDOG_TIMEOUT}"
+   ${MOE_RUNNER_BACKEND:+--sglang-moe-runner-backend ${MOE_RUNNER_BACKEND}}
 )
 
 if [[ "${USE_MTP_SPEC}" == "1" ]]; then
@@ -204,12 +220,13 @@ GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
    --disable-usage-stats \
    --temp-dir="${RAY_TEMP_DIR}"
 
-NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR},192.168.16.21"
-# A800 (sm80) cannot compile the deepseek_v4 Hopper MoE top-k JIT kernel
-# (topk_v2.cuh uses __cluster_dims__ / cooperative_groups::this_cluster, sm90-only),
-# which crashes cuda-graph capture. Force the non-cluster fallback top-k path.
-# Set AMPERE_TOPK_FALLBACK=0 when running on Hopper (H20/H100/H200).
-AMPERE_TOPK_FALLBACK="${AMPERE_TOPK_FALLBACK:-1}"
+NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR}"
+# Default 0 for Hopper (H20/H100/H200): use the native sm90 cluster top-k kernel.
+# On Ampere (sm80, e.g. A800) the deepseek_v4 top-k JIT kernel (topk_v2.cuh uses
+# __cluster_dims__ / cooperative_groups::this_cluster, sm90-only) crashes cuda-graph
+# capture — set AMPERE_TOPK_FALLBACK=1 there to force the non-cluster fallback path
+# (but the sm90-only DeepGEMM HC-prenorm GEMM still won't run on Ampere).
+AMPERE_TOPK_FALLBACK="${AMPERE_TOPK_FALLBACK:-0}"
 if [[ "${AMPERE_TOPK_FALLBACK}" == "1" ]]; then
    TOPK_ENV='"SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK": "0", "SGLANG_OPT_USE_TOPK_V2": "0", "SGLANG_OPT_USE_FUSED_HASH_TOPK": "0",'
 else
