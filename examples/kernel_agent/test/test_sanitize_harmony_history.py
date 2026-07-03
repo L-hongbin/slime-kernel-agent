@@ -65,10 +65,7 @@ def test_passthrough_variants(text):
 
 def test_multiple_finals_last_empty_keeps_last_nonempty():
     # A trailing empty final must not blow away the real answer.
-    text = (
-        "<|channel|>final<|message|>GOOD<|end|>"
-        "<|start|>assistant<|channel|>final<|message|>   <|end|>"
-    )
+    text = "<|channel|>final<|message|>GOOD<|end|>" "<|start|>assistant<|channel|>final<|message|>   <|end|>"
     assert sanitize(text) == "GOOD"
 
 

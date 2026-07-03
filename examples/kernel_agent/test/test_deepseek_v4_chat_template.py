@@ -15,7 +15,6 @@ Two layers:
                  message shapes, and assert the deployed copy matches the repo copy.
 """
 
-import os
 from pathlib import Path
 
 import pytest
@@ -38,9 +37,7 @@ def _render(messages, add_generation_prompt=True, **kwargs):
     """Render the template the way transformers' apply_chat_template does."""
     src = TEMPLATE_PATH.read_text()
     env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True)
-    return env.from_string(src).render(
-        messages=messages, add_generation_prompt=add_generation_prompt, **kwargs
-    )
+    return env.from_string(src).render(messages=messages, add_generation_prompt=add_generation_prompt, **kwargs)
 
 
 U = {"role": "user", "content": "Q1"}
@@ -50,6 +47,7 @@ S = {"role": "system", "content": "SYS"}
 
 
 # ----------------------------- hermetic layer -----------------------------
+
 
 def test_thinking_single_user():
     assert _render([U], enable_thinking=True) == f"{BOS}{USER}Q1{ASSIST}<think>"
@@ -128,13 +126,15 @@ def test_clean_answer_without_markers_unchanged():
 def test_three_turns_with_raw_sglang_style_responses():
     r1 = f"reasoning one</think>ANS1{EOS}"
     r2 = f"reasoning two</think>ANS2{EOS}"
-    msgs = [U, {"role": "assistant", "content": r1}, F,
-            {"role": "assistant", "content": r2}, {"role": "user", "content": "FB2"}]
+    msgs = [
+        U,
+        {"role": "assistant", "content": r1},
+        F,
+        {"role": "assistant", "content": r2},
+        {"role": "user", "content": "FB2"},
+    ]
     got = _render(msgs, enable_thinking=True)
-    expected = (
-        f"{BOS}{USER}Q1{ASSIST}</think>ANS1{EOS}{USER}FB1"
-        f"{ASSIST}</think>ANS2{EOS}{USER}FB2{ASSIST}<think>"
-    )
+    expected = f"{BOS}{USER}Q1{ASSIST}</think>ANS1{EOS}{USER}FB1" f"{ASSIST}</think>ANS2{EOS}{USER}FB2{ASSIST}<think>"
     assert got == expected
 
 
@@ -178,7 +178,5 @@ def test_byte_exact_against_official_encoder():
     for thinking, mode in [(True, "thinking"), (False, "chat")]:
         for msgs in shapes:
             ref = E.encode_messages([dict(m) for m in msgs], thinking_mode=mode)
-            got = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=thinking
-            )
+            got = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True, enable_thinking=thinking)
             assert ref == got, f"mismatch thinking={thinking} shape_len={len(msgs)}\nREF={ref!r}\nGOT={got!r}"
