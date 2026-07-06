@@ -12,12 +12,25 @@
 
 两种格式不兼容。如果直接把 MusaCoder 放进原先pipeline评测，很多样本会在格式校验或 binding 阶段失败。这不是模型能力本身的问题，而是输出格式不匹配
 
-## Takeaway
+## Takeaway（总览，2026-07-05 定稿）
 
-- `TF32 + 1e-4` 会低估 MusaCoder；关闭 TF32 后，pybind 一段式 correctness 从 **61.25%** 回到 **87.38%**
-- correctness 应关闭 TF32、保持 `1e-4`；performance/profile 再恢复 PyTorch 默认 TF32 路径
-- 反直觉：模型没有跨输出风格泛化，反而跨binding方法泛化
- 
+**定论数字**（均为 load_inline、TF32-off correctness、denom 见各自括注；"干净复测/t600"均已修复已知 harness bug）：
+
+| Level | T1 correct | best-by-turn correct | 官方单轮 | 缺口归因（一句话） |
+|---|---:|---:|---:|---|
+| L1（`mt3_largeshape`） | 86.50%（691/800） | 96.50%（772/800） | 95.75%（推测，未完全核实） | 主要是真实模型硬错（scan/转置matmul等），shape/harness 因素已排除 |
+| L2（新shape，`mt3_level2_t600`） | **68.00%**（544/800） | **92.50%**（740/800） | **92.88%** | tolerance 口径（1e-4 vs 1e-2）+ BatchNorm train/eval 陷阱 + 少量真实模型硬错（LayerNorm 陷阱等），三者叠加仍留 ~12-18pt |
+| L2（旧shape，`t1_level2_oldshape`，干净重新生成） | 72.25%（@1e-4）/ 74.88%（@1e-2） | - | 92.88% | 同上；证实 shape 不是主因，残余缺口与新shape一致 |
+| L3（`mt3_level3_t600`） | **24.50%**（98/400） | **54.50%**（218/400） | **65.75%** | BatchNorm 密度更高（19/50 题）导致 T1 硬性归零（0/152）+ 更高比例的真实模型硬错（完整模型比单算子/融合算子难得多），缺口 ~41pt，远大于 L2 |
+
+- **L2/L3 的缺口结构相似但量级不同**：两级都确认 tolerance、shape、编译预算等 harness 参数已经调到能调的极限，残余缺口是模型在我们 prompt+harness 组合下的真实能力边界，主因是 BatchNorm train/eval 语义陷阱（模型系统性按推理期语义写 BN，harness 按 KernelBench 官方约定的 train 语义打分，二者必然不 match）——L3 由于是完整模型、BN 层层堆叠，这个陷阱几乎是 T1 的死刑（0%），比 L2 单算子融合题的 5.7% 严重得多。**没有 MooreThreads 的确切 prompt、也不能排除官方在自家 MUSA 硬件/工具链上评测**，两者都可能是缺口的一部分，且都无法被我们进一步验证或证伪。
+- **harness 教训清单**（本轮调查定位、量化、（部分）修复的问题，供后续复用）：
+  0. **correctness 必须关闭 TF32，同时保持 `1e-4`**（本项目最早的发现，细节见下文"问题根源：精度口径对比"）：Ampere+ GPU 上 cuDNN conv 默认启用 TF32，reference 若不关闭会引入 ~3e-4 量级噪声，超过 `1e-4` 容差；关闭 TF32 后 L1 pybind 一段式 correctness 从 61.25% 回到 87.38%。correctness 与 performance/profile 口径要解耦（后者恢复默认 TF32）。
+  1. **编译+执行超时预算不能只按 nvcc 编译时间估**：300s 是整个任务（编译+correctness 执行）的墙钟；融合/复杂 kernel 编译中位数就要 90-150s，朴素实现的执行阶段可能另需数百秒，二者相加轻松超支，系统性误伤"其实是对的"kernel。L2/L3 均已提到 600s 并验证大幅回收（L2 94.00%→98.75% compile；L3 隔离重跑 89.7%/71.2% 转编译且正确）。
+  2. **BatchNorm train/eval 是 KernelBench 官方约定，不是我们的 bug，但是模型的系统性盲点**：harness 从不对 reference 调 `.eval()`（官方 fork 与我们一致），模型倾向按"推理期"语义（读 running stats）写 BN，二者必然 mismatch。多轮反馈能部分修复（L3 观察到 BN 题 best-by-turn 从 0%→59.87%，甚至超过非BN题的提升），但 T1 单轮口径下无解。
+  3. **依赖完整性**：reward server venv 缺 `einops` 导致 Mamba2 类题目 100% 报 "cannot unpack non-iterable NoneType"（`loading.py` 在 `exec()` 失败时返回裸 `None` 掩盖了真实异常）——任何引用非标准依赖的 reference 题目都可能撞到同类问题，建议长期让 venv 依赖与 KernelBench 题库要求的 import 保持同步核对。
+  4. **服务端校验器应该验证"会被编译的代码"，不是"原始响应"**：100KB 长度校验卡在退化/截断生成的推理文字上，不是真实代码体积，且遗留证据显示 400 拒绝会拖累后续轮次恢复率（L3-t600：17 个有后续轮次的 400 样本只 1 个转正确）——这是仍未修的已知 caveat。
+  5. **多轮 trajectory 的墙钟 guard 必须与"部分完成数据是否保留"解耦**：3000s 累计 guard 用 `asyncio.timeout` 硬中断协程，把已经算好但还没来得及返回的 T1/T2 数据一起丢弃（真正的 bug 在 `_generate_impl` 把中间结果存在局部变量、`_abort_result` 只合成一条占位记录）。当前的应对是把 guard 放宽到 10800s（3小时/trajectory）让它基本不触发，这是**规避（workaround），不是修复**——数据丢失的根因代码路径仍未改动，重跑时长墙钟策略不适用的场景（比如更慢的模型/硬件）应重新评估。
 
 # 问题根源：精度口径对比
 
@@ -433,3 +446,323 @@ best-by-turn correct=96.50% → **28 条 trajectory 3 轮都没做对**，且**�
 - **多轮 feedback 对"真算法/数值硬错"帮助有限**：50%（14 条）是编译通过但结果错，3 轮迭代没能修正（转置卷积语义、scan、loss reduce 等）。
 - **25%（7 条）是大 shape 的 int32 索引溢出**（pid45/100），属实现缺陷、非 infra 假失败（已与 cannot-open 区分）。
 - **25%（7 条）3 轮都没编译过**（pid68/97）。 -->
+
+# Level2 测试结果与错题分析
+
+## 1. 结果总表
+100 题 × 8 samples，load_inline、大 shape、TF32-off、tolerance 1e-4、max-turns=3
+
+<!-- 定稿口径 = `mt3_level2_t600`（600s task 预算 + 10800s trajectory guard，0 条记录缺失；300s 原始跑保留作对照）： -->
+
+| 指标 | T1 | T2 | T3 | best | official |
+|---|---:|---:|---:|---:|---:|
+| correct | 68.00% | 68.75% | 67.00% | 92.50% | 92.88% |
+| compile | 98.75% | 96.38% | 95.12% | 100.00% | - |
+| fast@1.0 | 0.88% | 1.50% | 3.12% | 3.75% | - |
+<!-- | correct（300s 原始跑，对照） | 64.12% | 65.38% | 64.12% | 89.38% | 92.88% | -->
+
+<!-- - **与官方可比的口径是 T1**（单轮，无反馈）：68.00% vs 92.88%，缺口 ~25pt；缺口调查与归因见第 3 节。
+- best-by-turn 92.50% 与官方 92.88% 数值接近属巧合观察（best-by-turn ≈ pass@3，不是官方的单轮统计量），不作推论（详见"五"节）。
+- per-turn 特征：T2/T3 与 T1 基本持平（模型在已正确后继续"优化"常把正确性改崩，与 L1 结论一致），多轮的价值体现在 best-by-turn（+24.5pt）。 -->
+
+## 2. 错题分布
+T1，800 样本中失败 256 个
+
+| 失败类别 | 数量 | 占 800 | 机制归因 |
+|---|---:|---:|---|
+| output_mismatch（真数值错，max_diff>1e-2） | 160 | 20.0% | **74 个（46%）来自 11 道 BatchNorm 题**（train/eval 语义陷阱，见"一"节）；其余 86 个为真实实现错，集中在 pid3/34（LayerNorm 轴陷阱，见"三"节）、pid28（BMM_InstanceNorm）等 |
+| near_miss（1e-4<max_diff≤1e-2） | 48 | 6.0% | 容差敏感：大规模 fp32 归约换序/精度漂移（pid14/19/18/54）+ dropout 随机性（pid66）；官方旧口径 1e-2 下全部计正确 |
+| shape_mismatch | 22 | 2.75% | 输出尺寸公式算错，集中 pid75（5/8） |
+| runtime_exception（forward 异常） | 16 | 2.0% | wrapper 参数/launch 逻辑错，分散 |
+| compile_fail（真编译错） | 6 | 0.75% | 300s 跑的 48 个"未编译"在 600s 下只剩 6 个真语法错——绝大多数原属预算误伤（见"二"节） |
+| task_timeout（600s 仍超时） | 3 | 0.4% | 极慢 kernel 残留（pid100/32） |
+| http400（>100KB 退化响应被拒） | 1 | 0.1% | 无有效代码的退化生成，等价 0 分 |
+
+<!-- **T1 全错（0/8）的 12 道题**：8 道 BatchNorm（pid 11/15/41/72/73/77/84/97）+ LayerNorm 轴陷阱（pid3）+ fp32 归约换序（pid14）+ dropout 结构性不可解（pid66）+ BMM_InstanceNorm（pid28）。 -->
+
+<!-- **best-by-turn 后仍失败的 60 条 trajectory（26 题）**：pid14（8/8——数学等价化简但 fp32 求和顺序不同，反馈无法修复这类"实现对、数值口径不同"的错）、pid66（8/8——train-mode 随机 dropout 结构性不可 match）、pid34（6/8）/pid3（2/8）LayerNorm 陷阱，其余散布（每题 1-3 条）。结构与 L1 一致：**多轮反馈能修语法/接口/多数语义错，修不动数值口径类与结构性不可解类**。 -->
+
+<!-- > 300s 原始跑的同类错题分布（逐机制的完整论证、0/8 归因总表与直方图口径）另见独立 handoff：`musacoder_l2_turn1_error_analysis.md`。 -->
+
+## 3. 与官方 92.88% 的差距分析
+<!-- （历史：基于 300s 原始跑展开；结论对 t600 同样成立） -->
+
+<!-- 单轮 T1 与官方缺口 ~25pt（t600）/ ~29pt（300s 时）。调查结论：**缺口不是单一原因，也不能靠 harness 参数关掉**——(1) tolerance 口径（现行 1e-4 vs 旧 1e-2）、(2) BatchNorm train/eval 语义陷阱（官方与我们的 harness 均不调 `.eval()`，已逐仓核实）、(3) 真实模型硬错，三者叠加后仍有 ~8-18pt 无法用任何可测旋钮解释（shape/tolerance/train-eval/超时预算全部试尽，含旧 shape prompt 干净重新生成对照：72.25% @1e-4 / 74.88% @1e-2）。**没有 MooreThreads 的确切 prompt、不能排除官方在自家 MUSA 硬件/工具链上评测**——最终交付定位为"我们 prompt+harness 下的忠实测量"。以下差距分解与"一~五"节为完整证据链。 -->
+
+<!-- ### 差距分解（baseline = t600 定稿；1e-2 行由 t600 dump 逐样本推导，BN eval-mode 行迁移 300s 跑的实测天花板） -->
+
+| setting | T1 avg@8 | 相对 baseline |
+|---|---:|---:|
+| baseline（train-mode、TF32-off、atol=rtol=1e-4） | 68.00% | - |
+| + tolerance 放宽到 1e-2 | 74.00% | +6.0pt |
+| + 仅 BatchNorm 题（11 题/88 样本）reference 换成 `.eval()` | 75.50% | +7.5pt |
+| 两者叠加（1e-2 + BN eval-mode） | 81.25% | ~+13.25pt |
+
+即便按"harness 最宽松、最偏官方"的设置叠加，仍有 **~10%+ 无法用 harness 参数解释**，是真实模型实现错误
+
+<!-- ### 一、BatchNorm train/eval 语义差距（已用干净的机制对照证实，非猜测）
+
+**现象**：100 题里 29 题含 BatchNorm/GroupNorm/InstanceNorm。若笼统按"含 norm 层"分组，avg@8 只有 44.6%（vs 其余 70 题 72.5%）——但这个粗分组会把 GroupNorm/InstanceNorm 错误地和 BatchNorm 混为一谈。按机制拆开后：
+
+| 分组 | 题数/样本数 | live avg@8 | reference 换 `.eval()` 后 avg@8 | 结论 |
+|---|---:|---:|---:|---|
+| 纯 BatchNorm 题（train/eval 语义敏感） | 11 题 / 88 样本 | **5.7%**（5/88） | **76.1%**（67/88） | 机制成立：模型系统性地按 eval 语义（读 `running_mean/running_var`）实现 BN kernel，harness 按 train 语义（当前 batch 统计量）打分参考模型，两者必然不一致 |
+| GroupNorm/InstanceNorm 题（无 train/eval 区分，无 running stats） | 17 题 / 136 样本 | 70.6%（96/136） | 70.6%（不变） | 干净的阴性对照：换 `.eval()` 对这组毫无影响，证明上面的效应确实来自 BatchNorm 语义，不是重打分本身的偏差 |
+
+**根因**：模型倾向于把 BatchNorm 实现成"推理期"语义（用 `self.bn.running_mean` / `self.bn.running_var`），这是绝大多数真实部署代码的写法；而 KernelBench 的评测约定（官方与我们的 harness 都一样）从不对 reference 调用 `.eval()`，因此 reference 在 forward 时用当前 batch 的统计量。二者本质不同的计算，不可能数值match。
+
+**这不能简单等同于"官方用 eval-mode 所以我们该切换"**：官方 KernelGym fork 源码里同样没有任何 `.eval()` 调用（整仓库 grep 确认，只有两处被注释掉的 `# model.eval()`，均在无关的 profiling 代码里）。所以官方大概率也是 train-mode 打分，这批题目对官方而言同样是难题。用算术核验：BatchNorm 题占比 11%，即便记满 76.1%（我们实测的 eval-mode 上限），要让总体达到 92.88%，剩下 89% 的非 BN 题需要平均 ~95% 正确率——而我们实测非 BN 题只有 ~70-72%。**无论 BatchNorm 这题怎么判，非 BN 题才是差距的主体**，这是纯算术结论,不依赖对官方 harness 设置的任何假设。 -->
+
+<!-- ### 二、300s task 超时是 shape 驱动的 harness 预算问题（执行阶段主导、非 nvcc），不是模型能力问题
+
+**现象**：800 个 T1 样本里 48 个"未编译"，但其中 **29 个（60%）实际是 300 秒编译超时**（`error_message` 含 "timeout after 300s"），不是语法错误；只有 19 个是真正的编译失败。
+
+**证实超时是 shape 驱动**：取 4 道全部因超时未编译的题（pid 40/56/78/100），把**同一份模型 response**（不重新生成）换成 2025-07-02 shape 放大前的旧版 reference（对应更小的 batch/channel），重打分：
+
+| pid | 现行 shape 编译/正确 | 旧（放大前）shape 编译/正确 |
+|---|---:|---:|
+| 40 | 2/8, 2/8 | 8/8, **8/8** |
+| 56 | 2/8, 1/8 | 8/8, **8/8** |
+| 78 | 2/8, 1/8 | 8/8, **7/8** |
+| 100 | 0/8, 0/8 | 8/8, **8/8** |
+
+4 题合计 32 样本中 31 个从"超时/未编译"变为"编译且正确"，**同一份代码，只是换了更小的输入 tensor**（且离线重打分用了同样的 300s 预算，排除"预算变长"解释）。
+
+**机制更正（重要）**：最初误写为"nvcc 编译超过 300s"。这不成立——同一份源码在两种 shape 下 nvcc 编译时间相同（kernel 以运行期参数接收维度）。真正的机制是：**300s 是 task 级预算**（error_message 为 "Task ... timeout after 300s"，`compile_artifact=None`，dump 里无法区分阶段），预算 = 编译（~90s，与输入 shape 无关）+ 5 次 correctness trial（**强依赖输入 shape**）。一个比 reference 慢 3-4 个数量级的朴素融合 kernel，在大 shape 输入上单次 forward 就能烧掉几分钟 → task 超时且被记为"未编译"；小 shape 下同一 forward 是毫秒级 → 通过。所以这批是"**执行阶段主导的 task 超时**（编译只固定占走 ~90s 预算）"，不是编译器慢。结论不变：仍是 harness 预算×大 shape 的组合伪影、非模型写错 kernel；600s 隔离重跑（进行中）会给出各阶段的实测拆分。
+
+按此外推，800 个 T1 里的 29 个超时样本中，多数大概率也是"kernel 本身正确、只是编译没跑完"，应从"模型真实失败"里剔除或单独标注，而不是计入模型能力的负分。**建议后续用不限时或更长超时（如 900s-1800s）对这 29 个样本做隔离重跑，拿到确切数字**（同 L1 handoff 里 `.so cannot open` 问题的处理方式：先诊断规模,再隔离重跑验证)。 -->
+
+<!-- 方法论说明：作为对照，同一批测试里 pid13（原本 2/8 correct）换成旧 shape 后反而 0/8 编译通过。这是预期的：模型代码是针对新 shape 的具体数值生成的，可能硬编码了与新 shape 相关的常量，换旧 shape 不代表"模型在旧 shape 下会怎么表现"，只能证明"变好"（代码本来就对，只是没编译完/没通过容差)，不能用"变差或不变"反推原始失败是不是shape引起。 -->
+
+<!-- ### 三、真实模型错误（非 harness 可解释，已逐个读代码确认）
+
+对 output_mismatch 类失败（164/800，`max_diff > 1e-2`，容差放宽也救不回）里选取代表性样本，读了模型实际的推理过程和实现:
+
+- **pid3、pid34**（`..._LayerNorm_...`，各 8/8 全错，`max_diff` 稳定在 ~1.25 / ~4.09）：两题都是 `ConvTranspose3d` 后接 `nn.LayerNorm(out_channels)`。PyTorch 的 `LayerNorm(out_channels)` 按**位置**归一化最后一维，而这两题的 `ConvTranspose3d` 输出宽度 `W'` **数值上恰好等于** `out_channels`（用转置卷积输出尺寸公式核实：两题均 64=64）——所以 reference 实际在对**宽度维**做归一化，不是模型自然会假设的**通道维**。模型的推理原文明确写着"LayerNorm is applied over the channel dimension"，落入了这个由参数巧合构成的陷阱。**这是真实的模型推理错误，不是打分口径问题**；两题共占 2/100，对总差距贡献约 2pt。
+- **pid14**（`Gemm_Divide_Sum_Scaling`，8/8 全错，`max_diff` 在 0.001-0.03 区间）：模型做了一个数学上等价的化简（`sum_j(matmul结果)` 等价于把 `weight` 先按 hidden 维求和再和输入做点积），对 8192×8192 的大规模归约改变了求和顺序，从而改变了 fp32 累加误差——**已用 shape 置换验证是纯粗大 shape 的精度问题**：换成旧（放大前）shape 后 8/8 全部转正确。这类"数学正确、fp32 顺序敏感"的失败应算精度容差/shape 口径问题，不是模型bug。 -->
+
+<!-- ### 四、旧 shape 干净复测（结案）
+
+上面"二"的 shape 置换测试用的是**离线换 reference**——把 2025-07-02 放大前的旧版 KernelBench reference，套在**新 shape prompt 生成的既有 response** 上重打分。这个方法本身有已知偏差（模型代码可能硬编码了新 shape 的常量），所以额外跑了一版**干净复测**：用旧 shape 的 KernelBench 题面重新构造 prompt，让模型针对旧 shape **重新生成** response（不是换 reference），再原生打分。两种方法互为交叉验证。
+
+### 结果对比
+
+| 口径 | 离线换 reference（新 shape response + 旧 shape reference，760/800 有效题） | 干净复测（旧 shape prompt 重新生成，800/800） |
+|---|---:|---:|
+| compile | 98.68%（750/760） | **96.38%**（771/800） |
+| correct@1e-4 | 69.74%（530/760） | **72.25%**（578/800） |
+| correct@1e-2（衍生：correct 或 compiled 且 correctness_issue 且 max_diff≤1e-2） | 73.42%（558/760） | **74.88%**（599/800） |
+| BatchNorm 题 correct（train-mode，语义仍不对） | 10.0%（8/80，不含 pid41，该题旧版计算逻辑不同已剔除） | **18.2%**（16/88） |
+| BatchNorm 题 + reference 换 `.eval()` | **78.75%**（63/80，真实重打分，非投影） | 未单独重打分（同机制，预期同量级，见下方叠加估算） |
+| 300s 编译超时样本数（占比） | 29/800（3.6%，新 shape prompt 下） | **4/800（0.5%）**——干净复测本身用的就是旧 shape 题面，超时问题随 shape 一起解决，不需要再单独隔离重跑 |
+| 0/8 全错题 | 与干净复测高度重合 | **[3, 11, 15, 34, 72, 73, 77]**（7 题）：LayerNorm 陷阱（3、34）+ BatchNorm 核心难题（11/15/72/73/77） |
+
+两种独立方法互相印证：干净复测（更可信，无硬编码常量偏差）的 correct@1e-4/1e-2 略**高于**离线换 reference 的数字（+2.5pt / +1.5pt），符合预期方向——干净复测不会有"新 shape 常量硬编码导致换 shape 后变差"的伪影（离线换 reference 版本里 12 题因此变差，损失 26 个样本，見"二"）。0/8 全错题两版完全一致，证明这 7 题的失败是**跨 shape、跨生成批次都稳定复现的真实模型缺陷**，不是某一次采样的噪声。
+
+### 叠加最优估算
+
+把"BatchNorm 题换 `.eval()`"的实测天花板（78.75%，来自离线换 reference 版本的真实重打分）套用到干净复测的 88 个 BN 样本上，与干净复测的非 BN 题 correct@1e-2（583/712=81.9%）叠加：
+
+**(583 + 88×0.7875) / 800 ≈ 81.1-81.5%**
+
+这是**已知可测 harness 因素全部按最有利方向叠加**后的上限估算，距官方 92.88% 仍有 **~12pt** 缺口；若只看单一口径（旧 shape + 1e-2，不叠加 BN eval-mode）则是 74.88%，缺口 **~18pt**（92.88−74.88=18.00，整数，非巧合）。 -->
+
+<!-- ### 结论：缺口是真实的，已穷尽可测 harness 旋钮
+
+**已系统性排除/量化的 harness 因素**：shape（新旧对比，干净复测确认）、tolerance（1e-4 vs 1e-2，两版口径都算过）、train/eval BatchNorm 语义（机制级证实+量化上限）、编译超时预算（证实是 shape 驱动，干净复测里已随旧 shape 一并消失）、dataset 版本（100/100 与上游一致）、TF32（已关闭）。这些旋钮已经调到头，仍有 ~12-18pt 缺口，且两次独立测试（离线换 reference、干净重新生成）都稳定指向同一批题（pid 3/34 LayerNorm 陷阱、pid 11/15/72/73/77 BatchNorm 核心难题）——这是**模型在我们的 prompt + harness 组合下真实、可复现的能力边界**，不是采样噪声或 harness bug。
+
+**MUSA 硬件/工具链是一个应正面提出的假说，而非兜底的免责声明**：MusaCoder 这个名字直接对应 Moore Threads 自家的 MUSA GPU 架构——这不是巧合式命名，意味着 MooreThreads 训练/评测该模型时大概率是在自家硬件 + 自家编译工具链（MUSA 对应 CUDA 的等价物）上完成的，而不是 NVIDIA/CUDA。如果确实如此，即使我们拿到了官方的确切 prompt，只要评测仍在 A800/CUDA 上跑，**由不同硬件后端、不同编译器代码生成、不同 kernel launch/调度语义带来的数值行为差异也可能是结构性、不可通过 harness 参数消除的**——这与"没有官方 prompt"是两个独立、都可能成立的解释，二者都无法被我们进一步验证或证伪，应该在最终结论里都点名，而不是把 gap 全部归因于 prompt 差异。
+
+**交付物口径**：新 shape mt3（T1 64.12%、best-by-turn 89.38%（715/800），两个数字均已独立核实）和旧 shape 干净复测 T1（72.25% @1e-4，74.88% @1e-2）都是"忠实测量"，可以作为最终交付数字使用；不建议再花时间去逼近 92.88%，除非拿到官方的确切 prompt 和/或确认官方评测使用的硬件后端。 -->
+
+<!-- ### 五、300s→600s 干净复测（`mt3_level2_t600`）：确认新 shape 数字里也有被 harness 预算误伤的部分
+
+L3 调查发现的四个 infra bug 里，有两个也适用于 L2（编译+执行超时预算、墙钟 guard），`einops` 缺失和 100KB 校验器则与 L2 题目无关（L2 题目没有 Mamba2，且响应远短于 L3 full-model 题）。用同样的修复（task timeout 300→600s，guard 3000s→10800s）在新 shape 上干净重跑，2400 样本、800 trajectory、T1=T2=T3=800、**0 条记录缺失**：
+
+| 指标 | 300s 原始跑 | 600s 干净复测（`mt3_level2_t600`） |
+|---|---:|---:|
+| compile T1 | 94.00%（752/800） | **98.75%**（790/800） |
+| correct T1 | 64.12%（513/800） | **68.00%**（544/800） |
+| correct T2 | - | 68.75%（550/800） |
+| correct T3 | - | 67.00%（536/800） |
+| best-by-turn correct | 89.38%（715/800） | **92.50%**（740/800） |
+| best-by-turn compiled | - | 100.00%（800/800） |
+
+**T1 68.00% 与之前用离线重打分修补 300s 超时桶得到的预测值 67.375%（539/800）几乎一致（差 5 个样本、0.625pt）**——两条独立路径（离线打补丁 vs 干净重跑）收敛到同一个数，说明当时的离线修补方法是可靠的代理，不是巧合凑出来的数字。
+
+**变化的原因**：与 L3 一样，300s 是编译+correctness 执行合计的墙钟，L2 融合 kernel 编译中位数本身就要 ~90s，加上朴素实现的执行阶段容易超支；预算提到 600s 后编译率从 94.00%→98.75%，correct T1 从 64.12%→68.00%，主要是把"其实是对的、只是没跑完"的样本捞回来了。`einops`/100KB 两个 bug 对 L2 不适用（L2 无 Mamba2 题、响应长度远低于 100KB 门槛），所以 L2 这次复测干净得多——**清洗后仍有 19 个（0.79%）任务超时 + 17 个（0.71%）HTTP-400**，量级都很小，不影响结论。
+
+**一个只做观察、不做因果论断的巧合**：干净复测的 best-by-turn correct **92.50%** 与官方单轮报告的 **92.88%** 数值上非常接近。这**不能**被解读为"官方其实用的是 best-of-N"或反推官方评测协议——best-by-turn 本质上包含 3 次尝试（近似 pass@3 的效果），与官方声明的单轮口径不是同一个统计量，二者接近很可能只是巧合（我们能拿到的唯一确定结论仍是：T1 单轮 68.00% 是与官方 92.88% 可比的口径，且仍有 ~25pt 缺口）。仅作为一个有趣的观察记录在此，不作为任何结论的依据。
+
+## L3 建议
+
+1. **可以直接跑 L3**，但交付物要按"our-harness 下的忠实测量"框定，不要承诺复现官方 65.75%——原因同 L2：没有 MooreThreads 的确切 prompt，harness 参数怎么调都补不齐这个差距的大头（非 BN 题的真实模型错误）。
+2. **300s 编译超时按用户明确指示保留**；L3 是 full-model 融合，kernel 复杂度/编译时间预期比 L2 更高，超时误伤比例大概率比 L2 的 3.6% 更高，写结论时要显著标注这个 caveat，并计划后续用隔离长超时重跑来单独量化这批样本的真实正确率。
+3. tolerance（1e-4 vs 1e-2）和 BatchNorm train/eval 口径**不建议在跑 L3 前"修正"**——我们无法证实哪个更贴近官方真实设置，强行改会让数字看起来更好看但失去"忠实测量"的意义；应作为灵敏度分析呈现,不作为最终口径。
+4. ~~把"shape 置换测试"扩展到 output_mismatch_real 桶的随机子集~~——**已被"四、旧 shape 干净复测"取代**：干净重新生成是比扩大离线置换更干净的验证方式，且已给出结案结论（缺口真实，不建议在拿到官方 prompt 前继续逼近 92.88%）。 -->
+
+# Level3 测试结果与错题分析
+
+## 1. 结果总表
+50 题 × 8 samples，load_inline、大 shape、TF32-off、tolerance 1e-4、max-turns=3
+
+<!-- 定稿口径 = `mt3_level3_t600`（600s task 预算 + 10800s trajectory guard + einops 修复，denom 全部 400、0 条记录缺失）；300s 原始跑（`mt3_level3`）被四个 infra bug 压低、数字不可信，仅作对照，见第 3 节。 -->
+
+| 指标 | T1 | T2 | T3 | best | official |
+|---|---:|---:|---:|---:|---:|
+| correct | 24.50% | 33.25% | 37.00% | 54.50% | 65.75% |
+| compile | 94.25% | 91.00% | 85.00% | 99.25% | - |
+| fast@1.0 | 0.00% | 0.00% | 0.25% | 0.25% | - |
+<!-- | correct（300s 原始跑，对照——被 4 个 infra bug 压低，不可信） | 7.75% | 21.25% | 16.50% | 32.50% | 65.75% | -->
+
+<!-- - **与官方可比的口径是 T1**：24.50% vs 65.75%，缺口 ~41pt，远大于 L2 的 ~25pt；归因见第 3 节。
+- 与 L1/L2 相反，correct **逐轮上升**（24.50→33.25→37.00）：T1 基数低，可被反馈修复的低垂错误（语法/接口/BN 语义）多，多轮净收益为正；BN 题尤其明显（T1 0% → best 59.87%）。
+- fast@1.0 ≈ 0：朴素 full-model 融合 kernel 打不过 torch/cuDNN 整网，预期内。 -->
+
+## 2. 错题分布
+T1，400 样本中失败 302 个
+
+| 失败类别 | 数量 | 占 400 | 机制归因 |
+|---|---:|---:|---|
+| output_mismatch（真数值错，max_diff>1e-2） | 177 | 44.25% | **107 个（60%）来自 19 道 BatchNorm 题**（train/eval 语义陷阱，同 L2"一"节机制；深层网络逐层传播放大，BN 题 T1 全军覆没 0/152）；其余 70 个为完整模型的真实实现错 |
+| runtime_exception（forward 异常） | 64 | 16.0% | 远高于 L2 的 2%——full-model 的 wrapper/多 kernel 组装复杂度（pid30 8/8、pid29 7/8、pid16/24 各 5/8） |
+| near_miss（1e-4<max_diff≤1e-2） | 35 | 8.75% | 容差敏感（pid36/37/47 各 6/8）；1e-2 口径下全部计正确 |
+| compile_fail（真编译错） | 14 | 3.5% | 真语法/binding 错，分散（pid7 3 个） |
+| http400（>100KB 退化响应被拒） | 5 | 1.25% | 退化生成，等价 0 分（校验器缺陷本身见第 3 节 bug 4） |
+| task_timeout（600s 仍超时） | 4 | 1.0% | 极慢 kernel 残留（pid18/44 各 2） |
+| shape_mismatch | 3 | 0.75% | 少量输出形状错 |
+
+<!-- **T1 全错（0/8）共 31/50 道题**：19 道 BatchNorm 题全部在内（0/152），其余 12 道非 BN 全错题主要为 ViT/Swin、LSTM/GRU、Mamba2（pid48/49）等非卷积完整模型。**BN 题 best-by-turn 从 0% 涨到 59.87%（91/152，超过非 BN 题的 51.21%）**——模型看到具体 correctness 反馈后能学会切到 train-mode 语义，但 T1 单轮口径下 BN 是 100% 硬伤。 -->
+
+## 3. 与官方 65.75% 的差距分析
+
+<!-- L3 首次跑的原始数字不可信——四个独立 harness/infra bug 同时压低分数（下表 bug 1-4，均已定位、量化、修复/规避并在 t600 重跑验证）。修复后 T1 24.50% 距官方仍有 ~41pt：主因是 BN 语义陷阱（19/50 题、T1 0/152）+ 完整模型的真实实现错，不是 harness。 -->
+
+| setting | T1 avg@8 | 相对 baseline |
+|---|---:|---:|
+| baseline train-mode、TF32-off、atol=rtol=1e-4 | 24.50% | - |
+| + tolerance 放宽到 1e-2（t600 dump 逐样本推导） | 33.25% | +8.75pt |
+| + BN 题按 L2 实测 eval-mode 天花板 76.1% 迁移估算（L3 未实测，纯估） | ~59.4% | ~+34.9pt |
+<!-- | （对照）300s 原始跑，含 4 个 infra bug | 7.75% | -16.75pt | -->
+
+<!-- 即便把 BN 全部按 eval-mode 天花板计（未在 L3 实测、纯迁移估算），距官方仍有 ~6pt；按可信的实测口径（1e-2），缺口 **~32.5pt**——主体是 **BN 语义陷阱（0/152）+ 完整模型的真实实现错（runtime_exception 16% + 非 BN 真数值错）**，不是 harness 参数能关掉的。与 L2 相同的不可验证因素（官方确切 prompt、MUSA 硬件/工具链）依然成立。 -->
+
+<!-- ### 二、干净数字 vs 官方（denom 全部 400，来自 `mt3_level3_t600`）
+
+| 指标 | 原始跑（`mt3_level3`） | 干净重跑（`mt3_level3_t600`，四个 bug 已修复，600s 预算） | 官方单轮 |
+|---|---:|---:|---:|
+| compile T1 | 59.75%（239/400；present=344，未记录的还有 66 个超时样本，实际重打分显示其中 66 个后来都能编译） | **94.25%**（377/400） | - |
+| compile best | - | **99.25%**（397/400） | - |
+| correct T1 | 7.75%（31/400） | **24.50%**（98/400） | **65.75%** |
+| correct T2 | 21.25%（85/400） | **33.25%**（133/400） | - |
+| correct T3 | 16.50%（66/400，含 56 个必然记 0 的中止占位符） | **37.00%**（148/400，其中 5 个 trajectory 因 `prompt_truncated` 自然终止未到 T3，非丢数据） | - |
+| best-by-turn | 32.50%（130/400） | **54.50%**（218/400） | - |
+
+T1 从 7.75%→24.50%，主要来自 bug 1（56 个中止 trajectory 的 T1 记录不再丢失）和 bug 2（66 个超时样本里实际有 47 个是正确 kernel）——这两个修复贡献了绝大部分回升。**即便如此，24.50% 距官方 65.75% 仍有 ~41pt 缺口**，比 L2 干净复测后的 ~12-18pt 缺口大得多。
+
+### 三、BatchNorm 语义陷阱：在 L3 比 L2 更致命，但可被多轮反馈部分修复
+
+- 干净重跑里，19/50（38%）道 L3 题目含 BatchNorm（卷积骨干网络天然层层堆叠 BN，密度远高于 L2 单融合算子题的 11%；此前"19/48"分母来自污染跑的 present 题数，已按干净跑全量 50 题修正）。
+- **含 BN 题目 T1 correct = 0.00%（0/152）**——比 L2 的 5.7% 更极端，机制相同（模型系统性按推理期语义写 BN，harness 按 train 语义打分参考模型，见 L2"一"节的完整证据链），只是深层网络里任何一层 BN 语义错都会通过下游层层传播放大误差，几乎不可能"蒙对"。
+- 非 BN 题目 T1 correct = **39.52%（98/248）**——这才是更接近"真实模型基础能力"的信号，比 BN 拉低前的总体 24.50% 高出不少。
+- **新发现，与 L2 不同**：BN 题目 best-by-turn 从 T1 的 0% 涨到 **59.87%（91/152）**——远超非 BN 题目的提升幅度，说明模型看到具体 correctness 报错反馈后，能在后续轮次里学会切换到 train-mode 语义。L2 没有类似的量化证据（当时没有针对 BN 题做逐轮追踪）；这是否是 L3 特有（更大 kernel、更多轮次里"练习"机会更多）还是 L2 也有但没测出来，值得后续单独确认，但不影响本次结论：**T1 单轮口径下 BN 陷阱依然是 100% 硬伤**。
+
+### 四、遗留 caveat（干净重跑仍有的，非阻塞性）
+
+- **40 个 HTTP-400（3.35%）未修复**：见上表 bug 4，本次重跑未改校验器，这批仍按 0 分计入；且发现会拖累后续轮次恢复率（17 个有后续轮次的只 1 个转正确），如果后续要进一步逼近官方数字，这是优先级最高的剩余 harness 项。
+- **14 个样本仍在 600s 预算内超时（1.17%）**：比 300s 时的 66 个大幅减少，但没有归零；这批样本没有再做更长预算的三次重跑，理论上还有极少量"隐藏正确"未计入 24.50%，量级可忽略（<1.5pt 影响）。
+- **5 个 trajectory 因 `prompt_truncated` 自然终止在 T3 之前**（非 bug，是多轮对话累积长度撞到生成上限的正常行为，T1/T2 记录完整无损，已逐条核实 `finish_reason`/`status`）。
+- 官方 65.75% 是否包含类似 harness 差异（tolerance、train/eval 口径、shape）在官方评测里如何处理，与 L2 一样无法证实——同样建议把最终交付物定位为"忠实测量"，缺口归因见"结论"，不再假设能靠 harness 参数逼近官方数字。
+-->
+
+# 四个 infra bug：定位、量化、修复验证
+
+原始 L3 跑（1084 个样本，T1 只有 344/400 有记录，56 条 trajectory 的 T1/T2 记录整段丢失）算出来的正确率是 **T1 7.75%、T2 21.25%、T3 16.50%、best 32.50%**，看起来非常差。
+排查后发现，这批数字被四个 harness bug 一起拉低了。下面逐个说明问题出在哪、影响多大、怎么修的（这些修复对 L2 的 t600 复测同样适用）
+
+## Bug 1：3000s 整条 trajectory 超时中止时，已经跑完的轮次会被一起丢弃
+
+**问题出在哪**：一条 trajectory 最多有 3 轮对话，系统给整条 trajectory 的总耗时设了一个上限——3000 秒。问题在于，程序每跑完一轮，会先把这一轮的结果暂存在一个临时变量里。一旦中途撞到 3000 秒的总时长上限被强制打断，这个临时变量会连同里面已经算好的结果一起被直接扔掉，最后只拿一条空的占位记录去充数。也就是说，哪怕前两轮已经算出了正确答案，只要第三轮拖得久了导致整体超时，前两轮的成果也都会消失
+
+<!-- （涉及代码：`generate_with_cuda_agent.py:34-38` 的超时阈值计算、`:815` 暂存逐轮结果的局部变量、`_abort_result`（`:614-655`）的占位兜底逻辑） -->
+
+<!-- **影响多大**：400 条 trajectory 里有 56 条（14%）中招，这些样本的 T1、T2 记录全部消失，直接被当成 0 分 -->
+
+**怎么修的**：（workaround）把超时阈值从 3000s 放宽到 10800s
+<!-- （相当于每条 trajectory 给 3 小时，通过 launch 脚本的环境变量 `KERNEL_AGENT_GENERATE_GUARD_SEC` 设置，eval 脚本也已经把这个变量透传下去），让中止基本不会再发生。但 `_abort_result` 会丢弃已完成轮次的这段代码本身**依然没改**，只是触发它的条件（超时）被人为消除了。干净重跑已验证：**0 条 abort**。 -->
+
+## Bug 2：300s 的编译+执行timeout，系统性地误杀了"跑得慢但其实是对的"kernel
+
+**问题出在哪**：实测下来，L2/L3 光编译一个融合/复杂 kernel，中位数就要 90-150 秒；如果模型写的是没优化过的朴素实现，在大 shape 输入下跑 correctness 校验阶段可能还要再花 100-400 秒。两者一相加，很轻松就超过原先level1时没问题的 300 秒——哪怕这个 kernel 语义完全正确，也会被系统性地判成"编译失败"或"超时"。
+
+<!-- **影响多大**：L2 有 29/800（3.6%）个样本因此中招；L3 344 个里有 66 个 -->
+
+**怎么修的**：把该timeout从 300s 提到 600s
+<!-- 单独把这批超时样本隔离出来重跑验证：**L2 的 29 个里有 26 个（89.7%）转成了"编译通过且正确"**；**L3 的 66 个全部（100%）都能编译通过了**，不过这 66 个里只有 47 个结果正确、另外 19 个虽然编译过了但结果是错的——说明 L3 的 kernel 本身出错率更高，不像 L2 那样几乎"一放开预算就全对"。 -->
+
+## Bug 3：reward server 的 venv 缺了 `einops`，导致两道 Mamba2 题目 100% 报错
+
+**问题出在哪**：程序在准备测试题目（加载 reference 模型代码）这一步里有一个隐藏的设计缺陷：这一步内部一旦执行失败，不管背后是什么原因，都会被当成"正常返回了一个空结果"处理，而不是把真实的报错信息往外抛。
+<!-- 于是下游代码在处理这个"空结果"时，就会跳出一个看起来毫不相关的报错（类似"无法拆包一个空对象"），完全看不出真正的病因在哪。往下深挖才确认，真正的原因是运行环境里少装了一个 Python 依赖包（`einops`）——两道用到这个包的 Mamba2 题目，只要跑到加载 reference 这一步就必然会撞上这个连锁报错。 -->
+
+<!-- （涉及代码：`kernelgym/toolkit/kernelbench/loading.py:38-55` 的 `load_original_model_and_inputs()`、调用方 `pipeline.py:678`、`:1073`） -->
+
+<!-- **影响多大**：344 个样本里有 15 个（pid48 占 7 个、pid49 占 8 个）；另外还有 1 个 pid48 的样本是撞上了 Bug 4（响应超长），不算在这 15 个里。 -->
+
+**怎么修的**：给 reward server 的 venv 补装 `einops`，并补充 KernelGym 环境本身报错信息
+<!-- 干净重跑验证：**不再有 unpack-None 报错**，pid48/49 的 T1 现在都能正常编译（分别是 6/8、7/8）。但修完依赖之后，**这两道题的 correct 仍然是 0/8**——说明这确实是模型本身实现有问题，之前的依赖缺失只是掩盖了这一点，并不是"修好依赖问题正确率就会提升"。 -->
+
+## Bug 4：100KB 的原始响应长度校验，误伤了截断/退化生成的样本
+
+**问题出在哪**：服务端在接收模型的每次生成结果时，会先做一次"体积检查"：只要这次生成的完整原始文本超过 10 万字符，就直接拒绝、返回一个通用错误。问题在于，这个检查用的是模型的**全部原始输出**（包括所有思考文字），而不是最终真正要拿去编译的那一小段代码。结果就是：如果模型这次生成陷入了退化状态，不停地写车轱辘话、迟迟不给出代码
+<!-- 哪怕它最终想写的代码本身完全没问题，也会因为整体文本太长而被直接拒绝、连编译的机会都没有。5 个触发样本的响应长度精确卡在这个 10 万字符的边界上，其中 4/5 干脆连代码都没写出来，就是模型在命中生成长度上限之前一直在"自由发挥"。 -->
+
+<!-- （涉及代码：`kernelgym/server/api/models.py:114-121` 的长度校验、`server.py:385-401` 的错误处理） -->
+
+<!-- **影响多大**：40/1195（3.35%） -->
+<!-- 。逐条核查这 40 个：39 个是命中 32768 token 上限的截断生成、11 个完全没有代码围栏，**但有 5 个含完整有效的 load_inline 代码块**（正确与否未知，从未被打分）——误伤不是纯理论风险。另外 100KB 这个阈值本身不苛刻：全部 1195 个样本抽取后的真实 kernel 代码最大只有 ~41KB；问题是校验对象错了——L3 合法响应（thinking+代码）的原始长度 p90 就有 59KB、p99 128KB，阈值正好落在合法分布的尾部里。 -->
+
+**怎么修的**：且长度超限时，不再返回全部原始输出，仅返回错误信息
+<!-- 目前**还没修**——这次重跑没有改动这个校验器，这 40 个样本仍然被判 400、记 0 分。建议的修复方向是改成校验 `extract_model_code()` 抽取出来的代码本身，而不是原始响应字段。这里还有一个**新发现**：这 40 个样本里有 17 个本来后面还有轮次机会，但只有 1 个（5.9%）后续转成了正确，明显低于整体的 T2/T3 转正率。原因也不难理解：模型收到的是服务端直接拒绝的通用错误提示，而不是真实的 compile/correctness 反馈，没有可操作的信息去做修正——所以 400 不只是让"这一轮记 0 分"，还会连带拖累后面轮次的修复概率。 -->
+
+## 建议参数（基于以上量化）
+
+**task 超时：按后端区分，不要一刀切。**
+
+| 场景 | 建议值 | 依据 |
+|---|---|---|
+| load_inline（L1/L2/L3） | **600s** | 300s 下 L2 误伤 3.6%、L3 误伤 19%（几乎全是"对的但没跑完"）；600s 已在 L2/L3 干净重跑验证，残余超时仅 0.8%/1.1%，且残余多为价值趋零的极慢 kernel（继续加预算只是让 worker 被占更久，不建议超过 600s 作默认；如需为报告彻底清零，可对残余 ~1% 做一次 900-1800s 隔离重跑单独标注） |
+| tvm-ffi（现有模型，如 Qwen3.6） | **300s 即可** | 实测 438 个已打分样本 max 275s、0 误伤；编译中位 0.2s、失败秒级返回，几乎不撞预算 |
+| tvm-ffi（未来高正确率模型，~90% correct） | **600s** | 高正确率下几乎每个样本都跑满 105 次 trial，预算由 correct 样本耗时分布决定（详见 time-breakdown handoff 的推演：600s ≈ 实测 correct-max 的 2 倍余量，覆盖到 kernel ≈ ref 1/80 速度） |
+
+<!-- **响应/代码长度校验：改校验对象，阈值本身不用动。**
+
+- **首选**：校验 `extract_model_code()` 抽取后的代码，阈值维持 **100KB**——全部 1195 个 L3 样本实测抽取后代码最大 ~41KB，100KB 有 >2 倍余量，永远不会误伤合法代码；退化的纯推理文字在抽取阶段自然变成"无代码可编译"，模型还能收到可操作的失败反馈（而不是无信息的 400）。
+- **若必须继续校验原始字段**：阈值提到 **256KB**——32768 token 生成上限下实测原始响应最大 204KB，256KB 覆盖生成上限所能产生的一切合法响应；100KB 落在合法分布尾部（p90 59KB、p99 128KB），已实证误杀过含完整有效代码的样本（5/40）。 -->
+
+<!-- 证据/复现细节：
+- 原始 L3 dump：`/nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_level3.load_inline/dumps/rollout_data/eval_0.pt`（1084 样本）。
+- 干净重跑 dump：`/nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_level3_t600.load_inline/dumps/rollout_data/eval_0.pt`（1195 样本）。
+- t600 错题分布与 1e-2/BN 拆分（第 2/3 节）：.22:/tmp/l3t600_errdist.py（correct 98 / real 177 其中 BN 107 / runtime 64 / near-miss 35 / compile 14 / 400 5 / timeout 4 / shape 3；@1e-2=133/400，BN@1e-2=11/152，nonBN@1e-2=122/248）。
+- L2/L3 timeout 隔离重跑（600s 预算，phase timing）：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_timeout_retest_600s.json`（29 样本，26 正确）、`l3_timeout_retest_600s.json`（66 样本，47 正确/19 编译但错）；提取脚本 `extract_timeout_retest_cases.py`、重打分脚本 `rescore_timeout_retest.py`。
+- score_one_sample.py 新增 phase timing 字段（`eval_wall_s`/`kg_kernel_backend_compile_s`/`correctness_trial_s` 等，纯新增）：`KernelGYM-load-inline/scripts/score_one_sample.py`。
+- einops 缺失根因复现、100KB validator 根因定位、3000s 墙钟+丢轮次机制，均由子 agent 深挖 KernelGYM-load-inline 与 slime-musacoder-mt 源码得出，file:line 见本节正文；未在此额外存档，需要时重新 grep `generate_with_cuda_agent.py`（wall clock/abort）、`loading.py`+`pipeline.py`（NoneType unpack）、`server/api/models.py`+`server.py`（400 validator）。
+- 四个 bug 的具体修复实现（einops 装包、validator 改动、wall-clock 累积逻辑、300→600s 预算）由 team lead 主导，本人只做定位/量化/干净重跑后的验证，未直接改动共享 reward server 代码。
+-->
+
+<!-- 证据/复现细节：
+- T1 metadata 全量提取：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_t1_meta.json`（800 条，来自 dump 的 env_state/metadata，无需重打分）。
+- t600 错题分布（第 2 节）：.22:/tmp/l2t600_errors.py，直接读 mt3_level2_t600 dump 分类（correct 544 / real 160 / near-miss 48 / shape 22 / runtime 16 / compile 6 / timeout 3 / 400 1）。
+- 20 样本 sanity check：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_normgroup_baseline_sanity20.json`，20/20 与 live 完全一致。
+- BatchNorm/GroupNorm/InstanceNorm 240 样本 eval-mode 重打分：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_normgroup_evalmode_full240.json`。
+- eval-mode + tolerance=1e-2 联合重打分（未跑完，64/240，为让路 L3 中止）：日志 `/nfs/FM/chenshuailin/staging_oneshot_conv1x1/rescore_evalmode_tol1e2.log`。
+- shape 置换测试（9 题/72 样本，pre-2025-07-02-scale-up 即 commit 21fbe5a 的 level2 reference）：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_shapetest_old.json`；旧 shape reference 提取到 `/nfs/FM/chenshuailin/staging_oneshot_conv1x1/kernelbench_level2_oldshape/`。
+- correctness.py 新增诊断开关 `KERNELGYM_CORRECTNESS_REFERENCE_EVAL_MODE`（默认关闭，不影响 live reward server 和 L3）：`KernelGYM-load-inline/kernelgym/toolkit/kernelbench/correctness.py`。
+- 原始 T1 dump：`/nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_level2.load_inline/dumps/rollout_data/eval_0.pt`。
+- 全量 760 题旧 shape 离线重打分（@1e-4）：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_full_oldshape_tol1e4.json`；提取脚本 `extract_full_oldshape_cases.py`，5 题（27/41/45/58/66）因旧 commit 下计算逻辑不同（非仅 shape 差异）被剔除，manifest 见 `l2_full_oldshape_cases/manifest.json`。
+- 近似 1e-2 桶（33 near-miss + 26 缺 max_diff）targeted 重打分：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_oldshape_1e2_targeted.json`（59 样本，28 个转正确）。
+- BatchNorm 10 题（80 样本，pid41 因计算逻辑不同排除）旧 shape + eval-mode 联合重打分：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_oldshape_bn_evalmode.json`（63/80=78.75%，真实重打分非投影）。
+- 干净复测（旧 shape prompt 重新生成，非离线换 reference）dump：`/nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT1.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.t1_level2_oldshape.load_inline/dumps/rollout_data/eval_0.pt`；本人独立复核脚本抽出的 metadata：`/nfs/FM/chenshuailin/staging_oneshot_conv1x1/l2_oldshape_cleanrun_meta.json`。
+- score_one_sample.py 增加了 `max_difference`/`avg_difference`/`correctness_issue_name` 三个输出字段（纯新增，未改动已有字段）：`KernelGYM-load-inline/scripts/score_one_sample.py`。
+- 教训记录：曾因两个独立 driver 进程各 20 worker 并发跑（共 40 worker）导致某种资源竞争，整个 760 样本重打分卡死 ~5 小时几乎无进展（表现为所有 worker 长期停留在最前面几个 case index）；杀掉后改回单 driver、16 worker（全程验证稳定的配置）才恢复正常速度。后续类似规模的并行重打分，建议单 driver 起步，扩容前先用小规模验证。
+-->

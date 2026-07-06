@@ -24,6 +24,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--level1-dir", required=True, type=Path, help="Dir of NN_*.py reference files.")
     p.add_argument("--target-data", required=True, type=Path, help="Output raw parquet.")
+    p.add_argument("--data-source", default=DATA_SOURCE, help="extra_info.data_source label.")
     return p.parse_args()
 
 
@@ -43,7 +44,7 @@ def main() -> None:
         extra_info.append(
             {
                 "ability": ABILITY,
-                "data_source": DATA_SOURCE,
+                "data_source": args.data_source,
                 "difficulty": None,
                 "name": name,
                 "problem_id": pid,
