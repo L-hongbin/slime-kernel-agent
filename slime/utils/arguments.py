@@ -1477,7 +1477,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--kernel-backend",
                 type=str,
-                choices=["cuda_agent", "tvm_ffi", "triton"],
+                choices=["cuda_agent", "tvm_ffi", "triton", "load_inline"],
                 default="cuda_agent",
                 help="Kernel backend name sent to the kernel agent environment.",
             )

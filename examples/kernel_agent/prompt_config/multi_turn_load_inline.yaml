@@ -1,0 +1,46 @@
+method: system
+prompt: null
+
+# Multi-turn config for MusaCoder load_inline (single-block) format. The first turn
+# uses the dataset prompt (musa_coder.jinja). On later turns the server feedback JSON
+# is injected and the model is asked to repair (if not yet correct) or optimize (if
+# already correct) — the "5+3"/Appendix-G repair-then-optimize pattern from the paper,
+# expressed as a single template (the model branches on the feedback JSON).
+per_turn_prompts:
+  - name: first_turn
+    condition: "current_turn == 0"
+    history_mode: all
+    skip_env: 0.0
+    response_truncation: python_code, answer_code
+    template: null
+  - name: tool_response
+    condition: "make_up_tool_response == True"
+    history_mode: all
+    skip_env: 0.0
+    response_truncation: python_code, answer_code
+    update_memory: false
+    template: |
+      === System Feedback for your last implementation ===
+      {feedback}
+
+      Use the feedback JSON above as the source of truth, together with all your previous
+      responses, and return an improved implementation.
+
+      - If correctness has NOT fully passed (compile/runtime errors, or output/shape/dtype
+        mismatch): FIX CORRECTNESS FIRST; do not optimize performance before correctness is
+        stable. Typical fixes: keep one complete ModelNew file with closed code fences; audit
+        CUDA indexing/bounds (e.g. idx < numel) and shape/stride assumptions; match the
+        reference output shape exactly (batch/axis order, broadcasting); preserve the
+        reference math and dtype/precision semantics; recall this benchmark runs Model in
+        TRAIN mode (BatchNorm/normalization must use current-batch statistics over N,H,W,
+        not the running buffers); remove disallowed aten ops from forward().
+      - If correctness ALREADY passed: keep outputs and state_dict compatibility unchanged and
+        optimize PERFORMANCE only — reduce kernel launch overhead, fuse adjacent ops, improve
+        coalesced memory access and occupancy; avoid risky rewrites; do not output the same code.
+      - Avoid decoy kernels: implement the core computation in genuine custom CUDA
+        (`__global__`) kernels; do NOT call native PyTorch/aten compute ops
+        (e.g. `torch.matmul`, `F.softmax`) in `forward()` to bypass the performance test.
+
+      Output format: return ONLY a single Python code block — a complete file that uses
+      `torch.utils.cpp_extension.load_inline` and defines `ModelNew` (the same single-block
+      load_inline format as your first answer). No three-section format, no extra prose.

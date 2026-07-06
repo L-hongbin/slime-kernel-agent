@@ -230,11 +230,21 @@ def _get_kernel_eval_worker(args, config: dict[str, Any]):
 
 
 def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    backend = payload.get("backend", payload.get("kernel_backend"))
+    # MusaCoder load_inline responses are a single ```python ModelNew block (not the
+    # three-section CUDA_KERNELS/APPLY_BINDINGS/MODEL_NEW format). Send the RAW response
+    # as kernel_code; the server's load_inline backend extracts the block itself
+    # (extract_model_code). Running it through the three-section extractor here would
+    # yield empty kernel_code.
+    if (backend or "").strip().lower() in ("load_inline", "inline"):
+        kernel_code = payload.get("kernel_code") or payload["response"]
+    else:
+        kernel_code = payload.get("kernel_code") or extract_cuda_agent_kernel_code(payload["response"])
     task_payload = {
         "task_id": payload.get("task_id") or next_kernel_task_id(),
         "reference_code": payload.get("reference_code", payload.get("ground_truth")),
-        "kernel_code": payload.get("kernel_code") or extract_cuda_agent_kernel_code(payload["response"]),
-        "backend": payload.get("backend", payload.get("kernel_backend")),
+        "kernel_code": kernel_code,
+        "backend": backend,
         "entry_point": payload["entry_point"],
         "num_correct_trials": payload.get(
             "num_correct_trials", _kernel_eval_param(args, config, "num_correct_trials")

@@ -1,3 +1,24 @@
+# MusaCoder 多轮评测 worktree（fork of slime）
+
+> 本 worktree 是 slime 的分支 **`feature/musacoder-multiturn`**，专用于在 KernelBench L1 上评测 **MooreThreads MusaCoder-27B** 的 PyTorch→CUDA kernel 生成能力，复刻论文的 **load_inline 单块格式 + 3 轮 multi-turn**（每轮把 reward 的结构化 feedback 拼进上下文，让模型迭代修正/优化）。
+> 以下为本 fork 说明；上游 slime 原始 README 见下方分隔线之后。
+
+## 定位
+- rollout（slime 生成）+ reward（KernelGym `load_inline` **实时**打分）**都跑在 .22 单机**（`ssh -p 24167 root@192.168.16.22`）：GPU **0-3 = KernelGym**，GPU **4-7 = rollout**。
+- 与上游 slime 的差异：支持 `--kernel-backend load_inline`、多轮 load_inline feedback 模板、live load_inline 打分链路（详见 handoff §3）。
+
+## 使用方法
+- **基建 / 部署 / 启动 / 坑** → `handoffs/musacoder_multiturn_handoff.md`（两节点架构与 .22 单机整合、KernelGym `deploy_node.sh`、启动脚本 `staging_oneshot_conv1x1/launch_mt3_*.sh`、改动文件、并发 bug 完整根因与修复）。
+- **评测方法与结果数表** → `handoffs/musacoder_load_inline_eval.md`（TF32/FP32 精度口径、三种 binding 方案对比、单轮 baseline、大 shape 三轮结果、失败解剖）。
+
+## 已有结果（摘要）
+- **单轮 baseline**（load_inline、TF32-off + 1e-4，大 shape）：correct **87.38%**、compile 98.25%。关键发现：模型**不跨输出风格泛化、却跨 binding 方法泛化**（pybind/TVM-FFI 接近，三段式大跌）。
+- **大 shape 3 轮 multi-turn**：T1 correct **86.50%** → **best-by-turn 96.50%**（compile best 99.12%、fast@1.0 best 25.00%）。多轮显著抬高 best-by-turn，但 **final-turn 会回落**（T3 75.25%）→ 真实使用须按 reward **选 best turn**。best-by-turn 仍失败的 28 条集中在 9 道硬题（conv_transposed_3D、HingeLoss 等）。
+- **顺带根治** KernelGym `load_inline` 并发假失败 bug（PyTorch JIT versioner 在 compile/execute 两进程间对复用 `name=` 算出不同 `_vN` → `cannot open .so`）：修复 = **客户端+服务端 `split_compile_and_execute=false`**，实证 cannot-open **193→0**。
+
+---
+<!-- 以下为上游 slime 原始 README -->
+
 # slime
 
 [中文版](./README_zh.md)

@@ -14,19 +14,28 @@ CUDA_AGENT_CONFIGS = {
     "env": {
         "kernel_eval_function_path": None,
         "kernel_eval_max_retries": 3,
-        "kernel_eval_task_timeout": 300,
-        "kernel_eval_client_timeout": 2400,
+        # 600s per eval task (user-directed "large enough timeout" for the L2/L3 re-runs,
+        # 2026-07-04): at 300s, 3.6% of L2-T1 and 19% of L3-T1 samples were execution-phase
+        # task timeouts; 600s resolved all 66 L3 cases in the isolated re-test.
+        "kernel_eval_task_timeout": 600,
+        # Client wait scaled with the task budget: 32 in-flight / 4 GPU workers can queue
+        # up to ~8 rounds x 600s in the worst case.
+        "kernel_eval_client_timeout": 4800,
         "kernel_eval_poll_interval": 1.0,
         "kernel_eval_heartbeat_interval": 60.0,
         "kernel_eval_worker_max_concurrency": 32,
         "kernel_eval_rate_limit": 32,
-        "kernel_eval_acquire_timeout": 2400,
+        "kernel_eval_acquire_timeout": 4800,
         "num_correct_trials": 5,
         "num_perf_trials": 100,
         "verbose_errors": True,
         "enable_profiling": True,
         "detect_decoy_kernel": True,
-        "split_compile_and_execute": True,
+        # split-compile=False: keep compile+load co-resident in ONE worker process so PyTorch's
+        # per-process JIT extension versioner stays consistent → fixes the cross-process
+        # `<name>_vN.so: cannot open` false COMPILATION_ERROR (verified root cause). The server-side
+        # SPLIT_COMPILE_AND_EXECUTE flag cannot override a client True, so it must be set here.
+        "split_compile_and_execute": False,
         "enable_compile_artifact_cache": True,
     },
     "reward": {

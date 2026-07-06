@@ -105,8 +105,57 @@ def _truncate_middle(text: str, max_chars: int) -> str:
     return text[:keep] + "...(truncated)..." + text[-keep:]
 
 
+# Curated feedback aligned with the MusaCoder paper (App. G / §4.3.4): keep only the
+# fields the model needs to repair/optimize, and drop the verifier's voluminous
+# telemetry (kg_stage_* timings, device/gpu_name/hardware, monotonic/unix stamps)
+# that would otherwise inject context noise across multi-turn history.
+_FEEDBACK_TOPLEVEL_KEYS = (
+    "compiled",
+    "correctness",
+    "decoy_kernel",
+    "speedup",
+    "reference_runtime",
+    "kernel_runtime",
+    "status",
+    "error",
+    "error_message",
+)
+_FEEDBACK_METADATA_KEYS = (
+    "backend",
+    "correctness_issue",
+    "max_difference",
+    "avg_difference",
+    "correctness_atol",
+    "correctness_rtol",
+    "correctness_tf32_disabled",
+)
+
+
+def _curate_env_feedback(env_state: Any) -> Any:
+    """Slim the env_state to the model-relevant fields (paper-aligned feedback_json)."""
+    if not isinstance(env_state, dict):
+        return env_state
+    slim: dict[str, Any] = {}
+    for key in _FEEDBACK_TOPLEVEL_KEYS:
+        value = env_state.get(key)
+        if value is None:
+            continue
+        # Drop placeholder runtimes (-1.0) on failed turns: they are noise, not signal.
+        if key in ("reference_runtime", "kernel_runtime") and value == -1.0:
+            continue
+        slim[key] = value
+    metadata = env_state.get("metadata")
+    if isinstance(metadata, dict):
+        md_slim = {k: metadata[k] for k in _FEEDBACK_METADATA_KEYS if metadata.get(k) is not None}
+        if md_slim:
+            slim["metadata"] = md_slim
+    # Fall back to the raw state if curation somehow stripped everything.
+    return slim or env_state
+
+
 def _apply_feedback_template(env_result: dict[str, Any], template: str) -> str:
     payload = env_result.get("env_state") or env_result.get("reward_extra_info") or env_result
+    payload = _curate_env_feedback(payload)
     try:
         feedback = json.dumps(payload, ensure_ascii=False, indent=2)
     except TypeError:
