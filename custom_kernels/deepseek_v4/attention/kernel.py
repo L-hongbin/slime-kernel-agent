@@ -1,6 +1,6 @@
 """DeepSeek-V4-Flash core attention -- tilelang forward + hand-written backward.
 
-Implements the A1 kernel from `../handoffs/in_progress/v4_kernel_inventory.md`:
+Implements the A1 kernel from `handoffs/deepseek-v4/v4_kernel_inventory.md`:
 shared-KV MQA (K == V, one KV head broadcast to all H heads), head_dim=512,
 per-head attention sink (gpt-oss style, denom-only), and an additive structural
 mask over a KV axis of `[ raw (length S, sliding-window causal) ++ compressed

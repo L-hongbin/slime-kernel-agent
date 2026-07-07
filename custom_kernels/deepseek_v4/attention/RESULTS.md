@@ -2,7 +2,7 @@
 
 Fused **MQA shared-KV + per-head attention-sink + sliding-window/compressed flash attention** at
 **head_dim=512**, hand-written tilelang forward + backward, on H20 (sm90 Hopper, bf16 peak ~148 TF/s).
-This is the long-pole A1 kernel from `../../handoffs/in_progress/v4_kernel_inventory.md`.
+This is the long-pole A1 kernel from `handoffs/deepseek-v4/v4_kernel_inventory.md`.
 
 ## Files
 - `reference.py`        — exact fp32 torch port of the HF eager math (source of truth).

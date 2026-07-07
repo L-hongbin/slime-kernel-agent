@@ -44,25 +44,37 @@ def build_additive_mask(
     m: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
+    comp_topk_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dense additive attention mask `[S, S + Tcomp]` (0 valid, -inf masked).
 
     Matches the structural masks the model builds: sliding-window causal over
     the raw region and causal-threshold over the compressed region.
+
+    ``comp_topk_mask`` [S, Tcomp] (bool, True=selected): the CSA lightning-indexer
+    top-k selection. When given, a compressed entry is valid only if it is BOTH
+    below the causal threshold AND selected — i.e. sparse attention over the
+    compressed region (matches the rollout, which is sparse by design).
     """
     q = torch.arange(s_raw, device=device)
     # --- raw region: sliding-window causal ---
     kr = torch.arange(s_raw, device=device)
-    raw_valid = (kr[None, :] <= q[:, None]) & (q[:, None] - kr[None, :] <= window - 1)
-    # --- compressed region: entry w valid iff w < (i+1)//m ---
+    raw_valid = (kr[None, :] <= q[:, None]) & (q[:, None] - kr[None, :] <= window - 1)  # [S,S]
+    # --- compressed region: entry w valid iff w < (i+1)//m (AND top-k if sparse) ---
     if t_comp > 0:
         wc = torch.arange(t_comp, device=device)
         thr = (q + 1) // m  # [S]
-        comp_valid = wc[None, :] < thr[:, None]
-        valid = torch.cat([raw_valid, comp_valid], dim=1)
+        comp_valid = wc[None, :] < thr[:, None]  # [S,Tcomp]
+        if comp_topk_mask is not None:
+            # per-query sparse selection -> mask gains a batch dim [B,S,S+Tcomp]
+            comp_valid = comp_valid[None] & comp_topk_mask.to(device=device, dtype=torch.bool)  # [B,S,Tcomp]
+            b = comp_valid.shape[0]
+            valid = torch.cat([raw_valid[None].expand(b, -1, -1), comp_valid], dim=-1)  # [B,S,S+Tcomp]
+        else:
+            valid = torch.cat([raw_valid, comp_valid], dim=1)  # [S,S+Tcomp]
     else:
         valid = raw_valid
-    mask = torch.zeros(s_raw, s_raw + t_comp, device=device, dtype=dtype)
+    mask = torch.zeros(*valid.shape, device=device, dtype=dtype)
     mask.masked_fill_(~valid, float("-inf"))
     return mask
 
@@ -75,6 +87,7 @@ def attention_reference(
     window: int,
     m: int,
     return_lse: bool = False,
+    comp_topk_mask: torch.Tensor | None = None,
 ):
     """Reference forward.
 
@@ -108,8 +121,8 @@ def attention_reference(
     kf = kvf.expand(B, H, kvf.shape[2], D)
 
     attn = torch.matmul(qf, kf.transpose(2, 3)) * scaling  # [B,H,S,KV]
-    mask = build_additive_mask(S, t_comp, window, m, q.device, compute_dtype)
-    attn = attn + mask[None, None]
+    mask = build_additive_mask(S, t_comp, window, m, q.device, compute_dtype, comp_topk_mask=comp_topk_mask)
+    attn = attn + (mask[:, None] if mask.dim() == 3 else mask[None, None])
 
     sink = sinks.to(compute_dtype).reshape(1, -1, 1, 1).expand(B, H, S, 1)
     combined = torch.cat([attn, sink], dim=-1)  # [B,H,S,KV+1]
