@@ -1,0 +1,42 @@
+\begin{table}[htbp]
+\centering
+\caption{Comparative Evaluation of \dsvivp{} and \dsviiiII{} on Search Q\&A Tasks.}
+\label{tab:search_qa}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{ll r | rrr rrr}
+\toprule
+& & & \multicolumn{6}{c}{\textbf{Internal Evaluation (内部综合评估)}} \\
+\cmidrule(lr){4-9}
+\textbf{Category} & \textbf{Subcategory} & \textbf{\#}
+  & \textbf{V4 win} & \textbf{V3.2 win} & \textbf{tie}
+  & \textbf{V4\%} & \textbf{V3.2\%} & \textbf{tie\%} \\
+\midrule
+
+% ===== Objective Q&A =====
+\multirow{4}{*}{\shortstack[l]{\textbf{Objective}\\\textbf{Q\&A}\\\textbf{(客观问答)}}}
+  & Single-value Search (单值信息查找)   &  95 & 36 & 10 & 49 & 37.9 & 10.5 & 51.6 \\
+  & Entity Search (实体信息查找)         &  99 & 24 &  7 & 68 & 24.2 &  7.1 & 68.7 \\
+  & Enumerative Search (枚举型信息查找)  &  95 & 19 &  8 & 68 & 20.0 &  8.4 & 71.6 \\
+\cmidrule(lr){2-9}
+  & \textbf{Subtotal (小计)} & \textbf{289} & \textbf{79} & \textbf{25} & \textbf{185} & \textbf{27.3} & \textbf{8.7} & \textbf{64.0} \\
+\midrule
+
+% ===== Subjective Q&A =====
+\multirow{8}{*}{\shortstack[l]{\textbf{Subjective}\\\textbf{Q\&A}\\\textbf{(主观问答)}}}
+  & Causal Analysis (原因分析)           & 100 & 28 &  5 & 67 & 28.0 &  5.0 & 67.0 \\
+  & Comparison (对比)                    &  96 & 28 & 20 & 48 & 29.2 & 20.8 & 50.0 \\
+  & Advice Seeking (寻求建议)            &  92 & 23 &  8 & 61 & 25.0 &  8.7 & 66.3 \\
+  & Recommendation (推荐)               &  95 & 26 & 19 & 50 & 27.4 & 20.0 & 52.6 \\
+  & Planning \& Strategy (攻略计划)      &  92 & 32 & 11 & 49 & 34.8 & 12.0 & 53.3 \\
+  & Opinion \& Evaluation (评价看法)     &  96 & 30 &  8 & 58 & 31.2 &  8.3 & 60.4 \\
+  & Trend Analysis (趋势分析)            &  96 & 23 &  3 & 70 & 24.0 &  3.1 & 72.9 \\
+\cmidrule(lr){2-9}
+  & \textbf{Subtotal (小计)} & \textbf{667} & \textbf{190} & \textbf{74} & \textbf{403} & \textbf{28.5} & \textbf{11.1} & \textbf{60.4} \\
+\midrule
+
+% ===== TOTAL =====
+\multicolumn{2}{c}{\textbf{TOTAL (总计)}} & \textbf{956} & \textbf{269} & \textbf{99} & \textbf{588} & \textbf{28.1} & \textbf{10.4} & \textbf{61.5} \\
+\bottomrule
+\end{tabular}
+\end{table}

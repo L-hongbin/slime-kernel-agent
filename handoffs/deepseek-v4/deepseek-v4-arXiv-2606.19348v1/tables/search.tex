@@ -1,0 +1,40 @@
+\begin{table}[htbp]
+\centering
+\caption{Agentic Search vs. Retrieval Augmented Search for \dsvivp{}.}
+\label{tab:agentic_search}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l l c | c c r rrr}
+\toprule
+ \textbf{Difficulty} & \textbf{Category} & \textbf{\#}
+  & \textbf{Agent Win} & \textbf{RAG Win} & \textbf{Tie}
+  & \textbf{Agent\%} & \textbf{RAG\%} & \textbf{Tie\%} \\
+\midrule
+
+% ===== V4 Retrieval Augmented Search =====
+
+   \multirow{2}{*}{Easy} & Objective Q\&A (客观问答)  & 196 & 110 &  43 &  43 & 56.1 & 21.9 & 21.9 \\
+                          & Subjective Q\&A (主观问答) & 321 & 198 &  56 &  67 & 61.7 & 17.4 & 20.9 \\
+\cmidrule(lr){1-9}
+   \multirow{2}{*}{Hard} & Objective Q\&A (客观问答)  & 168 & 102 &  33 &  33 & 60.7 & 19.6 & 19.6 \\
+                          & Subjective Q\&A (主观问答) & 184 & 126 &  27 &  31 & 68.5 & 14.7 & 16.8 \\
+\cmidrule(lr){1-9}
+   \multicolumn{2}{c}{\textbf{Total (总计)~~~~~~~~}} & \textbf{869} & \textbf{536} & \textbf{159} & \textbf{174} & \textbf{61.7} & \textbf{18.3} & \textbf{20.0} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Cost Comparison:Agentic Search vs. Retrieval Augmented Search (Mean) for \dsvivp{}. Most of the tool calls are parallel for Agentic Search.}
+\label{tab:cost_comparison}
+\small
+\begin{tabular}{l rrr}
+\toprule
+\textbf{Version} & \textbf{Tool Calls} & \textbf{Prefill (tokens)} & \textbf{Output (tokens)} \\
+\midrule
+V4 Agentic Search & 16.2 & 13649 & 1526 \\
+V4 Retrieval Augmented Search   &  --- & 10453 & 1308 \\
+\bottomrule
+\end{tabular}
+\end{table}
