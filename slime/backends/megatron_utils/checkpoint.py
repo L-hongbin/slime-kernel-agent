@@ -3,6 +3,10 @@ import os
 import re
 from pathlib import Path
 
+from .path_bootstrap import ensure_megatron_lm_on_sys_path
+
+ensure_megatron_lm_on_sys_path()
+
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
 from megatron.training.checkpointing import save_checkpoint
@@ -90,6 +94,81 @@ except ImportError:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _patch_chained_optimizer_synchronize_steps() -> None:
+    """Make ChainedOptimizer._synchronize_steps tolerate stub sub-optimizers.
+
+    Muon + LoRA builds a ChainedOptimizer where one sub-optimizer has no params
+    and is a stub (``optimizer.optimizer is None``, ``is_stub_optimizer``). The
+    upstream ``_synchronize_steps`` iterates ``optimizer.optimizer.param_groups``
+    with no stub guard (unlike the rest of the class), so any save/load with
+    optimizer state crashes with ``'NoneType' object has no attribute
+    'param_groups'``. Skip stubs (they have no step to synchronize).
+    """
+    try:
+        from megatron.core.optimizer.optimizer import ChainedOptimizer
+    except Exception:
+        return
+
+    def _synchronize_steps(self):
+        steps = []
+        for optimizer in self.chained_optimizers:
+            inner = getattr(optimizer, "optimizer", None)
+            if inner is None:  # stub sub-optimizer (empty param groups)
+                continue
+            for param_group in inner.param_groups:
+                if len(param_group["params"]) > 0 and "step" in param_group:
+                    steps.append(param_group["step"])
+        steps = list(set(steps))
+        assert len(steps) <= 1, f"steps: {steps}"
+        step = steps[0] if len(steps) == 1 else None
+        for optimizer in self.chained_optimizers:
+            inner = getattr(optimizer, "optimizer", None)
+            if inner is None:
+                continue
+            for param_group in inner.param_groups:
+                if len(param_group["params"]) > 0 and "step" in param_group:
+                    param_group["step"] = step
+        return step
+
+    ChainedOptimizer._synchronize_steps = _synchronize_steps
+
+
+def _patch_stub_optimizer_state_dict() -> None:
+    """Make a stub sub-optimizer's (empty param group, ``optimizer is None``)
+    state-dict methods no-op instead of dereferencing ``self.optimizer``.
+
+    Muon + LoRA chains a real optimizer with a param-less stub. Megatron's
+    ``Float16OptimizerWithFloat16Params.{state_dict,sharded_state_dict}`` call
+    ``self.optimizer.state_dict()`` with no stub guard, crashing every optimizer
+    save/load ("'NoneType' object has no attribute 'state_dict'"). A stub holds
+    no optimizer state, so return an empty dict for it on both save and load.
+    """
+    try:
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+    except Exception:
+        return
+
+    def _is_stub(self) -> bool:
+        return getattr(self, "is_stub_optimizer", False) or getattr(self, "optimizer", None) is None
+
+    for _name in ("state_dict", "sharded_state_dict"):
+        _orig = getattr(Float16OptimizerWithFloat16Params, _name)
+
+        def _make(orig):
+            def _wrapped(self, *args, **kwargs):
+                if _is_stub(self):
+                    return {}
+                return orig(self, *args, **kwargs)
+
+            return _wrapped
+
+        setattr(Float16OptimizerWithFloat16Params, _name, _make(_orig))
+
+
+_patch_chained_optimizer_synchronize_steps()
+_patch_stub_optimizer_state_dict()
 
 __all__ = ["save_checkpoint"]
 

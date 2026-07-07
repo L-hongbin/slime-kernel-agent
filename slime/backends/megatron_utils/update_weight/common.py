@@ -182,6 +182,13 @@ def _named_params_and_buffers_global(
             if not name.startswith("module.module."):
                 name = "module." + name
 
+            v4_name = _maybe_v4_global_name(
+                args, model_module, name, param, expert_offset if args.num_experts else None
+            )
+            if v4_name is not None:
+                yield v4_name, param
+                continue
+
             decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
             match = re.match(decoder_layers_pattern, name)
             if not match:
@@ -221,11 +228,18 @@ def _named_params_and_buffers_global(
         # treat expert bias as normal parameters
         for name, buffer in model_module.named_buffers():
             # TODO shall we handle (almost) all buffers like Megatron Bridge
-            if "expert_bias" not in name:
+            if "expert_bias" not in name and not _is_v4_sync_buffer(model_module, name):
                 continue
             # for model without ddp wrap
             if not name.startswith("module.module."):
                 name = "module." + name
+
+            v4_name = _maybe_v4_global_name(
+                args, model_module, name, buffer, expert_offset if args.num_experts else None
+            )
+            if v4_name is not None:
+                yield v4_name, buffer
+                continue
 
             decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
             match = re.match(decoder_layers_pattern, name)
@@ -235,3 +249,57 @@ def _named_params_and_buffers_global(
                 layer_idx, rest = match.groups()
                 layer_idx = int(layer_idx) + layer_offset
                 yield f"module.module.decoder.layers.{layer_idx}.{rest}", buffer
+
+
+def _unwrap_module_with_attr(model_module: torch.nn.Module, attr: str):
+    module = model_module
+    seen = set()
+    while module is not None and id(module) not in seen:
+        seen.add(id(module))
+        if getattr(module, attr, None) is not None:
+            return module
+        module = getattr(module, "module", None)
+    return None
+
+
+def _is_v4_sync_buffer(model_module: torch.nn.Module, name: str) -> bool:
+    if _unwrap_module_with_attr(model_module, "layer_ids") is None:
+        return False
+    return name.endswith(".mlp.gate.tid2eid") or name.endswith(".mlp.gate.e_score_correction_bias")
+
+
+def _maybe_v4_global_name(
+    args: Namespace,
+    model_module: torch.nn.Module,
+    name: str,
+    tensor: torch.Tensor,
+    expert_offset: int | None,
+) -> str | None:
+    v4_module = _unwrap_module_with_attr(model_module, "layer_ids")
+    if v4_module is None:
+        return None
+    layer_ids = v4_module.layer_ids
+
+    match = re.match(r"module\.module\.layers\.(\d+)\.(.+)", name)
+    if not match:
+        return None
+
+    local_layer_idx, rest = match.groups()
+    local_layer_idx = int(local_layer_idx)
+    if local_layer_idx >= len(layer_ids):
+        raise ValueError(f"V4 local layer index {local_layer_idx} is outside layer_ids={tuple(layer_ids)} for {name}")
+    global_layer_idx = int(layer_ids[local_layer_idx])
+
+    if rest in {"mlp.experts.gate_up_proj", "mlp.experts.down_proj"}:
+        local_expert_count = int(tensor.shape[0])
+        if expert_offset is None:
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            expert_start = ep_rank * local_expert_count
+        else:
+            expert_start = int(expert_offset)
+        expert_end = expert_start + local_expert_count
+        if args.num_experts and expert_end > args.num_experts:
+            raise ValueError(f"V4 expert range [{expert_start}, {expert_end}) exceeds num_experts={args.num_experts}")
+        return f"module.module.layers.{global_layer_idx}.{rest}" f".expert_range{expert_start}-{expert_end}"
+
+    return f"module.module.layers.{global_layer_idx}.{rest}"

@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -75,8 +76,16 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    if apply_temperature and args.rollout_temperature != 1.0:
-        logits = logits.div(args.rollout_temperature)
+    # rollout_temperature == 0 (greedy) would divide logits by zero here:
+    # Inf -> log_softmax NaN -> NaN loss/grads (R6 full-loop NaN root cause).
+    # slime_validate_args rejects it at launch; assert as defense in depth.
+    if apply_temperature:
+        assert args.rollout_temperature > 0, (
+            f"rollout_temperature must be > 0 in the train-side log-prob path, got "
+            f"{args.rollout_temperature}: dividing logits by it would produce a NaN loss."
+        )
+        if args.rollout_temperature != 1.0:
+            logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -417,7 +426,13 @@ def get_log_probs_and_entropy(
         logits = logits.view(-1, logits.size(-1))
 
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
+    # rollout_temperature == 0 (greedy) would divide by zero -> NaN loss;
+    # slime_validate_args rejects it at launch; assert as defense in depth.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+    assert rollout_temperature > 0, (
+        f"rollout_temperature must be > 0 in the train-side log-prob path, got "
+        f"{rollout_temperature}: dividing logits by it would produce a NaN loss."
+    )
     if rollout_temperature != 1.0:
         logits = logits / rollout_temperature
     logits = logits.contiguous()
@@ -1208,6 +1223,23 @@ def loss_function(
         loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # Diagnostic (env-gated): print per-microbatch loss / logits magnitude / mask
+    # sums on the loss-computing stage, to compare the failing full loop against
+    # the passing debug-train-only replay (which reports loss=0.069).
+    if os.environ.get("SLIME_DEBUG_LOSS", "0") == "1":
+        try:
+            _l = loss.detach().float()
+            _lg = logits.detach().float()
+            print(
+                f"[SLIME_DEBUG_LOSS] rank={dist.get_rank() if dist.is_initialized() else -1} "
+                f"loss={_l.item():.6e} finite={bool(torch.isfinite(_l).all().item())} "
+                f"logits_absmax={_lg.abs().amax().item():.3e} num_tokens={int(num_tokens)} "
+                f"mask_sums={[int(m.sum().item()) for m in batch['loss_masks']][:4]}",
+                flush=True,
+            )
+        except Exception as _e:  # never break training from a diagnostic
+            print(f"[SLIME_DEBUG_LOSS] error: {_e}", flush=True)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so

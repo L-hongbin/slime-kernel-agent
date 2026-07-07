@@ -73,6 +73,39 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
     return tokenizer.encode(sample.prompt, add_special_tokens=False)
 
 
+def _decode_routed_experts(
+    meta_info: dict[str, Any],
+    *,
+    token_count: int,
+    num_layers: int,
+    expected_topk: int | None,
+) -> np.ndarray:
+    raw = np.frombuffer(
+        pybase64.b64decode(meta_info["routed_experts"].encode("ascii")),
+        dtype=np.int32,
+    )
+    denom = token_count * num_layers
+    if denom <= 0:
+        raise ValueError(
+            "cannot decode routed_experts with non-positive shape: "
+            f"token_count={token_count}, num_layers={num_layers}"
+        )
+    if raw.size % denom != 0:
+        raise ValueError(
+            "routed_experts payload size is not divisible by token_count*num_layers: "
+            f"size={raw.size}, token_count={token_count}, num_layers={num_layers}, "
+            f"expected_topk={expected_topk}"
+        )
+    actual_topk = raw.size // denom
+    if expected_topk is not None and actual_topk != expected_topk:
+        logger.warning(
+            "routed_experts payload topk=%s differs from args.moe_router_topk=%s; using payload shape",
+            actual_topk,
+            expected_topk,
+        )
+    return raw.reshape(token_count, num_layers, actual_topk)
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -297,13 +330,11 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     sample.rollout_log_probs += new_response_log_probs
 
     if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
-            dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
+        sample.rollout_routed_experts = _decode_routed_experts(
+            output["meta_info"],
+            token_count=len(sample.tokens) - 1,
+            num_layers=args.num_layers,
+            expected_topk=getattr(args, "moe_router_topk", None),
         )
 
     sample.update_from_meta_info(args, output["meta_info"])

@@ -1,3 +1,5 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -9,16 +11,48 @@ from slime.utils.misc import should_run_periodic_action
 def train(args):
     configure_logger()
     # allocate the GPUs
+    logger = logging.getLogger(__name__)
+    logger.info("train: creating placement groups")
     pgs = create_placement_groups(args)
     init_tracking(args)
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
+    logger.info("train: creating rollout manager")
     rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
 
-    # Update primary W&B with SGLang metrics endpoint now that servers are up.
-    router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
-    update_tracking_open_metrics(args, router_addr)
+    if args.debug_train_only:
+        logger.info("debug-train-only: skipping rollout metrics router setup")
+    else:
+        # Update primary W&B with SGLang metrics endpoint now that servers are up.
+        logger.info("train: waiting for rollout metrics router address")
+        router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
+        logger.info("train: rollout metrics router address is %s", router_addr)
+        update_tracking_open_metrics(args, router_addr)
+
+    if args.debug_rollout_only:
+        # Rollout-only debugging should not allocate Megatron actors. The
+        # placement group only contains rollout GPU bundles in this mode.
+        if args.num_rollout == 0 and args.eval_interval is not None:
+            ray.get(rollout_manager.eval.remote(rollout_id=0))
+
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+                logger.info("debug-rollout-only: starting eval rollout_id=%s", rollout_id)
+                ray.get(rollout_manager.eval.remote(rollout_id))
+
+            logger.info("debug-rollout-only: starting generate rollout_id=%s", rollout_id)
+            ray.get(rollout_manager.generate.remote(rollout_id))
+            logger.info("debug-rollout-only: finished generate rollout_id=%s", rollout_id)
+
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                logger.info("debug-rollout-only: starting periodic eval rollout_id=%s", rollout_id)
+                ray.get(rollout_manager.eval.remote(rollout_id))
+
+        logger.info("debug-rollout-only: disposing rollout manager")
+        ray.get(rollout_manager.dispose.remote())
+        finish_tracking(args)
+        return
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)

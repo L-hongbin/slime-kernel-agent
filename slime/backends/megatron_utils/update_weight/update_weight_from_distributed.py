@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import socket
 import time
 from argparse import Namespace
@@ -17,7 +18,107 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
-from .common import all_gather_param, named_params_and_buffers
+from .common import _maybe_v4_global_name, all_gather_param, named_params_and_buffers
+
+_V4_MODEL_NAME_MARKERS = ("deepseekv4", "deepseek_v4")
+_LORA_IN_SUFFIX = ".linear_in.weight"
+_LORA_OUT_SUFFIX = ".linear_out.weight"
+_WEIGHT_SUFFIX = ".weight"
+_V4_SGLANG_COMPRESSOR_WEIGHT = re.compile(r"^layers\.\d+\.attn\.(?:indexer\.)?compressor\.(wkv|wgate)\.weight$")
+_V4_SGLANG_WQKV_A_WEIGHT = re.compile(r"^layers\.\d+\.attn\.(wq_a|wkv)\.(weight|weight_scale_inv)$")
+
+
+def _is_deepseekv4_model_name(model_name: str) -> bool:
+    return any(marker in model_name for marker in _V4_MODEL_NAME_MARKERS)
+
+
+def _lora_base_weight_name(name: str) -> str | None:
+    if name.endswith(_LORA_IN_SUFFIX):
+        return name[: -len(_LORA_IN_SUFFIX)] + _WEIGHT_SUFFIX
+    if name.endswith(_LORA_OUT_SUFFIX):
+        return name[: -len(_LORA_OUT_SUFFIX)] + _WEIGHT_SUFFIX
+    return None
+
+
+def _merge_lora_weight(
+    base_weight: torch.Tensor,
+    lora_in_weight: torch.Tensor,
+    lora_out_weight: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    if base_weight.ndim != 2 or lora_in_weight.ndim != 2 or lora_out_weight.ndim != 2:
+        raise ValueError(
+            "V4 LoRA merge expects 2D linear weights, got "
+            f"base={tuple(base_weight.shape)} in={tuple(lora_in_weight.shape)} "
+            f"out={tuple(lora_out_weight.shape)}"
+        )
+    if lora_in_weight.shape[1] != base_weight.shape[1] or lora_out_weight.shape[0] != base_weight.shape[0]:
+        raise ValueError(
+            "V4 LoRA merge shape mismatch: "
+            f"base={tuple(base_weight.shape)} in={tuple(lora_in_weight.shape)} "
+            f"out={tuple(lora_out_weight.shape)}"
+        )
+    merged = base_weight.float()
+    merged = merged + lora_out_weight.float().matmul(lora_in_weight.float()) * float(scale)
+    return merged.to(dtype=base_weight.dtype)
+
+
+def _v4_sglang_compressor_pair_key(name: str) -> tuple[str, str] | None:
+    match = _V4_SGLANG_COMPRESSOR_WEIGHT.fullmatch(name)
+    if match is None:
+        return None
+    return name.rsplit(".", 2)[0], match.group(1)
+
+
+def _v4_incomplete_sglang_compressor_pairs(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> dict[str, set[str]]:
+    pairs: dict[str, set[str]] = {}
+    for name, _ in named_tensors:
+        parsed = _v4_sglang_compressor_pair_key(name)
+        if parsed is None:
+            continue
+        key, side = parsed
+        pairs.setdefault(key, set()).add(side)
+    return {key: sides for key, sides in pairs.items() if sides != {"wkv", "wgate"}}
+
+
+def _v4_sglang_wqkv_a_pair_key(name: str) -> tuple[str, str] | None:
+    match = _V4_SGLANG_WQKV_A_WEIGHT.fullmatch(name)
+    if match is None:
+        return None
+    side = "q" if match.group(1) == "wq_a" else "kv"
+    key = name.replace(".wq_a.", ".wqkv_a.").replace(".wkv.", ".wqkv_a.")
+    return key, side
+
+
+def _v4_incomplete_sglang_wqkv_a_pairs(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> dict[str, set[str]]:
+    pairs: dict[str, set[str]] = {}
+    for name, _ in named_tensors:
+        parsed = _v4_sglang_wqkv_a_pair_key(name)
+        if parsed is None:
+            continue
+        key, side = parsed
+        pairs.setdefault(key, set()).add(side)
+    return {key: sides for key, sides in pairs.items() if sides != {"q", "kv"}}
+
+
+def _v4_incomplete_sglang_loader_pairs(named_tensors: Sequence[tuple[str, torch.Tensor]]) -> dict[str, set[str]]:
+    incomplete = _v4_incomplete_sglang_compressor_pairs(named_tensors)
+    incomplete.update(_v4_incomplete_sglang_wqkv_a_pairs(named_tensors))
+    return incomplete
+
+
+def _build_v4_lora_base_scales(args: Namespace, model: Sequence[torch.nn.Module]) -> dict[str, float]:
+    scales: dict[str, float] = {}
+    for model_module in model:
+        for module_name, module in model_module.named_modules():
+            if not all(hasattr(module, attr) for attr in ("weight", "linear_in", "linear_out", "scale")):
+                continue
+            base_name = f"{module_name}.weight" if module_name else "weight"
+            if not base_name.startswith("module.module."):
+                base_name = "module." + base_name
+            global_base_name = _maybe_v4_global_name(args, model_module, base_name, module.weight, expert_offset=None)
+            scales[global_base_name or base_name] = float(module.scale)
+    return scales
 
 
 class UpdateWeightFromDistributed:
@@ -46,6 +147,7 @@ class UpdateWeightFromDistributed:
         self.weight_version = 0
         self._model_update_groups = None
         self.update_weight_metrics: dict[str, float] = {}
+        self._v4_lora_base_scales: dict[str, float] | None = None
 
     def pop_metrics(self) -> dict[str, float]:
         """
@@ -149,6 +251,17 @@ class UpdateWeightFromDistributed:
         Hook for each HF chunk in ``_send_weights`` before its broadcast. No-op by default.
         """
 
+    def _get_v4_lora_base_scales(self) -> dict[str, float]:
+        if self._v4_lora_base_scales is None:
+            if _is_deepseekv4_model_name(self.model_name):
+                self._v4_lora_base_scales = _build_v4_lora_base_scales(self.args, self.model)
+            else:
+                self._v4_lora_base_scales = {}
+        return self._v4_lora_base_scales
+
+    def _uses_v4_lora_only_sync(self) -> bool:
+        return bool(self._get_v4_lora_base_scales())
+
     def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """
         Yield broadcast-sized HF chunks of non-expert params: TP all-gather +
@@ -157,21 +270,60 @@ class UpdateWeightFromDistributed:
         """
         buffer_size = 0
         buffer: list[tuple[str, torch.Tensor]] = []
-        for name, param in named_params_and_buffers(self.args, self.model):
+        named_tensors = list(named_params_and_buffers(self.args, self.model))
+        v4_lora_base_scales = self._get_v4_lora_base_scales()
+        v4_lora_only_sync = bool(v4_lora_base_scales)
+        v4_sglang_loader_pair_protection = _is_deepseekv4_model_name(self.model_name)
+        tensor_by_name = dict(named_tensors) if v4_lora_only_sync else {}
+        for name, param in named_tensors:
             if ".experts." in name:
                 continue
-            param = all_gather_param(name, param)
+
+            if v4_lora_only_sync:
+                if _lora_base_weight_name(name) is not None:
+                    continue
+                if name not in v4_lora_base_scales:
+                    continue
+
+                prefix = name[: -len(_WEIGHT_SUFFIX)]
+                lora_in_name = prefix + _LORA_IN_SUFFIX
+                lora_out_name = prefix + _LORA_OUT_SUFFIX
+                if lora_in_name not in tensor_by_name or lora_out_name not in tensor_by_name:
+                    raise KeyError(
+                        f"V4 LoRA base {name!r} is missing adapter tensors " f"{lora_in_name!r}/{lora_out_name!r}"
+                    )
+
+                base_param = all_gather_param(name, param)
+                lora_in = all_gather_param(lora_in_name, tensor_by_name[lora_in_name])
+                lora_out = all_gather_param(lora_out_name, tensor_by_name[lora_out_name])
+                if not self._is_pp_src_rank:
+                    continue
+                param = _merge_lora_weight(base_param, lora_in, lora_out, v4_lora_base_scales[name])
+            else:
+                param = all_gather_param(name, param)
+
             if not self._is_pp_src_rank:
                 continue
             hf_chunk = convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
             chunk_bytes = sum(t.numel() * t.element_size() for _, t in hf_chunk)
-            if buffer and buffer_size + chunk_bytes > self.args.update_weight_buffer_size:
+            if (
+                buffer
+                and buffer_size + chunk_bytes > self.args.update_weight_buffer_size
+                and not (v4_sglang_loader_pair_protection and _v4_incomplete_sglang_loader_pairs(buffer))
+            ):
                 yield buffer
                 buffer = []
                 buffer_size = 0
             buffer.extend(hf_chunk)
             buffer_size += chunk_bytes
         if buffer:
+            if v4_sglang_loader_pair_protection:
+                incomplete = _v4_incomplete_sglang_loader_pairs(buffer)
+                if incomplete:
+                    raise ValueError(
+                        "DeepSeek-V4 SGLang loader requires fused raw-name weight pairs "
+                        f"in the same online update chunk; incomplete pairs: {incomplete}"
+                    )
             yield buffer
 
     def _iter_expert_chunks(
@@ -184,6 +336,8 @@ class UpdateWeightFromDistributed:
         callers restrict the iter to a subset (used by delta-sync sub-passes);
         defaults to all expert params on this rank.
         """
+        if self._uses_v4_lora_only_sync():
+            return
         if params is None:
             params = ((n, p) for n, p in named_params_and_buffers(self.args, self.model) if ".experts." in n)
         buffer_size = 0
@@ -258,19 +412,29 @@ class UpdateWeightFromDistributed:
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(0.1)
 
-        refs = update_weights_from_distributed(
-            self._group_name,
-            self._model_update_groups,
-            self.weight_version,
-            self.rollout_engines,
-            converted_named_tensors,
-            load_format=load_format,
-            delta=delta,
-        )
-
-        ray.get(refs)
-        converted_named_tensors.clear()
-        ray.get(self.rollout_engine_lock.release.remote())
+        try:
+            refs = update_weights_from_distributed(
+                self._group_name,
+                self._model_update_groups,
+                self.weight_version,
+                self.rollout_engines,
+                converted_named_tensors,
+                load_format=load_format,
+                delta=delta,
+            )
+            try:
+                ray.get(refs)
+            except Exception as exc:
+                names = [name for name, _ in converted_named_tensors]
+                preview = names[:8]
+                suffix = " ..." if len(names) > len(preview) else ""
+                raise RuntimeError(
+                    f"Distributed weight update failed for group {self._group_name} "
+                    f"with {len(names)} tensors: {preview}{suffix}"
+                ) from exc
+            converted_named_tensors.clear()
+        finally:
+            ray.get(self.rollout_engine_lock.release.remote())
         pbar.update(1)
 
 

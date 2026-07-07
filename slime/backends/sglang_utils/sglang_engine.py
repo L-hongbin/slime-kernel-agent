@@ -17,6 +17,7 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+DEFAULT_ROUTER_REGISTRATION_TIMEOUT_SECS = 300.0
 
 
 def get_base_gpu_id(args, rank):
@@ -160,6 +161,17 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        logger.warning(
+            "SGLangEngine launch rank=%s worker_type=%s base_gpu_id=%s "
+            "tp_size=%s CUDA_VISIBLE_DEVICES=%s host=%s port=%s",
+            self.rank,
+            self.worker_type,
+            server_args_dict.get("base_gpu_id"),
+            server_args_dict.get("tp_size"),
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            self.server_host,
+            self.server_port,
+        )
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -198,23 +210,46 @@ class SGLangEngine(RayActor):
             return
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
+            worker_url = f"http://{self.server_host}:{self.server_port}"
+            registration_timeout = float(
+                os.environ.get("SGLANG_ROUTER_REGISTRATION_TIMEOUT_SECS", DEFAULT_ROUTER_REGISTRATION_TIMEOUT_SECS)
+            )
             if parse(sglang_router.__version__) <= parse("0.2.1"):
-                assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}",
+                registration_url = f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}"
+                logger.info(
+                    "Register SGLang worker with router: url=%s worker_type=%s timeout=%.1fs",
+                    registration_url,
+                    self.worker_type,
+                    registration_timeout,
                 )
+                assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
+                response = requests.post(registration_url, timeout=registration_timeout)
             else:
                 payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
+                    "url": worker_url,
                     "worker_type": self.worker_type,
                 }
                 if self.worker_type == "prefill":
                     payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
+                registration_url = f"http://{self.router_ip}:{self.router_port}/workers"
+                logger.info(
+                    "Register SGLang worker with router: url=%s payload=%s timeout=%.1fs",
+                    registration_url,
+                    payload,
+                    registration_timeout,
+                )
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    registration_url,
                     json=payload,
+                    timeout=registration_timeout,
                 )
             response.raise_for_status()
+            logger.info(
+                "Registered SGLang worker with router: worker_url=%s worker_type=%s status=%s",
+                worker_url,
+                self.worker_type,
+                response.status_code,
+            )
 
     def _make_request(self, endpoint: str, payload: dict | None = None):
         """Make a POST request to the specified endpoint with the given payload.

@@ -14,7 +14,7 @@ try:
 except ImportError:
     ray = None
 
-from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.sglang_rollout import GenerateState, _decode_routed_experts
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -535,6 +535,18 @@ def _sample_for_turn(
         if getattr(args, "sglang_speculative_algorithm", None):
             turn_sample.spec_info.add(meta_info=meta_info)
         turn_sample.prefix_cache_info.add(meta_info=meta_info)
+        # V4 MoE routing replay: decode this call's routed-expert indices into the
+        # turn sample (mirrors the default rollout, sglang_rollout.py; row count
+        # must be len(tokens)-1 per the upstream shape contract, THUDM/slime
+        # 1b73ddc1). fill_routing_replay requires this on EVERY sample when
+        # --use-rollout-routing-replay is set.
+        if getattr(args, "use_rollout_routing_replay", False) and "routed_experts" in meta_info:
+            turn_sample.rollout_routed_experts = _decode_routed_experts(
+                meta_info,
+                token_count=len(turn_sample.tokens) - 1,
+                num_layers=args.num_layers,
+                expected_topk=getattr(args, "moe_router_topk", None),
+            )
     return turn_sample
 
 
@@ -566,6 +578,15 @@ def _pad_turn_samples(
         fake_sample.rollout_log_probs = [0.0]
         fake_sample.reward = 0.0
         fake_sample.status = Sample.Status.COMPLETED
+        # V4 routing replay: a pad turn has len(tokens)-1 == 0 replayable tokens,
+        # so it carries an EMPTY (0, num_layers, topk) routed array — shape taken
+        # from any real turn — satisfying fill_routing_replay's per-sample
+        # invariant without influencing training (loss_mask 0, remove_sample).
+        for real in output_samples:
+            routed = getattr(real, "rollout_routed_experts", None)
+            if routed is not None:
+                fake_sample.rollout_routed_experts = routed[:0]
+                break
         fake_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
         fake_sample.loss_mask = [0]
         fake_sample.remove_sample = True
@@ -739,6 +760,13 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        # V4 MoE routing replay: ask the engine for the per-token routed-expert
+        # indices so the train side can replay rollout routing (same request the
+        # default slime rollout makes, sglang_rollout.py). Each turn is a
+        # standalone Sample (tokens = this call's prompt+response), so the
+        # per-call payload aligns with the turn sample 1:1.
+        if getattr(args, "use_rollout_routing_replay", False):
+            payload["return_routed_experts"] = True
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
         output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)

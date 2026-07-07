@@ -8,6 +8,11 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
+
+from .path_bootstrap import ensure_megatron_lm_on_sys_path
+
+ensure_megatron_lm_on_sys_path()
+
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
@@ -20,7 +25,7 @@ from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
-from slime.utils.routing_replay import RoutingReplay
+from slime.utils.routing_replay import RoutingReplay, record_rollout_routing_replay_for_layer
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
 
@@ -81,6 +86,15 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+
+        # V4 LoRA adapter-only resume: base loaded cold from --load above; overlay
+        # saved adapters (+ Muon optim) from the adapter checkpoint and continue
+        # the rollout counter from its iteration.
+        from .adapter_ckpt import adapter_only_ckpt_enabled
+
+        adapter_resume_path = os.environ.get("V4_LORA_ADAPTER_RESUME_LOAD", "")
+        if adapter_resume_path and adapter_only_ckpt_enabled(args) and role == "actor":
+            loaded_rollout_id = self.load_adapter_resume(adapter_resume_path, load_optim=not args.no_load_optim)
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -256,6 +270,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
             rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
 
+            # V4 PP needs the hidden-stream tensor shape to match this padded
+            # per-rollout length (all microbatches share it). model.py's V4 PP
+            # shape adapter + forward_backward seq_length read it from here; the
+            # static args.seq_length would give a stale (too-short) PP buffer.
+            self.args._v4_pp_current_seq_len = max_seq_len
+
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
                 continue
@@ -333,12 +353,33 @@ class MegatronTrainRayActor(TrainRayActor):
             # TODO: fuse this padding with the following slice_with_cp to reduce memory copy.
             rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
             # TODO: maybe extract a common process function for here and get_batch?
-            rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-            if pad != 0:
-                rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+            if self.args.qkv_format == "bshd":
+                # Match get_batch (data.py): in bshd each sample is padded to the
+                # rollout-wide max_seq_len and stacked, so the router flattens a
+                # [B, max_seq_len] grid. The replayed routing must be padded the
+                # SAME way (per-sample to max_seq_len), not just to pad_size —
+                # otherwise a short sample yields too few routing rows vs the
+                # globally-padded tokens ("replayed indices 128 vs scores 256").
+                max_seqlen = rollout_data["max_seq_lens"][0]
+                # Mirror get_batch's invariant (data.py): no sample may exceed the
+                # rollout-wide max_seq_len, else slice_with_cp's bshd pad goes
+                # negative and silently TRUNCATES routing (corrupting the replay).
+                for r in rollout_routed_experts:
+                    assert r.shape[0] <= max_seqlen, (
+                        f"routing rows {r.shape[0]} > max_seqlen {max_seqlen}; "
+                        "rollout max_seq_lens is inconsistent with the token padding"
+                    )
+                rollout_routed_experts = [
+                    slice_with_cp(r, pad_func, self.args.qkv_format, max_seqlen) for r in rollout_routed_experts
+                ]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+            else:
+                rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+                pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+                if pad != 0:
+                    rollout_routed_experts = pad_func(rollout_routed_experts, pad)
 
             if self.args.sequence_parallel:
                 seqlen = rollout_routed_experts.size(0)
@@ -348,7 +389,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
             routing_replay_offset = 0
             for vp_stage, model in enumerate(self.model):
-                config = model.module.config
+                model_module = model.module
+                config = model_module.config
                 num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
                 offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
                 for layer_id in range(offset, offset + num_layers_to_build):
@@ -361,9 +403,18 @@ class MegatronTrainRayActor(TrainRayActor):
                         if config.moe_layer_freq[layer_id] == 0:
                             continue
                     layer_routed_experts = rollout_routed_experts[:, layer_id]
-                    RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
-                    routing_replay_offset += 1
-            assert routing_replay_offset == len(RoutingReplay.all_routing_replays)
+                    routing_replay_offset = record_rollout_routing_replay_for_layer(
+                        model_module,
+                        layer_id,
+                        layer_routed_experts,
+                        routing_replay_offset,
+                    )
+            if routing_replay_offset != len(RoutingReplay.all_routing_replays):
+                raise AssertionError(
+                    "rollout routing replay did not fill all registered replays: "
+                    f"recorded={routing_replay_offset}, "
+                    f"registered={len(RoutingReplay.all_routing_replays)}"
+                )
 
         del rollout_data["rollout_routed_experts"]
 
@@ -449,6 +500,38 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+        # Diagnostic (env-gated, no-op unless enabled): after update_weights and
+        # before the first train forward/backward, scan live model params for
+        # NaN/Inf to tell param-corruption from a backward-compute NaN.
+        if os.environ.get("SLIME_DEBUG_CHECK_PARAMS", "0") == "1":
+            try:
+                bad = [
+                    (n, tuple(p.shape))
+                    for mdl in self.model
+                    for n, p in mdl.named_parameters()
+                    if not torch.isfinite(p.data).all()
+                ]
+                # Value checksum (not just finiteness): compare live full-loop vs
+                # debug-replay to detect params changed in place by update_weights.
+                csum = 0.0
+                for mdl in self.model:
+                    for _, p in mdl.named_parameters():
+                        csum += p.data.float().abs().sum().item()
+                print(
+                    f"[SLIME_DEBUG_CHECK_PARAMS] rollout_id={rollout_id} rank={dist.get_rank()} "
+                    f"pp={mpu.get_pipeline_model_parallel_rank()} nonfinite_params={len(bad)} "
+                    f"param_abs_sum={csum:.8e} first={bad[:5]}",
+                    flush=True,
+                )
+            except Exception as _e:  # never let the diagnostic break training
+                print(f"[SLIME_DEBUG_CHECK_PARAMS] error: {_e}", flush=True)
+        # Diagnostic (env-gated): autograd anomaly detection raises at the first
+        # backward op that produces NaN, with a traceback to the forward op that
+        # created it — pinpoints where the full-loop NaN originates.
+        if os.environ.get("SLIME_DEBUG_ANOMALY", "0") == "1":
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
+            if dist.get_rank() == 0:
+                print("[SLIME_DEBUG_ANOMALY] autograd anomaly detection ON", flush=True)
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
@@ -538,6 +621,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data,
             )
 
+            # Free the log-prob phase's cached/fragmented blocks before the train
+            # backward — at ctx 16k the stage-2 backward OOM'd by ~0.3GB with
+            # ~3.7GB sitting reserved-but-unallocated (v10, 2026-07-05).
+            if os.environ.get("V4_EMPTY_CACHE_BETWEEN_PHASES", "0") == "1":
+                clear_memory()
+
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
@@ -557,6 +646,10 @@ class MegatronTrainRayActor(TrainRayActor):
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
+            # Codex-review invariant: with V4 act-ckpt, verify every recorded
+            # routing entry was consumed by BOTH the forward and the backward
+            # recompute before clearing (catches silent same-shape misalignment).
+            RoutingReplay.check_fully_consumed(context=f"rollout {rollout_id} post-train")
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
@@ -692,3 +785,35 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
+
+    def load_adapter_resume(self, path: str, load_optim: bool = True) -> int:
+        """Resume V4 LoRA training from an adapter-only checkpoint.
+
+        The frozen base was already loaded cold from ``--load`` (torch_dist) in
+        ``initialize_model_and_optimizer``; this overlays the saved adapter
+        weights (and, when ``load_optim``, the Muon optimizer state) from an
+        adapter-only ``--save`` dir. Returns the checkpoint's iteration so the
+        rollout counter continues instead of restarting at 0. The model
+        sharded_state_dict is filtered to adapter keys so Megatron's load only
+        requests the (present) adapter tensors, not the absent base.
+        """
+        from .adapter_ckpt import adapter_only_model_load
+
+        old = (self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune)
+        self.args.load = path
+        self.args.no_load_optim = not load_optim
+        self.args.no_load_rng = True
+        self.args.finetune = False  # a real resume: keep the checkpoint iteration
+        try:
+            with adapter_only_model_load(self.model):
+                iteration, _ = load_checkpoint(
+                    self.model,
+                    self.optimizer if load_optim else None,
+                    self.opt_param_scheduler if load_optim else None,
+                    checkpointing_context={},
+                    skip_load_to_model_and_opt=False,
+                )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old
+        logger.info("V4 LoRA adapter resume: loaded adapters from %s at iteration %d", path, iteration)
+        return iteration

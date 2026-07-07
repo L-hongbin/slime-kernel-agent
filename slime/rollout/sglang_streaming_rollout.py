@@ -29,10 +29,7 @@ import logging
 from argparse import Namespace
 from typing import Any
 
-import numpy as np
-import pybase64
-
-from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids
+from slime.rollout.sglang_rollout import GenerateState, _decode_routed_experts, _prepare_prompt_ids
 from slime.utils import http_utils
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_span
@@ -152,13 +149,11 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
 
     # MoE routing replay (when requested) ships in the terminal chunk.
     if "routed_experts" in last_meta_info:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(last_meta_info["routed_experts"].encode("ascii")),
-            dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
+        sample.rollout_routed_experts = _decode_routed_experts(
+            last_meta_info,
+            token_count=len(sample.tokens) - 1,
+            num_layers=args.num_layers,
+            expected_topk=getattr(args, "moe_router_topk", None),
         )
 
     if last_meta_info.get("finish_reason"):

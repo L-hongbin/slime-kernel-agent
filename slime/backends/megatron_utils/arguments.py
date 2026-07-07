@@ -1,6 +1,10 @@
 import ast
 import logging
 
+from .path_bootstrap import ensure_megatron_lm_on_sys_path
+
+ensure_megatron_lm_on_sys_path()
+
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
@@ -145,8 +149,21 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    use_muon = "muon" in getattr(args, "optimizer", "")
+    if use_muon:
+        if getattr(args, "use_distributed_optimizer", False):
+            logger.info("Disabling distributed optimizer because Megatron Muon does not support it.")
+        if getattr(args, "overlap_grad_reduce", False):
+            logger.info("Disabling overlap_grad_reduce because Megatron Muon does not support it.")
+        if getattr(args, "overlap_param_gather", False):
+            logger.info("Disabling overlap_param_gather because Megatron Muon does not support it.")
+        args.use_distributed_optimizer = False
+        args.overlap_grad_reduce = False
+        args.overlap_param_gather = False
+        args.overlap_param_gather_with_optimizer_step = False
+    else:
+        # always use zero optimizer
+        args.use_distributed_optimizer = True
     # TODO: maybe change this after megatron has good fp8 support
     args.bf16 = not args.fp16
     # placeholders

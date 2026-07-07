@@ -3,6 +3,7 @@ import torch
 
 
 ROUTING_REPLAY = None
+ROUTING_REPLAY_LAYER_NOT_FOUND = object()
 
 
 def set_routing_replay(replay):
@@ -42,6 +43,35 @@ class RoutingReplay:
 
     def clear_forward(self):
         self.forward_index = 0
+
+    @staticmethod
+    def check_fully_consumed(context: str = "") -> None:
+        """Replay-consumption invariant (codex milestone review 2026-07-05).
+
+        With V4 activation checkpointing, every recorded routing entry must be
+        popped exactly once by the forward pass (forward_index) AND once by the
+        backward recompute (backward_index). A same-shaped misalignment (wrong
+        microbatch/layer replayed) advances the indices inconsistently, silently
+        biasing gradients — the per-pop shape assert cannot catch it. Warn by
+        default; V4_REPLAY_STRICT=1 raises instead.
+        """
+        import logging
+
+        if os.environ.get("V4_ACT_CKPT", "0") != "1":
+            return
+        problems = []
+        for i, replay in enumerate(RoutingReplay.all_routing_replays):
+            n = len(replay.top_indices_list)
+            if replay.forward_index != n or replay.backward_index != n:
+                problems.append(
+                    f"replay[{i}]: recorded={n} forward_popped={replay.forward_index} "
+                    f"backward_popped={replay.backward_index}"
+                )
+        if problems:
+            msg = f"routing replay not fully consumed ({context}): " + "; ".join(problems[:4])
+            if os.environ.get("V4_REPLAY_STRICT", "0") == "1":
+                raise AssertionError(msg)
+            logging.getLogger(__name__).warning(msg)
 
     @staticmethod
     def clear_all():
@@ -90,3 +120,87 @@ def register_routing_replay(module):
             set_routing_replay(module.routing_replay)
 
         module.register_forward_pre_hook(pre_forward_hook)
+
+
+def _iter_module_candidates(module):
+    seen = set()
+    stack = [module]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+
+        for attr in ("module", "model", "language_model"):
+            child = getattr(current, attr, None)
+            if child is not None and child is not current:
+                stack.append(child)
+
+        modules = getattr(current, "modules", None)
+        if callable(modules):
+            for child in modules():
+                if child is not current:
+                    stack.append(child)
+
+
+def get_rollout_routing_replay_for_layer(model_module, layer_id: int):
+    """Return a layer gate replay object, None for a known non-replay layer, or sentinel."""
+    for candidate in _iter_module_candidates(model_module):
+        layer_ids = getattr(candidate, "layer_ids", None)
+        layers = getattr(candidate, "layers", None)
+        if layer_ids is None or layers is None:
+            continue
+        try:
+            local_idx = tuple(layer_ids).index(layer_id)
+        except ValueError:
+            continue
+        if local_idx >= len(layers):
+            return None
+        mlp = getattr(layers[local_idx], "mlp", None)
+        gate = getattr(mlp, "gate", None)
+        return getattr(gate, "routing_replay", None)
+    return ROUTING_REPLAY_LAYER_NOT_FOUND
+
+
+def record_rollout_routing_replay_for_layer(
+    model_module,
+    layer_id: int,
+    layer_routed_experts: torch.Tensor,
+    routing_replay_offset: int,
+) -> int:
+    replay = get_rollout_routing_replay_for_layer(model_module, layer_id)
+    if replay is None:
+        return routing_replay_offset
+    if replay is ROUTING_REPLAY_LAYER_NOT_FOUND:
+        if routing_replay_offset >= len(RoutingReplay.all_routing_replays):
+            raise IndexError(
+                "rollout routing replay offset out of range: "
+                f"layer_id={layer_id}, offset={routing_replay_offset}, "
+                f"registered_replays={len(RoutingReplay.all_routing_replays)}, "
+                f"model_layer_ids={getattr(model_module, 'layer_ids', None)}"
+            )
+        replay = RoutingReplay.all_routing_replays[routing_replay_offset]
+    replay.record(layer_routed_experts)
+    return routing_replay_offset + 1
+
+
+def should_skip_rollout_routing_replay_layer(model_module, layer_id: int) -> bool:
+    """Return True for known layers whose router has no replay object."""
+    replay = get_rollout_routing_replay_for_layer(model_module, layer_id)
+    if replay is ROUTING_REPLAY_LAYER_NOT_FOUND:
+        return False
+    if replay is not None:
+        return False
+    layer_ids = getattr(model_module, "layer_ids", None)
+    layers = getattr(model_module, "layers", None)
+    if layer_ids is None or layers is None:
+        return True
+    try:
+        local_idx = tuple(layer_ids).index(layer_id)
+    except ValueError:
+        return False
+    if local_idx >= len(layers):
+        return True
+    mlp = getattr(layers[local_idx], "mlp", None)
+    return bool(getattr(mlp, "is_hash", True))

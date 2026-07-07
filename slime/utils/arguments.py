@@ -132,6 +132,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--actor-placement-resource",
+                type=str,
+                default=None,
+                help=(
+                    "Optional Ray custom resource name required by each actor placement-group GPU bundle. "
+                    "Use this to pin training actors to nodes started with matching --resources."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-placement-resource",
+                type=str,
+                default=None,
+                help=(
+                    "Optional Ray custom resource name required by each rollout placement-group GPU bundle. "
+                    "Use this to reserve separate rollout nodes in non-colocated runs."
+                ),
+            )
+            parser.add_argument(
                 "--colocate",
                 action="store_true",
                 default=False,
@@ -1906,6 +1924,17 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     _parse_sequence_mis_args(args)
+    # rollout_temperature <= 0 (greedy) breaks the train-side log-prob path,
+    # which divides logits by the temperature to match rollout log-probs:
+    # /0 -> Inf -> NaN loss -> "found NaN in local grad norm" in the first
+    # backward. Only rollout-only debugging (no train side) may use it.
+    if getattr(args, "rollout_temperature", 1.0) <= 0 and not getattr(args, "debug_rollout_only", False):
+        raise ValueError(
+            f"--rollout-temperature must be > 0 for training (got {args.rollout_temperature}): "
+            "the train-side log-prob computation divides logits by the rollout temperature, "
+            "so 0 (greedy) produces a NaN loss. Use --rollout-temperature 1 for on-policy RL; "
+            "temperature 0 is only allowed with --debug-rollout-only."
+        )
     if getattr(args, "sequence_mis_aggregation", None) == "turns_geometric" and not getattr(
         args, "enable_turns_dp_partitions", False
     ):

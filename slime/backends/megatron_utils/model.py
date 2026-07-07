@@ -15,6 +15,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -57,6 +58,71 @@ def _should_update_microbatch_pbar(model) -> bool:
     if mpu.get_virtual_pipeline_model_parallel_world_size() is not None and vp_stage is not None:
         return mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
     return mpu.is_pipeline_last_stage(ignore_virtual=True)
+
+
+def _v4_current_pp_seq_length(args: Namespace) -> int:
+    """The sequence length the CURRENT forward pass actually communicates.
+
+    slime pads each rollout's tokens to a per-step ``max_seq_len`` (actor.py, the
+    padded max over ``total_lengths``), stored on ``args._v4_pp_current_seq_len``.
+    That value — not the static ``args.seq_length`` — is what ``get_batch``
+    produces and what RoPE/position_ids use, so it is the length PP must
+    communicate. Falls back to ``args.seq_length`` when unset (e.g. before the
+    first rollout, or non-rollout forwards)."""
+    override = getattr(args, "_v4_pp_current_seq_len", None)
+    if override:
+        return int(override)
+    return int(args.seq_length)
+
+
+def _v4_pp_sequence_length(args: Namespace) -> int:
+    """Sequence length that V4 PP stages communicate for the current batch.
+
+    In slime's ``bshd`` path, ``get_batch`` pads token/loss-mask tensors to the
+    per-step ``max_seq_len``.  PP hidden-state communication must use the same
+    padded sequence length; otherwise non-first stages recompute RoPE for the
+    padded input ids but receive a shorter hidden stream (the RL log-prob forward
+    crashed here: q S=128 from a stale args.seq_length vs cos/sin S=384 from the
+    real rollout data).
+    """
+    seq_length = _v4_current_pp_seq_length(args)
+    if getattr(args, "qkv_format", None) == "bshd":
+        tp_size = int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        pad_multiplier = int(getattr(args, "data_pad_size_multiplier", 1) or 1)
+        pad_size = max(1, tp_size * pad_multiplier)
+        seq_length = ((seq_length + pad_size - 1) // pad_size) * pad_size
+    return seq_length
+
+
+def _v4_pp_adjust_tensor_shapes_fn(args: Namespace, model: Sequence[DDP]):
+    """Return Megatron PP tensor-shape adapter for V4's 4D hc stream, if needed.
+
+    Megatron's non-interleaved PP schedule defaults to communicating [S, B, H].
+    V4 stages pass the hyper-connection stream [B, S, hc_mult, H], so PP>1 needs
+    explicit recv/send shapes. Interleaved PP still has no adjust hook upstream.
+    """
+    if getattr(args, "pipeline_model_parallel_size", 1) <= 1:
+        return None
+    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
+        raise ValueError("V4LanguageModel does not support virtual pipeline parallelism yet")
+
+    hf_config = None
+    for module in unwrap_model(model):
+        hf_config = getattr(module, "hf_config", None)
+        if hf_config is not None and hasattr(hf_config, "hc_mult"):
+            break
+    if hf_config is None or not hasattr(hf_config, "hc_mult"):
+        return None
+
+    hc_mult = int(hf_config.hc_mult)
+    hidden_size = int(hf_config.hidden_size)
+    pp_seq_length = _v4_pp_sequence_length(args)
+
+    def adjust_tensor_shapes(_recv_shapes, _send_shapes):
+        shape = (args.micro_batch_size, pp_seq_length, hc_mult, hidden_size)
+        return [shape], [shape]
+
+    return adjust_tensor_shapes
 
 
 def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):
@@ -225,11 +291,19 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-    )
+    if "muon" in config.optimizer:
+        optimizer = get_megatron_muon_optimizer(
+            config=config,
+            model_chunks=model,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+            layer_wise_distributed_optimizer="dist" in config.optimizer,
+        )
+    else:
+        optimizer = get_megatron_optimizer(
+            config=config,
+            model_chunks=model,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 
@@ -369,6 +443,16 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
+    # V4's PP hidden stream is 4D [B, S, hc_mult, H]; PP>1 needs the same
+    # recv/send shape adapter here as the training forward (build_train_step),
+    # otherwise stage 1's log-prob forward allocates a 3D recv buffer and the mHC
+    # kernel fails with "not enough values to unpack (expected 4, got 3)". Returns
+    # None for PP<=1 / non-V4 models, so this is a no-op elsewhere.
+    adjust_tensor_shapes_fn = _v4_pp_adjust_tensor_shapes_fn(args, model)
+    # When the V4 adapter is active it fixes the PP tensor shape, so Megatron's
+    # own get_tensor_shapes must be told the same (current-rollout) seq length,
+    # not the static args.seq_length. No-op for non-V4 / PP<=1 (adapter is None).
+    log_prob_seq_length = _v4_current_pp_seq_length(args) if adjust_tensor_shapes_fn is not None else args.seq_length
     # Don't care about timing during evaluation
     config.timers = None
     forward_data_store = []
@@ -388,9 +472,10 @@ def forward_only(
             data_iterator=data_iterator,
             model=model,
             num_microbatches=num_microbatches[step_id],
-            seq_length=args.seq_length,
+            seq_length=log_prob_seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
+            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
     microbatch_pbar.close()
 
@@ -552,15 +637,20 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    adjust_tensor_shapes_fn = _v4_pp_adjust_tensor_shapes_fn(args, model)
+    # See forward_only: when the V4 adapter fixes the PP shape, Megatron's
+    # get_tensor_shapes must use the same current-rollout seq length.
+    train_seq_length = _v4_current_pp_seq_length(args) if adjust_tensor_shapes_fn is not None else args.seq_length
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
         data_iterator=data_iterator,
         model=model,
         num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
+        seq_length=train_seq_length,
         micro_batch_size=args.micro_batch_size,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
+        adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
     )
 
     valid_step = True
@@ -868,19 +958,44 @@ def save(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
+    from .adapter_ckpt import (
+        adapter_only_ckpt_enabled,
+        adapter_only_model_save,
+        replicate_ckpt_metadata_per_node,
+        write_latest_marker_per_node,
+    )
+
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
+
+    def _do_save():
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
+
+    if adapter_only_ckpt_enabled(args):
+        # LoRA-only save: filter the model state dict to adapter params (frozen
+        # base reloads cold from --load on resume). Always logs full-vs-kept byte
+        # sizes so the adapter-only shrink is visible.
+        with adapter_only_model_save(model):
+            _do_save()
+        # /nfs is per-node: replicate the rank-0 torch_dist metadata + latest
+        # marker to every node so the resume's format detection + load work
+        # cluster-wide (each node otherwise has only its own data shards).
+        if args.save:
+            replicate_ckpt_metadata_per_node(args.save, iteration)
+            write_latest_marker_per_node(args.save, iteration)
+    else:
+        _do_save()
+
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -975,4 +1090,71 @@ def initialize_model_and_optimizer(
             optimizer.reload_model_params()
     clear_memory()
 
+    _maybe_quantize_v4_frozen_experts_fp8(model)
+
     return model, optimizer, opt_param_scheduler, iteration
+
+
+def _maybe_quantize_v4_frozen_experts_fp8(model):
+    """After the base checkpoint load, requantize V4's frozen MoE experts to fp8
+    (V4_FP8_FROZEN_EXPERTS=1) — halves their resident memory so ctx-16k fits. Must
+    run post-load (weights populated) and post-critic-reinit; frozen experts carry
+    no optimizer state, so the optimizer is untouched. No-op when the flag is off
+    or the model has no V4GroupedExperts (non-V4 runs)."""
+    import os
+
+    if os.environ.get("V4_FP8_FROZEN_EXPERTS", "0") != "1":
+        return
+    # After quantization V4GroupedExperts.sharded_state_dict() returns {} for the
+    # frozen experts, which is ONLY correct for adapter-only saves. A full save (or
+    # a full ref/teacher/old_actor load) would silently drop them. Fail loud rather
+    # than corrupt (codex review 2026-07-05, finding 1). Our formal config uses
+    # V4_LORA_ADAPTER_ONLY_CKPT=1 and no ref/teacher/old_actor.
+    if os.environ.get("V4_LORA_ADAPTER_ONLY_CKPT", "0") != "1":
+        raise RuntimeError(
+            "V4_FP8_FROZEN_EXPERTS=1 requires V4_LORA_ADAPTER_ONLY_CKPT=1 "
+            "(a full checkpoint save/load would drop the fp8-quantized frozen experts)"
+        )
+    import torch
+
+    before_gb = torch.cuda.memory_allocated() / 1e9
+    shared_fp8 = os.environ.get("V4_FP8_SHARED_EXPERT", "0") == "1"
+    attn_fp8 = os.environ.get("V4_FP8_ATTENTION", "0") == "1"
+    n = 0
+    n_shared = 0
+    n_attn = 0
+    for chunk in model:
+        for module in chunk.modules():
+            if hasattr(module, "quantize_frozen_experts_fp8"):
+                module.quantize_frozen_experts_fp8()
+                n += 1
+            elif shared_fp8 and hasattr(module, "quantize_fp8"):
+                module.quantize_fp8()  # V4SharedExpertMLP (fp8 compute matches sglang)
+                n_shared += 1
+    if attn_fp8:
+        # fp8 the LoRA-wrapped attention projections whose base is fp8 in the
+        # checkpoint (self_attn wq_a/wq_b/wkv/wo_b); o_a_proj stays bf16 (bf16 in ckpt).
+        from custom_kernels.deepseek_v4.megatron.mcore_model import quantize_lora_adapter_fp8
+
+        _attn_targets = ("q_a_proj", "q_b_proj", "kv_proj", "o_b_proj")
+        for chunk in model:
+            for name, module in chunk.named_modules():
+                if (
+                    any(name.endswith("self_attn." + t) for t in _attn_targets)
+                    and hasattr(module, "linear_in")  # is a LoRA adapter
+                    and hasattr(module, "weight")  # base not yet fp8-quantized
+                ):
+                    quantize_lora_adapter_fp8(module)
+                    n_attn += 1
+    if n:
+        clear_memory()
+        after_gb = torch.cuda.memory_allocated() / 1e9
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+        # If the bf16 expert Parameters are still referenced (DDP grad buffer,
+        # Float16Module copy, optimizer main-param), delattr won't free them and
+        # freed_GB ~= 0 — the fp8 buffers then ADD memory instead of saving it.
+        print(
+            f"[V4_FP8_FROZEN_EXPERTS] rank={rank} quantized {n} expert + {n_shared} shared + {n_attn} attn modules; "
+            f"cuda_allocated {before_gb:.1f} -> {after_gb:.1f} GB (freed {before_gb - after_gb:.1f} GB)",
+            flush=True,
+        )

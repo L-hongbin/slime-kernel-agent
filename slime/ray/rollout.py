@@ -35,6 +35,17 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+SGLANG_ENGINE_ENV_DEFAULTS = {
+    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "true",
+    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "true",
+    "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
+    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+    "SLIME_ENABLE_PROFILING": "true",
+}
+
 
 @dataclasses.dataclass
 class ServerGroup:
@@ -121,18 +132,7 @@ class ServerGroup:
             )
 
             env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-                key: os.environ.get(key, default_val)
-                for key, default_val in {
-                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "true",
-                    "SGLANG_JIT_DEEPGEMM_FAST_WARMUP": "true",
-                    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-                    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-                    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                    "SLIME_ENABLE_PROFILING": "true",
-                }.items()
+                key: os.environ.get(key, default_val) for key, default_val in SGLANG_ENGINE_ENV_DEFAULTS.items()
             }
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
