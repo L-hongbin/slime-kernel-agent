@@ -236,3 +236,4 @@ RUNTIME.md
 hostfile
 gpu_mem_trend.png
 *.bundle
+wandb/
