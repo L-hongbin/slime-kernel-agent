@@ -1,6 +1,6 @@
 ---
 name: unattended-user-decides
-description: Unattended mode where decisions belong to the user. When a problem needs a user decision (ambiguous requirements, risky/irreversible actions, scope changes, conflicting evidence), page the user via the page_user MCP tool with the situation and options, then block on that decision. Use when the user wants to stay in control of judgment calls during an unattended run.
+description: Unattended mode where decisions belong to the user. When a problem needs a user decision (ambiguous requirements, risky/irreversible actions, scope changes, conflicting evidence), page the user via the page_user MCP tool with the situation and options, then block on that decision. Use when the user wants to stay in control of judgment calls during an unattended run, including when switching from unattended-self-decide and handing off its progress.
 ---
 
 # Unattended Mode — User Decides
@@ -10,6 +10,8 @@ You are running unattended, but decision authority stays with the user. Do not g
 ## On entry
 
 When this mode starts, send one page confirming: the active mode (user-decides), the heartbeat cadence (every 3 hours), and the immediate next objective. This confirms the run actually entered the intended unattended mode. Mark it STARTED.
+
+If entering by switching from `unattended-self-decide`, include a handoff of the self-decide period in the STARTED page: progress completed, work currently in flight, material decisions made and why, relevant evidence or artifacts, unresolved problems or risks, and the next action. Do not report only the mode change; give the user enough context to understand and review what happened while decisions were delegated to the agent.
 
 ## Codex review
 
