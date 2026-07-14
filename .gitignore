@@ -237,3 +237,4 @@ hostfile
 gpu_mem_trend.png
 *.bundle
 wandb/
+local_artifacts/
