@@ -134,6 +134,8 @@ def compute_policy_loss(
     pg_losses2 = -ratio.clamp(1 - eps_clip, 1 + eps_clip_high) * advantages
     clip_pg_losses1 = torch.maximum(pg_losses1, pg_losses2)
     clipfrac = torch.gt(pg_losses2, pg_losses1).float()
+    upper_clipfrac = clipfrac * (ratio > 1 + eps_clip_high).float()
+    lower_clipfrac = clipfrac * (ratio < 1 - eps_clip).float()
 
     if eps_clip_c is not None:
         assert (
@@ -145,7 +147,187 @@ def compute_policy_loss(
     else:
         pg_losses = clip_pg_losses1
 
-    return pg_losses, clipfrac
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_up_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+):
+    """Compute UP asymmetric policy loss."""
+    ppo_output = compute_policy_loss(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, eps_clip_c)
+    positive_advantage_mask = advantages > 0
+    positive_pg_losses = -advantages * log_probs
+    pg_losses = torch.where(positive_advantage_mask, positive_pg_losses, ppo_output["pg_losses"])
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": torch.where(positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_clipfrac"]),
+        "pg_upper_clipfrac": torch.where(
+            positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_upper_clipfrac"]
+        ),
+        "pg_lower_clipfrac": torch.where(
+            positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_lower_clipfrac"]
+        ),
+    }
+
+
+def compute_aspo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+):
+    """Compute ASPO loss with asymmetric positive-token IS weights."""
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    positive_advantage_mask = advantages > 0
+
+    negative_output = compute_policy_loss(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, None)
+
+    invalid_positive_mask = positive_advantage_mask & (ratio > 1 + eps_clip_high)
+    positive_valid_mask = 1.0 - invalid_positive_mask.detach().float()
+    reciprocal_ratio = (1.0 / ratio).detach()
+    if eps_clip_c is not None:
+        assert (
+            eps_clip_c > 1.0
+        ), f"The upper bound of ASPO reciprocal dual-clip should be greater than 1.0, but get the value: {eps_clip_c}."
+        reciprocal_ratio = reciprocal_ratio.clamp(max=eps_clip_c)
+    positive_pg_losses = -advantages * reciprocal_ratio * positive_valid_mask * log_probs
+
+    pg_losses = torch.where(positive_advantage_mask, positive_pg_losses, negative_output["pg_losses"])
+    upper_clipfrac = torch.where(
+        positive_advantage_mask, invalid_positive_mask.float(), negative_output["pg_upper_clipfrac"]
+    )
+    lower_clipfrac = torch.where(
+        positive_advantage_mask, torch.zeros_like(advantages), negative_output["pg_lower_clipfrac"]
+    )
+    clipfrac = torch.maximum(upper_clipfrac, lower_clipfrac)
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_cispo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+):
+    """Compute CISPO policy loss with a detached clipped importance ratio."""
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    clipped_ratio = torch.clamp(ratio, min=1 - eps_clip, max=1 + eps_clip_high)
+    clipped_ratio_sg = clipped_ratio.detach()
+
+    pg_losses = -clipped_ratio_sg * advantages * log_probs
+    upper_clipfrac = (ratio > 1 + eps_clip_high).float()
+    lower_clipfrac = (ratio < 1 - eps_clip).float()
+    clipfrac = torch.maximum(upper_clipfrac, lower_clipfrac)
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_dppo_binary_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    loss_mode: str,
+    eps_clip_c: float | None = None,
+):
+    """Compute DPPO binary-TV/KL policy loss against the configured old policy anchor."""
+    prob = log_probs.exp()
+    old_prob = old_log_probs.exp()
+
+    if loss_mode == "dppo_binary_tv":
+        invalid_positive_mask = (prob - old_prob) > eps_clip_high
+        invalid_negative_mask = (prob - old_prob) < -eps_clip
+    elif loss_mode == "dppo_binary_kl":
+        prob_for_other = torch.clamp(1.0 - prob, min=1e-8)
+        old_prob_for_other = torch.clamp(1.0 - old_prob, min=1e-8)
+        binary_kl = old_prob * (old_log_probs - log_probs) + old_prob_for_other * torch.log(
+            old_prob_for_other / prob_for_other
+        )
+        invalid_positive_mask = (binary_kl > eps_clip_high) & (prob > old_prob)
+        invalid_negative_mask = (binary_kl > eps_clip) & (prob < old_prob)
+    else:
+        raise ValueError(f"Unsupported DPPO loss mode: {loss_mode}")
+
+    positive_advantage_mask = advantages > 0
+    invalid_mask = torch.where(positive_advantage_mask, invalid_positive_mask, invalid_negative_mask)
+    valid_mask = 1.0 - invalid_mask.detach().float()
+
+    ratio_clip_c = 20.0 if eps_clip_c is None else eps_clip_c
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    ratio = torch.clamp(ratio, max=ratio_clip_c).detach()
+
+    pg_losses = -advantages * ratio * valid_mask * log_probs
+    upper_clipfrac = (positive_advantage_mask & invalid_positive_mask).float()
+    lower_clipfrac = (~positive_advantage_mask & invalid_negative_mask).float()
+    clipfrac = invalid_mask.float()
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_drpo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+):
+    """Compute DRPO smooth Binary-TV regularized policy loss."""
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    old_prob = old_log_probs.float().exp().detach()
+
+    positive_advantage_mask = advantages > 0
+    eps = torch.where(
+        positive_advantage_mask,
+        torch.full_like(advantages, eps_clip_high),
+        torch.full_like(advantages, eps_clip),
+    )
+    eps = torch.clamp(eps, min=1e-8)
+
+    quadratic_penalty = advantages.abs() * old_prob * (ratio - 1.0).pow(2) / (2.0 * eps)
+    pg_losses = -advantages * ratio + quadratic_penalty
+
+    prob = log_probs.float().exp()
+    invalid_positive_mask = (prob - old_prob) > eps_clip_high
+    invalid_negative_mask = (prob - old_prob) < -eps_clip
+    invalid_mask = torch.where(positive_advantage_mask, invalid_positive_mask, invalid_negative_mask)
+
+    upper_clipfrac = (positive_advantage_mask & invalid_positive_mask).float()
+    lower_clipfrac = (~positive_advantage_mask & invalid_negative_mask).float()
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": invalid_mask.float(),
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
 
 
 def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):

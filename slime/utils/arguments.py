@@ -945,13 +945,34 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
 
-            parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
-            parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+            parser.add_argument(
+                "--policy-loss-mode",
+                type=str,
+                choices=["ppo", "up", "aspo", "dppo_binary_tv", "dppo_binary_kl", "cispo", "drpo"],
+                default="ppo",
+                help=(
+                    "Policy loss trust-region mode. ppo uses ratio clipping; "
+                    "up uses unclipped positive-advantage updates and clipped non-positive updates; "
+                    "aspo uses reciprocal positive-advantage IS weights with hard/soft clipping; "
+                    "dppo_binary_tv and dppo_binary_kl use rollout-anchored DPPO binary masks; "
+                    "cispo uses detached clipped importance weights; drpo uses smooth Binary-TV regularization."
+                ),
+            )
+            parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO/DPPO lower clip range")
+            parser.add_argument(
+                "--eps-clip-high",
+                type=float,
+                default=None,
+                help="PPO clip upper offset; the final ratio upper bound is 1 + eps_clip_high.",
+            )
             parser.add_argument(
                 "--eps-clip-c",
                 type=float,
                 default=None,
-                help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
+                help=(
+                    "Dual-clip threshold. For PPO it is the lower bound from https://arxiv.org/pdf/1912.09729; "
+                    "for ASPO it is the optional upper bound for soft dual-clipping positive reciprocal weights."
+                ),
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
@@ -1991,6 +2012,24 @@ def slime_validate_args(args):
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+    policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
+    use_dppo_binary = policy_loss_mode in ["dppo_binary_tv", "dppo_binary_kl"]
+    assert not (
+        (use_dppo_binary or policy_loss_mode == "drpo") and args.use_tis
+    ), "DPPO binary loss, DRPO, and TIS apply policy-loss corrections; disable use_tis."
+    if use_dppo_binary and not args.use_rollout_logprobs:
+        logger.warning(
+            "DPPO binary loss is using actor-recomputed old log_probs. According to the DPPO paper "
+            "this variant should usually be rollout-anchored. Consider adding --use-rollout-logprobs "
+            "to use rollout log_probs as the old-policy anchor, skip the actor old-logprob forward pass, "
+            "and improve training efficiency."
+        )
+    if policy_loss_mode == "drpo" and not args.use_rollout_logprobs:
+        logger.warning(
+            "DRPO is using actor-recomputed old log_probs. Consider adding --use-rollout-logprobs "
+            "to use rollout log_probs as the behavior-policy anchor."
+        )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

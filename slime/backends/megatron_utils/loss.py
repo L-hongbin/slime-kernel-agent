@@ -13,9 +13,14 @@ from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_aspo_policy_loss,
+    compute_cispo_policy_loss,
+    compute_dppo_binary_policy_loss,
+    compute_drpo_policy_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_up_policy_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
@@ -836,6 +841,8 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
+    policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
+    use_dppo_binary = policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch.get("log_probs")
 
     response_lengths = batch["response_lengths"]
@@ -903,7 +910,38 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    if use_dppo_binary:
+        policy_loss_output = compute_dppo_binary_policy_loss(
+            log_probs,
+            old_log_probs,
+            advantages,
+            args.eps_clip,
+            args.eps_clip_high,
+            policy_loss_mode,
+            args.eps_clip_c,
+        )
+    elif policy_loss_mode == "drpo":
+        policy_loss_output = compute_drpo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
+        )
+    elif policy_loss_mode == "up":
+        policy_loss_output = compute_up_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif policy_loss_mode == "aspo":
+        policy_loss_output = compute_aspo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif policy_loss_mode == "cispo":
+        policy_loss_output = compute_cispo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
+        )
+    else:
+        policy_loss_output = compute_policy_loss(
+            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    pg_loss = policy_loss_output["pg_losses"]
+    policy_loss_metrics = {key: value for key, value in policy_loss_output.items() if key != "pg_losses"}
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -967,7 +1005,10 @@ def policy_loss_function(
         pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
+    policy_loss_metrics = {
+        metric_key: sum_of_sample_mean(metric_value) for metric_key, metric_value in policy_loss_metrics.items()
+    }
+    pg_clipfrac = policy_loss_metrics["pg_clipfrac"]
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
@@ -1009,6 +1050,10 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
+    for metric_key, metric_value in policy_loss_metrics.items():
+        if metric_key == "pg_clipfrac":
+            continue
+        reported_loss[metric_key] = metric_value.clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
