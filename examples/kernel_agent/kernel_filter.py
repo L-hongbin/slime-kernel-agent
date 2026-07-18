@@ -96,16 +96,16 @@ def _get_sequence_mis_aggregation(args) -> str | None:
     aggregation = getattr(args, "sequence_mis_aggregation", None)
     if aggregation is None:
         return None
-    if aggregation not in {"kl", "geometric", "turns_geometric"}:
+    if aggregation not in {"kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"}:
         raise ValueError(
             "[kernel_agent][sequence_mis] aggregation must be one of "
-            f"['kl', 'geometric', 'turns_geometric'], got {aggregation!r}."
+            f"['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop'], got {aggregation!r}."
         )
     return aggregation
 
 
 def _get_sequence_mis_group_size(args, aggregation: str | None) -> int | None:
-    if aggregation != "turns_geometric":
+    if aggregation not in {"turns_geometric", "turns_mirrorpop"}:
         return None
     group_size = int(getattr(args, "sequence_mis_group_size", None) or getattr(args, "n_samples_per_prompt", 1) or 1)
     if group_size <= 0:
@@ -117,7 +117,7 @@ def _get_sequence_mis_batch_size(args, aggregation: str | None, max_turns: int |
     batch_size = int(getattr(args, "sequence_mis_batch_size", 8) or 8)
     if batch_size <= 0:
         raise ValueError(f"[kernel_agent][sequence_mis] sequence_mis_batch_size must be positive, got {batch_size}.")
-    if aggregation == "turns_geometric":
+    if aggregation in {"turns_geometric", "turns_mirrorpop"}:
         assert max_turns is not None
         if batch_size % max_turns != 0:
             batch_size = ((batch_size + max_turns - 1) // max_turns) * max_turns
@@ -131,6 +131,27 @@ def _has_positive_advantage(advantage: torch.Tensor | None, mask: torch.Tensor) 
     if advantage.shape == mask.shape:
         return bool(((advantage > 0) & mask.bool()).any().item())
     return bool((advantage > 0).any().item())
+
+
+def _sequence_mis_mask_and_log_ratios(
+    *,
+    index: int,
+    full_train_log_prob: torch.Tensor,
+    full_rollout_log_prob: torch.Tensor,
+    loss_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if full_train_log_prob.shape != full_rollout_log_prob.shape:
+        raise ValueError(
+            "[kernel_agent][sequence_mis] log_prob shape mismatch at sample "
+            f"{index}: train={tuple(full_train_log_prob.shape)}, rollout={tuple(full_rollout_log_prob.shape)}."
+        )
+    if full_train_log_prob.shape != loss_mask.shape:
+        raise ValueError(
+            "[kernel_agent][sequence_mis] loss_mask shape mismatch at sample "
+            f"{index}: log_prob={tuple(full_train_log_prob.shape)}, loss_mask={tuple(loss_mask.shape)}."
+        )
+    mask = loss_mask.float()
+    return mask, (full_train_log_prob.float() - full_rollout_log_prob.float()) * mask
 
 
 def _apply_mis(
@@ -188,20 +209,14 @@ def _gather_sequence_mis_chunk(
             rollout_log_probs[i], int(total_lengths[i]), int(response_lengths[i])
         )
 
-        if full_train_log_prob.shape != full_rollout_log_prob.shape:
-            raise ValueError(
-                "[kernel_agent][sequence_mis] log_prob shape mismatch at sample "
-                f"{i}: train={tuple(full_train_log_prob.shape)}, rollout={tuple(full_rollout_log_prob.shape)}."
-            )
-        if full_train_log_prob.shape != loss_masks[i].shape:
-            raise ValueError(
-                "[kernel_agent][sequence_mis] loss_mask shape mismatch at sample "
-                f"{i}: log_prob={tuple(full_train_log_prob.shape)}, loss_mask={tuple(loss_masks[i].shape)}."
-            )
-
-        mask = loss_masks[i].float()
+        mask, sample_log_ratios = _sequence_mis_mask_and_log_ratios(
+            index=i,
+            full_train_log_prob=full_train_log_prob,
+            full_rollout_log_prob=full_rollout_log_prob,
+            loss_mask=loss_masks[i],
+        )
         masks.append(mask)
-        log_ratios.append((full_train_log_prob.float() - full_rollout_log_prob.float()) * mask)
+        log_ratios.append(sample_log_ratios)
         advantage = None if advantages is None else advantages[i]
         advantage_protected_flags.append(_has_positive_advantage(advantage, mask))
     return log_ratios, masks, advantage_protected_flags
@@ -225,6 +240,7 @@ def _loop_sequence_mis(
 ) -> None:
     temp_turns: list[tuple[int, torch.Tensor, torch.Tensor, bool, bool]] = []
     temp_log_ratio_sum = None
+    temp_abs_log_ratio_sum = None
     temp_valid_token_count = None
 
     with torch.no_grad():
@@ -236,19 +252,12 @@ def _loop_sequence_mis(
                 rollout_log_probs[i], int(total_lengths[i]), int(response_lengths[i])
             )
 
-            if full_train_log_prob.shape != full_rollout_log_prob.shape:
-                raise ValueError(
-                    "[kernel_agent][sequence_mis] log_prob shape mismatch at sample "
-                    f"{i}: train={tuple(full_train_log_prob.shape)}, rollout={tuple(full_rollout_log_prob.shape)}."
-                )
-            if full_train_log_prob.shape != loss_masks[i].shape:
-                raise ValueError(
-                    "[kernel_agent][sequence_mis] loss_mask shape mismatch at sample "
-                    f"{i}: log_prob={tuple(full_train_log_prob.shape)}, loss_mask={tuple(loss_masks[i].shape)}."
-                )
-
-            mask = loss_masks[i].float()
-            log_ratios = (full_train_log_prob.float() - full_rollout_log_prob.float()) * mask
+            mask, log_ratios = _sequence_mis_mask_and_log_ratios(
+                index=i,
+                full_train_log_prob=full_train_log_prob,
+                full_rollout_log_prob=full_rollout_log_prob,
+                loss_mask=loss_masks[i],
+            )
             valid_token_count = torch.clamp_min(mask.sum(), 1)
             is_token_veto = bool(
                 log_veto_threshold is not None and ((log_ratios < log_veto_threshold) & mask.bool()).any().item()
@@ -282,23 +291,45 @@ def _loop_sequence_mis(
                     upper_bound=upper_bound,
                     stats=stats,
                 )
-            elif aggregation == "turns_geometric":
+            elif aggregation == "mirrorpop":
+                sequence_value = log_ratios.abs().sum() / valid_token_count
+                _apply_mis(
+                    loss_masks=loss_masks,
+                    index=i,
+                    mask=mask,
+                    sequence_value=sequence_value,
+                    is_token_veto=is_token_veto,
+                    advantage_protected=advantage_protected,
+                    lower_bound=lower_bound,
+                    upper_bound=upper_bound,
+                    stats=stats,
+                )
+            elif aggregation in {"turns_geometric", "turns_mirrorpop"}:
                 assert max_turns is not None
                 temp_turns.append((i, mask, log_ratios, is_token_veto, advantage_protected))
                 temp_log_ratio_sum = (
                     log_ratios.sum() if temp_log_ratio_sum is None else temp_log_ratio_sum + log_ratios.sum()
                 )
+                temp_abs_log_ratio_sum = (
+                    log_ratios.abs().sum()
+                    if temp_abs_log_ratio_sum is None
+                    else temp_abs_log_ratio_sum + log_ratios.abs().sum()
+                )
                 temp_valid_token_count = (
                     mask.sum() if temp_valid_token_count is None else temp_valid_token_count + mask.sum()
                 )
                 if len(temp_turns) == max_turns:
-                    group_value = torch.exp(
-                        torch.clamp(
-                            temp_log_ratio_sum / torch.clamp_min(temp_valid_token_count, 1),
-                            min=-20.0,
-                            max=20.0,
+                    valid_token_count = torch.clamp_min(temp_valid_token_count, 1)
+                    if aggregation == "turns_mirrorpop":
+                        group_value = temp_abs_log_ratio_sum / valid_token_count
+                    else:
+                        group_value = torch.exp(
+                            torch.clamp(
+                                temp_log_ratio_sum / valid_token_count,
+                                min=-20.0,
+                                max=20.0,
+                            )
                         )
-                    )
                     for index, turn_mask, _turn_log_ratios, turn_is_token_veto, turn_advantage_protected in temp_turns:
                         _apply_mis(
                             loss_masks=loss_masks,
@@ -313,6 +344,7 @@ def _loop_sequence_mis(
                         )
                     temp_turns = []
                     temp_log_ratio_sum = None
+                    temp_abs_log_ratio_sum = None
                     temp_valid_token_count = None
             elif aggregation is None:
                 _apply_mis(
@@ -373,24 +405,29 @@ def _batch_sequence_mis(
                 sequence_values = torch.exp(
                     torch.clamp(log_ratios_padded.sum(dim=1) / valid_token_counts, min=-20.0, max=20.0)
                 )
-            elif aggregation == "turns_geometric":
+            elif aggregation == "mirrorpop":
+                sequence_values = log_ratios_padded.abs().sum(dim=1) / valid_token_counts
+            elif aggregation in {"turns_geometric", "turns_mirrorpop"}:
                 assert max_turns is not None
                 if len(log_ratios) % max_turns != 0:
                     raise ValueError(
-                        "[kernel_agent][sequence_mis] internal batch for turns_geometric is incomplete: "
+                        "[kernel_agent][sequence_mis] internal batch for turns_geometric or turns_mirrorpop is incomplete: "
                         f"batch_size={len(log_ratios)}, max_turns={max_turns}."
                     )
                 trajectory_count = len(log_ratios) // max_turns
                 grouped_log_ratios = log_ratios_padded.reshape(trajectory_count, max_turns, log_ratios_padded.size(1))
                 grouped_masks = masks_padded.reshape(trajectory_count, max_turns, masks_padded.size(1))
                 grouped_valid_token_counts = torch.clamp_min(grouped_masks.sum(dim=(1, 2)), 1)
-                group_values = torch.exp(
-                    torch.clamp(
-                        grouped_log_ratios.sum(dim=(1, 2)) / grouped_valid_token_counts,
-                        min=-20.0,
-                        max=20.0,
+                if aggregation == "turns_mirrorpop":
+                    group_values = grouped_log_ratios.abs().sum(dim=(1, 2)) / grouped_valid_token_counts
+                else:
+                    group_values = torch.exp(
+                        torch.clamp(
+                            grouped_log_ratios.sum(dim=(1, 2)) / grouped_valid_token_counts,
+                            min=-20.0,
+                            max=20.0,
+                        )
                     )
-                )
                 sequence_values = group_values.unsqueeze(1).expand(trajectory_count, max_turns).reshape(-1)
             elif aggregation is None:
                 sequence_values = [None] * len(log_ratios)
@@ -462,10 +499,12 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
             "[kernel_agent][sequence_mis] token veto threshold must be positive, " f"got {token_veto_threshold}."
         )
 
-    if aggregation == "turns_geometric":
+    if aggregation in {"turns_geometric", "turns_mirrorpop"}:
         max_turns = getattr(args, "max_turns", None)
         if max_turns is None:
-            raise ValueError("[kernel_agent][sequence_mis] --max-turns must be set for turns_geometric aggregation.")
+            raise ValueError(
+                "[kernel_agent][sequence_mis] --max-turns must be set for turns_geometric or turns_mirrorpop aggregation."
+            )
         max_turns = int(max_turns)
         if max_turns <= 0:
             raise ValueError(f"[kernel_agent][sequence_mis] --max-turns must be positive, got {max_turns}.")
@@ -499,7 +538,7 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
 
     if max_turns is not None and len(train_log_probs) % max_turns != 0:
         raise ValueError(
-            "[kernel_agent][sequence_mis] turns_geometric requires complete trajectory-major groups: "
+            "[kernel_agent][sequence_mis] turns_geometric and turns_mirrorpop require complete trajectory-major groups: "
             f"got {len(train_log_probs)} samples, max_turns={max_turns}. "
             "For multi-turn rollout, consider enabling --filter-by-last-turn and --padding-turns."
         )
@@ -561,7 +600,12 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
         raise ValueError(f"[kernel_agent][sequence_mis] sequence_mis_mode must be 'loop' or 'batch', got {mode!r}.")
 
     rollout_data["loss_masks"] = loss_masks
-    mean_ratio = stats["ratio_sum"] / max(stats["valid_sequences"], 1)
+    valid_sequences = stats["valid_sequences"]
+    rejected = stats["rejected"]
+    mean_ratio = stats["ratio_sum"] / max(valid_sequences, 1)
+    rollout_data["seq_mis/reject_rate"] = (rejected, valid_sequences)
+    rollout_data["seq_mis/advantage_protected_rate"] = (stats["advantage_protected"], valid_sequences)
+    rollout_data["seq_mis/ratio_mean"] = (stats["ratio_sum"], valid_sequences)
     logger.info(
         "[kernel_agent][sequence_mis] rollout_id=%s mode=%s rejected=%s/%s reject_rate=%.6f "
         "advantage_protected=%s ratio_mean=%.6g ratio_min=%.6g ratio_max=%.6g",

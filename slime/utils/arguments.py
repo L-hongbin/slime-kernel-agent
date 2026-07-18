@@ -56,13 +56,15 @@ def _parse_sequence_mis_args(args) -> None:
         args.sequence_mis_use_advantage = config["use_advantage"]
 
     aggregation = getattr(args, "sequence_mis_aggregation", "geometric")
-    if aggregation not in {"kl", "geometric", "turns_geometric"}:
+    if aggregation not in {"kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"}:
         raise ValueError(
-            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "
+            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop'], "
             f"got {aggregation!r}."
         )
-    if aggregation == "turns_geometric" and args.max_turns is None:
-        raise ValueError("--max-turns must be set when --sequence-mis-config aggregation=turns_geometric.")
+    if aggregation in {"turns_geometric", "turns_mirrorpop"} and args.max_turns is None:
+        raise ValueError(
+            "--max-turns must be set when --sequence-mis-config aggregation=turns_geometric or turns_mirrorpop."
+        )
     token_veto_threshold = getattr(args, "sequence_mis_token_veto_threshold", None)
     if token_veto_threshold is not None and token_veto_threshold <= 0:
         raise ValueError(
@@ -1907,10 +1909,12 @@ def slime_validate_args(args):
         args.sglang_enable_fp32_lm_head = True
 
     _parse_sequence_mis_args(args)
-    if getattr(args, "sequence_mis_aggregation", None) == "turns_geometric" and not getattr(
+    if getattr(args, "sequence_mis_aggregation", None) in {"turns_geometric", "turns_mirrorpop"} and not getattr(
         args, "enable_turns_dp_partitions", False
     ):
-        raise ValueError("--enable-turns-dp-partitions must be set when Sequence MIS aggregation is turns_geometric.")
+        raise ValueError(
+            "--enable-turns-dp-partitions must be set when Sequence MIS aggregation is turns_geometric or turns_mirrorpop."
+        )
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.use_slime_router:
