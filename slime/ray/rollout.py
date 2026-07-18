@@ -1452,6 +1452,7 @@ def _compute_kernel_agent_metrics(samples):
     }
     total_count = len(samples)
     coverage_rs_masked_count = 0
+    conditional_truncation_masked_count = 0
     correct_count = 0
     coverage_rs_correct_masked_count = 0
     precheck_count = 0
@@ -1460,8 +1461,13 @@ def _compute_kernel_agent_metrics(samples):
     for sample in samples:
         metadata = sample.metadata or {}
         is_coverage_rs_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
+        is_conditional_truncation_masked = (
+            sample.remove_sample and metadata.get("remove_reason") == "conditional_truncation_masking"
+        )
         if is_coverage_rs_masked:
             coverage_rs_masked_count += 1
+        if is_conditional_truncation_masked:
+            conditional_truncation_masked_count += 1
 
         model_time = metadata.get("model_time")
         if not isinstance(model_time, bool) and isinstance(model_time, (int, float)):
@@ -1522,6 +1528,9 @@ def _compute_kernel_agent_metrics(samples):
                 log_dict[f"{prefix}/{key}/{stat_key}"] = stats[stat_key]
     if total_count > 0:
         log_dict["coverage/coverage_rs_masked_fraction"] = coverage_rs_masked_count / total_count
+        log_dict["sample_mask/conditional_truncation_masked_fraction"] = (
+            conditional_truncation_masked_count / total_count
+        )
     if correct_count > 0:
         log_dict["coverage/coverage_rs_correct_masked_fraction"] = coverage_rs_correct_masked_count / correct_count
     if precheck_count > 0:

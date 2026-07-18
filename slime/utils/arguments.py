@@ -1917,6 +1917,9 @@ def slime_validate_args(args):
         )
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    conditional_truncation_mask_prob = getattr(args, "conditional_truncation_mask_prob", 0.1)
+    assert 0.0 <= conditional_truncation_mask_prob <= 1.0, "conditional_truncation_mask_prob must be in [0, 1]."
+
     if args.use_slime_router:
         logger.warning(
             "--use-slime-router is deprecated and ignored. slime now always uses sglang_router "

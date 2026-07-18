@@ -747,6 +747,51 @@ def test_normalize_env_feedback_extra_info_defaults_missing_decoy_kernel():
     assert env_extra_info["decoy_kernel"] is False
 
 
+@pytest.mark.unit
+def test_conditional_truncation_masking_uses_max_response_length():
+    from examples.kernel_agent import utils as kernel_agent_utils
+
+    short_sample = Sample(
+        prompt="prompt",
+        tokens=[1, 2],
+        response="short",
+        response_length=2,
+        loss_mask=[1, 1],
+        reward=1.0,
+        status=Sample.Status.TRUNCATED,
+        metadata={"env_extra_info": {"decoy_kernel": False}},
+    )
+    max_response_sample = Sample(
+        prompt="prompt",
+        tokens=[1, 2, 3, 4],
+        response="full",
+        response_length=4,
+        loss_mask=[1, 1, 1, 1],
+        reward=1.0,
+        status=Sample.Status.COMPLETED,
+        metadata={"env_extra_info": {"decoy_kernel": False}},
+    )
+    args = SimpleNamespace(
+        use_coverage_rs=False,
+        use_conditional_truncation_mask=True,
+        conditional_truncation_mask_prob=1.0,
+        conditional_truncation_repeat_window=128,
+        rollout_max_response_len=4,
+        finalize_mode="none",
+        advantage_estimator="grpo",
+    )
+
+    short_result, max_response_result = kernel_agent_utils.postprocess_turn_samples(
+        args, [short_sample, max_response_sample], finish_reason="max_turns"
+    )
+
+    assert short_result.remove_sample is False
+    assert "conditional_truncation_masking_eligible" not in short_result.metadata
+    assert max_response_result.remove_sample is True
+    assert max_response_result.metadata["remove_reason"] == "conditional_truncation_masking"
+    assert max_response_result.metadata["conditional_truncation_masking_eligible"] is True
+
+
 def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
     from slime.ray.rollout import _compute_kernel_agent_metrics
 
@@ -789,6 +834,20 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
                 },
             },
         ),
+        Sample(
+            prompt="prompt",
+            remove_sample=True,
+            metadata={
+                "remove_reason": "conditional_truncation_masking",
+                "env_extra_info": {
+                    "correctness": False,
+                    "compilation": True,
+                    "speedup": 0.0,
+                    "decoy_kernel": False,
+                    "precheck": "passed",
+                },
+            },
+        ),
     ]
 
     metrics = _compute_kernel_agent_metrics(samples)
@@ -798,3 +857,4 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
     assert metrics["kernel/time/detail_env_time/kernel_runtime/mean"] == pytest.approx(20.0)
     assert metrics["kernel/time/detail_env_time/profile_time/sum"] == pytest.approx(400.0)
     assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)
+    assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)
