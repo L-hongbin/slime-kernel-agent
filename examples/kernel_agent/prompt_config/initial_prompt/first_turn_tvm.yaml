@@ -1,0 +1,89 @@
+method: system
+prompt: null
+
+per_turn_prompts:
+  - name: first_turn
+    condition: "current_turn == 0"
+    history_mode: all
+    skip_env: 0.0
+    response_truncation: python_code, answer_code
+    template: |
+      You are a PyTorch and CUDA expert. Optimize the given PyTorch `Model` by returning a CUDA extension implementation that is faster than the original while preserving correctness.
+
+      Do not use inline CUDA strings or call `tvm_ffi.cpp.build`, `tvm_ffi.cpp.load`, `torch.utils.cpp_extension.load`, or `load_inline` yourself.
+
+      Output exactly this section structure:
+
+      ### CUDA_KERNELS
+      ```cpp
+      <CUDA .cu source: kernels, device helpers, and C ABI launcher functions>
+      ```
+
+      ### APPLY_BINDINGS
+      ```cpp
+      <C++/TVM-FFI source that exports launcher wrappers with TVM_FFI_DLL_EXPORT_TYPED_FUNC>
+      ```
+
+      ### MODEL_NEW
+      ```python
+      <Python ModelNew implementation using tvm_ffi_extension>
+      ```
+
+      CUDA_KERNELS requirements:
+      - Implement the core computation with real CUDA C++ code. Prefer custom `__global__` kernels.
+      - This section is pure CUDA/C++; do not call PyTorch, ATen, TVM, TVM-FFI, or Python APIs here.
+      - You may use cuBLAS for GEMM and cuDNN for convolution when appropriate.
+      - Expose launcher functions for APPLY_BINDINGS: raw pointers, sizes/strides, scalar parameters, and an opaque `void*` stream handle. Keep `cudaStream_t` and other CUDA runtime types inside this section.
+
+      APPLY_BINDINGS requirements:
+      - Use TVM-FFI bindings only. Include `#include <tvm/ffi/tvm_ffi.h>` and `#include <tvm/ffi/extra/c_env_api.h>`.
+      - Export each Python-callable wrapper with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function_name);`.
+      - TVM-FFI receives tensors as `tvm::ffi::Tensor`. Get the current CUDA stream from the TVM-FFI environment:
+        `void* stream_handle = TVMFFIEnvGetStream(input.device().device_type, input.device().device_id);`
+      - Validate op-specific invariants with `TVM_FFI_ICHECK` (device, dtype, ndim, output shape, contiguity).
+      - Allocate output tensors in Python (passed in by `MODEL_NEW` via `torch.empty` / `torch.empty_like`); the binding fills them. This keeps shape derivation in Python where it is easier to express and inspect.
+      - The binding's job is to marshal tensors into your launcher; do not invoke PyTorch / ATen compute operators here.
+      - Minimal example (1D elementwise float32, output preallocated in Python; adapt shape, dtype, and validation for your op):
+        ```cpp
+        #include <tvm/ffi/tvm_ffi.h>
+        #include <tvm/ffi/extra/c_env_api.h>
+
+        extern "C" void my_kernel_launcher(float* out, const float* in, int64_t n, void* stream_handle);
+
+        void my_kernel_forward(tvm::ffi::Tensor input, tvm::ffi::Tensor output) {
+            TVM_FFI_ICHECK(input.device().device_type == kDLCUDA) << "input must be CUDA";
+            void* stream_handle = TVMFFIEnvGetStream(
+                input.device().device_type, input.device().device_id);
+            my_kernel_launcher(
+                static_cast<float*>(output.data_ptr()),
+                static_cast<const float*>(input.data_ptr()),
+                input.shape()[0],
+                stream_handle);
+        }
+
+        TVM_FFI_DLL_EXPORT_TYPED_FUNC(my_kernel_forward, my_kernel_forward);
+        ```
+
+      MODEL_NEW requirements:
+      - Define `class ModelNew(nn.Module)` matching the original `Model.__init__` and `forward` signatures.
+      - Preserve parameter / buffer attribute names, shapes, and dtypes so the original `state_dict` still loads. Do not invent new trainable parameters, do not rename, and do not create attribute names containing `.`.
+      - If the original `Model` uses a submodule (e.g. `self.conv`, `self.linear`), instantiate the same submodule in `ModelNew` and pass its `.weight` / `.bias` into `tvm_ffi_extension` calls. Do not replace it with a new `nn.Parameter` on the same attribute name.
+      - Import the compiled extension as `tvm_ffi_extension` and route the core computation through it; do not bypass with PyTorch compute operators (`torch.matmul`, `F.conv2d`, etc.).
+      - Allocate output tensors with `torch.empty` / `torch.empty_like(..., device=x.device, dtype=x.dtype)` and pass them into the wrapper.
+      - Example:
+        ```python
+        import torch
+        import torch.nn as nn
+        import tvm_ffi_extension
+
+        class ModelNew(nn.Module):
+            def __init__(self, ...):
+                super().__init__()
+
+            def forward(self, x):
+                out = torch.empty_like(x)
+                tvm_ffi_extension.my_kernel_forward(x.contiguous(), out)
+                return out
+        ```
+
+      {{ problem }}

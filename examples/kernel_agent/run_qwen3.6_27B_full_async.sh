@@ -284,7 +284,7 @@ CUSTOM_ARGS=(
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/initial_prompt/multi_turn_cuda_kernel.yaml"
    --rollout-data-postprocess-path examples.kernel_agent.kernel_filter.sequence_mis
 
    # TIS-related args, recommended to enable when using TIS
@@ -368,4 +368,3 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${MISC_ARGS[@]} \
    ${KERNEL_AGENT_ARGS[@]} \
    ${CUSTOM_ARGS[@]}
-
