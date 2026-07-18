@@ -1,8 +1,12 @@
+import logging
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable, Iterable
 
 import torch
+
+logger = logging.getLogger(__name__)
+_PIN_MEMORY_WARNING_EMITTED = False
 
 _SourceGetter = Callable[[], Iterable[tuple[str, torch.Tensor]]]
 
@@ -39,6 +43,20 @@ class TensorBackuper(ABC):
         raise NotImplementedError
 
 
+def _empty_cpu_like_for_backup(param: torch.Tensor) -> torch.Tensor:
+    global _PIN_MEMORY_WARNING_EMITTED
+    try:
+        return torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+    except Exception as exc:
+        if not _PIN_MEMORY_WARNING_EMITTED:
+            logger.warning(
+                "Failed to allocate pinned CPU backup tensor; falling back to non-pinned CPU memory: %s",
+                exc,
+            )
+            _PIN_MEMORY_WARNING_EMITTED = True
+        return torch.empty_like(param, device=torch.device("cpu"))
+
+
 class _TensorBackuperNormal(TensorBackuper):
     def __init__(self, source_getter):
         super().__init__(source_getter=source_getter)
@@ -56,7 +74,7 @@ class _TensorBackuperNormal(TensorBackuper):
         backup_dict = self._backups[tag]
         for name, param in self._source_getter():
             if name not in backup_dict:
-                backup_dict[name] = torch.empty_like(param, device=torch.device("cpu"), pin_memory=True)
+                backup_dict[name] = _empty_cpu_like_for_backup(param)
             backup_dict[name].copy_(param.detach(), non_blocking=True)
         torch.cuda.synchronize()
 

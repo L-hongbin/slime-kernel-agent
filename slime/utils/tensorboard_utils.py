@@ -55,7 +55,10 @@ class _TensorboardAdapter(metaclass=SingletonMeta):
         """
         for key in data:
             self._writer.add_scalar(key, data[key], step)
+        self._writer.flush()
 
     def finish(self):
         """Close the tensorboard writer"""
-        self._writer.close()
+        if self._writer is not None:
+            self._writer.flush()
+            self._writer.close()

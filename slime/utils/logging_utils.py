@@ -36,6 +36,12 @@ def update_tracking_open_metrics(args, router_addr):
 
 
 def finish_tracking(args):
+    if args.use_tensorboard:
+        try:
+            _TensorboardAdapter(args).finish()
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to finish tensorboard writer")
+
     if not args.use_wandb:
         return
     try:

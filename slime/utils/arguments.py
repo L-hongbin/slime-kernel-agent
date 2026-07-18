@@ -577,6 +577,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--log-response-diversity",
+                action="store_true",
+                default=False,
+                help="Whether to log response diversity as unique 4-grams / total 4-grams during rollout.",
+            )
+            parser.add_argument(
                 "--custom-eval-rollout-log-function-path",
                 type=str,
                 default=None,
