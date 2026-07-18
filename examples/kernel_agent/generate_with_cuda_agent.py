@@ -18,7 +18,7 @@ from slime.utils.types import Sample
 
 try:
     from .config import CUDA_AGENT_CONFIGS
-    from .kernel_response import next_kernel_task_id, run_kernel_eval
+    from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
     from .kernel_reward import calculate_reward
     from .utils import (
         _extract_env_extra_info,
@@ -29,7 +29,7 @@ try:
     )
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
-    from kernel_response import next_kernel_task_id, run_kernel_eval
+    from kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
     from kernel_reward import calculate_reward
 
     from utils import (
@@ -420,46 +420,50 @@ async def cuda_kernel_env(
             "env_state": precheck_state,
             "env_extra_info": _extract_env_extra_info(precheck_state),
         }
+    else:
+        task_id = next_kernel_task_id()
+        metadata = dict(sample.metadata or {})
+        metadata["task_id"] = task_id
+        sample.metadata = metadata
 
-    task_id = next_kernel_task_id()
-    metadata = dict(sample.metadata or {})
-    metadata["task_id"] = task_id
-    sample.metadata = metadata
-
-    env_config = CUDA_AGENT_CONFIGS["env"]
-    payload = {
-        "task_id": task_id,
-        "response": response,
-        "ground_truth": _get_label_value(sample, "ground_truth"),
-        "kernel_backend": kernel_backend,
-        "reference_backend": reference_backend,
-        "entry_point": entry_point,
-        "uuid": (sample.metadata or {}).get("uuid"),
-        "return_full_state": True,
-        "metadata": sample.metadata,
-        "turn_idx": turn_idx,
-        "num_correct_trials": env_config.get("num_correct_trials"),
-        "num_perf_trials": env_config.get("num_perf_trials"),
-        "num_warmup": env_config.get("num_warmup"),
-        "perf_trim_count": env_config.get("perf_trim_count"),
-        "adaptive_perf_trials": env_config.get("adaptive_perf_trials"),
-        "perf_min_trials": env_config.get("perf_min_trials"),
-        "perf_cv_threshold": env_config.get("perf_cv_threshold"),
-        "refer_num_perf_trials": env_config.get("refer_num_perf_trials"),
-        "correctness_timeout": env_config.get("correctness_timeout"),
-        "correctness_timeout_enabled": env_config.get("correctness_timeout_enabled"),
-    }
-    kernel_eval_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
-    raw_env_state = kernel_eval_result.get("env_state") if isinstance(kernel_eval_result, dict) else None
-    if not isinstance(raw_env_state, dict):
-        raw_env_state = kernel_eval_result
-    if not isinstance(raw_env_state, dict):
-        raise TypeError("Kernel eval result must be a dict or contain dict env_state.")
-    normalized_env_state, env_extra_info = normalize_env_feedback(raw_env_state)
-    return {
-        "env_state": normalized_env_state,
-        "env_extra_info": env_extra_info,
-    }
+        env_config = CUDA_AGENT_CONFIGS["env"]
+        payload = {
+            "task_id": task_id,
+            "response": response,
+            "ground_truth": _get_label_value(sample, "ground_truth"),
+            "kernel_backend": kernel_backend,
+            "reference_backend": reference_backend,
+            "entry_point": entry_point,
+            "uuid": (sample.metadata or {}).get("uuid"),
+            "return_full_state": True,
+            "metadata": sample.metadata,
+            "turn_idx": turn_idx,
+            # Timing controls forwarded to KernelGYM /evaluate. Reference and kernel
+            # are both timed under these identical settings.
+            "num_correct_trials": env_config.get("num_correct_trials"),
+            "num_perf_trials": env_config.get("num_perf_trials"),
+            "num_warmup": env_config.get("num_warmup"),
+            "perf_trim_count": env_config.get("perf_trim_count"),
+            # Adaptive kernel-perf trials (default off) + optional separate reference count.
+            "adaptive_perf_trials": env_config.get("adaptive_perf_trials"),
+            "perf_min_trials": env_config.get("perf_min_trials"),
+            "perf_cv_threshold": env_config.get("perf_cv_threshold"),
+            "refer_num_perf_trials": env_config.get("refer_num_perf_trials"),
+            # Correctness-stage timeout overrides (None -> server config/formula).
+            "correctness_timeout": env_config.get("correctness_timeout"),
+            "correctness_timeout_enabled": env_config.get("correctness_timeout_enabled"),
+        }
+        kernel_eval_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
+        raw_env_state = kernel_eval_result.get("env_state") if isinstance(kernel_eval_result, dict) else None
+        if not isinstance(raw_env_state, dict):
+            raw_env_state = kernel_eval_result
+        if not isinstance(raw_env_state, dict):
+            raise TypeError("Kernel eval result must be a dict or contain dict env_state.")
+        normalized_env_state, env_extra_info = normalize_env_feedback(raw_env_state)
+        return {
+            "env_state": normalized_env_state,
+            "env_extra_info": env_extra_info,
+        }
 
 
 def _sample_for_turn(
@@ -516,7 +520,10 @@ def _pad_turn_samples(
             continue
 
         fake_sample = deepcopy(base_sample)
-        fake_sample.tokens = [pad_token_id]
+        # Keep one prompt token before the dummy response token so Megatron can
+        # produce a response log-prob. A one-token total sequence has no previous
+        # token to score, which makes CP=1 return an empty train log-prob.
+        fake_sample.tokens = [pad_token_id, pad_token_id]
         fake_sample.response = pad_token
         fake_sample.response_length = 1
         fake_sample.rollout_log_probs = [0.0]
@@ -619,10 +626,21 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             return await _generate_impl(args, sample, sampling_params)
     except asyncio.TimeoutError:
         elapsed_sec = time.monotonic() - started_at
+        task_id = (sample.metadata or {}).get("task_id")
+        cancel_sent = False
+        if task_id:
+            try:
+                cancel_sent = await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Failed to cancel KernelGYM task after generate timeout: task_id=%s error=%s", task_id, exc
+                )
         logger.warning(
-            "CUDA agent generate timed out after %.1fs (guard=%ss)",
+            "CUDA agent generate timed out after %.1fs (guard=%ss, task_id=%s, cancel_sent=%s)",
             elapsed_sec,
             KERNEL_AGENT_GENERATE_GUARD_SEC,
+            task_id,
+            cancel_sent,
         )
         return _abort_result(args, sample, "wall_clock_timeout", elapsed_sec)
     except Exception as exc:  # noqa: BLE001

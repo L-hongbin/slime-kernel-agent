@@ -13,8 +13,7 @@ from examples.kernel_agent.utils import (
     extract_cuda_agent_kernel_code,
     normalize_env_feedback,
     parse_cuda_agent_response,
-    precheck_cuda_agent_response,
-    precheck_tvm_ffi_response,
+    precheck_response,
     split_think_response,
 )
 from slime.utils.types import Sample
@@ -314,12 +313,16 @@ def _format_feedback_for_test(env_result):
 @pytest.mark.parametrize("case", KERNEL_EVAL_CASES)
 def test_precheck_accepts_cuda_agent_responses_from_compiled_feedback_cases(request, case):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
-    assert precheck_cuda_agent_response(VALID_CUDA_AGENT_RESPONSE, "Model") is None
+    precheck_passed, precheck_state = precheck_response(VALID_CUDA_AGENT_RESPONSE, "Model", "cuda_agent")
+    assert precheck_passed is True
+    assert precheck_state is None
 
 
 @pytest.mark.unit
 def test_precheck_accepts_tvm_ffi_responses():
-    assert precheck_tvm_ffi_response(VALID_TVM_FFI_RESPONSE, "Model") is None
+    precheck_passed, precheck_state = precheck_response(VALID_TVM_FFI_RESPONSE, "Model", "tvm_ffi")
+    assert precheck_passed is True
+    assert precheck_state is None
 
 
 @pytest.mark.unit
@@ -328,7 +331,8 @@ def test_precheck_rejects_tvm_ffi_missing_export():
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward, copy_forward);",
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward_exported, copy_forward);",
     )
-    result = precheck_tvm_ffi_response(response, "Model")
+    precheck_passed, result = precheck_response(response, "Model", "tvm_ffi")
+    assert precheck_passed is False
     assert result is not None
     assert "TVM-FFI model calls are not exported: copy_forward" in result["error_message"]
 

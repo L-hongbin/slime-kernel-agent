@@ -139,7 +139,9 @@ class KernelAgentAsyncRolloutWorker:
     def stop(self) -> None:
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
+            self.worker_thread.join(timeout=15)
+            if self.worker_thread.is_alive():
+                logger.warning("kernel-agent fully-async: worker thread did not stop within timeout")
 
     def get_completed_groups(self) -> list[tuple[int, RolloutTaskResult]]:
         completed: list[tuple[int, RolloutTaskResult]] = []
@@ -211,15 +213,26 @@ class KernelAgentAsyncRolloutWorker:
 
         if active_tasks:
             logger.info("kernel-agent fully-async: waiting for %d in-flight tasks to drain", len(active_tasks))
-            try:
-                await asyncio.wait(active_tasks, timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
+            done, pending = await asyncio.wait(active_tasks, timeout=10)
+            if pending:
+                logger.warning(
+                    "kernel-agent fully-async: cancelling %d in-flight tasks after drain timeout", len(pending)
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                try:
+                    task.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("kernel-agent fully-async: in-flight task finished with error during stop: %r", exc)
 
     def _make_done_cb(self, gid: int, original_group: RolloutGroup):
         def _cb(done_task: asyncio.Task) -> None:
             try:
                 result = done_task.result()
+            except asyncio.CancelledError:
+                return
             except Exception:  # noqa: BLE001
                 self.exception_count += 1
                 logger.exception("kernel-agent fully-async: process task raised")
@@ -336,9 +349,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     ]
     sample = data[-1][0]
     logger.info(
-        "Finish kernel-agent fully-async rollout %d: target collected cost %.1fs, %s, label: %s, reward: %s",
+        "kernel-agent fully-async rollout %d: done in %.1fs, queue_left=%d, %s, label: %s, reward: %s",
         rollout_id,
         collect_time,
+        worker.queue_size(),
         [str(sample.prompt) + sample.response],
         str(sample.label)[:100],
         sample.reward,

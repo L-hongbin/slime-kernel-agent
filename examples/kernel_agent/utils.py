@@ -737,68 +737,42 @@ def extract_cuda_agent_kernel_code(response: str) -> str:
     return "\n\n".join(ordered_sections) if ordered_sections else response
 
 
-def precheck_cuda_agent_response(response: str, entry_point: str) -> dict[str, Any] | None:
-    cuda_sources, model_new_code = parse_cuda_agent_response(response)
-    error_message, error, precheck = precheck_cuda_agent_code(
-        model_new_code,
-        cuda_sources,
-        entry_point=entry_point,
-    )
-    if precheck == "passed":
-        return None
-
-    return {
-        "status": "failed",
-        "precheck": precheck,
-        "success": False,
-        "correctness": None,
-        "compiled": None,
-        "speedup": None,
-        "error": error,
-        "error_message": error_message,
-        "metadata": {
-            "kernel_eval_failure": True,
-        },
-    }
-
-
-def precheck_tvm_ffi_response(response: str, entry_point: str) -> dict[str, Any] | None:
-    cuda_sources, model_new_code = parse_cuda_agent_response(response)
-    error_message, error, precheck = precheck_cuda_tvm_code(
-        model_new_code,
-        cuda_sources,
-        entry_point=entry_point,
-    )
-    if precheck == "passed":
-        return None
-
-    return {
-        "status": "failed",
-        "precheck": precheck,
-        "success": False,
-        "correctness": None,
-        "compiled": None,
-        "speedup": None,
-        "error": error,
-        "error_message": error_message,
-        "metadata": {
-            "kernel_eval_failure": True,
-        },
-    }
-
-
 def precheck_response(
     response: str,
     entry_point: str,
     backend: str,
 ) -> tuple[bool, dict[str, Any] | None]:
     if backend == "cuda_agent":
-        precheck_state = precheck_cuda_agent_response(response, entry_point)
+        precheck_func = precheck_cuda_agent_code
     elif backend == "tvm_ffi":
-        precheck_state = precheck_tvm_ffi_response(response, entry_point)
+        precheck_func = precheck_cuda_tvm_code
     else:
         return True, None
-    return precheck_state is None, precheck_state
+
+    cuda_sources, model_new_code = parse_cuda_agent_response(response)
+    error_message, error, precheck = precheck_func(
+        model_new_code,
+        cuda_sources,
+        entry_point=entry_point,
+    )
+    if precheck == "passed":
+        return True, None
+    else:
+        precheck_state = {
+            "status": "failed",
+            "precheck": precheck,
+            "success": False,
+            "correctness": None,
+            "compiled": None,
+            "speedup": None,
+            "decoy_kernel": False,
+            "error": error,
+            "error_message": error_message,
+            "metadata": {
+                "kernel_eval_failure": True,
+            },
+        }
+        return False, precheck_state
 
 
 def _mark_remove_sample(sample: Sample, reason: str) -> None:
