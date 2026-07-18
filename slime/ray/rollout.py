@@ -1442,7 +1442,14 @@ def _compute_kernel_agent_metrics(samples):
     bool_keys = {"correctness", "compilation", "decoy_kernel"}
     coverage_keys = {"time_coverage", "num_coverage"}
     values_by_key = {}
-    time_values = {"model_time": [], "env_time": []}
+    time_values = {
+        "model_time": [],
+        "env_time": [],
+        "detail_env_time/compile_time": [],
+        "detail_env_time/kernel_runtime": [],
+        "detail_env_time/profile_time": [],
+        "detail_env_time/refer_runtime": [],
+    }
     total_count = len(samples)
     coverage_rs_masked_count = 0
     correct_count = 0
@@ -1456,15 +1463,29 @@ def _compute_kernel_agent_metrics(samples):
         if is_coverage_rs_masked:
             coverage_rs_masked_count += 1
 
-        for key in time_values:
-            value = metadata.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            time_values[key].append(float(value))
+        model_time = metadata.get("model_time")
+        if not isinstance(model_time, bool) and isinstance(model_time, (int, float)):
+            time_values["model_time"].append(float(model_time))
 
         env_extra_info = metadata.get("env_extra_info")
         if not isinstance(env_extra_info, dict):
             continue
+
+        env_time = metadata.get("env_time")
+        if (
+            env_extra_info.get("precheck") != "failed"
+            and not isinstance(env_time, bool)
+            and isinstance(env_time, (int, float))
+        ):
+            time_values["env_time"].append(float(env_time))
+
+            detail_env_time = env_extra_info.get("detail_env_time")
+            if isinstance(detail_env_time, dict):
+                for key in ("compile_time", "kernel_runtime", "profile_time", "refer_runtime"):
+                    value = detail_env_time.get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    time_values[f"detail_env_time/{key}"].append(float(value))
 
         precheck = env_extra_info.get("precheck")
         if precheck in ("passed", "failed"):
@@ -1509,6 +1530,11 @@ def _compute_kernel_agent_metrics(samples):
         if values:
             log_dict[f"kernel/time/{key}/mean"] = np.mean(values).item()
             log_dict[f"kernel/time/{key}/sum"] = np.sum(values).item()
+            log_dict[f"kernel/time/{key}/count"] = len(values)
+            log_dict[f"kernel/time/{key}/p50"] = np.percentile(values, 50).item()
+            log_dict[f"kernel/time/{key}/p90"] = np.percentile(values, 90).item()
+            log_dict[f"kernel/time/{key}/p95"] = np.percentile(values, 95).item()
+            log_dict[f"kernel/time/{key}/max"] = np.max(values).item()
     return log_dict
 
 

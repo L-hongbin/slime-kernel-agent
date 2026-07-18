@@ -220,7 +220,7 @@ def _build_sample(args) -> Sample:
         return Sample(
             prompt=args.prompt,
             label={"entry_point": "Model", "ground_truth": REFERENCE_IDENTITY_CODE},
-            metadata={"uuid": args.uuid, "source_row": "generate_smoke", "log_multi_turn": True},
+            metadata={"uuid": args.uuid, "source_row": "generate_smoke", "log_rollout_info": True},
         )
 
     row = _read_data_row(args.sample_path, args.sample_index)
@@ -245,7 +245,7 @@ def _build_sample(args) -> Sample:
             "uuid": str(_get_row_value(row, args.uuid_key) or args.uuid),
             "source_row": args.sample_index,
             "sample_path": args.sample_path,
-            "log_multi_turn": True,
+            "log_rollout_info": True,
         }
     )
     print(
@@ -328,7 +328,7 @@ def _install_fake_model(response: str) -> None:
 
 def _install_fake_env(compiled: bool) -> None:
     async def fake_run_kernel_eval(args, sample, payload, config):
-        env_state = generate_with_cuda_agent.normalize_env_feedback(_mock_env_state(compiled))
+        env_state, _env_extra_info = generate_with_cuda_agent.normalize_env_feedback(_mock_env_state(compiled))
         return {"env_state": env_state, "reward_extra_info": env_state}
 
     generate_with_cuda_agent.run_kernel_eval = fake_run_kernel_eval
@@ -416,7 +416,7 @@ async def _run(args) -> None:
     )
     _init_ray_for_kernel_env(args)
     CUDA_AGENT_CONFIGS["max_feedback_chars"] = args.max_feedback_chars
-    CUDA_AGENT_CONFIGS["log_multi_turn_sample_rate"] = 1.0
+    CUDA_AGENT_CONFIGS["log_rollout_info_rate"] = 1.0
     CUDA_AGENT_CONFIGS["do_precheck"] = args.do_precheck
     CUDA_AGENT_CONFIGS["finalize_mode"] = None if args.finalize_mode == "none" else args.finalize_mode
 

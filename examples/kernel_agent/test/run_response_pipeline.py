@@ -20,7 +20,6 @@ from examples.kernel_agent.utils import (
     precheck_response,
 )
 
-
 DEFAULT_LOG_PATH = "examples/kernel_agent/test/log/run_generate_smoke_real_sample_20260525_090634_sample0.log"
 DEFAULT_SAMPLE_PATH = "/nfs/FM/lihongbin/datasets/CUDA_RL/RL_Data/prompt_tvm/drkernel_rl_thinking.parquet"
 
@@ -116,7 +115,7 @@ async def _run(args) -> None:
     }
     env_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
     raw_env_state = env_result.get("env_state", env_result)
-    normalized_env_state = normalize_env_feedback(raw_env_state)
+    normalized_env_state, _env_extra_info = normalize_env_feedback(raw_env_state)
     if args.do_precheck:
         normalized_env_state["precheck"] = "passed" if precheck_result is None else "failed"
 
