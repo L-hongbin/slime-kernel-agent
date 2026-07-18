@@ -12,7 +12,7 @@ try:
 except ImportError:
     ray = None
 
-from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.sglang_rollout import GenerateState, PromptTemplate
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
@@ -81,12 +81,12 @@ def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{"role": "user", "content": str(prompt)}]
 
 
-def _get_tool_response_template(state: GenerateState) -> str:
-    template = (state.multi_turn_templates or {}).get("tool_response")
-    if template is None:
+def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
+    response_template = getattr(state, "multi_turn_template", None)
+    if response_template is None:
         logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
-        return DEFAULT_TOOL_RESPONSE_TEMPLATE
-    return template
+        return PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
+    return response_template
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
@@ -96,17 +96,17 @@ def _truncate_middle(text: str, max_chars: int) -> str:
     return text[:keep] + "...(truncated)..." + text[-keep:]
 
 
-def _apply_feedback_template(env_result: dict[str, Any], template: str) -> str:
-    payload = env_result.get("env_state") or env_result.get("reward_extra_info") or env_result
+def _apply_feedback_template(env_result: dict[str, Any], response_template: PromptTemplate) -> str:
+    feedback_dict = env_result.get("env_state") or env_result
     try:
-        feedback = json.dumps(payload, ensure_ascii=False, indent=2)
+        feedback = json.dumps(feedback_dict, ensure_ascii=False, indent=2)
     except TypeError:
-        feedback = str(payload)
+        feedback = str(feedback_dict)
 
     max_chars = int(CUDA_AGENT_CONFIGS["max_feedback_chars"])
     # max_chars <= 0 means no truncation
     feedback = _truncate_middle(feedback, max_chars)
-    return template.format(feedback=feedback)
+    return response_template.format(feedback=feedback, feedback_dict=feedback_dict)
 
 
 def _json_dumps_for_log(payload: Any) -> str:

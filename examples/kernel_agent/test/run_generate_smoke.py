@@ -24,7 +24,6 @@ from slime.utils.data import read_file
 from slime.utils.http_utils import init_http_client
 from slime.utils.types import Sample
 
-
 DEFAULT_SAMPLE_PATH = "/nfs/FM/lihongbin/datasets/CUDA_RL/SFT/prompt_v4/parallel_drkernel_minimax_results_sft.parquet"
 
 
@@ -185,7 +184,7 @@ class FakeTokenizer:
 class FakeGenerateState:
     def __init__(self, args):
         self.tokenizer = FakeTokenizer()
-        self.multi_turn_templates = None
+        self.multi_turn_template = None
         self.apply_chat_template_kwargs = {}
 
     def _is_qwen3_5_model(self):

@@ -17,7 +17,6 @@ from examples.kernel_agent.utils import (
 )
 from slime.utils.types import Sample
 
-
 VALID_CUDA_AGENT_RESPONSE = """
 ### CUDA_KERNELS
 ```cpp
@@ -305,7 +304,7 @@ def _skip_unselected_compiled_case(request, case, compiled_key):
 
 
 def _format_feedback_for_test(env_result):
-    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_templates=None))
+    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_template=None))
     return generate_with_cuda_agent._apply_feedback_template(env_result, template)
 
 
