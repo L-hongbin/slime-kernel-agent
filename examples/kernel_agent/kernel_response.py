@@ -20,6 +20,12 @@ except ImportError:
 _TASK_COUNTER = 0
 _WORKERS: dict[tuple[str, int, int, int, int], Any] = {}
 _HEARTBEAT_STARTED_AT = time.time()
+# Read timeout for the submit POST /evaluate, bounded separately from the (long)
+# per-task run timeout: if the submit response is slow we fall through to polling
+# /status rather than blocking for the full run. Kept generous (not a few seconds)
+# because an overloaded /evaluate can enqueue the task quickly yet be slow to send
+# the HTTP response -- a too-short value here just triggers redundant polling.
+_SUBMIT_READ_TIMEOUT_S = 60
 
 
 def next_kernel_task_id(prefix: str = "parallel_task") -> str:
@@ -73,6 +79,19 @@ class _HybridHttpWorker:
     def _backoff(self, attempt: int, base: int = 2, cap: int = 30) -> float:
         return min(base**attempt, cap)
 
+    @staticmethod
+    def _is_duplicate_response(response: Any) -> bool:
+        """Best-effort detection of an 'already accepted' response (e.g. HTTP 400/422
+        with a duplicate message) so a resubmit of an already-enqueued task_id is
+        polled rather than treated as a hard failure. HTTP 409 is handled directly."""
+        if getattr(response, "status_code", None) not in (400, 409, 422):
+            return False
+        try:
+            body = response.text.lower()
+        except Exception:
+            return False
+        return any(m in body for m in ("already exists", "already submitted", "already running", "duplicate"))
+
     def get_token_in_use(self) -> int:
         try:
             return ray.get(self._rate_limit_worker.get_current_count.remote())
@@ -92,6 +111,9 @@ class _HybridHttpWorker:
         start_time = time.time()
         attempt = 0
         unlimited = max_retries is None or max_retries == -1
+        submit_read_timeout = min(self.default_timeout, _SUBMIT_READ_TIMEOUT_S)
+        submitted = False  # POST /evaluate confirmed (HTTP 200)
+        submit_error: str | None = None  # last transport error when submit was NOT confirmed
 
         while unlimited or attempt < max(1, max_retries):
             try:
@@ -106,7 +128,11 @@ class _HybridHttpWorker:
                     print(
                         f"[HybridWorker] POST /evaluate task_id={task_data.get('task_id', '')} url={self.server_url}"
                     )
-                response = self._client.post(f"{self.server_url}/evaluate", json=task_data)
+                response = self._client.post(
+                    f"{self.server_url}/evaluate",
+                    json=task_data,
+                    timeout=httpx.Timeout(connect=10.0, read=submit_read_timeout, write=10.0, pool=5.0),
+                )
                 try:
                     print(
                         f"[HybridWorker] POST /evaluate resp={response.status_code} "
@@ -121,6 +147,18 @@ class _HybridHttpWorker:
                     pass
 
                 if response.status_code == 200:
+                    submitted = True
+                    break
+                if response.status_code == 409 or self._is_duplicate_response(response):
+                    # The task_id was already accepted server-side -- typically a prior
+                    # POST that transport-timed-out on the client still enqueued it, and
+                    # this retry is a duplicate. Treat it as submitted and poll the
+                    # existing task instead of raising it as a hard failure.
+                    print(
+                        f"[HybridWorker] POST /evaluate duplicate/conflict ({response.status_code}) "
+                        f"task_id={task_data.get('task_id', '')}; polling existing task"
+                    )
+                    submitted = True
                     break
                 if response.status_code in (429, 503):
                     time.sleep(self._backoff(attempt, base=2 if response.status_code == 429 else 5))
@@ -132,11 +170,22 @@ class _HybridHttpWorker:
                     self._rate_limit_worker.release.remote()
                 except Exception:
                     pass
+                submit_error = str(exc)
                 if unlimited or attempt < max(1, max_retries) - 1:
                     time.sleep(self._backoff(attempt))
                     attempt += 1
                     continue
-                return {"status": "failed", "error_message": str(exc)}
+                # Retries exhausted on a *transport* timeout: the submit response was
+                # not confirmed, but the task (client-provided task_id) may well have
+                # been enqueued server-side. Fall through to polling /results instead
+                # of giving up -- otherwise a slow/overloaded submit is reported as a
+                # bare "timed out" and the server's real result (incl. compiled state)
+                # is never fetched.
+                print(
+                    f"[HybridWorker] submit transport error task_id={task_data.get('task_id', '')} "
+                    f"err={submit_error!r}; polling /results in case it was enqueued"
+                )
+                break
             except Exception as exc:
                 try:
                     self._rate_limit_worker.release.remote()
@@ -146,6 +195,13 @@ class _HybridHttpWorker:
 
         task_id = task_data.get("task_id", "")
         last_status = None
+        _ = (submitted, submit_error)  # captured for logging above; not used to gate polling
+        # IMPORTANT: do NOT treat a 404 from /status as "task not enqueued". For split
+        # (compile+execute) workflows the parent task_id returns 404 the entire time its
+        # sub-tasks run -- the parent result only materializes when the workflow finishes
+        # (which for a hung kernel is at the full task timeout). Bailing on a 404 abandons
+        # a task that is actually running, so we poll until the task resolves to a terminal
+        # status or the client timeout elapses.
         while time.time() - start_time < client_timeout:
             try:
                 status_response = self._client.get(f"{self.server_url}/status/{task_id}")
@@ -164,18 +220,21 @@ class _HybridHttpWorker:
                             pass
                     if status in ("completed", "failed", "timeout", "cancelled"):
                         error_message = status_payload.get("error_message", f"Task {status}")
-                        if status in ("completed", "failed"):
+                        # Fetch /results for ANY terminal status, not just completed/failed:
+                        # a server-side timeout (or cancel) still writes a result carrying
+                        # the real compiled state + stage metadata (e.g. kg_kernel_backend_
+                        # compile_s), which must be surfaced rather than replaced by a bare
+                        # status. Fall back to the bare status only if no result exists.
+                        try:
                             result_response = self._client.get(f"{self.server_url}/results/{task_id}")
                             if result_response.status_code == 200:
                                 result = result_response.json()
                                 result["status"] = status
-                                if status == "failed":
-                                    result["error_message"] = result.get("error_message", error_message)
+                                if status != "completed":
+                                    result["error_message"] = result.get("error_message") or error_message
                                 return result
-                            return {
-                                "status": status,
-                                "error_message": f"Failed to fetch results: HTTP {result_response.status_code}",
-                            }
+                        except Exception:
+                            pass
                         return {"status": status, "error_message": error_message}
             except Exception:
                 pass
@@ -201,6 +260,25 @@ def _kernel_eval_param(args, config: dict[str, Any], name: str, default: Any = _
     if default is not _MISSING:
         return default
     raise KeyError(f"Missing kernel eval parameter: {name}")
+
+
+async def cancel_kernel_eval(args, task_id: str | None, config: dict[str, Any]) -> bool:
+    if not task_id:
+        return False
+
+    config = dict(config)
+    server_url = _kernel_eval_param(args, config, "kernel_env_url", None)
+    if not server_url:
+        return False
+    timeout = float(_kernel_eval_param(args, config, "kernel_eval_cancel_timeout", 5.0))
+
+    def _delete() -> bool:
+        timeout_config = httpx.Timeout(connect=2.0, read=timeout, write=2.0, pool=2.0)
+        with httpx.Client(timeout=timeout_config) as client:
+            response = client.delete(f"{str(server_url).rstrip('/')}/tasks/{task_id}")
+            return response.status_code in (200, 202, 204, 404)
+
+    return await asyncio.to_thread(_delete)
 
 
 def _get_kernel_eval_worker(args, config: dict[str, Any]):
@@ -240,6 +318,15 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
             "num_correct_trials", _kernel_eval_param(args, config, "num_correct_trials")
         ),
         "num_perf_trials": payload.get("num_perf_trials", _kernel_eval_param(args, config, "num_perf_trials")),
+        "num_warmup": payload.get("num_warmup", _kernel_eval_param(args, config, "num_warmup", 3)),
+        "perf_trim_count": payload.get("perf_trim_count", _kernel_eval_param(args, config, "perf_trim_count", 0)),
+        "adaptive_perf_trials": payload.get(
+            "adaptive_perf_trials", _kernel_eval_param(args, config, "adaptive_perf_trials", False)
+        ),
+        "perf_min_trials": payload.get("perf_min_trials", _kernel_eval_param(args, config, "perf_min_trials", 20)),
+        "perf_cv_threshold": payload.get(
+            "perf_cv_threshold", _kernel_eval_param(args, config, "perf_cv_threshold", 0.05)
+        ),
         "timeout": payload.get("timeout", _kernel_eval_param(args, config, "kernel_eval_task_timeout")),
         "priority": payload.get("priority", "normal"),
         "is_valid": payload.get("is_valid", False),
@@ -251,19 +338,42 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
             "detect_decoy_kernel", _kernel_eval_param(args, config, "detect_decoy_kernel", True)
         ),
         "reference_backend": payload.get("reference_backend"),
+        "uuid": payload.get("uuid"),
     }
-    if payload.get("uuid"):
-        task_payload["uuid"] = payload["uuid"]
+    # Reference-timing cache requires a uuid; the server rejects
+    # use_reference_cache=True without one, so only set it when present.
+    if payload.get("use_reference_cache", _kernel_eval_param(args, config, "use_reference_cache", False)):
+        assert task_payload["uuid"] is not None, "use_reference_cache requires a uuid in the payload"
+        task_payload["use_reference_cache"] = True
     if payload.get("split_compile_and_execute", _kernel_eval_param(args, config, "split_compile_and_execute", True)):
         task_payload["split_compile_and_execute"] = True
     if payload.get(
         "enable_compile_artifact_cache", _kernel_eval_param(args, config, "enable_compile_artifact_cache", True)
     ):
         task_payload["enable_compile_artifact_cache"] = True
+    # Optional separate reference perf-trial count; omit when unset so the server
+    # falls back to num_perf_trials.
+    refer_num_perf_trials = payload.get(
+        "refer_num_perf_trials", _kernel_eval_param(args, config, "refer_num_perf_trials", None)
+    )
+    if refer_num_perf_trials is not None:
+        task_payload["refer_num_perf_trials"] = refer_num_perf_trials
+    # Correctness-stage timeout overrides: only send when set so an unset value
+    # leaves the server's config/formula in effect.
+    correctness_timeout = payload.get(
+        "correctness_timeout", _kernel_eval_param(args, config, "correctness_timeout", None)
+    )
+    if correctness_timeout is not None:
+        task_payload["correctness_timeout"] = correctness_timeout
+    correctness_timeout_enabled = payload.get(
+        "correctness_timeout_enabled", _kernel_eval_param(args, config, "correctness_timeout_enabled", None)
+    )
+    if correctness_timeout_enabled is not None:
+        task_payload["correctness_timeout_enabled"] = correctness_timeout_enabled
     return task_payload
 
 
-def _normalize_env_failure(result: dict[str, Any], task_payload: dict[str, Any]) -> dict[str, Any]:
+def _format_env_return(result: dict[str, Any], task_payload: dict[str, Any]) -> dict[str, Any]:
     status = result.get("status") or "failed"
     if status == "completed":
         return result
@@ -281,9 +391,9 @@ def _normalize_env_failure(result: dict[str, Any], task_payload: dict[str, Any])
     env_state = {
         **result,
         "status": status,
-        "success": False,
-        "correctness": False,
-        "compiled": False,
+        "success": result.get("success"),
+        "correctness": result.get("correctness"),
+        "compiled": result.get("compiled"),
         "speedup": 0.0,
         "error": error_message,
         "error_message": error_message,
@@ -301,11 +411,15 @@ async def _wait_kernel_eval_result(
 ) -> dict[str, Any]:
     start_time = time.time()
     pending = [object_ref]
+    if heartbeat_interval <= 0:
+        result = await asyncio.to_thread(ray.get, object_ref)
+        return _format_env_return(result, task_payload)
+
     while pending:
         done, pending = await asyncio.to_thread(ray.wait, pending, num_returns=1, timeout=heartbeat_interval)
         if done:
             result = await asyncio.to_thread(ray.get, done[0])
-            return _normalize_env_failure(result, task_payload)
+            return _format_env_return(result, task_payload)
 
         elapsed = time.time() - start_time
         total_elapsed = time.time() - _HEARTBEAT_STARTED_AT
@@ -327,7 +441,7 @@ async def _wait_kernel_eval_result(
             f"uuid={(task_payload.get('uuid') or 'N/A')[:8]}"
         )
 
-    return _normalize_env_failure(
+    return _format_env_return(
         {"status": "failed", "error_message": "Kernel eval task disappeared before completion"},
         task_payload,
     )
@@ -350,7 +464,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
         if isinstance(result, dict) and isinstance(result.get("env_state"), dict):
             return result
         if isinstance(result, dict):
-            return {"env_state": result, "reward_extra_info": result}
+            return {"env_state": result}
         return result
 
     worker = _get_kernel_eval_worker(args, config)
@@ -368,4 +482,4 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
         heartbeat_interval=float(_kernel_eval_param(args, config, "kernel_eval_heartbeat_interval", 60.0)),
         rate_limit=int(_kernel_eval_param(args, config, "kernel_eval_rate_limit")),
     )
-    return {"env_state": result, "reward_extra_info": result}
+    return {"env_state": result}
