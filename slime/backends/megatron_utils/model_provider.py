@@ -1,8 +1,10 @@
 # Adapt from https://github.com/NVIDIA/Megatron-LM/blob/b1efb3c7126ef7615e8c333432d76e08038e17ff/pretrain_gpt.py
 import argparse
 import inspect
+import logging
 import re
 from contextlib import nullcontext
+from types import MethodType
 from typing import Literal
 
 import torch
@@ -19,6 +21,8 @@ from megatron.training.arguments import core_transformer_config_from_args
 
 from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
+
+logger = logging.getLogger(__name__)
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -55,6 +59,85 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def _cast_lm_head_result_to_fp32(result):
+    if isinstance(result, tuple):
+        result = list(result)
+        if result and isinstance(result[0], torch.Tensor):
+            result[0] = result[0].float()
+        if len(result) > 1 and isinstance(result[1], torch.Tensor):
+            result[1] = result[1].float()
+        return tuple(result)
+    if isinstance(result, torch.Tensor):
+        return result.float()
+    return result
+
+
+def _cast_parameter_data_to_fp32(param: torch.Tensor | None) -> bool:
+    if not isinstance(param, torch.Tensor) or param.dtype == torch.float32:
+        return False
+    param.data = param.data.float()
+    return True
+
+
+def _enable_fp32_forward_for_output_layer(output_layer: torch.nn.Module) -> None:
+    if getattr(output_layer, "_slime_fp32_lm_head_enabled", False):
+        return
+
+    original_forward = output_layer.forward
+    signature = inspect.signature(original_forward)
+    accepts_weight = "weight" in signature.parameters
+    accepts_runtime_gather = "runtime_gather_output" in signature.parameters
+
+    def fp32_forward(
+        self,
+        input_: torch.Tensor,
+        weight: torch.Tensor | None = None,
+        runtime_gather_output: bool | None = None,
+    ):
+        forward_kwargs = {}
+        if accepts_weight:
+            if weight is None:
+                weight = getattr(self, "weight", None)
+            forward_kwargs["weight"] = weight
+        if accepts_runtime_gather:
+            forward_kwargs["runtime_gather_output"] = runtime_gather_output
+
+        if isinstance(weight, torch.Tensor) and weight.dtype == torch.float32:
+            result = original_forward(input_.float(), **forward_kwargs)
+        else:
+            if not getattr(self, "_slime_fp32_lm_head_weight_warning_logged", False):
+                logger.warning(
+                    "--enable-fp32-lm-head is set, but this output_layer forward received weight dtype %s. "
+                    "Keeping input dtype unchanged to preserve Megatron's dtype contract.",
+                    getattr(weight, "dtype", None),
+                )
+                self._slime_fp32_lm_head_weight_warning_logged = True
+            result = original_forward(input_, **forward_kwargs)
+        return _cast_lm_head_result_to_fp32(result)
+
+    output_layer.forward = MethodType(fp32_forward, output_layer)
+    output_layer._slime_fp32_lm_head_enabled = True
+
+
+def _enable_actor_fp32_lm_head(model: torch.nn.Module) -> torch.nn.Module:
+    patched_names = []
+    fp32_weight_names = []
+    for name, module in model.named_modules():
+        if name.split(".")[-1] == "output_layer" and hasattr(module, "weight"):
+            if _cast_parameter_data_to_fp32(getattr(module, "weight", None)):
+                fp32_weight_names.append(f"{name or 'output_layer'}.weight")
+            _enable_fp32_forward_for_output_layer(module)
+            patched_names.append(name or "output_layer")
+
+    if patched_names:
+        logger.info("Enabled fp32 lm head forward for output layer(s): %s", ", ".join(patched_names))
+        if fp32_weight_names:
+            logger.info("Converted lm head parameter(s) to fp32: %s", ", ".join(fp32_weight_names))
+    else:
+        logger.warning("--enable-fp32-lm-head was set, but no output_layer module with weight was found.")
+    return model
+
+
 def _get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -77,6 +160,8 @@ def _get_model_provider_func(
                 model.output_layer = LinearForLastLayer(
                     input_size=model.config.hidden_size, output_size=1, config=model.config
                 )
+            if role == "actor" and post_process and getattr(args, "enable_fp32_lm_head", False):
+                return _enable_actor_fp32_lm_head(model)
             return model
 
         return wrapped_model_provider
@@ -117,6 +202,17 @@ def _get_model_provider_func(
 
             return _critic_provide
 
+        if role == "actor" and getattr(args, "enable_fp32_lm_head", False):
+            _original_provide = provider.provide
+
+            def _actor_provide(pre_process=True, post_process=True, vp_stage=None):
+                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
+                if post_process:
+                    return _enable_actor_fp32_lm_head(model)
+                return model
+
+            return _actor_provide
+
         return provider.provide
 
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
@@ -150,6 +246,8 @@ def _get_model_provider_func(
                         model.output_layer = LinearForLastLayer(
                             input_size=config.hidden_size, output_size=1, config=config
                         )
+                    if role == "actor" and post_process and getattr(args, "enable_fp32_lm_head", False):
+                        return _enable_actor_fp32_lm_head(model)
                     return model
                 transformer_layer_spec = result
         else:
@@ -234,6 +332,8 @@ def _get_model_provider_func(
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
 
+        if role == "actor" and post_process and getattr(args, "enable_fp32_lm_head", False):
+            return _enable_actor_fp32_lm_head(model)
         return model
 
     return model_provider

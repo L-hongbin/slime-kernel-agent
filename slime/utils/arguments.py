@@ -284,6 +284,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--enable-fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Request fp32 lm-head logits. Megatron actor logits are cast to fp32 while preserving the "
+                    "original output-layer parameter and TP gradient path; SGLang rollout engines are also asked "
+                    "to enable fp32 lm head when supported."
+                ),
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -1891,6 +1901,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if getattr(args, "enable_fp32_lm_head", False):
+        if not getattr(args, "sglang_enable_fp32_lm_head", False):
+            logger.info("--enable-fp32-lm-head is set; setting --sglang-enable-fp32-lm-head for rollout engines.")
+        args.sglang_enable_fp32_lm_head = True
+
     _parse_sequence_mis_args(args)
     if getattr(args, "sequence_mis_aggregation", None) == "turns_geometric" and not getattr(
         args, "enable_turns_dp_partitions", False
