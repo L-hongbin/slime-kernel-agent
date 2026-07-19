@@ -222,6 +222,54 @@ def compute_aspo_policy_loss(
     }
 
 
+def compute_ripo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    ripo_delta: float,
+    ripo_delta_high: float,
+    ripo_ratio_min: float | None = 0.5,
+    ripo_ratio_max: float | None = 10.0,
+):
+    """Compute RIPO/RIC policy loss with token-wise dynamic clipping bounds."""
+    assert ripo_delta > 0.0, f"ripo_delta must be positive, got {ripo_delta}."
+    assert ripo_delta_high > 0.0, f"ripo_delta_high must be positive, got {ripo_delta_high}."
+
+    log_ratio = torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0)
+    ratio = torch.exp(log_ratio)
+    old_prob = old_log_probs.float().exp().detach().clamp_min(1e-12).to(ratio.dtype)
+
+    eps_low = torch.sqrt(ratio.new_tensor(ripo_delta) / old_prob)
+    eps_high = torch.sqrt(ratio.new_tensor(ripo_delta_high) / old_prob)
+    clip_lower = 1.0 - eps_low
+    clip_upper = 1.0 + eps_high
+
+    if ripo_ratio_min is not None:
+        clip_lower = torch.clamp(clip_lower, min=ripo_ratio_min)
+    if ripo_ratio_max is not None:
+        clip_upper = torch.clamp(clip_upper, max=ripo_ratio_max)
+
+    clipped_ratio = torch.minimum(torch.maximum(ratio, clip_lower), clip_upper)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * clipped_ratio
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    clipfrac = (pg_losses2 > pg_losses1).float()
+    upper_clipfrac = clipfrac * (ratio > clip_upper).float()
+    lower_clipfrac = clipfrac * (ratio < clip_lower).float()
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+        "ripo_eps_low": eps_low,
+        "ripo_eps_high": eps_high,
+        "ripo_clip_lower": clip_lower,
+        "ripo_clip_upper": clip_upper,
+    }
+
+
 def compute_cispo_policy_loss(
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,

@@ -838,78 +838,6 @@ def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
             _mark_remove_sample(sample, "coverage_rs")
 
 
-def _is_maskable_truncated_sample(sample: Sample) -> bool:
-    env_extra_info = sample.metadata.get("env_extra_info") if isinstance(sample.metadata, dict) else None
-    if not isinstance(env_extra_info, dict):
-        return True
-    return not bool(env_extra_info.get("decoy_kernel"))
-
-
-def _apply_conditional_truncation_masking(args, output_samples: list[Sample]) -> None:
-    mask_prob = float(getattr(args, "conditional_truncation_mask_prob", 0.2))
-    if mask_prob <= 0.0:
-        return
-    if mask_prob > 1.0:
-        raise ValueError(f"conditional_truncation_mask_prob must be in [0, 1], got {mask_prob}.")
-
-    max_response_len = int(getattr(args, "rollout_max_response_len", getattr(args, "max_new_tokens", 0)) or 0)
-    if max_response_len <= 0:
-        return
-
-    repeat_window = int(getattr(args, "conditional_truncation_repeat_window", 128))
-    max_response_count = 0
-    repeated_count = 0
-    unmaskable_count = 0
-    eligible_count = 0
-    masked_count = 0
-
-    for sample in output_samples:
-        response_length = int(sample.response_length or 0)
-        if (
-            sample.remove_sample
-            or response_length < max_response_len
-            or (sample.loss_mask is not None and sum(sample.loss_mask) == 0)
-        ):
-            continue
-
-        max_response_count += 1
-        response_tokens = sample.tokens[-response_length:] if response_length > 0 else []
-        has_tail_repetition = (
-            repeat_window > 0
-            and len(response_tokens) >= 2 * repeat_window
-            and response_tokens[-repeat_window:] == response_tokens[-2 * repeat_window : -repeat_window]
-        )
-        if has_tail_repetition:
-            repeated_count += 1
-            continue
-        if not _is_maskable_truncated_sample(sample):
-            unmaskable_count += 1
-            continue
-
-        eligible_count += 1
-        sample.metadata = dict(sample.metadata or {})
-        sample.metadata["conditional_truncation_masking_eligible"] = True
-        if random.random() < mask_prob:
-            _mark_remove_sample(sample, "conditional_truncation_masking")
-            sample.metadata["conditional_truncation_mask_prob"] = mask_prob
-            sample.metadata["conditional_truncation_repeat_window"] = repeat_window
-            masked_count += 1
-
-    if max_response_count > 0 or masked_count > 0:
-        logger.info(
-            "[kernel_agent][conditional_truncation_masking] max_response=%s eligible=%s masked=%s "
-            "repeated=%s unmaskable=%s mask_prob=%.3f repeat_window=%s max_response_len=%s",
-            max_response_count,
-            eligible_count,
-            masked_count,
-            repeated_count,
-            unmaskable_count,
-            mask_prob,
-            repeat_window,
-            max_response_len,
-        )
-
-
 def _apply_rollout_progress_metadata(output_samples: list[Sample], finish_reason: str) -> None:
     total_model_time = 0.0
     total_env_time = 0.0
@@ -990,8 +918,6 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
         return output_samples
 
     _apply_coverage_rs(args, output_samples)
-    if getattr(args, "use_conditional_truncation_mask", False):
-        _apply_conditional_truncation_masking(args, output_samples)
 
     finalize_mode = getattr(args, "finalize_mode", "positive")
     if finalize_mode == "none":

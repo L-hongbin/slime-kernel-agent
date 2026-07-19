@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -966,15 +967,40 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--policy-loss-mode",
                 type=str,
-                choices=["ppo", "up", "aspo", "dppo_binary_tv", "dppo_binary_kl", "cispo", "drpo"],
+                choices=["ppo", "up", "aspo", "ripo", "dppo_binary_tv", "dppo_binary_kl", "cispo", "drpo"],
                 default="ppo",
                 help=(
                     "Policy loss trust-region mode. ppo uses ratio clipping; "
                     "up uses unclipped positive-advantage updates and clipped non-positive updates; "
                     "aspo uses reciprocal positive-advantage IS weights with hard/soft clipping; "
+                    "ripo uses token-wise Riemannian dynamic clipping; "
                     "dppo_binary_tv and dppo_binary_kl use rollout-anchored DPPO binary masks; "
                     "cispo uses detached clipped importance weights; drpo uses smooth Binary-TV regularization."
                 ),
+            )
+            parser.add_argument(
+                "--ripo-delta",
+                type=float,
+                default=0.05,
+                help="RIPO/RIC trust-region radius delta.",
+            )
+            parser.add_argument(
+                "--ripo-delta-high",
+                type=float,
+                default=None,
+                help="Optional RIPO upper-bound delta, analogous to --eps-clip-high. Defaults to --ripo-delta.",
+            )
+            parser.add_argument(
+                "--ripo-ratio-min",
+                type=float,
+                default=0.5,
+                help="Outer lower bound for RIPO importance-ratio clipping.",
+            )
+            parser.add_argument(
+                "--ripo-ratio-max",
+                type=float,
+                default=10.0,
+                help="Outer upper bound for RIPO importance-ratio clipping.",
             )
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO/DPPO lower clip range")
             parser.add_argument(
@@ -1925,6 +1951,17 @@ def slime_validate_args(args):
 
     conditional_truncation_mask_prob = getattr(args, "conditional_truncation_mask_prob", 0.1)
     assert 0.0 <= conditional_truncation_mask_prob <= 1.0, "conditional_truncation_mask_prob must be in [0, 1]."
+    if getattr(args, "use_conditional_truncation_mask", False):
+        reward_post_process_path = getattr(args, "custom_reward_post_process_path", None)
+        expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+        if reward_post_process_path != expected_path:
+            logger.warning(
+                "--use-conditional-truncation-mask is applied by %s, but "
+                "--custom-reward-post-process-path is %r. CTM will not be applied unless the configured hook "
+                "implements equivalent post-normalization masking.",
+                expected_path,
+                reward_post_process_path,
+            )
 
     if args.use_slime_router:
         logger.warning(
@@ -2043,6 +2080,24 @@ def slime_validate_args(args):
 
     policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
     use_dppo_binary = policy_loss_mode in ["dppo_binary_tv", "dppo_binary_kl"]
+    if policy_loss_mode == "ripo":
+        if not math.isfinite(args.ripo_delta) or args.ripo_delta <= 0.0:
+            raise ValueError(f"--ripo-delta must be a finite positive number, got {args.ripo_delta}.")
+        if args.ripo_delta_high is not None and (
+            not math.isfinite(args.ripo_delta_high) or args.ripo_delta_high <= 0.0
+        ):
+            raise ValueError(
+                f"--ripo-delta-high must be a finite positive number when set, got {args.ripo_delta_high}."
+            )
+        if not math.isfinite(args.ripo_ratio_min) or not 0.0 <= args.ripo_ratio_min <= 1.0:
+            raise ValueError(f"--ripo-ratio-min must be finite and in [0, 1], got {args.ripo_ratio_min}.")
+        if not math.isfinite(args.ripo_ratio_max) or args.ripo_ratio_max < 1.0:
+            raise ValueError(f"--ripo-ratio-max must be finite and >= 1, got {args.ripo_ratio_max}.")
+        if args.ripo_ratio_min > args.ripo_ratio_max:
+            raise ValueError(
+                "--ripo-ratio-min must not exceed --ripo-ratio-max, got "
+                f"{args.ripo_ratio_min} > {args.ripo_ratio_max}."
+            )
     assert not (
         (use_dppo_binary or policy_loss_mode == "drpo") and args.use_tis
     ), "DPPO binary loss, DRPO, and TIS apply policy-loss corrections; disable use_tis."

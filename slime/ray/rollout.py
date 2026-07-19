@@ -1540,9 +1540,7 @@ def _compute_kernel_agent_metrics(samples):
     for sample in samples:
         metadata = sample.metadata or {}
         is_coverage_rs_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
-        is_conditional_truncation_masked = (
-            sample.remove_sample and metadata.get("remove_reason") == "conditional_truncation_masking"
-        )
+        is_conditional_truncation_masked = bool(metadata.get("conditional_truncation_masked"))
         if is_coverage_rs_masked:
             coverage_rs_masked_count += 1
         if is_conditional_truncation_masked:

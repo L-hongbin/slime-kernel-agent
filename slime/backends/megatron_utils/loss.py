@@ -20,6 +20,7 @@ from slime.utils.ppo_utils import (
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
+    compute_ripo_policy_loss,
     compute_up_policy_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
@@ -931,6 +932,17 @@ def policy_loss_function(
     elif policy_loss_mode == "aspo":
         policy_loss_output = compute_aspo_policy_loss(
             log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif policy_loss_mode == "ripo":
+        ripo_delta_high = args.ripo_delta_high if args.ripo_delta_high is not None else args.ripo_delta
+        policy_loss_output = compute_ripo_policy_loss(
+            log_probs,
+            old_log_probs,
+            advantages,
+            args.ripo_delta,
+            ripo_delta_high,
+            args.ripo_ratio_min,
+            args.ripo_ratio_max,
         )
     elif policy_loss_mode == "cispo":
         policy_loss_output = compute_cispo_policy_loss(
