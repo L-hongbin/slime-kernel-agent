@@ -15,12 +15,24 @@ def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> floa
 
 
 def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
+    """Apply the MicroCoder-GRPO Conditional Truncation Mask (CTM).
+
+    Implements CTM from Breaking Training Bottlenecks: Effective and Stable
+    Reinforcement Learning for Coding Models (arXiv:2603.07777). Eligible
+    responses reach the maximum length, are non-incorrect (correct or
+    incomplete), and do not repeat the preceding 128-token window at the tail;
+    their post-processed advantages are randomly zeroed with probability rho.
+    The paper compares rho=0.1, 0.2, and 0.3; slime defaults to rho=0.1. This
+    hook runs after group reward normalization so masked samples do not alter
+    other samples' advantages.
+    """
     if sample.remove_sample:
         return advantage
     if sample.loss_mask is not None and sum(sample.loss_mask) == 0:
         return advantage
 
-    # CTM eligibility: max length, non-incorrect (correct or truncated), no repeated tail, then Bernoulli masking.
+    # Paper CTM eligibility: max length, non-incorrect (correct or truncated),
+    # no repeated tail, then Bernoulli masking.
     max_response_len = int(getattr(args, "rollout_max_response_len", getattr(args, "max_new_tokens", 0)) or 0)
     response_length = int(sample.response_length or 0)
     if max_response_len <= 0 or response_length != max_response_len:

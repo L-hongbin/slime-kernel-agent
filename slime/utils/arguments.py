@@ -967,22 +967,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--policy-loss-mode",
                 type=str,
-                choices=["ppo", "up", "aspo", "ripo", "dppo_binary_tv", "dppo_binary_kl", "cispo", "drpo"],
+                choices=["ppo", "up", "aspo", "ripo", "dppo_binary_tv", "dppo_binary_kl", "cppo", "cispo", "drpo"],
                 default="ppo",
                 help=(
                     "Policy loss trust-region mode. ppo uses ratio clipping; "
-                    "up uses unclipped positive-advantage updates and clipped non-positive updates; "
-                    "aspo uses reciprocal positive-advantage IS weights with hard/soft clipping; "
-                    "ripo uses token-wise Riemannian dynamic clipping; "
-                    "dppo_binary_tv and dppo_binary_kl use rollout-anchored DPPO binary masks; "
-                    "cispo uses detached clipped importance weights; drpo uses smooth Binary-TV regularization."
+                    "up is UP (arXiv:2607.06987): unclipped positive-advantage updates and clipped non-positive updates; "
+                    "aspo is ASPO (arXiv:2510.06062): reciprocal positive-advantage IS weights with hard/soft clipping; "
+                    "ripo is RIPO/RIC (arXiv:2607.10169): token-wise Riemannian dynamic clipping; "
+                    "dppo_binary_tv and dppo_binary_kl are DPPO (arXiv:2602.04879): divergence-based binary masks; "
+                    "cppo is CPPO (arXiv:2606.10968) in Binary-TV mode: position-weighted clipping with a prefix budget; "
+                    "cispo uses detached clipped importance weights; "
+                    "drpo is DRPO (arXiv:2606.09821): smooth Binary-TV regularization."
                 ),
             )
             parser.add_argument(
                 "--ripo-delta",
                 type=float,
                 default=0.05,
-                help="RIPO/RIC trust-region radius delta.",
+                help="RIPO/RIC trust-region radius delta. Paper arXiv:2607.10169 uses 0.05 by default.",
             )
             parser.add_argument(
                 "--ripo-delta-high",
@@ -994,15 +996,39 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--ripo-ratio-min",
                 type=float,
                 default=0.5,
-                help="Outer lower bound for RIPO importance-ratio clipping.",
+                help="Outer lower bound for RIPO importance-ratio clipping. Paper uses 0.5.",
             )
             parser.add_argument(
                 "--ripo-ratio-max",
                 type=float,
                 default=10.0,
-                help="Outer upper bound for RIPO importance-ratio clipping.",
+                help="Outer upper bound for RIPO importance-ratio clipping. Paper uses 10.",
             )
-            parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO/DPPO lower clip range")
+            parser.add_argument(
+                "--eps-clip",
+                type=float,
+                default=0.2,
+                help="PPO/DPPO lower clip range; CPPO uses it as the token-divergence threshold delta.",
+            )
+            parser.add_argument(
+                "--cppo-prefix-delta",
+                type=float,
+                default=0.02,
+                help=(
+                    "CPPO dynamic prefix-budget floor delta_b_min. Each sequence uses "
+                    "clamp(P90(D), delta_b_min, 2*delta_b_min), matching the official UniRL implementation. "
+                    "The paper uses 0.015 for the post-trained model and 0.02 for Base models."
+                ),
+            )
+            parser.add_argument(
+                "--cppo-weight-floor",
+                type=float,
+                default=0.8,
+                help=(
+                    "CPPO final-token position weight w_min; weights decay linearly from 1. "
+                    "CPPO (arXiv:2606.10968) uses 0.8."
+                ),
+            )
             parser.add_argument(
                 "--eps-clip-high",
                 type=float,
@@ -1582,6 +1608,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=0.1,
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
             )
+            parser.add_argument(
+                "--use-conditional-truncation-mask",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable Conditional Truncation Masking from MicroCoder-GRPO (arXiv:2603.07777), which "
+                    "probabilistically zeros post-processed advantages for eligible max-length responses."
+                ),
+            )
+            parser.add_argument(
+                "--conditional-truncation-mask-prob",
+                type=float,
+                default=0.1,
+                help=("CTM masking probability rho. The paper compares 0.1, 0.2, and 0.3; slime defaults to 0.1."),
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -2080,6 +2121,20 @@ def slime_validate_args(args):
 
     policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
     use_dppo_binary = policy_loss_mode in ["dppo_binary_tv", "dppo_binary_kl"]
+    if policy_loss_mode == "cppo":
+        if not math.isfinite(args.eps_clip) or args.eps_clip <= 0.0:
+            raise ValueError(f"--eps-clip must be finite and positive for CPPO, got {args.eps_clip}.")
+        if not math.isfinite(args.cppo_prefix_delta) or args.cppo_prefix_delta <= 0.0:
+            raise ValueError(f"--cppo-prefix-delta must be finite and positive, got {args.cppo_prefix_delta}.")
+        if not math.isfinite(args.cppo_weight_floor) or not 0.0 < args.cppo_weight_floor <= 1.0:
+            raise ValueError(f"--cppo-weight-floor must be finite and in (0, 1], got {args.cppo_weight_floor}.")
+        if args.eps_clip_high is not None and args.eps_clip_high != args.eps_clip:
+            logger.warning(
+                "CPPO uses --eps-clip as its symmetric TV-divergence threshold; --eps-clip-high=%s is ignored.",
+                args.eps_clip_high,
+            )
+        if args.eps_clip_c is not None:
+            logger.warning("CPPO does not use --eps-clip-c; its trust region is applied only through masking.")
     if policy_loss_mode == "ripo":
         if not math.isfinite(args.ripo_delta) or args.ripo_delta <= 0.0:
             raise ValueError(f"--ripo-delta must be a finite positive number, got {args.ripo_delta}.")
@@ -2099,19 +2154,31 @@ def slime_validate_args(args):
                 f"{args.ripo_ratio_min} > {args.ripo_ratio_max}."
             )
     assert not (
-        (use_dppo_binary or policy_loss_mode == "drpo") and args.use_tis
-    ), "DPPO binary loss, DRPO, and TIS apply policy-loss corrections; disable use_tis."
-    if use_dppo_binary and not args.use_rollout_logprobs:
-        logger.warning(
-            "DPPO binary loss is using actor-recomputed old log_probs. According to the DPPO paper "
-            "this variant should usually be rollout-anchored. Consider adding --use-rollout-logprobs "
-            "to use rollout log_probs as the old-policy anchor, skip the actor old-logprob forward pass, "
-            "and improve training efficiency."
+        (use_dppo_binary or policy_loss_mode in {"cppo", "drpo"}) and args.use_tis
+    ), "DPPO binary loss, CPPO, DRPO, and TIS apply policy-loss corrections; disable use_tis."
+    if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl", "cppo", "drpo"} and not args.use_rollout_logprobs:
+        if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}:
+            loss_name = "DPPO binary loss"
+        elif policy_loss_mode == "cppo":
+            loss_name = "CPPO"
+        else:
+            loss_name = policy_loss_mode.upper()
+        paper_context = (
+            " This is the decoupled-objective ablation, not the rollout behavior-policy anchor used in "
+            "the DPPO paper (https://arxiv.org/abs/2602.04879)."
+            if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}
+            else (
+                " CPPO (https://arxiv.org/abs/2606.10968) defines its divergence against the rollout "
+                "behavior policy."
+                if policy_loss_mode == "cppo"
+                else ""
+            )
         )
-    if policy_loss_mode == "drpo" and not args.use_rollout_logprobs:
         logger.warning(
-            "DRPO is using actor-recomputed old log_probs. Consider adding --use-rollout-logprobs "
-            "to use rollout log_probs as the behavior-policy anchor."
+            "%s is using actor-recomputed old log_probs.%s Add --use-rollout-logprobs to use the rollout "
+            "behavior-policy anchor and skip the actor old-logprob forward pass.",
+            loss_name,
+            paper_context,
         )
 
     if args.eps_clip_high is None:

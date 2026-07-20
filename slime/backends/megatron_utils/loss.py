@@ -15,6 +15,7 @@ from slime.utils.ppo_utils import (
     compute_approx_kl,
     compute_aspo_policy_loss,
     compute_cispo_policy_loss,
+    compute_cppo_policy_loss,
     compute_dppo_binary_policy_loss,
     compute_drpo_policy_loss,
     compute_gspo_kl,
@@ -867,11 +868,12 @@ def policy_loss_function(
     if not train_log_probs_for_tis:
         train_log_probs_for_tis = [log_prob.detach() for log_prob in log_probs]
 
-    # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    # Pre-gather log probs if needed by OPSM, GSPO, or response-level CPPO to avoid duplicate gathering
+    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo" or policy_loss_mode == "cppo"
 
     full_log_probs = None
     full_old_log_probs = None
+    full_advantages = None
     if need_full_log_probs:
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
@@ -885,6 +887,13 @@ def policy_loss_function(
                 old_log_probs, total_lengths, response_lengths, strict=False
             )
         ]
+        if policy_loss_mode == "cppo":
+            full_advantages = [
+                all_gather_with_cp(advantage, total_length, response_length)
+                for advantage, total_length, response_length in zip(
+                    batch["advantages"], total_lengths, response_lengths, strict=False
+                )
+            ]
 
     # Compute OPSM mask if enabled
     if args.use_opsm:
@@ -925,6 +934,42 @@ def policy_loss_function(
         policy_loss_output = compute_drpo_policy_loss(
             log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
         )
+    elif policy_loss_mode == "cppo":
+        per_sample_outputs = [
+            compute_cppo_policy_loss(
+                full_log_prob,
+                full_old_log_prob,
+                full_advantage,
+                args.eps_clip,
+                args.cppo_prefix_delta,
+                args.cppo_weight_floor,
+            )
+            for full_log_prob, full_old_log_prob, full_advantage in zip(
+                full_log_probs, full_old_log_probs, full_advantages, strict=False
+            )
+        ]
+        policy_loss_output = {
+            key: torch.cat(
+                [
+                    slice_log_prob_with_cp(
+                        item[key],
+                        total_length,
+                        response_length,
+                        args.qkv_format,
+                        max_seq_len,
+                    )
+                    for item, total_length, response_length, max_seq_len in zip(
+                        per_sample_outputs,
+                        total_lengths,
+                        response_lengths,
+                        max_seq_lens if max_seq_lens is not None else [None] * len(total_lengths),
+                        strict=False,
+                    )
+                ],
+                dim=0,
+            )
+            for key in per_sample_outputs[0]
+        }
     elif policy_loss_mode == "up":
         policy_loss_output = compute_up_policy_loss(
             log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
