@@ -943,6 +943,7 @@ def policy_loss_function(
                 args.eps_clip,
                 args.cppo_prefix_delta,
                 args.cppo_weight_floor,
+                args.eps_clip_c,
             )
             for full_log_prob, full_old_log_prob, full_advantage in zip(
                 full_log_probs, full_old_log_probs, full_advantages, strict=False

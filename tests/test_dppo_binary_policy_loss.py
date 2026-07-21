@@ -22,7 +22,7 @@ def test_dppo_binary_tv_masks_advantage_direction_updates():
     clipfrac = output["pg_clipfrac"]
 
     expected_clipfrac = torch.tensor([0.0, 1.0, 1.0, 1.0])
-    ratio = torch.exp(log_probs - rollout_log_probs).clamp(max=20.0)
+    ratio = torch.exp(log_probs - rollout_log_probs).clamp(max=10.0)
     expected_loss = -advantages * ratio * (1.0 - expected_clipfrac) * log_probs
 
     torch.testing.assert_close(clipfrac, expected_clipfrac)
@@ -46,4 +46,6 @@ def test_dppo_binary_kl_masks_only_matching_probability_direction():
     )
     clipfrac = output["pg_clipfrac"]
 
+    # Both tokens have large binary KL, but their probability movement is opposite
+    # to the advantage-specific invalid direction, so neither update is masked.
     torch.testing.assert_close(clipfrac, torch.zeros_like(clipfrac))

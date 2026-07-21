@@ -306,6 +306,7 @@ def compute_cppo_policy_loss(
     delta: float,
     prefix_delta: float,
     weight_floor: float,
+    eps_clip_c: float | None = None,
 ):
     """Compute CPPO policy loss in Binary-TV mode for one complete response.
 
@@ -334,7 +335,6 @@ def compute_cppo_policy_loss(
         raise ValueError(f"CPPO weight_floor must be finite and in (0, 1], got {weight_floor}.")
 
     response_length = log_probs.numel()
-    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
     old_prob = old_log_probs.float().exp().detach()
     divergence = (log_probs.float().exp().detach() - old_prob).abs()
 
@@ -353,11 +353,15 @@ def compute_cppo_policy_loss(
         delta + sequence_prefix_delta * prefix_weight - prefix_divergence,
     )
 
+    ratio_clip_c = 20.0 if eps_clip_c is None else eps_clip_c
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    ratio = torch.clamp(ratio, max=ratio_clip_c).detach()
+
     outward_update = advantages * (ratio.detach() - 1.0) > 0.0
     invalid_mask = outward_update & (weighted_divergence > effective_threshold)
     valid_mask = (~invalid_mask).to(log_probs.dtype)
 
-    pg_losses = -advantages * ratio * valid_mask
+    pg_losses = -advantages * ratio * valid_mask * log_probs
 
     positive_advantage_mask = advantages > 0
     token_threshold_violation = outward_update & (weighted_divergence > delta)

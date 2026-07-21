@@ -77,3 +77,22 @@ def test_cppo_single_token_has_unit_position_weight_and_masks_gradient():
     torch.testing.assert_close(output["cppo_weighted_divergence"], torch.tensor([0.3]))
     torch.testing.assert_close(output["pg_clipfrac"], torch.ones(1))
     torch.testing.assert_close(log_probs.grad, torch.zeros_like(log_probs))
+
+
+def test_cppo_eps_clip_c_caps_detached_score_function_weight():
+    log_probs = torch.tensor([0.0], requires_grad=True)
+    old_log_probs = torch.tensor([-2.0])
+
+    output = compute_cppo_policy_loss(
+        log_probs,
+        old_log_probs,
+        torch.ones(1),
+        delta=10.0,
+        prefix_delta=10.0,
+        weight_floor=0.8,
+        eps_clip_c=2.0,
+    )
+
+    output["pg_losses"].sum().backward()
+
+    torch.testing.assert_close(log_probs.grad, torch.tensor([-2.0]))

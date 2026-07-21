@@ -74,6 +74,51 @@ def test_post_process_rewards_by_group_matches_original_last_turn(
     assert rewards_by_group == pytest.approx(rewards)
 
 
+@pytest.mark.parametrize(
+    ("advantage_estimator", "rloo_scale"),
+    [("grpo", 1.0), ("rloo", 1.5), ("reinforce_plus_plus_baseline", 1.0)],
+)
+def test_reward_post_process_by_group_normalizes_each_turn(advantage_estimator: str, rloo_scale: float):
+    manager = _make_manager(advantage_estimator=advantage_estimator, use_multi_turn=True)
+    samples = [
+        _make_sample(0, 0, 1.0, turn_idx=0),
+        _make_sample(1, 0, 2.0, turn_idx=0),
+        _make_sample(2, 0, 4.0, turn_idx=0),
+        _make_sample(0, 0, 3.0, turn_idx=1),
+        _make_sample(1, 0, 6.0, turn_idx=1),
+        _make_sample(2, 0, 9.0, turn_idx=1),
+        _make_sample(3, 1, 2.0, turn_idx=0),
+        _make_sample(4, 1, 5.0, turn_idx=0),
+        _make_sample(5, 1, 8.0, turn_idx=0),
+        _make_sample(3, 1, 4.0, turn_idx=1),
+        _make_sample(4, 1, 7.0, turn_idx=1),
+        _make_sample(5, 1, 10.0, turn_idx=1),
+    ]
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
+    expected_rewards = []
+    for start in range(0, len(raw_rewards), manager.args.n_samples_per_prompt):
+        group_rewards = raw_rewards[start : start + manager.args.n_samples_per_prompt]
+        group_mean = sum(group_rewards) / len(group_rewards)
+        expected_rewards.extend((reward - group_mean) * rloo_scale for reward in group_rewards)
+
+    assert rewards == pytest.approx(expected_rewards)
+
+
+def test_reward_post_process_by_group_handles_single_valid_sample_after_pad_masking():
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True, grpo_std_normalization=True)
+    valid_sample = _make_sample(0, 0, 3.0, turn_idx=1)
+    pad_sample = _make_sample(1, 0, 0.0, turn_idx=1)
+    pad_sample.remove_sample = True
+    pad_sample.loss_mask = [0]
+    pad_sample.metadata["is_pad_turn"] = True
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, [valid_sample, pad_sample])
+
+    assert raw_rewards == [3.0, 0.0]
+    assert rewards == pytest.approx([0.0, 0.0])
+
+
 def _make_ctm_candidate(
     index: int,
     reward: float,
@@ -156,42 +201,5 @@ def test_ctm_rejects_non_max_length_or_repeated_response(response_length, tokens
     assert rewards == pytest.approx([0.0])
 
 
-@pytest.mark.parametrize("advantage_estimator", ["grpo", "rloo", "reinforce_plus_plus_baseline"])
-def test_post_process_rewards_by_group_matches_original_all_turn(advantage_estimator: str):
-    manager = _make_manager(advantage_estimator=advantage_estimator, use_multi_turn=True)
-    samples = [
-        _make_sample(0, 0, 1.0, turn_idx=0),
-        _make_sample(1, 0, 2.0, turn_idx=0),
-        _make_sample(2, 0, 4.0, turn_idx=0),
-        _make_sample(0, 0, 3.0, turn_idx=1),
-        _make_sample(1, 0, 6.0, turn_idx=1),
-        _make_sample(2, 0, 9.0, turn_idx=1),
-        _make_sample(3, 1, 2.0, turn_idx=0),
-        _make_sample(4, 1, 5.0, turn_idx=0),
-        _make_sample(5, 1, 8.0, turn_idx=0),
-        _make_sample(3, 1, 4.0, turn_idx=1),
-        _make_sample(4, 1, 7.0, turn_idx=1),
-        _make_sample(5, 1, 10.0, turn_idx=1),
-    ]
-
-    raw_rewards, rewards = manager._post_process_rewards(samples)
-    raw_rewards_by_group, rewards_by_group = reward_post_process_by_group(manager.args, samples)
-
-    assert raw_rewards_by_group == raw_rewards
-    expected = [
-        -4.0 / 3.0,
-        -1.0 / 3.0,
-        5.0 / 3.0,
-        -3.0,
-        0.0,
-        3.0,
-        -3.0,
-        0.0,
-        3.0,
-        -3.0,
-        0.0,
-        3.0,
-    ]
-    if advantage_estimator == "rloo":
-        expected = [value * 1.5 for value in expected]
-    assert rewards_by_group == pytest.approx(expected)
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

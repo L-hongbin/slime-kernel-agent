@@ -64,7 +64,7 @@ async def _run(args) -> None:
 
     cuda_sources, model_new_code = parse_cuda_agent_response(response)
     kernel_code = extract_cuda_agent_kernel_code(response)
-    precheck_result = precheck_response(response, precheck_entry_point, args.kernel_backend)
+    precheck_passed, precheck_state = precheck_response(response, precheck_entry_point, args.kernel_backend)
 
     print("[cuda_agent][response_pipeline] parse summary:")
     print(
@@ -85,7 +85,7 @@ async def _run(args) -> None:
     )
 
     print("[cuda_agent][response_pipeline] precheck result:")
-    print(_json_dumps(precheck_result or {"precheck": "passed"}))
+    print(_json_dumps({"precheck": "passed"} if precheck_passed else precheck_state))
 
     if args.print_kernel_code:
         print("[cuda_agent][response_pipeline] extracted kernel_code:")
@@ -93,7 +93,7 @@ async def _run(args) -> None:
 
     if args.skip_env:
         return
-    if precheck_result is not None and not args.run_env_on_precheck_fail:
+    if not precheck_passed and not args.run_env_on_precheck_fail:
         print("[cuda_agent][response_pipeline] skip Env because precheck failed.")
         return
     if not args.kernel_env_url:
@@ -116,8 +116,8 @@ async def _run(args) -> None:
     env_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
     raw_env_state = env_result.get("env_state", env_result)
     normalized_env_state, _env_extra_info = normalize_env_feedback(raw_env_state)
-    if args.do_precheck:
-        normalized_env_state["precheck"] = "passed" if precheck_result is None else "failed"
+    if args.do_precheck and not precheck_passed:
+        normalized_env_state["precheck"] = "failed"
 
     print("[cuda_agent][response_pipeline] raw Env result:")
     print(_json_dumps(raw_env_state))

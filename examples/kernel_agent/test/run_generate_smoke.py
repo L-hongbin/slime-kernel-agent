@@ -329,7 +329,7 @@ def _install_fake_model(response: str) -> None:
 def _install_fake_env(compiled: bool) -> None:
     async def fake_run_kernel_eval(args, sample, payload, config):
         env_state, _env_extra_info = generate_with_cuda_agent.normalize_env_feedback(_mock_env_state(compiled))
-        return {"env_state": env_state, "reward_extra_info": env_state}
+        return {"env_state": env_state}
 
     generate_with_cuda_agent.run_kernel_eval = fake_run_kernel_eval
 

@@ -1041,7 +1041,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Dual-clip threshold. For PPO it is the lower bound from https://arxiv.org/pdf/1912.09729; "
-                    "for ASPO it is the optional upper bound for soft dual-clipping positive reciprocal weights."
+                    "for ASPO it is the optional upper bound for soft dual-clipping positive reciprocal weights; "
+                    "for DPPO/CPPO it is the detached importance-ratio upper bound."
                 ),
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
@@ -2133,8 +2134,11 @@ def slime_validate_args(args):
                 "CPPO uses --eps-clip as its symmetric TV-divergence threshold; --eps-clip-high=%s is ignored.",
                 args.eps_clip_high,
             )
-        if args.eps_clip_c is not None:
-            logger.warning("CPPO does not use --eps-clip-c; its trust region is applied only through masking.")
+        if args.eps_clip_c is not None and (not math.isfinite(args.eps_clip_c) or args.eps_clip_c <= 1.0):
+            raise ValueError(
+                "--eps-clip-c must be finite and greater than 1 for CPPO's detached ratio upper bound, "
+                f"got {args.eps_clip_c}."
+            )
     if policy_loss_mode == "ripo":
         if not math.isfinite(args.ripo_delta) or args.ripo_delta <= 0.0:
             raise ValueError(f"--ripo-delta must be a finite positive number, got {args.ripo_delta}.")
