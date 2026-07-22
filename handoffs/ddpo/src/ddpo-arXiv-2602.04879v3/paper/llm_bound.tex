@@ -1,0 +1,71 @@
+
+\section{Trust Region Under LLM Regime}
+\label{sec:llm_tr}  
+
+In this section, we adapt the trust region framework to the specific context of LLM fine-tuning. This setting differs from the classical RL paradigm in two crucial ways. First, the learning problem is structured as an undiscounted ($\gamma=1$) episodic task with a finite horizon $T$, which makes the original bound in \Cref{eq:tv-bound} ill-defined, as the $\frac{1}{1-\gamma}$ term diverges to infinity. Second, due to the sparse reward nature, advantages are often estimated at the sequence level \citep{shao2024deepseekmath}, rather than on a per-token basis.
+
+Formally, given a prompt $x$, a policy $\pi$ (the LLM) generates a response $y=(y_1, \dots, y_T)$ by sequentially sampling tokens. At each step $t$, the policy defines a conditional distribution $\pi(y_t|s_t)$ over the vocabulary $\mathcal{A}$, where the state $s_t = (x, y_1, \dots, y_{t-1})$ consists of the prompt and previously generated tokens. The probability of the complete response is the product of these conditional probabilities:  
+$
+\pi(y|x) = \prod_{t=1}^{T} \pi(y_t | s_t).  
+$
+After the full response is generated, a scalar reward $R(y, x)$ is provided. For brevity, we will omit the dependency on the initial prompt $x$ and write the objective function as: 
+$$  
+\mathcal{J}(\pi) = \mathbb{E}_{y \sim \pi}[R(y)].  
+$$  
+We now derive performance difference identity and policy improvement bound tailored to this regime.  
+
+\begin{theorem}[Performance Difference Identity for LLMs]  
+\label{lem:llm_identity} 
+In a finite-horizon setting ($T$) with no discount ($\gamma=1$), for any two policies $\trainerpi$ and $\rolloutpi$, the performance difference can be decomposed as:  
+\[
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) = L_{\rolloutpi}'(\trainerpi) - \Delta(\rolloutpi, \trainerpi),
+\]
+where $L_{\rolloutpi}'(\trainerpi)$ is a surrogate objective defined as:  
+\begin{equation}  
+L_{\rolloutpi}'(\trainerpi) = \mathbb{E}_{y \sim \redmu} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \right],  
+\label{eq:llm_surrogate}  
+\end{equation}  
+and $\Delta(\rolloutpi, \trainerpi)$ is an error term given by:  
+\begin{align} 
+\Delta(\rolloutpi, \trainerpi) =& \mathbb{E}_{y \sim \redmu} \Big[ R(y) \\
+& \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} \!-\! 1 \right) \! \left( 1 \!-\! \prod_{j=t+1}^{T} \frac{\trainerpi(y_j|s_j)}{\rolloutpi(y_j|s_j)} \right) \Big]. \nonumber
+% & \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} \!-\! 1 \right) \left( 1 \!-\! \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{> t}|s_{t+1})} \right) \Big].  
+\end{align} 
+\end{theorem}  
+This theorem provides an exact expression for the policy improvement. The surrogate $L_{\rolloutpi}'(\trainerpi)$ represents a first-order approximation, while the error term $\Delta$ captures the higher-order effects of the policy change. To make this practical for optimization, we bound the error term.  
+  
+\begin{theorem}[Policy Improvement Bound for LLMs]  
+\label{thm:llm_tr_bound}  
+In a finite-horizon setting ($T$) with no discount ($\gamma=1$), let $\xi = \max_{y} |R(y)|$ be the maximum absolute reward, $D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) = \max_{s_t} D_{\mathrm{TV}}\big(\rolloutpi(\cdot|s_t)  \|  \trainerpi(\cdot|s_t)\big)$ be the maximum Total Variation (TV) divergence over all states, and
+\(
+\bar{D}_{\mathrm{TV}}(\rolloutpi,\trainerpi)
+= \mathbb{E}_{y \sim \rolloutpi}\!\left[\sum_{t=1}^{|y|} D_{\mathrm{TV}}\big(\rolloutpi(\cdot|s_t)\|\trainerpi(\cdot|s_t)\big)\right]
+\)
+be the average token-level TV divergence. Then the policy improvement is lower-bounded by both:
+\begin{align}
+\!\!\!\!  \mathcal{J}(\trainerpi) \!-\! \mathcal{J}(\rolloutpi)
+&\ge L_{\rolloutpi}'(\trainerpi) - 2 \xi T(T\!-\!1) \cdot {D_{\mathrm{TV}}^{\max}(\rolloutpi \| \trainerpi)}^2,
+\label{eq:llm-tv-bound} \\
+\!\!\!\!  \mathcal{J}(\trainerpi) \!-\! \mathcal{J}(\rolloutpi)
+&\ge L_{\rolloutpi}'(\trainerpi) - 4 \xi \bar{D}_{\mathrm{TV}}(\rolloutpi,\trainerpi).
+\label{eq:llm-tv-linear-bound}
+\end{align}
+\end{theorem}  
+This theorem establishes lower bounds on policy improvement. The max-divergence form in \Cref{eq:llm-tv-bound} is structurally analogous to the bound in \Cref{schulman2015trust} (see Appendix \ref{app:compare_classical_rl}), with the horizon $T$ playing a role similar to the effective horizon $\frac{1}{1-\gamma}$ in the discounted setting. The average-divergence form in \Cref{eq:llm-tv-linear-bound} is tighter for long LLM responses and more directly matches the per-token divergence control used in PPO and our algorithm. Together, they provide a clear theoretical justification for adapting the trust region approach into LLM regime.
+Similar to \Cref{eq:trpo-obj}, we can solve the following constrained optimization problem to guarantee stable learning:
+% \begin{equation}
+% \label{eq:llm-trpo-obj}  
+% \begin{split}
+% \max_{\trainerpi} \quad & L_{\rolloutpi}'(\trainerpi) \\  
+% \text{s.t.} \quad & D_{\mathrm{TV}}^{\max}(\rolloutpi \| \trainerpi) \le \delta,  
+% % \text{s.t.} \quad & \mathbb{E}_{y \sim {\rolloutpi}} \left[ \sum_{t=1}^{|y|} D\big(\rolloutpi(\cdot| s_t)\,\|\,\trainerpi(\cdot| s_t)\big) \right] \le \delta, \nonumber  
+% \end{split}
+% \end{equation}   
+\begin{equation}
+\label{eq:llm-trpo-obj} 
+\max_{\trainerpi} \quad  L_{\rolloutpi}'(\trainerpi), \quad \quad
+\text{s.t.} \quad  D_{\mathrm{TV}}^{\max}(\rolloutpi \| \trainerpi) \le \delta,  
+\end{equation}   
+where the constraint can also be applied on a KL divergence.
+
+The proofs for \Cref{lem:llm_identity} and both parts of \Cref{thm:llm_tr_bound} are deferred to Appendix~\ref{app:llm_tr_proof}.

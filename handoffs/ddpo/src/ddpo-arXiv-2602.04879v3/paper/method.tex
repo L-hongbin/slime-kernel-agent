@@ -1,0 +1,135 @@
+\section{Methodology}  
+\label{sec:method}  
+
+\subsection{Proximal Policy Optimization}  
+
+While theoretically appealing, the constrained optimization in TRPO requires second-order information and is difficult to scale. PPO \citep{schulman2017proximal} was introduced as a first-order alternative that retains much of the stability. Owing to its simplicity and strong empirical performance, PPO has become a standard algorithm for fine-tuning LLMs.
+
+Instead of enforcing an explicit trust-region constraint, PPO optimizes a clipped surrogate objective:
+\begin{align}    
+\! L^{\mathrm{PPO}}_{\rolloutpi}({\trainerpi}) \! &= \! \mathbb{E}_{y \sim \rolloutpi} \!\! \left[ \sum_{t=1}^{|y|} \! \min \! \left( r_t \hat{A}_t, \operatorname{clip}(r_t, 1 \! - \! \epsilon, 1 \! + \! \epsilon) \hat{A}_t \right) \! \right] \!\!, \nonumber \\
+r_t &= \frac{\trainerpi(y_t | s_t)}{\rolloutpi(y_t | s_t)},
+\label{eq:ppo-clip}
+\end{align}    
+where $\hat{A}_t$ denotes the estimated advantage at timestep $t$. In LLM fine-tuning, critic training is expensive and often noisy, so critic-free methods such as RLOO and GRPO are commonly used~\citep{ahmadian2024back, shao2024deepseekmath, liu2025understanding}. A typical advantage estimate compares the reward of a sampled response against the average reward of a group of responses generated for the same prompt:
+\[
+    \hat{A} = R(y) - \frac{1}{G}\sum_{i=1}^{G} R({y_i}),
+\]
+where ${y_i}_{i=1}^G$ denotes the response group.
+
+
+The term $r_t \hat{A}_t$ in \Cref{eq:ppo-clip} is the commonly used form of the surrogate in \Cref{eq:llm_surrogate}: replacing $r_t - 1$ with $r_t$ leaves the gradient unchanged, while replacing $R(y)$ with $\hat{A}_t$ reduces variance without biasing the expected policy gradient (see Appendix~\ref{app:compare_classical_rl}).
+The combination of the $\min$ and $\operatorname{clip}$ operations then acts as an implicit trust-region constraint. Once $r_t$ is outside the interval $[1-\epsilon, 1+\epsilon]$, the clipped branch removes the incentive to move the new policy farther from the old one.
+The connection between this clipping rule and the formal trust region can be understood by examining the TV divergence:
+\begin{equation}  
+\label{eq:tv_as_expectation}
+D_{\mathrm{TV}}\big(\rolloutpi(\cdot | s_t) \|  \trainerpi(\cdot | s_t)\big)  =  \frac{1}{2}  \mathbb{E}_{y_t \sim \rolloutpi} \left[ \big|  r_t - 1 \big| \right].
+\end{equation}
+From this perspective, PPO's clipping condition, $|r_t - 1| \le \epsilon$, can be interpreted as constraining a \textbf{single-sample Monte Carlo estimate} of the expected value in \Cref{eq:tv_as_expectation}.
+In essence, PPO enforces its trust region not on the true TV divergence, but on a noisy, single-point estimation. As we will argue next, this crude approximation is the source of significant pathologies when applied to the large, long-tailed vocabulary distributions characteristic of LLMs.
+
+
+\subsection{Limitations of PPO Ratio Clipping}  
+\label{sec:method_limitations}  
+
+The key limitation of PPO is that whether an update is clipped depends heavily on the sampled token's probability, rather than the true TV divergence between $\rolloutpi(\cdot | s_t)$ and $\trainerpi(\cdot | s_t)$.  
+Concretely, consider a fixed state $s$ and two tokens $a_{\mathrm{low}}$ and $a_{\mathrm{high}}$ with  
+\begin{align*}  
+\rolloutpi(a_{\mathrm{low}} | s) &= 10^{-4},  
+&  
+\trainerpi(a_{\mathrm{low}} | s) &= 10^{-2},  
+\\  
+\rolloutpi(a_{\mathrm{high}} | s) &= 0.99,  
+&  
+\trainerpi(a_{\mathrm{high}} | s) &= 0.80.  
+\end{align*}  
+The probability ratio for the low-probability token is  $r_{\mathrm{low}}  =  \frac{10^{-2}}{10^{-4}} = 100$, which is far outside a typical clipping range $[1-\epsilon, 1+\epsilon]$ (e.g., $\epsilon = 0.2$). PPO would thus heavily clip the contribution of this update. In contrast, the actual contribution of this change to the TV divergence can be very small, because the total mass moved at $a_{\mathrm{low}}$ is tiny.  
+For the high-probability token,  $r_{\mathrm{high}}  =  \frac{0.80}{0.99} \approx 0.808$,
+which can still lie \emph{inside} the clipping range for a moderate $\epsilon$. Yet this update removes $0.19$ probability mass from the dominant token, and therefore induces a much larger contribution to $D_{\mathrm{TV}}$. \looseness=-1
+
+These examples highlight a structural flaw in PPO's clipping heuristic. For \textbf{low-probability tokens}, an update that produces a large probability ratio is aggressively constrained, even when its impact on the TV divergence is negligible, thereby slowing training efficiency. Conversely, for \textbf{high-probability tokens}, an update producing a ratio close to one may go unpenalized, even when the absolute change in probability mass is large enough to cause a substantial TV divergence, which in turn risks training instability. 
+
+
+\textbf{Connections to Existing Work} 
+The insight that PPO's ratio clipping disproportionately penalizes low-probability tokens aligns with several prior studies. For instance, methods like \textit{Clip-Higher} \citep{yu2025dapo} and CISPO \citep{chen2025minimax} observe that important ``exploration'' or ``reasoning'' tokens often have low initial probabilities (see Appendix \ref{app:clipped_tokens}). These tokens usually get high importance ratios during policy updates and are consequently clipped, hindering the learning process.  
+However, the solutions proposed remain heuristic and problematic. \textit{Clip-Higher} suggests manually increasing the upper clipping bound, while CISPO continues to apply the gradient even for large divergence, completely ignoring the trust region. While these methods correctly identify the symptom, they fail to address the root cause: the fundamental mismatch between the single-sample probability ratio and the true distributional divergence.
+
+
+\subsection{Divergence Proximal Policy Optimization}  
+  
+To address the limitations of PPO's ratio clipping, we introduce Divergence Proximal Policy Optimization (DPPO), which directly uses a divergence-based constraint grounded in trust region theory (see \Cref{app:related_work_ratio_clipping} for a discussion on related work).  
+Similar to PPO, we employ a dynamic mask to block updates that would push policy outside the trust region. The DPPO objective is:  
+\begin{equation}  
+\label{eq:dppo_obj}
+\begin{split}
+&L^{\mathrm{DPPO}}_{\rolloutpi}({\trainerpi}) = \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|} M_t^{\mathrm{DPPO}} \cdot r_t \cdot \hat{A}_t \right],  \\
+&M_t^{\mathrm{DPPO}} \!=\!  
+	\begin{cases}  
+		0, \!\!\!\! & \text{if } (\hat{A}_t \!>\! 0 \text{ and } r_t \!>\! 1 \text{ and } D \!>\! \delta) \text{ or } \\  
+           & \;\;\; (\hat{A}_t \!<\! 0 \text{ and } r_t \!<\! 1 \text{ and } D \!>\! \delta) \\  
+		1, \!\!\!\! & \text{otherwise},  
+	\end{cases}  
+\end{split}  
+\end{equation}  
+where $D \equiv D\big(\rolloutpi(\cdot| s_t) \| \trainerpi(\cdot| s_t)\big)$ denotes the divergence (e.g., TV or KL) between the rollout and training policy distributions, and $\delta$ is a divergence threshold hyperparameter. As noted by \citet{chen2025minimax, zheng2025stabilizing}, this objective recovers the original PPO algorithm in \Cref{eq:ppo-clip} when the divergence $D$ is replaced by $|r_t - 1|$.  
+Our key innovation lies in the design of this mask: instead of relying on the noisy single-sample ratio, it is conditioned on a direct measure of the distributional policy shift.
+
+  
+This design directly approximates the formal trust region constraint from \Cref{thm:llm_tr_bound} while preserving the beneficial asymmetric structure of PPO's clipping. The mask only considers blocking an update if it is already moving away from the trusted region (i.e., $r_t > 1$ for a positive advantage or $r_t < 1$ for a negative advantage). It never blocks updates that move the policy ratio towards one (e.g., when $\hat{A}_t > 0$ and $r_t < 1$), a desirable property for accelerating learning.  
+  
+Unlike PPO, the final decision to block an update is based on whether the entire policy distribution has shifted too far ($D > \delta$), not on the noisy and often misleading ratio of a single sample. This resolves the over- and under-constraining issues inherent in standard PPO. The primary remaining challenge is the overhead of calculating the full divergence $D$ over a large vocabulary in LLMs, which we address next.
+
+
+\subsection{Approximating Distribution Divergence}  
+\label{sec:method_large_vocab}  
+
+Directly computing the policy divergence is memory-prohibitive for LLMs. To make it practical, we introduce two lightweight approximations, which serve as principled lower bounds of the true divergence (see Appendix~\ref{app:divergence_lower_bounds}).
+
+\begin{figure*}[t]
+    \centering  
+    \includegraphics[width=1.0\linewidth]{figs/sanity_test.pdf}  
+    \caption{DPPO variants achieve stable training while controlling the training-inference mismatch at a low level. In contrast, methods without a trust region (PG-IS, CISPO) or with a misspecified one (MiniRL) suffer from growing mismatch and eventual collapse.}  
+    \vspace{-0.2cm}
+    \label{fig:sanity_test}  
+\end{figure*}  
+
+\textbf{Binary Approximation}  
+\label{sec:method_binary} 
+The binary approximation collapses the original categorical distribution into a simple Bernoulli distribution, distinguishing only between the sampled token and all other tokens. We define the new distribution as: 
+$
+p^{\tilde{\pi}}_t \!\!= \big( \tilde{\pi}(a_t | s_t), \quad 1 - \tilde{\pi}(a_t | s_t) \big)
+$, where $\tilde{\pi}$ can be $\rolloutpi$ or $\trainerpi$.
+The TV and KL divergences are then computed as:
+\begin{align}  
+D_{\mathrm{TV}}^{\mathrm{Bin}}(t) =& \big| \rolloutpi(a_t | s_t) - \trainerpi(a_t | s_t) \big|, 
+\label{eq:binary_tv}
+\\
+\begin{split}
+D_{\mathrm{KL}}^{\mathrm{Bin}}(t) =& \rolloutpi(a_t|s_t) \log\frac{\rolloutpi(a_t|s_t)}{\trainerpi(a_t|s_t)} \\
+&+ (1-\rolloutpi(a_t|s_t)) \log\frac{1-\rolloutpi(a_t|s_t)}{1-\trainerpi(a_t|s_t)}.  
+\end{split}
+\label{eq:binary_kl}
+\end{align}  
+This binary divergence can be computed at negligible overhead. Crucially, it correctly distinguishes between large versus small shifts in absolute probability mass, thereby resolving the primary failure mode of PPO's clipping. 
+
+\textbf{Top-K Approximation}  
+\label{sec:method_topk}  
+To provide a richer and more faithful approximation of the distributional shift, the top-K variant explicitly tracks the most probable tokens. First, we define a small, representative set of tokens $\mathcal{A}'_t$ as:  
+$ \mathcal{A}'_t = \operatorname{TopK}\big(\rolloutpi(\cdot | s_t), K\big) \cup \{a_t\},  $
+which includes the $K$ highest-probability tokens under the behavior policy, augmented with the sampled token $a_t$ if it is not already present. We then form reduced categorical distributions, $p^{\rolloutpi}_t$ and $p^{\trainerpi}_t$, over the new vocabulary $\mathcal{A}''_t = \mathcal{A}'_t \cup \{\text{other}\}$. For any token $a \in \mathcal{A}'_t$, its probability is its original probability, while all other tokens are aggregated into the ``other'' category:  
+% $ p^{\tilde{\pi}}_t(a) = \tilde{\pi}(a | s_t) \quad \forall a \in \mathcal{A}'_t $, and $p^{\tilde{\pi}}_t(\text{other}) = 1 - \sum_{a \in \mathcal{A}'_t} \tilde{\pi}(a | s_t)$,
+\begin{align*}  
+p^{\tilde{\pi}}_t(a) &= \tilde{\pi}(a | s_t) \quad \forall a \in \mathcal{A}'_t, \\  
+p^{\tilde{\pi}}_t(\text{other}) &= 1 - \sum_{a \in \mathcal{A}'_t} \tilde{\pi}(a | s_t),  
+\end{align*}  
+where $\tilde{\pi}$ can be $\rolloutpi$ or $\trainerpi$. The divergence is then computed over this reduced distribution: 
+\begin{align}  
+D_{\mathrm{TV}}^{\mathrm{TopK}}(t) &= \frac{1}{2} \sum_{a \in \mathcal{A}''_t} \big| p^{\rolloutpi}_t(a) - p^{\trainerpi}_t(a) \big|, 
+\label{eq:topk_tv}
+\\  
+D_{\mathrm{KL}}^{\mathrm{TopK}}(t) &= \sum_{a \in \mathcal{A}''_t} p^{\rolloutpi}_t(a) \log \frac{p^{\rolloutpi}_t(a)}{p^{\trainerpi}_t(a)}.
+\label{eq:topk_kl}
+\end{align}  
+This approach better captures changes in the head of the policy distribution, which typically dominates the true divergence value. The overhead is minimal, making it a practical and high-fidelity choice for DPPO.
+
+% This approach better captures changes in the head of the policy distribution, which typically dominates the true divergence value. Its main benefit is memory efficiency: rollout workers only need to cache the sampled-token and top-$K$ probabilities rather than the full vocabulary logits. Empirically, the top-20 tokens already carry 99.4\% of the probability mass at the beginning of an RLHF run and 99.9\% after 100 training steps, making the top-$K$ approximation tight in practice.

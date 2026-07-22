@@ -1,0 +1,50 @@
+\section{Related Work}
+\label{sec:related}
+
+\noindent\textbf{Trust-region policy optimization.}
+Constraining each update to a neighborhood of the data-generating policy is the
+central idea of TRPO~\citep{trpo} and CPO~\citep{cpo}, which enforce an explicit
+KL constraint, and of PPO~\citep{ppo}, which approximates it with the cheap
+clipped surrogate of Eq.~(\ref{eq:ppo}). Mirror-descent and proximal
+formulations~\citep{tomar2022mirror,wang2020truly,wang2019trust} make the
+constraint explicit again, and SPO~\citep{spo} replaces the hard clip with a
+smooth quadratic penalty whose stationary point lies on the trust-region
+boundary. Our work stays within this family but separates a clipping rule into a
+proximity criterion and a direction criterion. This separation shows that
+existing trust-region masks can improve the proximity criterion while still using
+PPO's sampled-ratio direction criterion.
+
+\noindent\textbf{RL for LLM reasoning and off-policy correction.}
+PPO-style optimization drives RLHF~\citep{ouyang2022training} and modern reasoning
+training~\citep{guo2025deepseekr1,team2025kimi,zhou2025reinforcing,zhou2025variational}. GRPO~\citep{grpo} removes the
+critic with group-relative advantages, and recent
+follow-ups~\citep{ahmadian2024back,drgrpo,yu2025dapo,cispo} refine the advantage
+estimator, the clipping range, or the importance-sampling correction.
+DAPO~\citep{yu2025dapo} decouples the upper and lower clip bounds, while
+CISPO~\citep{cispo} truncates importance weights instead of masking. These
+methods modify the objective or the clipping rule, but they still decide the
+update direction from the sampled importance ratio.
+In deployed LLM RL systems, an additional source of instability is the
+training-inference mismatch. The rollout policy served by an optimized inference
+engine can differ from the training policy, which induces an off-policy gap and destabilizes
+training~\citep{qi2025defeating,yao2025offpolicy,zheng2025stabilizing}.
+Prior work mitigates this gap with truncated or masked importance
+sampling~\citep{yao2025offpolicy,zheng2025stabilizing,liu-li-2025,team2025every},
+or with engineering-level alignment of numerical and implementation
+details~\citep{Team2025EveryAM,he2025nondeterminism}.
+
+\noindent\textbf{Divergence-based trust-region masks.}
+Closest to us are methods that replace the sampled ratio deviation $|r-1|$ with a
+distributional measure of policy drift. DPPO~\citep{dppo} reinterprets PPO's clip
+as a one-sample estimate of total variation and replaces it with an explicit
+divergence mask, including the top-$K$ KL realization of Eq.~(\ref{eq:topk-kl})
+that we build on.
+Complementary work studies non-uniform token-level trust regions that vary the
+trust-region constraint across tokens~\citep{mao2026beyond}.
+Other divergence-based methods~\citep{r2vpo,yao2026rethinking} use smooth
+regularization and reweight updates rather than masking them. All of these
+methods inherit PPO's ratio-based direction criterion, which decides whether an
+update is outward-pointing from the sign of $\Adv(r-1)$. Our contribution is to
+make the direction criterion consistent with the divergence it serves.
+We derive the first-order change of the divergence in closed form for softmax
+policies and provide truncation-aware estimators of the resulting coefficient.
