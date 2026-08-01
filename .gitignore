@@ -238,3 +238,4 @@ gpu_mem_trend.png
 *.bundle
 wandb/
 local_artifacts/
+.slime-v4-source-provenance
