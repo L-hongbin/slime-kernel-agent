@@ -1,18 +1,52 @@
 import ast
+import copy
 import logging
 
 from .path_bootstrap import ensure_megatron_lm_on_sys_path
 
 ensure_megatron_lm_on_sys_path()
 
+import megatron.training.arguments as _megatron_arguments
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 from transformers import AutoConfig
 
+from slime.utils.secret_redaction import redact_secrets_for_logging
+
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
+
+
+def _redacted_argument_view(args):
+    """Copy an args namespace for printing while leaving runtime values intact."""
+    view = copy.copy(args)
+    for name, value in vars(args).items():
+        setattr(view, name, redact_secrets_for_logging(value, key=name))
+    return view
+
+
+def _print_args_with_secret_redaction(printer, title, args):
+    return printer(title, _redacted_argument_view(args))
+
+
+def _install_secret_redacting_argument_printer():
+    """Protect Megatron's central argument table without changing validation."""
+    current_printer = getattr(_megatron_arguments, "_print_args", None)
+    if current_printer is None:
+        return
+    if getattr(current_printer, "_slime_secret_redacting", False):
+        return
+
+    def redacting_printer(title, args):
+        return _print_args_with_secret_redaction(current_printer, title, args)
+
+    redacting_printer._slime_secret_redacting = True
+    _megatron_arguments._print_args = redacting_printer
+
+
+_install_secret_redacting_argument_printer()
 
 
 _ALLGATHER_CP_DSA_ARCHITECTURES = {

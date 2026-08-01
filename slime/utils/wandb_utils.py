@@ -4,6 +4,8 @@ from copy import deepcopy
 
 import wandb
 
+from .secret_redaction import redact_secrets_for_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -152,7 +154,7 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    return redact_secrets_for_logging(deepcopy(args.__dict__))
 
 
 def _prefix_config_keys(config, prefix):
