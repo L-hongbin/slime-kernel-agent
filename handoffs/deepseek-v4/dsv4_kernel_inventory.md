@@ -49,7 +49,7 @@ PASS。结论：node70 当前不能用于 kernel-on 训练或 sglang V4 rollout�
 node62 rollout，下一训练 fallback 是 node64+node69 `PP2_EP8`。
 
 **R4 PP2 fallback（2026-07-02）**：已转换并验证 `PP2_EP8` torch_dist：
-PP2/EP8 转换 verify 为 16/16 ranks PASS（evidence 文件已在 2026-07-03 清理中删除；可用 `scripts/v4/convert_torch_dist.sh` 链式 verify 重新生成），missing/unexpected
+PP2/EP8 转换 verify 为 16/16 ranks PASS（evidence 文件已在 2026-07-03 清理中删除；可用 `scripts/dsv4/convert_torch_dist.sh` 链式 verify 重新生成），missing/unexpected
 为空，代表性 direct/expert diff 全 0。kernel-on debug-train-only smoke 在 node64/69
 通过，日志 `handoffs/deepseek-v4/r2_logs/r4_pp2_ep8_kernel_on_train_smoke_attempt2.log`：
 checkpoint load 成功，V4 kernels enabled，`actor_train end (259.4s)`，

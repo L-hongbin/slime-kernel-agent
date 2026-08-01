@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# V4 task-arg assembly, extracted from full_loop_smoke.sh so it can be unit-tested
-# in isolation (tests/deepseek-v4/test_v4_rl_task_args.py) without the cluster
+# DS-V4 task-arg assembly, extracted from full_loop_smoke.sh so it can be unit-tested
+# in isolation (tests/deepseek-v4/test_dsv4_rl_task_args.py) without the cluster
 # bring-up. Sets the global array TASK_ARGS from the caller's environment.
 #
 # Inputs (env): TASK_MODE, REWARD_MODE, PROMPT_DATA, INPUT_KEY, LABEL_KEY,
@@ -10,7 +10,7 @@
 #   DEBUG_DIR, and the ROUTING_REPLAY_ARGS array.
 # Output: the TASK_ARGS array (declared by the caller / this function).
 
-build_v4_task_args() {
+build_dsv4_task_args() {
   local -a routing_replay=()
   if [[ "${USE_ROLLOUT_ROUTING_REPLAY:-1}" == "1" ]]; then
     routing_replay=(--use-rollout-routing-replay)
@@ -84,7 +84,7 @@ build_v4_task_args() {
         --coverage-rs-factor 0.1
       )
     else
-      # Gate-A isolation: exercise the V4 RL math with a reward-free stand-in so a
+      # Gate-A isolation: exercise the DS-V4 RL math with a reward-free stand-in so a
       # failure points at the RL path, not the KernelGym task infra.
       reward_args=(--rm-type random)
     fi

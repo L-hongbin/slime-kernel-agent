@@ -14,7 +14,7 @@ The R6 full loop runs **end-to-end** and both historical blockers are
    **Verified: attempt36_tempfix PASSED the full R6 gate** (finite loss 0.0743,
    grad_norm 0.344, routing-replay dump verified). The R6 smoke's post-hoc dump
    verifier also needed `--expected-samples` (it defaulted to R4's 2; R6 has 8)
-   — fixed in `scripts/v4/full_loop_smoke.sh` (both call sites) via `N_SAMPLES_PER_PROMPT`.
+   — fixed in `scripts/dsv4/full_loop_smoke.sh` (both call sites) via `N_SAMPLES_PER_PROMPT`.
 
 ## Root Cause of the First-Backward NaN: rollout-temperature 0
 
@@ -117,7 +117,7 @@ was removed — skipping update_weights breaks the gloo group.
 - With only four H20 nodes currently available, reserve at least one node for
   rollout. Do not use PP2/EP16 across all four nodes.
 - If any kernel changes, rerun forward and backward efficiency measurements and
-  update `handoffs/deepseek-v4/v4_kernel_inventory.md`.
+  update `handoffs/deepseek-v4/dsv4_kernel_inventory.md`.
 
 ## Current Runtime Target
 
@@ -134,7 +134,7 @@ was removed — skipping update_weights breaks the gloo group.
 | --- | --- | --- |
 | V4 mcore model, LoRA wrapping, SFT sanity | Passed | `custom_kernels/deepseek_v4/megatron/*`, `tests/test_v4_model_provider.py` |
 | HF-native FP8 to Megatron conversion | Passed | audit evidence removed in cleanup; re-derivable via `native_checkpoint.py --output-json` |
-| PP2/EP8 Megatron checkpoint conversion | Passed | verify evidence removed in cleanup; re-verify any checkpoint via `scripts/v4/convert_torch_dist.sh` chained verify or `verify_torch_dist.py` standalone |
+| PP2/EP8 Megatron checkpoint conversion | Passed | verify evidence removed in cleanup; re-verify any checkpoint via `scripts/dsv4/convert_torch_dist.sh` chained verify or `verify_torch_dist.py` standalone |
 | Real-weight HF vs mcore parity samples | Passed | parity evidence removed in cleanup; re-run `real_weight_parity.py` (layers 0/2/3 all passed) |
 | Kernel-on PP2/EP8 debug-train smoke | Passed | `r2_logs/r4_pp2_ep8_kernel_on_train_smoke_attempt2.log` |
 | Node62 SGLang rollout smoke with routed experts | Passed | `r2_logs/r4_node62_rollout_smoke_attempt16.log` |
@@ -213,7 +213,7 @@ Validation already run for these fixes:
 - `python3 -m pytest -q tests/test_deepseekv4_megatron_to_hf.py`
 - Standalone Ray actor test: env_vars `PYTHONPATH=/root/Megatron-LM` →
   `megatron.training` imports; without it → `ModuleNotFoundError` (reproduced).
-- `bash -n scripts/v4/full_loop_smoke.sh`
+- `bash -n scripts/dsv4/full_loop_smoke.sh`
 - Codex (xhigh) reviewed the diagnosis and the fixes; it verified the PYTHONPATH
   fix and flagged the cleanup pkills as unsafe on the shared box (now defaulted off).
 
@@ -241,9 +241,9 @@ compressor LoRA only) — Megatron-Bridge *does* support expert/router LoRA
 `nn.Parameter` grouped GEMMs (`V4GroupedExperts`), not `linear_fc1/2` submodules,
 so `is_expert_linear` never matches them — freezing is the validated path.
 
-Launcher: `scripts/v4/run.t1.deepseek_v4_flash.rl.sh` -> the R6 smoke in
-`TASK_MODE=rl`. Task-arg assembly extracted to `scripts/v4/_v4_task_args.sh`
-(`build_v4_task_args`), unit-tested in `tests/deepseek-v4/test_v4_rl_task_args.py`.
+Launcher: `scripts/dsv4/run.t1.deepseek_v4_flash.rl.sh` -> the R6 smoke in
+`TASK_MODE=rl`. Task-arg assembly extracted to `scripts/dsv4/_dsv4_task_args.sh`
+(`build_dsv4_task_args`), unit-tested in `tests/deepseek-v4/test_dsv4_rl_task_args.py`.
 Borrowed hyperparams: advantage-estimator trloo, eps-clip 0.2/0.28, entropy 0,
 gbs 256 (rollout 16 x n-samples 16), constant LR, wd 0.01; V4-mandatory kept:
 Muon, PP2/EP8, custom provider, torch_dist load, routing replay.
@@ -285,7 +285,7 @@ log-prob/train forward, never the SFT smoke; rollout worked every attempt):
    got 3-D not 4-D. Fixed in `model.py` (both forward paths now wire it;
    `test_v4_pp_shape_adapter.py` guards both).
 2. SGLang context vs response length rejection -> total-budget windows +
-   `--rollout-max-prompt-len` (`full_loop_smoke.sh`, `_v4_task_args.sh`).
+   `--rollout-max-prompt-len` (`full_loop_smoke.sh`, `_dsv4_task_args.sh`).
 3. V4 PP shape adapter hardcoded S from static `args.seq_length`, but slime uses
    `variable_seq_lengths` and pads each rollout to a per-step `max_seq_len` (~384)
    while RoPE used the real length -> RoPE shape clash. Fixed: `actor.py` stashes

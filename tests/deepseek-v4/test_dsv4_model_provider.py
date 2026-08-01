@@ -28,7 +28,7 @@ def load_megatron_model_module():
     return importlib.import_module("slime.backends.megatron_utils.model")
 
 
-def test_v4_pp_sequence_length_matches_bshd_padding():
+def test_dsv4_pp_sequence_length_matches_bshd_padding():
     module = load_megatron_model_module()
 
     args = SimpleNamespace(

@@ -21,13 +21,13 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-R6 = REPO / "scripts" / "v4" / "full_loop_smoke.sh"
+R6 = REPO / "scripts" / "dsv4" / "full_loop_smoke.sh"
 # The task-arg assembly (loss type, rollout-temperature wiring, etc.) was
 # extracted into this sourceable helper so it can be unit-tested in isolation;
 # the r6_text fixture reads both so these assertions still cover it.
-R6_TASK_ARGS = REPO / "scripts" / "v4" / "_v4_task_args.sh"
-R4 = REPO / "scripts" / "v4" / "rollout_smoke.sh"
-R3 = REPO / "scripts" / "v4" / "train_smoke.sh"
+R6_TASK_ARGS = REPO / "scripts" / "dsv4" / "_dsv4_task_args.sh"
+R4 = REPO / "scripts" / "dsv4" / "rollout_smoke.sh"
+R3 = REPO / "scripts" / "dsv4" / "train_smoke.sh"
 ALL_LAUNCHERS = [R6, R4, R3]
 
 
@@ -110,8 +110,8 @@ def test_r4_rollout_only_sampling_default_positive():
 
 def test_smoke_prompt_data_satisfies_batch_sizes(r6_text):
     rollout_batch_size = int(_default(r6_text, "ROLLOUT_BATCH_SIZE"))
-    full_loop = REPO / "Data" / "v4_full_loop_smoke.jsonl"
-    rollout_only = REPO / "Data" / "v4_rollout_smoke.jsonl"
+    full_loop = REPO / "Data" / "dsv4_full_loop_smoke.jsonl"
+    rollout_only = REPO / "Data" / "dsv4_rollout_smoke.jsonl"
     for path, need in [(full_loop, rollout_batch_size), (rollout_only, 2)]:
         assert path.is_file(), f"{path} missing: the smoke launchers preflight it"
         lines = [ln for ln in path.read_text().splitlines() if ln.strip()]

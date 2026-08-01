@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-Usage: scripts/sync/sync_v4_active_nodes.sh [--dry-run | --check] [--target HOST]...
+Usage: scripts/sync/sync_dsv4_active_nodes.sh [--dry-run | --check] [--target HOST]...
 
 With no --target flags, concurrently sync the node64 checkout to all active
 targets: node69_slime, node53_dspark, and node70_dspark. After a real sync,

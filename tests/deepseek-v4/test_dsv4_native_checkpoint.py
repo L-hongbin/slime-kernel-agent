@@ -10,7 +10,7 @@ def load_r2_module():
     module_path = (
         Path(__file__).resolve().parents[2] / "custom_kernels/deepseek_v4" / "megatron" / "native_checkpoint.py"
     )
-    spec = importlib.util.spec_from_file_location("test_v4_native_checkpoint_module", module_path)
+    spec = importlib.util.spec_from_file_location("test_dsv4_native_checkpoint_module", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module

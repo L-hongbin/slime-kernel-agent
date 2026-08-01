@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.v4.verify_rollout_dump import verify
+from scripts.dsv4.verify_rollout_dump import verify
 
 
 def _routed(tokens=4):

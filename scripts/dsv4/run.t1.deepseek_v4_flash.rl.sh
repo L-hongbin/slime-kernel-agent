@@ -1,7 +1,7 @@
 #!/bin/bash
 # Formal DeepSeek-V4-Flash LoRA RL training launcher.
 #
-# Reuses the validated R6 full-loop infrastructure (scripts/v4/full_loop_smoke.sh:
+# Reuses the validated R6 full-loop infrastructure (scripts/dsv4/full_loop_smoke.sh:
 # fratricide guard, ray bring-up, external-sglang guard, PP2/EP8 Megatron actor +
 # SGLang TP4 rollout, Muon, torch_dist checkpoint, rollout routing replay) via
 # TASK_MODE=rl, and layers on the RL task.

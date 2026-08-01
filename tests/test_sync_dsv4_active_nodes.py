@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SYNC_FILES = (
     "rsync_project.sh",
     "runtime_fingerprint.sh",
-    "sync_v4_active_nodes.sh",
+    "sync_dsv4_active_nodes.sh",
 )
 
 
@@ -172,7 +172,7 @@ def test_tar_fallback_refuses_delete_semantics(tmp_path: Path, fake_transport) -
 def test_active_sync_dry_run_is_concurrent_whitelisted_and_fail_closed(tmp_path: Path, fake_transport) -> None:
     fake_bin, call_log = fake_transport
     root = _fixture_repo(tmp_path)
-    script = root / "scripts/sync/sync_v4_active_nodes.sh"
+    script = root / "scripts/sync/sync_dsv4_active_nodes.sh"
     env = {
         **_env(fake_bin, call_log),
         "FAKE_REMOTE_RSYNC": "1",
@@ -237,7 +237,7 @@ def test_check_compares_streamed_deterministic_fingerprints(tmp_path: Path, fake
         "FAKE_FINGERPRINT_SCRIPT": str(fingerprint_helper),
         "SYNC_V4_TILEKERNELS_DIR": str(tile),
     }
-    script = root / "scripts/sync/sync_v4_active_nodes.sh"
+    script = root / "scripts/sync/sync_dsv4_active_nodes.sh"
 
     # Non-delete syncs may leave historical files. They are outside the source
     # manifest and therefore must not make a correctly synced checkout fail.

@@ -8,7 +8,7 @@ set -euo pipefail
 
 REPO=${REPO:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora}
 HF_CKPT=${HF_CKPT:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8}
-PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/v4_rollout_smoke.jsonl}
+PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/dsv4_rollout_smoke.jsonl}
 SCRATCH=${SCRATCH:-/nfs/FM/csl_v4r4_rollout_smoke_node62}
 DEBUG_DIR=${DEBUG_DIR:-${SCRATCH}/debug}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
@@ -221,7 +221,7 @@ if [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
 fi
 
 echo "=== submitting debug-rollout-only job ===" | tee -a "${LOG}"
-JOB_ID=${RAY_JOB_ID:-r4_v4_rollout_smoke_$(date -u +%Y%m%d_%H%M%S)_$$}
+JOB_ID=${RAY_JOB_ID:-r4_dsv4_rollout_smoke_$(date -u +%Y%m%d_%H%M%S)_$$}
 JOB_LOG_CAPTURE="${SCRATCH}/ray_job_${JOB_ID}.log"
 JOB_LOG_CAPTURE_TMP="${JOB_LOG_CAPTURE}.tmp"
 LAST_JOB_LOG_LINES=0
@@ -295,6 +295,6 @@ done
 
 append_new_job_logs
 
-python3 scripts/v4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" | tee -a "${LOG}"
+python3 scripts/dsv4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" | tee -a "${LOG}"
 
 echo "=== R4 node62 rollout smoke PASS ===" | tee -a "${LOG}"

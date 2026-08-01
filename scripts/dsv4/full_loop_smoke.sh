@@ -9,7 +9,7 @@ set -euo pipefail
 REPO=${REPO:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora}
 HF_CKPT=${HF_CKPT:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8}
 LOAD=${LOAD:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8-r2-pp2-ep8-torch_dist}
-PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/v4_full_loop_smoke.jsonl}
+PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/dsv4_full_loop_smoke.jsonl}
 SCRATCH=${SCRATCH:-/nfs/FM/csl_v4r6_full_loop}
 SAVE=${SAVE:-${SCRATCH}/out}
 DEBUG_DIR=${DEBUG_DIR:-${SCRATCH}/debug}
@@ -134,7 +134,7 @@ RUNTIME_CACHE_ROOT=${RUNTIME_CACHE_ROOT:-/dev/shm/v4r6_full_loop_cache}
 RAY_OBJECT_STORE_MEMORY=${RAY_OBJECT_STORE_MEMORY:-20000000000}
 RAY_DASHBOARD_AGENT_PATCHER=${RAY_DASHBOARD_AGENT_PATCHER:-${REPO}/scripts/patch_ray_dashboard_agent_early_port.py}
 SLIME_RAY_DASHBOARD_AGENT_EARLY_PORT=${SLIME_RAY_DASHBOARD_AGENT_EARLY_PORT:-1}
-SGLANG_MHC_PATCHER=${SGLANG_MHC_PATCHER:-${REPO}/scripts/v4/patch_sglang_dsv4_mhc_sinkhorn_torch.py}
+SGLANG_MHC_PATCHER=${SGLANG_MHC_PATCHER:-${REPO}/scripts/dsv4/patch_sglang_dsv4_mhc_sinkhorn_torch.py}
 SLIME_PATCH_SGLANG_DSV4_MHC_SINKHORN_TORCH=${SLIME_PATCH_SGLANG_DSV4_MHC_SINKHORN_TORCH:-0}
 SSH_OPTS=${SSH_OPTS:--o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null}
 PHYSICAL_SSH_OPTS=${PHYSICAL_SSH_OPTS:-${SSH_OPTS}}
@@ -784,10 +784,10 @@ fi
 
 # --- Task-specific arg assembly (smoke_sft vs rl) --------------------------
 # Assembly lives in a sourceable helper so it can be unit-tested without the
-# cluster bring-up (tests/deepseek-v4/test_v4_rl_task_args.py). Sets TASK_ARGS.
-# shellcheck source=scripts/v4/_v4_task_args.sh
-source "${REPO}/scripts/v4/_v4_task_args.sh"
-build_v4_task_args
+# cluster bring-up (tests/deepseek-v4/test_dsv4_rl_task_args.py). Sets TASK_ARGS.
+# shellcheck source=scripts/dsv4/_dsv4_task_args.sh
+source "${REPO}/scripts/dsv4/_dsv4_task_args.sh"
+build_dsv4_task_args
 
 RUNTIME_ENV_JSON=$(python - <<PY
 import json, os
@@ -908,7 +908,7 @@ if [[ "${RAY_RUN_MODE}" == "direct" ]]; then
     exit 1
   fi
   if [[ "${TASK_MODE}" == "smoke_sft" ]]; then
-    python3 scripts/v4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" --expected-samples "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))" | tee -a "${LOG}"
+    python3 scripts/dsv4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" --expected-samples "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))" | tee -a "${LOG}"
     echo "=== R6 V4 full-loop smoke PASS ===" | tee -a "${LOG}"
   else
     echo "=== V4 ${TASK_MODE} (${REWARD_MODE}) run finished OK ===" | tee -a "${LOG}"
@@ -999,6 +999,6 @@ while true; do
 done
 
 append_new_job_logs
-python3 scripts/v4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" --expected-samples "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))" | tee -a "${LOG}"
+python3 scripts/dsv4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt" --expected-samples "$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))" | tee -a "${LOG}"
 
 echo "=== R6 V4 full-loop smoke PASS ===" | tee -a "${LOG}"

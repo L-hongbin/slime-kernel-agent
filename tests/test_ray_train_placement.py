@@ -76,7 +76,7 @@ def test_rollout_actor_disables_sglang_tp_memory_imbalance_guard():
 
 
 def test_dsv4_rollout_smoke_uses_fp8_low_latency_recipe_by_default():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "v4" / "rollout_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "rollout_smoke.sh").read_text()
 
     assert "ROLLOUT_GPUS=${ROLLOUT_GPUS:-4}" in source
     assert "GPUS_PER_ENGINE=${GPUS_PER_ENGINE:-4}" in source
@@ -93,7 +93,7 @@ def test_dsv4_rollout_smoke_uses_fp8_low_latency_recipe_by_default():
     assert "ray_start_args=(" in source
     assert 'ray start "${ray_start_args[@]}"' in source
     assert 'GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME}" ray start \\' not in source
-    assert "python3 scripts/v4/verify_rollout_dump.py" in source
+    assert "python3 scripts/dsv4/verify_rollout_dump.py" in source
     assert 'python3 - "${DEBUG_DIR}/rollout_0.pt" <<' not in source
     assert "--sglang-data-parallel-size" in source
     assert "--sglang-enable-dp-attention" in source
@@ -104,7 +104,7 @@ def test_dsv4_rollout_smoke_uses_fp8_low_latency_recipe_by_default():
 
 
 def test_train_smoke_gpu_idle_check_strips_nvidia_smi_units():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "v4" / "train_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "train_smoke.sh").read_text()
 
     assert 'gsub(/[^0-9.]/, \\"\\", \\$2)' in source
     assert "\\$2 + 0 > max" in source
@@ -114,18 +114,18 @@ def test_train_smoke_gpu_idle_check_strips_nvidia_smi_units():
 
 
 def test_r6_full_loop_smoke_starts_from_rollout_zero_and_cleans_debug_dumps():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "v4" / "full_loop_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
 
     assert "START_ROLLOUT_ID=${START_ROLLOUT_ID:-0}" in source
     assert "MOE_ROUTER_TOPK=${MOE_ROUTER_TOPK:-6}" in source
     assert '--moe-router-topk "${MOE_ROUTER_TOPK}"' in source
     assert '--start-rollout-id "${START_ROLLOUT_ID}"' in source
     assert 'rm -f "${DEBUG_DIR}"/rollout_*.pt "${DEBUG_DIR}"/train_*.pt' in source
-    assert 'python3 scripts/v4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt"' in source
+    assert 'python3 scripts/dsv4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt"' in source
 
 
 def test_r6_full_loop_smoke_keeps_runtime_cache_off_root_disk():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "v4" / "full_loop_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
 
     assert "RUNTIME_CACHE_ROOT=${RUNTIME_CACHE_ROOT:-/dev/shm/v4r6_full_loop_cache}" in source
     assert "export TMPDIR=${TMPDIR:-${RUNTIME_CACHE_ROOT}/tmp}" in source

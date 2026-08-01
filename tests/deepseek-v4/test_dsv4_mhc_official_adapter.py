@@ -94,7 +94,7 @@ def test_ds_v4_decoder_defaults_to_official_mhc():
 
 
 def test_full_loop_exports_tilekernels_for_train_actors():
-    launcher_path = REPO_ROOT / "scripts" / "v4" / "full_loop_smoke.sh"
+    launcher_path = REPO_ROOT / "scripts" / "dsv4" / "full_loop_smoke.sh"
     source = launcher_path.read_text()
 
     assert "TILEKERNELS_DIR=${TILEKERNELS_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/TileKernels}" in source
@@ -102,7 +102,7 @@ def test_full_loop_exports_tilekernels_for_train_actors():
 
 
 def test_train_smoke_exports_tilekernels_without_mhc_runtime_switch():
-    launcher_path = REPO_ROOT / "scripts" / "v4" / "train_smoke.sh"
+    launcher_path = REPO_ROOT / "scripts" / "dsv4" / "train_smoke.sh"
     source = launcher_path.read_text()
     removed_env = "V4_MHC_" "TORCH"
 

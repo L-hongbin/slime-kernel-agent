@@ -2,7 +2,7 @@
 
 V4-specific structures with **no existing Megatron implementation**, written as tilelang
 kernels (hand-written forward + backward) for the V4-Flash LoRA-on-Megatron port.
-Inventory + rationale: `handoffs/deepseek-v4/v4_kernel_inventory.md`.
+Inventory + rationale: `handoffs/deepseek-v4/dsv4_kernel_inventory.md`.
 
 ## Confirmed environment (this container)
 

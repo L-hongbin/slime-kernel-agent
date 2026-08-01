@@ -1,4 +1,4 @@
-"""Unit tests for scripts/v4/_v4_task_args.sh::build_v4_task_args.
+"""Unit tests for scripts/dsv4/_dsv4_task_args.sh::build_dsv4_task_args.
 
 Pins the RL launcher's arg wiring (borrowed from run.t1.qwen3.6.27B.fasync.sh)
 so a regression in the task-arg assembly is caught without a cluster run:
@@ -13,11 +13,11 @@ import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-HELPER = REPO / "scripts" / "v4" / "_v4_task_args.sh"
+HELPER = REPO / "scripts" / "dsv4" / "_dsv4_task_args.sh"
 
 
 def _task_args(**env):
-    """Source the helper, run build_v4_task_args, print TASK_ARGS one per line."""
+    """Source the helper, run build_dsv4_task_args, print TASK_ARGS one per line."""
     base = {
         "REPO": str(REPO),
         "PROMPT_DATA": "/data/x.parquet",
@@ -40,7 +40,7 @@ def _task_args(**env):
         "USE_ROLLOUT_ROUTING_REPLAY": "1",
     }
     base.update(env)
-    script = f'set -euo pipefail\nsource "{HELPER}"\nbuild_v4_task_args\nprintf "%s\\n" "${{TASK_ARGS[@]}}"\n'
+    script = f'set -euo pipefail\nsource "{HELPER}"\nbuild_dsv4_task_args\nprintf "%s\\n" "${{TASK_ARGS[@]}}"\n'
     out = subprocess.run(
         ["bash", "-c", script],
         env={"PATH": "/usr/bin:/bin", **base},

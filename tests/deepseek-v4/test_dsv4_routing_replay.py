@@ -28,7 +28,7 @@ class _FakeReplay:
         return self.recorded[0]
 
 
-def test_v4_topk_router_uses_routing_replay(monkeypatch):
+def test_dsv4_topk_router_uses_routing_replay(monkeypatch):
     from custom_kernels.deepseek_v4.megatron.mcore_model import V4TopKRouter
 
     monkeypatch.setenv("ENABLE_ROUTING_REPLAY", "1")
@@ -74,7 +74,7 @@ def test_v4_topk_router_uses_routing_replay(monkeypatch):
     assert torch.equal(replayed_indices, recorded_indices)
 
 
-def test_v4_topk_registers_but_hash_router_does_not(monkeypatch):
+def test_dsv4_topk_registers_but_hash_router_does_not(monkeypatch):
     from custom_kernels.deepseek_v4.megatron.mcore_model import V4HashRouter, V4TopKRouter
 
     from slime.utils.routing_replay import RoutingReplay

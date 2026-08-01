@@ -1,4 +1,4 @@
-# V4-Flash → mcore: module structure + TP/PP/EP sharding contract (DESIGN ONLY)
+# DS-V4 → mcore: module structure + TP/PP/EP sharding contract (DESIGN ONLY)
 
 > The distributed-execution contract codex flagged as the prerequisite to swapping
 > the M0 torch `V4Model` (`custom_kernels/deepseek_v4/megatron/`, forward-parity-validated vs HF
@@ -10,7 +10,7 @@
 > (`base_model_ep_plan` ~:114); M0 modules (`attention.py`/`compressor.py`/`decoder.py`);
 > Megatron-LM `megatron/core/{transformer/moe,tensor_parallel,models/gpt}`;
 > `megatron.bridge.peft.lora`; slime `backends/megatron_utils/{model.py,model_provider.py}`.
-> Companion plan: [[v4_megatron_phase1_plan]]; kernel map: [[v4_kernel_inventory]].
+> Companion plan: [[v4_megatron_phase1_plan]]; kernel map: [[dsv4_kernel_inventory]].
 
 ## 0. The supporting fact (decides everything below)
 

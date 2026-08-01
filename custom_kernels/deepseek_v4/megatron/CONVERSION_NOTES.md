@@ -1,6 +1,6 @@
 # R2 Notes — V4-Flash Native FP8 Checkpoint Mapping
 
-> Renamed from `R2_NOTES.md` (gate-R2 era); modules renamed: `r2_checkpoint`→`native_checkpoint`, `r2_slice_torch_dist`→`slice_torch_dist`, `r2_verify_torch_dist`→`verify_torch_dist`, `r2_real_weight_parity`→`real_weight_parity`. Historical run logs keep the old names. Evidence files formerly under `handoffs/in_progress/` (verify/parity `.txt`, audit/plan `.json`) were removed in the 2026-07-03 cleanup; results are re-derivable via `scripts/v4/convert_torch_dist.sh` (chained verify) and `real_weight_parity.py`, and the surviving run logs live in `handoffs/deepseek-v4/r2_logs/`.
+> Renamed from `R2_NOTES.md` (gate-R2 era); modules renamed: `r2_checkpoint`→`native_checkpoint`, `r2_slice_torch_dist`→`slice_torch_dist`, `r2_verify_torch_dist`→`verify_torch_dist`, `r2_real_weight_parity`→`real_weight_parity`. Historical run logs keep the old names. Evidence files formerly under `handoffs/in_progress/` (verify/parity `.txt`, audit/plan `.json`) were removed in the 2026-07-03 cleanup; results are re-derivable via `scripts/dsv4/convert_torch_dist.sh` (chained verify) and `real_weight_parity.py`, and the surviving run logs live in `handoffs/deepseek-v4/r2_logs/`.
 
 Status: mapping/dequant audit PASS; `torch_dist` preflight slice save/load PASS; full
 43-layer actor `PP3_EP8` conversion/load-back PASS on node64/69/70, leaving node62

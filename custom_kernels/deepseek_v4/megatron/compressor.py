@@ -10,7 +10,7 @@ Each module owns the torch-side glue around the B2 pool kernel:
   * RoPE on the compressed entries at their deterministic absolute positions
     ``w * compress_rate`` (stateless / no-cache training path; HF:421-424).
   * The Lightning Indexer + top-k is DROPPED (dense-over-compressed; tiny seq makes
-    it a no-op, see v4_kernel_inventory.md).  So no ``block_bias`` is materialised:
+    it a no-op, see dsv4_kernel_inventory.md).  So no ``block_bias`` is materialised:
     the causal-threshold mask over compressed entries is applied STRUCTURALLY inside
     the A1 attention kernel (``(w+1)*m <= qpos+1``), which equals HF's
     ``block_bias`` at tiny seq.

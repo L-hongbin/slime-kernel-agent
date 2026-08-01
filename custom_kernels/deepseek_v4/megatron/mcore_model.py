@@ -7,7 +7,7 @@ train loop + ``loss.py`` drive, while reusing the M1-parity-validated V4 compute
 the MoE, and a custom V4 MoE sub-layer that threads ``input_ids`` to the V4
 routers and applies the exact V4 clamp+SwiGLU expert activation.
 
-Design contract: ``handoffs/deepseek-v4/v4_megatron_sharding_contract.md``.
+Design contract: ``handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md``.
 At TP=PP=EP=1 the model is the M0 torch path (forward-parity-validated at M1)
 wrapped in the mcore module surface; every Megatron parallel primitive
 short-circuits at world_size==1, so this introduces NO collectives and NO
