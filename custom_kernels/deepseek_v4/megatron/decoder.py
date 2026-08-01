@@ -24,23 +24,17 @@ MoE (routers + grouped experts + shared expert + clamped SwiGLU) and the final
 ``hc_head`` collapse reuse the HF modules verbatim (group-C ops; not kernels).
 """
 
-import os
-
 import torch
+
+# DS-V4 production always uses DeepSeek's official TileKernels mHC. Diagnostics
+# that need the exact torch reference inject it explicitly instead of changing
+# production behavior through an environment variable.
+from custom_kernels.deepseek_v4.mhc.official import hyper_connection_official as _HC
 from torch import nn
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperHead, DeepseekV4SparseMoeBlock
 
-from . import _kernels
 from .attention import V4Attention
 from .rope import DeepseekV4RotaryEmbedding, V4RMSNorm
-
-# Default B1 path: the dtype-agnostic hybrid (no sglang coupling for the scaffold).
-# Set V4_MHC_TORCH=1 to use the exact torch reference path when TileLang/TVM codegen
-# is not stable on a target node; this is slower but keeps the training chain testable.
-if os.environ.get("V4_MHC_TORCH", "0") == "1":
-    from custom_kernels.deepseek_v4.mhc.reference import hyper_connection_forward as _HC
-else:
-    _HC = _kernels.hyper_connection
 
 
 class V4HyperConnection(nn.Module):

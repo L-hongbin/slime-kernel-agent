@@ -10,6 +10,7 @@
 set -euo pipefail
 
 REPO=${REPO:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora}
+TILEKERNELS_DIR=${TILEKERNELS_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/TileKernels}
 HF_CKPT=${HF_CKPT:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8}
 LOAD=${LOAD:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8-r2-pp3-ep8-torch_dist}
 SCRATCH=${SCRATCH:-/nfs/FM/csl_v4r3}
@@ -60,12 +61,11 @@ export PATH="/usr/local/cuda/bin:${PATH}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-bond0}
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-bond0}
-export PYTHONPATH="${REPO}:/root/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${REPO}:/root/Megatron-LM:${TILEKERNELS_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export V4_LORA_DIM=${V4_LORA_DIM:-4}
 export V4_LORA_ALPHA=${V4_LORA_ALPHA:-8}
 export V4_LORA_DROPOUT=${V4_LORA_DROPOUT:-0.0}
 export V4_SFT_B=${V4_SFT_B:-8}
-export V4_MHC_TORCH=${V4_MHC_TORCH:-1}
 export V4_COMPRESS_TORCH=${V4_COMPRESS_TORCH:-1}
 export V4_ATTENTION_TORCH=${V4_ATTENTION_TORCH:-1}
 export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-/tmp/tilelang_cache_v4_r3_smoke}
@@ -327,14 +327,13 @@ fi
 RUNTIME_ENV_JSON=$(python - <<PY
 import json, os
 env = {
-    "PYTHONPATH": "${REPO}:/root/Megatron-LM",
+    "PYTHONPATH": "${REPO}:/root/Megatron-LM:${TILEKERNELS_DIR}",
     "CUDA_DEVICE_MAX_CONNECTIONS": os.environ["CUDA_DEVICE_MAX_CONNECTIONS"],
     "PYTORCH_CUDA_ALLOC_CONF": os.environ["PYTORCH_CUDA_ALLOC_CONF"],
     "V4_LORA_DIM": os.environ["V4_LORA_DIM"],
     "V4_LORA_ALPHA": os.environ["V4_LORA_ALPHA"],
     "V4_LORA_DROPOUT": os.environ["V4_LORA_DROPOUT"],
     "V4_SFT_B": os.environ["V4_SFT_B"],
-    "V4_MHC_TORCH": os.environ["V4_MHC_TORCH"],
     "V4_COMPRESS_TORCH": os.environ["V4_COMPRESS_TORCH"],
     "V4_ATTENTION_TORCH": os.environ["V4_ATTENTION_TORCH"],
     "PATH": os.environ["PATH"],

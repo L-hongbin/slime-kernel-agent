@@ -175,7 +175,9 @@ export PATH="/usr/local/cuda/bin:${PATH}"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-bond0}
 export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-bond0}
-export PYTHONPATH="${REPO}:/root/Megatron-LM${PYTHONPATH:+:${PYTHONPATH}}"
+# TileKernels (DeepSeek official mHC kernels; always used outside torch-reference diagnostics).
+TILEKERNELS_DIR=${TILEKERNELS_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/TileKernels}
+export PYTHONPATH="${REPO}:/root/Megatron-LM:${TILEKERNELS_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 export V4_LORA_DIM=${V4_LORA_DIM:-4}
 export V4_LORA_ALPHA=${V4_LORA_ALPHA:-8}
 export V4_LORA_DROPOUT=${V4_LORA_DROPOUT:-0.0}
@@ -192,9 +194,8 @@ export V4_FP8_FROZEN_EXPERTS=${V4_FP8_FROZEN_EXPERTS:-$([[ "${TASK_MODE}" == "rl
 export V4_FP8_EXPERT_GEMM=${V4_FP8_EXPERT_GEMM:-$([[ "${TASK_MODE}" == "rl" ]] && echo 1 || echo 0)}
 export V4_FP8_SHARED_EXPERT=${V4_FP8_SHARED_EXPERT:-$([[ "${TASK_MODE}" == "rl" ]] && echo 1 || echo 0)}
 export V4_FP8_ATTENTION=${V4_FP8_ATTENTION:-$([[ "${TASK_MODE}" == "rl" ]] && echo 1 || echo 0)}
-# V4_MHC_TORCH / V4_COMPRESS_TORCH / V4_ATTENTION_TORCH (torch-fallback toggles)
-# are NOT exported here: the code already defaults them to "0" (kernels on). The
-# node70 fallback path sets them explicitly via env when needed.
+# DS-V4 training uses the official TileKernels mHC. Diagnostic harnesses call
+# or inject their torch references explicitly.
 export TILELANG_CACHE_DIR=${TILELANG_CACHE_DIR:-/dev/shm/tilelang_cache_v4_r6_full_loop}
 export TILELANG_TMP_DIR=${TILELANG_TMP_DIR:-${TILELANG_CACHE_DIR}/tmp}
 export TMPDIR=${TMPDIR:-${RUNTIME_CACHE_ROOT}/tmp}
