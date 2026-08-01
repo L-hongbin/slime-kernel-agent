@@ -14,7 +14,7 @@ Forward parity (incl. a LoRA-applied pass): `... -m custom_kernels.deepseek_v4.m
 
 | File | Contents |
 |---|---|
-| `lora.py` | `apply_v4_lora(model, dim, alpha, dropout)` (build `LoRA` + apply), `V4_LORA_TARGET_MODULES`, `audit_lora(model)`. |
+| `lora.py` | `apply_v4_lora(model, dim, alpha, dropout)` (build `LoRA` + apply), `DSV4_LORA_TARGET_MODULES`, `audit_lora(model)`. |
 | `lora_validate.py` | The 4-check gate (trainable-only-LoRA / forward-identity / backward-only-LoRA / wrap-audit). |
 | `test_lora_grad_gating.py` | Unit check: A1/B2 backward returns None for frozen params, present+unchanged for trained, input grads preserved. |
 | `model_provider.py` | `v4_model_provider` applies LoRA when `--v4-lora-dim > 0`. |
@@ -27,7 +27,7 @@ Forward parity (incl. a LoRA-applied pass): `... -m custom_kernels.deepseek_v4.m
 wildcards** (not bare leaf names) because several leaf names collide:
 
 ```
-V4_LORA_TARGET_MODULES = [
+DSV4_LORA_TARGET_MODULES = [
     "*.self_attn.q_a_proj", "*.self_attn.q_b_proj",
     "*.self_attn.kv_proj",  "*.self_attn.o_b_proj",
     "*.self_attn.compressor.kv_proj", "*.self_attn.compressor.gate_proj",

@@ -1,5 +1,6 @@
 import logging
 from argparse import Namespace
+from collections import Counter
 from collections.abc import Sequence
 
 import numpy as np
@@ -16,6 +17,7 @@ from slime.utils.types import RolloutBatch
 
 from ...utils import logging_utils
 from .cp_utils import (
+    compute_cp_padded_max_seq_len,
     gather_and_reduce_log_dict,
     get_sum_of_sample_mean,
     rollout_log_metric_contribution,
@@ -23,6 +25,141 @@ from .cp_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def compute_bshd_max_seq_lens(
+    total_lengths: Sequence[int],
+    micro_batch_indices: Sequence[Sequence[int]],
+    *,
+    pad_size: int,
+    cp_size: int,
+    cp_partition_mode: str,
+    pipeline_model_parallel_size: int = 1,
+) -> list[int]:
+    """Compute the padded BSHD width used by each scheduled sample.
+
+    ``get_batch`` stacks all samples in one microbatch, so every sample in that
+    microbatch must use the same width: the aligned maximum of its real
+    ``total_length`` values.  With PP1, different microbatches may use different
+    widths and avoid padding every sample to the longest sequence in the whole
+    rollout.
+
+    V4 PP communication shapes are currently fixed once per Megatron pipeline
+    schedule.  Until that schedule is split by sequence shape, PP>1 must keep a
+    rollout-wide width; doing otherwise would make the sender and receiver
+    allocate different P2P buffers.  The explicit fallback here preserves the
+    previously validated PP behavior instead of silently enabling unsafe
+    per-microbatch shapes.
+
+    The schedule is also validated as an exact partition of local samples.  A
+    duplicate or missing index would otherwise leave a sample with a stale or
+    unrelated padding width and can corrupt BSHD loss/routing offsets.
+    """
+    if pad_size <= 0:
+        raise ValueError(f"pad_size must be positive, got {pad_size}")
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if pipeline_model_parallel_size <= 0:
+        raise ValueError("pipeline_model_parallel_size must be positive, " f"got {pipeline_model_parallel_size}")
+
+    num_samples = len(total_lengths)
+    if num_samples == 0:
+        if micro_batch_indices:
+            raise ValueError("empty total_lengths requires an empty microbatch schedule")
+        return []
+
+    max_seq_lens: list[int | None] = [None] * num_samples
+    microbatch_widths: list[int] = []
+    for microbatch_id, indices in enumerate(micro_batch_indices):
+        if not indices:
+            raise ValueError(f"microbatch {microbatch_id} is empty")
+
+        seen_in_microbatch: set[int] = set()
+        raw_max_seq_len = 0
+        for sample_index in indices:
+            if not isinstance(sample_index, int):
+                raise TypeError(f"microbatch {microbatch_id} has non-integer sample index " f"{sample_index!r}")
+            if sample_index < 0 or sample_index >= num_samples:
+                raise IndexError(
+                    f"microbatch {microbatch_id} sample index {sample_index} is outside " f"[0, {num_samples})"
+                )
+            if sample_index in seen_in_microbatch or max_seq_lens[sample_index] is not None:
+                raise ValueError(f"sample index {sample_index} appears more than once in the schedule")
+            seen_in_microbatch.add(sample_index)
+
+            total_length = int(total_lengths[sample_index])
+            if total_length <= 0:
+                raise ValueError(f"total_lengths[{sample_index}] must be positive, got {total_length}")
+            raw_max_seq_len = max(raw_max_seq_len, total_length)
+
+        padded_width = compute_cp_padded_max_seq_len(
+            raw_max_seq_len,
+            pad_size,
+            cp_size,
+            cp_partition_mode,
+        )
+        microbatch_widths.append(padded_width)
+        for sample_index in indices:
+            max_seq_lens[sample_index] = padded_width
+
+    missing = [i for i, width in enumerate(max_seq_lens) if width is None]
+    if missing:
+        raise ValueError(f"microbatch schedule is missing sample indices {missing}")
+
+    if pipeline_model_parallel_size > 1:
+        rollout_width = max(microbatch_widths)
+        return [rollout_width] * num_samples
+
+    return [int(width) for width in max_seq_lens]
+
+
+def summarize_bshd_padding(
+    total_lengths: Sequence[int],
+    max_seq_lens: Sequence[int],
+) -> dict[str, int | float | str]:
+    """Return compact, log-friendly actual-length padding statistics."""
+    if len(total_lengths) != len(max_seq_lens):
+        raise ValueError(
+            "total_lengths and max_seq_lens must have the same size, got "
+            f"{len(total_lengths)} and {len(max_seq_lens)}"
+        )
+    if not total_lengths:
+        return {
+            "samples": 0,
+            "unique_widths": 0,
+            "width_hist": "",
+            "raw_slots": 0,
+            "padded_slots": 0,
+            "rollout_wide_slots": 0,
+            "padding_overhead_pct": 0.0,
+            "saved_vs_rollout_wide_pct": 0.0,
+        }
+
+    raw_lengths = [int(length) for length in total_lengths]
+    padded_widths = [int(width) for width in max_seq_lens]
+    for sample_index, (raw_length, padded_width) in enumerate(zip(raw_lengths, padded_widths, strict=True)):
+        if raw_length <= 0:
+            raise ValueError(f"total_lengths[{sample_index}] must be positive, got {raw_length}")
+        if padded_width < raw_length:
+            raise ValueError(
+                f"max_seq_lens[{sample_index}]={padded_width} is smaller than "
+                f"total_lengths[{sample_index}]={raw_length}"
+            )
+
+    width_counts = Counter(padded_widths)
+    raw_slots = sum(raw_lengths)
+    padded_slots = sum(padded_widths)
+    rollout_wide_slots = max(padded_widths) * len(padded_widths)
+    return {
+        "samples": len(padded_widths),
+        "unique_widths": len(width_counts),
+        "width_hist": ",".join(f"{width}:{width_counts[width]}" for width in sorted(width_counts)),
+        "raw_slots": raw_slots,
+        "padded_slots": padded_slots,
+        "rollout_wide_slots": rollout_wide_slots,
+        "padding_overhead_pct": 100.0 * (padded_slots - raw_slots) / raw_slots,
+        "saved_vs_rollout_wide_pct": 100.0 * (rollout_wide_slots - padded_slots) / rollout_wide_slots,
+    }
 
 
 def get_batch(
@@ -68,7 +205,11 @@ def get_batch(
     cp_rank = mpu.get_context_parallel_rank()
 
     if qkv_format == "bshd":
-        max_seqlen = batch["max_seq_lens"][0]
+        max_seq_lens = batch["max_seq_lens"]
+        assert max_seq_lens and all(width == max_seq_lens[0] for width in max_seq_lens), (
+            "bshd samples in one microbatch must share max_seq_len, got " f"{max_seq_lens}"
+        )
+        max_seqlen = max_seq_lens[0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
         tokens = torch.stack(tokens)
@@ -202,7 +343,15 @@ def gather_log_data(
     )
     if reduced is None:
         return None
-    reduced_log_dict = {f"{metric_name}/{k}": v for k, v in reduced.items()}
+    reduced_log_dict = {}
+    for key, value in reduced.items():
+        if metric_name == "rollout" and key == "entropy":
+            output_key = "entropy/rollout"
+        elif metric_name == "rollout" and key == "entropy_mc":
+            output_key = "entropy/rollout_mc"
+        else:
+            output_key = f"{metric_name}/{key}"
+        reduced_log_dict[output_key] = value
     logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
     # Calculate step once to avoid duplication
     step = compute_rollout_step(args, rollout_id)
@@ -297,10 +446,14 @@ def log_rollout_data(
                 "tokens",
                 "multimodal_train_inputs",
                 "loss_masks",
+                train_metric_utils.ENTROPY_COMMON_PROBE_MASK_KEY,
                 "sample_indices",
                 "group_ids",
                 "group_mask_sums",
                 "rollout_routed_experts",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
+                "rollout_topk_valid_mask",
                 "max_seq_lens",
                 "global_batch_sizes",
                 "num_microbatches",
@@ -343,6 +496,19 @@ def log_rollout_data(
                             dp_size=dp_world,
                         )
                         log_dict[key] = (sum_value, count)
+                        if key == "rollout_log_probs":
+                            token_sum = get_sum_of_sample_mean(
+                                total_lengths,
+                                response_lengths,
+                                loss_masks,
+                                calculate_per_token_loss=True,
+                                qkv_format=args.qkv_format,
+                                max_seq_lens=max_seq_lens,
+                            )
+                            log_dict["entropy_mc"] = (
+                                token_sum(-tensor).item(),
+                                token_sum(torch.ones_like(tensor)).item(),
+                            )
                         continue
                     tensor = torch.cat(val).clone().detach()
                     # val.mean() * cp_size is the per-sample mean for one rank;
@@ -376,8 +542,8 @@ def log_rollout_data(
                 assert abs(reduced_log_dict["rollout/log_probs"] - reduced_log_dict["rollout/ref_log_probs"]) < 1e-8
             if "rollout/log_probs" in reduced_log_dict:
                 assert -1 < reduced_log_dict["rollout/log_probs"] < 0
-            if "rollout/entropy" in reduced_log_dict:
-                assert 0 < reduced_log_dict["rollout/entropy"] < 1
+            if "entropy/rollout" in reduced_log_dict:
+                assert 0 < reduced_log_dict["entropy/rollout"] < 1
 
     if args.log_multi_turn:
         log_multi_turn_data(rollout_id, args, rollout_data)
@@ -523,6 +689,20 @@ def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None =
         / dist.get_world_size()
         / 1e12,
         extra_metrics=extra_metrics,
+    )
+
+
+def log_named_perf_timers(rollout_id: int, args: Namespace, *timer_names: str) -> None:
+    """Report selected post-train timers without resetting unrelated metrics."""
+    train_metric_utils.log_named_perf_timers_raw(
+        rollout_id=rollout_id,
+        args=args,
+        is_primary_rank=(
+            mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.is_pipeline_last_stage()
+            and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+        ),
+        timer_names=tuple(timer_names),
     )
 
 

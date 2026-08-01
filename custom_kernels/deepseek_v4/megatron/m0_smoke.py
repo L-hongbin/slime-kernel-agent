@@ -64,6 +64,12 @@ def tiny_config() -> DeepseekV4Config:
             "heavily_compressed_attention",
         ],
         mlp_layer_types=["hash_moe", "hash_moe", "moe"],
+        quantization_config={
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
     )
 
 

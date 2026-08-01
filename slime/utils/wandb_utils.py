@@ -225,6 +225,9 @@ def init_wandb_secondary(args, role=None):
 def _init_wandb_common():
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("dppo/*", step_metric="train/step")
+    wandb.define_metric("entropy/*", step_metric="train/step")
+    wandb.define_metric("entropy/rollout*", step_metric="rollout/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")

@@ -38,29 +38,14 @@ import os
 
 import torch
 import torch.nn.functional as F
-
-# mHC mixing oracle: detach the Sinkhorn-derived `comb`/`post` in the residual
-# combine so the backward does not propagate through the 20-iteration Sinkhorn VJP
-# (DeepSeek-V4 RL stability recipe: freeze Sinkhorn in mHC as a mixing oracle).
-# On by default; set V4_MHC_MIXING_ORACLE=0 to restore full backprop.
-_MHC_MIXING_ORACLE = os.environ.get("V4_MHC_MIXING_ORACLE", "1") == "1"
-
-# SwiGLU-limit clamp backward. torch.clamp has ZERO gradient outside [min,max],
-# so on outlier activations (|gate/up| > swiglu_limit) the gradient flowing back
-# THROUGH the frozen expert to the LoRA is killed. The DeepSeek-V4 paper does not
-# specify the swiglu-limit clamp's backward (it uses QK-Clip nowhere, and FP4-QAT
-# elsewhere), so we default to the straight-through estimator: forward clamps,
-# backward is identity. Set V4_CLAMP_STE=0 for the true (grad-zeroing) clamp.
-_CLAMP_STE = os.environ.get("V4_CLAMP_STE", "1") == "1"
+import torch.utils.checkpoint  # noqa: F401  (used by the validated full-recompute path)
 
 
 def _clamp(x, min=None, max=None):
-    if _CLAMP_STE:
-        # STE, bit-exact forward: clamp(x).detach() carries the EXACT clamped value
-        # (no bf16 add/sub on it), and (x - x.detach()) is exactly 0 in value but
-        # has gradient 1 -> forward == torch.clamp, backward == identity.
-        return x.clamp(min=min, max=max).detach() + (x - x.detach())
-    return x.clamp(min=min, max=max)
+    """Clamp in the forward and use the identity straight-through gradient."""
+    # clamp(x).detach() preserves the exact clamped value without an extra bf16
+    # add/sub; x - x.detach() is exactly zero in value and has gradient one.
+    return x.clamp(min=min, max=max).detach() + (x - x.detach())
 
 
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
@@ -79,12 +64,94 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from .attention import V4Attention
+from .cp_utils import CP_HALO, assert_local_len_aligned, get_cp_info
 from .decoder import V4HyperConnection
 from .rope import DeepseekV4RotaryEmbedding, V4RMSNorm
 
 
 def _routing_replay_enabled():
     return os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1"
+
+
+def _forward_v4_decoder_layers(
+    layers,
+    hidden_states,
+    position_embeddings,
+    input_ids,
+    *,
+    use_act_ckpt,
+    recompute_num_layers=1,
+    recompute_method="uniform",
+    use_reentrant=True,
+):
+    """Run V4 decoder layers, optionally checkpointing layer segments.
+
+    Megatron semantics, reimplemented for V4's hand-written decoder loop
+    (``TransformerBlock``'s checkpoint path can't run here):
+
+    - ``recompute_method="uniform"``: ``recompute_num_layers`` is the number of
+      consecutive layers in one checkpointed unit; ALL layers are recomputed.
+    - ``recompute_method="block"``: the FIRST ``recompute_num_layers`` layers
+      are checkpointed individually; the remaining layers store their
+      activations (memory-for-speed dial — backward skips their recompute).
+    """
+    if not use_act_ckpt:
+        for layer in layers:
+            hidden_states = layer(hidden_states, position_embeddings, input_ids)
+        return hidden_states
+
+    if isinstance(recompute_num_layers, bool) or not isinstance(recompute_num_layers, int):
+        raise TypeError("V4 recompute_num_layers must be an integer, " f"got {recompute_num_layers!r}")
+    if recompute_num_layers <= 0:
+        raise ValueError("V4 recompute_num_layers must be greater than zero, " f"got {recompute_num_layers}")
+    if recompute_method not in ("uniform", "block"):
+        raise ValueError("V4 recompute_method must be 'uniform' or 'block', " f"got {recompute_method!r}")
+    if recompute_method == "block" and recompute_num_layers > len(layers):
+        raise ValueError(
+            "V4 block recompute_num_layers cannot exceed the local decoder "
+            f"layer count: K={recompute_num_layers}, local_layers={len(layers)}"
+        )
+
+    def _checkpoint_segment(hidden, segment):
+        # Capture an immutable snapshot in the closure.  A default argument is
+        # intentional: checkpoint executes this function again during backward,
+        # after the loop variable has advanced to the final segment.
+        def run_segment(hidden, positions, tokens, segment=segment):
+            for layer in segment:
+                hidden = layer(hidden, positions, tokens)
+            return hidden
+
+        return torch.utils.checkpoint.checkpoint(
+            run_segment,
+            hidden,
+            position_embeddings,
+            input_ids,
+            use_reentrant=use_reentrant,
+        )
+
+    if recompute_method == "block":
+        for idx, layer in enumerate(layers):
+            if idx < recompute_num_layers:
+                hidden_states = _checkpoint_segment(hidden_states, (layer,))
+            else:
+                hidden_states = layer(hidden_states, position_embeddings, input_ids)
+        return hidden_states
+
+    for start in range(0, len(layers), recompute_num_layers):
+        segment = tuple(layers[start : start + recompute_num_layers])
+        hidden_states = _checkpoint_segment(hidden_states, segment)
+    return hidden_states
+
+
+def _v4_stage_builds_embedding(pre_process, post_process, enable_mtp):
+    """Whether this PP stage builds the shared embedding.
+
+    Always on the first stage (``pre_process``).  Additionally on the LAST stage
+    (``post_process``) when the MTP head is enabled, because the MTP head embeds its
+    rolled ``input_ids`` there.  At PP=1 the first==last stage already qualifies via
+    ``pre_process``.  Mirrors Megatron's ``pre_process or mtp_process`` embedding build.
+    """
+    return bool(pre_process or (post_process and enable_mtp))
 
 
 # ======================================================================================
@@ -103,7 +170,7 @@ class V4TopKRouter(nn.Module):
     needs this custom router (sharding contract §risks 1).
     """
 
-    def __init__(self, config):
+    def __init__(self, config, *, enable_routing_replay=True):
         super().__init__()
         self.top_k = config.num_experts_per_tok
         self.num_experts = config.num_local_experts  # alias -> n_routed_experts
@@ -112,7 +179,13 @@ class V4TopKRouter(nn.Module):
         self.score_fn = ACT2FN[config.scoring_func]
         self.routed_scaling_factor = config.routed_scaling_factor
         self.register_buffer("e_score_correction_bias", torch.zeros(self.num_experts), persistent=True)
-        if _routing_replay_enabled():
+        # ``enable_routing_replay=False`` keeps this router OUT of the rollout routing
+        # replay machinery: it never constructs a ``RoutingReplay`` (which would append a
+        # spurious entry to the global ``all_routing_replays`` list and shift the
+        # main-layer offset mapping) and never gets a ``routing_replay`` attr, so
+        # ``_select_indices`` falls through to a LIVE top-k. The MTP layer's MoE uses this
+        # (it is not one of the main decoder layers whose routing the rollout records).
+        if enable_routing_replay and _routing_replay_enabled():
             from slime.utils.routing_replay import register_routing_replay
 
             register_routing_replay(self)
@@ -157,25 +230,18 @@ class V4TopKRouter(nn.Module):
         return logits, weights * self.routed_scaling_factor, indices
 
 
-class V4HashRouter(nn.Module):
-    """Hash router: frozen ``tid2eid[input_ids]`` selection, learned-gate weights.
-    Faithful to ``DeepseekV4HashRouter`` (HF:1040).  Needs ``input_ids`` threaded in
-    (sharding contract §risks 2) — the single biggest deviation from stock MoELayer.
-    """
+from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HashRouter as _HFDeepseekV4HashRouter
 
-    def __init__(self, config):
-        super().__init__()
-        self.top_k = config.num_experts_per_tok
-        self.num_experts = config.num_local_experts
-        self.hidden_dim = config.hidden_size
-        self.weight = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim))
-        self.score_fn = ACT2FN[config.scoring_func]
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.register_buffer(
-            "tid2eid",
-            torch.zeros(config.vocab_size, self.top_k, dtype=torch.long),
-            persistent=True,
-        )
+
+class V4HashRouter(_HFDeepseekV4HashRouter):
+    """The OFFICIAL HF ``DeepseekV4HashRouter`` (structure/init/``tid2eid`` buffer
+    inherited upstream — tracks community updates), with ONE deliberate forward
+    deviation: the weight renorm uses sglang's bare sum (NO ``+1e-20`` guard) so
+    train-side gate weights bit-match the rollout engine (sglang moe/topk.py:643).
+    Scores are strictly positive (sigmoid/sqrtsoftplus) so the denominator is >0.
+    Needs ``input_ids`` threaded in (sharding contract §risks 2) — the single
+    biggest deviation from stock MoELayer.
+    """
 
     def forward(self, hidden_states, input_ids):
         assert input_ids is not None, "V4HashRouter requires input_ids"
@@ -184,217 +250,84 @@ class V4HashRouter(nn.Module):
         scores = self.score_fn(logits)
         indices = self.tid2eid[input_ids.reshape(-1)].long()
         weights = scores.gather(1, indices)
-        # Match sglang exactly: renorm with a bare sum (no +1e-20 guard). Scores are
-        # positive (sigmoid/sqrtsoftplus) so the denominator is >0; sglang omits the
-        # guard (moe/topk.py:643 `topk_weights / topk_weights.sum(...)`).
+        # sglang-exact renorm (see class docstring) — the only line that differs
+        # from the inherited HF forward.
         weights = weights / weights.sum(dim=-1, keepdim=True)
         return logits, weights * self.routed_scaling_factor, indices
 
 
-# To MATCH sglang's fp8 rollout (minimize train_rollout_logprob_diff) the ue8m0
-# scale format must be split into WEIGHT vs ACTIVATION — they differ:
-#  * WEIGHTS: the checkpoint STORES ue8m0 (power-of-2) block scales, so requantizing
-#    the bf16 weights needs use_ue8m0=True to bit-recover the stored fp8 (verified:
-#    ue8m0=True -> 0.00% byte diff vs the checkpoint; ue8m0=False -> 88% diff).
-#  * ACTIVATIONS: sglang's runtime activation quant is HARDWARE-gated, not checkpoint-
-#    gated: DEEPGEMM_SCALE_UE8M0 = DEEPGEMM_BLACKWELL (sglang configurer.py). On H20
-#    (Hopper, sm90 < sm100) it is FALSE => LINEAR activation scales (verified: sglang
-#    activation quant matches deep_gemm ue8m0=False at 0.0005 mismatch, ue8m0=True at
-#    0.91). Conflating the two (single flag) makes EITHER weights OR activations wrong
-#    -> fp8 loses to bf16; splitting them is the fix. (codex kernel review 2026-07-06)
-_V4_FP8_WEIGHT_UE8M0 = os.environ.get("V4_FP8_WEIGHT_UE8M0", "1") == "1"
+# --- Packed-MXFP4 frozen experts (V4_FP4_FROZEN_EXPERTS=1) --------------------
+# The OFFICIAL DeepSeek-V4-Flash checkpoint stores routed experts as packed
+# MXFP4: int8 nibble pairs (E2M1, low nibble = even K element, high = odd) plus
+# per-32-along-K E8M0 scales (uint8 exponent bytes, value = 2^(byte-127)).
+# These bytes stay RESIDENT verbatim (uint8 buffers); compute is W4A16 — the
+# weight is unpacked transiently to bf16 and multiplied against bf16
+# activations, matching sglang's SM90 flashinfer_mxfp4/Marlin W4A16 serving of
+# the same checkpoint. The decode is EXACT in bf16 (E2M1 magnitudes
+# {0,.5,1,1.5,2,3,4,6} need <=3 significand bits; the scale is a power of two),
+# validated bit-identical to deep_gemm.cast_back_from_fp4(gran_k=32) and to the
+# secondary FP8 checkpoint's dequant of the same experts (lossless FP4->FP8
+# expansion) on the official fixture — see
+# handoffs/deepseek-v4/fp4_w4a16_design.md and
+# tests/deepseek-v4/test_dsv4_fp4_frozen_experts.py.
+
+_E2M1_LUT = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+    dtype=torch.bfloat16,
+)
+
+_MXFP4_GROUP = 32  # E8M0 scale granularity along K (official checkpoint layout)
 
 
-def _default_act_ue8m0():
-    env = os.environ.get("V4_FP8_ACT_UE8M0")
-    if env is not None:
-        return env == "1"
-    try:  # Blackwell (sm100+) uses ue8m0 activation scales; Hopper/H20 uses linear
-        return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
-    except Exception:
-        return False
+def _v4_fp4_frozen_experts_enabled():
+    """Read the packed-MXFP4 mode at model-construction time."""
+    return os.environ.get("V4_FP4_FROZEN_EXPERTS", "0") == "1"
 
 
-_V4_FP8_ACT_UE8M0 = _default_act_ue8m0()
+def _unpack_mxfp4(w_pack, sf, out_dtype=torch.bfloat16):
+    """packed E2M1 uint8 [O, K/2] + E8M0 uint8 [O, K/32] -> [O, K] bf16.
+
+    MEMORY-CRITICAL: callers must treat the result as a transient and never
+    retain it across autograd. bf16 multiply is exact here
+    (power-of-two scale only shifts the exponent), so unlike the fp8 path there
+    is no bf16-vs-fp32 dequant tradeoff at all."""
+    assert (
+        w_pack.dtype == torch.uint8 and sf.dtype == torch.uint8
+    ), f"packed MXFP4 expects uint8 buffers, got {w_pack.dtype}/{sf.dtype}"
+    O, Kh = w_pack.shape
+    K = Kh * 2
+    assert sf.shape == (O, K // _MXFP4_GROUP), f"scale shape {tuple(sf.shape)} != ({O}, {K // _MXFP4_GROUP})"
+    lut = _E2M1_LUT.to(device=w_pack.device)
+    lo = lut[(w_pack & 0x0F).long()]  # even K indices
+    hi = lut[(w_pack >> 4).long()]  # odd K indices
+    w = torch.stack((lo, hi), dim=-1).reshape(O, K)
+    # E8M0 decode 2^(e-127) via torch's NATIVE float8_e8m0fnu cast — correct for
+    # all 256 byte values incl. the boundaries (0x00 -> 2^-127, 0xFF -> NaN),
+    # unlike the (byte<<23) bit-trick which yields 0.0/+Inf there (codex impl
+    # review finding 2; bytes 1-254 are bit-identical either way, and the
+    # boundary bytes are additionally hard-rejected by verify_fp4_loaded).
+    scale = sf.view(torch.float8_e8m0fnu).to(torch.float32).to(torch.bfloat16)
+    return (w.view(O, K // _MXFP4_GROUP, _MXFP4_GROUP) * scale[:, :, None]).reshape(O, K).to(out_dtype)
 
 
-def _dequant_block_fp8(w_fp8, scale, blk):
-    """[O,I] float8 + [Ob,Ib] scale -> [O,I] bf16 (block-broadcast, no full-scale
-    materialization). A transient; callers must NOT retain it."""
-    O, I = w_fp8.shape
-    # multiply in fp32 (scale stays fp32), cast once to bf16 (codex review item 3)
-    w = w_fp8.to(torch.float32).view(O // blk, blk, I // blk, blk)
-    return (w * scale[:, None, :, None]).reshape(O, I).to(torch.bfloat16)
-
-
-class _FrozenFp8ExpertLinear(torch.autograd.Function):
-    """y = x @ W^T for a frozen fp8-stored expert weight, WITHOUT retaining the
-    bf16 weight (the ctx saves only the resident fp8 buffers; the bf16 weight is a
-    transient re-derived in forward and again in backward). This is the fix for the
-    ctx-16k activation-recompute OOM. No grad_weight (frozen)."""
+class _FrozenFp4ExpertLinear(torch.autograd.Function):
+    """y = x @ W^T for a frozen packed-MXFP4 expert weight, WITHOUT retaining
+    the bf16 weight (ctx saves only the resident packed buffers; the bf16 weight
+    is a transient re-derived in forward and again in backward. No grad_weight
+    is produced because routed experts are frozen."""
 
     @staticmethod
-    def forward(ctx, x, w_fp8, scale, blk):
-        ctx.save_for_backward(w_fp8, scale)  # fp8 buffers — already resident, no new memory
-        ctx.blk = blk
-        w = _dequant_block_fp8(w_fp8, scale, blk)  # transient, NOT saved
+    def forward(ctx, x, w_pack, w_sf):
+        ctx.save_for_backward(w_pack, w_sf)  # resident uint8 buffers — no new memory
+        w = _unpack_mxfp4(w_pack, w_sf)  # transient, NOT saved
         return F.linear(x, w)
 
     @staticmethod
     def backward(ctx, grad_out):
-        w_fp8, scale = ctx.saved_tensors
-        w = _dequant_block_fp8(w_fp8, scale, ctx.blk)  # transient re-dequant
+        w_pack, w_sf = ctx.saved_tensors
+        w = _unpack_mxfp4(w_pack, w_sf)  # transient re-unpack
         grad_x = grad_out @ w  # grad_x = grad_y @ W  (y = x @ W^T)
-        return grad_x, None, None, None
-
-
-def _pad_to_alignment(hidden, counts, align):
-    """Scatter contiguous per-expert segments into `align`-multiple padded slots
-    (deep_gemm's contiguous grouped GEMM needs each group padded to `align`).
-    Returns (hidden_padded [Tp,H], m_indices [Tp], gather [T]) where
-    gather[real_row] = padded_row, to un-pad the [Tp,O] output back to [T,O]."""
-    pc = [((c + align - 1) // align) * align for c in counts]
-    Tp = sum(pc)
-    T = hidden.shape[0]
-    hp = hidden.new_zeros(Tp, hidden.shape[1])
-    m_idx = torch.empty(Tp, device=hidden.device, dtype=torch.int32)
-    gather = torch.empty(T, device=hidden.device, dtype=torch.long)
-    s = d = 0
-    for e, (c, p) in enumerate(zip(counts, pc)):
-        if c:
-            hp[d : d + c] = hidden[s : s + c]
-            gather[s : s + c] = torch.arange(d, d + c, device=hidden.device)
-        m_idx[d : d + p] = e
-        s += c
-        d += p
-    return hp, m_idx, gather
-
-
-class _Fp8GroupedExpertMatmul(torch.autograd.Function):
-    """Grouped y = x @ W^T over dispatcher-permuted experts, computed in FP8 with
-    deep_gemm — the SAME kernel sglang uses to serve these experts at rollout, so
-    the train forward matches the rollout forward (minimizes
-    train_rollout_logprob_abs_diff). Forward: pad each expert to 128 rows,
-    per-token fp8-quantize the activations (+ TMA-align the scale), grouped fp8
-    GEMM, un-pad. Backward grad_x: per-expert bf16 (dequant the frozen fp8 weight
-    transiently) — training-only, no sglang counterpart, and bf16 avoids
-    fp8-gradient noise. No grad_weight (frozen). No bf16 weight is ever retained."""
-
-    @staticmethod
-    def forward(ctx, hidden, w_fp8, w_scale, tokens_per_expert, blk):
-        from deep_gemm import (
-            get_m_alignment_for_contiguous_layout,
-            get_mn_major_tma_aligned_tensor,
-            m_grouped_fp8_gemm_nt_contiguous,
-            per_token_cast_to_fp8,
-        )
-
-        counts = tokens_per_expert.tolist()
-        align = get_m_alignment_for_contiguous_layout()
-        hp, m_idx, gather = _pad_to_alignment(hidden, counts, align)
-        a_fp8, a_scale = per_token_cast_to_fp8(hp, use_ue8m0=_V4_FP8_ACT_UE8M0)
-        a_scale = get_mn_major_tma_aligned_tensor(a_scale)
-        out_pad = torch.empty(hp.shape[0], w_fp8.shape[1], dtype=torch.bfloat16, device=hidden.device)
-        m_grouped_fp8_gemm_nt_contiguous((a_fp8, a_scale), (w_fp8, w_scale), out_pad, m_idx)
-        out = out_pad.index_select(0, gather)  # un-pad -> [T, O]
-        ctx.save_for_backward(w_fp8, w_scale, tokens_per_expert)
-        ctx.blk = blk
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        w_fp8, w_scale, tokens_per_expert = ctx.saved_tensors
-        blk = ctx.blk
-        grad_x = torch.empty(grad_out.shape[0], w_fp8.shape[2], dtype=grad_out.dtype, device=grad_out.device)
-        off = 0
-        for e, c in enumerate(tokens_per_expert.tolist()):
-            if c:
-                w = _dequant_block_fp8(w_fp8[e], w_scale[e], blk)  # [O,I] bf16 transient
-                grad_x[off : off + c] = grad_out[off : off + c] @ w  # grad_y @ W -> [c, I]
-            off += c
-        return grad_x, None, None, None, None
-
-
-class _FrozenFp8DenseLinear(torch.autograd.Function):
-    """y = x @ W^T for a FROZEN fp8-stored dense weight, computed in fp8 via
-    deep_gemm (per-token activation quant + fp8 matmul) — matches sglang's fp8
-    serving of the shared expert / attention base, so the train forward matches
-    the rollout forward. Backward grad_x is bf16 (dequant the frozen fp8 weight
-    transiently; no grad_weight — frozen). No M-padding needed (dense fp8_gemm_nt
-    handles arbitrary token counts)."""
-
-    @staticmethod
-    def forward(ctx, x, w_fp8, w_scale, blk):
-        from deep_gemm import fp8_gemm_nt, get_mn_major_tma_aligned_tensor, per_token_cast_to_fp8
-
-        x2d = x.reshape(-1, x.shape[-1])
-        a_fp8, a_scale = per_token_cast_to_fp8(x2d, use_ue8m0=_V4_FP8_ACT_UE8M0)
-        a_scale = get_mn_major_tma_aligned_tensor(a_scale)
-        out = torch.empty(x2d.shape[0], w_fp8.shape[0], dtype=torch.bfloat16, device=x.device)
-        fp8_gemm_nt((a_fp8, a_scale), (w_fp8, w_scale), out)
-        ctx.save_for_backward(w_fp8, w_scale)
-        ctx.blk = blk
-        ctx.in_shape = x.shape
-        return out.reshape(*x.shape[:-1], w_fp8.shape[0])
-
-    @staticmethod
-    def backward(ctx, grad_out):
-        w_fp8, w_scale = ctx.saved_tensors
-        w = _dequant_block_fp8(w_fp8, w_scale, ctx.blk)  # [O, I] bf16
-        g2d = grad_out.reshape(-1, grad_out.shape[-1])
-        grad_x = (g2d @ w).reshape(*ctx.in_shape)
-        return grad_x, None, None, None
-
-
-def _quantize_linear_fp8(linear, blk):
-    """Requantize a FROZEN nn.Linear weight to blockwise float8_e4m3fn (deep_gemm
-    per_block layout), replacing the bf16 Parameter with fp8 + scale buffers.
-    Idempotent; returns (w_fp8, w_scale) or None if already quantized / trainable."""
-    from deep_gemm import per_block_cast_to_fp8
-
-    if getattr(linear, "_fp8", False):
-        return None
-    w = linear.weight
-    assert not w.requires_grad, "fp8 dense quantization is only for FROZEN linears"
-    O, I = w.shape
-    assert O % blk == 0 and I % blk == 0, f"dims ({O},{I}) must be multiples of {blk}"
-    w_fp8, w_scale = per_block_cast_to_fp8(w.data.float(), use_ue8m0=_V4_FP8_WEIGHT_UE8M0)
-    del linear.weight
-    linear.register_buffer("weight_fp8", w_fp8, persistent=False)
-    linear.register_buffer("weight_scale", w_scale, persistent=False)
-    linear._fp8 = True
-
-
-def _fp8_lora_adapter_forward(self, x):
-    """Replacement forward for a megatron-bridge LoRA adapter (nn.Linear subclass)
-    whose FROZEN base is fp8: base matmul in fp8 (matches sglang's fp8 serving of
-    wq_a/wq_b/wkv/wo_b), LoRA delta in bf16 (bridge keeps LoRA in original precision).
-    Mirrors TELinearAdapter.forward exactly except the base uses the fp8 kernel."""
-    res = _FrozenFp8DenseLinear.apply(x, self.weight_fp8, self.weight_scale, self._FP8_BLOCK)
-    if self.bias is not None:
-        res = res + self.bias
-    if not getattr(self, "_adapter_enabled", True):
-        return res
-    if getattr(self, "dropout_position", "post") == "pre":
-        x = self.dropout(x)
-    lora_res = self.linear_out(self.linear_in(x)) * self.scale
-    if getattr(self, "dropout_position", "post") == "post":
-        lora_res = self.dropout(lora_res)
-    return res + lora_res
-
-
-def quantize_lora_adapter_fp8(adapter, blk=128):
-    """fp8 the FROZEN base weight of a LoRA-wrapped attention projection and patch
-    its forward so the base runs in fp8 (weight ue8m0 + activation linear on H20) with
-    the bf16 LoRA delta on top. Only for adapters whose base is fp8 in the checkpoint
-    (self_attn wq_a/wq_b/wkv/wo_b). Idempotent."""
-    import types
-
-    if getattr(adapter, "_fp8", False):
-        return
-    _quantize_linear_fp8(adapter, blk)  # base weight -> fp8 buffers (asserts frozen)
-    adapter._FP8_BLOCK = blk
-    adapter.forward = types.MethodType(_fp8_lora_adapter_forward, adapter)
+        return grad_x, None, None
 
 
 class V4GroupedExperts(nn.Module):
@@ -409,11 +342,25 @@ class V4GroupedExperts(nn.Module):
     swapped in at the EP>1 milestone where the all-to-all is non-trivial.
     """
 
-    def __init__(self, config, *, expert_model_parallel_size=1, expert_model_parallel_rank=0):
+    def __init__(
+        self,
+        config,
+        *,
+        expert_model_parallel_size=1,
+        expert_model_parallel_rank=0,
+        expert_data_parallel_group=None,
+    ):
         super().__init__()
+        self._checkpoint_config = config
         self.num_global_experts = config.num_local_experts
         self.expert_model_parallel_size = int(expert_model_parallel_size)
         self.expert_model_parallel_rank = int(expert_model_parallel_rank)
+        # Expert shards are replicated across the expert-DP group.  Distributed
+        # checkpointing must see exactly one main replica for every EP shard; in
+        # particular, CP>1 can make expert-DP larger than one even when ordinary
+        # model weights merely look CP-replicated.  This mirrors Megatron's native
+        # GroupedMLP ``self.dp_group = pg_collection.expt_dp`` contract.
+        self.expert_data_parallel_group = expert_data_parallel_group
         if self.expert_model_parallel_size < 1:
             raise ValueError("expert_model_parallel_size must be >= 1")
         if not 0 <= self.expert_model_parallel_rank < self.expert_model_parallel_size:
@@ -431,11 +378,36 @@ class V4GroupedExperts(nn.Module):
         self.local_expert_end = self.local_expert_start + self.num_experts
         self.hidden_dim = config.hidden_size
         self.intermediate_dim = config.intermediate_size  # alias -> moe_intermediate_size
-        self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
-        self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
-        expert_parallel = self.expert_model_parallel_size > 1
-        self.gate_up_proj.allreduce = not expert_parallel
-        self.down_proj.allreduce = not expert_parallel
+        # Packed-MXFP4 mode (V4_FP4_FROZEN_EXPERTS=1): the OFFICIAL checkpoint's
+        # packed expert bytes stay resident verbatim — no bf16 Parameters are ever
+        # created, torch_dist carries the packed uint8 tensors directly (see
+        # sharded_state_dict), and compute is W4A16 via transient unpack. Read at
+        # CONSTRUCTION time (both the conversion driver and the trainer export the
+        # env before building the model).
+        self._experts_fp4 = _v4_fp4_frozen_experts_enabled()
+        if self._experts_fp4:
+            E, H, I = self.num_experts, self.hidden_dim, self.intermediate_dim
+            assert (
+                H % (2 * _MXFP4_GROUP) == 0 and I % (2 * _MXFP4_GROUP) == 0
+            ), f"packed MXFP4 needs dims divisible by {2 * _MXFP4_GROUP}, got H={H} I={I}"
+            # gate_up: logical [E, 2I, H] -> packed [E, 2I, H/2] + scales [E, 2I, H/32]
+            # down:    logical [E, H, I]  -> packed [E, H, I/2]  + scales [E, H, I/32]
+            # Buffers (not Parameters): invisible to DDP/optimizer, untouched by
+            # .bfloat16() casts. persistent=True is REQUIRED (unlike the post-load
+            # fp8 buffers): these exist AT LOAD TIME, and Megatron's checkpoint load
+            # finishes with module.load_state_dict(...) whose key set only contains
+            # persistent buffers — persistent=False would make every packed key an
+            # unexpected_key and strict loads would raise.
+            self.register_buffer("gate_up_proj_fp4", torch.zeros(E, 2 * I, H // 2, dtype=torch.uint8))
+            self.register_buffer("gate_up_proj_sf", torch.zeros(E, 2 * I, H // _MXFP4_GROUP, dtype=torch.uint8))
+            self.register_buffer("down_proj_fp4", torch.zeros(E, H, I // 2, dtype=torch.uint8))
+            self.register_buffer("down_proj_sf", torch.zeros(E, H, I // _MXFP4_GROUP, dtype=torch.uint8))
+        else:
+            self.gate_up_proj = nn.Parameter(torch.empty(self.num_experts, 2 * self.intermediate_dim, self.hidden_dim))
+            self.down_proj = nn.Parameter(torch.empty(self.num_experts, self.hidden_dim, self.intermediate_dim))
+            expert_parallel = self.expert_model_parallel_size > 1
+            self.gate_up_proj.allreduce = not expert_parallel
+            self.down_proj.allreduce = not expert_parallel
         self.act_fn = ACT2FN[config.hidden_act]
         self.limit = config.swiglu_limit
 
@@ -445,101 +417,21 @@ class V4GroupedExperts(nn.Module):
         up = _clamp(up, min=-self.limit, max=self.limit)
         return self.act_fn(gate) * up
 
-    # --- FP8 frozen-expert storage (V4_FP8_FROZEN_EXPERTS=1) -------------------
-    # The experts are FROZEN (LoRA is attention/compressor only) and the source
-    # checkpoint is FP8, yet params_dtype=bf16 doubles their resident footprint —
-    # the bulk of the ~63GB/GPU rest state. Requantize them to float8_e4m3fn +
-    # per-expert scale AFTER load, freeing the bf16 copies (~half the expert
-    # memory) so ctx-16k fits. Dequant per-expert in the forward loop (transient,
-    # one expert at a time). This also matches sglang's fp8 rollout serving,
-    # reducing the train/rollout expert-precision mismatch rather than adding one.
-    _FP8_E4M3_MAX = 448.0
-    _FP8_BLOCK = 128  # matches the source checkpoint's weight_block_size [128,128]
-
-    def quantize_frozen_experts_fp8(self):
-        """bf16 -> float8_e4m3fn with BLOCKWISE [128,128] scales, in place, idempotent.
-
-        Blockwise (not per-tensor) matches the source/rollout FP8 format
-        (config.json weight_block_size [128,128]), so training experts stay close
-        to what sglang serves — reducing, not adding, train/rollout mismatch
-        (codex review 2026-07-05, finding 3). Must be called AFTER the checkpoint
-        load (weights populated). Quantizes one expert at a time so the transient
-        fp32 copy is one-expert-sized, not whole-tensor (finding 4). Guarded to
-        frozen params only (finding 2). No-op if already quantized."""
-        if getattr(self, "_experts_fp8", False):
-            return
-        blk = self._FP8_BLOCK
-        for name in ("gate_up_proj", "down_proj"):
-            param = getattr(self, name)
-            assert not param.requires_grad, (
-                f"{name} is trainable; fp8 quantization is only for FROZEN experts "
-                "(would strand optimizer/DDP references)"
-            )
-            w = param.data  # [E, O, I] bf16
-            E, O, I = w.shape
-            assert O % blk == 0 and I % blk == 0, f"{name} dims ({O},{I}) must be multiples of {blk} for blockwise fp8"
-            Ob, Ib = O // blk, I // blk
-            w_fp8 = torch.empty(E, O, I, dtype=torch.float8_e4m3fn, device=w.device)
-            scale = torch.empty(E, Ob, Ib, dtype=torch.float32, device=w.device)
-            for e in range(E):  # bound the fp32 transient to one expert
-                we = w[e].float().reshape(Ob, blk, Ib, blk)  # ~one-expert fp32
-                amax = we.abs().amax(dim=(1, 3)).clamp_(min=1e-8)  # [Ob, Ib]
-                se = amax / self._FP8_E4M3_MAX
-                w_fp8[e] = (
-                    (we / se[:, None, :, None])
-                    .clamp_(-self._FP8_E4M3_MAX, self._FP8_E4M3_MAX)
-                    .to(torch.float8_e4m3fn)
-                    .reshape(O, I)
-                )
-                scale[e] = se
-                del we, amax, se
-            delattr(self, name)  # drop the bf16 Parameter
-            self.register_buffer(f"{name}_fp8", w_fp8, persistent=False)
-            self.register_buffer(f"{name}_scale", scale, persistent=False)
-            del w
-        self._experts_fp8 = True
-
     def _expert_matmul(self, x, name, idx):
-        """y = x @ W_idx^T for a FROZEN expert, without retaining the bf16 weight.
-
-        The 16k OOM root cause: a plain `F.linear(x, dequant(W_fp8))` saves the
-        dequantized bf16 weight for autograd, and under whole-layer activation
-        recompute EVERY active expert's bf16 weight is held through the layer
-        backward (~32 experts, the ~2GB overflow). This custom Function saves only
-        the resident fp8 buffers (no extra memory) and re-dequantizes a single
-        expert transiently inside forward AND backward — so no bf16 weight is ever
-        retained. Weights stay fp8-precision (matches sglang's fp8 rollout); the
-        matmul is bf16 (no fp8-gradient noise). For non-quantized params, plain
-        F.linear."""
-        if not getattr(self, "_experts_fp8", False):
-            return F.linear(x, getattr(self, name)[idx])
-        return _FrozenFp8ExpertLinear.apply(
-            x,
-            getattr(self, f"{name}_fp8")[idx],
-            getattr(self, f"{name}_scale")[idx],
-            self._FP8_BLOCK,
-        )
+        """Apply one frozen expert, unpacking packed MXFP4 weights transiently."""
+        if getattr(self, "_experts_fp4", False):
+            return _FrozenFp4ExpertLinear.apply(
+                x,
+                getattr(self, f"{name}_fp4")[idx],
+                getattr(self, f"{name}_sf")[idx],
+            )
+        return F.linear(x, getattr(self, name)[idx])
 
     def _expert_weight(self, name, idx):
-        """Return expert `idx`'s [O, I] weight in bf16, dequantizing on the fly
-        when the frozen experts are stored in blockwise fp8.
-
-        MEMORY-CRITICAL: this runs inside the activation-checkpoint recompute, and
-        with whole-layer recompute EVERY active expert's dequantized weight is
-        retained until the layer's backward completes (~32 experts/layer). Dequant
-        entirely in bf16 (not fp32) to keep that retained footprint ~half — the
-        fp32 path OOM'd the ctx-16k backward by ~1.7GB (2026-07-05). The bf16
-        multiply differs from an fp32 multiply by ~1e-3 (codex finding 5), which is
-        negligible for frozen fp8-precision inference weights. Block-broadcast the
-        scale via a reshaped view (no full [O,I] scale materialization)."""
-        if not getattr(self, "_experts_fp8", False):
-            return getattr(self, name)[idx]
-        blk = self._FP8_BLOCK
-        w = getattr(self, f"{name}_fp8")[idx].to(torch.bfloat16)  # [O, I]
-        O, I = w.shape
-        s = getattr(self, f"{name}_scale")[idx].to(torch.bfloat16)  # [Ob, Ib]
-        wb = w.view(O // blk, blk, I // blk, blk) * s[:, None, :, None]
-        return wb.reshape(O, I)
+        """Return expert ``idx``'s weight, unpacking packed MXFP4 on demand."""
+        if getattr(self, "_experts_fp4", False):
+            return _unpack_mxfp4(getattr(self, f"{name}_fp4")[idx], getattr(self, f"{name}_sf")[idx])
+        return getattr(self, name)[idx]
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         if self.expert_model_parallel_size > 1:
@@ -575,10 +467,8 @@ class V4GroupedExperts(nn.Module):
                 f"tokens_per_expert has {tokens_per_expert.numel()} entries, expected "
                 f"{self.num_experts} local experts"
             )
-        # Count validation up front so BOTH the fp8 fast path and the bf16 loop are
-        # guarded (codex review 2026-07-05, items 1/5): reject negatives, require the
-        # counts to sum to the token rows, and short-circuit an empty batch (the fp8
-        # path would otherwise call deep_gemm on 0 rows).
+        # Reject negatives, require counts to sum to the token rows, and handle an
+        # empty dispatcher batch without entering any expert loop.
         if (tokens_per_expert < 0).any():
             raise ValueError(f"tokens_per_expert has a negative entry: {tokens_per_expert.tolist()}")
         total = int(tokens_per_expert.sum().item())
@@ -586,27 +476,6 @@ class V4GroupedExperts(nn.Module):
             raise ValueError(f"tokens_per_expert sums to {total}, but hidden_states has {hidden_states.shape[0]} rows")
         if hidden_states.shape[0] == 0:
             return torch.empty_like(hidden_states)
-        # FP8 grouped-GEMM path (V4_FP8_EXPERT_GEMM, default on when experts are
-        # fp8-stored + on GPU): compute the two expert matmuls in fp8 via deep_gemm
-        # — the SAME kernel sglang serves these experts with — so the train forward
-        # matches the rollout forward (minimizes train_rollout_logprob_abs_diff),
-        # and no bf16 weight is materialized (fits ctx-16k). Falls back to the
-        # per-expert bf16 loop below on CPU / non-fp8 (tests, EP=1 smokes).
-        if (
-            getattr(self, "_experts_fp8", False)
-            and hidden_states.is_cuda
-            and os.environ.get("V4_FP8_EXPERT_GEMM", "1") == "1"
-        ):
-            gate_up = _Fp8GroupedExpertMatmul.apply(
-                hidden_states, self.gate_up_proj_fp8, self.gate_up_proj_scale, tokens_per_expert, self._FP8_BLOCK
-            )
-            current = self._apply_gate(gate_up)
-            out = _Fp8GroupedExpertMatmul.apply(
-                current, self.down_proj_fp8, self.down_proj_scale, tokens_per_expert, self._FP8_BLOCK
-            )
-            if permuted_probs is not None:
-                out = out * permuted_probs[:, None]
-            return out.to(hidden_states.dtype)
         output = torch.empty_like(hidden_states)
         offset = 0
         for local_expert_idx, count_tensor in enumerate(tokens_per_expert):
@@ -630,16 +499,47 @@ class V4GroupedExperts(nn.Module):
             )
         return output
 
+    def verify_fp4_loaded(self):
+        """Post-load sanity for the packed mode. Rejects ANY invalid scale byte,
+        not just floods (codex review 2026-07-16, finding 9): 0x00 decodes to
+        2^-127 (an unpopulated zero-init buffer OR a nonsensical weight scale —
+        the official checkpoint contains zero 0x00 scale bytes), and 0xFF is NaN
+        in E8M0 — a single one poisons 32 consecutive weights with NaN/Inf."""
+        assert getattr(self, "_experts_fp4", False), "verify_fp4_loaded requires packed-MXFP4 mode"
+        for name in ("gate_up_proj", "down_proj"):
+            sf = getattr(self, f"{name}_sf")
+            n_zero = int((sf == 0x00).sum())
+            n_nan = int((sf == 0xFF).sum())
+            if n_zero or n_nan:
+                raise RuntimeError(
+                    f"packed-MXFP4 {name}_sf has invalid E8M0 scale bytes: "
+                    f"{n_zero} x 0x00 (unpopulated buffer / wrong checkpoint family) and "
+                    f"{n_nan} x 0xFF (NaN scale) out of {sf.numel()} — refusing to train"
+                )
+
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Shard grouped expert tensors on the global expert axis for EP conversion."""
         del metadata
-        # Once the frozen experts are quantized to fp8 (post-load), the bf16
-        # Parameters no longer exist. sharded_state_dict is only reached again for
-        # SAVES, and V4 saves are adapter-only (trainable params) — the frozen
-        # experts are never saved — so returning {} here is correct. The LOAD path
-        # always runs before quantization (bf16 params present), so it is unaffected.
-        if getattr(self, "_experts_fp8", False):
-            return {}
+        expert_dp_rank = self.expert_data_parallel_group.rank() if self.expert_data_parallel_group is not None else 0
+        replica_id = (0, 0, expert_dp_rank)
+        # Packed-MXFP4 mode: torch_dist carries the packed uint8 tensors verbatim.
+        # These entries serve the LOAD path (and conversion-time SAVE); adapter-only
+        # training saves filter to requires_grad adapter keys, so the packed buffers
+        # never leak into adapter checkpoints.
+        if getattr(self, "_experts_fp4", False):
+            prepend_axis_num = len(sharded_offsets)
+            ep_offset = (prepend_axis_num, self.expert_model_parallel_rank, self.expert_model_parallel_size)
+            return {
+                f"{prefix}{name}": ShardedTensor.from_rank_offsets(
+                    f"{prefix}{name}",
+                    getattr(self, name),
+                    *sharded_offsets,
+                    ep_offset,
+                    replica_id=replica_id,
+                    prepend_axis_num=prepend_axis_num,
+                )
+                for name in ("gate_up_proj_fp4", "gate_up_proj_sf", "down_proj_fp4", "down_proj_sf")
+            }
         prepend_axis_num = len(sharded_offsets)
         ep_offset = (prepend_axis_num, self.expert_model_parallel_rank, self.expert_model_parallel_size)
         return {
@@ -648,6 +548,7 @@ class V4GroupedExperts(nn.Module):
                 self.gate_up_proj,
                 *sharded_offsets,
                 ep_offset,
+                replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
             ),
             f"{prefix}down_proj": ShardedTensor.from_rank_offsets(
@@ -655,6 +556,7 @@ class V4GroupedExperts(nn.Module):
                 self.down_proj,
                 *sharded_offsets,
                 ep_offset,
+                replica_id=replica_id,
                 prepend_axis_num=prepend_axis_num,
             ),
         }
@@ -665,6 +567,7 @@ class V4SharedExpertMLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
+        self._checkpoint_config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=config.mlp_bias)
@@ -677,32 +580,18 @@ class V4SharedExpertMLP(nn.Module):
         # on any token whose shared gate/up exceeds +-limit. Same clamp as the routed
         # V4GroupedExperts._apply_gate, applied in bf16.
         self.limit = config.swiglu_limit
-        self._FP8_BLOCK = 128
 
     def _act(self, gate, up):
         gate = _clamp(gate, max=self.limit)
         up = _clamp(up, min=-self.limit, max=self.limit)
-        return self.act_fn(gate) * up
-
-    def quantize_fp8(self):
-        """fp8-quantize the 3 frozen dense linears (V4_FP8_SHARED_EXPERT=1). Runs on
-        every token, fp8 on disk + served fp8 by sglang -> fp8 compute here matches
-        the rollout. Idempotent. Bias (if any) stays bf16 and is added in forward."""
-        if getattr(self, "_fp8", False):
-            return
-        for lin in (self.gate_proj, self.up_proj, self.down_proj):
-            _quantize_linear_fp8(lin, self._FP8_BLOCK)
-        self._fp8 = True
-
-    def _lin(self, linear, x):
-        if getattr(linear, "_fp8", False):
-            y = _FrozenFp8DenseLinear.apply(x, linear.weight_fp8, linear.weight_scale, self._FP8_BLOCK)
-            return y if linear.bias is None else y + linear.bias
-        return linear(x)
+        assert self._checkpoint_config.hidden_act == "silu", (
+            "DS-V4 shared-expert alignment requires hidden_act='silu'; " f"got {self._checkpoint_config.hidden_act!r}"
+        )
+        # Match sglang's silu_and_mul_clamp boundary: compute SiLU and the
+        # product in fp32, then round to bf16 once.
+        return (self.act_fn(gate.float()) * up.float()).to(gate.dtype)
 
     def forward(self, x):
-        if getattr(self, "_fp8", False):
-            return self._lin(self.down_proj, self._act(self._lin(self.gate_proj, x), self._lin(self.up_proj, x)))
         return self.down_proj(self._act(self.gate_proj(x), self.up_proj(x)))
 
 
@@ -723,16 +612,29 @@ class V4MoELayer(nn.Module):
         expert_model_parallel_rank=0,
         mcore_config: TransformerConfig | None = None,
         pg_collection=None,
+        mlp_type_override: str | None = None,
+        enable_routing_replay: bool = True,
     ):
         super().__init__()
-        self.is_hash = config.mlp_layer_types[layer_idx] == "hash_moe"
+        # ``mlp_type_override`` decouples the router kind from ``config.mlp_layer_types``:
+        # the V4 MTP head's FFN is a learned top-k MoE (its ``mtp.0.ffn.gate`` has a
+        # correction ``bias`` and NO ``tid2eid``), so it is built with "moe" regardless
+        # of what the layer-0 schedule says.  ``enable_routing_replay=False`` keeps the
+        # MTP router live (see V4TopKRouter).
+        mlp_type = mlp_type_override if mlp_type_override is not None else config.mlp_layer_types[layer_idx]
+        self.is_hash = mlp_type == "hash_moe"
         self.num_global_experts = config.num_local_experts
         self.mcore_config = mcore_config
-        self.gate = V4HashRouter(config) if self.is_hash else V4TopKRouter(config)
+        self.gate = (
+            V4HashRouter(config) if self.is_hash else V4TopKRouter(config, enable_routing_replay=enable_routing_replay)
+        )
         self.experts = V4GroupedExperts(
             config,
             expert_model_parallel_size=expert_model_parallel_size,
             expert_model_parallel_rank=expert_model_parallel_rank,
+            expert_data_parallel_group=(
+                getattr(pg_collection, "expt_dp", None) if pg_collection is not None else None
+            ),
         )
         self.shared_experts = V4SharedExpertMLP(config)
         self.token_dispatcher = self._build_token_dispatcher(mcore_config, pg_collection)
@@ -803,6 +705,33 @@ class V4MoELayer(nn.Module):
         return routed + self.shared_experts(residual)
 
 
+# --- Fixed fp32 mHC post/comb combine (T5 probe S6/§5) -------------------------
+#
+# handoffs/deepseek-v4/t5_mhc_probe.md §S6: the dominant mHC train<->serve seam is THIS
+# glue — casting post/comb to bf16 and materializing two bf16 terms flips 43-48% of
+# output bytes (~3.3e-3 rel) vs sglang's stock mhc_post_tilelang, which keeps the
+# coefficients fp32, forms c*d + sum_k a[k,j]*b[k,h] in fp32, and does ONE bf16 store.
+# The combine reproduces that schedule with plain torch
+# ops (fp32 coefficients, fp32 multiply/matmul/add, single final cast): bit-identical
+# (n=1) / <=4e-5 bytediff (cuBLAS batched-matmul order residue) to stock serving AND
+# more accurate vs an fp64 oracle (rel-err ~2.9e-3 -> ~1.7e-3).  Backward is plain
+# autograd through the fp32 ops (LoRA adapter grads flow through attn/mlp output;
+# hidden-stream grads through the matmul). The trainer-side fp32 schedule is
+# the sole supported alignment direction.
+
+
+def _v4_hc_post_combine(post, comb, branch_output, hidden_states, dtype):
+    """One mHC post/comb combine site of ``V4DecoderLayer.forward`` (attn or ffn).
+
+    Coefficients and the combine stay fp32 until one final ``dtype`` cast,
+    matching sglang's stock ``mhc_post``.
+    """
+    return (
+        post.float().unsqueeze(-1) * branch_output.float().unsqueeze(-2)
+        + torch.matmul(comb.float().transpose(-1, -2), hidden_states.float())
+    ).to(dtype)
+
+
 # ======================================================================================
 # Decoder layer: the M1-validated V4DecoderLayer math, with the custom V4MoELayer.
 # ======================================================================================
@@ -821,10 +750,13 @@ class V4DecoderLayer(nn.Module):
         expert_model_parallel_rank=0,
         mcore_config: TransformerConfig | None = None,
         pg_collection=None,
+        attn_layer_type: str | None = None,
+        mlp_type: str | None = None,
+        enable_routing_replay: bool = True,
     ):
         super().__init__()
         self.layer_idx = layer_idx
-        self.self_attn = V4Attention(config, layer_idx)
+        self.self_attn = V4Attention(config, layer_idx, layer_type_override=attn_layer_type)
         self.mlp = V4MoELayer(
             config,
             layer_idx,
@@ -832,6 +764,8 @@ class V4DecoderLayer(nn.Module):
             expert_model_parallel_rank=expert_model_parallel_rank,
             mcore_config=mcore_config,
             pg_collection=pg_collection,
+            mlp_type_override=mlp_type,
+            enable_routing_replay=enable_routing_replay,
         )
         self.input_layernorm = V4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = V4RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -840,28 +774,13 @@ class V4DecoderLayer(nn.Module):
 
     def forward(self, hidden_states, position_embeddings, input_ids):
         dtype = hidden_states.dtype
-        # mHC "mixing oracle" (DeepSeek-V4 RL recipe): the Sinkhorn-derived mixing
-        # matrix `comb` and output gate `post` are used forward-only and detached in
-        # the backward, so gradients do NOT propagate through the numerically-fragile
-        # 20-iteration Sinkhorn VJP (the source of the first-backward grad NaN). The
-        # residual-stream gradient still flows via `comb.T @ hidden_states` (constant
-        # comb) and cross-layer gradient still flows via the differentiable `collapsed`
-        # sublayer input. Ref: LMSYS "DeepSeek-V4 Day-0 RL" — freeze Sinkhorn in mHC.
         post, comb, collapsed = self.attn_hc(hidden_states)
-        if _MHC_MIXING_ORACLE:
-            post, comb = post.detach(), comb.detach()
         attn_output = self.self_attn(self.input_layernorm(collapsed), position_embeddings)
-        hidden_states = post.to(dtype).unsqueeze(-1) * attn_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        hidden_states = _v4_hc_post_combine(post, comb, attn_output, hidden_states, dtype)
 
         post, comb, collapsed = self.ffn_hc(hidden_states)
-        if _MHC_MIXING_ORACLE:
-            post, comb = post.detach(), comb.detach()
         mlp_output = self.mlp(self.post_attention_layernorm(collapsed), input_ids=input_ids)
-        hidden_states = post.to(dtype).unsqueeze(-1) * mlp_output.unsqueeze(-2) + torch.matmul(
-            comb.to(dtype).transpose(-1, -2), hidden_states
-        )
+        hidden_states = _v4_hc_post_combine(post, comb, mlp_output, hidden_states, dtype)
         return hidden_states
 
 
@@ -888,11 +807,16 @@ class V4LanguageModel(LanguageModule):
         layer_ids: list[int] | tuple[int, ...] | None = None,
         expert_model_parallel_size=1,
         expert_model_parallel_rank=0,
+        enable_mtp: bool | None = None,
     ):
         super().__init__(config=config)
         self.hf_config = hf_config
         self.pre_process = pre_process
         self.post_process = post_process
+        # MTP head gate (off by default; None -> False). Built ONLY on the last PP
+        # stage (post_process) — it consumes the pre-collapse hc stream + the shared
+        # output head, both of which live there.
+        self.enable_mtp = bool(enable_mtp)
         self.layer_ids = tuple(range(hf_config.num_hidden_layers) if layer_ids is None else layer_ids)
         self.expert_model_parallel_size = int(expert_model_parallel_size)
         self.expert_model_parallel_rank = int(expert_model_parallel_rank)
@@ -912,7 +836,15 @@ class V4LanguageModel(LanguageModule):
         # recomputing it locally from position_ids is cheaper and deterministic.
         self.rotary_emb = DeepseekV4RotaryEmbedding(hf_config)
 
-        if self.pre_process:
+        # The MTP head (last PP stage) needs the SHARED embedding to embed its rolled
+        # input_ids.  At PP=1 the first==last stage already builds it; at PP>1 the last
+        # stage must build its own copy (Megatron builds the embedding on every
+        # ``mtp_process`` stage, multi_token_prediction path).  V4's embedding is FROZEN
+        # (LoRA touches attention only), so this copy stays byte-identical to the
+        # first-stage embedding via the checkpoint load — no grad-tie/all-reduce needed
+        # (unlike Megatron's trainable tied embedding).
+        self._build_embedding = _v4_stage_builds_embedding(self.pre_process, self.post_process, self.enable_mtp)
+        if self._build_embedding:
             # VocabParallelEmbedding; at TP=1 this is a plain replicated nn.Embedding.
             self.embedding = LanguageModelEmbedding(
                 config=config,
@@ -954,8 +886,46 @@ class V4LanguageModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
+            # V4 MTP head (gated). Lives on the last PP stage: it consumes the
+            # pre-collapse hc stream produced here and the shared output_layer.
+            self.mtp = None
+            if self.enable_mtp:
+                from .mtp import V4MultiTokenPredictionLayer
+
+                self.mtp = V4MultiTokenPredictionLayer(
+                    hf_config,
+                    expert_model_parallel_size=self.expert_model_parallel_size,
+                    expert_model_parallel_rank=self.expert_model_parallel_rank,
+                    mcore_config=config,
+                    pg_collection=self.pg_collection,
+                )
+        else:
+            self.mtp = None
+
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
+
+    def setup_embeddings_and_output_layer(self):
+        """V4 override: tag the standard param attributes, skip the tied-embedding tie.
+
+        Setting ``config.mtp_num_layers=1`` (so Megatron's schedule sets the MTP loss
+        scale) makes the base ``LanguageModule.setup_embeddings_and_output_layer`` run
+        the *tied*-embedding machinery (zero + all-reduce a duplicated embedding across
+        the embedding group, using ``self.vp_stage`` / a configured embd group).  That
+        is wrong for V4: its embedding and output head are UNTIED
+        (``share_embeddings_and_output_weights=False``) and FROZEN (LoRA touches
+        attention only).  The MTP head's last-stage embedding copy is byte-identical to
+        the first-stage embedding because BOTH are loaded from the same checkpoint tensor
+        (``embed.weight``) and never change, so no grad-tie/all-reduce is needed
+        (``finalize_model_grads`` word-embedding all-reduce is itself a no-op on the
+        frozen grads).  We therefore replicate only the base method's safe attribute
+        tagging and skip the tie.  (PP>1 correctness rests on the frozen + same-checkpoint
+        invariant; a multi-rank smoke is the remaining validation.)
+        """
+        if getattr(self, "_build_embedding", False) and hasattr(self, "embedding"):
+            self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
+        if self.post_process and self.output_layer.weight is not None:
+            self.output_layer.weight.is_embedding_or_output_parameter = True
 
     def set_input_tensor(self, input_tensor):
         """PP plumbing. At PP=1 this is never used (pre_process and post_process True)."""
@@ -993,6 +963,42 @@ class V4LanguageModel(LanguageModule):
                 f"{prefix}layers.{global_idx}.mlp.experts.",
             )
             state.update(expert_state)
+
+        # MTP head experts (last PP stage): the same EP-sharding treatment as the main
+        # layers.  ``V4GroupedExperts`` is a plain ``nn.Module``, so the default
+        # ``super().sharded_state_dict`` recursion does NOT invoke its custom
+        # (EP-aware) ``sharded_state_dict``; call it explicitly and overwrite the plain
+        # entries.  No layer-id remap (the MTP head has a fixed ``mtp.*`` namespace).
+        # Post-fp8-quantization this returns {} (adapter-only saves), matching the main
+        # layers.  Only needed for EP>1 torch_dist conversion/load.
+        if self.mtp is not None:
+            mtp_expert_prefix = f"{prefix}mtp.transformer_layer.mlp.experts."
+            mtp_expert_state = self.mtp.transformer_layer.mlp.experts.sharded_state_dict(
+                mtp_expert_prefix, sharded_offsets, metadata
+            )
+            state.update(mtp_expert_state)
+
+        # PP>1 MTP: the last-stage embedding is a DUPLICATE of the first-stage embedding
+        # (both frozen, both loaded from the same ``embed.weight``).  Megatron's default
+        # tags every ``embedding.word_embeddings.weight`` shard as the MAIN replica
+        # ``(0, 0, dp)``; two main copies of the same key make dist-checkpoint validation
+        # reject overlapping main shards.  Retag the duplicate (non-first-stage) copy as a
+        # non-main replica, exactly like Megatron's MTP embedding tie
+        # (``tie_word_embeddings_state_dict``).  At PP=1 ``pre_process`` is True so the
+        # embedding stays the legitimate main copy and this is skipped.
+        if self._build_embedding and not self.pre_process:
+            emb_key = f"{prefix}embedding.word_embeddings.weight"
+            if emb_key in state and torch.distributed.is_initialized():
+                from megatron.core import parallel_state
+                from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
+
+                tie_word_embeddings_state_dict(
+                    state,
+                    self.embedding.word_embeddings.weight,
+                    emb_key,
+                    self.pg_collection.tp,
+                    parallel_state.get_data_parallel_group(with_context_parallel=True),
+                )
         return state
 
     def restore_fp32_modules(self):
@@ -1020,6 +1026,15 @@ class V4LanguageModel(LanguageModule):
                 gate.e_score_correction_bias.data = gate.e_score_correction_bias.data.float()
         if self.post_process:
             self.hc_head.float()  # local choice (see docstring), not HF-strict
+        # The MTP head has the same fp32-kept sites: its transformer layer's two mHC
+        # sites, its top-k router correction bias, and its own hc_head collapse.
+        if self.mtp is not None:
+            self.mtp.transformer_layer.attn_hc.float()
+            self.mtp.transformer_layer.ffn_hc.float()
+            mtp_gate = self.mtp.transformer_layer.mlp.gate
+            if hasattr(mtp_gate, "e_score_correction_bias"):
+                mtp_gate.e_score_correction_bias.data = mtp_gate.e_score_correction_bias.data.float()
+            self.mtp.hc_head.float()
         return self
 
     def bfloat16(self):
@@ -1038,11 +1053,19 @@ class V4LanguageModel(LanguageModule):
         emb = self.embedding(input_ids=input_ids, position_ids=position_ids)  # [S,B,H]
         return emb.transpose(0, 1).contiguous()  # [B,S,H]
 
-    def _position_embeddings(self, x, position_ids):
-        return {
+    def _position_embeddings(self, x, position_ids, *, haloed_position_ids=None):
+        emb = {
             "main": self.rotary_emb(x, position_ids=position_ids, layer_type="main"),
             "compress": self.rotary_emb(x, position_ids=position_ids, layer_type="compress"),
         }
+        # CP2: cos/sin for the halo'd raw-KV axis [global_start-halo, global_start+l_local).
+        # Built once per stage (halo width + global_start are per-rank constants); the
+        # attention module picks the "*_haloed" entry for its k_raw RoPE on rank>0.  x is
+        # used only for dtype/device, so the longer haloed length comes from position_ids.
+        if haloed_position_ids is not None:
+            emb["main_haloed"] = self.rotary_emb(x, position_ids=haloed_position_ids, layer_type="main")
+            emb["compress_haloed"] = self.rotary_emb(x, position_ids=haloed_position_ids, layer_type="compress")
+        return emb
 
     def forward(
         self,
@@ -1053,6 +1076,7 @@ class V4LanguageModel(LanguageModule):
         labels=None,
         packed_seq_params=None,
         loss_mask=None,
+        mtp_kwargs=None,
         **kwargs,
     ):
         """GPTModel-compatible forward.
@@ -1087,12 +1111,42 @@ class V4LanguageModel(LanguageModule):
                 "the per-document THD path is a documented deferred item."
             )
         B, S = input_ids.shape
+        cp_info = get_cp_info()
+        haloed_position_ids = None
+        if cp_info.enabled and position_ids is not None:
+            # Under CP the model owns synthesizing GLOBAL positions for its contiguous
+            # shard (slime always passes position_ids=None); an externally supplied
+            # position_ids would be inconsistent with the halo'd raw-KV axis this stage
+            # builds, so hard-fail rather than silently mix local/global frames.
+            raise ValueError(
+                "V4LanguageModel context parallelism requires position_ids=None so the "
+                "model can synthesize global positions for its contiguous shard; got an "
+                "explicit position_ids."
+            )
         if position_ids is None:
-            position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
+            if cp_info.enabled:
+                # CP2: this rank owns the contiguous slice [rank*l_local, (rank+1)*l_local),
+                # so synthesize GLOBAL positions -- RoPE and the compressed causal threshold
+                # ((w+1)*m <= qpos+1) must see absolute positions.  The halo'd raw-KV axis
+                # also needs cos/sin down to global_start-halo (rank>0) for the exchanged
+                # boundary rows; build those "*_haloed" once per stage.
+                assert_local_len_aligned(S, cp_info)
+                global_start = cp_info.global_start(S)
+                position_ids = (global_start + torch.arange(S, device=input_ids.device)).unsqueeze(0).expand(B, -1)
+                if cp_info.rank > 0:
+                    haloed_position_ids = (
+                        (global_start - CP_HALO + torch.arange(CP_HALO + S, device=input_ids.device))
+                        .unsqueeze(0)
+                        .expand(B, -1)
+                    )
+            else:
+                position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, -1)
 
         if self.pre_process:
             inputs_embeds = self._embed(input_ids, position_ids)
-            position_embeddings = self._position_embeddings(inputs_embeds, position_ids)
+            position_embeddings = self._position_embeddings(
+                inputs_embeds, position_ids, haloed_position_ids=haloed_position_ids
+            )
             # [B, S, hc_mult, hidden] parallel-stream stack (HF:1292).
             hidden_states = inputs_embeds.unsqueeze(2).expand(-1, -1, self.hf_config.hc_mult, -1).contiguous()
         else:
@@ -1101,26 +1155,36 @@ class V4LanguageModel(LanguageModule):
             if hidden_states is None:
                 raise ValueError("V4LanguageModel PP stage received no input_tensor")
             rotary_input = hidden_states[..., 0, :] if hidden_states.ndim == 4 else hidden_states
-            position_embeddings = self._position_embeddings(rotary_input, position_ids)
+            position_embeddings = self._position_embeddings(
+                rotary_input, position_ids, haloed_position_ids=haloed_position_ids
+            )
 
-        # Activation checkpointing (V4_ACT_CKPT=1): recompute each decoder layer
-        # in the backward instead of storing activations. Megatron's --recompute-*
-        # is a no-op for this custom loop; without this, 1F1B keeps pp_size
+        # Activation checkpointing: recompute decoder-layer segments in the
+        # backward instead of storing their internal activations.
+        # ``config.recompute_num_layers`` controls the number of consecutive layers
+        # in each segment (Megatron uniform semantics). v4_model_provider derives
+        # this directly from Megatron's --recompute-granularity=full. Without it,
+        # 1F1B keeps pp_size
         # microbatches of full-layer activations in flight and the train backward
         # OOMs at real scale (stage-0 OOM, ctx 8192 x 32 microbatches, 2026-07-05).
         # Compatible with rollout routing replay BY DESIGN: the recompute pass
         # runs under ROUTING_REPLAY_STAGE=replay_backward, which pops from the
         # separate backward_index (slime/utils/routing_replay.py). Only active
         # when grads are enabled, so the log-prob forward_only path is unchanged.
-        use_act_ckpt = os.environ.get("V4_ACT_CKPT", "0") == "1" and self.training and torch.is_grad_enabled()
-        # use_reentrant: False (default) is the modern API but has a known peak-
-        # memory bug where per-segment recompute activations are NOT freed across
-        # the stage backward (pytorch#147449; "does not work well with DDP") — at
-        # ctx-16k this accumulates ~4.4GB/layer -> OOM (measured per-layer). The
-        # reentrant variant runs a nested backward per segment and frees each
-        # layer's recompute immediately. V4_ACT_CKPT_REENTRANT=1 selects it.
-        _reentrant = os.environ.get("V4_ACT_CKPT_REENTRANT", "1") == "1"
-        if use_act_ckpt and _reentrant and self.pre_process and not hidden_states.requires_grad:
+        use_act_ckpt = (
+            getattr(self.config, "recompute_granularity", None) == "full" and self.training and torch.is_grad_enabled()
+        )
+        # use_reentrant: at ctx-16k the stage backward once accumulated
+        # ~4.4GB/layer of held recompute transients -> OOM under
+        # use_reentrant=False (pytorch#147449 class); switching to the reentrant
+        # variant (nested backward per segment, immediate free) fixed the real
+        # system. NOTE 2026-07-09: an isolated single-process repro
+        # (scripts/dsv4/diagnostics/parity/test_act_ckpt_reentrant_memory.py) shows BOTH modes free
+        # per-segment on torch 2.11 with any kernel impl (ours/torch/official
+        # TileKernels) — the production accumulation needs full-stack
+        # ingredients (1F1B in-flight microbatches / Megatron DDP main-grad
+        # buffers), so reentrant is the sole validated production behavior.
+        if use_act_ckpt and self.pre_process and not hidden_states.requires_grad:
             # Reentrant checkpoint requires >=1 input to require grad, else it does
             # NOT attach to autograd and the backward recompute is silently skipped
             # -> zero LoRA gradients on the FIRST PP stage (its input comes from the
@@ -1129,32 +1193,135 @@ class V4LanguageModel(LanguageModule):
             # 2026-07-05; mirrors Megatron Bridge's PEFT recompute-input patch). The
             # gradient w.r.t. this input is computed then discarded (embeddings frozen).
             hidden_states.requires_grad_(True)
-        for layer in self.layers:
-            if use_act_ckpt:
-                hidden_states = torch.utils.checkpoint.checkpoint(
-                    layer, hidden_states, position_embeddings, input_ids, use_reentrant=_reentrant
-                )
-            else:
-                hidden_states = layer(hidden_states, position_embeddings, input_ids)
+        recompute_method = getattr(self.config, "recompute_method", None)
+        if use_act_ckpt and recompute_method not in (None, "uniform", "block"):
+            raise ValueError(
+                "V4 full activation recompute supports recompute_method 'uniform' or "
+                f"'block'; got {recompute_method!r}"
+            )
+        recompute_num_layers = getattr(self.config, "recompute_num_layers", None)
+        if recompute_num_layers is None:
+            recompute_num_layers = 1
+        hidden_states = _forward_v4_decoder_layers(
+            self.layers,
+            hidden_states,
+            position_embeddings,
+            input_ids,
+            use_act_ckpt=use_act_ckpt,
+            recompute_num_layers=recompute_num_layers,
+            recompute_method=recompute_method or "uniform",
+            use_reentrant=True,
+        )
 
         if not self.post_process:
             return hidden_states  # the [B,S,hc,H] stream stack (PP, deferred)
 
-        # Collapse the hc streams (hc_head) then final norm (HF:1309).
-        hidden_states = self.norm(self.hc_head(hidden_states))  # [B,S,H]
+        # The pre-collapse hc stream [B,S,hc,H] is what the MTP head consumes (sglang
+        # NextN's ``spec_info.hidden_states`` == the main model's ``pre_hc_head``).
+        hc_stream = hidden_states
 
-        # output_layer wants [S,B,H]; returns [S,B,V].
-        hs_sbh = hidden_states.transpose(0, 1).contiguous()
-        logits, _ = self.output_layer(hs_sbh)  # [S,B,V]
-        logits = logits.float()
+        # Collapse the hc streams (hc_head) then final norm (HF:1309).
+        main_hidden = self.norm(self.hc_head(hc_stream))  # [B,S,H]
+
+        # MTP training loss (stock slime ``enable_mtp_training`` path: it passes
+        # ``mtp_kwargs={"mtp_labels": tokens}``).  Compute + log the MTP loss and seed
+        # its backward via MTPLossAutoScaler on ``main_hidden`` — so the main output
+        # logits returned below carry the MTP backward, and slime's external main-loss
+        # backward triggers it (the scheduler already set the MTP loss scale).  No-op
+        # unless the MTP head is built (gated) AND mtp_labels are supplied.
+        mtp_labels = (mtp_kwargs or {}).get("mtp_labels")
+        if self.mtp is not None and mtp_labels is not None:
+            main_hidden = self._apply_mtp_training_loss(
+                main_hidden=main_hidden,
+                hc_stream=hc_stream,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+                mtp_labels=mtp_labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+            )
+
+        logits = self._output_logits(main_hidden)  # [B,S,V] fp32
 
         if labels is None:
-            # [S,B,V] -> [B,S,V] (matches GPTModel's labels-None return contract).
-            return logits.transpose(0, 1).contiguous()
+            return logits  # matches GPTModel's labels-None return contract ([B,S,V])
 
         # labels path (not used by slime, which computes loss externally): [b,s] CE.
-        loss = self.compute_language_model_loss(labels, logits)
+        # compute_language_model_loss wants [S,B,V] logits.
+        loss = self.compute_language_model_loss(labels, logits.transpose(0, 1).contiguous())
         return loss
+
+    def _output_logits(self, hidden_bsh, weight=None):
+        """Shared output head: [B,S,H] -> fp32 logits [B,S,V].
+
+        output_layer (ColumnParallelLinear) wants [S,B,H] and returns [S,B,V]; cast to
+        fp32 and return [B,S,V] to match GPTModel's labels-None contract.  ``weight``
+        overrides the head weight (the MTP loss uses the DETACHED shared weight).
+        """
+        hs_sbh = hidden_bsh.transpose(0, 1).contiguous()  # [S,B,H]
+        logits, _ = self.output_layer(hs_sbh, weight=weight)  # [S,B,V]
+        return logits.float().transpose(0, 1).contiguous()  # [B,S,V]
+
+    def _apply_mtp_training_loss(
+        self,
+        *,
+        main_hidden,
+        hc_stream,
+        input_ids,
+        position_ids,
+        position_embeddings,
+        mtp_labels,
+        loss_mask,
+        packed_seq_params,
+    ):
+        """Run the MTP head + fold its loss into the tracker / backward (stock path).
+
+        Mirrors Megatron ``GPTModel.forward`` MTP postprocess: run the MTP layer over
+        the pre-collapse hc stream, compute the per-depth CE with the DETACHED shared
+        output head, log to ``MTPLossLoggingHelper``, and seed the backward via
+        ``MTPLossAutoScaler`` on ``main_hidden``.  Returns the wrapped ``main_hidden``.
+
+        MEMORY: this materializes the full MTP logits ``[B,S,V]`` (like V4's main logits,
+        which are also un-fused).  Megatron's ``fuse_linear_cross_entropy`` avoids that
+        extra ``[B,S,V]`` for the MTP loss; V4 does not use fused CE anywhere, so at
+        ctx-16k + large vocab the MTP loss adds ~one main-logits' worth of activation.
+        A fused linear-CE path for the MTP head is the follow-up memory optimization.
+        """
+        from megatron.core import parallel_state
+
+        from .mtp import apply_mtp_loss
+
+        mtp_hidden, _, _ = self.mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hc_stream,
+            position_embeddings=position_embeddings,
+            embedding=self._embed,
+        )
+        # DETACH the shared output weight: the MTP loss must not train the output head
+        # (Megatron detaches ``mtp_output_weight``); it trains the MTP head + main model.
+        detached_weight = self.output_layer.weight.detach()
+        avg_group = (
+            parallel_state.get_data_parallel_group(with_context_parallel=True)
+            if torch.distributed.is_initialized()
+            else None
+        )
+        return apply_mtp_loss(
+            mtp_hidden=mtp_hidden,
+            main_hidden=main_hidden,
+            mtp_labels=mtp_labels,
+            loss_mask=loss_mask,
+            output_logits_fn=lambda h: self._output_logits(h, weight=detached_weight),
+            ce_fn=lambda labels, logits_bsv: self.compute_language_model_loss(
+                labels, logits_bsv.transpose(0, 1).contiguous()
+            ),
+            config=self.config,
+            cp_group=getattr(self.pg_collection, "cp", None),
+            packed_seq_params=packed_seq_params,
+            training=self.training,
+            avg_group=avg_group,
+        )
 
 
 __all__ = [

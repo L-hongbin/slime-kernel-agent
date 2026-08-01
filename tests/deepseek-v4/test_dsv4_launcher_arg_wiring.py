@@ -1,4 +1,4 @@
-"""Static contract tests for the V4 gate launchers' argument wiring.
+"""Static contract tests for the DS-V4 gate launchers' argument wiring.
 
 The R6 full-loop NaN root cause was a launcher flag (``--rollout-temperature 0``)
 flowing into the train-side log-prob path — invisible to code-level unit tests
@@ -26,8 +26,12 @@ R6 = REPO / "scripts" / "dsv4" / "full_loop_smoke.sh"
 # extracted into this sourceable helper so it can be unit-tested in isolation;
 # the r6_text fixture reads both so these assertions still cover it.
 R6_TASK_ARGS = REPO / "scripts" / "dsv4" / "_dsv4_task_args.sh"
+R6_CLUSTER_LIB = REPO / "scripts" / "dsv4" / "_dsv4_cluster_lib.sh"
 R4 = REPO / "scripts" / "dsv4" / "rollout_smoke.sh"
 R3 = REPO / "scripts" / "dsv4" / "train_smoke.sh"
+T1 = REPO / "scripts" / "dsv4" / "run.t1.deepseek_v4_flash.rl.sh"
+FORMAL = REPO / "scripts" / "dsv4" / "run.deepseek_v4_flash.fp4.formal.rl.sh"
+ARGUMENTS = REPO / "slime" / "utils" / "arguments.py"
 ALL_LAUNCHERS = [R6, R4, R3]
 
 
@@ -82,11 +86,13 @@ def test_r6_train_actor_env_carries_pythonpath(r6_text):
         "R6 must pass --train-env-vars: Ray train actors need explicit env "
         "(raylet env is not inherited reliably in direct-driver mode)."
     )
-    m = re.search(r"TRAIN_ENV_VARS_JSON=\$\(python[^)]*?keys = \[(.*?)\]", r6_text, flags=re.S)
-    assert m, "R6 should build TRAIN_ENV_VARS_JSON from an explicit key list"
+    assert "TRAIN_ENV_VARS_JSON=$(dsv4_build_train_env_vars_json)" in r6_text
+    cluster_lib = R6_CLUSTER_LIB.read_text()
+    m = re.search(r"local -a core_keys=\((.*?)\n  \)", cluster_lib, flags=re.S)
+    assert m, "DS-V4 cluster helper should declare an explicit env key list"
     keys = m.group(1)
     for required in ["PYTHONPATH", "PATH", "NCCL_SOCKET_IFNAME", "NO_PROXY"]:
-        assert f'"{required}"' in keys, (
+        assert re.search(rf"^\s*{required}\s*$", keys, flags=re.M), (
             f"--train-env-vars must forward {required}: PYTHONPATH makes "
             "megatron.training importable in actors; the others keep NCCL/proxy sane."
         )
@@ -121,3 +127,51 @@ def test_smoke_prompt_data_satisfies_batch_sizes(r6_text):
             assert (
                 "input" in row and "label" in row
             ), f"{path.name} rows must have the launchers' --input-key/--label-key fields"
+
+
+def test_data_padding_and_sequence_mis_are_explicit_launcher_arguments():
+    full_loop = R6.read_text()
+    train_smoke = R3.read_text()
+    task_args = R6_TASK_ARGS.read_text()
+    t1 = T1.read_text()
+    formal = FORMAL.read_text()
+
+    assert "--data-pad-size-multiplier)" in full_loop
+    assert "--data-pad-size-multiplier)" in train_smoke
+    assert "--sequence-mis-config)" in full_loop
+    assert "${SEQUENCE_MIS_CONFIG:-$_seq_mis_default}" in task_args
+    assert '--sequence-mis-config "${T1_SEQUENCE_MIS_CONFIG}"' in t1
+    assert '--data-pad-size-multiplier "${FORMAL_DATA_PAD_SIZE_MULTIPLIER}"' in formal
+    assert '--sequence-mis-config "${FORMAL_SEQUENCE_MIS_CONFIG}"' in formal
+
+    combined = "\n".join((full_loop, train_smoke, task_args, t1, formal))
+    assert "V4_DATA_PAD_SIZE_MULTIPLIER" not in combined
+    assert "V4_SEQUENCE_MIS_CONFIG" not in combined
+
+
+def test_lora_config_is_registered_and_wired_as_cli_arguments():
+    arguments = ARGUMENTS.read_text()
+    full_loop = R6.read_text()
+    train_smoke = R3.read_text()
+    t1 = T1.read_text()
+    formal = FORMAL.read_text()
+    combined = "\n".join((full_loop, train_smoke, t1, formal))
+
+    for flag in (
+        "--lora-dim",
+        "--lora-alpha",
+        "--lora-dropout",
+        "--lora-rslora",
+        "--lora-plus-lambda",
+        "--dsv4-lora-shared-expert",
+        "--lora-adapter-resume-load",
+        "--lora-checkpoint-max-node-bytes",
+    ):
+        assert flag in arguments
+        assert flag in combined
+
+    assert re.search(r"\bV4_LORA_", combined) is None
+    assert "V4_RUNTIME" not in combined
+    assert '--lora-dim "${FORMAL_LORA_DIM}"' in formal
+    assert "--lora-rslora" in formal
+    assert "--dsv4-lora-shared-expert" in formal

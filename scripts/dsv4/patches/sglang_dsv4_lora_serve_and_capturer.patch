@@ -1,0 +1,1185 @@
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index f57486e..dbba5b3 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -249,6 +249,16 @@ class DSV4AttnMetadata:
+             compute_page_indices=True,
+         )
+ 
++        # Same pad-row hazard as c4_sparse_page_indices: rows whose raw c128
++        # length is 0 (cuda-graph pad rows, seqs shorter than the compress
++        # window) keep -1 page indices while c128_topk_lengths_clamp1 says 1 —
++        # FlashMLA then dereferences page -1 inside the replayed graph. Pin
++        # column 0 to the valid dummy page 0 ONLY where it was never written
++        # (elementwise, graph-capture safe; real rows keep their indices).
++        _c128_col0 = self.c128_page_indices[:, 0]
++        self.c128_page_indices[:, 0] = torch.where(
++            _c128_col0 < 0, torch.zeros_like(_c128_col0), _c128_col0
++        )
+         self.c128_page_indices = _pad_last_dim(self.c128_page_indices)
+         self.swa_page_indices = _pad_last_dim(self.swa_page_indices)
+ 
+@@ -319,6 +329,14 @@ class DSV4AttnMetadata:
+             dtype=torch.int32,
+             device=self.c4_topk_lengths_clamp1.device,
+         )
++        # CUDA-graph pad rows (and any row with raw c4 length 0) never get their
++        # page indices written by the indexer scatter, yet their FlashMLA length
++        # is clamped to >=1 (c4_topk_lengths_clamp1). length=1 + page=-1 makes the
++        # sparse-fp8 splitkv decode kernel read an invalid page -> illegal memory
++        # access (seen under LoRA, which forces the monolithic graph path). Pin
++        # column 0 to the valid dummy page 0: every REAL row (length>=1)
++        # overwrites it; only never-written rows keep the safe dummy.
++        self.c4_sparse_page_indices[:, 0] = 0
+         self.c4_sparse_page_indices = _pad_last_dim(self.c4_sparse_page_indices)
+         if is_prefill:
+             self.c4_sparse_raw_indices = torch.empty_like(self.c4_sparse_page_indices)
+diff --git a/python/sglang/srt/layers/attention/dsv4/compressor.py b/python/sglang/srt/layers/attention/dsv4/compressor.py
+index bc8b211..dd45746 100644
+--- a/python/sglang/srt/layers/attention/dsv4/compressor.py
++++ b/python/sglang/srt/layers/attention/dsv4/compressor.py
+@@ -406,12 +406,23 @@ class Compressor(nn.Module):
+         return ret
+ 
+     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
++        # This fused kernel reads wkv_gate.weight directly, bypassing the module
++        # forward, so a LoRA wrapper on wkv_gate never sees the activations. When
++        # a LoRA adapter is active we (a) read the base weight through the wrapper
++        # (.base_layer.weight) and (b) add the fused kv+gate LoRA delta explicitly
++        # via the wrapper's apply_lora (n_slices=2). When no adapter is loaded
++        # (the default / non-LoRA path) this is a single `getattr` and byte-identical.
++        wkv_gate = self.wkv_gate
++        weight = getattr(wkv_gate, "base_layer", wkv_gate).weight
+         if _tgemm is not None:
+             # linear_bf16_fp32 uses tgemm.mm + .float(); skip the .float() cast
+             # because downstream Triton kernels promote bf16→fp32 internally.
+-            kv_score = _tgemm.mm(x, self.wkv_gate.weight, otype=x.dtype)
++            kv_score = _tgemm.mm(x, weight, otype=x.dtype)
+         else:
+-            kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
++            kv_score = linear_bf16_fp32(x, weight)
++
++        if getattr(wkv_gate, "set_lora", False):
++            kv_score = wkv_gate.apply_lora(kv_score, x)
+ 
+         # CUDA path: delegate to backend
+         if dsa_use_prefill_cp(forward_batch):
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index d28145e..a6149b7 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -702,6 +702,28 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+ 
+         buffer = self._get_buffer()
+         _deepep_precompile_tp_barrier()
++        if get_bool_env_var("SGLANG_DEEPEP_CHECK_TOPK"):
++            # Fail-fast invariant ahead of the LL dispatch kernel: an
++            # out-of-range expert id or a token overflow corrupts the NVSHMEM
++            # buffers and surfaces as cudaErrorIllegalAddress inside
++            # internode_ll.cu with no pointer back to the producer. Syncs the
++            # stream (one .item() per MoE layer) — debug runs only.
++            if hidden_states.shape[0] > self.num_max_dispatch_tokens_per_rank:
++                raise RuntimeError(
++                    f"DeepEP LL token overflow: {hidden_states.shape[0]} > "
++                    f"{self.num_max_dispatch_tokens_per_rank}"
++                )
++            if topk_ids.numel():
++                bad = (topk_ids < -1) | (topk_ids >= self.num_experts)
++                if bad.any().item():
++                    where = bad.nonzero()[:16].detach().cpu().tolist()
++                    vals = topk_ids[bad][:16].detach().cpu().tolist()
++                    raise RuntimeError(
++                        f"DeepEP LL topk_ids out of range [-1, {self.num_experts}): "
++                        f"shape={tuple(topk_ids.shape)} dtype={topk_ids.dtype} "
++                        f"min={topk_ids.min().item()} max={topk_ids.max().item()} "
++                        f"where={where} vals={vals}"
++                    )
+         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+             buffer.low_latency_dispatch(
+                 hidden_states,
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index b104e40..5e1227f 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -213,6 +213,11 @@ class TopKConfig:
+     fused_shared_experts_scaling_factor: Optional[float] = None
+     output_format: Optional[TopKOutputFormat] = None
+     scoring_func: str = "softmax"
++    # False for spec-decode DRAFT (nextn/MTP) TopK layers: the draft shares the
++    # GLOBAL routed-experts capturer with the target model, and a draft-side
++    # capture write would be baked into the draft cuda graph, polluting the
++    # target's capture rows (seen as nonzero hash-layer rows in RL replay dumps).
++    capture_routed_experts: bool = True
+ 
+ 
+ # -------------------------------- TopKOutput ---------------------------------------
+@@ -377,6 +382,7 @@ class TopK(MultiPlatformOp):
+         output_format: Optional[TopKOutputFormat] = None,
+         fused_shared_experts_scaling_factor: Optional[float] = None,
+         is_fp4_experts: bool = False,
++        capture_routed_experts: bool = True,
+     ):
+         # NOTE: scoring_func is not used for now, but we keep it for future use
+         # see https://github.com/sgl-project/sglang/pull/4505 for more details
+@@ -417,6 +423,7 @@ class TopK(MultiPlatformOp):
+             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
+             output_format=output_format,
+             scoring_func=scoring_func,
++            capture_routed_experts=capture_routed_experts,
+         )
+ 
+     def _apply_deepep_waterfill(
+@@ -1479,7 +1486,9 @@ def _post_process_topk_ids(
+     fused_shared_experts_scaling_factor = (
+         topk_config.fused_shared_experts_scaling_factor
+     )
+-    if (cap := get_global_experts_capturer()) is not None:
++    if (
++        cap := get_global_experts_capturer()
++    ) is not None and topk_config.capture_routed_experts:
+         cap.capture(
+             layer_id=layer_id,
+             topk_indices=topk_ids,
+diff --git a/python/sglang/srt/lora/backend/triton_backend.py b/python/sglang/srt/lora/backend/triton_backend.py
+index 47bca9c..5c9314f 100644
+--- a/python/sglang/srt/lora/backend/triton_backend.py
++++ b/python/sglang/srt/lora/backend/triton_backend.py
+@@ -54,6 +54,61 @@ class TritonLoRABackend(BaseLoRABackend):
+             return pruned_batch_info
+         return getattr(self, "sgemm_batch_info", None) or self.batch_info
+ 
++    @staticmethod
++    def _debug_validate_sgemm(tag, x, weights, info, base_output=None, output_offset=None):
++        """Fail-fast invariant check before launching the triton LoRA kernels
++        (env SGLANG_LORA_CHECK_BATCH=1). An x/batch_info row mismatch or a bad
++        weight index makes the kernels chase wild pointers — the resulting
++        illegal access surfaces later (DeepEP / graph replay) with no producer
++        frame. Syncs the stream; debug runs only."""
++        import os
++
++        if os.environ.get("SGLANG_LORA_CHECK_BATCH", "0") != "1":
++            return
++        problems = []
++        if info is None:
++            problems.append("batch_info is None")
++        else:
++            total = int(info.seg_indptr[-1].item())
++            if total != x.size(0):
++                problems.append(f"x rows {x.size(0)} != seg total {total}")
++            wi = info.weight_indices[: info.num_segments]
++            wi_max = int(wi.max().item()) if wi.numel() else -1
++            wi_min = int(wi.min().item()) if wi.numel() else 0
++            if wi_max >= weights.size(0) or wi_min < 0:
++                problems.append(
++                    f"weight_indices out of range [{wi_min},{wi_max}] vs num_lora {weights.size(0)}"
++                )
++            if info.max_len is not None and info.seg_lens is not None:
++                sl = info.seg_lens[: info.num_segments]
++                if sl.numel() and int(sl.max().item()) > info.max_len:
++                    problems.append(
++                        f"seg_lens max {int(sl.max().item())} > max_len {info.max_len}"
++                    )
++        if output_offset is not None and base_output is not None:
++            off_last = int(output_offset[-1].item())
++            if off_last > base_output.size(1):
++                problems.append(
++                    f"output_offset[-1] {off_last} > base_output cols {base_output.size(1)}"
++                )
++        if problems:
++            detail = ""
++            if info is not None:
++                detail = (
++                    f" bs={info.bs} num_segments={info.num_segments}"
++                    f" use_cuda_graph={info.use_cuda_graph} max_len={info.max_len}"
++                    f" seg_indptr={info.seg_indptr[:min(info.num_segments + 1, 32)].tolist()}"
++                    f" weight_indices={info.weight_indices[:min(info.num_segments, 32)].tolist()}"
++                    f" lora_ranks={info.lora_ranks.tolist()}"
++                    f" scalings={info.scalings.tolist()}"
++                )
++            raise RuntimeError(
++                f"LoRA sgemm invariant violated at {tag}: {'; '.join(problems)}."
++                f" x={tuple(x.shape)}/{x.dtype} weights={tuple(weights.shape)}"
++                + (f" base_output={tuple(base_output.shape)}" if base_output is not None else "")
++                + detail
++            )
++
+     def run_lora_a_sgemm(
+         self,
+         x: torch.Tensor,
+@@ -63,9 +118,9 @@ class TritonLoRABackend(BaseLoRABackend):
+         *args,
+         **kwargs,
+     ) -> torch.Tensor:
+-        return sgemm_lora_a_fwd(
+-            x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
+-        )
++        info = self._sgemm_info(pruned_batch_info)
++        self._debug_validate_sgemm("run_lora_a_sgemm", x, weights, info)
++        return sgemm_lora_a_fwd(x, weights, info, stack_num=stack_num)
+ 
+     def run_lora_b_sgemm(
+         self,
+@@ -76,9 +131,9 @@ class TritonLoRABackend(BaseLoRABackend):
+         *args,
+         **kwargs,
+     ) -> torch.Tensor:
+-        return sgemm_lora_b_fwd(
+-            x, weights, self._sgemm_info(pruned_batch_info), base_output
+-        )
++        info = self._sgemm_info(pruned_batch_info)
++        self._debug_validate_sgemm("run_lora_b_sgemm", x, weights, info, base_output)
++        return sgemm_lora_b_fwd(x, weights, info, base_output)
+ 
+     def run_qkv_lora(
+         self,
+@@ -99,6 +154,9 @@ class TritonLoRABackend(BaseLoRABackend):
+         assert isinstance(qkv_lora_b, torch.Tensor)
+ 
+         sgemm_info = self._sgemm_info()
++        self._debug_validate_sgemm(
++            "run_qkv_lora", x, qkv_lora_a, sgemm_info, base_output, output_offset
++        )
+         lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
+         lora_output = qkv_lora_b_fwd(
+             lora_a_output,
+@@ -296,6 +354,15 @@ class TritonLoRABackend(BaseLoRABackend):
+             scalings_tensor, non_blocking=True
+         )
+         batch_info.weight_indices[:bs].copy_(weight_indices_tensor, non_blocking=True)
++        if use_cuda_graph:
++            # CUDA-graph replay may run a LARGER captured batch than the raw bs
++            # (cuda_graph_runner pads the batch to the nearest captured size, and
++            # the kernel grid is baked at capture). Rows [bs:] would read whatever
++            # garbage the torch.empty()-initialized buffer holds -> arbitrary pool
++            # offsets -> cudaErrorIllegalAddress under sustained varied-bs decode
++            # (observed with per-step LoRA adapter swaps). Pin the tail to slot 0,
++            # which is always a valid pool address; pad-row outputs are discarded.
++            batch_info.weight_indices[bs:].fill_(0)
+ 
+         batch_info = self._add_moe_lora_info(forward_batch, batch_info)
+         self.batch_info = batch_info
+diff --git a/python/sglang/srt/lora/layers.py b/python/sglang/srt/lora/layers.py
+index ec54319..1db87be 100644
+--- a/python/sglang/srt/lora/layers.py
++++ b/python/sglang/srt/lora/layers.py
+@@ -45,6 +45,31 @@ class BaseLayerWithLoRA(nn.Module):
+         if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+             self.bias = self.base_layer.bias
+ 
++    # Names the wrapper registers on itself during __init__ (weight/bias are
++    # Parameters) and the proxy target itself must NEVER be proxied: nn.Module's
++    # register_parameter/register_buffer use hasattr() as a collision guard, so a
++    # proxy would make `self.weight = base_layer.weight` raise
++    # KeyError("attribute 'weight' already exists") before the assignment lands.
++    _NO_PROXY_ATTRS = frozenset({"weight", "bias", "base_layer"})
++
++    def __getattr__(self, name: str):
++        # Transparent proxy: fall back to the wrapped base layer for attributes
++        # the LoRA wrapper does not define (e.g. reduce_results, tp_size,
++        # output_size), so model code / fused kernels that read base-layer
++        # attributes off the (now possibly wrapped) module keep working. Only
++        # reached when nn.Module's own lookup (params/buffers/submodules) misses.
++        try:
++            return super().__getattr__(name)
++        except AttributeError:
++            if name in BaseLayerWithLoRA._NO_PROXY_ATTRS:
++                raise
++            # Look up base_layer without re-entering __getattr__ (avoid recursion
++            # and the register_parameter hasattr guard during __init__).
++            base_layer = self.__dict__.get("_modules", {}).get("base_layer")
++            if base_layer is None:
++                raise
++            return getattr(base_layer, name)
++
+     def forward(self, x: torch.Tensor):
+         return self.base_layer.forward(x)
+ 
+@@ -211,7 +236,13 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
+             base_output = self.extra_token_embedding(input_, base_output)
+ 
+         # Apply LoRA if configured
+-        if self.set_lora:
++        if self.set_lora and input_.shape[0] > 0:
++            # x.shape[0] == 0: DP-attention IDLE forwards (rank has no local
++            # requests) still execute the layer; LoRA batch metadata is NOT
++            # prepared for idle passes, so launching the triton LoRA kernels
++            # would consume stale segment/permutation state -> illegal memory
++            # access (root cause of the sustained-decode crashes: random DP
++            # rank = whichever idled first; uniform-load repros never idled).
+             # The backend's run_lora_a_embedding now handles both regular
+             # and extra tokens efficiently with CUDA graph support
+             base_output = self.apply_lora(base_output, input_, batch_info)
+@@ -377,7 +408,13 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
+         )
+ 
+         # Apply LoRA if set
+-        if self.set_lora:
++        if self.set_lora and hidden_states.shape[0] > 0:
++            # x.shape[0] == 0: DP-attention IDLE forwards (rank has no local
++            # requests) still execute the layer; LoRA batch metadata is NOT
++            # prepared for idle passes, so launching the triton LoRA kernels
++            # would consume stale segment/permutation state -> illegal memory
++            # access (root cause of the sustained-decode crashes: random DP
++            # rank = whichever idled first; uniform-load repros never idled).
+             base_output = self.apply_lora(base_output, hidden_states)
+ 
+         return base_output
+@@ -466,7 +503,13 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
+             self.base_layer, input_, bias
+         )
+ 
+-        if self.set_lora:
++        if self.set_lora and input_.shape[0] > 0:
++            # x.shape[0] == 0: DP-attention IDLE forwards (rank has no local
++            # requests) still execute the layer; LoRA batch metadata is NOT
++            # prepared for idle passes, so launching the triton LoRA kernels
++            # would consume stale segment/permutation state -> illegal memory
++            # access (root cause of the sustained-decode crashes: random DP
++            # rank = whichever idled first; uniform-load repros never idled).
+             output_parallel = self.apply_lora(output_parallel, input_)
+ 
+         if self.base_layer.gather_output:
+@@ -576,6 +619,12 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
+         return A
+ 
+     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
++        # A layer built with tp_size==1 (e.g. the DeepSeek-V4 shared expert under
++        # DeepEP) holds the FULL weight on every rank while the caller passes the
++        # GLOBAL tp_rank: partition==full there, so any tp_rank>0 would read past
++        # each slice's real data. Slice as rank 0 (identity for tp1 layers).
++        if getattr(self.base_layer, "tp_size", 1) == 1:
++            tp_rank = 0
+         partition_sizes = self.base_layer.output_partition_sizes
+         output_sizes = self.base_layer.output_sizes
+         slices = []
+@@ -748,7 +797,13 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
+                 base_output=output_,
+             )
+         else:
+-            if self.set_lora:
++            if self.set_lora and input_parallel.shape[0] > 0:
++            # x.shape[0] == 0: DP-attention IDLE forwards (rank has no local
++            # requests) still execute the layer; LoRA batch metadata is NOT
++            # prepared for idle passes, so launching the triton LoRA kernels
++            # would consume stale segment/permutation state -> illegal memory
++            # access (root cause of the sustained-decode crashes: random DP
++            # rank = whichever idled first; uniform-load repros never idled).
+                 output_parallel = self.apply_lora(output_parallel, input_parallel)
+             if should_reduce:
+                 output_ = tensor_model_parallel_all_reduce(output_parallel)
+@@ -844,10 +899,21 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
+         )
+         return lora_output
+ 
+-    def forward(self, x: torch.Tensor):
++    def forward(self, x: torch.Tensor, skip_all_reduce: bool = False, forward_batch=None):
++        # skip_all_reduce/forward_batch mirror RowParallelLinearWithLoRA's
++        # signature: tp1-built Row/Column layers are wrapped as replicated (see
++        # get_lora_layer) but callers still pass row-parallel kwargs (e.g. the
++        # DeepSeek shared-expert MLP's down_proj call). A replicated layer has
++        # no all-reduce, so the flag is accepted and ignored.
+         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
+         output = self.base_layer.quant_method.apply(self.base_layer, x, bias)
+-        if self.set_lora:
++        if self.set_lora and x.shape[0] > 0:
++            # x.shape[0] == 0: DP-attention IDLE forwards (rank has no local
++            # requests) still execute the layer; LoRA batch metadata is NOT
++            # prepared for idle passes, so launching the triton LoRA kernels
++            # would consume stale segment/permutation state -> illegal memory
++            # access (root cause of the sustained-decode crashes: random DP
++            # rank = whichever idled first; uniform-load repros never idled).
+             output = self.apply_lora(output, x)
+         output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+         return output, output_bias
+@@ -1192,6 +1258,20 @@ def get_lora_layer(
+         ColumnParallelLinear: ColumnParallelLinearWithLoRA,
+         RowParallelLinear: RowParallelLinearWithLoRA,
+     }
++    # A tp_size==1 *plain* Column/Row parallel linear is functionally replicated
++    # (full weight on every rank, no gather/reduce), so its LoRA A/B must stay
++    # unsharded. Wrap it with ReplicatedLinearWithLoRA so mem_pool slicing is a
++    # no-op — required for DeepSeek-V4 attention LoRA under dp-attention, where
++    # wq_b (ColumnParallel) and wo_b (RowParallel) are built with attn-tp==1.
++    # Restricted to the exact base types (not Merged/QKV subclasses, which carry
++    # multi-slice output offsets that the replicated single-projection path would
++    # mishandle).
++    if (
++        type(layer) in (ColumnParallelLinear, RowParallelLinear)
++        and getattr(layer, "tp_size", 1) == 1
++    ):
++        return ReplicatedLinearWithLoRA(layer, lora_backend)
++
+     for src_layer_type, lora_layer_type in supported_layer_types.items():
+         if isinstance(layer, src_layer_type):  # pylint: disable=unidiomatic-typecheck
+             ret = lora_layer_type(layer, lora_backend)
+diff --git a/python/sglang/srt/lora/lora.py b/python/sglang/srt/lora/lora.py
+index 245c15e..edd46e1 100644
+--- a/python/sglang/srt/lora/lora.py
++++ b/python/sglang/srt/lora/lora.py
+@@ -212,6 +212,8 @@ class LoRAAdapter(nn.Module):
+             self.normalize_gate_up_proj(weight_names, layer.weights)
+             weight_names = list(layer.weights.keys())
+             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
++            weight_names = list(layer.weights.keys())
++            self.normalize_wkv_gate(weight_names, layer.weights)
+ 
+     def normalize_qkv_proj(
+         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+@@ -424,6 +426,40 @@ class LoRAAdapter(nn.Module):
+             if kv_a_name in weights:
+                 weights.pop(kv_a_name)
+ 
++    def normalize_wkv_gate(
++        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
++    ):
++        """Fuse DeepSeek-V4 compressor kv (``wkv``) and gate (``wgate``) LoRA
++        weights into a single ``wkv_gate`` entry (concat kv-then-gate along dim 0
++        for both A and B), matching the served fused compressor projection whose
++        base weight is likewise ``cat([wkv, wgate], dim=0)``. Mirrors
++        :meth:`normalize_fused_qkv_a_proj`.
++
++        The kv half is matched on the ``.compressor.wkv.`` substring, which never
++        matches the standalone attention ``wkv`` projection (``.attn.wkv.``, no
++        ``compressor`` component) nor the already-fused ``wkv_gate`` (no trailing
++        ``.`` after ``wkv``)."""
++        for weight_name in weight_names:
++            if ".compressor.wkv." not in weight_name:
++                continue
++
++            kv_name = weight_name
++            gate_name = weight_name.replace(".compressor.wkv.", ".compressor.wgate.")
++            fused_name = weight_name.replace(
++                ".compressor.wkv.", ".compressor.wkv_gate."
++            )
++
++            gate_weight = (
++                weights[gate_name]
++                if gate_name in weights
++                else torch.zeros_like(weights[kv_name])
++            )
++
++            weights[fused_name] = torch.cat((weights[kv_name], gate_weight), dim=0)
++            weights.pop(kv_name)
++            if gate_name in weights:
++                weights.pop(gate_name)
++
+     def pin_weights_in_cpu(self):
+         for layer in self.layers:
+             for name, weight in layer.weights.items():
+diff --git a/python/sglang/srt/lora/lora_manager.py b/python/sglang/srt/lora/lora_manager.py
+index a43c5df..8da61b8 100644
+--- a/python/sglang/srt/lora/lora_manager.py
++++ b/python/sglang/srt/lora/lora_manager.py
+@@ -261,6 +261,14 @@ class LoRAManager:
+             del self.loras[lora_ref.lora_id]
+             del self.lora_refs[lora_ref.lora_id]
+             self.num_pinned_loras -= int(lora_ref.pinned)
++            # Release this adapter's memory-pool slot immediately. Otherwise
++            # uid_to_buffer_id / buffer_id_to_uid / the eviction policy keep
++            # referencing the unloaded uid until it is lazily evicted on the next
++            # load — so a subsequent reload takes the evict-and-reuse path instead
++            # of the empty-slot path the (working) first load uses. Under the RL
++            # per-step unload+reload pattern this is the only code-path difference
++            # between first-load and reload.
++            self.memory_pool.free_lora_slot(lora_ref.lora_id)
+         except Exception as e:
+             return self.create_lora_update_result(
+                 success=False,
+@@ -316,15 +324,27 @@ class LoRAManager:
+             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
+         )
+ 
+-    def prepare_lora_batch(self, forward_batch: ForwardBatch):
++    def prepare_lora_batch(
++        self,
++        forward_batch: ForwardBatch,
++        use_cuda_graph: Optional[bool] = None,
++    ):
+         # set up batch info shared by all lora modules
+         bs = forward_batch.batch_size
+ 
+-        use_cuda_graph = (
+-            hasattr(self, "max_bs_in_cuda_graph")
+-            and bs <= self.max_bs_in_cuda_graph
+-            and forward_batch.forward_mode.is_cuda_graph()
+-        )
++        # use_cuda_graph selects WHICH state this prep writes: the static
++        # cuda-graph buffers (True) or the eager batch_info (False). The
++        # heuristic below infers it from the forward MODE, but a mode can run
++        # on either path (e.g. IDLE executes eagerly via forward_idle in a
++        # graphs-enabled server) — callers that know the execution path must
++        # pass it explicitly, else the prep updates the wrong state and the
++        # kernels consume stale segments (illegal memory access).
++        if use_cuda_graph is None:
++            use_cuda_graph = (
++                hasattr(self, "max_bs_in_cuda_graph")
++                and bs <= self.max_bs_in_cuda_graph
++                and forward_batch.forward_mode.is_cuda_graph()
++            )
+ 
+         weight_indices = [0] * len(forward_batch.lora_ids)
+         lora_ranks = [0] * self.max_loras_per_batch
+@@ -812,6 +832,30 @@ class LoRAManager:
+                 self.lora_modules[layer_id][module_name] = lora_module
+                 continue
+ 
++            # Handle DeepSeek-V4 fused compressor kv+gate projection: the served
++            # ``wkv_gate`` ReplicatedLinear stacks kv (first half) then gate
++            # (second half) of equal size, so set the boundary to output_size//2
++            # for the n_slices=2 fused LoRA path (mirrors fused_qkv_a above).
++            # The C4 indexer owns a second, smaller compressor whose wkv_gate
++            # leaf would match by name — but it is NOT a training target, and
++            # wrapping it makes compute_kv_score apply the ATTENTION
++            # compressor's adapter (shared per-(leaf,layer) mem-pool buffer,
++            # incompatible dims: 2*coff*128 vs 2*coff*512) to the indexer's
++            # scores. Exclude it.
++            if ".indexer." in module_name:
++                continue
++            if "wkv_gate" in self.target_modules and module_name.endswith("wkv_gate"):
++                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
++
++                layer_id = get_layer_id(module_name)
++                if layer_id is None:
++                    continue
++                lora_module = self.set_lora_module(module_name, module)
++                if isinstance(lora_module, ReplicatedLinearWithLoRA):
++                    lora_module.first_output_dim = module.output_size // 2
++                self.lora_modules[layer_id][module_name] = lora_module
++                continue
++
+             # The module should be converted if it is included in target_names
+             if module_name.split(".")[-1] in self.target_modules:
+                 layer_id = get_layer_id(module_name)
+@@ -825,6 +869,15 @@ class LoRAManager:
+             if isinstance(module, FusedMoE) and all(
+                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+             ):
++                # DeepSeek-V4 shared-expert LoRA: gate_up_proj/down_proj target the
++                # SHARED-expert MLP (a separate tp1 DeepseekV2MLP), never the routed
++                # FusedMoE. The adapter has no per-expert weights, and at
++                # n_shared_experts=1 the routed per-expert dims EQUAL the shared
++                # dims — wrapping FusedMoE here would apply the shared-expert
++                # adapter to routed experts and corrupt outputs SILENTLY. Models
++                # opt out of expert-LoRA explicitly via ``lora_skip_fused_moe``.
++                if getattr(self.base_model, "lora_skip_fused_moe", False):
++                    continue
+                 layer_id = get_layer_id(module_name)
+                 if layer_id is None:
+                     # FusedMoE submodules outside the decoder layer hierarchy
+diff --git a/python/sglang/srt/lora/mem_pool.py b/python/sglang/srt/lora/mem_pool.py
+index e7541b2..b658754 100644
+--- a/python/sglang/srt/lora/mem_pool.py
++++ b/python/sglang/srt/lora/mem_pool.py
+@@ -375,6 +375,10 @@ class LoRAMemoryPool:
+             effective_tp_size > 1
+             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+             and module_name not in REPLICATED_LINEAR_LORA_NAMES
++            # Model-declared replicated leaves (e.g. DeepSeek-V4's tp1 shared
++            # expert): the module holds FULL weights on every rank, so its
++            # LoRA A must be sized full despite the global tp_size.
++            and module_name not in getattr(base_model, "lora_replicated_modules", ())
+         ):
+             input_dim = divide(input_dim, effective_tp_size)
+ 
+@@ -469,6 +473,9 @@ class LoRAMemoryPool:
+             effective_tp_size > 1
+             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+             and module_name not in REPLICATED_LINEAR_LORA_NAMES
++            # Model-declared replicated leaves (e.g. DeepSeek-V4's tp1 shared
++            # expert gate_up_proj): full output dim on every rank.
++            and module_name not in getattr(base_model, "lora_replicated_modules", ())
+         ):
+             output_dim = self._column_parallel_lora_b_per_rank_dim(
+                 module_name, output_dim, effective_tp_size
+@@ -547,7 +554,14 @@ class LoRAMemoryPool:
+                             for idx in range(self.num_layer)
+                         ]
+ 
+-                    # MoE expert version (4D)
++                    # MoE expert version (4D). Models that opt out of
++                    # per-expert (FusedMoE) LoRA — e.g. DeepSeek-V4, whose
++                    # gate_up/down targets are the SHARED expert only — must
++                    # not allocate expert buffers (their get_hidden_dim has no
++                    # ``*_moe`` entries, and expert buffers for 256 experts
++                    # would be pure waste).
++                    if getattr(base_model, "lora_skip_fused_moe", False):
++                        continue
+                     moe_key = f"{module_name}_moe"
+                     buffer[moe_key] = [
+                         torch.zeros(
+@@ -671,6 +685,20 @@ class LoRAMemoryPool:
+ 
+         return cached_weight
+ 
++    def free_lora_slot(self, uid: Optional[str]) -> None:
++        """Release the memory-pool slot held by ``uid`` (called on unload).
++
++        No-op if the adapter never occupied a slot (e.g. it was loaded but never
++        used in a forward, so its buffer was never lazily populated). Keeps
++        ``uid_to_buffer_id`` / ``buffer_id_to_uid`` / the eviction policy in sync
++        so a subsequent load sees an empty slot rather than having to evict.
++        """
++        buffer_id = self.uid_to_buffer_id.pop(uid, None)
++        if buffer_id is None:
++            return
++        self.buffer_id_to_uid[buffer_id] = EMPTY_SLOT
++        self.eviction_policy.remove(uid)
++
+     def prepare_lora_batch(
+         self,
+         cur_uids: Set[Optional[str]],
+diff --git a/python/sglang/srt/lora/triton_ops/kernel_utils.py b/python/sglang/srt/lora/triton_ops/kernel_utils.py
+index 788a7c3..42a10e9 100644
+--- a/python/sglang/srt/lora/triton_ops/kernel_utils.py
++++ b/python/sglang/srt/lora/triton_ops/kernel_utils.py
+@@ -13,7 +13,13 @@ def _resolve_token_positions(
+     When False, tokens are already contiguous starting at seg_start.
+     """
+     if SORTED_BY_ADAPTER:
++        # other=0 is load-bearing: without it, masked lanes return UNDEFINED
++        # values which callers use in pointer arithmetic (x + s_physical *
++        # stride) BEFORE the load/store masks apply — wild pointers ->
++        # cudaErrorIllegalAddress. Inert at cuda-graph capture (rank-0
++        # early-out) but lethal on replay with a real adapter under varied-bs
++        # decode (many masked lanes). Token row 0 is always a valid row.
+         return tl.load(
+-            sorted_token_ids + seg_start + s_offset, mask=s_offset < seg_len
++            sorted_token_ids + seg_start + s_offset, mask=s_offset < seg_len, other=0
+         ).to(tl.int64)
+     return (seg_start + s_offset).to(tl.int64)
+diff --git a/python/sglang/srt/lora/utils.py b/python/sglang/srt/lora/utils.py
+index b2984ed..e21c49f 100644
+--- a/python/sglang/srt/lora/utils.py
++++ b/python/sglang/srt/lora/utils.py
+@@ -248,6 +248,18 @@ def get_normalized_target_modules(
+         "unembed_tokens": "lm_head",
+         "q_a_proj": "fused_qkv_a_proj_with_mqa",
+         "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
++        # DeepSeek-V4: the compressor kv (``wkv``) and gate (``wgate``) sub-projections
++        # are physically fused into a single ``wkv_gate`` ReplicatedLinear at serve
++        # time (see lora.py normalize_wkv_gate). The attention ``wkv`` (main KV proj)
++        # is a distinct standalone module and is intentionally left unmapped.
++        "wgate": "wkv_gate",
++        # DeepSeek native checkpoint leaves for the SHARED-expert MLP (adapters
++        # exported from the train side use these names): w1=gate, w3=up, w2=down.
++        # LoRAAdapter._rename_expert_w_to_proj renames the weights themselves;
++        # this mapping covers the adapter config's target_modules tokens.
++        "w1": "gate_up_proj",
++        "w3": "gate_up_proj",
++        "w2": "down_proj",
+     }
+ 
+     result = set()
+@@ -306,6 +318,19 @@ REPLICATED_LINEAR_LORA_NAMES = [
+     "fused_qkv_a_proj_with_mqa",
+     "fc1_latent_proj",
+     "fc2_latent_proj",
++    # DeepSeek-V4 attention/compressor LoRA targets. Under dp-attention (the V4
++    # serving config: --enable-dp-attention with dp_size==tp_size, so attn-tp==1)
++    # every attention projection is replicated on each GPU, so the LoRA A/B are
++    # full (unsharded). ``wq_b`` (ColumnParallel) and ``wo_b`` (RowParallel) are
++    # built with tp_size==1 and are wrapped as replicated (see get_lora_layer),
++    # so listing them here keeps mem_pool buffer sizing full to match the no-op
++    # slice. NOTE: this makes these names unsupported under attn-tp>1; the V4
++    # model raises at init if enable_lora and attn-tp>1.
++    "wq_a",
++    "wkv",
++    "wq_b",
++    "wo_b",
++    "wkv_gate",
+ ]
+ 
+ # Normalized module names that the LoRA system fully supports
+@@ -327,6 +352,13 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
+         "fused_qkv_a_proj_with_mqa",
+         "q_b_proj",
+         "kv_b_proj",
++        # DeepSeek-V4 MLA / compressor leaf targets (get_hidden_dim +
++        # get_stacked_multiply are provided by DeepseekV4ForCausalLM).
++        "wq_a",
++        "wkv",
++        "wq_b",
++        "wo_b",
++        "wkv_gate",
+     }
+ )
+ 
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index a282339..6e481af 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -175,6 +175,51 @@ class SchedulerBatchResultProcessor:
+                     elem = elem.copy()
+                 req.customized_info[k].append(elem)
+ 
++    def _finalize_routed_experts_output(self, batch, result) -> None:
++        """Finalize captured routed-experts rows into the host cache.
++
++        For spec-v2 target-verify results, keep ONLY accepted tokens' rows
++        (request-major blocks of stride speculative_num_draft_tokens; the
++        accepted rows are the first accept_lens[i] of block i, bonus token
++        included). Rejected draft rows would otherwise write junk into KV
++        slots that get freed and reused. Callers must copy_done.synchronize()
++        first so accept_lens and the captured tensors are CPU-valid.
++        """
++        out = getattr(result, "routed_experts_output", None)
++        if out is None:
++            return
++
++        # Non-overlap spec verify defers finalization without a copy_to_cpu
++        # caller (GenerationBatchResult.copy_to_cpu only runs in overlap
++        # scheduling) — bring the tensors to host here.
++        if out.out_cache_loc.is_cuda:
++            out.out_cache_loc = out.out_cache_loc.cpu()
++        if out.topk.is_cuda:
++            out.topk = out.topk.cpu()
++
++        accept_lens = getattr(result, "accept_lens", None)
++        if getattr(batch, "is_spec_v2", False) and accept_lens is not None:
++            stride = result.speculative_num_draft_tokens
++            assert (
++                stride is not None
++            ), "spec-v2 result missing speculative_num_draft_tokens"
++            lens = accept_lens.to(torch.int64).tolist()
++            keep_rows = [
++                torch.arange(i * stride, i * stride + a, dtype=torch.long)
++                for i, a in enumerate(lens)
++                if a > 0
++            ]
++            keep = (
++                torch.cat(keep_rows)
++                if keep_rows
++                else torch.empty(0, dtype=torch.long)
++            )
++            out.out_cache_loc = out.out_cache_loc[keep]
++            out.topk = out.topk[keep]
++
++        out.finalize()
++        result.routed_experts_output = None
++
+     def process_batch_result_prefill(
+         self,
+         batch: ScheduleBatch,
+@@ -185,9 +230,7 @@ class SchedulerBatchResultProcessor:
+         if self.is_generation:
+             if result.copy_done is not None:
+                 result.copy_done.synchronize()
+-            if result.routed_experts_output is not None:
+-                result.routed_experts_output.finalize()
+-                result.routed_experts_output = None
++            self._finalize_routed_experts_output(batch, result)
+             if result.indexer_topk_output is not None:
+                 result.indexer_topk_output.finalize()
+                 result.indexer_topk_output = None
+@@ -594,9 +637,7 @@ class SchedulerBatchResultProcessor:
+     ):
+         if result.copy_done is not None:
+             result.copy_done.synchronize()
+-        if result.routed_experts_output is not None:
+-            result.routed_experts_output.finalize()
+-            result.routed_experts_output = None
++        self._finalize_routed_experts_output(batch, result)
+         if result.indexer_topk_output is not None:
+             result.indexer_topk_output.finalize()
+             result.indexer_topk_output = None
+diff --git a/python/sglang/srt/managers/tokenizer_control_mixin.py b/python/sglang/srt/managers/tokenizer_control_mixin.py
+index ee25e5e..70dbf28 100644
+--- a/python/sglang/srt/managers/tokenizer_control_mixin.py
++++ b/python/sglang/srt/managers/tokenizer_control_mixin.py
+@@ -563,9 +563,15 @@ class TokenizerControlMixin:
+ 
+             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+             # with dp_size > 1.
++            # Dynamic LoRA load/unload is broadcast to every scheduler as a
++            # control request (request_receiver broadcasts control_reqs over the
++            # full tp_group / attn_tp_group), so each dp-attention replica's own
++            # LoRA mem_pool is populated and exactly dp_size leaders answer the
++            # FanOutCommunicator — identical to update_weights_*, which already
++            # permit enable_dp_attention. Match that guard here.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 (or --enable-dp-attention) for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter. Lora name=%s, path=%s",
+                 obj.lora_name,
+@@ -639,9 +645,15 @@ class TokenizerControlMixin:
+                     "LoRA is not enabled. Please set `--enable-lora` to enable LoRA."
+                 )
+ 
++            # Dynamic LoRA load/unload is broadcast to every scheduler as a
++            # control request (request_receiver broadcasts control_reqs over the
++            # full tp_group / attn_tp_group), so each dp-attention replica's own
++            # LoRA mem_pool is populated and exactly dp_size leaders answer the
++            # FanOutCommunicator — identical to update_weights_*, which already
++            # permit enable_dp_attention. Match that guard here.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 (or --enable-dp-attention) for dynamic lora loading"
+             logger.info(
+                 "Start load Lora adapter from tensors. Lora name=%s",
+                 obj.lora_name,
+@@ -715,9 +727,15 @@ class TokenizerControlMixin:
+ 
+             # TODO (lifuhuang): Remove this after we verify that dynamic lora loading works
+             # with dp_size > 1.
++            # Dynamic LoRA load/unload is broadcast to every scheduler as a
++            # control request (request_receiver broadcasts control_reqs over the
++            # full tp_group / attn_tp_group), so each dp-attention replica's own
++            # LoRA mem_pool is populated and exactly dp_size leaders answer the
++            # FanOutCommunicator — identical to update_weights_*, which already
++            # permit enable_dp_attention. Match that guard here.
+             assert (
+-                self.server_args.dp_size == 1
+-            ), "dp_size must be 1 for dynamic lora loading"
++                self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
++            ), "dp_size must be 1 (or --enable-dp-attention) for dynamic lora loading"
+             logger.info(
+                 "Start unload Lora adapter. Lora name=%s",
+                 obj.lora_name,
+diff --git a/python/sglang/srt/managers/tokenizer_manager.py b/python/sglang/srt/managers/tokenizer_manager.py
+index 1f6dc90..66586ae 100644
+--- a/python/sglang/srt/managers/tokenizer_manager.py
++++ b/python/sglang/srt/managers/tokenizer_manager.py
+@@ -2658,6 +2658,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
+         }
+         del self.rid_to_state[recv_obj.rid]
+ 
++        # Mark ongoing LoRA request as finished — mirrors the normal-completion
++        # and error paths. Without this every ABORTED request leaks one
++        # lora_registry ref on its adapter, so wait_for_unload (unload_lora_adapter)
++        # blocks forever once any request was aborted (slime's RL rollout aborts
++        # batches at every dynamic-fill/pause -> guaranteed leak; hung the
++        # per-step adapter swap, formal r7f/r7g/r7h 2026-07-10).
++        if self.server_args.enable_lora and state.obj.lora_path:
++            asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
++
+         state.out_list.append(out)
+         state.event.set()
+ 
+diff --git a/python/sglang/srt/model_executor/cuda_graph_runner.py b/python/sglang/srt/model_executor/cuda_graph_runner.py
+index ebbfc2b..c33619e 100644
+--- a/python/sglang/srt/model_executor/cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/cuda_graph_runner.py
+@@ -1167,6 +1167,32 @@ class CudaGraphRunner:
+     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+         self.deepep_adapter.replay()
+ 
++        # LoRA graph static state must be refreshed before EVERY replay,
++        # decoupled from attention-metadata init (the pre-planned path can skip
++        # replay_prepare entirely). IDLE dp-attention batches carry
++        # lora_ids == [] (forward_batch_info sets [] and returns before LoRA
++        # prep), so without this the idle replay consumes the previous ACTIVE
++        # bucket's static segment/rank/routing state — after an adapter unload
++        # that means stale lora_ranks[freed_slot] > 0 and stale seg/permutation
++        # rows -> captured LoRA kernels chase wild offsets -> illegal access
++        # surfacing at the idle result's stream sync. Prepare with all-None ids
++        # (rank-0 no-op kernels). Non-idle batches (truthy lora_ids) were
++        # already prepared by ForwardBatch.init_new.
++        if (
++            self.model_runner.server_args.enable_lora
++            and not forward_batch.lora_ids
++            # The chunked backend's prep raises on IDLE mode
++            # (generate_sequence_lengths: "Unsupported forward mode"); only the
++            # triton backend's static-state refresh is idle-safe. Chunked +
++            # graphs + idle keeps its pre-existing stale-state exposure.
++            and getattr(self.model_runner.lora_manager.lora_backend, "name", "")
++            == "triton"
++        ):
++            forward_batch.lora_ids = [None] * max(forward_batch.batch_size, 1)
++            self.model_runner.lora_manager.prepare_lora_batch(
++                forward_batch, use_cuda_graph=True
++            )
++
+         if forward_batch.needs_forward_metadata_init():
+             self.replay_prepare(forward_batch, pp_proxy_tensors)
+         else:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index d715bc6..82ddc2b 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3529,6 +3529,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             if not self.server_args.enable_pdmux and self.device == "cuda":
+                 forward_batch = self._eager_fb_view(forward_batch, pp_proxy_tensors)
+             self.attn_backend.init_forward_metadata(forward_batch)
++            # Same stale-state hazard as the attention metadata above, but for
++            # LoRA: padded IDLE batches run the LoRA wrappers with dummy tokens,
++            # and without a prepare_lora_batch the triton kernels consume the
++            # PREVIOUS batch's segment/permutation/weight-index state ->
++            # cudaErrorIllegalAddress (repro: sustained varied-bs decode with an
++            # active adapter on dp-attention; random rank = whichever idled).
++            # Prepare with all-None ids: rank-0 no-op kernels, consistent state.
++            if self.server_args.enable_lora:
++                if forward_batch.lora_ids is None:
++                    forward_batch.lora_ids = [None] * forward_batch.batch_size
++                # use_cuda_graph=False: this is the EAGER idle path, so the prep
++                # must write the eager batch_info. Without the override, IDLE
++                # (a cuda-graph forward MODE) makes the heuristic target the
++                # static graph buffers in a graphs-enabled server, leaving the
++                # eager state stale (last prefill's segments) -> illegal access.
++                self.lora_manager.prepare_lora_batch(
++                    forward_batch, use_cuda_graph=False
++                )
+         else:
+             self.attn_backend.forward_metadata = None
+ 
+@@ -3638,12 +3656,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 )
+         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+ 
+-        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
++        # Target-verify (spec decode) must defer host finalization until accept_lens
++        # is known, so the result processor can filter rejected draft rows.
++        no_copy_to_cpu = (
++            not self.server_args.disable_overlap_schedule
++            or forward_batch.forward_mode.is_target_verify()
++        )
+         cuda_graph_num_tokens = None
+-        decode_graph_runner = getattr(self, "decode_cuda_graph_runner", None)
+-        if getattr(decode_graph_runner, "bs", None):
+-            cuda_graph_num_tokens = decode_graph_runner.bs * getattr(
+-                decode_graph_runner, "num_tokens_per_bs", 1
++        # The live runner attribute is `graph_runner` (there is no
++        # decode_cuda_graph_runner); with the old getattr this was always None and
++        # DP-attention graph slicing computed dp_rank * None offsets.
++        graph_runner = getattr(self, "graph_runner", None)
++        if output.can_run_graph and getattr(graph_runner, "bs", None):
++            cuda_graph_num_tokens = graph_runner.bs * getattr(
++                graph_runner, "num_tokens_per_bs", 1
+             )
+         if (experts_capturer := get_global_experts_capturer()) is not None:
+             output.routed_experts_output = experts_capturer.on_forward_end(
+diff --git a/python/sglang/srt/models/deepseek_v2.py b/python/sglang/srt/models/deepseek_v2.py
+index c34681c..2c0c00d 100644
+--- a/python/sglang/srt/models/deepseek_v2.py
++++ b/python/sglang/srt/models/deepseek_v2.py
+@@ -318,10 +318,14 @@ class DeepseekV2MLP(nn.Module):
+         gate_up, _ = self.gate_up_proj(x)
+         # Fast path: fused silu+clamp+fp8_quant+deepgemm when conditions met.
+         # Only valid when down_proj does NOT need an all-reduce and its weights
+-        # are fp8 (uint8 storage with weight_scale_inv).
++        # are fp8 (uint8 storage with weight_scale_inv). Must NOT engage when
++        # down_proj is LoRA-wrapped: the raw deepgemm call bypasses the wrapper
++        # and silently drops the adapter delta (shared-expert LoRA).
+         if (
+             self.swiglu_limit is not None
++            and not getattr(self.down_proj, "set_lora", False)
+             and not self.down_proj.reduce_results
++            and getattr(self.down_proj, "weight", None) is not None
+             and self.down_proj.weight.dtype == torch.uint8
+             and hasattr(self.down_proj, "weight_scale_inv")
+         ):
+@@ -664,6 +668,9 @@ class DeepseekV2MoE(nn.Module):
+                         else self.experts.should_fuse_routed_scaling_factor_in_topk
+                     ),
+                 )
++            # Spec-decode draft (nextn/MTP) layers must not write the GLOBAL
++            # routed-experts capturer (would corrupt the target's capture rows).
++            topk_kwargs["capture_routed_experts"] = not is_nextn
+             self.topk = TopK(**topk_kwargs)
+ 
+         self.shared_experts_is_int8 = False
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index 7494ce8..e693c15 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -904,6 +904,16 @@ class MQALayer(nn.Module):
+             and x.shape[0] <= self._multi_stream_bs_limit
+             and not (self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch))
+             and not (_is_hip and self.compressor is None)
++            # When the compressor carries an active LoRA adapter, keep it on the
++            # main stream: compute_kv_score runs the wkv_gate LoRA delta via the
++            # LoRA backend (run_qkv_lora reads batch_info prepared on the default
++            # stream). Capturing that kernel on the alternate compressor stream is
++            # a cross-stream hazard under cuda graph and triggers an illegal
++            # memory access on replay. Falls back to the proven single-stream path.
++            and not (
++                self.compressor is not None
++                and getattr(self.compressor.wkv_gate, "set_lora", False)
++            )
+         )
+ 
+         tp_slice, q_padded, q_out = slice(None), None, None
+@@ -1731,6 +1741,19 @@ class DeepseekV4ForCausalLM(nn.Module):
+         self.config = config
+         self.tp_size = get_tensor_model_parallel_world_size()
+         self.quant_config = quant_config
++        # LoRA on the MLA/compressor projections is only supported when attention
++        # runs replicated (attn-tp==1), i.e. the V4 dp-attention serving config
++        # (--enable-dp-attention with dp_size==tp_size). Under attn-tp>1 the
++        # attention LoRA A/B would need per-rank sharding that this port does not
++        # implement (the V4 leaf names are registered as replicated in
++        # lora/utils.py). Fail loud instead of silently mis-serving.
++        if get_global_server_args().enable_lora and get_attention_tp_size() > 1:
++            raise NotImplementedError(
++                "DeepSeek-V4 LoRA serving requires attention-tp == 1 "
++                f"(got attn_tp_size={get_attention_tp_size()}). Launch with "
++                "--enable-dp-attention and --dp-size == --tp-size so every "
++                "attention projection is replicated per GPU."
++            )
+         self.determine_num_fused_shared_experts()
+         self.model = DeepseekV4Model(
+             config, quant_config, prefix=add_prefix("model", prefix)
+@@ -1776,6 +1799,85 @@ class DeepseekV4ForCausalLM(nn.Module):
+     def routed_experts_weights_of_layer(self):
+         return self._routed_experts_weights_of_layer.value
+ 
++    # ---------------------------------------------------------------------
++    # LoRA support (MLA attention + compressor). Served leaf module names, valid
++    # only under attn-tp==1 (see the guard in __init__ and lora/utils.py). Launch
++    # with SGLANG_OPT_FUSE_WQA_WKV=0 so wq_a/wkv are separate ReplicatedLinear
++    # modules (otherwise they are fused into wqkv_a and unavailable as targets).
++    # ---------------------------------------------------------------------
++    # gate_up_proj/down_proj LoRA targets are the SHARED expert only — never
++    # per-expert adapters on the routed FusedMoE (see lora_manager skip).
++    lora_skip_fused_moe = True
++    # The shared expert is built with tp_size=1 under DeepEP (replicated on
++    # every rank), so its LoRA buffers must be sized FULL — mem_pool consults
++    # this to skip the global-tp division for these leaves (the generic
++    # REPLICATED_LINEAR_LORA_NAMES list can't carry them: for ordinary dense
++    # models gate_up/down ARE tp-sharded).
++    lora_replicated_modules = ("gate_up_proj", "down_proj")
++    supported_lora_modules = [
++        "wq_a",
++        "wkv",
++        "wq_b",
++        "wo_b",
++        "wkv_gate",
++        # Shared-expert MLP (--dsv4-lora-shared-expert on the train side). Under
++        # DeepEP the shared expert is built with tp_size=1 (replicated), so the
++        # full unsliced adapter A/B map 1:1 — same contract as the attention
++        # leaves above. Routed experts stay excluded (see the FusedMoE skip in
++        # lora_manager.init_lora_modules): at n_shared_experts=1 the routed
++        # per-expert dims EQUAL the shared dims, so a mis-wrap would corrupt
++        # silently rather than crash.
++        "gate_up_proj",
++        "down_proj",
++    ]
++
++    def get_hidden_dim(self, module_name: str, layer_idx: int):
++        """(input_dim, output_dim) of a LoRA target's base linear. Full
++        (unsharded) dims — attn-tp==1 replicates every attention projection, so
++        mem_pool sizes them full (the V4 leaves are in REPLICATED_LINEAR_LORA_NAMES)."""
++        config = self.config
++        head_dim = config.head_dim
++        if module_name == "wq_a":  # ReplicatedLinear(hidden, q_lora_rank)
++            return config.hidden_size, config.q_lora_rank
++        elif module_name == "wkv":  # ReplicatedLinear(hidden, head_dim)
++            return config.hidden_size, head_dim
++        elif module_name == "wq_b":  # ColumnParallel(q_lora_rank, n_heads*head_dim)
++            return config.q_lora_rank, config.num_attention_heads * head_dim
++        elif module_name == "wo_b":  # RowParallel(o_groups*o_lora_rank, hidden)
++            return config.o_groups * config.o_lora_rank, config.hidden_size
++        elif module_name == "wkv_gate":
++            # Fused compressor kv+gate ReplicatedLinear(hidden, 2*coff*head_dim),
++            # coff = 1 + (compress_ratio == 4). Per-layer via compress_ratios.
++            coff = 2 if config.compress_ratios[layer_idx] == 4 else 1
++            return config.hidden_size, 2 * coff * head_dim
++        elif module_name == "gate_up_proj":
++            # Shared-expert MergedColumnParallel (tp1). Stock convention: FULL
++            # stacked output dim (gate+up), cf. lora/utils.get_hidden_dim.
++            return (
++                config.hidden_size,
++                2 * config.moe_intermediate_size * config.n_shared_experts,
++            )
++        elif module_name == "down_proj":
++            # Shared-expert RowParallel (tp1) — full (unsharded) dims; both
++            # names are in lora_replicated_modules so mem_pool never divides
++            # them by the GLOBAL tp_size (the layer itself is tp1-replicated).
++            return (
++                config.moe_intermediate_size * config.n_shared_experts,
++                config.hidden_size,
++            )
++        else:
++            raise NotImplementedError(
++                f"get_hidden_dim not implemented for {module_name}"
++            )
++
++    def get_stacked_multiply(self, module_name: str) -> int:
++        # wkv_gate stacks two equal sub-projections (kv, gate) → n_slices=2.
++        if module_name == "wkv_gate":
++            return 2
++        from sglang.srt.lora.utils import get_stacked_multiply
++
++        return get_stacked_multiply(module_name)
++
+     def determine_num_fused_shared_experts(self):
+         self.num_fused_shared_experts = 0
+         if get_global_server_args().disable_shared_experts_fusion:
+@@ -1789,6 +1891,13 @@ class DeepseekV4ForCausalLM(nn.Module):
+                     "DeepEP Waterfill for DeepSeek V4 expects exactly one shared "
+                     f"expert, but got n_shared_experts={self.config.n_shared_experts}."
+                 )
++            if get_global_server_args().enable_lora:
++                raise ValueError(
++                    "DeepEP Waterfill fuses the shared expert into FusedMoE, so the "
++                    "separate shared_experts module V4 LoRA serving wraps (incl. "
++                    "shared-expert adapters) does not exist. Disable "
++                    "--enable-deepep-waterfill or --enable-lora."
++                )
+             self.num_fused_shared_experts = self.config.n_shared_experts
+             log_info_on_rank0(
+                 logger,
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index 44f339e..d7358eb 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -63,10 +63,13 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+         # and otherwise overflows on dp_rank > 0 when max_running_requests >
+         # chunked_prefill_size.
+-        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
++        # Spec decoding: a target-verify forward routes bs * num_draft_tokens rows
++        # (request-major blocks), so the decode-side bound must scale by the max
++        # draft width (adaptive spec exposes it via max_speculative_num_draft_tokens).
++        verify_tokens = server_args.max_speculative_num_draft_tokens or 1
+         max_batch_size = max(
+             server_args.chunked_prefill_size * server_args.dp_size,
+-            max_running_requests * server_args.dp_size,
++            max_running_requests * verify_tokens * server_args.dp_size,
+         )
+ 
+         super().__init__(
+@@ -95,11 +98,17 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+             )
+ 
+     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+-        if get_moe_a2a_backend().is_deepep():
++        # attn_tp==1 (dp-attention): every rank already sees its full local
++        # batch; the size-1 "all-gather" is a pointless collective plus an
++        # extra device copy on the decode path — skip it and write through.
++        if get_moe_a2a_backend().is_deepep() and get_attention_tp_size() > 1:
+             local_topk = topk_indices
+-            topk_indices = self.gather_buffer[
+-                : local_topk.size(0) * get_attention_tp_size()
+-            ]
++            gathered_rows = local_topk.size(0) * get_attention_tp_size()
++            assert gathered_rows <= self.gather_buffer.size(0), (
++                f"routed-experts gather overflow: {gathered_rows} rows > "
++                f"gather_buffer {self.gather_buffer.size(0)}"
++            )
++            topk_indices = self.gather_buffer[:gathered_rows]
+             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
+         super().capture(layer_id, topk_indices)
+ 
+diff --git a/python/sglang/srt/utils/common.py b/python/sglang/srt/utils/common.py
+index 9c28114..7d503bf 100644
+--- a/python/sglang/srt/utils/common.py
++++ b/python/sglang/srt/utils/common.py
+@@ -3678,6 +3678,13 @@ SUPPORTED_LORA_TARGET_MODULES = [
+     "gate_up_proj",
+     "embed_tokens",
+     "lm_head",
++    # DeepSeek-V4 MLA / compressor leaf module names (served leaf names, not the
++    # HF checkpoint names). ``wkv_gate`` is the fused compressor kv+gate proj.
++    "wq_a",
++    "wkv",
++    "wq_b",
++    "wo_b",
++    "wkv_gate",
+ ]
+ 
+ LORA_TARGET_ALL_MODULES = "all"

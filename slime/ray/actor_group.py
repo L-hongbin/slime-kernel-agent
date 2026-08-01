@@ -137,9 +137,30 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
+    def async_finalize_async_save(self, iteration, terminate=False, wake_if_offloaded=False):
+        """Finalize pending async saves in actor order and return their Ray refs."""
+        return [
+            actor.finalize_async_save.remote(
+                iteration,
+                terminate=terminate,
+                wake_if_offloaded=wake_if_offloaded,
+            )
+            for actor in self._actor_handlers
+        ]
+
     def save_model(self, rollout_id, force_sync=False):
-        """Save actor model"""
+        """Run the distributed checkpoint phase on every training actor."""
+        if getattr(self.args, "offload_train", False):
+            # Finish the all-rank wake phase before any actor is allowed into
+            # checkpoint collectives.
+            ray.get([actor.prepare_save_model.remote() for actor in self._actor_handlers])
         return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
+
+    def finish_save_model(self, rollout_id):
+        """Run rank-local HF export/offload only after checkpoint completion."""
+        if not getattr(self.args, "offload_train", False) and getattr(self.args, "save_hf", None) is None:
+            return None
+        return ray.get([actor.finish_save_model.remote(rollout_id) for actor in self._actor_handlers])
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""

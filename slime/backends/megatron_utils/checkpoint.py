@@ -166,6 +166,17 @@ def _patch_stub_optimizer_state_dict() -> None:
 
         setattr(Float16OptimizerWithFloat16Params, _name, _make(_orig))
 
+    _orig_load_state_dict = Float16OptimizerWithFloat16Params.load_state_dict
+
+    def _load_state_dict(self, state_dict):
+        if _is_stub(self):
+            if state_dict not in ({}, None):
+                raise RuntimeError("stub optimizer checkpoint must be empty; refusing unexpected optimizer state")
+            return None
+        return _orig_load_state_dict(self, state_dict)
+
+    Float16OptimizerWithFloat16Params.load_state_dict = _load_state_dict
+
 
 _patch_chained_optimizer_synchronize_steps()
 _patch_stub_optimizer_state_dict()
@@ -182,8 +193,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
         load_path
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
+    scheduler_group_overrides = None
+    if args.override_opt_param_scheduler and optimizer is not None and opt_param_scheduler is not None:
+        # Optimizer.load_state_dict restores per-group max_lr/min_lr from the
+        # checkpoint. Those values override the scheduler globals, so preserve
+        # the current launcher's group bounds across every optimizer load.
+        scheduler_group_overrides = [
+            {key: group[key] for key in ("max_lr", "min_lr") if key in group} for group in optimizer.param_groups
+        ]
+
     if _is_megatron_checkpoint(load_path):
-        return _load_checkpoint_megatron(
+        result = _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
@@ -191,12 +211,36 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
             skip_load_to_model_and_opt=skip_load_to_model_and_opt,
         )
     else:
-        return _load_checkpoint_hf(
+        result = _load_checkpoint_hf(
             ddp_model=ddp_model,
             optimizer=optimizer,
             args=args,
             load_path=load_path,
         )
+
+    if scheduler_group_overrides is not None:
+        if len(scheduler_group_overrides) != len(optimizer.param_groups):
+            raise RuntimeError(
+                "optimizer param-group count changed while loading checkpoint: "
+                f"{len(scheduler_group_overrides)} -> {len(optimizer.param_groups)}"
+            )
+        for group, current_values in zip(optimizer.param_groups, scheduler_group_overrides, strict=True):
+            for key in ("max_lr", "min_lr"):
+                if key in current_values:
+                    group[key] = current_values[key]
+                else:
+                    group.pop(key, None)
+        opt_param_scheduler.step(increment=0)
+        logger.info(
+            "Applied launcher LR bounds after optimizer load from %s: %s",
+            load_path,
+            [
+                {key: group.get(key) for key in ("lr", "max_lr", "min_lr", "lr_mult")}
+                for group in optimizer.param_groups
+            ],
+        )
+
+    return result
 
 
 def _is_megatron_checkpoint(path: str | Path) -> bool:

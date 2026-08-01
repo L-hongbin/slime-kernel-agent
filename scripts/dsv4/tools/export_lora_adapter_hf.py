@@ -2,7 +2,7 @@
 """Export an adapter-only Megatron distcp checkpoint to an HF/PEFT LoRA directory.
 
 Reads a ``torch.distributed.checkpoint`` ("distcp") directory that slime writes when
-``V4_LORA_ADAPTER_ONLY_CKPT=1`` (only the trainable LoRA adapter tensors — no frozen
+DS-V4 adapter-only checkpointing (only the trainable LoRA adapter tensors — no frozen
 base, no optimizer state) and emits a PEFT adapter directory
 (``adapter_model.safetensors`` + ``adapter_config.json``) that sglang can load via
 ``/load_lora_adapter``.
@@ -19,7 +19,7 @@ delta = scale * B @ A with scale = alpha/r classic, alpha/sqrt(r) under rsLoRA).
 exported ``lora_B`` tensors are RAW (unscaled); the adapter_config.json carries
 ``lora_alpha`` so sglang reproduces the same effective delta via its own
 ``scaling = lora_alpha / r``. This matches ``build_lora_adapter_state_dict`` exactly
-(``lora_alpha = scale * r``). **If the checkpoint was trained with V4_LORA_RSLORA=1
+(``lora_alpha = scale * r``). **If the checkpoint was trained with ``--lora-rslora``
 you MUST pass ``--rslora``** — the tensors alone cannot reveal the scaling mode, and
 exporting an rsLoRA-trained adapter without it serves a 4x-too-weak delta (at r=16).
 
@@ -55,7 +55,7 @@ from slime.backends.megatron_utils.update_weight.lora_adapter_sync import (
     is_adapter_param_name,
 )
 
-# --- authoritative expected contract (read off build_fake_adapter, V4_LORA_SHARED_EXPERT=1) ---
+# --- authoritative expected contract (read off build_fake_adapter with shared experts) ---
 # Module-path suffixes (layer index stripped) present under base_model.model.layers.{L}.
 # MANDATORY leaves appear on every decoder layer; OPTIONAL (compressor) leaves appear only
 # on layers that carry a compressor (compress_ratios[L] != 0).
@@ -179,7 +179,7 @@ def main() -> int:
     ap.add_argument(
         "--rslora",
         action="store_true",
-        help="checkpoint was trained with V4_LORA_RSLORA=1 (trainer scale alpha/sqrt(r)); "
+        help="checkpoint was trained with --lora-rslora (trainer scale alpha/sqrt(r)); "
         "exports the effective lora_alpha = alpha*sqrt(r) so sglang's lora_alpha/r "
         "reproduces the trainer scaling exactly",
     )

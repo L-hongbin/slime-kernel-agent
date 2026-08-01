@@ -9,13 +9,21 @@ import time
 from copy import deepcopy
 from typing import Any
 
+import numpy as np
+
 try:
     import ray
 except ImportError:
     ray = None
 
-from slime.rollout.sglang_rollout import GenerateState, _decode_routed_experts
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    _decode_routed_experts,
+    _empty_predictive_support,
+    _extract_predictive_support,
+)
 from slime.utils.http_utils import post
+from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
 from slime.utils.types import Sample
 
 try:
@@ -508,12 +516,23 @@ def _sample_for_turn(
     env_result: dict[str, Any],
     args: Any = None,
     meta_info: dict[str, Any] | None = None,
+    predictive_support: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> Sample:
     turn_sample = deepcopy(base_sample)
     turn_sample.tokens = prompt_ids + response_ids
     turn_sample.response = response
     turn_sample.response_length = len(response_ids)
     turn_sample.rollout_log_probs = log_probs
+    if predictive_support is None:
+        turn_sample.rollout_topk_token_ids = None
+        turn_sample.rollout_topk_log_probs = None
+        turn_sample.rollout_topk_valid_mask = None
+    else:
+        (
+            turn_sample.rollout_topk_token_ids,
+            turn_sample.rollout_topk_log_probs,
+            turn_sample.rollout_topk_valid_mask,
+        ) = predictive_support
     turn_sample.reward = reward
     turn_sample.status = status
     turn_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
@@ -557,6 +576,7 @@ def _pad_turn_samples(
     max_turns: int,
     pad_token_id: int | None,
     pad_token: str | None,
+    predictive_top_k: int = 0,
 ) -> list[Sample]:
     if pad_token_id is None or pad_token is None:
         raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
@@ -576,6 +596,16 @@ def _pad_turn_samples(
         fake_sample.response = pad_token
         fake_sample.response_length = 1
         fake_sample.rollout_log_probs = [0.0]
+        if predictive_top_k:
+            (
+                fake_sample.rollout_topk_token_ids,
+                fake_sample.rollout_topk_log_probs,
+                fake_sample.rollout_topk_valid_mask,
+            ) = _empty_predictive_support(1, predictive_top_k)
+        else:
+            fake_sample.rollout_topk_token_ids = None
+            fake_sample.rollout_topk_log_probs = None
+            fake_sample.rollout_topk_valid_mask = None
         fake_sample.reward = 0.0
         fake_sample.status = Sample.Status.COMPLETED
         # V4 routing replay: a pad turn has len(tokens)-1 == 0 replayable tokens,
@@ -649,6 +679,17 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
     aborted.response = ""
     aborted.response_length = 1
     aborted.rollout_log_probs = [0.0]
+    predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
+    if predictive_top_k:
+        (
+            aborted.rollout_topk_token_ids,
+            aborted.rollout_topk_log_probs,
+            aborted.rollout_topk_valid_mask,
+        ) = _empty_predictive_support(1, predictive_top_k)
+    else:
+        aborted.rollout_topk_token_ids = None
+        aborted.rollout_topk_log_probs = None
+        aborted.rollout_topk_valid_mask = None
     aborted.reward = 0.0
     aborted.status = Sample.Status.ABORTED
     aborted.group_id = sample.group_id if sample.group_id is not None else sample.index
@@ -673,6 +714,7 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
             max_turns=max_turns,
             pad_token_id=pad_token_id,
             pad_token=pad_token,
+            predictive_top_k=predictive_top_k,
         )
     return postprocess_turn_samples(args, output_samples, finish_reason="aborted")
 
@@ -760,6 +802,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
+        if predictive_top_k < 0:
+            raise ValueError(f"dppo_predictive_top_k must be non-negative, got {predictive_top_k}")
+        if predictive_top_k:
+            payload["top_logprobs_num"] = predictive_top_k
         # V4 MoE routing replay: ask the engine for the per-token routed-expert
         # indices so the train side can replay rollout routing (same request the
         # default slime rollout makes, sglang_rollout.py). Each turn is a
@@ -767,6 +814,14 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         # per-call payload aligns with the turn sample 1:1.
         if getattr(args, "use_rollout_routing_replay", False):
             payload["return_routed_experts"] = True
+        # Route to the currently-served (alternating) LoRA adapter, mirroring the
+        # default slime rollout (sglang_rollout.py generate). Without this the
+        # USE_LORA_WEIGHT_SYNC path would serve the base model on this custom
+        # rollout. The active name is refreshed onto the shared GenerateState by
+        # the RolloutManager each step; None -> base-only (unset lora_path).
+        lora_path = _rollout_lora_path(args, state.active_lora_name)
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
         output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
@@ -784,6 +839,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                     max_turns=max_turns,
                     pad_token_id=pad_token_id,
                     pad_token=pad_token,
+                    predictive_top_k=predictive_top_k,
                 )
             output_samples = postprocess_turn_samples(
                 args,
@@ -794,11 +850,27 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                 return output_samples
             return output_samples[-1] if output_samples else sample
 
-        token_logprobs = output["meta_info"].get("output_token_logprobs", [])
-        response_ids = [item[1] for item in token_logprobs]
-        log_probs = [item[0] for item in token_logprobs]
+        predictive_support = None
+        if predictive_top_k:
+            (
+                response_ids,
+                log_probs,
+                support_token_ids,
+                support_log_probs,
+                support_valid_mask,
+            ) = _extract_predictive_support(output["meta_info"], predictive_top_k)
+            predictive_support = (support_token_ids, support_log_probs, support_valid_mask)
+        else:
+            token_logprobs = output["meta_info"].get("output_token_logprobs", [])
+            response_ids = [item[1] for item in token_logprobs]
+            log_probs = [item[0] for item in token_logprobs]
         response = output["text"]
         if not response_ids:
+            if predictive_top_k and response:
+                raise ValueError(
+                    "SGLang returned non-empty response text without output_token_logprobs "
+                    "while predictive-mask support is enabled"
+                )
             response_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
             log_probs = [0.0] * len(response_ids)
 
@@ -824,6 +896,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             env_result=env_result,
             args=args,
             meta_info=output["meta_info"],
+            predictive_support=predictive_support,
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time
@@ -885,6 +958,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             max_turns=max_turns,
             pad_token_id=pad_token_id,
             pad_token=pad_token,
+            predictive_top_k=int(getattr(args, "dppo_predictive_top_k", 0) or 0),
         )
     output_samples = postprocess_turn_samples(
         args,

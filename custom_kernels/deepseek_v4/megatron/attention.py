@@ -17,44 +17,40 @@ The sliding-window causal mask (raw region) and the causal-threshold mask
 built.  The per-head ``sinks`` are passed to A1 (gpt-oss style, denom-only).
 """
 
-import os
-
 import torch
 from torch import nn
 from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4GroupedLinear
 
 from . import _kernels
 from .compressor import COMPRESSOR_CLASSES
+from .cp_utils import (
+    CP_HALO,
+    assert_local_len_aligned,
+    compressor_drop_windows,
+    cp_allgather_compressed,
+    cp_halo_exchange,
+    get_cp_info,
+)
 from .rope import V4RMSNorm, V4UnweightedRMSNorm, apply_rotary_pos_emb
 
-# Set V4_ATTENTION_TORCH=1 to use the exact torch reference path when TileLang/TVM
-# codegen is not stable on a target node. The reference computes in fp32, so cast
-# back to q dtype to preserve the module contract seen by the output projections.
-if os.environ.get("V4_ATTENTION_TORCH", "0") == "1":
-    from custom_kernels.deepseek_v4.attention.reference import attention_reference as _attention_reference
-
-    def _v4flash_attention(q, k_raw, k_comp, sinks, window, m):
-        return _attention_reference(q, k_raw, k_comp, sinks, window, m).to(q.dtype)
-
-else:
-    _v4flash_attention = _kernels.v4flash_attention
-
-
-# V4_SPARSE_ATTENTION=1: run the CSA lightning indexer + attend only to its top-k
-# compressed KV entries (the model's NATIVE sparse attention, dropped in the M0
-# dense-over-compressed path). Matches the sparse rollout. Currently routed through
-# the torch reference (exact); the A1 tilelang top-k mask is the perf follow-up.
-_SPARSE_ATTENTION = os.environ.get("V4_SPARSE_ATTENTION", "0") == "1"
-if _SPARSE_ATTENTION:
-    from custom_kernels.deepseek_v4.attention.reference import attention_reference as _sparse_attention_reference
+# Production always uses the validated TileLang kernel. Diagnostic harnesses
+# inject attention_reference explicitly instead of changing model behavior via
+# inherited process environment.
+_v4flash_attention = _kernels.v4flash_attention
 
 
 class V4Attention(nn.Module):
-    def __init__(self, config, layer_idx: int):
+    def __init__(self, config, layer_idx: int, *, layer_type_override: str | None = None):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.layer_type = config.layer_types[layer_idx]
+        # ``layer_type_override`` lets a caller build a variant decoupled from the
+        # per-layer schedule in ``config.layer_types``.  The V4 MTP head uses
+        # ``"sliding_attention"`` here: its attention has NO compressor/indexer
+        # (sglang builds the NextN attention with ``compress_ratio=0``, which uses the
+        # main RoPE + sliding window and skips the compressor), matching the fact that
+        # the checkpoint's ``mtp.0.attn.*`` subtree has no compressor/indexer tensors.
+        self.layer_type = layer_type_override if layer_type_override is not None else config.layer_types[layer_idx]
         self.rope_layer_type = "main" if self.layer_type == "sliding_attention" else "compress"
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
@@ -83,59 +79,25 @@ class V4Attention(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor, position_embeddings: dict) -> torch.Tensor:
-        # hidden_states: [B, S, hidden]  (HC-collapsed + input_layernorm'd by the layer)
-        input_shape = hidden_states.shape[:-1]  # (B, S)
+        # hidden_states: [B, S, hidden]  (HC-collapsed + input_layernorm'd by the layer).
+        # Under context parallelism (CP2) S is the rank's LOCAL contiguous shard length
+        # l_local; the receptive field is completed by a left-halo exchange + a
+        # compressed all-gather (see cp_utils).  cp_size==1 takes the original path,
+        # bit-identical to pre-CP behavior (no CP op is constructed).
+        input_shape = hidden_states.shape[:-1]  # (B, l_local)
         hidden_shape = (*input_shape, -1, self.head_dim)
         cos, sin = position_embeddings[self.rope_layer_type]
 
         q_residual = self.q_a_norm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_residual).view(*hidden_shape).transpose(1, 2)  # [B,H,S,D]
         q = self.q_b_norm(q)
-        q = apply_rotary_pos_emb(q, cos, sin)
+        q = apply_rotary_pos_emb(q, cos, sin)  # LOCAL queries; cos/sin carry global positions under CP
 
-        kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)  # [B,1,S,D]
-        kv = apply_rotary_pos_emb(kv, cos, sin)
-
-        k_comp = None
-        if self.compressor is not None:
-            k_comp = self.compressor(hidden_states)  # [B,1,T,head_dim] post-RoPE, or T==0
-            if k_comp.shape[2] == 0:
-                k_comp = None
-
-        # A1: shared-KV MQA (k_raw==v), per-head sink, structural sliding-window +
-        # causal-threshold compressed masks.  Returns [B,H,S,D] pre-o_proj.
-        comp_topk_mask = None
-        if _SPARSE_ATTENTION and k_comp is not None and hasattr(self.compressor, "indexer"):
-            # CSA lightning indexer -> top-k compressed selection [B,S,k], then a
-            # [B,S,Tcomp] bool mask (scatter; -1 sentinel -> discarded slot 0).
-            B, S = input_shape
-            pos = torch.arange(S, device=hidden_states.device).unsqueeze(0).expand(B, -1)
-            tki = self.compressor.indexer(hidden_states, q_residual, pos, None, self.layer_idx)  # [B,S,k]
-            t_comp = k_comp.shape[2]
-            scat = torch.zeros(B, S, t_comp + 1, dtype=torch.bool, device=hidden_states.device)
-            scat.scatter_(2, (tki.clamp(min=-1) + 1).long(), True)
-            comp_topk_mask = scat[:, :, 1:]
-        if comp_topk_mask is not None:
-            attn_output = _sparse_attention_reference(
-                q.contiguous(),
-                kv.contiguous(),
-                k_comp.contiguous(),
-                self.sinks,
-                self.sliding_window,
-                self.compress_rate,
-                comp_topk_mask=comp_topk_mask,
-            ).to(
-                q.dtype
-            )  # [B,H,S,D]
+        cp_info = get_cp_info()
+        if cp_info.enabled:
+            attn_output = self._forward_attn_cp(hidden_states, position_embeddings, cos, sin, q, cp_info, input_shape)
         else:
-            attn_output = _v4flash_attention(
-                q.contiguous(),
-                kv.contiguous(),
-                None if k_comp is None else k_comp.contiguous(),
-                self.sinks,
-                self.sliding_window,
-                self.compress_rate,
-            )  # [B,H,S,D]
+            attn_output = self._forward_attn_local(hidden_states, hidden_shape, cos, sin, q, q_residual, input_shape)
 
         # HF eager hands back [B,S,H,D] (it transposes 1<->2 at the end); A1 gives
         # [B,H,S,D], so transpose to match HF's layout before the conjugate RoPE.
@@ -150,6 +112,85 @@ class V4Attention(nn.Module):
         grouped = self.o_a_proj(grouped).flatten(2)
         output = self.o_b_proj(grouped)
         return output
+
+    def _forward_attn_local(self, hidden_states, hidden_shape, cos, sin, q, q_residual, input_shape):
+        """Non-CP (cp_size==1) attention core -- the original whole-sequence path.
+
+        Returns the pre-o_proj attention output ``[B,H,S,D]``.  Kept byte-identical to
+        the pre-CP forward so ``cp_size==1`` is unchanged."""
+        kv = self.kv_norm(self.kv_proj(hidden_states)).view(*hidden_shape).transpose(1, 2)  # [B,1,S,D]
+        kv = apply_rotary_pos_emb(kv, cos, sin)
+
+        k_comp = None
+        if self.compressor is not None:
+            k_comp = self.compressor(hidden_states)  # [B,1,T,head_dim] post-RoPE, or T==0
+            if k_comp.shape[2] == 0:
+                k_comp = None
+
+        # A1: shared-KV MQA (k_raw==v), per-head sink, structural sliding-window +
+        # causal-threshold compressed masks.  Returns [B,H,S,D] pre-o_proj.
+        # The maintained trainer path is dense over the compressed region.
+        return _v4flash_attention(
+            q.contiguous(),
+            kv.contiguous(),
+            None if k_comp is None else k_comp.contiguous(),
+            self.sinks,
+            self.sliding_window,
+            self.compress_rate,
+            comp_topk_mask=None,
+        )  # [B,H,S,D]
+
+    def _forward_attn_cp(self, hidden_states, position_embeddings, cos, sin, q, cp_info, input_shape):
+        """Context-parallel (cp_size>1) attention core (design CP2 dataflow §4).
+
+        halo exchange -> local kv_proj over ``[halo || local]`` -> local compressor with
+        global position offset + boundary-window drop -> all-gather the owned compressed
+        windows into the global comp axis -> ONE A1 kernel call with ``q_pos0`` /
+        ``raw_halo``.  The halo rows' gradient flows back through the SAME
+        ``cp_halo_exchange`` (it feeds both kv_proj and the compressor), and the global
+        ``dk_comp`` reduce-scatters to owners inside ``cp_allgather_compressed`` -- no
+        hand-routed boundary gradients.  Returns ``[B,H,l_local,D]`` pre-o_proj.
+        """
+        B, l_local = input_shape
+        assert_local_len_aligned(l_local, cp_info)
+        this_halo = cp_info.local_halo(CP_HALO)  # 128 for rank>0, 0 for rank0
+        global_start = cp_info.global_start(l_local)  # rank * l_local (contiguous partition)
+
+        # ONE shared halo exchange feeding BOTH kv_proj and the compressor (design M5).
+        hidden_haloed = cp_halo_exchange(hidden_states, cp_info)  # [B, this_halo+l_local, H]
+        kv_len = hidden_haloed.shape[1]
+        kv_shape = (B, kv_len, -1, self.head_dim)
+        kv = self.kv_norm(self.kv_proj(hidden_haloed)).view(*kv_shape).transpose(1, 2)  # [B,1,this_halo+l_local,D]
+        if this_halo > 0:
+            # k_raw spans global positions [global_start-halo, global_start+l_local);
+            # rank0 (this_halo==0) reuses the local (== global) cos/sin.
+            cos_kv, sin_kv = position_embeddings[self.rope_layer_type + "_haloed"]
+        else:
+            cos_kv, sin_kv = cos, sin
+        kv = apply_rotary_pos_emb(kv, cos_kv, sin_kv)
+
+        k_comp = None
+        if self.compressor is not None:
+            drop = compressor_drop_windows(this_halo, self.compress_rate)  # halo // m (CSA 32 / HCA 1)
+            k_comp_local = self.compressor(
+                hidden_haloed, position_offset=global_start - this_halo, drop_windows=drop
+            )  # [B,1,l_local/m,head_dim] -- the windows this rank OWNS
+            if k_comp_local.shape[2] > 0:
+                # All-gather owned windows -> global comp axis (rank order); the causal
+                # threshold inside A1 masks each rank's future (other-rank) windows.
+                k_comp = cp_allgather_compressed(k_comp_local, cp_info)  # [B,1,S/m,head_dim]
+
+        return _v4flash_attention(
+            q.contiguous(),
+            kv.contiguous(),
+            None if k_comp is None else k_comp.contiguous(),
+            self.sinks,
+            self.sliding_window,
+            self.compress_rate,
+            comp_topk_mask=None,
+            q_pos0=global_start,
+            raw_halo=this_halo,
+        )  # [B,H,l_local,D]
 
 
 __all__ = ["V4Attention"]

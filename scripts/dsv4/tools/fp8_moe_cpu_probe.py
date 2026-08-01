@@ -6,6 +6,7 @@ source-derived quantization recipes against one real expert from the serialized
 FP8 checkpoint.  It is not a replacement for a CUDA DeepGEMM/sgl_kernel probe.
 """
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -14,23 +15,16 @@ import torch
 from safetensors.torch import load_file
 
 
-CKPT = Path(
-    os.environ.get(
-        "V4_FP8_CKPT",
-        "/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8",
-    )
-)
-LAYER = int(os.environ.get("V4_PROBE_LAYER", "3"))
-EXPERT = int(os.environ.get("V4_PROBE_EXPERT", "0"))
+DEFAULT_CKPT = Path("/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8")
 BLK = 128
 FP8_MAX = 448.0
 SWIGLU_LIMIT = 10.0
 
 
-def load_tensor(key: str) -> torch.Tensor:
-    with (CKPT / "model.safetensors.index.json").open() as f:
+def load_tensor(checkpoint: Path, key: str) -> torch.Tensor:
+    with (checkpoint / "model.safetensors.index.json").open() as f:
         index = json.load(f)["weight_map"]
-    path = CKPT / index[key]
+    path = checkpoint / index[key]
     return load_file(str(path), device="cpu")[key]
 
 
@@ -125,18 +119,24 @@ def compare_outputs(name, ref, cmp):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CKPT)
+    parser.add_argument("--layer", type=int, default=3)
+    parser.add_argument("--expert", type=int, default=0)
+    args = parser.parse_args()
+
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "4")))
     torch.manual_seed(1234)
 
-    base = f"layers.{LAYER}.ffn.experts.{EXPERT}"
-    w1_q = load_tensor(f"{base}.w1.weight")
-    s1 = load_tensor(f"{base}.w1.scale")
-    w3_q = load_tensor(f"{base}.w3.weight")
-    s3 = load_tensor(f"{base}.w3.scale")
-    w2_q = load_tensor(f"{base}.w2.weight")
-    s2 = load_tensor(f"{base}.w2.scale")
-    print(f"checkpoint={CKPT}")
-    print(f"layer={LAYER} expert={EXPERT}")
+    base = f"layers.{args.layer}.ffn.experts.{args.expert}"
+    w1_q = load_tensor(args.checkpoint, f"{base}.w1.weight")
+    s1 = load_tensor(args.checkpoint, f"{base}.w1.scale")
+    w3_q = load_tensor(args.checkpoint, f"{base}.w3.weight")
+    s3 = load_tensor(args.checkpoint, f"{base}.w3.scale")
+    w2_q = load_tensor(args.checkpoint, f"{base}.w2.weight")
+    s2 = load_tensor(args.checkpoint, f"{base}.w2.scale")
+    print(f"checkpoint={args.checkpoint}")
+    print(f"layer={args.layer} expert={args.expert}")
     print("w1", tuple(w1_q.shape), w1_q.dtype, tuple(s1.shape), s1.dtype)
     print("w3", tuple(w3_q.shape), w3_q.dtype, tuple(s3.shape), s3.dtype)
     print("w2", tuple(w2_q.shape), w2_q.dtype, tuple(s2.shape), s2.dtype)

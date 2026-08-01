@@ -24,7 +24,13 @@ def _read_config(hf_ckpt: str) -> dict:
         return json.load(f)
 
 
-def build_fake_adapter(cfg: dict, rank: int, b_scale: float = 0.0) -> tuple[dict, dict]:
+def build_fake_adapter(
+    cfg: dict,
+    rank: int,
+    b_scale: float = 0.0,
+    *,
+    shared_expert: bool = False,
+) -> tuple[dict, dict]:
     """PEFT state-dict + config matching the V4 served leaf modules/shapes.
 
     Names mirror slime's converter output (base_model.model.layers.N.attn.*).
@@ -80,7 +86,7 @@ def build_fake_adapter(cfg: dict, rank: int, b_scale: float = 0.0) -> tuple[dict
                 sd[f"{pre}.compressor.{leaf}.lora_B.weight"] = b
 
     target_modules = ["wq_a", "wq_b", "wkv", "wo_b", "wgate"]
-    if os.environ.get("V4_LORA_SHARED_EXPERT", "0") == "1":
+    if shared_expert:
         # Shared-expert adapters, NATIVE leaf names exactly as slime's exporter
         # emits them (w1=gate, w3=up, w2=down): sglang renames + stacks w1/w3
         # into the tp1-replicated gate_up_proj and serves w2 as down_proj.
@@ -135,7 +141,6 @@ def load_adapter(base: str, name: str, tensors: dict, config_dict: dict) -> tupl
     shared memory object ... No such file"), crashing the server. Returns (resp, dir);
     the caller frees the dir on unload/reuse."""
     import json
-    import os
     import tempfile
 
     from safetensors.torch import save_file
@@ -172,7 +177,6 @@ def _dump_cycle_state(step: int) -> None:
     leftover torch_* IPC files (should stay ~0 on the disk path), our adapter-dir
     count (should stay bounded ~2), and GPU0 memory."""
     import glob
-    import os
     import shutil
     import subprocess
 
@@ -261,6 +265,7 @@ def main() -> int:
     )
     ap.add_argument("--iters", type=int, default=4)
     ap.add_argument("--b-scale", type=float, default=0.0)
+    ap.add_argument("--shared-expert", action="store_true")
     ap.add_argument(
         "--mode",
         choices=("same-slot", "alternating"),
@@ -310,7 +315,12 @@ def main() -> int:
                 assert r.status_code == 200, r.text
                 _rmtree(prev_dir)
 
-            tensors, config_dict = build_fake_adapter(cfg, args.rank, b_scale=args.b_scale)
+            tensors, config_dict = build_fake_adapter(
+                cfg,
+                args.rank,
+                b_scale=args.b_scale,
+                shared_expert=args.shared_expert,
+            )
             r, prev_dir = load_adapter(base, name, tensors, config_dict)
             print(f"[driver] step {i} load -> {r.status_code}", flush=True)
             assert r.status_code == 200, r.text
@@ -359,7 +369,12 @@ def _run_alternating(base: str, cfg: dict, args) -> int:
             # Reusing an alternating name: drop its stale dir (from 2 cycles ago).
             _rmtree(dirs.pop(new_name, None))
             # LOAD new first (old still resident + cuda-graph-referenced).
-            tensors, config_dict = build_fake_adapter(cfg, args.rank, b_scale=args.b_scale)
+            tensors, config_dict = build_fake_adapter(
+                cfg,
+                args.rank,
+                b_scale=args.b_scale,
+                shared_expert=args.shared_expert,
+            )
             r, dirs[new_name] = load_adapter(base, new_name, tensors, config_dict)
             print(f"[driver] step {i} load {new_name} -> {r.status_code}", flush=True)
             assert r.status_code == 200, r.text

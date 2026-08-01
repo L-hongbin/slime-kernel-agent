@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import torch
 
 
@@ -32,6 +33,14 @@ class Sample:
     loss_mask: list[int] | None = None
     weight_versions: list[str] = field(default_factory=list)
     rollout_log_probs: list[float] | None = None  # Log probabilities from rollout engine
+    # Compact behavior-policy support used by predictive-mask DPPO.  Each
+    # response-token row has width ``dppo_predictive_top_k + 1``: the rollout
+    # top-k tokens plus (when it was outside top-k) the sampled token.  Invalid
+    # padding slots are selected by ``rollout_topk_valid_mask`` rather than a
+    # sentinel token id, since token id 0 is a valid vocabulary item.
+    rollout_topk_token_ids: np.ndarray | None = None
+    rollout_topk_log_probs: np.ndarray | None = None
+    rollout_topk_valid_mask: np.ndarray | None = None
     rollout_routed_experts: list[list[int]] | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
@@ -233,7 +242,7 @@ class ParamInfo:
 # A dict-based batch produced along the rollout -> training path
 # In Megatron backend, several fields are converted to torch.Tensor lists on GPU
 # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
-RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
+RolloutBatch = dict[str, list[torch.Tensor] | list[np.ndarray] | list[int] | list[float] | list[str]]
 
 
 @dataclass

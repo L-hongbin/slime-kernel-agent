@@ -11,8 +11,6 @@ copy of:
   * ``DeepseekV4RMSNorm`` / ``DeepseekV4UnweightedRMSNorm`` (HF:46 / :66)
 """
 
-import os
-
 import torch
 from torch import nn
 
@@ -38,10 +36,8 @@ class V4RMSNorm(nn.Module):
         hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
         # Match sglang's RMSNorm (cast_x_before_out_mul=False, its default): apply the
         # weight in fp32 and cast the PRODUCT to the I/O dtype, rather than HF's
-        # `weight * x.to(bf16)` (cast the normalized x first). Aligns train→rollout;
-        # differs from HF eager by ~1 bf16 ulp. Env V4_RMSNORM_HF=1 reverts to HF order.
-        if os.environ.get("V4_RMSNORM_HF", "0") == "1":
-            return self.weight * hidden_states.to(input_dtype)
+        # `weight * x.to(bf16)` (cast the normalized x first). Aligns train→rollout
+        # and differs from HF eager by about one bf16 ulp.
         return (self.weight * hidden_states).to(input_dtype)
 
 

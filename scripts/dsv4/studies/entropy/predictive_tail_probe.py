@@ -55,21 +55,8 @@ FORMAT_SCORE = "predictive-tail-train-score-v1"
 # arithmetic switches printed by the active r21 launcher.  CP remains 1 in
 # this eight-GPU diagnostic (the formal run is CP2/EP8 on 16 GPUs), so the
 # absolute endpoint is production-like rather than production-identical.
-R21_TRAIN_ENV = {
+DSV4_TRAIN_ENV = {
     "V4_FP4_FROZEN_EXPERTS": "1",
-    "V4_FP4_EXPERT_GEMM": "0",
-    "V4_FP8_FROZEN_EXPERTS": "0",
-    "V4_FP8_EXPERT_GEMM": "0",
-    "V4_FP8_SHARED_EXPERT": "0",
-    "V4_FP8_ATTENTION": "0",
-    "V4_FUSED_SILU_QUANT": "0",
-    "V4_SHARED_EXPERT_ALIGN_ACT": "1",
-    "V4_MHC_POST_FP32_COMBINE": "1",
-    "V4_QUANT_DIV_ALIGN": "1",
-    "V4_LORA_SHARED_EXPERT": "1",
-    # Exported adapters encode the rsLoRA effective scale in lora_alpha, so
-    # the standalone wrapper must apply ordinary alpha/r scaling once.
-    "V4_LORA_RSLORA": "0",
 }
 
 
@@ -177,8 +164,8 @@ def write_torch(payload: dict[str, Any], output: Path) -> None:
 def configure_train_environment(profile: str) -> dict[str, str]:
     if profile != "r21":
         raise ValueError(f"unsupported train environment profile {profile!r}")
-    os.environ.update(R21_TRAIN_ENV)
-    return {key: os.environ[key] for key in R21_TRAIN_ENV}
+    os.environ.update(DSV4_TRAIN_ENV)
+    return {key: os.environ[key] for key in DSV4_TRAIN_ENV}
 
 
 def review_preview(content: str, width: int = 1200) -> str:
@@ -608,9 +595,16 @@ def load_adapter_into_model(model: torch.nn.Module, adapter_dir: Path) -> dict[s
     config = json.loads((adapter_dir / "adapter_config.json").read_text())
     rank = int(config["r"])
     effective_alpha = float(config["lora_alpha"])
-    os.environ["V4_LORA_SHARED_EXPERT"] = "1"
-    os.environ["V4_LORA_RSLORA"] = "0"
-    model = apply_v4_lora(model, dim=rank, alpha=effective_alpha, dropout=0.0).eval()
+    # Exported adapters encode rsLoRA's effective scale in lora_alpha, so the
+    # standalone wrapper applies ordinary alpha/r scaling exactly once.
+    model = apply_v4_lora(
+        model,
+        dim=rank,
+        alpha=effective_alpha,
+        dropout=0.0,
+        rslora=False,
+        shared_expert=True,
+    ).eval()
     state = load_file(str(adapter_dir / "adapter_model.safetensors"), device="cpu")
     loaded: set[str] = set()
     with torch.no_grad():

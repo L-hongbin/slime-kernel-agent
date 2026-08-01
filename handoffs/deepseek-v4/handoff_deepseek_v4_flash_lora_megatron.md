@@ -497,8 +497,8 @@ adapter-only save is **22 MB** (0.0265% — 244 adapter keys / 10.86 MB per rank
 the 41 GB full model dict). Resume RE-LOADS the adapters and CONTINUES training:
 `V4 LoRA adapter resume: loaded adapters ... at iteration 1` → step0 loss -0.037
 grad_norm 0.119 → `run finished OK`.
-`V4_LORA_ADAPTER_ONLY_CKPT=1` writes MB-scale LoRA checkpoints;
-`V4_LORA_ADAPTER_RESUME_LOAD=<adapter ckpt dir>` overlays adapters on the
+Positive `--lora-dim` writes MB-scale LoRA checkpoints;
+`--lora-adapter-resume-load <adapter ckpt dir>` overlays adapters on the
 cold-loaded base and continues from the checkpoint iteration.
 
 Three per-node-`/nfs` issues fixed along the way (torch_dist writes shared files
@@ -519,7 +519,7 @@ bypassed and the full base was written. Fix: `adapter_ckpt.py` wraps
 "flat-buffer view" theory was WRONG — the adapter ShardedTensors are genuinely
 tiny once the filter actually runs. Implementation:
 `slime/backends/megatron_utils/adapter_ckpt.py` (`adapter_only_model_save/load`,
-requires_grad-keyed filter, `V4_LORA_ADAPTER_CKPT_DEBUG=1` logs sizes + aborts
+requires_grad-keyed filter, with size validation that aborts
 before write), wired in `model.py::save` and `actor.py` (`load_adapter_resume`,
 init overlay). Muon optimizer-save stub crashes fixed en route
 (`checkpoint.py` patches `ChainedOptimizer._synchronize_steps` +
@@ -539,8 +539,8 @@ Execution-ready (injection points located):
   save_checkpoint` -> `generate_state_dict` (checkpointing.py:877) ->
   `model[i].sharded_state_dict()` (:903). Inject by filtering the model's
   `sharded_state_dict` to adapter keys during save (drop `_extra_state`, per
-  bridge `apply_peft_adapter_filter_to_state_dict`, checkpointing.py:2594). Gate
-  behind a flag (e.g. `V4_LORA_ADAPTER_ONLY_CKPT`), default OFF = current full save.
+  bridge `apply_peft_adapter_filter_to_state_dict`, checkpointing.py:2594). The
+  implemented contract now enables this automatically whenever `--lora-dim > 0`.
 - **Resume (two-source)**: base still loads cold from the torch_dist `--load`
   (existing path). Then overlay adapters via the `load_other_checkpoint`
   (`actor.py:740`) pattern (no_load_optim/rng, finetune=True) pointed at the

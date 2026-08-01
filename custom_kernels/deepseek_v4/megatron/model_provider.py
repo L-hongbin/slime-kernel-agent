@@ -35,12 +35,18 @@ def make_transformer_config(
     tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
     expert_model_parallel_size=1,
+    context_parallel_size=1,
     moe_token_dispatcher_type=None,
     moe_flex_dispatcher_backend="deepep",
     moe_router_dtype="fp32",
     moe_deepep_num_sms=20,
     num_layers_in_first_pipeline_stage=None,
     num_layers_in_last_pipeline_stage=None,
+    enable_mtp=False,
+    mtp_loss_scaling_factor=0.2,
+    recompute_granularity=None,
+    recompute_method=None,
+    recompute_num_layers=None,
 ) -> TransformerConfig:
     """Build a minimal-but-valid Megatron ``TransformerConfig`` for the V4
     ``LanguageModule`` base + embedding + output_layer at TP=PP=EP=1.
@@ -85,7 +91,10 @@ def make_transformer_config(
         pipeline_model_parallel_size=pipeline_model_parallel_size,
         expert_model_parallel_size=expert_model_parallel_size,
         expert_tensor_parallel_size=1,
-        context_parallel_size=1,
+        # V4 CP2 (context parallelism): bshd-contiguous, left-halo + compressed-allgather
+        # orchestration (cp_utils / attention CP path).  sequence_parallel stays False
+        # (V4 attention/compressor/mHC are replicated, not TP/SP-sharded).
+        context_parallel_size=context_parallel_size,
         sequence_parallel=False,
         # dtype / init.
         params_dtype=params_dtype,
@@ -102,11 +111,21 @@ def make_transformer_config(
         # silently corrupt a real (training-mode) forward.  Pin to 0.
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        recompute_granularity=recompute_granularity,
+        recompute_method=recompute_method,
+        recompute_num_layers=recompute_num_layers,
         **moe_kwargs,
         **pp_kwargs,
     )
     # max_position_embeddings is not a TransformerConfig field; stash it for the model.
     cfg.max_position_embeddings = hf_config.max_position_embeddings
+    # MTP: setting ``mtp_num_layers`` is what makes Megatron's schedule set the
+    # ``MTPLossAutoScaler`` loss scale (schedules.py:298-309); ``mtp_loss_scaling_factor``
+    # weights the MTP loss (V4 default 0.2; Megatron's own default is 0.1).  Left at
+    # None when MTP is off so behavior is unchanged.
+    if enable_mtp:
+        cfg.mtp_num_layers = 1
+        cfg.mtp_loss_scaling_factor = mtp_loss_scaling_factor
     return cfg
 
 
@@ -127,9 +146,11 @@ def resolve_v4_layer_ids(
 @torch.no_grad()
 def init_v4_module_weights(model, hf_config):
     """Initialize the V4 modules' params that default to ``torch.empty`` (HF builds these
-    via ``_init_weights``, which the mcore build path does NOT run).  Without this the
-    routers / experts / hc_head are uninitialized (zeros/garbage) and the forward NaNs —
-    the M0_NOTES "uninit router weight -> NaN" trap, now hit through the real provider.
+    via ``_init_weights``, which the mcore build path does NOT run).  Without this a
+    RANDOM-INIT forward NaNs (the M0_NOTES "uninit router weight -> NaN" trap).  Only
+    for harnesses that forward without loading a checkpoint (``init_weights=True``);
+    checkpoint-loading paths skip it so a load gap fails loudly instead of being
+    masked by plausible random values.
 
     Mirrors HF ``DeepseekV4PreTrainedModel._init_weights`` for the trainable tensors that
     should start from normal/zero/one values. The one deliberate R1 smoke divergence is
@@ -157,8 +178,16 @@ def init_v4_module_weights(model, hf_config):
                     dtype=torch.long,
                 )
         elif isinstance(m, V4GroupedExperts):
-            nn.init.normal_(m.gate_up_proj, mean=0.0, std=std)
-            nn.init.normal_(m.down_proj, mean=0.0, std=std)
+            if getattr(m, "_experts_fp4", False):
+                # Packed-MXFP4 mode (random-init smokes): random E2M1 nibbles with a
+                # small fixed E8M0 scale (2^-6 ~ byte 121, the checkpoint's modal
+                # scale) — gives finite, sanely-scaled random experts.
+                for name in ("gate_up_proj", "down_proj"):
+                    getattr(m, f"{name}_fp4").random_(0, 256)
+                    getattr(m, f"{name}_sf").fill_(121)
+            else:
+                nn.init.normal_(m.gate_up_proj, mean=0.0, std=std)
+                nn.init.normal_(m.down_proj, mean=0.0, std=std)
         elif isinstance(m, DeepseekV4HyperHead):
             nn.init.normal_(m.hc_fn, mean=0.0, std=std)
             nn.init.zeros_(m.hc_base)
@@ -174,12 +203,13 @@ def build_v4_mcore_model(
     pre_process=True,
     post_process=True,
     params_dtype=torch.bfloat16,
-    init_weights=True,
+    init_weights=False,
     layer_ids: list[int] | tuple[int, ...] | None = None,
     expert_model_parallel_size=1,
     expert_model_parallel_rank=0,
     tensor_model_parallel_size=1,
     pipeline_model_parallel_size=1,
+    context_parallel_size=1,
     moe_token_dispatcher_type=None,
     moe_flex_dispatcher_backend="deepep",
     moe_router_dtype="fp32",
@@ -187,18 +217,32 @@ def build_v4_mcore_model(
     num_layers_in_first_pipeline_stage=None,
     num_layers_in_last_pipeline_stage=None,
     vp_stage=None,
+    enable_mtp=None,
+    mtp_loss_scaling_factor=0.2,
+    recompute_granularity=None,
+    recompute_method=None,
+    recompute_num_layers=None,
 ) -> V4LanguageModel:
     """Build the V4 mcore model from an HF ``DeepseekV4Config``.
 
-    ``init_weights`` (default True) runs ``init_v4_module_weights`` so the torch.empty
-    router/expert/hc_head params are sane (else a random-init forward NaNs).  Pass
-    ``init_weights=False`` when the caller immediately overwrites via load_state_dict
-    (the parity harness does, to keep its exact HF-copied weights)."""
+    ``init_weights`` (default False) leaves the torch.empty router/expert/hc_head
+    params UNINITIALIZED — correct for every checkpoint-loading path (the load
+    overwrites them; LoRA adapters self-init at wrap time), and a tensor a buggy
+    load misses fails LOUDLY as a NaN forward instead of being masked by
+    plausible random values.  Random-init harnesses that forward without a
+    checkpoint need initialized params: the r3 archive smokes pass
+    ``init_weights=True``; mcore_smoke/sft_sanity/lora_validate self-init
+    inline after build (predating this helper) — equivalent effect.
+
+    ``enable_mtp`` builds the V4 MTP head on the last PP stage.  Off by default
+    (None -> False) so behavior is unchanged."""
+    enable_mtp_resolved = bool(enable_mtp)
     cfg = make_transformer_config(
         hf_config,
         params_dtype=params_dtype,
         tensor_model_parallel_size=tensor_model_parallel_size,
         pipeline_model_parallel_size=pipeline_model_parallel_size,
+        context_parallel_size=context_parallel_size,
         expert_model_parallel_size=expert_model_parallel_size,
         moe_token_dispatcher_type=moe_token_dispatcher_type,
         moe_flex_dispatcher_backend=moe_flex_dispatcher_backend,
@@ -206,6 +250,11 @@ def build_v4_mcore_model(
         moe_deepep_num_sms=moe_deepep_num_sms,
         num_layers_in_first_pipeline_stage=num_layers_in_first_pipeline_stage,
         num_layers_in_last_pipeline_stage=num_layers_in_last_pipeline_stage,
+        enable_mtp=enable_mtp_resolved,
+        mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+        recompute_granularity=recompute_granularity,
+        recompute_method=recompute_method,
+        recompute_num_layers=recompute_num_layers,
     )
     if layer_ids is None and pipeline_model_parallel_size > 1:
         layer_ids = resolve_v4_layer_ids(cfg, vp_stage=vp_stage)
@@ -217,6 +266,7 @@ def build_v4_mcore_model(
         layer_ids=layer_ids,
         expert_model_parallel_size=expert_model_parallel_size,
         expert_model_parallel_rank=expert_model_parallel_rank,
+        enable_mtp=enable_mtp_resolved,
     )
     if init_weights:
         init_v4_module_weights(model, hf_config)
@@ -224,30 +274,71 @@ def build_v4_mcore_model(
 
 
 def _v4_lora_cfg(args):
-    """Resolve LoRA config from args (if registered) else env vars.  slime's Megatron
-    parser uses ``ignore_unknown_args=True``, so a bare ``--v4-lora-dim`` CLI flag is
-    silently dropped — the launcher therefore passes these via env vars
-    (``V4_LORA_DIM`` / ``V4_LORA_ALPHA`` / ``V4_LORA_DROPOUT``).  args take precedence
-    if present (e.g. a future custom-arg provider registers them)."""
-    import os
+    """Validate and resolve the registered LoRA training arguments."""
 
-    dim = getattr(args, "v4_lora_dim", None)
-    if dim is None:
-        dim = os.environ.get("V4_LORA_DIM", 0)
-    dim = int(dim or 0)
-    alpha = getattr(args, "v4_lora_alpha", None)
-    if alpha is None:
-        alpha = os.environ.get("V4_LORA_ALPHA", 2 * dim)
-    dropout = getattr(args, "v4_lora_dropout", None)
-    if dropout is None:
-        dropout = os.environ.get("V4_LORA_DROPOUT", 0.0)
-    return dim, int(alpha or 2 * dim), float(dropout or 0.0)
+    dim = int(getattr(args, "lora_dim", 0) or 0)
+    alpha_arg = getattr(args, "lora_alpha", None)
+    alpha = int(alpha_arg) if alpha_arg is not None else 2 * dim
+    dropout = float(getattr(args, "lora_dropout", 0.0) or 0.0)
+    if dim < 0:
+        raise ValueError(f"--lora-dim must be non-negative, got {dim}")
+    if dim > 0 and alpha <= 0:
+        raise ValueError(f"--lora-alpha must be positive when LoRA is enabled, got {alpha}")
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"--lora-dropout must be in [0, 1), got {dropout}")
+    return dim, alpha, dropout
+
+
+def _v4_full_recompute_enabled(
+    recompute_granularity,
+    recompute_method,
+    recompute_num_layers,
+):
+    """Validate V4's user-facing recompute contract and return whether it is on.
+
+    The V4 model owns a hand-written decoder loop, so Megatron Core's
+    ``TransformerBlock`` recompute implementation is not on its forward path.
+    We reproduce Megatron's *full-layer* methods in ``mcore_model``:
+
+    * ``full + uniform + N`` checkpoints every layer in N-layer segments.
+    * ``full + block + K`` checkpoints the first K local decoder layers and
+      stores the remaining layer activations.  This is the supported V4
+      memory-for-speed dial (and matches Megatron's block semantics).
+
+    Megatron's ``selective`` granularity is a different, submodule-level
+    feature driven by ``recompute_modules`` hooks.  V4 attention/MoE modules do
+    not implement those hooks, so accepting it would silently run with no
+    activation recompute.  Reject it until those custom modules are wired.
+    """
+    if recompute_granularity is None:
+        if recompute_method is not None or recompute_num_layers is not None:
+            raise ValueError("V4 recompute method/num-layers require " "--recompute-granularity full")
+        return False
+
+    if recompute_granularity == "selective":
+        raise ValueError(
+            "V4 does not support Megatron submodule-selective activation "
+            "recompute yet; use --recompute-granularity full with "
+            "--recompute-method block and --recompute-num-layers K for "
+            "selective layer-level recompute"
+        )
+    if recompute_granularity != "full":
+        raise ValueError("V4 recompute_granularity must be 'full' or None; " f"got {recompute_granularity!r}")
+    if recompute_method not in ("uniform", "block"):
+        raise ValueError(
+            "V4 full activation recompute supports --recompute-method " f"uniform or block; got {recompute_method!r}"
+        )
+    if isinstance(recompute_num_layers, bool) or not isinstance(recompute_num_layers, int):
+        raise TypeError("V4 --recompute-num-layers must be an integer; " f"got {recompute_num_layers!r}")
+    if recompute_num_layers <= 0:
+        raise ValueError("V4 --recompute-num-layers must be greater than zero; " f"got {recompute_num_layers}")
+    return True
 
 
 def v4_model_provider(pre_process=True, post_process=True, vp_stage=None):
     """slime entry point. Reads the HF config from megatron args (--hf-checkpoint).
 
-    If LoRA dim > 0 (``--v4-lora-dim`` or env ``V4_LORA_DIM``), applies LoRA (freezes
+    If ``--lora-dim`` is positive, applies LoRA (freezes
     base, wraps the V4 attention + compressor linears, excludes ``o_a_proj``) on the
     built model BEFORE slime's Float16Module/DDP wrap — so the optimizer sees only the
     trainable LoRA adapters.
@@ -260,6 +351,27 @@ def v4_model_provider(pre_process=True, post_process=True, vp_stage=None):
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
     ep_size = getattr(args, "expert_model_parallel_size", 1)
     ep_rank = parallel_state.get_expert_model_parallel_rank() if ep_size > 1 else 0
+    # MTP head gate: slime registers --mtp-num-layers (add_mtp_training_arguments),
+    # so the arg is always parsed properly — no env fallback needed.
+    enable_mtp = int(getattr(args, "mtp_num_layers", 0) or 0) == 1
+    # Activation checkpointing rides Megatron's recompute arguments. Megatron's
+    # implementation can't run here (hand-written layer loop, no
+    # TransformerBlock), so the provider validates the V4-specific contract and
+    # stores it in TransformerConfig for mcore_model, MTP, and routing replay.
+    # Both full/uniform and full/block are implemented; Megatron's
+    # submodule-selective granularity is rejected until V4 exposes its hooks.
+    recompute_granularity = getattr(args, "recompute_granularity", None)
+    recompute_method = getattr(args, "recompute_method", None)
+    recompute_num_layers = getattr(args, "recompute_num_layers", None)
+    _v4_full_recompute_enabled(
+        recompute_granularity,
+        recompute_method,
+        recompute_num_layers,
+    )
+    # MTP loss weight: slime always defines --mtp-loss-scaling-factor (default 0.2);
+    # the literal fallback only covers running the provider outside slime, where
+    # upstream Megatron-LM has no such arg.
+    mtp_loss_scaling_factor = getattr(args, "mtp_loss_scaling_factor", None)
     model = build_v4_mcore_model(
         hf_config,
         pre_process=pre_process,
@@ -269,6 +381,7 @@ def v4_model_provider(pre_process=True, post_process=True, vp_stage=None):
         expert_model_parallel_rank=ep_rank,
         tensor_model_parallel_size=getattr(args, "tensor_model_parallel_size", 1),
         pipeline_model_parallel_size=getattr(args, "pipeline_model_parallel_size", 1),
+        context_parallel_size=getattr(args, "context_parallel_size", 1),
         moe_token_dispatcher_type=getattr(args, "moe_token_dispatcher_type", None),
         moe_flex_dispatcher_backend=getattr(args, "moe_flex_dispatcher_backend", "deepep"),
         moe_router_dtype=getattr(args, "moe_router_dtype", "fp32") or "fp32",
@@ -276,13 +389,25 @@ def v4_model_provider(pre_process=True, post_process=True, vp_stage=None):
         num_layers_in_first_pipeline_stage=getattr(args, "decoder_first_pipeline_num_layers", None),
         num_layers_in_last_pipeline_stage=getattr(args, "decoder_last_pipeline_num_layers", None),
         vp_stage=vp_stage,
+        enable_mtp=enable_mtp,
+        mtp_loss_scaling_factor=mtp_loss_scaling_factor,
+        recompute_granularity=recompute_granularity,
+        recompute_method=recompute_method,
+        recompute_num_layers=recompute_num_layers,
     )
 
     lora_dim, lora_alpha, lora_dropout = _v4_lora_cfg(args)
     if lora_dim > 0:
         from .lora import apply_v4_lora
 
-        model = apply_v4_lora(model, dim=lora_dim, alpha=lora_alpha, dropout=lora_dropout)
+        model = apply_v4_lora(
+            model,
+            dim=lora_dim,
+            alpha=lora_alpha,
+            dropout=lora_dropout,
+            rslora=bool(getattr(args, "lora_rslora", False)),
+            shared_expert=bool(getattr(args, "dsv4_lora_shared_expert", False)),
+        )
     return model
 
 

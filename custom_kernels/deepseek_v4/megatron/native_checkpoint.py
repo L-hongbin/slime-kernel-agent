@@ -26,6 +26,79 @@ from safetensors import safe_open
 
 DEFAULT_V4_FLASH_FP8_CKPT = "/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8"
 EXPERT_RE = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
+# The MTP head's routed experts (``mtp.<d>.ffn.experts.<e>.w{1,2,3}.weight``). Only
+# consumed when MTP conversion is explicitly enabled; otherwise mtp.* is ignored.
+MTP_EXPERT_RE = re.compile(r"^mtp\.(\d+)\.ffn\.experts\.(\d+)\.w([123])\.weight$")
+
+# Attention/FFN leaf maps shared by the layer and MTP mappings (kept in one place so
+# the two subtrees can never drift).
+_ATTN_LEAF = {
+    "wq_a": "q_a_proj",
+    "wq_b": "q_b_proj",
+    "wkv": "kv_proj",
+    "wo_a": "o_a_proj",
+    "wo_b": "o_b_proj",
+    "q_norm": "q_a_norm",
+    "kv_norm": "kv_norm",
+}
+_SHARED_EXPERT_LEAF = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
+
+def native_mtp_key_to_mcore(key: str) -> str | None:
+    """Map one non-expert native ``mtp.<d>.*`` key to the V4 mcore ``mtp.*`` subtree.
+
+    Destination is ``V4LanguageModel.mtp`` (a single ``V4MultiTokenPredictionLayer``),
+    so the MTP layer index ``<d>`` is dropped (only one MTP head is built).  Expert
+    weights and ``*.scale`` tensors are handled elsewhere / consumed by FP8 dequant.
+    Returns None for anything that is not an MTP non-expert weight.
+    """
+    m = re.fullmatch(r"mtp\.(\d+)\.(.+)", key)
+    if not m:
+        return None
+    rest = m.group(2)
+    if rest.endswith(".scale") or MTP_EXPERT_RE.match(key):
+        return None
+
+    # MTP-local (not inside the transformer layer): the split projections, the two
+    # fusion norms, the final norm, and the head-side hc collapse.
+    mtp_local = {
+        "enorm.weight": "enorm.weight",
+        "hnorm.weight": "hnorm.weight",
+        "e_proj.weight": "e_proj.weight",
+        "h_proj.weight": "h_proj.weight",
+        "norm.weight": "norm.weight",
+        "hc_head_fn": "hc_head.hc_fn",
+        "hc_head_base": "hc_head.hc_base",
+        "hc_head_scale": "hc_head.hc_scale",
+    }
+    if rest in mtp_local:
+        return f"mtp.{mtp_local[rest]}"
+
+    # Everything else lives inside the single V4 decoder layer (transformer_layer.*).
+    tl = "mtp.transformer_layer."
+    if rest == "attn_norm.weight":
+        return f"{tl}input_layernorm.weight"
+    if rest == "ffn_norm.weight":
+        return f"{tl}post_attention_layernorm.weight"
+    mm = re.fullmatch(r"hc_attn_(fn|base|scale)", rest)
+    if mm:
+        return f"{tl}attn_hc.{mm.group(1)}"
+    mm = re.fullmatch(r"hc_ffn_(fn|base|scale)", rest)
+    if mm:
+        return f"{tl}ffn_hc.{mm.group(1)}"
+    if rest == "attn.attn_sink":
+        return f"{tl}self_attn.sinks"
+    mm = re.fullmatch(r"attn\.([^.]+)\.weight", rest)
+    if mm and mm.group(1) in _ATTN_LEAF:
+        return f"{tl}self_attn.{_ATTN_LEAF[mm.group(1)]}.weight"
+    if rest == "ffn.gate.weight":
+        return f"{tl}mlp.gate.weight"
+    if rest == "ffn.gate.bias":
+        return f"{tl}mlp.gate.e_score_correction_bias"
+    mm = re.fullmatch(r"ffn\.shared_experts\.(w[123])\.weight", rest)
+    if mm:
+        return f"{tl}mlp.shared_experts.{_SHARED_EXPERT_LEAF[mm.group(1)]}.weight"
+    return None
 
 
 @dataclass(frozen=True)
@@ -270,14 +343,17 @@ def read_native_weight(
     return dequant_fp8_block(tensor, scales, output_dtype=output_dtype), scale_key, scales
 
 
-def native_key_to_mcore(key: str) -> str | None:
+def native_key_to_mcore(key: str, *, include_mtp: bool = False) -> str | None:
     """Map one non-expert native checkpoint key to the current V4 mcore key.
 
     Scale tensors are consumed by FP8 dequant and intentionally do not map to mcore.
-    MTP tensors are also ignored because the current training model does not
-    instantiate the V4 next-token-prediction module.
+    MTP tensors are ignored by default (``include_mtp=False``) so existing
+    conversions stay byte-identical; pass ``include_mtp=True`` (only when the mcore
+    model was built with the MTP head) to map the ``mtp.*`` subtree.
     """
-    if key.startswith("mtp.") or key.endswith(".scale") or EXPERT_RE.match(key):
+    if key.startswith("mtp."):
+        return native_mtp_key_to_mcore(key) if include_mtp else None
+    if key.endswith(".scale") or EXPERT_RE.match(key):
         return None
     if key == "embed.weight":
         return "embedding.word_embeddings.weight"
@@ -457,9 +533,13 @@ def native_key_to_hf(key: str) -> str | None:
     return None
 
 
-def expert_native_keys(layer: int, expert: int) -> tuple[str, str, str]:
-    root = f"layers.{layer}.ffn.experts.{expert}"
+def expert_native_keys(layer: int, expert: int, *, mtp: bool = False) -> tuple[str, str, str]:
+    root = f"mtp.{layer}.ffn.experts.{expert}" if mtp else f"layers.{layer}.ffn.experts.{expert}"
     return (f"{root}.w1.weight", f"{root}.w3.weight", f"{root}.w2.weight")
+
+
+def _is_packed_int8_tensor(tensor: torch.Tensor) -> bool:
+    return tensor.dtype in (torch.int8, torch.uint8)
 
 
 def read_expert_tensors(
@@ -468,15 +548,62 @@ def read_expert_tensors(
     expert: int,
     *,
     output_dtype: torch.dtype = torch.bfloat16,
+    mtp: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Read one expert and assemble mcore's gate_up/down expert slices."""
-    w1_key, w3_key, w2_key = expert_native_keys(layer, expert)
+    w1_key, w3_key, w2_key = expert_native_keys(layer, expert, mtp=mtp)
+    root = f"mtp.{layer}.mlp.experts" if mtp else f"layers.{layer}.mlp.experts"
+    probe = checkpoint.get_tensor(w1_key)
+    if _is_packed_int8_tensor(probe):
+        return read_expert_tensors_packed(checkpoint, layer, expert, mtp=mtp)
     w1, _, _ = read_native_weight(checkpoint, w1_key, output_dtype=output_dtype)
     w3, _, _ = read_native_weight(checkpoint, w3_key, output_dtype=output_dtype)
     w2, _, _ = read_native_weight(checkpoint, w2_key, output_dtype=output_dtype)
     return {
-        f"layers.{layer}.mlp.experts.gate_up_proj[{expert}]": torch.cat([w1, w3], dim=0),
-        f"layers.{layer}.mlp.experts.down_proj[{expert}]": w2,
+        f"{root}.gate_up_proj[{expert}]": torch.cat([w1, w3], dim=0),
+        f"{root}.down_proj[{expert}]": w2,
+    }
+
+
+def read_expert_tensors_packed(
+    checkpoint: NativeV4Checkpoint,
+    layer: int,
+    expert: int,
+    *,
+    mtp: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Read one OFFICIAL packed-MXFP4 expert verbatim (no dequant).
+
+    Official layout per matrix: weight I8 [O, K/2] (E2M1 nibble pairs, low nibble
+    = even K element) + sibling ``.scale`` F8_E8M0 [O, K/32] (per-32 power-of-two
+    scales). Both are carried as raw uint8 bytes; packing is along K (dim 1), so
+    the mcore [w1;w3] concat along dim 0 is unaffected."""
+    w1_key, w3_key, w2_key = expert_native_keys(layer, expert, mtp=mtp)
+    root = f"mtp.{layer}.mlp.experts" if mtp else f"layers.{layer}.mlp.experts"
+
+    def _packed_pair(weight_key: str) -> tuple[torch.Tensor, torch.Tensor]:
+        w = checkpoint.get_tensor(weight_key)
+        if not _is_packed_int8_tensor(w):
+            raise ValueError(f"expected packed int8 expert weight for {weight_key}, got {w.dtype}")
+        scale_key = fp8_scale_key(weight_key)
+        if not checkpoint.has_tensor(scale_key):
+            raise KeyError(f"packed MXFP4 tensor {weight_key} is missing scale tensor {scale_key}")
+        sf = checkpoint.get_tensor(scale_key)
+        if sf.dtype != torch.float8_e8m0fnu:
+            raise ValueError(f"expected F8_E8M0 scales for {scale_key}, got {sf.dtype}")
+        O, Kh = w.shape
+        if sf.shape != (O, Kh * 2 // 32):
+            raise ValueError(f"scale shape {tuple(sf.shape)} does not match packed weight {tuple(w.shape)}")
+        return w.view(torch.uint8), sf.view(torch.uint8)
+
+    w1, s1 = _packed_pair(w1_key)
+    w3, s3 = _packed_pair(w3_key)
+    w2, s2 = _packed_pair(w2_key)
+    return {
+        f"{root}.gate_up_proj_fp4[{expert}]": torch.cat([w1, w3], dim=0),
+        f"{root}.gate_up_proj_sf[{expert}]": torch.cat([s1, s3], dim=0),
+        f"{root}.down_proj_fp4[{expert}]": w2,
+        f"{root}.down_proj_sf[{expert}]": s2,
     }
 
 
@@ -516,6 +643,7 @@ def load_native_checkpoint_into_mcore_model(
     *,
     layer_map: dict[int, int] | None = None,
     strict: bool = True,
+    include_mtp: bool | None = None,
 ) -> dict[str, int | tuple[str, ...]]:
     """Copy native V4 checkpoint tensors into an instantiated mcore model.
 
@@ -523,7 +651,13 @@ def load_native_checkpoint_into_mcore_model(
     receives `layers.0.*` tensors plus top-level embedding/head/norm/HC head.
     Expert tensors are copied expert-by-expert into the destination storage to
     avoid materializing a whole layer's expert block on CPU.
+
+    ``include_mtp`` controls whether the ``mtp.*`` subtree is mapped: ``None``
+    (default) auto-detects it from whether the model has an MTP head, so a model
+    built WITHOUT MTP loads byte-identically to before.
     """
+    if include_mtp is None:
+        include_mtp = getattr(model, "mtp", None) is not None
     checkpoint = NativeV4Checkpoint(checkpoint_dir)
     targets = _model_named_tensors(model)
     modules = dict(model.named_modules())
@@ -532,8 +666,11 @@ def load_native_checkpoint_into_mcore_model(
     expert_slice_count = 0
 
     for native_key in sorted(checkpoint.actual_key_to_file()):
-        mcore_key = native_key_to_mcore(native_key)
-        mcore_key = remap_mcore_layer_key(mcore_key, layer_map) if mcore_key is not None else None
+        mcore_key = native_key_to_mcore(native_key, include_mtp=include_mtp)
+        # Layer remap applies to numbered decoder layers only; MTP keys carry no
+        # remappable layer index (single ``mtp.*`` head) and are passed through.
+        if mcore_key is not None and not mcore_key.startswith("mtp."):
+            mcore_key = remap_mcore_layer_key(mcore_key, layer_map)
         if mcore_key is None or mcore_key not in targets:
             continue
         dest = targets[mcore_key]
@@ -543,19 +680,41 @@ def load_native_checkpoint_into_mcore_model(
         loaded.add(mcore_key)
         direct_count += 1
 
+    # Expert targets come in two families: bf16 grouped Parameters
+    # (``gate_up_proj``/``down_proj``) or packed-MXFP4 uint8 buffers
+    # (``gate_up_proj_fp4``/``_sf``/``down_proj_fp4``/``_sf``,
+    # V4_FP4_FROZEN_EXPERTS=1). The model's buffers define which family is
+    # expected; read_expert_tensors{,_packed} must supply matching slices —
+    # a bf16 model fed a packed checkpoint (or vice versa) fails loudly on the
+    # slice-key lookup below.
     expert_targets = [k for k in targets if k.endswith("mlp.experts.gate_up_proj")]
+    packed_expert_targets = [k for k in targets if k.endswith("mlp.experts.gate_up_proj_fp4")]
     target_to_source = {target: source for source, target in (layer_map or {}).items()}
-    for gate_key in sorted(expert_targets):
-        m = re.fullmatch(r"layers\.(\d+)\.mlp\.experts\.gate_up_proj", gate_key)
-        if not m:
-            continue
-        target_layer = int(m.group(1))
-        source_layer = target_to_source.get(target_layer, target_layer)
-        down_key = f"layers.{target_layer}.mlp.experts.down_proj"
-        gate_dest = targets[gate_key]
-        down_dest = targets[down_key]
-        expert_module_name = gate_key[: -len(".gate_up_proj")]
-        expert_module = modules.get(expert_module_name)
+    for gate_key in sorted(expert_targets) + sorted(packed_expert_targets):
+        packed = gate_key.endswith(".gate_up_proj_fp4")
+        gate_attr = ".gate_up_proj_fp4" if packed else ".gate_up_proj"
+        module_name = gate_key[: -len(gate_attr)]
+        is_mtp_experts = gate_key.startswith("mtp.")
+        if is_mtp_experts:
+            if not include_mtp:
+                continue
+            # Single MTP head -> native root ``mtp.0.ffn.experts.*``.
+            source_root = "mtp.0.mlp.experts"
+            source_layer = 0
+        else:
+            m = re.match(r"^layers\.(\d+)\.mlp\.experts\.", gate_key)
+            if not m:
+                continue
+            target_layer = int(m.group(1))
+            source_layer = target_to_source.get(target_layer, target_layer)
+            source_root = f"layers.{source_layer}.mlp.experts"
+        if packed:
+            dest_names = ("gate_up_proj_fp4", "gate_up_proj_sf", "down_proj_fp4", "down_proj_sf")
+        else:
+            dest_names = ("gate_up_proj", "down_proj")
+        dests = {n: targets[f"{module_name}.{n}"] for n in dest_names}
+        gate_dest = dests[dest_names[0]]
+        expert_module = modules.get(module_name)
         global_expert_ids = _local_expert_global_ids(expert_module, gate_dest.shape[0])
         for local_expert_idx, global_expert_id in enumerate(global_expert_ids):
             slices = read_expert_tensors(
@@ -563,20 +722,16 @@ def load_native_checkpoint_into_mcore_model(
                 source_layer,
                 global_expert_id,
                 output_dtype=gate_dest.dtype if gate_dest.dtype.is_floating_point else torch.bfloat16,
+                mtp=is_mtp_experts,
             )
-            gate_dest.data[local_expert_idx].copy_(
-                slices[f"layers.{source_layer}.mlp.experts.gate_up_proj[{global_expert_id}]"].to(
-                    device=gate_dest.device, dtype=gate_dest.dtype
+            for n in dest_names:
+                dest = dests[n]
+                dest.data[local_expert_idx].copy_(
+                    slices[f"{source_root}.{n}[{global_expert_id}]"].to(device=dest.device, dtype=dest.dtype)
                 )
-            )
-            down_dest.data[local_expert_idx].copy_(
-                slices[f"layers.{source_layer}.mlp.experts.down_proj[{global_expert_id}]"].to(
-                    device=down_dest.device, dtype=down_dest.dtype
-                )
-            )
-            expert_slice_count += 2
-        loaded.add(gate_key)
-        loaded.add(down_key)
+                expert_slice_count += 1
+        for n in dest_names:
+            loaded.add(f"{module_name}.{n}")
 
     missing = tuple(
         sorted(k for k in targets if k not in loaded and not (k.startswith("rotary_emb.") or ".rotary_emb." in k))

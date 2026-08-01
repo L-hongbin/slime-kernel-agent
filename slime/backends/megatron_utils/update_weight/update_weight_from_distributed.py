@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import socket
 import time
@@ -8,6 +9,8 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import ray
 import torch
+
+logger = logging.getLogger(__name__)
 import torch.distributed as dist
 from megatron.core import mpu
 from ray import ObjectRef
@@ -19,6 +22,15 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
 from .common import _maybe_v4_global_name, all_gather_param, named_params_and_buffers
+from .lora_adapter_sync import (
+    all_alternating_lora_names,
+    build_lora_adapter_state_dict,
+    is_adapter_param_name,
+    lora_adapter_name,
+    plan_lora_swap,
+    raise_on_failed_lora_load,
+    use_lora_weight_sync,
+)
 
 _V4_MODEL_NAME_MARKERS = ("deepseekv4", "deepseek_v4")
 _LORA_IN_SUFFIX = ".linear_in.weight"
@@ -111,12 +123,15 @@ def _build_v4_lora_base_scales(args: Namespace, model: Sequence[torch.nn.Module]
     scales: dict[str, float] = {}
     for model_module in model:
         for module_name, module in model_module.named_modules():
-            if not all(hasattr(module, attr) for attr in ("weight", "linear_in", "linear_out", "scale")):
+            if not all(hasattr(module, attr) for attr in ("linear_in", "linear_out", "scale")):
+                continue
+            probe = getattr(module, "weight", None)
+            if probe is None:
                 continue
             base_name = f"{module_name}.weight" if module_name else "weight"
             if not base_name.startswith("module.module."):
                 base_name = "module." + base_name
-            global_base_name = _maybe_v4_global_name(args, model_module, base_name, module.weight, expert_offset=None)
+            global_base_name = _maybe_v4_global_name(args, model_module, base_name, probe, expert_offset=None)
             scales[global_base_name or base_name] = float(module.scale)
     return scales
 
@@ -148,13 +163,25 @@ class UpdateWeightFromDistributed:
         self._model_update_groups = None
         self.update_weight_metrics: dict[str, float] = {}
         self._v4_lora_base_scales: dict[str, float] | None = None
+        # Name of the LoRA adapter loaded on the engines by the previous sync (for
+        # unload-then-reload; sglang forbids re-loading an existing adapter name).
+        self._lora_prev_adapter_name: str | None = None
 
     def pop_metrics(self) -> dict[str, float]:
         """
         Return and clear ``update_weight_metrics``. Drained by the actor onto the rollout/step log.
+
+        The metrics are produced on GLOBAL RANK 0 (the adapter gather/swap runs
+        there), but wandb logging happens on the PRIMARY rank (tp0/dp0 of the
+        LAST pipeline stage — a different node under PP>1). Broadcast rank 0's
+        dict so the primary rank pops real values; without this the lora/*
+        panels were silently empty (bit r9o 2026-07-12). Collective-safe: every
+        rank calls pop_metrics via log_perf_data each step.
         """
-        out, self.update_weight_metrics = self.update_weight_metrics, {}
-        return out
+        payload = [self.update_weight_metrics]
+        dist.broadcast_object_list(payload, src=0, group=get_gloo_group())
+        self.update_weight_metrics = {}
+        return payload[0]
 
     def connect_rollout_engines(
         self,
@@ -164,7 +191,12 @@ class UpdateWeightFromDistributed:
         engine_gpu_offsets: Sequence[int] | None = None,
     ) -> None:
         """
-        Create NCCL "slime-pp_{pp_rank}" if PP source (DP=TP=0). Lock prevents concurrent broadcasts.
+        Bind rollout engines and create NCCL "slime-pp_{pp_rank}" for full-weight sync.
+
+        Adapter-only LoRA sync sends tensors through Ray RPCs and never consumes
+        ``_model_update_groups``.  Keep the native PP-source ownership metadata,
+        but avoid making every rollout GPU join an otherwise-unused NCCL group.
+        The legacy full-weight path retains the existing group lifecycle.
         """
         self.rollout_engines = rollout_engines
         self.rollout_engine_lock = rollout_engine_lock
@@ -181,6 +213,17 @@ class UpdateWeightFromDistributed:
             self._group_name = f"slime-pp_{pp_rank}"
 
         if self._is_pp_src_rank:
+            if use_lora_weight_sync(self.args):
+                if self._model_update_groups is not None:
+                    disconnect_rollout_engines_from_distributed(
+                        self.args, self._group_name, self._model_update_groups, self.rollout_engines
+                    )
+                self._model_update_groups = None
+                logger.info(
+                    "[%s] LoRA adapter-only sync: skipping unused native weight-update NCCL group",
+                    self._group_name,
+                )
+                return
             if self._model_update_groups is not None:
                 disconnect_rollout_engines_from_distributed(
                     self.args, self._group_name, self._model_update_groups, self.rollout_engines
@@ -220,8 +263,11 @@ class UpdateWeightFromDistributed:
                 )
         dist.barrier(group=get_gloo_group())
 
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
-        self._send_weights(pbar)
+        if use_lora_weight_sync(self.args):
+            self._update_weights_lora_adapter()
+        else:
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+            self._send_weights(pbar)
 
         if dist.get_rank() == 0:
             # int4/fp4 post_process
@@ -232,7 +278,25 @@ class UpdateWeightFromDistributed:
                     rollout_engines=self.rollout_engines,
                 )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            self._finish_lora_adapter_swap()
         dist.barrier(group=get_gloo_group())
+
+    def _finish_lora_adapter_swap(self) -> None:
+        """Best-effort unload of the previous alternating adapter, AFTER
+        generation resumed (rank0 only). Bounded by the engine-side timeout; on
+        timeout the adapter stays resident and the next swap retries first."""
+        pending = getattr(self, "_lora_pending_unload", None)
+        if pending is None:
+            return
+        try:
+            ray.get([engine.unload_lora_adapter.remote(lora_name=pending) for engine in self.rollout_engines])
+            self._lora_pending_unload = None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "deferred lora unload of %s failed (%s); leaving resident, will retry next swap",
+                pending,
+                exc,
+            )
 
     def _send_weights(self, pbar: tqdm | None) -> None:
         """
@@ -261,6 +325,206 @@ class UpdateWeightFromDistributed:
 
     def _uses_v4_lora_only_sync(self) -> bool:
         return bool(self._get_v4_lora_base_scales())
+
+    def _collect_local_adapter_named_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        """Gather trainable LoRA params, materializing CPU payloads only on PP sources.
+
+        ``all_gather_param`` is still called by every rank in the same parameter
+        order because TP shards require the collective.  The native
+        ``_is_pp_src_rank`` ownership rule (DP-with-CP rank 0 and TP rank 0)
+        selects one canonical payload owner per PP stage; all DP/CP/EP replicas
+        discard the gathered GPU view instead of copying it to CPU.  Routed-expert
+        adapters are rejected until this path has an EP gather.
+        """
+        adapter_named_tensors = [
+            (name, param)
+            for name, param in named_params_and_buffers(self.args, self.model)
+            if getattr(param, "requires_grad", False) and is_adapter_param_name(name)
+        ]
+        routed_expert_names = [name for name, _param in adapter_named_tensors if ".experts." in name]
+        if routed_expert_names:
+            raise RuntimeError(
+                "LoRA adapter-only sync does not yet support routed-expert LoRA parameters "
+                "('.experts.'): their EP shards require an expert-model-parallel gather "
+                "before canonical PP-source materialization. Replicated '.shared_experts.' "
+                f"adapters remain supported. Found {len(routed_expert_names)}, e.g. {routed_expert_names[0]!r}."
+            )
+
+        collected: list[tuple[str, torch.Tensor]] = []
+        for name, param in adapter_named_tensors:
+            full = all_gather_param(name, param)
+            if not self._is_pp_src_rank:
+                continue
+            collected.append((name, full.detach().to("cpu", copy=True)))
+        return collected
+
+    @torch.no_grad()
+    def _update_weights_lora_adapter(self) -> None:
+        """Ship only the trainable LoRA adapter to the engines (base + adapter served).
+
+        Every rank joins the per-parameter shard collectives, but only the canonical
+        source of each PP stage materializes a CPU payload.  PP=1 builds directly
+        on global rank 0; PP>1 gathers the stage-source payloads (and empty payloads
+        from all other ranks) to global rank 0.  Rank 0 then assembles a PEFT state
+        dict + config and drives the existing alternating adapter hot-swap endpoint.
+        """
+        scales = self._get_v4_lora_base_scales()
+        if not scales:
+            raise RuntimeError(
+                "--use-lora-weight-sync requires a V4 LoRA model (no trainable adapter "
+                "modules with weight/linear_in/linear_out/scale were found)."
+            )
+        scale = next(iter(scales.values()))
+
+        # Phase timers (perf/lora_swap/*): the swap sits on the async loop's
+        # critical path (engine idle during it), so decompose where the ~5s goes
+        # before optimizing — gather (collect+gloo), build (dedupe+state dict),
+        # swap (ship to engines + load + unload).
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        local = self._collect_local_adapter_named_tensors()
+
+        gloo_group = get_gloo_group()
+        global_rank = dist.get_rank()
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size < 1:
+            raise RuntimeError(f"invalid pipeline model parallel size {pp_size}")
+
+        gathered: list[list[tuple[str, torch.Tensor]] | None] | None
+        if pp_size == 1:
+            # With one PP stage the native source rule must select global rank 0.
+            # All ranks have already completed the per-parameter collectives above,
+            # so nonzero ranks can wait at update_weights()'s trailing Gloo barrier
+            # without serializing an empty object through another collective.
+            expected_source = global_rank == 0
+            if self._is_pp_src_rank != expected_source:
+                raise RuntimeError(
+                    "PP=1 LoRA sync requires global rank 0 to be the sole canonical "
+                    f"PP source, but rank {global_rank} has _is_pp_src_rank={self._is_pp_src_rank}"
+                )
+            gathered = [local] if global_rank == 0 else None
+        else:
+            world_size = dist.get_world_size(gloo_group)
+            gathered = [None] * world_size if global_rank == 0 else None
+            dist.gather_object(local, object_gather_list=gathered, dst=0, group=gloo_group)
+        _t_gather = _time.perf_counter()
+
+        if global_rank != 0:
+            return
+
+        if gathered is None:
+            raise RuntimeError("global rank 0 did not receive LoRA adapter payloads")
+
+        # PP stage sources normally own disjoint global layer names.  Keep the
+        # historical first-wins merge for tied/overlapping names.
+        merged: dict[str, torch.Tensor] = {}
+        for chunk in gathered:
+            if chunk is None:
+                raise RuntimeError("LoRA adapter gather returned an incomplete payload list")
+            for name, tensor in chunk:
+                merged.setdefault(name, tensor)
+
+        state_dict, config_dict = build_lora_adapter_state_dict(self.args, list(merged.items()), scale=scale)
+        _t_build = _time.perf_counter()
+
+        engines = list(self.rollout_engines)
+        if not engines:
+            return
+
+        self._apply_lora_adapter_swap(engines, state_dict, config_dict)
+        _t_swap = _time.perf_counter()
+        # wandb sections group by the first path segment: one "lora" group with
+        # the adapter-shape panel (lora/lora_adapter/*) and the swap-phase panel
+        # (lora/lora_swap/*).
+        self.update_weight_metrics["lora/lora_adapter/num_tensors"] = float(len(state_dict))
+        self.update_weight_metrics["lora/lora_adapter/rank"] = float(config_dict["r"])
+        self.update_weight_metrics["lora/lora_adapter/bytes"] = float(
+            sum(t.numel() * t.element_size() for t in state_dict.values())
+        )
+        self.update_weight_metrics["lora/lora_swap/gather_time"] = _t_gather - _t0
+        self.update_weight_metrics["lora/lora_swap/build_time"] = _t_build - _t_gather
+        self.update_weight_metrics["lora/lora_swap/engine_swap_time"] = _t_swap - _t_build
+        self.update_weight_metrics["lora/lora_swap/total_time"] = _t_swap - _t0
+        logger.info(
+            "[lora_swap] gather=%.2fs build=%.2fs engine_swap=%.2fs total=%.2fs",
+            _t_gather - _t0,
+            _t_build - _t_gather,
+            _t_swap - _t_build,
+            _t_swap - _t0,
+        )
+
+    def _apply_lora_adapter_swap(self, engines, state_dict, config_dict) -> None:
+        """Execute one alternating adapter swap on ``engines`` and advance
+        ``_lora_prev_adapter_name``.
+
+        QeRL-style ALTERNATING adapters: load a NEW name while the PREVIOUS adapter
+        is still resident (double buffer), then unload the old one. ``plan_lora_swap``
+        returns ``[("load", new)]`` on the first sync and ``[("load", new),
+        ("unload", prev)]`` afterwards — load ALWAYS precedes unload so the
+        cuda-graph-referenced old slot is never reload-reused in place (the
+        same-slot reload is what triggers cudaErrorIllegalAddress). Needs
+        ``--sglang-max-loras-per-batch >= 2`` (two mem-pool slots during the swap).
+        Generation is paused+flushed for the whole sync, so the swap is
+        request-free; the ordering is belt-and-suspenders for any in-flight ref.
+
+        Split out from the gather so the swap ordering + first-sync restart cleanup
+        is unit-testable without the megatron gather (see test_dsv4_lora_serve.py).
+        """
+        adapter_name = lora_adapter_name(self.weight_version)
+
+        # First sync of this updater (fresh process / resume / external engine):
+        # the engines may still hold adapters from a prior run in either
+        # alternating slot. Clear all alternating names best-effort so the first
+        # load never collides with a resident name and the mem-pool has a free
+        # slot. Unloading an absent name is a harmless no-op on a fresh engine.
+        if self._lora_prev_adapter_name is None:
+            for stale in all_alternating_lora_names():
+                for engine in engines:
+                    try:
+                        ray.get(engine.unload_lora_adapter.remote(lora_name=stale))
+                    except Exception:
+                        pass
+
+        # A pending unload that timed out after the previous swap: retry before
+        # loading (the old adapter's refs drained during the intervening rollout,
+        # so this is instant now; also frees the mem-pool slot the load may need).
+        pending = getattr(self, "_lora_pending_unload", None)
+        if pending is not None:
+            for engine in engines:
+                try:
+                    ray.get(engine.unload_lora_adapter.remote(lora_name=pending))
+                except Exception:
+                    pass
+            self._lora_pending_unload = None
+
+        for op, name in plan_lora_swap(adapter_name, self._lora_prev_adapter_name):
+            if op == "load":
+                results = ray.get(
+                    [
+                        engine.load_lora_adapter_from_tensors.remote(
+                            lora_name=name,
+                            tensors=state_dict,
+                            config_dict=config_dict,
+                            weight_version=str(self.weight_version),
+                        )
+                        for engine in engines
+                    ]
+                )
+                # Fail loudly on a partial/failed load BEFORE unloading the old
+                # (still-serving) adapter — otherwise engines are left serving
+                # base-only / a stale adapter and _lora_prev_adapter_name would
+                # advance past a name that never went live.
+                raise_on_failed_lora_load(results, name)
+            else:  # "unload"
+                # DEFERRED: sglang's unload waits for the old adapter's request
+                # refs to drain, which can never happen while generation is
+                # paused — executing it here hung rank0 indefinitely and
+                # collapsed the sync barrier (formal r7f/r7g 2026-07-10). The
+                # unload now runs in _finish_lora_adapter_swap AFTER
+                # continue_generation.
+                self._lora_pending_unload = name
+        self._lora_prev_adapter_name = adapter_name
 
     def _iter_non_expert_chunks(self) -> Iterator[list[tuple[str, torch.Tensor]]]:
         """

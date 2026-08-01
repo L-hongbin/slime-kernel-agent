@@ -230,5 +230,8 @@ kernel/serve 与 routing-replay 数据面；node70 仍不参与 kernel-on。
 3. **接入 Megatron Phase-1 parity spike**：把三个核接进 mcore 的 V4 模型，逐层对齐 HF。
 
 ## FP8 MoE expert compute (deep_gemm grouped fp8)
-- Bench: `custom_kernels/deepseek_v4/megatron/bench_fp8_moe.py`; results: `custom_kernels/deepseek_v4/megatron/FP8_MOE_RESULTS.md`
+- Historical benchmark sources and results were retired from the working tree; recover them with
+  `git show 851199b:custom_kernels/deepseek_v4/megatron/bench_fp8_moe.py` and
+  `git show 851199b:custom_kernels/deepseek_v4/megatron/FP8_MOE_RESULTS.md` if needed. The
+  production path now uses frozen FP4 experts.
 - fp8 grouped fwd ~2x, fwd+bwd ~1.7x faster than the per-expert bf16 loop; matches sglang serving numerics. (2026-07-05)

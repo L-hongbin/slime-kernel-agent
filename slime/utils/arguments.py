@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import logging
+import math
 import os
 from typing import Any
 
@@ -14,6 +15,91 @@ from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_config
 from slime.utils.logging_utils import configure_logger
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_lora_args(args) -> None:
+    dim = int(getattr(args, "lora_dim", 0) or 0)
+    alpha = getattr(args, "lora_alpha", None)
+    dropout = float(getattr(args, "lora_dropout", 0.0) or 0.0)
+    plus_lambda = getattr(args, "lora_plus_lambda", None)
+    max_node_bytes = int(getattr(args, "lora_checkpoint_max_node_bytes", 2 * 1024**3))
+
+    if dim < 0:
+        raise ValueError(f"--lora-dim must be non-negative, got {dim}")
+    if dim > 0 and alpha is not None and int(alpha) <= 0:
+        raise ValueError(f"--lora-alpha must be positive when LoRA is enabled, got {alpha}")
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"--lora-dropout must be in [0, 1), got {dropout}")
+    if plus_lambda is not None and float(plus_lambda) <= 0:
+        raise ValueError(f"--lora-plus-lambda must be positive, got {plus_lambda}")
+    if max_node_bytes <= 0:
+        raise ValueError("--lora-checkpoint-max-node-bytes must be positive, " f"got {max_node_bytes}")
+    if dim == 0 and (
+        alpha is not None
+        or dropout != 0.0
+        or getattr(args, "lora_rslora", False)
+        or plus_lambda not in (None, 1, 1.0)
+        or getattr(args, "dsv4_lora_shared_expert", False)
+        or getattr(args, "lora_adapter_resume_load", "")
+        or getattr(args, "use_lora_weight_sync", False)
+    ):
+        raise ValueError("LoRA options require --lora-dim to be positive")
+
+
+def _validate_dppo_predictive_args(args) -> None:
+    """Validate that rollout and train distributions match for predictive Top-K KL."""
+    if getattr(args, "policy_loss_mode", "ppo") != "dppo_topk_kl_predictive":
+        return
+    top_k = getattr(args, "dppo_predictive_top_k", 0)
+    if top_k <= 0:
+        raise ValueError("dppo_topk_kl_predictive requires --dppo-predictive-top-k to be a positive integer.")
+    vocab_size = getattr(args, "vocab_size", None)
+    if vocab_size is not None and top_k >= vocab_size:
+        raise ValueError(f"--dppo-predictive-top-k ({top_k}) must be smaller than vocab_size ({vocab_size}).")
+    if not args.use_rollout_logprobs:
+        raise ValueError(
+            "dppo_topk_kl_predictive requires --use-rollout-logprobs: the Top-K distribution "
+            "and sampled-token importance ratio must share the rollout behavior-policy anchor."
+        )
+    if args.use_tis:
+        raise ValueError("dppo_topk_kl_predictive is incompatible with --use-tis.")
+    if args.eps_clip <= 0 or args.eps_clip_high != args.eps_clip:
+        raise ValueError(
+            "dppo_topk_kl_predictive uses one positive KL threshold delta; set "
+            "--eps-clip and --eps-clip-high to the same positive value."
+        )
+    if getattr(args, "rollout_temperature", 1.0) != 1.0:
+        raise ValueError(
+            "dppo_topk_kl_predictive currently requires --rollout-temperature 1: SGLang's "
+            "returned Top-K log-probs are not temperature-scaled in the pinned runtime."
+        )
+    if getattr(args, "rollout_top_p", 1.0) != 1.0 or getattr(args, "rollout_top_k", -1) != -1:
+        raise ValueError(
+            "dppo_topk_kl_predictive currently requires --rollout-top-p 1 and "
+            "--rollout-top-k -1 so rollout behavior probabilities and train probabilities "
+            "refer to the same untruncated distribution."
+        )
+    if getattr(args, "allgather_cp", False):
+        raise ValueError(
+            "dppo_topk_kl_predictive does not yet support --allgather-cp; its contiguous-logit "
+            "layout needs a separate Top-K support redistribution. Use the regular CP path."
+        )
+
+
+def _validate_dis_args(args) -> None:
+    """Validate the paper's direct rollout-policy DIS contract."""
+    if getattr(args, "policy_loss_mode", "ppo") != "dis":
+        return
+    if not args.use_rollout_logprobs:
+        raise ValueError("DIS requires --use-rollout-logprobs as its direct behavior-policy anchor.")
+    if args.use_tis:
+        raise ValueError("DIS is incompatible with --use-tis: its ratio already uses the rollout policy directly.")
+    if getattr(args, "eps_clip_c", None) is not None:
+        raise ValueError("DIS does not use --eps-clip-c; configure only --eps-clip and --eps-clip-high.")
+    if not math.isfinite(args.eps_clip) or not (0.0 < args.eps_clip < 1.0):
+        raise ValueError("DIS requires 0 < --eps-clip < 1 so the lower ratio bound is positive.")
+    if not math.isfinite(args.eps_clip_high) or args.eps_clip_high <= 0:
+        raise ValueError("DIS requires --eps-clip-high > 0.")
 
 
 def _parse_sequence_mis_args(args) -> None:
@@ -31,7 +117,7 @@ def _parse_sequence_mis_args(args) -> None:
     if not isinstance(config, dict):
         raise ValueError("--sequence-mis-config must parse to a dictionary/object.")
 
-    allowed_keys = {"aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage"}
+    allowed_keys = {"aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage", "ratio_source"}
     unknown_keys = set(config) - allowed_keys
     if unknown_keys:
         raise ValueError(f"Unknown --sequence-mis-config keys: {sorted(unknown_keys)}")
@@ -54,6 +140,15 @@ def _parse_sequence_mis_args(args) -> None:
         if not isinstance(config["use_advantage"], bool):
             raise ValueError("--sequence-mis-config use_advantage must be a JSON boolean.")
         args.sequence_mis_use_advantage = config["use_advantage"]
+    if "ratio_source" in config:
+        ratio_source = str(config["ratio_source"])
+        if ratio_source not in {"rollout", "old_actor"}:
+            raise ValueError(
+                "--sequence-mis-config ratio_source must be 'rollout' (default: sglang-vs-megatron "
+                "cross-engine pair) or 'old_actor' (same-stack current-vs-old megatron drift ratio; "
+                f"requires --keep-old-actor and is incompatible with routing replay), got {ratio_source!r}."
+            )
+        args.sequence_mis_ratio_source = ratio_source
 
     aggregation = getattr(args, "sequence_mis_aggregation", "geometric")
     if aggregation not in {"kl", "geometric", "turns_geometric"}:
@@ -79,6 +174,76 @@ def _parse_sequence_mis_args(args) -> None:
         getattr(args, "sequence_mis_use_advantage", False),
         sequence_mis_config,
     )
+
+
+def _validate_sequence_mis_ratio_source(args) -> None:
+    """Same-stack MIS (``ratio_source='old_actor'``) scores drift as current-vs-old
+    megatron log-probs, which needs the behavioral old actor AND a current-actor
+    recompute at postprocess time. That extra current recompute cannot share routing
+    replay's forward-consumption accounting, so it is (for now) mutually exclusive
+    with routing replay."""
+    if getattr(args, "sequence_mis_ratio_source", "rollout") != "old_actor":
+        return
+    if not getattr(args, "keep_old_actor", False):
+        raise ValueError(
+            "--sequence-mis-config ratio_source='old_actor' requires --keep-old-actor "
+            "(the behavioral old-actor log-probs are the ratio denominator)."
+        )
+    if getattr(args, "use_routing_replay", False) or getattr(args, "use_rollout_routing_replay", False):
+        raise ValueError(
+            "--sequence-mis-config ratio_source='old_actor' is incompatible with routing replay "
+            "(--use-routing-replay / --use-rollout-routing-replay): the extra current-actor "
+            "recompute would double-consume the replayed routing. Use ratio_source='rollout' "
+            "(default) with routing replay, or disable routing replay for same-stack MIS."
+        )
+
+
+def _validate_debug_freeze_old_actor_snapshot(args) -> None:
+    """Fail closed around the fixed-behavior debug replay escape hatch.
+
+    Freezing the adapter-only old-actor snapshot is only meaningful when one
+    immutable rollout dump is replayed without SGLang or weight publication.
+    Keeping the flag valid in any broader mode would silently turn a live PPO
+    run's behavioral policy into a stale policy.
+    """
+    if not getattr(args, "debug_freeze_old_actor_snapshot", False):
+        return
+
+    missing = []
+    if not getattr(args, "debug_train_only", False):
+        missing.append("--debug-train-only")
+    if getattr(args, "load_debug_rollout_data", None) is None:
+        missing.append("--load-debug-rollout-data")
+    if not getattr(args, "keep_old_actor", False):
+        missing.append("--keep-old-actor")
+    if missing:
+        raise ValueError(
+            "--debug-freeze-old-actor-snapshot is a fixed-behavior replay-only flag and requires "
+            + ", ".join(missing)
+            + ". It is forbidden in live rollout/training modes because a frozen old actor would "
+            "no longer match the batch's behavior policy."
+        )
+
+
+def _validate_debug_force_old_actor_logprob_recompute(args) -> None:
+    """Restrict the matched-forward diagnostic escape hatch to frozen replay."""
+
+    if not getattr(args, "debug_force_old_actor_logprob_recompute", False):
+        return
+
+    missing = []
+    if not getattr(args, "debug_train_only", False):
+        missing.append("--debug-train-only")
+    if getattr(args, "load_debug_rollout_data", None) is None:
+        missing.append("--load-debug-rollout-data")
+    if not getattr(args, "keep_old_actor", False):
+        missing.append("--keep-old-actor")
+    if missing:
+        raise ValueError(
+            "--debug-force-old-actor-logprob-recompute is a fixed-replay diagnostic flag and requires "
+            + ", ".join(missing)
+            + "."
+        )
 
 
 def reset_arg(parser, name, **kwargs):
@@ -196,6 +361,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="The qkv layout for Megatron backend.",
             )
             parser.add_argument(
+                "--cp-partition-mode",
+                type=str,
+                choices=["zigzag", "contiguous"],
+                default="zigzag",
+                help=(
+                    "Context-parallel sequence partition layout. 'zigzag' (default) is Megatron's "
+                    "balanced mirror-pair partition. 'contiguous' gives each CP rank a single "
+                    "contiguous [r*l_local, (r+1)*l_local) block, required by the DeepSeek-V4-Flash "
+                    "attention kernel (raw sliding-window / compressor look-back need a monotone "
+                    "local position axis). No-op at --context-parallel-size 1."
+                ),
+            )
+            parser.add_argument(
                 "--qwen-gdn-backend",
                 type=str,
                 choices=["fla", "flashqla"],
@@ -293,6 +471,82 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-lora-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "LoRA-adapter weight sync (DeepSeek-V4). When set, each sync ships only the "
+                    "trainable (requires_grad) LoRA adapter tensors to sglang's "
+                    "load_lora_adapter_from_tensors path (base + adapter served) instead of merging "
+                    "the adapter into the full base linear and broadcasting it. Default OFF keeps the "
+                    "merge-and-broadcast behavior byte-identical. "
+                    "Requires the sglang engine launched with --enable-lora and no EAGLE/MTP spec-decode "
+                    "(see handoffs/deepseek-v4/lora_serve_design.md)."
+                ),
+            )
+            parser.add_argument(
+                "--lora-dim",
+                type=int,
+                default=0,
+                help=(
+                    "LoRA adapter rank. A positive value enables LoRA training and "
+                    "adapter-only checkpointing; zero disables LoRA."
+                ),
+            )
+            parser.add_argument(
+                "--lora-alpha",
+                type=int,
+                default=None,
+                help="LoRA alpha. Defaults to twice --lora-dim when LoRA is enabled.",
+            )
+            parser.add_argument(
+                "--lora-dropout",
+                type=float,
+                default=0.0,
+                help="LoRA adapter dropout probability.",
+            )
+            parser.add_argument(
+                "--lora-rslora",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Use rank-stabilized LoRA scaling alpha/sqrt(rank).",
+            )
+            parser.add_argument(
+                "--lora-plus-lambda",
+                type=float,
+                default=None,
+                help="LoRA+ B/A learning-rate ratio; unset or 1 disables the split.",
+            )
+            parser.add_argument(
+                "--dsv4-lora-shared-expert",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help="Apply LoRA to DS-V4 shared-expert MLPs in addition to attention/compressor linears.",
+            )
+            parser.add_argument(
+                "--lora-adapter-resume-load",
+                type=str,
+                default="",
+                help="Adapter-only checkpoint directory overlaid after loading the frozen base checkpoint.",
+            )
+            parser.add_argument(
+                "--lora-checkpoint-max-node-bytes",
+                type=int,
+                default=2 * 1024**3,
+                help="Maximum node-local size accepted for one adapter-only checkpoint iteration.",
+            )
+            parser.add_argument(
+                "--rollout-lora-name",
+                type=str,
+                default=None,
+                help=(
+                    "Name of one statically preloaded SGLang LoRA adapter to attach to every "
+                    "rollout /generate request. This is intended for eval/inference with "
+                    "--sglang-lora-paths NAME=PATH; dynamic training-time adapter sync should "
+                    "leave it unset and use the engine-reported active adapter name instead."
+                ),
+            )
+            parser.add_argument(
                 "--custom-model-provider-path",
                 type=str,
                 default=None,
@@ -371,6 +625,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Note that, we will always update the parameters in sglang with that of megatron before training, "
                     "so you only need to provide a huggingface checkpoint that has the same architecture as the model you want to train. "
                     "It doesn't necessary need to contain the most up-to-date parameters."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-model-path",
+                type=str,
+                default=None,
+                help=(
+                    "Model path served by the rollout engine when it must differ from --hf-checkpoint. "
+                    "Used for DeepSeek-V4 DSpark speculative decoding: rollout serves the -DSpark checkpoint "
+                    "variant (extra mtp.* draft stages; backbone numerically identical to the standard ckpt, "
+                    "see handoffs/deepseek-v4/dspark_backbone_audit.md) while the trainer and weight-sync "
+                    "keep using --hf-checkpoint. Defaults to --hf-checkpoint."
                 ),
             )
             parser.add_argument(
@@ -495,6 +761,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Regardless of whether partial rollout is used or filters are applied, "
                     "the sampling granularity is always determined by this value. "
                     "If this value is None, rollout_batch_size will be used as the default over_sampling_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--over-sampling-refill-factor",
+                type=int,
+                default=None,
+                help=(
+                    "Optional adaptive refill factor in prompt-group units. When set to F and k accepted "
+                    "prompt groups are still missing, submit min(over_sampling_batch_size, F * k) prompt "
+                    "groups instead of another fixed over_sampling_batch_size wave. Each prompt group still "
+                    "expands to n_samples_per_prompt completions. Default None preserves legacy behavior."
                 ),
             )
             parser.add_argument(
@@ -726,6 +1003,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default="slime.rollout.data_source.RolloutDataSourceWithBuffer",
                 help="The data source class for rollout data.",
+            )
+            parser.add_argument(
+                "--rollout-dataset-load",
+                type=str,
+                default=None,
+                help=(
+                    "Directory from which to load rollout/global_dataset_state_dict_<rollout_id>.pt. "
+                    "Defaults to --load for backward compatibility."
+                ),
             )
             parser.add_argument(
                 "--prompt-data",
@@ -979,6 +1265,45 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
+            parser.add_argument(
+                "--policy-loss-mode",
+                type=str,
+                default="ppo",
+                choices=["ppo", "dis", "dppo_binary_tv", "dppo_binary_kl", "dppo_topk_kl_predictive"],
+                help=(
+                    "Policy surrogate: 'ppo' = ratio-clipped PPO (default); "
+                    "'dis' = Direct Double-Sided Importance Sampling against rollout "
+                    "log-probs, masking ratios outside (1-eps-clip, 1+eps-clip-high); "
+                    "'dppo_binary_tv'/'dppo_binary_kl' = Stable-RL DPPO divergence "
+                    "trust region (eps-clip/eps-clip-high become the TV/binary-KL "
+                    "thresholds); 'dppo_topk_kl_predictive' = predictive divergence "
+                    "mask with a rollout Top-K forward-KL support (arXiv:2607.10848; "
+                    "eps-clip is delta). eps-clip-c caps the detached IS ratio."
+                ),
+            )
+            parser.add_argument(
+                "--dis-ratio-level",
+                choices=["token", "sequence"],
+                default="token",
+                help="Compute DIS importance ratios per token or from each response's mean log-ratio.",
+            )
+            parser.add_argument(
+                "--dppo-predictive-top-k",
+                type=int,
+                default=0,
+                help=(
+                    "Number of behavior-policy Top-K entries stored per response token for "
+                    "dppo_topk_kl_predictive. The sampled token is added to the support when "
+                    "it is not already in Top-K, so storage width is K+1."
+                ),
+            )
+            parser.add_argument(
+                "--dppo-predictive-tail-estimator",
+                type=str,
+                choices=["aggregated", "uniform"],
+                default="aggregated",
+                help="Tail approximation for the predictive Top-K KL directional derivative.",
+            )
             parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
             parser.add_argument(
                 "--eps-clip-c",
@@ -1111,6 +1436,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to calculate the entropy when calculating the logprobs from actor and reference model. "
                     "This is useful for doing special loss mask."
                 ),
+            )
+            parser.add_argument(
+                "--entropy-common-probe",
+                action="store_true",
+                default=False,
+                help="Measure entropy on the original fixed-batch response mask for diagnostic comparisons.",
+            )
+            parser.add_argument(
+                "--assert-zero-lora-out",
+                action="store_true",
+                default=False,
+                help="Require a freshly loaded LoRA actor to have an exact-zero adapter output.",
             )
             parser.add_argument(
                 "--get-mismatch-metrics",
@@ -1387,6 +1724,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Subsample a portion of the debug rollout data for faster debugging.",
             )
             parser.add_argument(
+                "--debug-freeze-old-actor-snapshot",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fixed-behavior debug replay only: seed the LoRA old-actor adapter snapshot once "
+                    "from the initial live actor and never refresh it across repeated training passes. "
+                    "Requires --debug-train-only, --load-debug-rollout-data, and --keep-old-actor."
+                ),
+            )
+            parser.add_argument(
+                "--debug-force-old-actor-logprob-recompute",
+                action="store_true",
+                default=False,
+                help=(
+                    "Fixed-replay denominator A/B only: execute the frozen old-actor log-prob forward "
+                    "even when --use-rollout-logprobs selects the rollout denominator. This equalizes "
+                    "the forward path without enabling TIS or mismatch metrics. Requires "
+                    "--debug-train-only, --load-debug-rollout-data, and --keep-old-actor."
+                ),
+            )
+            parser.add_argument(
                 "--save-debug-train-data",
                 type=str,
                 default=None,
@@ -1569,6 +1927,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.1,
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--overlong-penalty",
+                action="store_true",
+                default=False,
+                help="Apply a linear reward penalty near the response-length cap.",
+            )
+            parser.add_argument(
+                "--overlong-buffer-len",
+                type=int,
+                default=2048,
+                help="Number of tokens before the response cap over which the overlong penalty ramps.",
+            )
+            parser.add_argument(
+                "--overlong-penalty-factor",
+                type=float,
+                default=1.0,
+                help="Maximum reward subtraction applied by --overlong-penalty.",
             )
             return parser
 
@@ -1924,6 +2300,7 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def slime_validate_args(args):
     _parse_sequence_mis_args(args)
+    _validate_lora_args(args)
     # rollout_temperature <= 0 (greedy) breaks the train-side log-prob path,
     # which divides logits by the temperature to match rollout log-probs:
     # /0 -> Inf -> NaN loss -> "found NaN in local grad norm" in the first
@@ -1939,6 +2316,7 @@ def slime_validate_args(args):
         args, "enable_turns_dp_partitions", False
     ):
         raise ValueError("--enable-turns-dp-partitions must be set when Sequence MIS aggregation is turns_geometric.")
+    _validate_sequence_mis_ratio_source(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.use_slime_router:
@@ -2059,6 +2437,9 @@ def slime_validate_args(args):
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
+    _validate_dppo_predictive_args(args)
+    _validate_dis_args(args)
+
     if args.eval_reward_key is None:
         args.eval_reward_key = args.reward_key
 
@@ -2072,6 +2453,12 @@ def slime_validate_args(args):
             "will not instantiate sglang servers and will only run the training process."
         )
         args.debug_train_only = True
+
+    # Validate after --load-debug-rollout-data has implied debug_train_only.
+    # Doing this near the top of slime_validate_args would reject the valid
+    # implicit form before that normalization has happened.
+    _validate_debug_freeze_old_actor_snapshot(args)
+    _validate_debug_force_old_actor_logprob_recompute(args)
 
     args.use_critic = args.advantage_estimator == "ppo"
     # Critic always uses the same GPU count as actor.
@@ -2148,6 +2535,12 @@ def slime_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+    over_sampling_refill_factor = getattr(args, "over_sampling_refill_factor", None)
+    if over_sampling_refill_factor is not None and over_sampling_refill_factor < 1:
+        raise ValueError(
+            "over_sampling_refill_factor must be a positive integer when configured, "
+            f"got {over_sampling_refill_factor}"
+        )
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

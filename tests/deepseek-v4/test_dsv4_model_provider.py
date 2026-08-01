@@ -28,6 +28,19 @@ def load_megatron_model_module():
     return importlib.import_module("slime.backends.megatron_utils.model")
 
 
+def test_dsv4_lora_config_uses_registered_generic_args_only():
+    module = load_model_provider_module()
+
+    assert module._v4_lora_cfg(SimpleNamespace(lora_dim=16, lora_alpha=None, lora_dropout=0.0)) == (16, 32, 0.0)
+    assert module._v4_lora_cfg(SimpleNamespace(lora_dim=32, lora_alpha=32, lora_dropout=0.1)) == (32, 32, 0.1)
+    with pytest.raises(ValueError, match="--lora-dim"):
+        module._v4_lora_cfg(SimpleNamespace(lora_dim=-1, lora_alpha=None, lora_dropout=0.0))
+    with pytest.raises(ValueError, match="--lora-alpha"):
+        module._v4_lora_cfg(SimpleNamespace(lora_dim=4, lora_alpha=0, lora_dropout=0.0))
+    with pytest.raises(ValueError, match="--lora-dropout"):
+        module._v4_lora_cfg(SimpleNamespace(lora_dim=4, lora_alpha=8, lora_dropout=1.0))
+
+
 def test_dsv4_pp_sequence_length_matches_bshd_padding():
     module = load_megatron_model_module()
 
@@ -69,6 +82,12 @@ def test_resolve_v4_layer_ids_handles_uneven_43_layer_pp4_split():
 
 def test_grouped_expert_ep_sharded_state_dict_uses_global_expert_axis():
     module = load_mcore_model_module()
+
+    class _ExpertDpGroup:
+        @staticmethod
+        def rank():
+            return 1
+
     cfg = SimpleNamespace(
         num_local_experts=8,
         hidden_size=4,
@@ -76,7 +95,12 @@ def test_grouped_expert_ep_sharded_state_dict_uses_global_expert_axis():
         hidden_act="silu",
         swiglu_limit=7.0,
     )
-    experts = module.V4GroupedExperts(cfg, expert_model_parallel_size=4, expert_model_parallel_rank=2)
+    experts = module.V4GroupedExperts(
+        cfg,
+        expert_model_parallel_size=4,
+        expert_model_parallel_rank=2,
+        expert_data_parallel_group=_ExpertDpGroup(),
+    )
 
     assert tuple(experts.gate_up_proj.shape) == (2, 6, 4)
     assert tuple(experts.down_proj.shape) == (2, 4, 3)
@@ -92,9 +116,11 @@ def test_grouped_expert_ep_sharded_state_dict_uses_global_expert_axis():
     assert gate.global_shape == (8, 6, 4)
     assert gate.global_offset == (4, 0, 0)
     assert gate.axis_fragmentations == (4, 1, 1)
+    assert gate.replica_id == (0, 0, 1)
     assert down.local_shape == (2, 4, 3)
     assert down.global_shape == (8, 4, 3)
     assert down.global_offset == (4, 0, 0)
+    assert down.replica_id == (0, 0, 1)
 
 
 def test_grouped_expert_ep1_params_remain_dense_allreduce():
@@ -110,6 +136,33 @@ def test_grouped_expert_ep1_params_remain_dense_allreduce():
 
     assert experts.gate_up_proj.allreduce is True
     assert experts.down_proj.allreduce is True
+
+
+def test_dsv4_moe_wires_expert_dp_group_into_grouped_experts(monkeypatch):
+    module = load_mcore_model_module()
+    captured = {}
+
+    class _Experts(torch.nn.Module):
+        def __init__(self, _config, **kwargs):
+            super().__init__()
+            captured.update(kwargs)
+            self.expert_model_parallel_size = 1
+
+    monkeypatch.setattr(module, "V4GroupedExperts", _Experts)
+    monkeypatch.setattr(module, "V4TopKRouter", lambda _config, **_kwargs: torch.nn.Identity())
+    monkeypatch.setattr(module, "V4SharedExpertMLP", lambda _config: torch.nn.Identity())
+
+    expert_dp_group = object()
+    config = SimpleNamespace(mlp_layer_types=["moe"], num_local_experts=4)
+    module.V4MoELayer(
+        config,
+        0,
+        expert_model_parallel_size=1,
+        expert_model_parallel_rank=0,
+        pg_collection=SimpleNamespace(expt_dp=expert_dp_group),
+    )
+
+    assert captured["expert_data_parallel_group"] is expert_dp_group
 
 
 def test_grouped_expert_dispatched_compute_matches_legacy_permutation():

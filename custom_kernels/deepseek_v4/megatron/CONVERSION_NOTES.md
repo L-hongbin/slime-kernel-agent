@@ -1,6 +1,6 @@
 # R2 Notes — V4-Flash Native FP8 Checkpoint Mapping
 
-> Renamed from `R2_NOTES.md` (gate-R2 era); modules renamed: `r2_checkpoint`→`native_checkpoint`, `r2_slice_torch_dist`→`slice_torch_dist`, `r2_verify_torch_dist`→`verify_torch_dist`, `r2_real_weight_parity`→`real_weight_parity`. Historical run logs keep the old names. Evidence files formerly under `handoffs/in_progress/` (verify/parity `.txt`, audit/plan `.json`) were removed in the 2026-07-03 cleanup; results are re-derivable via `scripts/dsv4/convert_torch_dist.sh` (chained verify) and `real_weight_parity.py`, and the surviving run logs live in `handoffs/deepseek-v4/r2_logs/`.
+> Renamed from `R2_NOTES.md` (gate-R2 era); modules renamed: `r2_checkpoint`→`native_checkpoint`, `r2_slice_torch_dist`→`slice_torch_dist`, `r2_verify_torch_dist`→`verify_torch_dist`, `r2_real_weight_parity`→`real_weight_parity`. Historical run logs keep the old names. Evidence files formerly under `handoffs/in_progress/` (verify/parity `.txt`, audit/plan `.json`) were removed in the 2026-07-03 cleanup; results are re-derivable via `scripts/dsv4/convert_torch_dist.sh` (chained verify) and `real_weight_parity.py`, and the surviving raw logs live in `local_artifacts/deepseek-v4/r2_logs/`.
 
 Status: mapping/dequant audit PASS; `torch_dist` preflight slice save/load PASS; full
 43-layer actor `PP3_EP8` conversion/load-back PASS on node64/69/70, leaving node62
@@ -42,7 +42,7 @@ for rollout; single-layer real-weight HF eager vs mcore forward parity PASS at E
   `handoffs/in_progress/r2_slice_real_ep8_verify.txt`.
 - Full 43-layer actor conversion evidence:
   `handoffs/in_progress/r2_pp3_ep8_verify.txt` and local node64 conversion log
-  `handoffs/deepseek-v4/r2_logs/convert_pp3_ep8_node64.log`. The node69/node70
+  `local_artifacts/deepseek-v4/r2_logs/convert_pp3_ep8_node64.log`. The node69/node70
   conversion logs live on their containers at the same repo-relative path.
 - Real-weight forward parity evidence:
   `handoffs/in_progress/r2_real_weight_layer0_parity.txt`,
@@ -163,16 +163,16 @@ Commands/evidence:
 
 - Layer 0, sliding attention + hash router:
   `handoffs/in_progress/r2_real_weight_layer0_parity.txt`,
-  log `handoffs/deepseek-v4/r2_logs/r2_real_weight_layer0_parity_node64.log`.
+  log `local_artifacts/deepseek-v4/r2_logs/r2_real_weight_layer0_parity_node64.log`.
   Result: PASS, final hidden `rel=0.006770`, `cos=0.99997699`.
 - Layer 2, CSA compressor/indexer + hash router:
   `handoffs/in_progress/r2_real_weight_layer2_parity.txt`,
-  log `handoffs/deepseek-v4/r2_logs/r2_real_weight_layer2_parity_node64.log`.
+  log `local_artifacts/deepseek-v4/r2_logs/r2_real_weight_layer2_parity_node64.log`.
   Result: PASS, compressor `rel=0.004233`, final hidden `rel=0.006203`,
   `cos=0.99998093`, router agreement `16/16`.
 - Layer 3, HCA + learned top-k router with `seq_len=128`:
   `handoffs/in_progress/r2_real_weight_layer3_parity.txt`,
-  log `handoffs/deepseek-v4/r2_logs/r2_real_weight_layer3_parity_node64.log`.
+  log `local_artifacts/deepseek-v4/r2_logs/r2_real_weight_layer3_parity_node64.log`.
   Result: PASS with bounded learned-router top-k flips: router agreement `123/128`,
   `router_in_flipped rel=0.005582`, `matched_mlp rel=0.008207`,
   final hidden `rel=0.013415`, `cos=0.99991000`.
@@ -581,7 +581,7 @@ Full `PP3_EP8` checkpoint production is complete, but R2 is not the full trainin
   checkpoint.
 - R3 single-node EP2 MoE adapter, tiny full-model, LoRA+Muon, PP2 P2P shape-adapter,
   and full `PP3_EP8` debug-train-only actor smoke now pass. The full smoke evidence is
-  `handoffs/deepseek-v4/r2_logs/r3_pp3_ep8_train_smoke_attempt11.log`: 24/24 Ray GPUs,
+  `local_artifacts/deepseek-v4/r2_logs/r3_pp3_ep8_train_smoke_attempt11.log`: 24/24 Ray GPUs,
   checkpoint load, synthetic rollout dump, `actor_train end`, Muon BF16 Newton-Schulz,
   `train/loss=12.953747749328613`, `train/grad_norm=1.9838293331558539`, model-only
   checkpoint save, and Ray job success. The 186G smoke checkpoint was deleted after
@@ -595,8 +595,8 @@ Full `PP3_EP8` checkpoint production is complete, but R2 is not the full trainin
 
 ## Checks
 
-- `python -m py_compile custom_kernels/deepseek_v4/__init__.py custom_kernels/deepseek_v4/megatron/mcore_model.py custom_kernels/deepseek_v4/megatron/model_provider.py custom_kernels/deepseek_v4/megatron/native_checkpoint.py custom_kernels/deepseek_v4/megatron/real_weight_parity.py custom_kernels/deepseek_v4/megatron/slice_torch_dist.py custom_kernels/deepseek_v4/megatron/verify_torch_dist.py tests/test_v4_model_provider.py tests/test_v4_native_checkpoint.py`
-- `pytest -q tests/test_v4_model_provider.py tests/test_v4_native_checkpoint.py tests/test_megatron_argument_validation.py` (23 tests)
+- `python -m py_compile custom_kernels/deepseek_v4/__init__.py custom_kernels/deepseek_v4/megatron/mcore_model.py custom_kernels/deepseek_v4/megatron/model_provider.py custom_kernels/deepseek_v4/megatron/native_checkpoint.py custom_kernels/deepseek_v4/megatron/real_weight_parity.py custom_kernels/deepseek_v4/megatron/slice_torch_dist.py custom_kernels/deepseek_v4/megatron/verify_torch_dist.py tests/test_dsv4_model_provider.py tests/test_dsv4_native_checkpoint.py`
+- `pytest -q tests/test_dsv4_model_provider.py tests/test_dsv4_native_checkpoint.py tests/test_megatron_argument_validation.py` (23 tests)
 - Real checkpoint audit command above.
 - PP/EP metadata plan JSON files above, including the high-EP-first 6-node H20 candidates.
 - 1-layer `torch_dist` slice builds + load-back verifications above.
@@ -607,4 +607,7 @@ Full `PP3_EP8` checkpoint production is complete, but R2 is not the full trainin
 - Real-weight EP1 forward parity for layer0/layer2/layer3 above.
 - `bash -n scripts/run.r2.v4.convert.pp3_ep16.sh` plus refusal-path sanity checks.
 - `bash -n scripts/run.r3.v4.pp3_ep8.train_smoke.sh`
-- `pytest -q tests/test_ray_train_placement.py tests/test_v4_attention_fallback.py tests/test_v4_compressor_fallback.py tests/test_v4_model_provider.py tests/test_megatron_argument_validation.py` (20 tests)
+- Compressor 的旧环境变量 fallback 测试已由 `tests/deepseek-v4/test_dsv4_compressor_fixed_path.py`
+  取代：生产路径固定为 kernel，torch reference 由诊断代码显式调用。
+- Attention 的旧环境变量 fallback 测试同样由
+  `tests/deepseek-v4/test_dsv4_attention_fixed_path.py` 取代。

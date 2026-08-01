@@ -30,6 +30,13 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.train_metric_utils import (
+    ENTROPY_COMMON_PROBE_MASK_KEY,
+    add_derived_dppo_metrics,
+    add_derived_entropy_metrics,
+    add_entropy_common_probe_metric,
+    format_train_metric_key,
+)
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -223,7 +230,12 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    args.train_iters = _estimate_train_iters(
+        args.num_rollout,
+        args.rollout_batch_size,
+        args.n_samples_per_prompt,
+        args.global_batch_size,
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -255,6 +267,119 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     )
 
     return opt_param_scheduler
+
+
+def _estimate_train_iters(
+    num_rollout: int,
+    rollout_batch_size: int,
+    n_samples_per_prompt: int,
+    global_batch_size: int,
+) -> int:
+    total_samples = num_rollout * rollout_batch_size * n_samples_per_prompt
+    if total_samples <= 0:
+        return 0
+    return max(1, math.ceil(total_samples / global_batch_size))
+
+
+_LORA_B_PARAM_SUFFIX = ".linear_out.weight"
+
+
+def _v4_lora_plus_config_overrides(config: OptimizerConfig, model: Sequence[DDP], lam: float):
+    """Megatron ``config_overrides`` implementing LoRA+ (eta_B = lambda * eta_A).
+
+    Builds on the standard overrides (bias/1D weight-decay skip — preserved so the
+    non-LoRA behavior is unchanged) and adds a ``ParamKey`` matching the LoRA B
+    matrices (``*.linear_out.weight``; only megatron-bridge ``LinearAdapter``
+    modules own a ``linear_out`` child, and only adapter params are trainable, so
+    the glob cannot catch base weights). The override sets:
+
+    * ``max_lr`` / ``min_lr`` scaled by lambda — these are the per-group knobs
+      ``OptimizerParamScheduler.get_lr`` actually honors (it IGNORES ``lr_mult``;
+      the scheduler multiplies nothing), so the B group tracks every decay style
+      at exactly lambda x the A group (min_lr scaled too, keeping the ratio exact
+      through cosine/linear floors; during a warmup ramp the ratio approaches
+      lambda as lr leaves ``init_lr``).
+    * ``lr_mult = lambda`` — NOT for the scheduler (ignored there) but because it
+      is part of Megatron's param-group identity tuple
+      (``param_group_identifier_keys = (wd_mult, lr_mult, is_expert_parallel,
+      is_decoupled_lr)`` — note ``max_lr`` is NOT in it). Without a distinct
+      ``lr_mult`` the A and B groups would collide into ONE identifier on
+      optimizer-state save/resume (``_filter_and_reorder_param_groups`` keys a
+      dict on the tuple), silently cross-mapping Muon momentum between groups.
+      With it, resume round-trips, and resuming with a DIFFERENT lambda (or
+      toggling LoRA+ across a resume) fails loud with a missing-group ValueError
+      instead of silently keeping the old ratio.
+
+    Raises if no trainable LoRA B param exists (lambda set on a non-LoRA run is a
+    config error, not a no-op).
+    """
+    from megatron.core.optimizer import get_standard_config_overrides
+    from megatron.core.optimizer.optimizer_config import ParamKey
+
+    n_b = 0
+    for chunk in model:
+        for name, param in chunk.named_parameters():
+            if param.requires_grad and name.endswith(_LORA_B_PARAM_SUFFIX):
+                n_b += 1
+    if n_b == 0:
+        raise RuntimeError(
+            f"--lora-plus-lambda={lam} is set but the model has no trainable LoRA "
+            f"B params (*{_LORA_B_PARAM_SUFFIX}); LoRA+ requires --lora-dim > 0."
+        )
+
+    overrides = get_standard_config_overrides(config)
+    overrides[ParamKey(name=f"*{_LORA_B_PARAM_SUFFIX}")] = {
+        "max_lr": lam * config.lr,
+        "min_lr": lam * (config.min_lr or 0.0),
+        "lr_mult": float(lam),
+    }
+    return overrides
+
+
+def _log_v4_lora_plus_groups(optimizer: MegatronOptimizer, model: Sequence[DDP], lam: float) -> None:
+    """Verify + log the LoRA+ split once at init (after the scheduler's step(0)).
+
+    Fails loud if the optimizer does not contain exactly the expected B group:
+    the B (lr_mult == lambda) group's param shapes must equal the model's
+    trainable ``linear_out`` shapes (shape multiset survives the fp32
+    master-param clone inside Float16OptimizerWithFloat16Params, unlike ids),
+    and its lr must be exactly lambda x the default group's lr.
+    """
+    expected_b_shapes = sorted(
+        tuple(p.shape)
+        for chunk in model
+        for name, p in chunk.named_parameters()
+        if p.requires_grad and name.endswith(_LORA_B_PARAM_SUFFIX)
+    )
+    b_groups = [g for g in optimizer.param_groups if g.get("lr_mult") == lam and g["params"]]
+    a_groups = [g for g in optimizer.param_groups if g.get("lr_mult", 1.0) == 1.0 and g["params"]]
+    if len(b_groups) != 1 or not a_groups:
+        raise RuntimeError(
+            f"LoRA+ group split failed: found {len(b_groups)} B group(s) with "
+            f"lr_mult=={lam} and {len(a_groups)} default group(s) "
+            f"(param_groups={[(g.get('lr_mult'), len(g['params'])) for g in optimizer.param_groups]})"
+        )
+    b_group = b_groups[0]
+    got_b_shapes = sorted(tuple(p.shape) for p in b_group["params"])
+    if got_b_shapes != expected_b_shapes:
+        raise RuntimeError(
+            f"LoRA+ B group does not contain exactly the LoRA linear_out params: "
+            f"expected {len(expected_b_shapes)} tensors, got {len(got_b_shapes)}"
+        )
+    eta_a = a_groups[0]["lr"]
+    eta_b = b_group["lr"]
+    if eta_b != lam * eta_a:
+        raise RuntimeError(f"LoRA+ effective LRs wrong at init: eta_A={eta_a} eta_B={eta_b} lambda={lam}")
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info(
+            "[lora+] optimizer param groups split: eta_A=%.3e (%d tensors), eta_B=%.3e "
+            "(%d tensors), lambda=%g (--lora-plus-lambda)",
+            eta_a,
+            sum(len(g["params"]) for g in a_groups),
+            eta_b,
+            len(b_group["params"]),
+            lam,
+        )
 
 
 def setup_model_and_optimizer(
@@ -291,10 +416,23 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
+    # LoRA+ (--lora-plus-lambda, default unset/1.0 = OFF): separate param group
+    # for the LoRA B matrices with eta_B = lambda * eta_A. When off,
+    # config_overrides stays None and the optimizer construction below is
+    # byte-identical to the pre-LoRA+ behavior (None triggers megatron's own
+    # get_standard_config_overrides fallback inside _get_param_groups).
+    from slime.utils.lora_utils import lora_plus_lambda
+
+    lora_plus_lam = lora_plus_lambda(args)
+    config_overrides = (
+        _v4_lora_plus_config_overrides(config, model, lora_plus_lam) if lora_plus_lam is not None else None
+    )
+
     if "muon" in config.optimizer:
         optimizer = get_megatron_muon_optimizer(
             config=config,
             model_chunks=model,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
             layer_wise_distributed_optimizer="dist" in config.optimizer,
         )
@@ -302,9 +440,13 @@ def setup_model_and_optimizer(
         optimizer = get_megatron_optimizer(
             config=config,
             model_chunks=model,
+            config_overrides=config_overrides,
             use_gloo_process_groups=args.enable_gloo_process_groups,
         )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    if lora_plus_lam is not None:
+        # scheduler __init__ ran step(0), so per-group lrs are live — verify + log.
+        _log_v4_lora_plus_groups(optimizer, model, lora_plus_lam)
     return model, optimizer, opt_param_scheduler
 
 
@@ -516,7 +658,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict[str, float]]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -540,8 +682,9 @@ def train_one_step(
             equals the per-step sample count, so behavior is unchanged.
 
     Returns:
-        tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
-        and gradient norm for logging.
+        tuple[dict[str, float], float, dict[str, float]]: Reduced loss
+        dictionary (last stage only), gradient norm, and optional gradient
+        diagnostic metrics for logging.
     """
     args = get_args()
 
@@ -582,12 +725,16 @@ def train_one_step(
                 "total_lengths",
                 "response_lengths",
                 "loss_masks",
+                ENTROPY_COMMON_PROBE_MASK_KEY,
                 "log_probs",
                 "ref_log_probs",
                 "values",
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
+                "rollout_topk_valid_mask",
                 "max_seq_lens",
                 "teacher_log_probs",
                 "group_mask_sums",
@@ -881,14 +1028,19 @@ def train(
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
+            add_entropy_common_probe_metric(
+                loss_dict,
+                required=getattr(args, "entropy_common_probe", False),
+            )
+            add_derived_dppo_metrics(loss_dict)
+            add_derived_entropy_metrics(loss_dict)
             log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+                format_train_metric_key(key, role_tag): val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
-
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
@@ -959,17 +1111,19 @@ def save(
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
     from .adapter_ckpt import (
+        adapter_checkpoint_staging,
         adapter_only_ckpt_enabled,
         adapter_only_model_save,
-        replicate_ckpt_metadata_per_node,
-        write_latest_marker_per_node,
+        finalize_adapter_checkpoint,
+        register_adapter_async_finalize,
+        validate_lora_optimizer_state,
     )
 
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
 
-    def _do_save():
+    def _do_save(*, non_persistent_ckpt=False):
         save_checkpoint(
             iteration,
             model,
@@ -979,20 +1133,58 @@ def save(
             checkpointing_context=None,
             train_data_iterator=None,
             preprocess_common_state_dict_fn=None,
+            non_persistent_ckpt=non_persistent_ckpt,
         )
 
     if adapter_only_ckpt_enabled(args):
         # LoRA-only save: filter the model state dict to adapter params (frozen
         # base reloads cold from --load on resume). Always logs full-vs-kept byte
         # sizes so the adapter-only shrink is visible.
-        with adapter_only_model_save(model):
-            _do_save()
-        # /nfs is per-node: replicate the rank-0 torch_dist metadata + latest
-        # marker to every node so the resume's format detection + load work
-        # cluster-wide (each node otherwise has only its own data shards).
-        if args.save:
-            replicate_ckpt_metadata_per_node(args.save, iteration)
-            write_latest_marker_per_node(args.save, iteration)
+        optimizer_stats = None
+        if not args.no_save_optim:
+            optimizer_stats = validate_lora_optimizer_state(model, optimizer)
+        if not args.save:
+            raise RuntimeError("adapter-only checkpointing requires args.save")
+        final_save_dir = args.save
+        saved_optimizer = not args.no_save_optim
+        saved_rng = not args.no_save_rng
+        # Upstream Megatron writes latest_checkpointed_iteration.txt before our
+        # node-local files can be unioned. Route the save to a hidden
+        # non-persistent-global root, replicate and validate there, atomically
+        # promote the iteration on each node, and publish final latest markers
+        # only after every node has committed.  With --async-save, the post-write
+        # work is registered on Megatron's AsyncRequest and therefore runs only
+        # after all distcp writer processes have completed.
+        with adapter_checkpoint_staging(args, iteration) as staging_dir:
+
+            def _finalize_adapter_save():
+                finalize_adapter_checkpoint(
+                    final_save_dir,
+                    staging_dir,
+                    iteration,
+                    model,
+                    optimizer_stats=optimizer_stats,
+                    saved_optimizer=saved_optimizer,
+                    saved_rng=saved_rng,
+                    max_node_bytes=args.lora_checkpoint_max_node_bytes,
+                    rslora=args.lora_rslora,
+                )
+
+            with adapter_only_model_save(model):
+                if args.async_save:
+                    with register_adapter_async_finalize(_finalize_adapter_save):
+                        _do_save(non_persistent_ckpt=True)
+                else:
+                    _do_save(non_persistent_ckpt=True)
+        if args.async_save:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.info(
+                    "adapter checkpoint SCHEDULED: iteration=%s staging_dir=%s",
+                    iteration,
+                    staging_dir,
+                )
+        else:
+            _finalize_adapter_save()
     else:
         _do_save()
 
@@ -1090,71 +1282,36 @@ def initialize_model_and_optimizer(
             optimizer.reload_model_params()
     clear_memory()
 
-    _maybe_quantize_v4_frozen_experts_fp8(model)
+    _maybe_verify_v4_frozen_experts_fp4(model)
 
     return model, optimizer, opt_param_scheduler, iteration
 
 
-def _maybe_quantize_v4_frozen_experts_fp8(model):
-    """After the base checkpoint load, requantize V4's frozen MoE experts to fp8
-    (V4_FP8_FROZEN_EXPERTS=1) — halves their resident memory so ctx-16k fits. Must
-    run post-load (weights populated) and post-critic-reinit; frozen experts carry
-    no optimizer state, so the optimizer is untouched. No-op when the flag is off
-    or the model has no V4GroupedExperts (non-V4 runs)."""
+def _maybe_verify_v4_frozen_experts_fp4(model):
+    """Packed-MXFP4 frozen experts (V4_FP4_FROZEN_EXPERTS=1): the OFFICIAL
+    checkpoint's packed expert bytes were loaded VERBATIM into uint8 buffers by
+    the torch_dist load (no post-load quantization step exists in this mode).
+    Verify the buffers were actually populated — a checkpoint-family mixup leaves
+    the zero-init scales in place, which would silently make every expert a
+    near-no-op. The packed buffers never enter adapter saves, so full
+    saves/ref/teacher loads remain forbidden."""
     import os
 
-    if os.environ.get("V4_FP8_FROZEN_EXPERTS", "0") != "1":
+    if os.environ.get("V4_FP4_FROZEN_EXPERTS", "0") != "1":
         return
-    # After quantization V4GroupedExperts.sharded_state_dict() returns {} for the
-    # frozen experts, which is ONLY correct for adapter-only saves. A full save (or
-    # a full ref/teacher/old_actor load) would silently drop them. Fail loud rather
-    # than corrupt (codex review 2026-07-05, finding 1). Our formal config uses
-    # V4_LORA_ADAPTER_ONLY_CKPT=1 and no ref/teacher/old_actor.
-    if os.environ.get("V4_LORA_ADAPTER_ONLY_CKPT", "0") != "1":
+    n = 0
+    for chunk in model:
+        for module in chunk.modules():
+            if hasattr(module, "verify_fp4_loaded") and getattr(module, "_experts_fp4", False):
+                module.verify_fp4_loaded()
+                n += 1
+    if n == 0:
         raise RuntimeError(
-            "V4_FP8_FROZEN_EXPERTS=1 requires V4_LORA_ADAPTER_ONLY_CKPT=1 "
-            "(a full checkpoint save/load would drop the fp8-quantized frozen experts)"
+            "V4_FP4_FROZEN_EXPERTS=1 but no packed-MXFP4 V4GroupedExperts modules "
+            "were found — the model was built without the flag (it is read at "
+            "module construction) or this is not a V4 model"
         )
     import torch
 
-    before_gb = torch.cuda.memory_allocated() / 1e9
-    shared_fp8 = os.environ.get("V4_FP8_SHARED_EXPERT", "0") == "1"
-    attn_fp8 = os.environ.get("V4_FP8_ATTENTION", "0") == "1"
-    n = 0
-    n_shared = 0
-    n_attn = 0
-    for chunk in model:
-        for module in chunk.modules():
-            if hasattr(module, "quantize_frozen_experts_fp8"):
-                module.quantize_frozen_experts_fp8()
-                n += 1
-            elif shared_fp8 and hasattr(module, "quantize_fp8"):
-                module.quantize_fp8()  # V4SharedExpertMLP (fp8 compute matches sglang)
-                n_shared += 1
-    if attn_fp8:
-        # fp8 the LoRA-wrapped attention projections whose base is fp8 in the
-        # checkpoint (self_attn wq_a/wq_b/wkv/wo_b); o_a_proj stays bf16 (bf16 in ckpt).
-        from custom_kernels.deepseek_v4.megatron.mcore_model import quantize_lora_adapter_fp8
-
-        _attn_targets = ("q_a_proj", "q_b_proj", "kv_proj", "o_b_proj")
-        for chunk in model:
-            for name, module in chunk.named_modules():
-                if (
-                    any(name.endswith("self_attn." + t) for t in _attn_targets)
-                    and hasattr(module, "linear_in")  # is a LoRA adapter
-                    and hasattr(module, "weight")  # base not yet fp8-quantized
-                ):
-                    quantize_lora_adapter_fp8(module)
-                    n_attn += 1
-    if n:
-        clear_memory()
-        after_gb = torch.cuda.memory_allocated() / 1e9
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
-        # If the bf16 expert Parameters are still referenced (DDP grad buffer,
-        # Float16Module copy, optimizer main-param), delattr won't free them and
-        # freed_GB ~= 0 — the fp8 buffers then ADD memory instead of saving it.
-        print(
-            f"[V4_FP8_FROZEN_EXPERTS] rank={rank} quantized {n} expert + {n_shared} shared + {n_attn} attn modules; "
-            f"cuda_allocated {before_gb:.1f} -> {after_gb:.1f} GB (freed {before_gb - after_gb:.1f} GB)",
-            flush=True,
-        )
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[V4_FP4_FROZEN_EXPERTS] rank={rank} verified {n} packed-MXFP4 expert modules", flush=True)

@@ -240,11 +240,12 @@ def create_training_models(args, pgs, rollout_manager):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    actor_model.set_rollout_manager(rollout_manager)
-    if args.use_critic:
-        critic_model.set_rollout_manager(rollout_manager)
+    if rollout_manager is not None:
+        actor_model.set_rollout_manager(rollout_manager)
+        if args.use_critic:
+            critic_model.set_rollout_manager(rollout_manager)
 
-    if args.rollout_global_dataset:
+    if args.rollout_global_dataset and rollout_manager is not None:
         ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     return actor_model, critic_model

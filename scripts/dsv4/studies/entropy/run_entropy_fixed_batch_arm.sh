@@ -11,22 +11,35 @@
 # dump has been copied to both nodes in each pair.
 set -euo pipefail
 
-ARM=${1:?usage: $0 ARM node64|node69 [--prepare-only]}
-HEAD_PHYSICAL=${2:?usage: $0 ARM node64|node69 [--prepare-only]}
-MODE=${3:-}
-if [[ -n "${MODE}" && "${MODE}" != "--prepare-only" ]]; then
-  echo "FATAL: third argument must be --prepare-only, got '${MODE}'." >&2
-  exit 2
-fi
+ARM=${1:?usage: $0 ARM node64|node69 [--prepare-only] [--sequence-mis-config JSON]}
+HEAD_PHYSICAL=${2:?usage: $0 ARM node64|node69 [--prepare-only] [--sequence-mis-config JSON]}
+shift 2
+MODE=
+REQUESTED_SEQUENCE_MIS_CONFIG=
+while (( "$#" > 0 )); do
+  case "$1" in
+    --prepare-only)
+      MODE=--prepare-only
+      shift
+      ;;
+    --sequence-mis-config)
+      [[ "$#" -ge 2 ]] || { echo "FATAL: --sequence-mis-config requires a value" >&2; exit 2; }
+      REQUESTED_SEQUENCE_MIS_CONFIG=$2
+      shift 2
+      ;;
+    *)
+      echo "FATAL: unknown argument '$1'." >&2
+      exit 2
+      ;;
+  esac
+done
 
 REPO=${REPO:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora}
 DEBUG_DATA=${DEBUG_DATA:?set DEBUG_DATA to the frozen rollout dump on both nodes of the selected pair}
 
 # This diagnostic must not inherit a formal/smoke shell's hidden model or
-# runtime variants.  Preserve the one arm input that is intentionally supplied
-# by the caller, then clear every transported experiment-prefix variable; the
+# runtime variants. Clear every transported experiment-prefix variable; the
 # resolved contract is rebuilt explicitly below.
-REQUESTED_SEQUENCE_MIS_CONFIG=${V4_SEQUENCE_MIS_CONFIG-}
 while IFS= read -r inherited_name; do
   unset "${inherited_name}"
 done < <(compgen -e | LC_ALL=C grep -E '^(V4_|SGLANG_|SLIME_)' || true)
@@ -84,7 +97,7 @@ NOOP_MIS_CONFIG='{"aggregation":"turns_geometric"}'
 # canonical config has no bounds and no token veto, hence it cannot filter.
 # Arms that recompute train log-probs retain mismatch telemetry; rollout-anchor
 # predictive arms may skip that postprocessor because no train log-probs exist.
-V4_SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
+SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
 case "${ARM}" in
   token_predictive)
     POLICY_LOSS_MODE=dppo_topk_kl_predictive
@@ -105,7 +118,7 @@ case "${ARM}" in
     # and freeze the same Megatron old actor and recompute its log-probs; only
     # policy_loss_function's denominator selector differs.  TIS and strict MIS
     # stay off in both arms.
-    V4_SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
+    SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
     POLICY_LOSS_MODE=ppo
     USE_ROLLOUT_LOGPROBS=1
     USE_TIS=0
@@ -117,7 +130,7 @@ case "${ARM}" in
   ppo_recompute_denom)
     # Exact mate of ppo_rollout_denom: the only changed loss input is the PPO
     # denominator, selected from the frozen Megatron old-actor recompute.
-    V4_SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
+    SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
     POLICY_LOSS_MODE=ppo
     USE_ROLLOUT_LOGPROBS=0
     USE_TIS=0
@@ -139,8 +152,8 @@ case "${ARM}" in
   mis_tis)
     # Exact historical MIS/TIS bands are supplied by the caller after the
     # source run is identified.  Refuse a guessed configuration.
-    : "${REQUESTED_SEQUENCE_MIS_CONFIG:?mis_tis requires the exact source-run V4_SEQUENCE_MIS_CONFIG}"
-    V4_SEQUENCE_MIS_CONFIG=${REQUESTED_SEQUENCE_MIS_CONFIG}
+    : "${REQUESTED_SEQUENCE_MIS_CONFIG:?mis_tis requires --sequence-mis-config from the exact source run}"
+    SEQUENCE_MIS_CONFIG=${REQUESTED_SEQUENCE_MIS_CONFIG}
     POLICY_LOSS_MODE=ppo
     USE_ROLLOUT_LOGPROBS=0
     USE_TIS=1
@@ -158,7 +171,7 @@ case "${ARM}" in
     # an aggregation-only config is the explicit no-op: lower/upper resolve to
     # -inf/+inf and token veto remains disabled.  The hook still reports the
     # cross-engine mismatch distribution and MUST report mis_reject_rate=0.
-    V4_SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
+    SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
     POLICY_LOSS_MODE=ppo
     USE_ROLLOUT_LOGPROBS=0
     USE_TIS=1
@@ -179,8 +192,8 @@ esac
 EXPECTED_SEQUENCE_MIS_CONFIG=${NOOP_MIS_CONFIG}
 [[ "${ARM}" == "mis_tis" ]] && EXPECTED_SEQUENCE_MIS_CONFIG=${HISTORICAL_MIS_CONFIG}
 if ! python3 -c 'import json,sys; raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)' \
-  "${V4_SEQUENCE_MIS_CONFIG}" "${EXPECTED_SEQUENCE_MIS_CONFIG}"; then
-  echo "FATAL: ${ARM} V4_SEQUENCE_MIS_CONFIG does not match its canonical experiment contract." >&2
+  "${SEQUENCE_MIS_CONFIG}" "${EXPECTED_SEQUENCE_MIS_CONFIG}"; then
+  echo "FATAL: ${ARM} --sequence-mis-config does not match its canonical experiment contract." >&2
   exit 2
 fi
 
@@ -313,7 +326,7 @@ CRITICAL_CODE_FILES=(
   examples/kernel_agent/kernel_filter.py
   examples/kernel_agent/kernel_reward.py
   examples/kernel_agent/utils.py
-  scripts/dsv4/_v4_cluster_lib.sh
+  scripts/dsv4/_dsv4_cluster_lib.sh
   scripts/dsv4/_dsv4_task_args.sh
   scripts/dsv4/full_loop_smoke.sh
   scripts/dsv4/studies/entropy/prepare_entropy_fixed_rollout.py
@@ -555,14 +568,9 @@ export PROMPT_DATA
 
 export PP_SIZE=1 CP_SIZE=2 EP_SIZE=8 FIRST_LAYERS=43 LAST_LAYERS=0
 export MAX_CONTEXT_LEN=12288 MAX_RESPONSE_LEN=12288 ROLLOUT_MAX_PROMPT_LEN=8192
-export V4_DATA_PAD_SIZE_MULTIPLIER=1024 RECOMPUTE=1 RECOMPUTE_NUM_LAYERS=1 RECOMPUTE_METHOD=uniform
-export V4_ACT_CKPT_REENTRANT=1 LOG_PROBS_CHUNK_SIZE=512
-export V4_FP4_FROZEN_EXPERTS=1 V4_FP4_EXPERT_GEMM=0 V4_FP8_FROZEN_EXPERTS=0 V4_FP8_ATTENTION=1
-export V4_FUSED_SILU_QUANT=0 V4_SHARED_EXPERT_ALIGN_ACT=1 V4_MHC_POST_FP32_COMBINE=1 V4_QUANT_DIV_ALIGN=1
-export V4_LORA_DIM=32 V4_LORA_ALPHA=32 V4_LORA_DROPOUT=0.0 V4_LORA_RSLORA=1
-export V4_LORA_PLUS_LAMBDA=4 V4_LORA_SHARED_EXPERT=1 V4_LORA_ADAPTER_ONLY_CKPT=1
-export V4_LORA_ADAPTER_RESUME_LOAD= V4_LORA_CHECKPOINT_MAX_NODE_BYTES=2147483648
-export V4_ENTROPY_AB_ASSERT_ZERO_LORA_OUT=1 V4_ENTROPY_AB_COMMON_PROBE=1
+export RECOMPUTE=1 RECOMPUTE_NUM_LAYERS=1 RECOMPUTE_METHOD=uniform
+export LOG_PROBS_CHUNK_SIZE=512
+export V4_FP4_FROZEN_EXPERTS=1
 export LR=1e-5 LR_DECAY_STYLE=constant WEIGHT_DECAY=0.01 ADVANTAGE_ESTIMATOR=trloo ENTROPY_COEF=0.0
 export MAX_TURNS=1 TIS_CLIP=2.0 TIS_CLIP_LOW=0.0
 export INPUT_KEY=prompt LABEL_KEY=reward_model METADATA_KEY=extra_info
@@ -571,18 +579,16 @@ export TILEKERNELS_DIR DISTRIBUTED_TIMEOUT_MINUTES=120
 export EPS_CLIP EPS_CLIP_HIGH EPS_CLIP_C
 export POLICY_LOSS_MODE USE_ROLLOUT_LOGPROBS USE_TIS USE_KEEP_OLD_ACTOR
 export CALCULATE_PER_TOKEN_LOSS CUSTOM_PG_LOSS_REDUCER_FUNCTION_PATH
-export V4_SEQUENCE_MIS_CONFIG
 export DPPO_PREDICTIVE_TOP_K=20 DPPO_PREDICTIVE_TAIL_ESTIMATOR=aggregated
 export ROLLOUT_TEMPERATURE=1 ROLLOUT_TOP_P=1 USE_ROLLOUT_ROUTING_REPLAY=1
 
 # SGLang is skipped by LOAD_DEBUG_ROLLOUT_DATA, but the common launcher still
 # validates the rollout worker and constructs its resource labels.
-export V4_RUNTIME=dspark
 export V4_ROLLOUT_MODEL_PATH=/nfs/FM/chenshuailin/checkpoints/deepseek-ai/DeepSeek-V4-Flash-DSpark
 export SGLANG_DSV4_FP4_EXPERTS=1 SGLANG_ENABLE_DP_ATTENTION=1 SGLANG_SHARED_EXPERT_TP1=1
 export SGLANG_DP_SIZE=8 SGLANG_CONTEXT_LENGTH=12288 SGLANG_MAX_PREFILL_TOKENS=12288
 export SGLANG_CHUNKED_PREFILL_SIZE=2048 SGLANG_MAX_RUNNING_REQUESTS=128 SGLANG_CUDA_GRAPH_MAX_BS=128
-export SGLANG_ENABLE_LORA=0 USE_LORA_WEIGHT_SYNC=0 USE_SGLANG_DEEPEP=0
+export USE_SGLANG_DEEPEP=0
 
 unset WANDB_API_KEY
 export USE_WANDB=0 CLEAN_DEBUG_DIR=1 CLEAN_TILELANG_CACHE=0 CLEAN_RUNTIME_CACHE=0
@@ -622,11 +628,22 @@ freeze_old_actor_snapshot=${DEBUG_FREEZE_OLD_ACTOR_SNAPSHOT}
 force_old_actor_logprob_recompute=${DEBUG_FORCE_OLD_ACTOR_LOGPROB_RECOMPUTE}
 policy=${POLICY_LOSS_MODE} rollout_logprobs=${USE_ROLLOUT_LOGPROBS} tis=${USE_TIS} keep_old=${USE_KEEP_OLD_ACTOR}
 clip=eps_clip:${EPS_CLIP},eps_clip_high:${EPS_CLIP_HIGH},eps_clip_c:${EPS_CLIP_C:-none}
-sequence_mis_config=${V4_SEQUENCE_MIS_CONFIG}
+sequence_mis_config=${SEQUENCE_MIS_CONFIG}
 resolved_contract=${ENTROPY_AB_CONTRACT}
 reduction=$([[ "${CALCULATE_PER_TOKEN_LOSS}" == 1 ]] && echo global_token || echo completion_equal)
 parallel=PP1/CP2/EP8 actor_nodes=1 batch=${GLOBAL_BATCH_SIZE} repeats=${NUM_ROLLOUT}
 save_model=0 wandb=0 log=${LOG}
 EOF
 
-exec bash "${REPO}/scripts/dsv4/full_loop_smoke.sh"
+exec bash "${REPO}/scripts/dsv4/full_loop_smoke.sh" \
+  --lora-dim 32 \
+  --lora-alpha 32 \
+  --lora-dropout 0.0 \
+  --lora-rslora \
+  --lora-plus-lambda 4 \
+  --dsv4-lora-shared-expert \
+  --lora-checkpoint-max-node-bytes 2147483648 \
+  --data-pad-size-multiplier 1024 \
+  --sequence-mis-config "${SEQUENCE_MIS_CONFIG}" \
+  --entropy-common-probe \
+  --assert-zero-lora-out

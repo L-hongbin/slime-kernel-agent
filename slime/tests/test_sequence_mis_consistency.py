@@ -50,7 +50,7 @@ def _import_kernel_filter():
     import kernel_filter
 
     # This script validates sequence-level logic, not CP transport.
-    kernel_filter.all_gather_with_cp = lambda tensor, _total_length, _response_length: tensor
+    kernel_filter.all_gather_with_cp = lambda tensor, _total_length, _response_length, **_layout: tensor
     return kernel_filter
 
 

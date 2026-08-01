@@ -240,8 +240,12 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
             "num_correct_trials", _kernel_eval_param(args, config, "num_correct_trials")
         ),
         "num_perf_trials": payload.get("num_perf_trials", _kernel_eval_param(args, config, "num_perf_trials")),
+        # Warmup iterations before the timed perf trials. Server-side field
+        # exists (api/models.py num_warmup, 0-100); without sending it the
+        # service silently used its default of 3.
+        "num_warmup": payload.get("num_warmup", _kernel_eval_param(args, config, "num_warmup", 3)),
         "timeout": payload.get("timeout", _kernel_eval_param(args, config, "kernel_eval_task_timeout")),
-        "priority": payload.get("priority", "normal"),
+        "priority": payload.get("priority", _kernel_eval_param(args, config, "kernel_eval_priority", "normal")),
         "is_valid": payload.get("is_valid", False),
         "verbose_errors": payload.get("verbose_errors", _kernel_eval_param(args, config, "verbose_errors", True)),
         "enable_profiling": payload.get(

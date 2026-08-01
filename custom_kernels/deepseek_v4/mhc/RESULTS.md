@@ -27,14 +27,14 @@ and copies the live columns before passing `Raw` to TileLang. For `N>1`, the old
 not expected to change materially.
 
 Validation evidence:
-- Stride unit: `pytest -q tests/test_v4_mhc_stride.py` -> PASS.
-- Single-token GPU repro after fix: `handoffs/deepseek-v4/r2_logs/r4_mhc_stride_fix_s1_repro.log`
+- Stride unit: `pytest -q tests/test_dsv4_mhc_stride.py` -> PASS.
+- Single-token GPU repro after fix: `local_artifacts/deepseek-v4/r2_logs/r4_mhc_stride_fix_s1_repro.log`
   -> `OVERALL mhc_s1_after_stride_fix PASS`.
-- Full mHC correctness: `handoffs/deepseek-v4/r2_logs/r4_mhc_stride_fix_correctness.log`
+- Full mHC correctness: `local_artifacts/deepseek-v4/r2_logs/r4_mhc_stride_fix_correctness.log`
   -> `OVERALL: ALL PASS` (fp64 formula, fp32 fwd/bwd, bf16 fwd/bwd, sglang-fwd + our-bwd).
 
 Efficiency rebench after the kernel edit, node64 H20 GPU0, bf16, `bench.py`; raw log:
-`handoffs/deepseek-v4/r2_logs/r4_mhc_stride_fix_bench.log`.
+`local_artifacts/deepseek-v4/r2_logs/r4_mhc_stride_fix_bench.log`.
 
 | shape | impl | fwd ms | bwd ms | fwd+bwd ms | peak MB |
 |---|---|---:|---:|---:|---:|
@@ -53,7 +53,7 @@ at S8192/S16384.
 Node-specific kernel-on gate after this fix: node64 and node69 pass the same
 single-process mHC S64 forward/backward check, but node70 currently fails any mHC
 TileLang/sglang sm90a path at module load/runtime. Evidence:
-`handoffs/deepseek-v4/r2_logs/r4_node70_mhc_norm_single.log` (our norm_gemm
+`local_artifacts/deepseek-v4/r2_logs/r4_node70_mhc_norm_single.log` (our norm_gemm
 segfault), `r4_node70_sglang_pre_only.log` (sglang pre-only SIGILL),
 `r4_node70_mhc_torch_norm_hybrid2.log` (fused middle SIGILL), and
 `r4_node70_mhc_torch_norm_middle_tilelang_bwd.log` (backward d_pre segfault).

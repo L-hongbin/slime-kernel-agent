@@ -60,7 +60,9 @@ def execute(mode: str = "", optimizer: str = "cpu", checkpoint_dir: str = ""):
     elif mode == "async_save":
         ckpt_args += f"--save {checkpoint_dir_arg} "
         ckpt_args += "--save-interval 2 "
-        ckpt_args += "--async-save "
+        # Megatron deliberately downgrades --async-save to synchronous save
+        # unless the persistent checkpoint worker is enabled as well.
+        ckpt_args += "--async-save --use-persistent-ckpt-worker "
     elif mode == "load":
         ckpt_args += f"--load {checkpoint_dir_arg} "
         ckpt_args += "--ckpt-step 1 "

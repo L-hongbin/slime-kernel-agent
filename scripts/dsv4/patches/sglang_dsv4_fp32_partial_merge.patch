@@ -1,0 +1,142 @@
+--- a/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
++++ b/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
+@@ -27,6 +27,16 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# T3 train<->rollout alignment: raw (SWA) and compressed (c4/c128) attention
++# partials are always kept in
++# fp32 until ONE final bf16 store, and the LSE-weighted merge + attention-sink
++# fold happen fused in fp32 — removing the three bf16 seams the trainer's A1
++# kernel does not have (raw partial store, compressed partial store,
++# merged-before-sink store). See tests/deepseek-v4/test_dsv4_fp32_partial_merge.py;
++# measured these seams at 25-34% of the serving-vs-trainer per-op distance on
++# bf16 KV. This is the sole supported DS-V4 merge path.
++_FP32_PARTIAL_MERGE = True
++
+ LOG2E = tl.constexpr(1.4426950408889634)
+ 
+ # DSv4 KV cache layout constants
+@@ -225,9 +235,14 @@
+     lse = tl.where(l_i > 0.0, m_i / LOG2E + tl.math.log(safe_l), float("-inf"))
+ 
+     # ---- Store output ----
++    # Store in O's dtype: bf16 for the legacy path (unchanged numerics), fp32
++    # when the fixed FP32 merge keeps partials unrounded until the
++    # final fused merge+sink store. For bf16 buffers this compiles to the same
++    # .to(tl.bfloat16) as before (covered by test_dsv4_fp32_partial_merge.py).
+     o_base = bid * stride_ob + hid * stride_oh
+-    tl.store(O_ptr + o_base + nope_offs, acc_nope.to(tl.bfloat16), mask=nope_mask)
+-    tl.store(O_ptr + o_base + NOPE_DIM_RT + rope_offs, acc_rope.to(tl.bfloat16))
++    o_dt = O_ptr.dtype.element_ty
++    tl.store(O_ptr + o_base + nope_offs, acc_nope.to(o_dt), mask=nope_mask)
++    tl.store(O_ptr + o_base + NOPE_DIM_RT + rope_offs, acc_rope.to(o_dt))
+     tl.store(LSE_ptr + bid * H + hid, lse)
+ 
+ 
+@@ -237,8 +252,14 @@
+     indices: torch.Tensor,  # [B, ...] int32
+     topk_length: Optional[torch.Tensor],
+     softmax_scale: float,
++    out_dtype: torch.dtype = torch.bfloat16,
+ ) -> Tuple[torch.Tensor, torch.Tensor]:
+-    """Run the tiled Triton sparse decode kernel on one paged KV cache."""
++    """Run the tiled Triton sparse decode kernel on one paged KV cache.
++
++    out_dtype: partial-output store dtype. bf16 = legacy behavior; fp32 is used
++    by the fixed DS-V4 path to defer rounding to the final
++    fused merge+sink store. The LSE is fp32 and invariant to this choice.
++    """
+     B, _, H, D = q.shape
+     num_pages = k_cache.shape[0]
+     page_size = k_cache.shape[1]
+@@ -272,7 +293,7 @@
+     # Output width is the kernel's fixed latent size (_D = nope 448 + rope 64 =
+     # 512), NOT q's D_qk. Sizing by q.shape[-1] would leave a 64-wide zero tail
+     # for 576-wide queries and diverge from the torch reference (head_dim_v).
+-    out = torch.zeros(B, H, _D, dtype=torch.bfloat16, device=q.device)
++    out = torch.zeros(B, H, _D, dtype=out_dtype, device=q.device)
+     lse = torch.full((B, H), float("-inf"), dtype=torch.float32, device=q.device)
+ 
+     # Round topk for autotune key stability
+@@ -358,6 +379,54 @@
+     return (out.float() * w.unsqueeze(-1)).to(torch.bfloat16), combined_lse
+ 
+ 
++def _merge_partials_and_sink_fp32(
++    out1: torch.Tensor,
++    lse1: torch.Tensor,
++    out2: Optional[torch.Tensor],
++    lse2: Optional[torch.Tensor],
++    attn_sink: Optional[torch.Tensor],
++) -> Tuple[torch.Tensor, torch.Tensor]:
++    """Fused fp32 LSE merge + attention-sink fold with ONE final bf16 store.
++
++    DS-V4 fixed path: `out1`/`out2` are fp32 partials fresh
++    from the decode kernel's fp32 accumulator (never materialized in bf16), so
++    unlike `_merge_partial_attn` + `_apply_attn_sink` there is no bf16
++    round-trip for (a) either partial, (b) the merged pre-sink output. The
++    arithmetic below mirrors those two functions exactly; only the intermediate
++    roundings are removed — matching the trainer A1 kernel, whose single fp32
++    online-softmax state folds the sink before its one bf16 store.
++
++    out1/out2: [B, 1, H, D] fp32,  lse1/lse2: [B, 1, H] fp32,  attn_sink: [H] f32
++    """
++    if out2 is not None:
++        max_lse = torch.maximum(lse1, lse2)
++        w1 = torch.where(
++            lse1 > -1e20, torch.exp(lse1 - max_lse), torch.zeros_like(lse1)
++        )
++        w2 = torch.where(
++            lse2 > -1e20, torch.exp(lse2 - max_lse), torch.zeros_like(lse2)
++        )
++        total = (w1 + w2).clamp(min=1e-20)
++        merged = (
++            w1.unsqueeze(-1) * out1.float() + w2.unsqueeze(-1) * out2.float()
++        ) / total.unsqueeze(-1)
++        lse = max_lse + torch.log(total)
++    else:
++        merged = out1.float()
++        lse = lse1
++    if attn_sink is not None:
++        sink_lse = attn_sink.view(1, 1, -1).expand_as(lse)
++        combined_lse = torch.logaddexp(lse, sink_lse)
++        w = torch.where(
++            lse > -1e20,
++            torch.exp(lse - combined_lse),
++            torch.zeros_like(lse),
++        )
++        merged = merged * w.unsqueeze(-1)
++        lse = combined_lse
++    return merged.to(torch.bfloat16), lse
++
++
+ def flash_mla_sparse_decode_triton(
+     q: torch.Tensor,
+     k_cache: torch.Tensor,
+@@ -378,6 +447,25 @@
+     if softmax_scale is None:
+         softmax_scale = q.shape[-1] ** (-0.5)
+ 
++    if _FP32_PARTIAL_MERGE:
++        # fp32-partial path: partials never touch bf16; merge + sink fold in
++        # fp32; ONE bf16 store at the end (trainer-aligned; see module header).
++        # Static shapes, fixed launch set — CUDA-graph capturable like legacy.
++        out32, lse = _run_triton_sparse_decode(
++            q, k_cache, indices, topk_length, softmax_scale,
++            out_dtype=torch.float32,
++        )
++        out_extra32, lse_extra = None, None
++        if extra_k_cache is not None and extra_indices is not None:
++            out_extra32, lse_extra = _run_triton_sparse_decode(
++                q, extra_k_cache, extra_indices, extra_topk_length,
++                softmax_scale, out_dtype=torch.float32,
++            )
++        out, lse = _merge_partials_and_sink_fp32(
++            out32, lse, out_extra32, lse_extra, attn_sink
++        )
++        return out, lse.permute(0, 2, 1)
++
+     # Process main cache (SWA)
+     out, lse = _run_triton_sparse_decode(
+         q,

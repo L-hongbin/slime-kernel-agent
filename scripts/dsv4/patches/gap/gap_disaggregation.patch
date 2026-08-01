@@ -1,0 +1,647 @@
+diff --git a/python/sglang/srt/disaggregation/base/conn.py b/python/sglang/srt/disaggregation/base/conn.py
+index a7bf990..b0cb56a 100644
+--- a/python/sglang/srt/disaggregation/base/conn.py
++++ b/python/sglang/srt/disaggregation/base/conn.py
+@@ -32,6 +32,7 @@ class KVArgs:
+     kv_data_ptrs: List[int]
+     kv_data_lens: List[int]
+     kv_item_lens: List[int]
++    aux_buffer_names: List[str]
+     aux_data_ptrs: List[int]
+     aux_data_lens: List[int]
+     aux_item_lens: List[int]
+diff --git a/python/sglang/srt/disaggregation/decode.py b/python/sglang/srt/disaggregation/decode.py
+index e9efdcd..70265a4 100644
+--- a/python/sglang/srt/disaggregation/decode.py
++++ b/python/sglang/srt/disaggregation/decode.py
+@@ -21,6 +21,7 @@ Life cycle of a request in the decode server
+ from __future__ import annotations
+ 
+ import logging
++import os
+ import time
+ from collections import deque
+ from dataclasses import dataclass
+@@ -49,8 +50,10 @@ from sglang.srt.disaggregation.utils import (
+     MetadataBuffers,
+     ReqToMetadataIdxAllocator,
+     TransferBackend,
++    apply_prefill_timing_payload,
+     _is_fake_transfer,
+     get_kv_class,
++    is_slime_profiling_enabled,
+     is_mla_backend,
+     poll_and_all_reduce,
+     poll_and_all_reduce_with_staging,
+@@ -425,6 +428,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+             self.metadata_buffers.get_buf_infos()
+         )
++        kv_args.aux_buffer_names = self.metadata_buffers.get_aux_buffer_names()
+ 
+         setup_state_kv_args(
+             kv_args,
+@@ -632,12 +636,33 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+         )
+ 
++        bootstrap_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
+                 continue
+ 
+             if poll == KVPoll.Bootstrapping:
+-                pass
++                entry_time = (
++                    decode_req.req.time_stats.decode_prealloc_queue_entry_time
++                )
++                if entry_time > 0 and now - entry_time > bootstrap_timeout:
++                    error_message = (
++                        f"Decode prealloc timeout for request rank={self.tp_rank} "
++                        f"{decode_req.req.rid=} {decode_req.req.bootstrap_room=} "
++                        f"after {bootstrap_timeout}s"
++                    )
++                    logger.error(error_message)
++                    prepare_abort(
++                        decode_req.req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    if self.scheduler.metrics_reporter.enable_metrics:
++                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
+             elif poll == KVPoll.WaitingForInput:
+                 decode_req.waiting_for_input = True
+                 decode_req.req.time_stats.set_bootstrap_done_time()
+@@ -1027,6 +1052,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+                 self.req_to_metadata_buffer_idx_allocator.alloc()
+             )
+             assert decode_req.metadata_buffer_index is not None
++            self.metadata_buffers.clear_profiling_buf(decode_req.metadata_buffer_index)
+             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size)
+             decode_req.kv_receiver.send_metadata(
+                 page_indices,
+@@ -1403,6 +1429,17 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
+             return host_indices
+         return kv_loc
+ 
++    def release_memory_occupation(self):
++        self.queue.clear()
++        self.retracted_queue.clear()
++        self.pending_reqs.clear()
++        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
++            self.kv_manager.deregister_buffer_to_engine()
++
++    def resume_memory_occupation(self):
++        if hasattr(self.kv_manager, "register_buffer_to_engine"):
++            self.kv_manager.register_buffer_to_engine()
++
+ 
+ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+     """
+@@ -1455,6 +1492,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+             output_topk_index,
+             output_hidden_states,
+             output_bootstrap_room,
++            output_prefill_timing,
+         ) = self.metadata_buffers.get_buf(idx)
+ 
+         # Validate bootstrap_room to detect context corruption
+@@ -1543,6 +1581,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+                 ].tolist()
+             )
+ 
++        if is_slime_profiling_enabled():
++            apply_prefill_timing_payload(
++                decode_req.req.time_stats,
++                output_prefill_timing,
++            )
++
+         decode_req.kv_receiver.clear()
+         decode_req.kv_receiver = None
+         decode_req.req.time_stats.set_wait_queue_entry_time()
+@@ -1600,6 +1644,11 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+         else:
+             polls = self._poll_with_metadata_gate()
+ 
++        transfer_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         transferred_reqs = []
+         indices_to_remove = set()
+         for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+@@ -1674,7 +1723,17 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+                 KVPoll.WaitingForInput,
+                 KVPoll.Transferring,
+             ]:
+-                pass
++                entry_time = decode_req.req.time_stats.decode_transfer_queue_entry_time
++                if entry_time > 0 and now - entry_time > transfer_timeout:
++                    logger.error(
++                        "Decode transfer timeout for request rank=%s rid=%s room=%s "
++                        "after %ss",
++                        self.tp_rank,
++                        decode_req.req.rid,
++                        decode_req.req.bootstrap_room,
++                        transfer_timeout,
++                    )
++                    decode_req.kv_receiver.abort()
+             else:
+                 raise ValueError(f"Unexpected poll case: {poll}")
+ 
+@@ -1698,6 +1757,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
+ 
+         return transferred_reqs
+ 
++    def release_memory_occupation(self):
++        for decode_req in self.queue:
++            if decode_req.kv_receiver is not None:
++                decode_req.kv_receiver.abort()
++        self.queue.clear()
++
++    def resume_memory_occupation(self):
++        pass
++
+ 
+ class SchedulerDisaggregationDecodeMixin:
+     @torch.no_grad()
+@@ -1893,6 +1961,11 @@ class SchedulerDisaggregationDecodeMixin:
+         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
+         self.waiting_queue.extend(resumed_reqs)
+         if len(self.disagg_decode_prealloc_queue.retracted_queue) > 0:
++            transferred_reqs = self.disagg_decode_transfer_queue.pop_transferred()
++            if self.enable_hisparse:
++                for req in transferred_reqs:
++                    self.hisparse_coordinator.admit_request_direct(req)
++            self.waiting_queue.extend(transferred_reqs)
+             # if there are still retracted requests, we do not allocate new requests
+             return
+ 
+diff --git a/python/sglang/srt/disaggregation/mooncake/conn.py b/python/sglang/srt/disaggregation/mooncake/conn.py
+index b21aee9..87f0a6f 100644
+--- a/python/sglang/srt/disaggregation/mooncake/conn.py
++++ b/python/sglang/srt/disaggregation/mooncake/conn.py
+@@ -39,7 +39,10 @@ from sglang.srt.disaggregation.common.utils import (
+ from sglang.srt.disaggregation.mooncake.utils import (
+     check_mooncake_custom_mem_pool_enabled,
+ )
+-from sglang.srt.disaggregation.utils import DisaggregationMode
++from sglang.srt.disaggregation.utils import (
++    DisaggregationMode,
++    iter_aux_transfer_specs,
++)
+ from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
+ from sglang.srt.environ import envs
+ from sglang.srt.observability.mooncake_trace import (
+@@ -257,6 +260,19 @@ class MooncakeKVManager(CommonKVManager):
+             if ptrs and lens:
+                 self.engine.batch_register(ptrs, lens)
+ 
++    def deregister_buffer_to_engine(self):
++        if self.kv_args.kv_data_ptrs and self.kv_args.kv_data_lens:
++            self.engine.batch_deregister(self.kv_args.kv_data_ptrs)
++
++        if self.kv_args.aux_data_ptrs and self.kv_args.aux_data_lens:
++            self.engine.batch_deregister(self.kv_args.aux_data_ptrs)
++
++        for ptrs, lens in zip(
++            self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
++        ):
++            if ptrs and lens:
++                self.engine.batch_deregister(ptrs)
++
+     # ------------------------------------------------------------------
+     # Staging buffer methods (all delegate to staging_handler.py)
+     # ------------------------------------------------------------------
+@@ -827,10 +843,14 @@ class MooncakeKVManager(CommonKVManager):
+         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+         prefill_aux_item_lens = self.kv_args.aux_item_lens
+ 
+-        for i, dst_aux_ptr in enumerate(dst_aux_ptrs):
+-            length = prefill_aux_item_lens[i]
+-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
+-            dst_addr = dst_aux_ptrs[i] + length * req.dst_aux_index
++        for _, src_addr, dst_addr, length in iter_aux_transfer_specs(
++            self.kv_args.aux_buffer_names,
++            prefill_aux_ptrs,
++            prefill_aux_item_lens,
++            dst_aux_ptrs,
++            prefill_aux_index,
++            req.dst_aux_index,
++        ):
+             transfer_blocks.append((src_addr, dst_addr, length))
+ 
+         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
+@@ -844,9 +864,14 @@ class MooncakeKVManager(CommonKVManager):
+         prefill_aux_ptrs = self.kv_args.aux_data_ptrs
+         prefill_aux_item_lens = self.kv_args.aux_item_lens
+ 
+-        for i in range(len(prefill_aux_ptrs)):
+-            length = prefill_aux_item_lens[i]
+-            src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
++        for i, src_addr, _, length in iter_aux_transfer_specs(
++            self.kv_args.aux_buffer_names,
++            prefill_aux_ptrs,
++            prefill_aux_item_lens,
++            dst_aux_ptrs,
++            prefill_aux_index,
++            req.dst_aux_index,
++        ):
+             data = AuxDataCodec.serialize_data_from_buffer(src_addr, length)
+ 
+             self.send_aux_data_to_endpoint(
+@@ -994,15 +1019,17 @@ class MooncakeKVManager(CommonKVManager):
+                 src_indices = list(indices)
+                 dst_indices_local = list(dst_indices)
+                 if len(src_indices) > len(dst_indices_local):
+-                    logger.warning(
+-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
++                    logger.error(
++                        f"len(prefill_state_indices) = {len(src_indices)}, "
++                        f"len(dst_state_indices) = {len(dst_indices_local)}"
+                     )
+-                    src_indices = src_indices[: len(dst_indices_local)]
++                    return -1
+                 elif len(src_indices) < len(dst_indices_local):
+-                    logger.warning(
+-                        f"len(prefill_state_indices) = {len(src_indices)}, len(dst_state_indices) = {len(dst_indices_local)}"
++                    logger.error(
++                        f"len(prefill_state_indices) = {len(src_indices)}, "
++                        f"len(dst_state_indices) = {len(dst_indices_local)}"
+                     )
+-                    dst_indices_local = dst_indices_local[: len(src_indices)]
++                    return -1
+                 rc = (
+                     self._send_kvcache_generic(
+                         mooncake_session_id=req.mooncake_session_id,
+@@ -1279,12 +1306,6 @@ class MooncakeKVManager(CommonKVManager):
+                         if ret != 0:
+                             with self.session_lock:
+                                 self.session_failures[req.mooncake_session_id] += 1
+-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
+-                                if self.session_failures[req.mooncake_session_id] >= 1:
+-                                    self.failed_sessions.add(req.mooncake_session_id)
+-                                    logger.error(
+-                                        f"Session {req.mooncake_session_id} failed."
+-                                    )
+                             self.record_failure(
+                                 kv_chunk.room,
+                                 f"Failed to send kv chunk of {kv_chunk.room} to "
+@@ -1302,12 +1323,27 @@ class MooncakeKVManager(CommonKVManager):
+ 
+                         if kv_chunk.is_last_chunk:
+                             if kv_chunk.state_indices:
+-                                self.maybe_send_extra(
++                                ret = self.maybe_send_extra(
+                                     req,
+                                     kv_chunk.state_indices,
+                                     executor,
+                                     target_rank_registration_info,
+                                 )
++                                if ret != 0:
++                                    self.record_failure(
++                                        kv_chunk.room,
++                                        f"Failed to send extra state of {kv_chunk.room} to "
++                                        f"{NetworkAddress(req.endpoint, req.dst_port).to_host_port_str()}",
++                                    )
++                                    self.update_status(kv_chunk.room, KVPoll.Failed)
++                                    self.sync_status_to_decode_endpoint(
++                                        req.endpoint,
++                                        req.dst_port,
++                                        req.room,
++                                        KVPoll.Failed,
++                                        prefill_unique_rank,
++                                    )
++                                    break
+ 
+                             # Only the last chunk we need to send the aux data
+                             ret = self.send_aux(
+diff --git a/python/sglang/srt/disaggregation/prefill.py b/python/sglang/srt/disaggregation/prefill.py
+index ce1afda..de8fd05 100644
+--- a/python/sglang/srt/disaggregation/prefill.py
++++ b/python/sglang/srt/disaggregation/prefill.py
+@@ -21,6 +21,8 @@ from __future__ import annotations
+ 
+ import hashlib
+ import logging
++import os
++import time
+ from array import array
+ from collections import deque
+ from http import HTTPStatus
+@@ -180,6 +182,7 @@ class PrefillBootstrapQueue:
+         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
+             self.metadata_buffers.get_buf_infos()
+         )
++        kv_args.aux_buffer_names = self.metadata_buffers.get_aux_buffer_names()
+         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
+         kv_args.gpu_id = self.scheduler.ps.gpu_id
+ 
+@@ -332,6 +335,11 @@ class PrefillBootstrapQueue:
+             self.scheduler.attn_tp_cpu_group,
+         )
+ 
++        bootstrap_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         for i, (req, poll) in enumerate(zip(self.queue, polls)):
+             if (
+                 rids_to_check is not None
+@@ -348,6 +356,27 @@ class PrefillBootstrapQueue:
+                 indices_to_remove.add(i)
+                 failed_reqs.append(req)
+             elif poll == KVPoll.Bootstrapping:
++                entry_time = req.time_stats.prefill_bootstrap_queue_entry_time
++                if entry_time > 0 and now - entry_time > bootstrap_timeout:
++                    error_message = (
++                        f"Prefill bootstrap timed out after {now - entry_time:.1f}s "
++                        f"for request rank={self.tp_rank} "
++                        f"{req.rid=} {req.bootstrap_room=}"
++                    )
++                    logger.error(error_message)
++                    prepare_abort(
++                        req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    self.scheduler.output_streamer.stream_output(
++                        [req], req.return_logprob
++                    )
++                    indices_to_remove.add(i)
++                    failed_reqs.append(req)
++                    if self.scheduler.metrics_reporter.enable_metrics:
++                        self.scheduler.metrics_collector.increment_bootstrap_failed_reqs()
++                    continue
+                 if (
+                     req.time_stats.prefill_retry_count
+                     < self.scheduler.server_args.optimistic_prefill_retries
+@@ -378,6 +407,15 @@ class PrefillBootstrapQueue:
+         else:
+             return bootstrapped_reqs, failed_reqs
+ 
++    def release_memory_occupation(self):
++        self.queue.clear()
++        if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
++            self.kv_manager.deregister_buffer_to_engine()
++
++    def resume_memory_occupation(self):
++        if hasattr(self.kv_manager, "register_buffer_to_engine"):
++            self.kv_manager.register_buffer_to_engine()
++
+ 
+ class SchedulerDisaggregationPrefillMixin:
+     """
+@@ -685,6 +723,11 @@ class SchedulerDisaggregationPrefillMixin:
+             self.attn_tp_cpu_group,
+         )
+ 
++        transfer_timeout = float(
++            os.environ.get("SGLANG_DISAGGREGATION_TRANSFER_TIMEOUT", "600")
++        )
++        now = time.perf_counter()
++
+         undone_reqs: List[Req] = []
+         # Check .poll() for the reqs in disagg_prefill_inflight_queue. If Success, respond to the client and remove it from the queue
+         for req, poll in zip(self.disagg_prefill_inflight_queue, polls):
+@@ -710,7 +753,27 @@ class SchedulerDisaggregationPrefillMixin:
+                     continue
+ 
+             if poll in [KVPoll.WaitingForInput, KVPoll.Transferring]:
+-                undone_reqs.append(req)
++                entry_time = req.time_stats.prefill_transfer_queue_entry_time
++                if entry_time > 0 and now - entry_time > transfer_timeout:
++                    error_message = (
++                        f"Prefill transfer timed out after {now - entry_time:.1f}s "
++                        f"(state={poll}) for request rank={self.ps.tp_rank} "
++                        f"{req.rid=} {req.bootstrap_room=}"
++                    )
++                    logger.error(error_message)
++                    release_kv_cache(req, self.tree_cache)
++                    prepare_abort(
++                        req,
++                        error_message,
++                        status_code=HTTPStatus.GATEWAY_TIMEOUT,
++                    )
++                    if hasattr(req.disagg_kv_sender, "clear"):
++                        req.disagg_kv_sender.clear()
++                    done_reqs.append(req)
++                    if self.metrics_reporter.enable_metrics:
++                        self.metrics_collector.increment_transfer_failed_reqs()
++                else:
++                    undone_reqs.append(req)
+             elif poll == KVPoll.Success:  # transfer done
+                 release_kv_cache(req, self.tree_cache)  # unlock the tree
+                 req.finished_reason = FINISH_LENGTH(length=0)
+diff --git a/python/sglang/srt/disaggregation/utils.py b/python/sglang/srt/disaggregation/utils.py
+index e1d7d9c..a446857 100644
+--- a/python/sglang/srt/disaggregation/utils.py
++++ b/python/sglang/srt/disaggregation/utils.py
+@@ -2,6 +2,7 @@ from __future__ import annotations
+ 
+ import os
+ import random
++import time
+ from collections import deque
+ from contextlib import nullcontext
+ from enum import Enum
+@@ -30,6 +31,17 @@ if TYPE_CHECKING:
+ # Constants & Enums
+ #########################
+ FAKE_BOOTSTRAP_HOST = "2.2.2.2"
++PREFILL_TIMING_AUX_BUFFER_NAME = "prefill_timing"
++PREFILL_TIMING_DEST_ATTRS = (
++    ("fwd_prefill_bootstrap_queue_duration", float),
++    ("fwd_prefill_forward_duration", float),
++    ("fwd_prefill_transfer_queue_duration", float),
++    ("fwd_prefill_bootstrap_duration", float),
++    ("fwd_prefill_alloc_wait_duration", float),
++    ("fwd_transfer_speed_gb_s", float),
++    ("fwd_transfer_total_mb", float),
++    ("fwd_prefill_retry_count", int),
++)
+ 
+ 
+ class DisaggregationMode(Enum):
+@@ -255,46 +267,32 @@ class MetadataBuffers:
+             self.bootstrap_room = torch.zeros(
+                 (size, 8), dtype=bootstrap_room_dtype, device=device
+             )
++            self.prefill_timing = torch.zeros(
++                (size, 16), dtype=torch.float32, device=device
++            )
++        self.aux_buffers = [
++            ("output_ids", self.output_ids),
++            ("cached_tokens", self.cached_tokens),
++            ("output_token_logprobs_val", self.output_token_logprobs_val),
++            ("output_token_logprobs_idx", self.output_token_logprobs_idx),
++            ("output_top_logprobs_val", self.output_top_logprobs_val),
++            ("output_top_logprobs_idx", self.output_top_logprobs_idx),
++            ("output_topk_p", self.output_topk_p),
++            ("output_topk_index", self.output_topk_index),
++            ("output_hidden_states", self.output_hidden_states),
++            ("bootstrap_room", self.bootstrap_room),
++            (PREFILL_TIMING_AUX_BUFFER_NAME, self.prefill_timing),
++        ]
+ 
+     def get_buf_infos(self):
+-        ptrs = [
+-            self.output_ids.data_ptr(),
+-            self.cached_tokens.data_ptr(),
+-            self.output_token_logprobs_val.data_ptr(),
+-            self.output_token_logprobs_idx.data_ptr(),
+-            self.output_top_logprobs_val.data_ptr(),
+-            self.output_top_logprobs_idx.data_ptr(),
+-            self.output_topk_p.data_ptr(),
+-            self.output_topk_index.data_ptr(),
+-            self.output_hidden_states.data_ptr(),
+-            self.bootstrap_room.data_ptr(),
+-        ]
+-        data_lens = [
+-            self.output_ids.nbytes,
+-            self.cached_tokens.nbytes,
+-            self.output_token_logprobs_val.nbytes,
+-            self.output_token_logprobs_idx.nbytes,
+-            self.output_top_logprobs_val.nbytes,
+-            self.output_top_logprobs_idx.nbytes,
+-            self.output_topk_p.nbytes,
+-            self.output_topk_index.nbytes,
+-            self.output_hidden_states.nbytes,
+-            self.bootstrap_room.nbytes,
+-        ]
+-        item_lens = [
+-            self.output_ids[0].nbytes,
+-            self.cached_tokens[0].nbytes,
+-            self.output_token_logprobs_val[0].nbytes,
+-            self.output_token_logprobs_idx[0].nbytes,
+-            self.output_top_logprobs_val[0].nbytes,
+-            self.output_top_logprobs_idx[0].nbytes,
+-            self.output_topk_p[0].nbytes,
+-            self.output_topk_index[0].nbytes,
+-            self.output_hidden_states[0].nbytes,
+-            self.bootstrap_room[0].nbytes,
+-        ]
++        ptrs = [buffer.data_ptr() for _, buffer in self.aux_buffers]
++        data_lens = [buffer.nbytes for _, buffer in self.aux_buffers]
++        item_lens = [buffer[0].nbytes for _, buffer in self.aux_buffers]
+         return ptrs, data_lens, item_lens
+ 
++    def get_aux_buffer_names(self):
++        return [name for name, _ in self.aux_buffers]
++
+     def get_buf(self, idx: int):
+         return (
+             self.output_ids[idx].clone(),
+@@ -307,8 +305,12 @@ class MetadataBuffers:
+             self.output_topk_index[idx].clone(),
+             self.output_hidden_states[idx].clone(),
+             self.bootstrap_room[idx].clone(),
++            self.prefill_timing[idx].clone(),
+         )
+ 
++    def clear_profiling_buf(self, idx: int):
++        self.prefill_timing[idx].zero_()
++
+     def set_buf(self, req: Req):
+ 
+         self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+@@ -360,6 +362,93 @@ class MetadataBuffers:
+         self.bootstrap_room[req.metadata_buffer_index, 0] = (
+             req.bootstrap_room if req.bootstrap_room is not None else 0
+         )
++        ts = req.time_stats
++        timing = self.prefill_timing[req.metadata_buffer_index]
++        self.clear_profiling_buf(req.metadata_buffer_index)
++        if not is_slime_profiling_enabled():
++            return
++        for idx, value in enumerate(
++            build_prefill_timing_payload(ts, now=time.perf_counter())
++        ):
++            if value > 0:
++                timing[idx] = value
++
++
++def is_slime_profiling_enabled() -> bool:
++    return envs.SLIME_ENABLE_PROFILING.get()
++
++
++def build_prefill_timing_payload(time_stats, now: float) -> tuple[float, ...]:
++    bootstrap_queue_duration = 0.0
++    if (
++        time_stats.prefill_bootstrap_queue_entry_time > 0
++        and time_stats.wait_queue_entry_time > 0
++    ):
++        bootstrap_queue_duration = (
++            time_stats.wait_queue_entry_time
++            - time_stats.prefill_bootstrap_queue_entry_time
++        )
++
++    prefill_forward_duration = (
++        now - time_stats.forward_entry_time
++        if time_stats.forward_entry_time > 0
++        else 0.0
++    )
++
++    bootstrap_duration = 0.0
++    alloc_waiting_duration = 0.0
++    if (
++        time_stats.prefill_bootstrap_queue_entry_time > 0
++        and time_stats.bootstrap_done_time > 0
++    ):
++        bootstrap_duration = (
++            time_stats.bootstrap_done_time
++            - time_stats.prefill_bootstrap_queue_entry_time
++        )
++    if time_stats.bootstrap_done_time > 0 and time_stats.wait_queue_entry_time > 0:
++        alloc_waiting_duration = (
++            time_stats.wait_queue_entry_time - time_stats.bootstrap_done_time
++        )
++
++    return (
++        bootstrap_queue_duration,
++        prefill_forward_duration,
++        0.0,
++        max(0.0, bootstrap_duration),
++        max(0.0, alloc_waiting_duration),
++        max(0.0, time_stats.transfer_speed_gb_s),
++        max(0.0, time_stats.transfer_total_mb),
++        float(max(0, time_stats.prefill_retry_count)),
++    )
++
++
++def apply_prefill_timing_payload(time_stats, timing) -> None:
++    for value, (attr_name, caster) in zip(
++        timing[: len(PREFILL_TIMING_DEST_ATTRS)].tolist(),
++        PREFILL_TIMING_DEST_ATTRS,
++    ):
++        if value > 0:
++            setattr(time_stats, attr_name, caster(value))
++
++
++def iter_aux_transfer_specs(
++    aux_buffer_names: list[str],
++    prefill_aux_ptrs: list[int],
++    prefill_aux_item_lens: list[int],
++    dst_aux_ptrs: list[int],
++    prefill_aux_index: int,
++    dst_aux_index: int,
++):
++    profiling_enabled = is_slime_profiling_enabled()
++    for i, (buffer_name, dst_aux_ptr) in enumerate(zip(aux_buffer_names, dst_aux_ptrs)):
++        if not profiling_enabled and buffer_name == PREFILL_TIMING_AUX_BUFFER_NAME:
++            continue
++        length = prefill_aux_item_lens[i]
++        if length <= 0:
++            continue
++        src_addr = prefill_aux_ptrs[i] + length * prefill_aux_index
++        dst_addr = dst_aux_ptr + length * dst_aux_index
++        yield i, src_addr, dst_addr, length
+ 
+ 
+ #########################

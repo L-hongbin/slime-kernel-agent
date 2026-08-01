@@ -159,6 +159,29 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--plan-first-layers", type=int, default=None)
     parser.add_argument("--plan-last-layers", type=int, default=None)
     parser.add_argument(
+        "--include-mtp",
+        action="store_true",
+        default=False,
+        help=(
+            "Build the V4 MTP head on the last PP stage so the mtp.* subtree is "
+            "converted (native_checkpoint auto-includes it when model.mtp exists). "
+            "Required when the training run uses --mtp-num-layers 1."
+        ),
+    )
+    parser.add_argument(
+        "--fp4-experts",
+        action="store_true",
+        default=False,
+        help=(
+            "Build the model in packed-MXFP4 expert mode (sets V4_FP4_FROZEN_EXPERTS=1 "
+            "before construction): routed expert bytes + E8M0 scales from the OFFICIAL "
+            "mixed checkpoint are carried into torch_dist verbatim as uint8 tensors "
+            "instead of being dequantized to bf16. Requires an official packed "
+            "checkpoint as --checkpoint (per-tensor dtype is probed at load; a "
+            "uniform-FP8 checkpoint fails loudly)."
+        ),
+    )
+    parser.add_argument(
         "--logical-ep-size",
         type=int,
         default=1,
@@ -174,6 +197,9 @@ def main(argv: list[str] | None = None) -> int:
         help="Logical EP rank to materialize when --logical-ep-size > 1.",
     )
     args = parser.parse_args(argv)
+
+    if args.fp4_experts:
+        os.environ["V4_FP4_FROZEN_EXPERTS"] = "1"
 
     rank, world_size, _ = init_dist_from_env(
         args.master_port,
@@ -215,6 +241,7 @@ def main(argv: list[str] | None = None) -> int:
             expert_model_parallel_size=ep_size,
             expert_model_parallel_rank=ep_rank,
             pipeline_model_parallel_size=args.pp_size,
+            enable_mtp=args.include_mtp,
         )
         model = model.cuda().bfloat16()
         stats = load_native_checkpoint_into_mcore_model(model, args.checkpoint, layer_map=layer_map, strict=True)

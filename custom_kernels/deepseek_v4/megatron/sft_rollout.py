@@ -24,14 +24,13 @@ import os
 import shutil
 
 # Fixed synthetic batch shape (matches sft_sanity.py for a comparable loss curve).
-_B = int(os.environ.get("V4_SFT_B", 2))
 _TOTAL_LEN = 64
 _RESP_LEN = 32
 _VOCAB = 512  # must match the tiny DeepseekV4Config vocab_size
 _SEED = 123
 
 
-def _fixed_samples():
+def _fixed_samples(batch_size: int = 2):
     """Build the fixed list[list[Sample]] (B single-sample groups) with synthetic tokens.
 
     Deterministic (fixed torch seed) so every rollout returns the IDENTICAL batch — the
@@ -44,7 +43,7 @@ def _fixed_samples():
 
     g = torch.Generator(device="cpu").manual_seed(_SEED)
     groups = []
-    for sample_idx in range(_B):
+    for sample_idx in range(batch_size):
         toks = torch.randint(0, _VOCAB, (_TOTAL_LEN,), generator=g).tolist()
         s = Sample()
         s.index = sample_idx
@@ -65,7 +64,10 @@ def v4_sft_rollout(args, rollout_id, data_source, evaluation=False):
     assert not evaluation, "v4_sft_rollout is train-only (debug-train-only SFT sanity)"
     from slime.rollout.base_types import RolloutFnTrainOutput
 
-    return RolloutFnTrainOutput(samples=_fixed_samples(), metrics={"r1_synthetic": 1.0})
+    return RolloutFnTrainOutput(
+        samples=_fixed_samples(args.rollout_batch_size),
+        metrics={"r1_synthetic": 1.0},
+    )
 
 
 def stage_hf_checkpoint(dest: str, tokenizer_src: str | None = None):

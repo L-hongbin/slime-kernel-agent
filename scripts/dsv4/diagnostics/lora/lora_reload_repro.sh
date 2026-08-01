@@ -33,9 +33,10 @@ CUDA_GRAPH_MAX_BS=${CUDA_GRAPH_MAX_BS:-64}
 MAX_RUNNING_REQUESTS=${MAX_RUNNING_REQUESTS:-64}
 MAX_LORAS_PER_BATCH=${MAX_LORAS_PER_BATCH:-1}
 MAX_LORA_RANK=${MAX_LORA_RANK:-16}
-# Shared-expert LoRA targets ride along when V4_LORA_SHARED_EXPERT=1 (native
+# Shared-expert LoRA targets ride along when SHARED_EXPERT=1 (native
 # adapter leaves w1/w3/w2 normalize to the served gate_up_proj/down_proj).
-if [[ "${V4_LORA_SHARED_EXPERT:-0}" == "1" ]]; then
+SHARED_EXPERT=${SHARED_EXPERT:-0}
+if [[ "${SHARED_EXPERT}" == "1" ]]; then
   LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"wq_a wkv wq_b wo_b wkv_gate gate_up_proj down_proj"}
 else
   LORA_TARGET_MODULES=${LORA_TARGET_MODULES:-"wq_a wkv wq_b wo_b wkv_gate"}
@@ -146,11 +147,16 @@ cleanup() {
 trap cleanup EXIT
 
 # ---- drive the load/reload loop once the server is healthy ----
+DRIVER_LORA_ARGS=()
+if [[ "${SHARED_EXPERT}" == "1" ]]; then
+  DRIVER_LORA_ARGS+=(--shared-expert)
+fi
 python3 "${REPO}/scripts/dsv4/diagnostics/lora/lora_reload_repro_driver.py" \
   --host "${HOST}" --port "${PORT}" \
   --hf-ckpt "${HF_CKPT}" \
   --num-layers "${NUM_LAYERS}" \
   --rank "${MAX_LORA_RANK}" \
+  "${DRIVER_LORA_ARGS[@]}" \
   --iters "${ITERS}" \
   --b-scale "${B_SCALE:-0}" \
   --mode "${MODE}" \

@@ -1,3 +1,4 @@
+import math
 from collections.abc import Callable
 
 import torch
@@ -5,12 +6,74 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
 
+# --- CP sequence-partition mode -------------------------------------------------
+#
+# slime's default CP layout is Megatron's ZIGZAG (a.k.a. balanced) partition:
+# the padded sequence is cut into ``2*cp_size`` chunks and rank ``r`` owns the
+# mirror pair ``{r, 2*cp_size-1-r}`` so causal work is balanced across ranks.
+#
+# DeepSeek-V4-Flash needs a CONTIGUOUS partition instead: rank ``r`` owns the
+# single contiguous block ``[r*l_local, (r+1)*l_local)`` (l_local = S/cp_size),
+# because the V4 attention kernel's raw sliding-window / compressor look-back
+# assume a monotone local position axis. Implemented as a re-labelling of which
+# two of the ``2*cp_size`` chunks each rank owns: contiguous rank ``r`` owns the
+# ADJACENT pair ``{2r, 2r+1}`` (their union is exactly ``[r*l_local, (r+1)*l_local)``).
+#
+# Crucially ``chunk_size`` is IDENTICAL in both modes, so the per-rank local
+# tensor still holds ``2*chunk_size`` rows per sample and every downstream
+# consumer that reads the returned (chunks/logits/tokens) offsets keeps working
+# unchanged -- only *which global positions* those two chunks map to changes.
+#
+# The mode is a single process-wide setting (set once from args at init) rather
+# than a threaded argument, because ``get_logits_and_tokens_offset_with_cp`` is
+# also called from arg-less helpers (all_gather_with_cp, slice_log_prob_with_cp,
+# get_sum_of_sample_mean). ``cp_size == 1`` is a strict no-op in either mode.
+CP_PARTITION_ZIGZAG = "zigzag"
+CP_PARTITION_CONTIGUOUS = "contiguous"
+_CP_PARTITION_MODE = CP_PARTITION_ZIGZAG
+
+
+def set_cp_partition_mode(mode: str) -> None:
+    """Set the process-wide CP sequence-partition mode (called once from init)."""
+    global _CP_PARTITION_MODE
+    assert mode in (CP_PARTITION_ZIGZAG, CP_PARTITION_CONTIGUOUS), f"unknown cp_partition_mode: {mode!r}"
+    _CP_PARTITION_MODE = mode
+
+
+def get_cp_partition_mode() -> str:
+    return _CP_PARTITION_MODE
+
+
+def _resolve_cp_partition_mode(partition_mode: str | None) -> str:
+    return _CP_PARTITION_MODE if partition_mode is None else partition_mode
+
+
+def compute_cp_padded_max_seq_len(
+    raw_max_seq_len: int,
+    pad_size: int,
+    cp_size: int,
+    partition_mode: str | None = None,
+) -> int:
+    """Round ``raw_max_seq_len`` up to the bshd pad granularity (B1).
+
+    Under contiguous CP the per-rank block ``l_local = max_seq_len / cp_size`` must
+    be 128-aligned (HCA window / compressor look-back), so the pad granularity is
+    raised to ``lcm(pad_size, cp_size*128)`` -- the rounded length becomes a
+    multiple of ``cp_size*128`` and ``l_local % 128 == 0``. Strict no-op (unchanged
+    ``pad_size``) at ``cp_size == 1`` or in the zigzag layout.
+    """
+    mode = _resolve_cp_partition_mode(partition_mode)
+    if cp_size > 1 and mode == CP_PARTITION_CONTIGUOUS:
+        pad_size = math.lcm(pad_size, cp_size * 128)
+    return (raw_max_seq_len + pad_size - 1) // pad_size * pad_size
+
 
 def get_logits_and_tokens_offset_with_cp(
     total_length: int,
     response_length: int,
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
+    partition_mode: str | None = None,
 ):
     """
     All offsets start from the begining of the prompt.
@@ -18,6 +81,7 @@ def get_logits_and_tokens_offset_with_cp(
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = mpu.get_context_parallel_world_size()
     assert cp_size > 1
+    mode = _resolve_cp_partition_mode(partition_mode)
 
     prompt_length = total_length - response_length
     if qkv_format == "thd":
@@ -27,8 +91,14 @@ def get_logits_and_tokens_offset_with_cp(
         chunk_size = (max_seq_len + 2 * cp_size - 1) // (2 * cp_size)
 
     # the offset of 2 chunks
-    chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
-    chunk_1 = ((2 * cp_size - cp_rank - 1) * chunk_size, (2 * cp_size - cp_rank) * chunk_size)
+    if mode == CP_PARTITION_CONTIGUOUS:
+        # Contiguous: rank r owns the adjacent chunk pair {2r, 2r+1}. Their union
+        # [2r*chunk_size, (2r+2)*chunk_size) == [r*l_local, (r+1)*l_local).
+        chunk_0 = (2 * cp_rank * chunk_size, (2 * cp_rank + 1) * chunk_size)
+        chunk_1 = ((2 * cp_rank + 1) * chunk_size, (2 * cp_rank + 2) * chunk_size)
+    else:
+        chunk_0 = (cp_rank * chunk_size, (cp_rank + 1) * chunk_size)
+        chunk_1 = ((2 * cp_size - cp_rank - 1) * chunk_size, (2 * cp_size - cp_rank) * chunk_size)
 
     # the offset of 2 logits, note that the logits need a "-1".
     logits_0 = (max(chunk_0[0], prompt_length - 1), min(chunk_0[1], total_length - 1))
@@ -244,10 +314,22 @@ def gather_and_reduce_log_dict(
     return None
 
 
-def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length: int) -> torch.Tensor:
+def all_gather_with_cp(
+    tensor: torch.Tensor,
+    total_length: int,
+    response_length: int,
+    qkv_format: str = "thd",
+    max_seq_len: int | None = None,
+) -> torch.Tensor:
     """
     Gather tensors across all ranks in the context parallel group.
     The first dimension of the output tensor will be the `response_length`.
+
+    ``tensor`` must be interpreted with the same physical sequence layout that
+    produced it.  In particular, BSHD actual-length padding partitions CP by
+    the padded microbatch width (``max_seq_len``), not by ``total_length``.
+    Omitting that width would recompute different chunk boundaries and either
+    misplace rows or fail the local-shape assertion below.
     """
     cp_group = mpu.get_context_parallel_group()
     cp_size = mpu.get_context_parallel_world_size()
@@ -255,13 +337,30 @@ def all_gather_with_cp(tensor: torch.Tensor, total_length: int, response_length:
     if cp_size == 1:
         return tensor
 
-    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    if qkv_format == "bshd" and max_seq_len is None:
+        raise ValueError("all_gather_with_cp requires max_seq_len for qkv_format='bshd'.")
+    _, _, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+    )
 
     prompt_length = total_length - response_length
 
-    chunk_0 = tensor[: logits_offset[0][1] - logits_offset[0][0]]
-    chunk_1 = tensor[logits_offset[0][1] - logits_offset[0][0] :]
-    assert chunk_1.shape[0] == logits_offset[1][1] - logits_offset[1][0]
+    chunk_0_length = logits_offset[0][1] - logits_offset[0][0]
+    chunk_1_length = logits_offset[1][1] - logits_offset[1][0]
+    expected_local_length = chunk_0_length + chunk_1_length
+    if tensor.shape[0] != expected_local_length:
+        raise AssertionError(
+            "all_gather_with_cp local response length does not match its CP layout: "
+            f"actual={tensor.shape[0]}, expected={expected_local_length} "
+            f"(chunks={chunk_0_length}+{chunk_1_length}), total_length={total_length}, "
+            f"response_length={response_length}, qkv_format={qkv_format!r}, "
+            f"max_seq_len={max_seq_len}, logits_offset={logits_offset}."
+        )
+    chunk_0 = tensor[:chunk_0_length]
+    chunk_1 = tensor[chunk_0_length:]
 
     def zero(len: int) -> torch.Tensor:
         return torch.zeros(
@@ -301,9 +400,11 @@ def slice_with_cp(
     pad_value: tuple[int, float, Callable],
     qkv_format: str = "thd",
     max_seq_len: int | None = None,
+    partition_mode: str | None = None,
 ) -> torch.Tensor:
     cp_rank = mpu.get_context_parallel_rank()
     cp_size = mpu.get_context_parallel_world_size()
+    mode = _resolve_cp_partition_mode(partition_mode)
 
     if qkv_format == "bshd":
         assert max_seq_len is not None
@@ -334,9 +435,27 @@ def slice_with_cp(
     pad = 2 * cp_size * chunk_size - token_len
     tokens = pad_tokens(tokens, pad)
 
-    # get 2 chunk for thd cp
-    start_1, end_1 = chunk_size * cp_rank, chunk_size * (cp_rank + 1)
-    start_2, end_2 = chunk_size * (2 * cp_size - cp_rank - 1), chunk_size * (2 * cp_size - cp_rank)
+    if mode == CP_PARTITION_CONTIGUOUS:
+        # Contiguous partition: rank r owns the adjacent chunk pair {2r, 2r+1},
+        # i.e. a single contiguous block [r*l_local, (r+1)*l_local) with
+        # l_local = 2*chunk_size. The V4 attention kernel needs l_local aligned
+        # to the compressor / sliding-window granularity (128); B1 raises the
+        # max_seq_len pad multiplier to lcm(*, cp_size*128) upstream to guarantee
+        # it -- assert here so a mis-configured pad fails loud instead of
+        # silently scrambling the local position axis.
+        l_local = 2 * chunk_size
+        if qkv_format == "bshd":
+            assert l_local % 128 == 0, (
+                f"contiguous CP requires l_local (=max_seq_len/cp_size={l_local}) to be a multiple of 128; "
+                f"got max_seq_len={max_seq_len}, cp_size={cp_size}. Raise the max_seq_len pad multiplier "
+                f"to a multiple of cp_size*128 (B1)."
+            )
+        start_1, end_1 = 2 * cp_rank * chunk_size, (2 * cp_rank + 1) * chunk_size
+        start_2, end_2 = (2 * cp_rank + 1) * chunk_size, (2 * cp_rank + 2) * chunk_size
+    else:
+        # get 2 chunk for zigzag cp
+        start_1, end_1 = chunk_size * cp_rank, chunk_size * (cp_rank + 1)
+        start_2, end_2 = chunk_size * (2 * cp_size - cp_rank - 1), chunk_size * (2 * cp_size - cp_rank)
     return torch.cat([tokens[start_1:end_1], tokens[start_2:end_2]])
 
 

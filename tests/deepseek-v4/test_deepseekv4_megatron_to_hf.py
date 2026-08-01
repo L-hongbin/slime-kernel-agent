@@ -143,7 +143,7 @@ def test_deepseekv4_raw_fp8_quantization_uses_wo_a_scale_name():
     assert got[5][1].dtype is torch.float8_e4m3fn
 
 
-def test_v4_global_name_maps_pp_local_layers_and_ep_expert_ranges():
+def test_dsv4_global_name_maps_pp_local_layers_and_ep_expert_ranges():
     model_module = SimpleNamespace(layer_ids=(21, 22))
     layer_param = torch.ones(2, 2)
     expert_param = torch.ones(32, 4, 3)
@@ -170,7 +170,7 @@ def test_v4_global_name_maps_pp_local_layers_and_ep_expert_ranges():
     )
 
 
-def test_v4_global_name_unwraps_ddp_float16_module_chain():
+def test_dsv4_global_name_unwraps_ddp_float16_module_chain():
     wrapped = SimpleNamespace(module=SimpleNamespace(module=SimpleNamespace(layer_ids=(21, 22))))
 
     assert (
@@ -185,7 +185,7 @@ def test_v4_global_name_unwraps_ddp_float16_module_chain():
     )
 
 
-def test_v4_lora_merge_builds_effective_dense_weight():
+def test_dsv4_lora_merge_builds_effective_dense_weight():
     base = torch.zeros(2, 3, dtype=torch.bfloat16)
     lora_in = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=torch.bfloat16)
     lora_out = torch.tensor([[1.0, 0.5], [2.0, 1.0]], dtype=torch.bfloat16)
@@ -197,7 +197,7 @@ def test_v4_lora_merge_builds_effective_dense_weight():
     torch.testing.assert_close(got, expected)
 
 
-def test_v4_lora_base_scales_use_global_layer_names_through_wrappers():
+def test_dsv4_lora_base_scales_use_global_layer_names_through_wrappers():
     class FakeLora(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -229,7 +229,7 @@ def test_v4_lora_base_scales_use_global_layer_names_through_wrappers():
     }
 
 
-def test_v4_lora_only_distributed_iterator_skips_frozen_base_and_experts(monkeypatch):
+def test_dsv4_lora_only_distributed_iterator_skips_frozen_base_and_experts(monkeypatch):
     from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as upd
 
     base_name = "module.module.layers.21.self_attn.q_a_proj.weight"
@@ -274,7 +274,7 @@ def test_v4_lora_only_distributed_iterator_skips_frozen_base_and_experts(monkeyp
     assert list(updater._iter_expert_chunks()) == []
 
 
-def test_v4_lora_only_iterator_keeps_sglang_compressor_pairs_in_same_chunk(monkeypatch):
+def test_dsv4_lora_only_iterator_keeps_sglang_compressor_pairs_in_same_chunk(monkeypatch):
     from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as upd
 
     kv_base = "module.module.layers.21.self_attn.compressor.kv_proj.weight"
@@ -322,7 +322,7 @@ def test_v4_lora_only_iterator_keeps_sglang_compressor_pairs_in_same_chunk(monke
     ]
 
 
-def test_v4_sglang_compressor_pair_detector_tracks_loader_constraint():
+def test_dsv4_sglang_compressor_pair_detector_tracks_loader_constraint():
     assert _v4_incomplete_sglang_compressor_pairs(
         [
             ("layers.21.attn.compressor.wkv.weight", torch.ones(1)),
@@ -343,7 +343,7 @@ def test_v4_sglang_compressor_pair_detector_tracks_loader_constraint():
     )
 
 
-def test_v4_sglang_wqkv_a_pair_detector_tracks_loader_constraint():
+def test_dsv4_sglang_wqkv_a_pair_detector_tracks_loader_constraint():
     assert _v4_incomplete_sglang_wqkv_a_pairs(
         [
             ("layers.27.attn.wq_a.weight", torch.ones(1)),
@@ -367,7 +367,7 @@ def test_v4_sglang_wqkv_a_pair_detector_tracks_loader_constraint():
     )
 
 
-def test_v4_chunks_keep_sglang_fused_wq_a_wkv_together(monkeypatch):
+def test_dsv4_chunks_keep_sglang_fused_wq_a_wkv_together(monkeypatch):
     from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as upd
 
     q_name = "module.module.layers.27.self_attn.q_a_proj.weight"
@@ -420,7 +420,7 @@ def test_v4_chunks_keep_sglang_fused_wq_a_wkv_together(monkeypatch):
     ]
 
 
-def test_v4_lora_only_chunks_keep_sglang_compressor_wkv_wgate_together(monkeypatch):
+def test_dsv4_lora_only_chunks_keep_sglang_compressor_wkv_wgate_together(monkeypatch):
     from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as upd
 
     q_name = "module.module.layers.21.self_attn.q_a_proj.weight"

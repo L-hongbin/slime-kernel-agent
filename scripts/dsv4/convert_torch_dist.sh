@@ -25,9 +25,29 @@ NUM_LAYERS=${NUM_LAYERS:-43}
 FIRST_LAYERS=${FIRST_LAYERS:-21}
 LAST_LAYERS=${LAST_LAYERS:-22}
 MASTER_PORT=${MASTER_PORT:-29664}
+# FP4_EXPERTS=1: OFFICIAL mixed checkpoint conversion — routed experts stay
+# packed MXFP4 (uint8 nibbles + E8M0 scales) in torch_dist instead of bf16.
+# Requires CHECKPOINT to be the official deepseek-ai/DeepSeek-V4-Flash copy
+# (per-tensor dtype is probed; a uniform-FP8 checkpoint fails loudly). Expert
+# payload shrinks ~8x vs bf16, so MIN_FREE_GIB can be lowered (~120 GiB/node
+# at PP2_EP8).
+FP4_EXPERTS=${FP4_EXPERTS:-0}
+FP4_FLAG=()
+if [[ "${FP4_EXPERTS}" == "1" ]]; then
+  FP4_FLAG=(--fp4-experts)
+fi
+# INCLUDE_MTP=1: build the MTP head on the last PP stage and convert mtp.*
+# (avoids a separate reconversion cycle when MTP training is enabled later).
+# Applies to the CONVERSION only; verify_torch_dist checks the non-MTP surface.
+INCLUDE_MTP=${INCLUDE_MTP:-0}
+MTP_FLAG=()
+if [[ "${INCLUDE_MTP}" == "1" ]]; then
+  MTP_FLAG=(--include-mtp)
+fi
 # Local rank-shard estimate before overhead: ~306-320 GiB/node at PP2_EP8,
 # ~220 GiB/node at PP3_EP8. Keep a margin.
 MIN_FREE_GIB=${MIN_FREE_GIB:-340}
+VERIFY_ONLY=${VERIFY_ONLY:-0}
 CLUSTER_NO_PROXY=${CLUSTER_NO_PROXY:-127.0.0.1,localhost,10.11.2.164,10.11.2.169,10.11.2.170,10.11.2.162,node64,node69,node70,node62,node64_slime,node69_slime,node70_slime,node62_slime}
 
 : "${MASTER_ADDR:?Set MASTER_ADDR to the rank-0 actor node IP/hostname}"
@@ -49,16 +69,47 @@ if [[ ! -d "${CHECKPOINT}" || ! -f "${CHECKPOINT}/model.safetensors.index.json" 
   echo "Native checkpoint missing on this node: ${CHECKPOINT}" >&2
   exit 2
 fi
-if [[ -e "${SAVE}" ]]; then
-  echo "Output already exists, refusing to overwrite: ${SAVE}" >&2
+missing_shards=$(python3 - "${CHECKPOINT}/model.safetensors.index.json" <<'PY'
+import json
+import os
+import sys
+
+index_path = sys.argv[1]
+checkpoint_dir = os.path.dirname(index_path)
+with open(index_path, encoding="utf-8") as f:
+    shard_names = sorted(set(json.load(f)["weight_map"].values()))
+missing = [name for name in shard_names if not os.path.isfile(os.path.join(checkpoint_dir, name))]
+print("\n".join(missing))
+PY
+)
+if [[ -n "${missing_shards}" ]]; then
+  echo "Native checkpoint index exists but referenced shards are missing on this node: ${CHECKPOINT}" >&2
+  printf '%s\n' "${missing_shards}" | sed -n '1,10p' >&2
   exit 2
 fi
+if [[ "${VERIFY_ONLY}" == "1" ]]; then
+  if [[ ! -f "${SAVE}/release/.metadata" ]]; then
+    echo "Existing checkpoint metadata missing on this node: ${SAVE}/release/.metadata" >&2
+    exit 2
+  fi
+  free_gib="not-checked"
+else
+  if [[ -e "${SAVE}" ]]; then
+    echo "Output already exists, refusing to overwrite: ${SAVE}" >&2
+    exit 2
+  fi
 
-save_parent=$(dirname "${SAVE}")
-free_gib=$(df -BG "${save_parent}" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
-if [[ "${free_gib}" -lt "${MIN_FREE_GIB}" ]]; then
-  echo "Insufficient free space at ${save_parent}: ${free_gib} GiB < ${MIN_FREE_GIB} GiB" >&2
-  exit 2
+  save_parent=$(dirname "${SAVE}")
+  free_gib=$(df -BG "${save_parent}" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')
+  if [[ "${free_gib}" -lt "${MIN_FREE_GIB}" ]]; then
+    echo "Insufficient free space at ${save_parent}: ${free_gib} GiB < ${MIN_FREE_GIB} GiB" >&2
+    exit 2
+  fi
+fi
+
+if [[ "${PREPARE_ONLY:-0}" == "1" ]]; then
+  echo "PREPARE_ONLY=1: conversion/verification inputs, topology, and paths passed preflight."
+  exit 0
 fi
 
 export PYTHONUNBUFFERED=1
@@ -86,21 +137,25 @@ echo "  checkpoint=${CHECKPOINT}"
 echo "  save=${SAVE}"
 echo "  free_gib=${free_gib}"
 
-torchrun \
-  --nnodes="${NNODES}" \
-  --node_rank="${NODE_RANK}" \
-  --nproc_per_node="${NPROC_PER_NODE}" \
-  --master_addr="${MASTER_ADDR}" \
-  --master_port="${MASTER_PORT}" \
-  -m custom_kernels.deepseek_v4.megatron.slice_torch_dist \
-  --checkpoint "${CHECKPOINT}" \
-  --save "${SAVE}" \
-  --num-layers "${NUM_LAYERS}" \
-  --pp-size "${PP_SIZE}" \
-  --ep-size "${EP_SIZE}" \
-  --plan-first-layers "${FIRST_LAYERS}" \
-  --plan-last-layers "${LAST_LAYERS}" \
-  --master-port "${MASTER_PORT}"
+if [[ "${VERIFY_ONLY}" != "1" ]]; then
+  torchrun \
+    --nnodes="${NNODES}" \
+    --node_rank="${NODE_RANK}" \
+    --nproc_per_node="${NPROC_PER_NODE}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
+    -m custom_kernels.deepseek_v4.megatron.slice_torch_dist \
+    --checkpoint "${CHECKPOINT}" \
+    --save "${SAVE}" \
+    --num-layers "${NUM_LAYERS}" \
+    --pp-size "${PP_SIZE}" \
+    --ep-size "${EP_SIZE}" \
+    --plan-first-layers "${FIRST_LAYERS}" \
+    --plan-last-layers "${LAST_LAYERS}" \
+    --master-port "${MASTER_PORT}" \
+    ${FP4_FLAG[@]+"${FP4_FLAG[@]}"} \
+    ${MTP_FLAG[@]+"${MTP_FLAG[@]}"}
+fi
 
 # Always verify what actually landed on disk: a fresh process cold-reads the
 # saved torch_dist shards and diffs them against the native checkpoint.
@@ -109,7 +164,7 @@ torchrun \
 VERIFY=${VERIFY:-1}
 VERIFY_OUTPUT=${VERIFY_OUTPUT:-${SAVE}.verify.txt}
 VERIFY_MASTER_PORT=${VERIFY_MASTER_PORT:-$((MASTER_PORT + 1))}
-if [[ "${VERIFY}" == "1" ]]; then
+if [[ "${VERIFY}" == "1" || "${VERIFY_ONLY}" == "1" ]]; then
   echo "V4 verifying saved shards -> ${VERIFY_OUTPUT}"
   torchrun \
     --nnodes="${NNODES}" \
@@ -126,5 +181,6 @@ if [[ "${VERIFY}" == "1" ]]; then
     --ep-size "${EP_SIZE}" \
     --plan-first-layers "${FIRST_LAYERS}" \
     --plan-last-layers "${LAST_LAYERS}" \
-    --master-port "${VERIFY_MASTER_PORT}"
+    --master-port "${VERIFY_MASTER_PORT}" \
+    ${FP4_FLAG[@]+"${FP4_FLAG[@]}"}
 fi

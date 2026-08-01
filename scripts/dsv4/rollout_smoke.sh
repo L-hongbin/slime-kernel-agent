@@ -12,7 +12,7 @@ PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/dsv4_rollout_smoke.jsonl}
 SCRATCH=${SCRATCH:-/nfs/FM/csl_v4r4_rollout_smoke_node62}
 DEBUG_DIR=${DEBUG_DIR:-${SCRATCH}/debug}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
-LOG=${LOG:-${REPO}/handoffs/deepseek-v4/r2_logs/r4_node62_rollout_smoke_${RUN_ID}.log}
+LOG=${LOG:-${REPO}/local_artifacts/deepseek-v4/r2_logs/r4_node62_rollout_smoke_${RUN_ID}.log}
 
 MASTER_ADDR=${MASTER_ADDR:-10.11.2.162}
 RAY_PORT=${RAY_PORT:-6382}
@@ -34,7 +34,6 @@ SGLANG_ROUTER_REGISTRATION_TIMEOUT_SECS=${SGLANG_ROUTER_REGISTRATION_TIMEOUT_SEC
 USE_SGLANG_DEEPEP=${USE_SGLANG_DEEPEP:-0}
 SGLANG_DP_SIZE=${SGLANG_DP_SIZE:-4}
 SGLANG_DEEPEP_CONFIG=${SGLANG_DEEPEP_CONFIG:-'{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'}
-GPU_IDLE_MAX_MIB=${GPU_IDLE_MAX_MIB:-1024}
 CLEANUP_RAY_ON_EXIT=${CLEANUP_RAY_ON_EXIT:-1}
 RAY_STARTED=0
 
@@ -90,8 +89,9 @@ kill_old_sglang() {
 }
 
 check_gpu_idle() {
+  local -r max_mib=1024
   nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits \
-    | awk -F, -v max="${GPU_IDLE_MAX_MIB}" '{gsub(/[^0-9]/, "", $1); gsub(/[^0-9.]/, "", $2); if ($2 + 0 > max) {printf("gpu %s uses %s MiB > %s MiB\n", $1, $2, max); bad=1}} END {exit bad ? 1 : 0}'
+    | awk -F, -v max="${max_mib}" '{gsub(/[^0-9]/, "", $1); gsub(/[^0-9.]/, "", $2); if ($2 + 0 > max) {printf("gpu %s uses %s MiB > %s MiB\n", $1, $2, max); bad=1}} END {exit bad ? 1 : 0}'
 }
 
 echo "=== R4 node62 rollout smoke sanity ===" | tee "${LOG}"
@@ -195,12 +195,24 @@ print(json.dumps({"env_vars": env}))
 PY
 )
 
+# Request/graph budgets are divided across DP ranks: with dp-attention enabled
+# the per-rank request pool is max-running-requests/dp_size — below dp_size it
+# floors to 0 and graph capture asserts (capture_bs=[0], req_to_token_pool.size
+# feeds get_batch_sizes_to_capture). Keep >= 2 per DP rank when dp-attention is on.
+if [[ "${V4_FP4_FROZEN_EXPERTS:-0}" == "1" || "${USE_SGLANG_DEEPEP}" == "1" ]]; then
+  SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-$((SGLANG_DP_SIZE * 2))}
+  SGLANG_CUDA_GRAPH_MAX_BS=${SGLANG_CUDA_GRAPH_MAX_BS:-$((SGLANG_DP_SIZE * 2))}
+else
+  SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-2}
+  SGLANG_CUDA_GRAPH_MAX_BS=${SGLANG_CUDA_GRAPH_MAX_BS:-2}
+fi
+
 SGLANG_ARGS=(
   --rollout-num-gpus "${ROLLOUT_GPUS}"
   --rollout-num-gpus-per-engine "${GPUS_PER_ENGINE}"
   --sglang-context-length 512
-  --sglang-max-running-requests 2
-  --sglang-cuda-graph-max-bs 2
+  --sglang-max-running-requests "${SGLANG_MAX_RUNNING_REQUESTS}"
+  --sglang-cuda-graph-max-bs "${SGLANG_CUDA_GRAPH_MAX_BS}"
   --sglang-mem-fraction-static "${SGLANG_MEM_FRACTION_STATIC}"
   --sglang-chunked-prefill-size "${SGLANG_CHUNKED_PREFILL_SIZE}"
   --sglang-max-prefill-tokens "${SGLANG_MAX_PREFILL_TOKENS}"
@@ -211,7 +223,74 @@ SGLANG_ARGS=(
   --router-queue-timeout-secs 2400
 )
 
-if [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
+# NEXTN/EAGLE speculative decoding. Chain mode (eagle-topk=1) needs draft =
+# steps + 1. DELIBERATELY UNGATED for FP4+EAGLE (unlike full_loop_smoke.sh's
+# hard block): this rollout-only harness IS the investigation tool for the
+# known FP4+EAGLE NCCL deadlock (fp4_w4a16_design.md) — launching the wedging
+# combo on purpose is its job. Do not use this script for routine validation
+# with spec enabled unless you are reproducing/fixing that deadlock.
+if [[ "${SGLANG_SPECULATIVE_ALGORITHM:-}" == "DSPARK" ]]; then
+  # DSPARK (new runtime): draft config auto-inferred from the -DSpark ckpt;
+  # no EAGLE-style steps/topk/draft-tokens. dp-lm-head is a hard requirement
+  # under dp-attention. Serve the -DSpark ckpt (V4_ROLLOUT_MODEL_PATH).
+  SGLANG_ARGS+=(
+    --sglang-speculative-algorithm DSPARK
+    --sglang-enable-dp-lm-head
+  )
+  if [[ -n "${V4_ROLLOUT_MODEL_PATH:-}" ]]; then
+    # Rollout serves the -DSpark ckpt variant; trainer stays on --hf-checkpoint.
+    SGLANG_ARGS+=(--rollout-model-path "${V4_ROLLOUT_MODEL_PATH}")
+  fi
+elif [[ -n "${SGLANG_SPECULATIVE_ALGORITHM:-}" && "${SGLANG_SPECULATIVE_ALGORITHM}" != "none" ]]; then
+  SGLANG_ARGS+=(
+    --sglang-speculative-algorithm "${SGLANG_SPECULATIVE_ALGORITHM}"
+    --sglang-speculative-num-steps "${SGLANG_SPECULATIVE_NUM_STEPS:-1}"
+    --sglang-speculative-eagle-topk "${SGLANG_SPECULATIVE_EAGLE_TOPK:-1}"
+    --sglang-speculative-num-draft-tokens "${SGLANG_SPECULATIVE_NUM_DRAFT_TOKENS:-2}"
+  )
+  # Spec-stage MoE reroute (FP4+EAGLE NCCL-desync workaround, 2026-07-16): the
+  # pre-#23906 fork makes per-rank graph-vs-eager decisions in the spec stages,
+  # which desyncs the cross-DP MoE collectives that a2a=none requires. Routing
+  # ONLY the draft/verify/draft-extend MoE onto deepep (the fork's
+  # speculative_moe_a2a_backend_context) removes the count-sensitive collective.
+  if [[ -n "${SGLANG_SPECULATIVE_MOE_A2A_BACKEND:-}" ]]; then
+    SGLANG_ARGS+=(
+      --sglang-speculative-moe-a2a-backend "${SGLANG_SPECULATIVE_MOE_A2A_BACKEND}"
+      --sglang-speculative-moe-runner-backend "${SGLANG_SPECULATIVE_MOE_RUNNER_BACKEND:-deep_gemm}"
+    )
+  fi
+  if [[ -n "${SGLANG_EP_SIZE:-}" ]]; then
+    SGLANG_ARGS+=(--sglang-ep-size "${SGLANG_EP_SIZE}")
+  fi
+fi
+if [[ "${V4_FP4_FROZEN_EXPERTS:-0}" == "1" ]]; then
+  # Packed-MXFP4 W4A16 serving (official checkpoint): SM90 runners are a2a=none
+  # only; runner must be explicit ('auto' falls into Fp8MoEMethod). Mirrors the
+  # full_loop_smoke.sh FP4 block; design handoffs/deepseek-v4/fp4_w4a16_design.md.
+  if [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
+    echo "FATAL: V4_FP4_FROZEN_EXPERTS=1 requires USE_SGLANG_DEEPEP=0" >&2
+    exit 1
+  fi
+  if [[ "${SGLANG_DSV4_FP4_EXPERTS}" != "1" ]]; then
+    echo "FATAL: V4_FP4_FROZEN_EXPERTS=1 requires SGLANG_DSV4_FP4_EXPERTS=1" >&2
+    exit 1
+  fi
+  probed_dtype=$(python3 "${REPO}/scripts/dsv4/probe_expert_dtype.py" "${HF_CKPT}")
+  if [[ "${probed_dtype}" != "I8" && "${probed_dtype}" != "U8" ]]; then
+    echo "FATAL: HF_CKPT routed experts are ${probed_dtype}, expected packed I8: ${HF_CKPT}" >&2
+    exit 1
+  fi
+  # Keep the shared expert TP1-replicated under a2a=none (production/DeepEP-era
+  # semantics; also required for unsharded shared-expert LoRA adapters).
+  export SGLANG_SHARED_EXPERT_TP1=${SGLANG_SHARED_EXPERT_TP1:-1}
+  SGLANG_ARGS+=(
+    --sglang-data-parallel-size "${SGLANG_DP_SIZE}"
+    --sglang-enable-dp-attention
+    --sglang-moe-a2a-backend none
+    --sglang-moe-runner-backend "${SGLANG_MOE_RUNNER_BACKEND:-flashinfer_mxfp4}"
+    --sglang-disable-flashinfer-autotune
+  )
+elif [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
   SGLANG_ARGS+=(
     --sglang-data-parallel-size "${SGLANG_DP_SIZE}"
     --sglang-enable-dp-attention
@@ -221,7 +300,7 @@ if [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
 fi
 
 echo "=== submitting debug-rollout-only job ===" | tee -a "${LOG}"
-JOB_ID=${RAY_JOB_ID:-r4_dsv4_rollout_smoke_$(date -u +%Y%m%d_%H%M%S)_$$}
+JOB_ID=${RAY_JOB_ID:-r4_v4_rollout_smoke_$(date -u +%Y%m%d_%H%M%S)_$$}
 JOB_LOG_CAPTURE="${SCRATCH}/ray_job_${JOB_ID}.log"
 JOB_LOG_CAPTURE_TMP="${JOB_LOG_CAPTURE}.tmp"
 LAST_JOB_LOG_LINES=0

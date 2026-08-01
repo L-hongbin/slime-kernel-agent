@@ -21,8 +21,6 @@ for the attention module to concatenate onto A1's ``k_comp`` argument.
 Math truth: ``DeepseekV4HCACompressor`` (HF:362) / ``DeepseekV4CSACompressor`` (HF:579).
 """
 
-import os
-
 import torch
 from torch import nn
 
@@ -30,23 +28,27 @@ from . import _kernels
 from .rope import DeepseekV4RotaryEmbedding, V4RMSNorm, apply_rotary_pos_emb
 
 
-# Set V4_COMPRESS_TORCH=1 to use the exact torch reference path when TileLang/TVM
-# codegen is not stable on a target node. This is slower but keeps the training
-# chain testable without changing the default performance path.
-if os.environ.get("V4_COMPRESS_TORCH", "0") == "1":
-    from custom_kernels.deepseek_v4.compression.reference import csa_compress_ref as _csa_compress
-    from custom_kernels.deepseek_v4.compression.reference import hca_compress_ref as _hca_compress
-else:
-    _csa_compress = _kernels.csa_compress
-    _hca_compress = _kernels.hca_compress
+# Production always uses the validated TileLang kernels. Diagnostic harnesses
+# that need the torch reference inject csa_compress_ref/hca_compress_ref
+# explicitly instead of changing model behavior through inherited process env.
+_csa_compress = _kernels.csa_compress
+_hca_compress = _kernels.hca_compress
 
 
-def _rope_compressed(compressed, rotary_emb, compress_rate, n_windows, batch, layer_type="compress"):
+def _rope_compressed(
+    compressed, rotary_emb, compress_rate, n_windows, batch, layer_type="compress", position_offset=0
+):
     """RoPE the compressed entries at absolute positions ``w * compress_rate``.
 
-    Stateless training path: ``first_window_position = 0`` (HF:408)."""
+    Stateless training path: ``first_window_position = 0`` (HF:408).
+
+    ``position_offset`` (CP2): the global token position of the compressor input's row
+    0.  Under context parallelism the input is ``[halo || local]`` whose first row sits
+    at global position ``global_start - halo``, so window ``j`` gets absolute RoPE
+    position ``j * compress_rate + position_offset``.  0 for the non-CP / rank-0 case
+    (bit-identical to the zero-based path)."""
     positions = torch.arange(n_windows, device=compressed.device)
-    positions = (positions * compress_rate).unsqueeze(0).expand(batch, -1)
+    positions = (positions * compress_rate + position_offset).unsqueeze(0).expand(batch, -1)
     cos, sin = rotary_emb(compressed, position_ids=positions, layer_type=layer_type)
     return apply_rotary_pos_emb(compressed.unsqueeze(1), cos, sin).squeeze(1)
 
@@ -67,8 +69,11 @@ class V4HCACompressor(nn.Module):
         self.kv_norm = V4RMSNorm(self.head_dim, eps=self.eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # hidden_states: [B, S, hidden]  (already HC-collapsed by the layer)
+    def forward(self, hidden_states: torch.Tensor, *, position_offset: int = 0, drop_windows: int = 0) -> torch.Tensor:
+        # hidden_states: [B, S, hidden]  (already HC-collapsed by the layer).  Under CP2
+        # S = halo + l_local and the caller passes ``position_offset`` (global position
+        # of row 0) + ``drop_windows`` (leading halo windows to drop); defaults (0, 0)
+        # are the bit-identical non-CP path.
         batch, S, _ = hidden_states.shape
         kv = self.kv_proj(hidden_states)  # [B, S, head_dim]
         gate = self.gate_proj(hidden_states)
@@ -87,8 +92,19 @@ class V4HCACompressor(nn.Module):
             self.compress_rate,
         )  # [B, n_windows, head_dim]
         compressed = _rope_compressed(
-            compressed, self.rotary_emb, self.compress_rate, n_windows, batch, self.rope_layer_type
+            compressed,
+            self.rotary_emb,
+            self.compress_rate,
+            n_windows,
+            batch,
+            self.rope_layer_type,
+            position_offset=position_offset,
         )
+        # CP2: drop the first ``drop_windows`` (halo) windows -- owned by the left
+        # neighbour.  RoPE is applied at absolute positions first, so the kept windows
+        # already carry their global-position rotation.
+        if drop_windows:
+            compressed = compressed[:, drop_windows:]
         return compressed.unsqueeze(1)  # [B, 1, T, head_dim]
 
 
@@ -111,12 +127,16 @@ class V4CSACompressor(nn.Module):
         self.position_bias = nn.Parameter(torch.zeros(self.compress_rate, 2 * self.head_dim))
         self.kv_norm = V4RMSNorm(self.head_dim, eps=self.eps)
         self.rotary_emb = DeepseekV4RotaryEmbedding(config)
-        # Indexer kept for parity / state-dict mapping (M3+); not used in M0/M1.
-        from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Indexer
+        # Official HF indexer structure + official DeepGEMM fp8_mqa_logits
+        # scoring on GPU (torch fallback keeps CPU/parity paths HF-exact).
+        from custom_kernels.deepseek_v4.megatron.indexer import V4Indexer
 
-        self.indexer = DeepseekV4Indexer(config)
+        self.indexer = V4Indexer(config)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, *, position_offset: int = 0, drop_windows: int = 0) -> torch.Tensor:
+        # Under CP2 S = halo + l_local; ``position_offset`` / ``drop_windows`` handle the
+        # global RoPE position + boundary-window drop (defaults 0/0 == non-CP path).  The
+        # dropped windows also absorb the CSA w==0 overlap special case (design B2).
         batch, S, _ = hidden_states.shape
         kv = self.kv_proj(hidden_states)  # [B, S, 2*head_dim]
         gate = self.gate_proj(hidden_states)
@@ -135,8 +155,16 @@ class V4CSACompressor(nn.Module):
             self.compress_rate,
         )  # [B, n_windows, head_dim]
         compressed = _rope_compressed(
-            compressed, self.rotary_emb, self.compress_rate, n_windows, batch, self.rope_layer_type
+            compressed,
+            self.rotary_emb,
+            self.compress_rate,
+            n_windows,
+            batch,
+            self.rope_layer_type,
+            position_offset=position_offset,
         )
+        if drop_windows:
+            compressed = compressed[:, drop_windows:]
         return compressed.unsqueeze(1)  # [B, 1, T, head_dim]
 
 

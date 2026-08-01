@@ -398,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--router-flip-abs-min", type=int, default=2)
     parser.add_argument(
         "--output",
-        default="handoffs/deepseek-v4/r2_logs/real_weight_layer2_parity.txt",
+        default="local_artifacts/deepseek-v4/r2_logs/real_weight_layer2_parity.txt",
         help="Reviewable text report path.",
     )
     args = parser.parse_args(argv)

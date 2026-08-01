@@ -5,8 +5,8 @@ The input is the raw ``.pt`` emitted by ``dspark_full_vocab_probe.py``.  This
 program rebuilds the same token prefixes with the native DeepSeek-V4 Megatron
 implementation, loads the official checkpoint directly, and compares paired
 full-vocabulary rows.  It is a diagnostic forward only: no optimizer or
-checkpoint write is involved.  Optional zero-initialized LoRA wrapping permits
-testing the production FP8 base-weight paths without changing model outputs.
+checkpoint write is involved. Optional zero-initialized LoRA wrapping permits
+checking adapter wiring without changing model outputs.
 
 Launch one process per EP rank, for example::
 
@@ -23,9 +23,7 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sys
-import types
 from pathlib import Path
 from typing import Any
 
@@ -253,37 +251,14 @@ def _routing_alignment(model: torch.nn.Module, rollout_routes: torch.Tensor) -> 
 
 def _apply_precision_alignment(
     model: torch.nn.Module,
-    checkpoint_config: Any,
     args: argparse.Namespace,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
-    """Optionally reproduce the production LoRA + frozen-base FP8 paths."""
+    """Optionally wrap the frozen model with zero-initialized LoRA adapters."""
 
-    any_fp8 = any(
-        (
-            args.fp8_shared_expert,
-            args.fp8_attention,
-            args.checkpoint_fp8_shared_expert,
-            args.checkpoint_fp8_attention,
-        )
-    )
-    if any_fp8 and not args.apply_zero_lora:
-        raise ValueError("FP8 shared/attention probes require --apply-zero-lora")
-    if args.fp8_shared_expert and args.checkpoint_fp8_shared_expert:
-        raise ValueError("choose requantized or checkpoint-native shared-expert FP8")
-    if args.fp8_attention and args.checkpoint_fp8_attention:
-        raise ValueError("choose requantized or checkpoint-native attention FP8")
-
-    stats = {
-        "zero_lora": False,
-        "shared_experts_fp8": 0,
-        "attention_adapters_fp8": 0,
-        "checkpoint_fp8_shared_experts": 0,
-        "checkpoint_fp8_attention_adapters": 0,
-    }
+    stats = {"zero_lora": False}
     if not args.apply_zero_lora:
         return model, stats
 
-    os.environ["V4_LORA_SHARED_EXPERT"] = "1"
     from custom_kernels.deepseek_v4.megatron.lora import apply_v4_lora, audit_lora
 
     model = apply_v4_lora(
@@ -291,119 +266,12 @@ def _apply_precision_alignment(
         dim=args.zero_lora_dim,
         alpha=args.zero_lora_alpha,
         dropout=0.0,
+        shared_expert=True,
     ).eval()
     lora_audit = audit_lora(model)
     stats["zero_lora"] = True
     stats["lora_wrapped_modules"] = len(lora_audit["wrapped"])
     stats["lora_trainable_params"] = lora_audit["n_trainable"]
-
-    if args.fp8_shared_expert:
-        for module in model.modules():
-            if type(module).__name__ == "V4SharedExpertMLP":
-                module.quantize_fp8()
-                stats["shared_experts_fp8"] += 1
-
-    if args.fp8_attention:
-        from custom_kernels.deepseek_v4.megatron.mcore_model import (
-            fp8_weight_recipe_from_config,
-            quantize_lora_adapter_fp8,
-        )
-
-        block_size, use_weight_ue8m0 = fp8_weight_recipe_from_config(checkpoint_config)
-        targets = ("q_a_proj", "q_b_proj", "kv_proj", "o_b_proj")
-        for name, module in model.named_modules():
-            if (
-                any(name.endswith("self_attn." + target) for target in targets)
-                and hasattr(module, "linear_in")
-                and hasattr(module, "weight")
-            ):
-                quantize_lora_adapter_fp8(
-                    module,
-                    block_size,
-                    use_ue8m0=use_weight_ue8m0,
-                )
-                stats["attention_adapters_fp8"] += 1
-
-    if args.checkpoint_fp8_shared_expert or args.checkpoint_fp8_attention:
-        from custom_kernels.deepseek_v4.megatron.mcore_model import (
-            _fp8_lora_adapter_forward,
-            fp8_weight_recipe_from_config,
-        )
-        from custom_kernels.deepseek_v4.megatron.native_checkpoint import NativeV4Checkpoint, fp8_scale_key
-
-        block_size, _ = fp8_weight_recipe_from_config(checkpoint_config)
-        native = NativeV4Checkpoint(str(args.checkpoint))
-
-        def install(adapter: torch.nn.Module, native_key: str) -> None:
-            weight = native.get_tensor(native_key)
-            scale = native.get_tensor(fp8_scale_key(native_key))
-            if weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu:
-                raise TypeError(f"{native_key} expected E4M3/E8M0, got {weight.dtype}/{scale.dtype}")
-            if tuple(weight.shape) != tuple(adapter.weight.shape):
-                raise ValueError(f"{native_key} shape {tuple(weight.shape)} != adapter {tuple(adapter.weight.shape)}")
-            del adapter.weight
-            adapter.register_buffer("weight_fp8", weight.cuda().contiguous(), persistent=False)
-            # DeepGEMM's ue8m0 mode represents powers-of-two scales as FP32
-            # values; the checkpoint stores the same values as E8M0 bytes.
-            adapter.register_buffer(
-                "weight_scale",
-                scale.float().cuda().contiguous(),
-                persistent=False,
-            )
-            adapter._fp8 = True
-            adapter._FP8_BLOCK = block_size
-            adapter.forward = types.MethodType(_fp8_lora_adapter_forward, adapter)
-
-        if args.checkpoint_fp8_shared_expert:
-            shared_leaves = {
-                "gate_proj": "w1",
-                "up_proj": "w3",
-                "down_proj": "w2",
-            }
-            for name, module in model.named_modules():
-                match = re.fullmatch(r"layers\.(\d+)\.mlp\.shared_experts", name)
-                if not match:
-                    continue
-                layer_id = int(match.group(1))
-                for attr, native_leaf in shared_leaves.items():
-                    install(
-                        getattr(module, attr),
-                        f"layers.{layer_id}.ffn.shared_experts.{native_leaf}.weight",
-                    )
-                module._FP8_BLOCK = block_size
-                module._fp8 = True
-                stats["checkpoint_fp8_shared_experts"] += 1
-
-        if args.checkpoint_fp8_attention:
-            attention_leaves = {
-                "q_a_proj": "wq_a",
-                "q_b_proj": "wq_b",
-                "kv_proj": "wkv",
-                "o_b_proj": "wo_b",
-            }
-            for name, module in model.named_modules():
-                match = re.fullmatch(
-                    r"layers\.(\d+)\.self_attn\.(q_a_proj|q_b_proj|kv_proj|o_b_proj)",
-                    name,
-                )
-                if not match:
-                    continue
-                layer_id = int(match.group(1))
-                install(
-                    module,
-                    f"layers.{layer_id}.attn.{attention_leaves[match.group(2)]}.weight",
-                )
-                stats["checkpoint_fp8_attention_adapters"] += 1
-
-    if args.fp8_shared_expert and stats["shared_experts_fp8"] == 0:
-        raise RuntimeError("no V4SharedExpertMLP modules were FP8-quantized")
-    if args.fp8_attention and stats["attention_adapters_fp8"] == 0:
-        raise RuntimeError("no LoRA-wrapped attention modules were FP8-quantized")
-    if args.checkpoint_fp8_shared_expert and stats["checkpoint_fp8_shared_experts"] == 0:
-        raise RuntimeError("no shared experts received checkpoint-native FP8 buffers")
-    if args.checkpoint_fp8_attention and stats["checkpoint_fp8_attention_adapters"] == 0:
-        raise RuntimeError("no attention adapters received checkpoint-native FP8 buffers")
-    torch.cuda.empty_cache()
     return model, stats
 
 
@@ -459,7 +327,7 @@ def run(args: argparse.Namespace) -> None:
         layer_map={index: index for index in range(config.num_hidden_layers)},
         strict=True,
     )
-    model, precision_alignment = _apply_precision_alignment(model, config, args)
+    model, precision_alignment = _apply_precision_alignment(model, args)
     dist.barrier()
 
     torch.cuda.reset_peak_memory_stats()
@@ -599,11 +467,6 @@ def run(args: argparse.Namespace) -> None:
                 key: os.environ.get(key)
                 for key in (
                     "V4_FP4_FROZEN_EXPERTS",
-                    "V4_FP4_EXPERT_GEMM",
-                    "V4_FUSED_SILU_QUANT",
-                    "V4_QUANT_DIV_ALIGN",
-                    "V4_SHARED_EXPERT_ALIGN_ACT",
-                    "V4_MHC_POST_FP32_COMBINE",
                     "TILELANG_CACHE_DIR",
                     "ENABLE_ROUTING_REPLAY",
                     "ROUTING_REPLAY_STAGE",
@@ -639,10 +502,6 @@ def main() -> None:
     parser.add_argument("--apply-zero-lora", action="store_true")
     parser.add_argument("--zero-lora-dim", type=int, default=32)
     parser.add_argument("--zero-lora-alpha", type=float, default=32.0)
-    parser.add_argument("--fp8-shared-expert", action="store_true")
-    parser.add_argument("--fp8-attention", action="store_true")
-    parser.add_argument("--checkpoint-fp8-shared-expert", action="store_true")
-    parser.add_argument("--checkpoint-fp8-attention", action="store_true")
     parser.add_argument("--ep-size", type=int, default=8)
     parser.add_argument("--moe-dispatcher", choices=("flex", "alltoall", "allgather"), default="flex")
     parser.add_argument("--moe-flex-backend", default="deepep")

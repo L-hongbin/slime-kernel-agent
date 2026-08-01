@@ -1,6 +1,15 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+NUM_GPUS = 0
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def _router_cfg():
@@ -26,6 +35,47 @@ class _FakeReplay:
 
     def pop_backward(self):
         return self.recorded[0]
+
+
+@pytest.fixture
+def isolated_routing_replays():
+    from slime.utils.routing_replay import RoutingReplay
+
+    previous = list(RoutingReplay.all_routing_replays)
+    RoutingReplay.all_routing_replays.clear()
+    try:
+        yield RoutingReplay
+    finally:
+        RoutingReplay.all_routing_replays[:] = previous
+
+
+def _make_local_replay_model(RoutingReplay, *, method, num_layers, local_layers=4, granularity="full"):
+    replays = [RoutingReplay() for _ in range(local_layers)]
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            recompute_granularity=granularity,
+            recompute_method=method,
+            recompute_num_layers=num_layers,
+        ),
+        layer_ids=tuple(range(local_layers)),
+        layers=[
+            SimpleNamespace(
+                mlp=SimpleNamespace(
+                    is_hash=False,
+                    gate=SimpleNamespace(routing_replay=replay),
+                )
+            )
+            for replay in replays
+        ],
+    )
+    return SimpleNamespace(module=model), replays
+
+
+def _set_replay_consumption(replays, *, recorded, backward_expected):
+    for replay, expect_backward in zip(replays, backward_expected, strict=True):
+        replay.top_indices_list = [None] * recorded
+        replay.forward_index = recorded
+        replay.backward_index = recorded if expect_backward else 0
 
 
 def test_dsv4_topk_router_uses_routing_replay(monkeypatch):
@@ -212,11 +262,139 @@ def test_record_rollout_routing_replay_falls_back_to_global_offset_for_unknown_m
         RoutingReplay.all_routing_replays[:] = []
 
 
+def test_block_recompute_strict_checker_expects_backward_only_for_first_k_local_layers(isolated_routing_replays):
+    from slime.utils.routing_replay import get_routing_replay_backward_expectations
+
+    RoutingReplay = isolated_routing_replays
+    model, replays = _make_local_replay_model(
+        RoutingReplay,
+        method="block",
+        num_layers=2,
+    )
+    _set_replay_consumption(
+        replays,
+        recorded=3,
+        backward_expected=[True, True, False, False],
+    )
+
+    expectations = get_routing_replay_backward_expectations([model])
+    assert [expectations[replay] for replay in replays] == [True, True, False, False]
+    RoutingReplay.check_fully_consumed(
+        context="block strict test",
+        model_modules=[model],
+    )
+
+
+def test_block_recompute_strict_checker_keeps_forward_validation_for_uncheckpointed_layer(isolated_routing_replays):
+    RoutingReplay = isolated_routing_replays
+    model, replays = _make_local_replay_model(
+        RoutingReplay,
+        method="block",
+        num_layers=2,
+    )
+    _set_replay_consumption(
+        replays,
+        recorded=3,
+        backward_expected=[True, True, False, False],
+    )
+    replays[-1].forward_index = 2
+
+    with pytest.raises(AssertionError, match=r"forward_popped=2.*backward_expected=0"):
+        RoutingReplay.check_fully_consumed(
+            context="block missed forward",
+            model_modules=[model],
+        )
+
+
+def test_uniform_recompute_strict_checker_still_rejects_missing_backward_replay(isolated_routing_replays):
+    RoutingReplay = isolated_routing_replays
+    model, replays = _make_local_replay_model(
+        RoutingReplay,
+        method="uniform",
+        num_layers=2,
+    )
+    _set_replay_consumption(
+        replays,
+        recorded=3,
+        backward_expected=[True, True, True, True],
+    )
+    replays[-1].backward_index = 0
+
+    with pytest.raises(AssertionError, match=r"backward_popped=0.*backward_expected=3"):
+        RoutingReplay.check_fully_consumed(
+            context="uniform missed backward",
+            model_modules=[model],
+        )
+
+
+def test_recompute_off_strict_checker_expects_no_backward_but_all_forward(isolated_routing_replays):
+    RoutingReplay = isolated_routing_replays
+    model, replays = _make_local_replay_model(
+        RoutingReplay,
+        method="block",
+        num_layers=2,
+        granularity=None,
+    )
+    _set_replay_consumption(
+        replays,
+        recorded=2,
+        backward_expected=[False, False, False, False],
+    )
+
+    RoutingReplay.check_fully_consumed(
+        context="recompute off",
+        model_modules=[model],
+    )
+
+
+def test_block_recompute_expectations_allow_unrecorded_extra_model_replay(isolated_routing_replays):
+    from slime.utils.routing_replay import get_routing_replay_backward_expectations
+
+    RoutingReplay = isolated_routing_replays
+    model, _replays = _make_local_replay_model(
+        RoutingReplay,
+        method="block",
+        num_layers=2,
+    )
+    extra = RoutingReplay()  # ref/teacher router, empty in this actor pass
+
+    expectations = get_routing_replay_backward_expectations([model])
+    assert expectations[extra] is False
+    RoutingReplay.check_fully_consumed(
+        context="empty extra model replay",
+        model_modules=[model],
+    )
+
+
+def test_block_recompute_expectations_fail_if_recorded_replay_has_no_local_layer(isolated_routing_replays):
+    from slime.utils.routing_replay import get_routing_replay_backward_expectations
+
+    RoutingReplay = isolated_routing_replays
+    model, _replays = _make_local_replay_model(
+        RoutingReplay,
+        method="block",
+        num_layers=2,
+    )
+    extra = RoutingReplay()  # active/recorded but not associated with a local layer
+    extra.top_indices_list = [None]
+
+    with pytest.raises(AssertionError, match="could not map all recorded active replays"):
+        get_routing_replay_backward_expectations([model])
+
+
+def test_actor_passes_local_models_to_routing_replay_checker():
+    actor_source = (REPO_ROOT / "slime/backends/megatron_utils/actor.py").read_text()
+    assert "RoutingReplay.check_fully_consumed(" in actor_source
+    assert "model_modules=self.model" in actor_source
+    assert "registered_with_records = sum(" in actor_source
+    assert "if routing_replay_offset != registered_with_records:" in actor_source
+
+
 def test_fill_routing_replay_pads_bshd_to_max_seqlen():
     """Regression guard: in bshd, fill_routing_replay must pad each sample's
-    recorded routing to the rollout-wide max_seq_len (matching get_batch), not
+    recorded routing to the current microbatch max_seq_len (matching get_batch), not
     just to pad_size. Otherwise a short sample yields too few routing rows vs the
-    globally-padded [B, max_seq_len] tokens the router flattens -> "replayed V4
+    microbatch-padded [B, max_seq_len] tokens the router flattens -> "replayed V4
     top-k indices shape [128,6] does not match scores rows 256" (Gate-B scale,
     2026-07-03). Source-level check so the bshd branch can't silently regress to
     the pad_size-only path."""
@@ -231,8 +409,17 @@ def test_fill_routing_replay_pads_bshd_to_max_seqlen():
     # The bshd branch must pass qkv_format + a max-seqlen to slice_with_cp.
     assert re.search(r"slice_with_cp\(\s*r,\s*pad_func,\s*self\.args\.qkv_format,\s*max_seqlen", body), (
         "bshd fill_routing_replay must call slice_with_cp with qkv_format + max_seqlen "
-        "so routing is padded to the rollout-wide max_seq_len"
+        "so routing is padded to the current microbatch max_seq_len"
     )
+    assert re.search(
+        r'get_next\(\["rollout_routed_experts",\s*"tokens",\s*"max_seq_lens"\]\)', body
+    ), "routing replay must fetch the scheduled max_seq_lens with the current microbatch"
+    assert 'max_seq_lens = batch["max_seq_lens"]' in body
+    assert "max_seqlen = max_seq_lens[0]" in body
     assert (
-        'rollout_data["max_seq_lens"][0]' in body
-    ), "bshd max_seqlen must come from the same rollout-wide max_seq_lens get_batch uses"
+        'rollout_data["max_seq_lens"][0]' not in body
+    ), "routing replay must not reuse the first microbatch's width for the whole rollout"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

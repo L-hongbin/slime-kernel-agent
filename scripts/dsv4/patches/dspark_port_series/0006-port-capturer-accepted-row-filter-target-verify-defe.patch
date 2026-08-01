@@ -1,0 +1,145 @@
+From eb21129bec6b712f2e4e778928c9381b2e033e4e Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 09:24:23 +0900
+Subject: [PATCH 06/13] port: capturer accepted-row filter + target-verify
+ defer (re-anchored gate)
+
+batch_result_processor.py: add _finalize_routed_experts_output(batch, result)
+and route both finalize sites (prefill + decode) through it. For spec target-
+verify results it keeps ONLY accepted rows (request-major blocks of stride
+speculative_num_draft_tokens, first accept_lens[i] per block) so rejected draft
+rows never reach the trainer's routing replay.
+
+Gate RE-ANCHORED for 692c5f7d: the fork keyed on getattr(batch,"is_spec_v2",
+False), which does NOT exist upstream -> silently no-ops -> ALL verify rows
+(rejected drafts included) pollute the replay. Re-anchored to
+`not batch.spec_algorithm.is_none()`, upstream's spec-path idiom (verified at
+batch_result_processor.py:675,702,765,804). accept_lens and
+speculative_num_draft_tokens are populated on the verify GenerationBatchResult
+by the DFLASH/DSPARK worker (dflash_worker_v2.py:1664-1670, accept_lens=
+commit_lens @1667, speculative_num_draft_tokens=int(self.block_size) @1670;
+DSPARK shares this worker via is_dflash_or_dspark). The filter's stride math
+matches that worker's own accepted-token slicing (_resolve_spec_v2_tokens:571).
+
+model_runner.py: OR `forward_batch.forward_mode.is_target_verify()` into
+no_copy_to_cpu. Load-bearing for the filter: with no_copy_to_cpu=False,
+on_forward_end (state_capturer/base.py:178-186) finalizes ALL verify rows inline
+and returns None, so the accepted-row filter never runs. The OR-in only adds
+deferral for target-verify; every other path is unchanged.
+---
+ .../batch_result_processor.py                 | 62 +++++++++++++++++--
+ .../sglang/srt/model_executor/model_runner.py | 11 +++-
+ 2 files changed, 66 insertions(+), 7 deletions(-)
+
+diff --git a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+index 52637fc..4bf6425 100644
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -176,6 +176,60 @@ class SchedulerBatchResultProcessor:
+                     elem = elem.copy()
+                 req.customized_info[k].append(elem)
+ 
++    def _finalize_routed_experts_output(self, batch, result) -> None:
++        """Finalize captured routed-experts rows into the host cache.
++
++        For spec-v2 target-verify results, keep ONLY accepted tokens' rows
++        (request-major blocks of stride speculative_num_draft_tokens; the
++        accepted rows are the first accept_lens[i] of block i, bonus token
++        included). Rejected draft rows would otherwise write junk into KV
++        slots that get freed and reused. Callers must copy_done.synchronize()
++        first so accept_lens and the captured tensors are CPU-valid.
++        """
++        out = getattr(result, "routed_experts_output", None)
++        if out is None:
++            return
++
++        # Non-overlap spec verify defers finalization without a copy_to_cpu
++        # caller (GenerationBatchResult.copy_to_cpu only runs in overlap
++        # scheduling) — bring the tensors to host here.
++        if out.out_cache_loc.is_cuda:
++            out.out_cache_loc = out.out_cache_loc.cpu()
++        if out.topk.is_cuda:
++            out.topk = out.topk.cpu()
++
++        accept_lens = getattr(result, "accept_lens", None)
++        # Gate re-anchored for 692c5f7d: the fork keyed on `batch.is_spec_v2`,
++        # which does not exist upstream (getattr default False -> silent no-op,
++        # leaving rejected draft rows in the trainer's routing replay). Upstream
++        # detects the spec path via `not batch.spec_algorithm.is_none()` (cf.
++        # batch_result_processor.py:675/702/765/804). accept_lens /
++        # speculative_num_draft_tokens are populated on the verify result by the
++        # DFLASH/DSPARK worker (dflash_worker_v2.py:1667/1670, shared by DSPARK
++        # via is_dflash_or_dspark); the stride math here matches that worker's
++        # own accepted-token slicing in _resolve_spec_v2_tokens (:571).
++        if not batch.spec_algorithm.is_none() and accept_lens is not None:
++            stride = result.speculative_num_draft_tokens
++            assert (
++                stride is not None
++            ), "spec-v2 result missing speculative_num_draft_tokens"
++            lens = accept_lens.to(torch.int64).tolist()
++            keep_rows = [
++                torch.arange(i * stride, i * stride + a, dtype=torch.long)
++                for i, a in enumerate(lens)
++                if a > 0
++            ]
++            keep = (
++                torch.cat(keep_rows)
++                if keep_rows
++                else torch.empty(0, dtype=torch.long)
++            )
++            out.out_cache_loc = out.out_cache_loc[keep]
++            out.topk = out.topk[keep]
++
++        out.finalize()
++        result.routed_experts_output = None
++
+     def process_batch_result_prefill(
+         self,
+         batch: ScheduleBatch,
+@@ -186,9 +240,7 @@ class SchedulerBatchResultProcessor:
+         if self.is_generation:
+             if result.copy_done is not None:
+                 result.copy_done.synchronize()
+-            if result.routed_experts_output is not None:
+-                result.routed_experts_output.finalize()
+-                result.routed_experts_output = None
++            self._finalize_routed_experts_output(batch, result)
+             if result.indexer_topk_output is not None:
+                 result.indexer_topk_output.finalize()
+                 result.indexer_topk_output = None
+@@ -651,9 +703,7 @@ class SchedulerBatchResultProcessor:
+     ):
+         if result.copy_done is not None:
+             result.copy_done.synchronize()
+-        if result.routed_experts_output is not None:
+-            result.routed_experts_output.finalize()
+-            result.routed_experts_output = None
++        self._finalize_routed_experts_output(batch, result)
+         if result.indexer_topk_output is not None:
+             result.indexer_topk_output.finalize()
+             result.indexer_topk_output = None
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index b595e15..f8e829c 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3006,7 +3006,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+                 )
+         output.expert_distribution_metrics = recorder_outputs.get("metrics")
+ 
+-        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
++        # Target-verify (spec decode) must defer host finalization until accept_lens
++        # is known so the result processor can filter rejected draft rows: with
++        # no_copy_to_cpu=False, on_forward_end finalizes ALL verify rows inline
++        # (writes host_cache, returns None) and the accepted-row filter in
++        # batch_result_processor._finalize_routed_experts_output never runs. The
++        # OR-in only adds deferral for target-verify; all other paths unchanged.
++        no_copy_to_cpu = (
++            not self.server_args.disable_overlap_schedule
++            or forward_batch.forward_mode.is_target_verify()
++        )
+         if (
+             not self.is_draft_worker
+             and (experts_capturer := get_global_experts_capturer()) is not None
+-- 
+2.43.0
+

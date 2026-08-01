@@ -1,4 +1,5 @@
 import ast
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -81,7 +82,7 @@ def test_dsv4_rollout_smoke_uses_fp8_low_latency_recipe_by_default():
     assert "ROLLOUT_GPUS=${ROLLOUT_GPUS:-4}" in source
     assert "GPUS_PER_ENGINE=${GPUS_PER_ENGINE:-4}" in source
     assert "RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}" in source
-    assert "LOG=${LOG:-${REPO}/handoffs/deepseek-v4/r2_logs/r4_node62_rollout_smoke_${RUN_ID}.log}" in source
+    assert "LOG=${LOG:-${REPO}/local_artifacts/deepseek-v4/r2_logs/r4_node62_rollout_smoke_${RUN_ID}.log}" in source
     assert "r4_node62_rollout_smoke_attempt1.log" not in source
     assert 'gsub(/[^0-9.]/, "", $2)' in source
     assert "$2 + 0 > max" in source
@@ -117,8 +118,8 @@ def test_r6_full_loop_smoke_starts_from_rollout_zero_and_cleans_debug_dumps():
     source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
 
     assert "START_ROLLOUT_ID=${START_ROLLOUT_ID:-0}" in source
-    assert "MOE_ROUTER_TOPK=${MOE_ROUTER_TOPK:-6}" in source
-    assert '--moe-router-topk "${MOE_ROUTER_TOPK}"' in source
+    assert "MOE_ROUTER_TOPK" not in source
+    assert "--moe-router-topk" not in source
     assert '--start-rollout-id "${START_ROLLOUT_ID}"' in source
     assert 'rm -f "${DEBUG_DIR}"/rollout_*.pt "${DEBUG_DIR}"/train_*.pt' in source
     assert 'python3 scripts/dsv4/verify_rollout_dump.py "${DEBUG_DIR}/rollout_0.pt"' in source
@@ -127,16 +128,29 @@ def test_r6_full_loop_smoke_starts_from_rollout_zero_and_cleans_debug_dumps():
 def test_r6_full_loop_smoke_keeps_runtime_cache_off_root_disk():
     source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
 
-    assert "RUNTIME_CACHE_ROOT=${RUNTIME_CACHE_ROOT:-/dev/shm/v4r6_full_loop_cache}" in source
+    assert "readonly RUNTIME_CACHE_ROOT=/dev/shm/v4r6_full_loop_cache" in source
     assert "export TMPDIR=${TMPDIR:-${RUNTIME_CACHE_ROOT}/tmp}" in source
     assert "export XDG_CACHE_HOME=${XDG_CACHE_HOME:-${RUNTIME_CACHE_ROOT}/xdg}" in source
     assert "export TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-${RUNTIME_CACHE_ROOT}/triton}" in source
     assert "export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-${RUNTIME_CACHE_ROOT}/torchinductor}" in source
     assert "export CUDA_CACHE_PATH=${CUDA_CACHE_PATH:-${RUNTIME_CACHE_ROOT}/cuda}" in source
-    assert '"TMPDIR": os.environ["TMPDIR"]' in source
-    assert '"TRITON_CACHE_DIR": os.environ["TRITON_CACHE_DIR"]' in source
-    assert '"TORCHINDUCTOR_CACHE_DIR": os.environ["TORCHINDUCTOR_CACHE_DIR"]' in source
-    assert "TMPDIR=${TMPDIR} XDG_CACHE_HOME=${XDG_CACHE_HOME}" in source
+    # The cache dirs reach the remote ray/engine/actor envs via the cluster
+    # lib's unified env transport core list.
+    lib = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "_dsv4_cluster_lib.sh").read_text()
+    core = re.search(r"local -a core_keys=\((.*?)\n  \)", lib, flags=re.S)
+    assert core, "cluster lib must declare the env-transport core_keys list"
+    for key in ["TMPDIR", "TRITON_CACHE_DIR", "TORCHINDUCTOR_CACHE_DIR"]:
+        assert re.search(rf"^\s*{key}\s*$", core.group(1), flags=re.M), (
+            f"{key} missing from the env transport core list: remote caches " "would fall back to the root disk"
+        )
+    assert "TRAIN_ENV_VARS_JSON=$(dsv4_build_train_env_vars_json)" in source
+    # worker-side: start_ray_worker (lib) pre-creates the cache dirs on the
+    # remote node and injects the transported env prefix before ray start.
+    assert (
+        "mkdir -p ${temp_dir} ${TMPDIR} ${XDG_CACHE_HOME} ${TRITON_CACHE_DIR} ${TORCHINDUCTOR_CACHE_DIR} ${CUDA_CACHE_PATH}"
+        in lib
+    )
+    assert "${env_prefix}ray start" in lib
 
 
 def test_sglang_engine_registers_router_with_timeout(monkeypatch):
