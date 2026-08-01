@@ -135,6 +135,49 @@ def test_hf_validate_checks_dense_intermediate_size_when_moe_has_dense_layers(mo
 
 
 @pytest.mark.unit
+def test_router_topk_comes_from_checkpoint(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=2)
+    hf_config = types.SimpleNamespace(model_type="deepseek_v4", num_experts_per_tok=6)
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 6
+
+
+@pytest.mark.unit
+def test_router_topk_rejects_explicit_checkpoint_conflict(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(model_type="deepseek_v4", num_experts_per_tok=6)
+
+    with pytest.raises(ValueError, match="conflicts with checkpoint metadata"):
+        module._bind_checkpoint_moe_router_topk(args, hf_config, explicit_moe_router_topk=True)
+
+
+@pytest.mark.unit
+def test_non_ds_v4_router_topk_also_comes_from_checkpoint(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(text_config=types.SimpleNamespace(model_type="qwen3_moe", num_experts_per_tok=6))
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 6
+
+
+@pytest.mark.unit
+def test_router_topk_ignores_checkpoint_without_topk_metadata(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(model_type="dense")
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 8
+
+
+@pytest.mark.unit
 def test_allgather_cp_rejects_non_dsa_cp_models(monkeypatch):
     module = load_arguments_module(monkeypatch)
     args = make_allgather_cp_args()

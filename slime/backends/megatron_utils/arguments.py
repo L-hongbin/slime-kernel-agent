@@ -1,6 +1,7 @@
 import ast
 import copy
 import logging
+import sys
 
 from .path_bootstrap import ensure_megatron_lm_on_sys_path
 
@@ -107,6 +108,25 @@ def _is_moe_config(hf_config):
     )
 
 
+def _bind_checkpoint_moe_router_topk(args, hf_config, *, explicit_moe_router_topk=False):
+    """Use checkpoint metadata as the source of truth for MoE router top-k."""
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None:
+        hf_config = text_config
+    if not hasattr(hf_config, "num_experts_per_tok"):
+        return
+
+    checkpoint_topk = int(hf_config.num_experts_per_tok)
+    cli_topk = getattr(args, "moe_router_topk", None)
+    if explicit_moe_router_topk and cli_topk is not None and int(cli_topk) != checkpoint_topk:
+        raise ValueError(
+            "--moe-router-topk conflicts with checkpoint metadata: "
+            f"CLI={cli_topk}, config.num_experts_per_tok={checkpoint_topk}. "
+            "Remove the CLI option; model structure is checkpoint-defined."
+        )
+    args.moe_router_topk = checkpoint_topk
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
 
@@ -155,6 +175,7 @@ def _hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
+        ("num_experts_per_tok", "moe_router_topk", equal),
         ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
@@ -232,9 +253,18 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
 
     hf_config = None
-    if args.hf_checkpoint and not skip_hf_validate:
+    if args.hf_checkpoint:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        _hf_validate_args(args, hf_config)
+        explicit_moe_router_topk = any(
+            token == "--moe-router-topk" or token.startswith("--moe-router-topk=") for token in sys.argv[1:]
+        )
+        _bind_checkpoint_moe_router_topk(
+            args,
+            hf_config,
+            explicit_moe_router_topk=explicit_moe_router_topk,
+        )
+        if not skip_hf_validate:
+            _hf_validate_args(args, hf_config)
 
     if not skip_hf_validate:
         _validate_allgather_cp_supported(args, hf_config)
