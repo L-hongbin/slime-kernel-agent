@@ -2,7 +2,8 @@
 """Reproduce the ctx-16k activation-checkpoint recompute-holding memory bug and test
 whether custom ``torch.autograd.Function``s aggravate it.
 
-Background (handoffs/deepseek-v4/16k_memory_analysis.md, git 1a123a4): with each V4
+Background (historical snapshot: ``git show
+1a123a4:handoffs/deepseek-v4/16k_memory_analysis.md``): with each V4
 decoder layer wrapped in ``torch.utils.checkpoint``, the forward memory stays flat
 (only layer inputs stored) but the stage BACKWARD shows a monotonic per-layer climb
 -> OOM. The open question is whether ``use_reentrant=False`` (pytorch#147449) is the
