@@ -1,0 +1,88 @@
+MusaCoder-27B MT3 reproduction evidence
+Reviewed on: 2026-08-04 (Asia/Tokyo)
+
+Pinned code revisions
+---------------------
+slime:
+  remote: git@github.com:L-hongbin/slime-kernel-agent.git
+  branch: feature/musacoder-multiturn
+  code commit: 695664604b43b3b3c821e6c76fdb2cdad4b261e4
+  note: later documentation-only commits on the branch do not change this tested code baseline
+
+KernelGym:
+  remote: git@github.com:L-hongbin/KernelGYM.git
+  branch: feature/musacoder-load-inline
+  code commit: 55018290b4c27d6f480a93eadac4de307d5b6c6d
+  note: later documentation-only commits on the branch do not change this tested code baseline
+
+Dataset sanity on ai-16-22
+-------------------------
+L1: rows=100, expected=100, load_inline=True, three_section=False, ground_truth=True
+L2: rows=100, expected=100, load_inline=True, three_section=False, ground_truth=True
+L3: rows=50, expected=50, load_inline=True, three_section=False, ground_truth=True
+
+KernelGym focused tests on ai-16-22
+-----------------------------------
+Command:
+  .venv/bin/python -m pytest -q --disable-warnings \
+    tests/test_load_inline_detection.py tests/test_load_inline_decoy.py \
+    tests/test_kernelbench_tf32_correctness_policy.py tests/test_aten_decoy_detection.py \
+    tests/test_profiling_trials.py tests/test_cupti_tsc_shim.py \
+    tests/test_reference_load_and_validation_errors.py tests/test_request_defaults.py \
+    tests/test_static_env_profiles.py tests/test_service_cli.py \
+    tests/test_subprocess_pool.py tests/test_worker_monitor.py
+Result:
+  117 passed
+
+KernelGym worker/deploy regression tests on ai-16-22
+----------------------------------------------------
+Command:
+  .venv/bin/python -m pytest -q --disable-warnings \
+    tests/test_cpu_worker_heartbeat.py tests/test_gpu_worker_shutdown_drain.py \
+    tests/test_deploy_node_script.py
+Result:
+  13 passed
+
+Slime summarizer regression tests on ai-16-22
+---------------------------------------------
+Command:
+  python3 -m pytest -q examples/kernel_agent/test/test_summarize_eval.py
+Result:
+  5 passed
+
+L1 final artifact summary
+-------------------------
+path: /nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_largeshape_nosplit.load_inline/dumps/rollout_data/eval_0_merged_clean.pt
+samples: 2400; missing env_result: 0
+trajectories: 800; per-turn records: T1=800 T2=800 T3=800
+Compile T1/T2/T3/best: 97.38 / 93.38 / 94.38 / 99.12
+Correct T1/T2/T3/best: 86.50 / 75.25 / 75.25 / 96.50
+Fast@1.0 T1/T2/T3/best: 14.62 / 18.25 / 18.38 / 25.00
+Fast@1.2 T1/T2/T3/best: 11.00 / 13.75 / 13.00 / 17.12
+
+L2 final artifact summary
+-------------------------
+path: /nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_level2_t600.load_inline/dumps/rollout_data/eval_0.pt
+samples: 2400; missing env_result: 0
+trajectories: 800; per-turn records: T1=800 T2=800 T3=800
+Compile T1/T2/T3/best: 98.75 / 96.38 / 95.12 / 100.00
+Correct T1/T2/T3/best: 68.00 / 68.75 / 67.00 / 92.50
+Fast@1.0 T1/T2/T3/best: 0.88 / 1.50 / 3.12 / 3.75
+Fast@1.2 T1/T2/T3/best: 0.50 / 1.12 / 2.25 / 2.75
+
+L3 final artifact summary
+-------------------------
+path: /nfs/FM/chenshuailin/projects/kernel_agents/slime-musacoder-mt/experiments/EvalMT3.load_inline.MusaCoder-27B.CTX40960/MusaCoder-27B.mt3_level3_t600.load_inline/dumps/rollout_data/eval_0.pt
+samples: 1195; missing env_result: 0
+trajectories: 400; per-turn records: T1=400 T2=400 T3=395
+Compile T1/T2/T3/best: 94.25 / 91.00 / 85.00 / 99.25
+Correct T1/T2/T3/best: 24.50 / 33.25 / 37.00 / 54.50
+Fast@1.0 T1/T2/T3/best: 0.00 / 0.00 / 0.25 / 0.25
+Fast@1.2 T1/T2/T3/best: 0.00 / 0.00 / 0.00 / 0.00
+
+Representative artifact inspection
+----------------------------------
+The L1 merged dump has stale top-level group_id/index fields (662 unique groups)
+and normalized metadata.group_id/metadata.index fields (800 unique groups and
+2400 unique sample indices). Slime commit 69566460 makes summarize_eval.py prefer
+metadata.group_id, restoring the intended 800-trajectory denominator.

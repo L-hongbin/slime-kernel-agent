@@ -1,9 +1,9 @@
 # MusaCoder 多轮（3-round）评测 handoff（含 KernelGym load_inline 并发 bug）
 
-> 合并自原 `musacoder_multiturn.md`（多轮基建/里程碑）+ `kernelgym_load_inline_concurrency_handoff.md`（并发假失败 bug），并更新了过时内容（架构整合到 .22 单机、bug 的最终修复与实证、大 shape 最终结果）。**结果数表见同目录 `musacoder_load_inline_eval.md`**。
+> 合并自原 `musacoder_multiturn.md`（多轮基建/里程碑）+ `kernelgym_load_inline_concurrency_handoff.md`（并发假失败 bug），并更新了过时内容（架构整合到 .22 单机、bug 的最终修复与实证、大 shape 最终结果）。**最终 L1/L2/L3 结果表及复现步骤见同目录 [`musacoder_mt3_reproduction.md`](musacoder_mt3_reproduction.md)**。
 
 ## ✅ 最终状态（TL;DR，已实证 + codex xhigh 复核）
-- **多轮评测完成（大 shape）**：clean **T1 correct 86.50% / best-by-turn 96.50%**（compile best 99.12%，fast@1.0 best 25.00%，cannot-open=0）。final-turn 会回落（T3 75.25% < T1）→ 真实使用须按 reward **选 best turn**，不能盲取末轮。best-by-turn 仍失败的 28 条集中在 9 道硬题（conv_transposed_3D、HingeLoss 等）。详见 `musacoder_load_inline_eval.md` 大 shape 三轮节。
+- **多轮评测完成（大 shape）**：clean **T1 correct 86.50% / best-by-turn 96.50%**（compile best 99.12%，fast@1.0 best 25.00%，cannot-open=0）。final-turn 会回落（T3 75.25% < T1）→ 真实使用须按 reward **选 best turn**，不能盲取末轮。best-by-turn 仍失败的 28 条集中在 9 道硬题（conv_transposed_3D、HingeLoss 等）。最终结果见 [`musacoder_mt3_reproduction.md`](musacoder_mt3_reproduction.md)。
 - **KernelGym load_inline 并发假失败 bug 已根治**：根因 = PyTorch JIT versioner 在 **compile 进程**与 **execute 进程**间对复用的 `load_inline(name=…)` 算出不同 `_vN` → 假 `<name>_vN.so: cannot open shared object`。修复 = **客户端 `config.py:29` + 服务端 profile 都设 `split_compile_and_execute=false`**。实证：重跑 179 条污染 trajectory → **cannot-open 193→0**。
 - **架构整合到 .22 单机**：KernelGym 在 GPU 0-3，rollout 在 GPU 4-7。**不再用 .21**（已释放，用户另作他用，勿动）。
 
@@ -23,8 +23,8 @@
 单轮 baseline 用「cuda_agent precheck 拒 load_inline → reward=0 → 事后 rescore dump」绕过；**多轮不行**，第 N+1 轮 prompt 依赖第 N 轮的**实时**评测。改动（slime 侧）：
 1. `slime/utils/arguments.py`：`--kernel-backend` 加 `load_inline` 选项。
 2. `examples/kernel_agent/kernel_response.py`：load_inline 时 `kernel_code` 传**原始 response**（让 server 端抽块，不走三段式 `extract_cuda_agent_kernel_code`）；precheck 对 load_inline 返回 None 自动放行。
-3. KernelGym 侧唯一必需代码改动：`kernelgym/common.py` 的 `Backend` 枚举加 `LOAD_INLINE`（否则 `/evaluate` 返回 **400**，模型会把它误读成 COMPILATION_ERROR）。其余实时路径本就支持 load_inline（`dispatcher` auto 识别、`compile()` 对原始 response 调 `extract_model_code` 抽块、correctness 默认 TF32-off）。
-4. 已合并 kernelgym main 的 no_grad profiling 修复（cherry-pick → commit `1fe438b`，只改 `timing.py`）。
+3. KernelGym 专用分支提供完整 `load_inline` 路径：`Backend.LOAD_INLINE`、dispatcher 路由、原始单块代码抽取、复用 CUDA 编译执行路径以及 load_inline decoy 检查。KernelGym `main` 不能替代该分支。
+4. 已测试的 KernelGym 代码基线为 `feature/musacoder-load-inline@55018290`；它已合入 `dev_csl@2625505`，包含 no-grad profiling、true-FP32 correctness、CUPTI profiler 和 worker supervision 等近期更新。
 
 ## 4. feedback 拼接模板（论文 Appendix G）
 下一轮 user message = `=== System Feedback for Round N ===` + curated feedback，二分支：**Correct**→优化（保持 correctness、只提速）；**Wrong**→先修正确性。slime 侧：`generate_with_cuda_agent.py` 每轮 `_apply_feedback_template` 按 `prompt_config/multi_turn_load_inline.yaml`（新写，Appendix G 风格、要求单块 load_inline 输出）拼 user turn。
@@ -63,15 +63,15 @@ cannot-open 假失败会经 feedback 传染后续轮（模型去修不存在的�
 ## 6. 里程碑（历史，已全部完成）
 - **M0–M2**：recon + worktree；reward 侧（Backend 枚举 +LOAD_INLINE、no_grad 修复）；slime 侧（arguments/kernel_response/curation/yaml/eval 脚本）。codex(xhigh) M1+M2 review = GO。
 - **M3 sanity = GO**：3 题×2×3 轮，无 400、零遥测泄漏、context 受控、多轮真起作用（repair ❌→✅ + optimize），codex feedback review faithful。
-- **M4 小 shape 全量**：v1（128-wide）被并发污染作废；v2（16-wide）仍 3.6% 污染 → repair（重跑 84 条 `.so cannot open` 污染组）。**注：M4 时期记的"os.environ race"根因已被 codex REFUTE，正解是 §5.2 的 versioner 机制。** 小 shape repaired 结果见 `musacoder_load_inline_eval.md`（已注释，仅作历史）。
+- **M4 小 shape 全量**：v1（128-wide）被并发污染作废；v2（16-wide）仍 3.6% 污染 → repair（重跑 84 条 `.so cannot open` 污染组）。**注：M4 时期记的"os.environ race"根因已被 codex REFUTE，正解是 §5.2 的 versioner 机制。** 小 shape repaired 结果仅作历史，不属于最终三轮复现口径。
 - **M5 大 shape 全量 + 根治（最终）**：split-off（先服务端→发现客户端覆盖→改客户端 config.py:29）；32-wide 跑大 shape；重跑 179 条污染 trajectory 实证 cannot-open=0；merge + 算指标 + codex milestone review（3 VERIFIED / 1 ISSUE：merged .pt 的 group_id/index 已 normalize 修复）。
 
-## 7. 改动文件（分支 feature/musacoder-multiturn / feature/musacoder-load-inline，未 commit）
+## 7. 已发布改动文件（slime `69566460` / KernelGym 代码基线 `55018290`）
 - **slime**：`utils/arguments.py`（+load_inline）、`examples/kernel_agent/kernel_response.py`（raw response 路由）、`generate_with_cuda_agent.py`（`_curate_env_feedback`）、`config.py:29`（**split=False，bug 修复**）、`eval.mt3.musacoder.27B.sh`（`NUM_GPUS`/`ACTOR_NUM_GPUS` 参数化）、新 `prompt_config/multi_turn_load_inline.yaml`。
-- **KernelGym**：`kernelgym/common.py`（Backend +LOAD_INLINE）、`deployment_profiles.py`（split=false、gpu_devices=(0,1,2,3)、pool=4）；no_grad 修复已 commit `1fe438b`。
+- **KernelGym**：`kernelgym/common.py`（Backend +LOAD_INLINE）、`kernelgym/backend/kernelbench/load_inline_backend.py`（单块代码抽取/加载）、`kernelgym/toolkit/kernelbench/load_inline_decoy.py`（compiled-but-unused 检查）、`deployment_profiles.py`（split=false、gpu_devices=(0,1,2,3)、pool=4）。
 
 ## 8. 关键事实/坑（沿用单轮经验）
-- 评测 harness 跑 **train 模式**（不调 `.eval()`），BatchNorm 须现算 batch 统计量（见 `musacoder_load_inline_eval.md`）。
+- 评测 harness 跑 **train 模式**（不调 `.eval()`），BatchNorm 须现算 batch 统计量（见 [`musacoder_mt3_reproduction.md`](musacoder_mt3_reproduction.md)）。
 - correctness 用 **TF32-off + 1e-4**（`KERNELGYM_CORRECTNESS_DISABLE_TF32=1`，默认 on）。
 - EVAL_DATA 必须**绝对路径**（Data/ 被 gitignore，ray 上传 working-dir 会丢相对路径）。
 - ray 结束不自动 `ray stop`；重跑前 `ray stop --force` + 清残留 GCS/raylet（否则 GCS 启动超时）。fire-and-forget 启动（`setsid … </dev/null &`）以防 ssh 掉线杀进程。
