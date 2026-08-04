@@ -70,6 +70,14 @@ def _metadata(sample: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _group_id(sample: dict):
+    """Return the normalized trajectory id when a repaired dump provides one."""
+    metadata_group_id = _metadata(sample).get("group_id")
+    if metadata_group_id is not None:
+        return metadata_group_id
+    return sample.get("group_id")
+
+
 def _env_extra_info(sample: dict) -> dict | None:
     meta = _metadata(sample)
     env_extra_info = meta.get("env_extra_info")
@@ -161,7 +169,7 @@ def _empty_counts(fast_thresholds):
 def _summarize_group_best(samples, fast_thresholds, max_turns=None):
     trajectories = {}
     for sample in samples:
-        group_id = sample.get("group_id")
+        group_id = _group_id(sample)
         if group_id is None:
             continue
         trajectories.setdefault(group_id, []).append(sample)

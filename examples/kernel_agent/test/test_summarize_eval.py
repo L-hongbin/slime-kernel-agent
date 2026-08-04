@@ -59,13 +59,32 @@ def test_best_metrics_group_by_trajectory_and_ignore_pad_turns():
     assert res["BestFast@1"] == 1 / 3
     assert res["BestFast@1.2"] == 1 / 3
 
-    assert res["best_by_turn"][1]["Compile"] == 1 / 3
-    assert res["best_by_turn"][1]["Correct"] == 0
-    assert res["best_by_turn"][2]["Compile"] == 1 / 3
-    assert res["best_by_turn"][2]["Correct"] == 1 / 3
-    assert res["best_by_turn"][3]["Compile"] == 2 / 3
-    assert res["best_by_turn"][3]["Correct"] == 1 / 3
+    assert res["per_turn"][1]["Compile"] == 1 / 3
+    assert res["per_turn"][1]["Correct"] == 0
+    assert res["per_turn"][2]["Compile"] == 1 / 3
+    assert res["per_turn"][2]["Correct"] == 1 / 3
+    assert res["per_turn"][3]["Compile"] == 1 / 3
+    assert res["per_turn"][3]["Correct"] == 0
     assert res["best_source"] == "computed_group"
+
+
+def test_metadata_group_id_takes_precedence_over_stale_top_level_value():
+    samples = [
+        _sample(0, 0, 0, {"compilation": True, "correctness": False, "speedup": 0.8}),
+        _sample(0, 0, 1, {"compilation": True, "correctness": True, "speedup": 1.3}),
+        _sample(0, 0, 0, {"compilation": True, "correctness": True, "speedup": 1.1}),
+        _sample(0, 0, 1, {"compilation": True, "correctness": False, "speedup": 0.9}),
+    ]
+    for sample, normalized_group_id in zip(samples, (0, 0, 1, 1), strict=True):
+        sample["metadata"]["group_id"] = normalized_group_id
+
+    with pytest.warns(RuntimeWarning, match="No Best\\* metrics found"):
+        res = summarize_with_best(samples, (1.0, 1.2), max_turns=2)
+
+    assert res["trajectory_total"] == 2
+    assert res["per_turn"][1]["Correct"] == 1 / 2
+    assert res["per_turn"][2]["Correct"] == 1 / 2
+    assert res["BestCorrect"] == 1.0
 
 
 def test_best_metrics_are_skipped_for_single_turn():
