@@ -1,10 +1,10 @@
-# 可变多 slot shape solver：12,318 条恢复集暂停 handoff
+# 可变多 slot shape solver：12,318 条恢复集 handoff
 
 ## 摘要
 
 这条 follow-up lane 处理上一轮 full static solver 中因严格双 slot / 固定 2 的幂模式而未生成 child、但放宽词法位置限制后仍有正 storage witness 的 12,318 个 parent。它不改动已完成的 `run.full53896`，也没有把任何新行并入训练数据。
 
-暂停时已完成精确输入选择、2–5 logical slot solver、最终 128-parent static/FakeTensor canary，以及同一 canary 的 8-shard CPU 运行和 deterministic merge。尚未启动 12,318 条全量 CPU solver，也未启动 canary 或全量 H20 reference / changed-region 验证。当前没有 `run.recoverable12318` 或全量 shard-run 输出，`training_approved=false`。
+已完成精确输入选择、2–5 logical slot solver、最终 128-parent static/FakeTensor canary，以及同一 canary 的 8-shard CPU 运行和 deterministic merge。12,318 条全量 CPU solver 也已完成 1,024/1,024 shard manifest：node69_slime rank 0 和 node70_dspark rank 1 各保留 512 个 node-local shard。两边结果尚未汇集和 merge，因此没有 full static 统计或 canonical `run.recoverable12318`；canary 与全量 H20 reference / changed-region 都未启动，`training_approved=false`。
 
 | 阶段 | 状态 | 结果 |
 | --- | --- | --- |
@@ -13,7 +13,8 @@
 | 最终 128-parent static canary | 已完成 | 121 child，94.53% parent coverage |
 | 8-shard CPU + merge canary | 已完成 | 四个 parquet 与非分片 canary 逐字节一致 |
 | Canary H20 reference / region | 未启动 | 没有 runtime evidence |
-| 12,318 条全量 CPU solver / merge | 未启动 | 输出目录不存在 |
+| 12,318 条全量 CPU solver | 已完成分片 | 1,024/1,024 manifest；node69/node70 各 512，等待汇集 |
+| 全量 CPU merge / analysis | 未启动 | 没有 canonical merged run 或 full static count |
 | 全量 H20 reference / region | 未启动 | 没有 runtime-eligible child |
 
 ## 精确输入与来源约束
@@ -101,7 +102,7 @@ target 相对误差 P50 为 0.0330%，P90 为 0.0831%，最大为 1.5483%。121 
 
 ## 8-shard CPU / merge 验证
 
-暂停指令到达前，128 行输入还完成了 8-way modulo shard 集成：
+128 行输入还完成了 8-way modulo shard 集成：
 
 - shard input：`shards.canary128.v4.8`，`shards.json` SHA-256 `444d2c746cf1bc353442cb50a17f055fabd14ad2ba81f4786288cddb905d14dd`；
 - shard runs：`run.canary128.v4.sharded8`，8/8 manifest 完成；
@@ -132,11 +133,11 @@ target 相对误差 P50 为 0.0330%，P90 为 0.0831%，最大为 1.5483%。121 
 
 因此不得把 canary 的 121 个 child 或未来 static merge 直接接入训练。只有完整 paired reference、changed-region、exact shard checker 和 `--require-runtime-quality` analyzer 都通过后，才可形成 runtime review 集；即使如此，训练仍需另行批准。
 
-## 恢复顺序与命令
+## 后续汇集与验证顺序
 
-### 1. 恢复前资源和一致性检查
+### 1. 后续运行前的资源和一致性检查
 
-先把同一 commit 的工具和 `input.recoverable12318` / `shards.1024` 同步到参与节点，并核对本 handoff 中的 hash。暂停前曾观察到 node53 上有一套与本 lane 无关的 DeepSeek-V4-Flash TP8 vLLM 服务，占用约 93 GiB/卡；那不是本 lane 可自行终止的服务，而且状态可能已经变化。重新开始前必须在每台候选节点检查 `nvidia-smi`、compute process、CPU load、磁盘和 validation lock，不要假设 node53 或其他 H20 仍空闲。
+继续 H20 阶段前先核对同一 commit 的工具、`input.recoverable12318`、`shards.1024` 和 merged artifact hash。曾观察到 node53 上有一套与本 lane 无关的 DeepSeek-V4-Flash TP8 vLLM 服务，占用约 93 GiB/卡；该状态可能已经变化。启动 H20 前必须在每台候选节点检查 `nvidia-smi`、compute process、CPU load、磁盘和 validation lock，不要假设 node53 或其他 H20 仍空闲。
 
 H20 launcher 会 fail-closed 检查可见 GPU idle 状态。一次 reference 或 region run 的 machine count / rank mapping 会写入 scheduler contract，启动后不能在同一证据目录中改 machine count 续跑。如果四台都空闲，可使用 4 台；如果 node53 或用户的新扩展任务仍在使用 GPU，可选其余空闲节点并重新连续编号，但要在启动前固定 mapping。
 
@@ -177,15 +178,24 @@ python -m tools.data.synthesize.analyze_shape_solver_run \
 
 reference verify 后的第一次 analyzer 会生成 region allowlist。若跨节点运行，必须把 canonical run artifacts、完整 reference evidence 和生成的 allowlist 同步并逐文件校验后再启 region。
 
-### 3. 启动 12,318 条全量 CPU solver
+### 3. 汇集并合并 12,318 条全量 CPU shards
 
-全量采用已存在的 1,024 个 modulo shards。四机示例中每个节点各启动一个 rank；输出可以先保存在节点本地同路径，完成后只汇集该 rank 拥有的 shard 目录和日志到一个 canonical shard-run root。
+全量采用已存在的 1,024 个 modulo shards，并已按以下固定参数执行完毕：
+
+| 节点 | Rank | Shard ownership | 完成 manifest |
+| --- | ---: | --- | ---: |
+| node69_slime | 0 | 偶数 shard | 512 |
+| node70_dspark | 1 | 奇数 shard | 512 |
+
+launcher 使用 `SHAPE_CPU_MACHINE_COUNT=2`、`SHAPE_CPU_WORKERS=64` 和 `SHAPE_FAKE_TIMEOUT_SECONDS=30`。两个节点没有残留 solver process；任务正常跑完，没有被停止。输出位于各节点同名的 node-local 路径 `Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.sharded1024`。不要重新运行或覆盖这些目录。
+
+下一步只把 node69 的偶数 shard、node70 的奇数 shard 和各自日志汇集到一个 canonical shard-run root。汇集前后都要核对 1,024 个 manifest、shard ownership、artifact SHA 和 solver source SHA。下面的启动命令只用于说明本轮已使用的配置，不应再次执行：
 
 ```bash
-machine_rank=0  # 其余三台分别为 1、2、3
+machine_rank=0  # node70 使用 1
 
-SHAPE_CPU_MACHINE_COUNT=4 \
-SHAPE_CPU_WORKERS=32 \
+SHAPE_CPU_MACHINE_COUNT=2 \
+SHAPE_CPU_WORKERS=64 \
 SHAPE_FAKE_TIMEOUT_SECONDS=30 \
 bash tools/data/synthesize/launch_variable_shape_solver_cpu_shards.sh \
   "${machine_rank}" \
@@ -193,7 +203,7 @@ bash tools/data/synthesize/launch_variable_shape_solver_cpu_shards.sh \
   Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.sharded1024
 ```
 
-专用 wrapper 固定 module 为 `tools.data.synthesize.solve_variable_shape_delta`，并在运行和 resume 时要求 manifest contract 为 `shape_variable_multislot_solver_v5`，防止误用旧 exact-2 solver。四个 rank 都完成并汇集后再 merge：
+专用 wrapper 固定 module 为 `tools.data.synthesize.solve_variable_shape_delta`，并在运行和 resume 时要求 manifest contract 为 `shape_variable_multislot_solver_v5`，防止误用旧 exact-2 solver。两台的 rank-owned shards 完成汇集后再 merge：
 
 ```bash
 python -m tools.data.synthesize.merge_shape_solver_shards \
@@ -246,6 +256,6 @@ python -m tools.data.synthesize.analyze_shape_solver_run \
 | `launch_reference_validation_shards.sh` | `da63f011263caa0114d754090338304b57283002e814092b9de7ba63d46a4a38` |
 | `launch_shape_region_validation.sh` | `b1fa357bea9a7978a97325826bb1c4cade31eae657c1b323f89c66fe96cdf29f` |
 
-按要求没有为这些生产数据工具新增单元测试。发布暂停 checkpoint 时保留了上表已被 canary manifest 绑定的源码字节，没有应用会整体改变源码 SHA-256 的 Black/isort/Ruff 自动改写；`py_compile`、四个 launcher 的 `bash -n`、关键 CLI `--help` 和真实 canary/merge 证据均已通过。后续若格式化或修改任一 source-bound 文件，必须从相应 selection/static/runtime 阶段重新生成证据，不能只改 manifest hash。
+按要求没有为这些生产数据工具新增单元测试。发布 source-bound checkpoint 时保留了上表已被 canary manifest 绑定的源码字节，没有应用会整体改变源码 SHA-256 的 Black/isort/Ruff 自动改写；`py_compile`、四个 launcher 的 `bash -n`、关键 CLI `--help` 和真实 canary/merge 证据均已通过。后续若格式化或修改任一 source-bound 文件，必须从相应 selection/static/runtime 阶段重新生成证据，不能只改 manifest hash。
 
-本 handoff 记录的是暂停点和可恢复证据，不是完成报告；`training_approved=false`。
+本 handoff 记录的是 full CPU shard 完成点和后续可恢复边界，不是 runtime 完成报告；`training_approved=false`。
