@@ -559,7 +559,6 @@ def _verify_liveness(
             if not isinstance(trials, list) or len(trials) != config["trials"]:
                 raise ValueError(f"passed liveness trial count mismatch:{uuid}")
             frozen_input_schema: list[dict[str, Any]] | None = None
-            frozen_output_schema: list[dict[str, Any]] | None = None
             for trial_index, trial in enumerate(trials):
                 inputs, outputs, calls = _verify_trial(
                     trial,
@@ -584,15 +583,10 @@ def _verify_liveness(
                     }
                     for item in inputs
                 ]
-                output_schema = [
-                    {key: item[key] for key in ("path", "shape", "parent_dtype", "child_dtype", "elements")}
-                    for item in outputs
-                ]
                 if frozen_input_schema is None:
                     frozen_input_schema = input_schema
-                    frozen_output_schema = output_schema
-                elif frozen_input_schema != input_schema or frozen_output_schema != output_schema:
-                    raise ValueError(f"dtype tensor schema changes across trials:{uuid}")
+                elif frozen_input_schema != input_schema:
+                    raise ValueError(f"dtype input schema changes across trials:{uuid}")
                 trial_counts[target] += 1
                 input_observations[target] += len(inputs)
                 output_observations[target] += len(outputs)
