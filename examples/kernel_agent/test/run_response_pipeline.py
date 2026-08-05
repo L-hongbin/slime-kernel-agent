@@ -11,7 +11,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_response import run_kernel_eval
+from examples.kernel_agent.kernel_response import next_kernel_task_id, run_kernel_eval
 from examples.kernel_agent.test.run_generate_smoke import _build_sample, _init_ray_for_kernel_env
 from examples.kernel_agent.utils import (
     extract_cuda_agent_kernel_code,
@@ -100,20 +100,45 @@ async def _run(args) -> None:
         raise ValueError("--kernel-env-url is required unless --skip-env is set")
 
     _init_ray_for_kernel_env(args)
-    CUDA_AGENT_CONFIGS["env"]["kernel_env_url"] = args.kernel_env_url
+    env_config = CUDA_AGENT_CONFIGS["env"]
+    env_config["kernel_env_url"] = args.kernel_env_url
 
+    uuid = (sample.metadata or {}).get("uuid")
     payload = {
-        "response": response,
-        "ground_truth": sample.label["ground_truth"],
-        "kernel_backend": args.kernel_backend,
+        "task_id": next_kernel_task_id(),
+        "reference_code": sample.label["ground_truth"],
+        "kernel_code": kernel_code,
+        "backend": args.kernel_backend,
         "reference_backend": args.reference_backend,
         "entry_point": entry_point,
-        "uuid": (sample.metadata or {}).get("uuid"),
-        "return_full_state": True,
-        "metadata": sample.metadata,
-        "turn_idx": args.turn_idx,
+        "uuid": uuid,
+        "num_correct_trials": args.num_correct_trials,
+        "num_perf_trials": args.num_perf_trials,
+        "num_warmup": env_config.get("num_warmup"),
+        "perf_trim_count": env_config.get("perf_trim_count"),
+        "adaptive_perf_trials": env_config.get("adaptive_perf_trials"),
+        "perf_min_trials": env_config.get("perf_min_trials"),
+        "perf_cv_threshold": env_config.get("perf_cv_threshold"),
+        "timeout": args.kernel_eval_task_timeout,
+        "priority": "normal",
+        "is_valid": False,
+        "verbose_errors": args.verbose_errors,
+        "enable_profiling": args.enable_profiling,
+        "enable_ncu": bool(env_config.get("enable_ncu", False)),
+        "detect_decoy_kernel": args.detect_decoy_kernel,
     }
-    env_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
+    if env_config.get("use_reference_cache", False) and uuid is not None:
+        payload["use_reference_cache"] = True
+    if args.split_compile_and_execute:
+        payload["split_compile_and_execute"] = True
+    if args.enable_compile_artifact_cache:
+        payload["enable_compile_artifact_cache"] = True
+    for name in ("refer_num_perf_trials", "correctness_timeout", "correctness_timeout_enabled"):
+        value = env_config.get(name)
+        if value is not None:
+            payload[name] = value
+
+    env_result = await run_kernel_eval(args, sample, payload, env_config)
     raw_env_state = env_result.get("env_state", env_result)
     normalized_env_state, _env_extra_info = normalize_env_feedback(raw_env_state)
     if args.do_precheck and not precheck_passed:

@@ -11,12 +11,6 @@ import ray
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
-try:
-    from .utils import extract_cuda_agent_kernel_code
-except ImportError:
-    from utils import extract_cuda_agent_kernel_code
-
-
 _TASK_COUNTER = 0
 _WORKERS: dict[tuple[str, int, int, int, int], Any] = {}
 _HEARTBEAT_STARTED_AT = time.time()
@@ -307,72 +301,6 @@ def _get_kernel_eval_worker(args, config: dict[str, Any]):
     return _WORKERS[worker_key]
 
 
-def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    task_payload = {
-        "task_id": payload.get("task_id") or next_kernel_task_id(),
-        "reference_code": payload.get("reference_code", payload.get("ground_truth")),
-        "kernel_code": payload.get("kernel_code") or extract_cuda_agent_kernel_code(payload["response"]),
-        "backend": payload.get("backend", payload.get("kernel_backend")),
-        "entry_point": payload["entry_point"],
-        "num_correct_trials": payload.get(
-            "num_correct_trials", _kernel_eval_param(args, config, "num_correct_trials")
-        ),
-        "num_perf_trials": payload.get("num_perf_trials", _kernel_eval_param(args, config, "num_perf_trials")),
-        "num_warmup": payload.get("num_warmup", _kernel_eval_param(args, config, "num_warmup", 3)),
-        "perf_trim_count": payload.get("perf_trim_count", _kernel_eval_param(args, config, "perf_trim_count", 0)),
-        "adaptive_perf_trials": payload.get(
-            "adaptive_perf_trials", _kernel_eval_param(args, config, "adaptive_perf_trials", False)
-        ),
-        "perf_min_trials": payload.get("perf_min_trials", _kernel_eval_param(args, config, "perf_min_trials", 20)),
-        "perf_cv_threshold": payload.get(
-            "perf_cv_threshold", _kernel_eval_param(args, config, "perf_cv_threshold", 0.05)
-        ),
-        "timeout": payload.get("timeout", _kernel_eval_param(args, config, "kernel_eval_task_timeout")),
-        "priority": payload.get("priority", "normal"),
-        "is_valid": payload.get("is_valid", False),
-        "verbose_errors": payload.get("verbose_errors", _kernel_eval_param(args, config, "verbose_errors", True)),
-        "enable_profiling": payload.get(
-            "enable_profiling", _kernel_eval_param(args, config, "enable_profiling", True)
-        ),
-        "detect_decoy_kernel": payload.get(
-            "detect_decoy_kernel", _kernel_eval_param(args, config, "detect_decoy_kernel", True)
-        ),
-        "reference_backend": payload.get("reference_backend"),
-        "uuid": payload.get("uuid"),
-    }
-    # Reference-timing cache requires a uuid; the server rejects
-    # use_reference_cache=True without one, so only set it when present.
-    if payload.get("use_reference_cache", _kernel_eval_param(args, config, "use_reference_cache", False)):
-        assert task_payload["uuid"] is not None, "use_reference_cache requires a uuid in the payload"
-        task_payload["use_reference_cache"] = True
-    if payload.get("split_compile_and_execute", _kernel_eval_param(args, config, "split_compile_and_execute", True)):
-        task_payload["split_compile_and_execute"] = True
-    if payload.get(
-        "enable_compile_artifact_cache", _kernel_eval_param(args, config, "enable_compile_artifact_cache", True)
-    ):
-        task_payload["enable_compile_artifact_cache"] = True
-    # Optional separate reference perf-trial count; omit when unset so the server
-    # falls back to num_perf_trials.
-    refer_num_perf_trials = payload.get(
-        "refer_num_perf_trials", _kernel_eval_param(args, config, "refer_num_perf_trials", None)
-    )
-    if refer_num_perf_trials is not None:
-        task_payload["refer_num_perf_trials"] = refer_num_perf_trials
-    # Correctness-stage timeout overrides: only send when set so an unset value
-    # leaves the server's config/formula in effect.
-    correctness_timeout = payload.get(
-        "correctness_timeout", _kernel_eval_param(args, config, "correctness_timeout", None)
-    )
-    if correctness_timeout is not None:
-        task_payload["correctness_timeout"] = correctness_timeout
-    correctness_timeout_enabled = payload.get(
-        "correctness_timeout_enabled", _kernel_eval_param(args, config, "correctness_timeout_enabled", None)
-    )
-    if correctness_timeout_enabled is not None:
-        task_payload["correctness_timeout_enabled"] = correctness_timeout_enabled
-    return task_payload
-
-
 def _format_env_return(result: dict[str, Any], task_payload: dict[str, Any]) -> dict[str, Any]:
     status = result.get("status") or "failed"
     if status == "completed":
@@ -451,12 +379,6 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
     config = dict(config)
     eval_func_path = _kernel_eval_param(args, config, "kernel_eval_function_path", None)
     if eval_func_path:
-        task_payload = {
-            "task_id": payload.get("task_id"),
-            "entry_point": payload.get("entry_point"),
-            "backend": payload.get("backend", payload.get("kernel_backend")),
-            "uuid": payload.get("uuid"),
-        }
         eval_func = load_function(eval_func_path)
         result = eval_func(args, sample, payload)
         if inspect.isawaitable(result):
@@ -468,9 +390,8 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
         return result
 
     worker = _get_kernel_eval_worker(args, config)
-    task_payload = _build_kernel_eval_payload(args, payload, config)
     object_ref = worker.submit_and_poll.remote(
-        task_payload,
+        payload,
         client_timeout=int(_kernel_eval_param(args, config, "kernel_eval_client_timeout")),
         max_retries=int(_kernel_eval_param(args, config, "kernel_eval_max_retries")),
         poll_interval=float(_kernel_eval_param(args, config, "kernel_eval_poll_interval")),
@@ -478,7 +399,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
     result = await _wait_kernel_eval_result(
         object_ref,
         worker,
-        task_payload,
+        payload,
         heartbeat_interval=float(_kernel_eval_param(args, config, "kernel_eval_heartbeat_interval", 60.0)),
         rate_limit=int(_kernel_eval_param(args, config, "kernel_eval_rate_limit")),
     )

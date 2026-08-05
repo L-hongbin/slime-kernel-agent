@@ -22,6 +22,7 @@ try:
     from .kernel_reward import calculate_reward
     from .utils import (
         _extract_env_extra_info,
+        extract_cuda_agent_kernel_code,
         normalize_env_feedback,
         postprocess_turn_samples,
         precheck_response,
@@ -34,6 +35,7 @@ except ImportError:
 
     from utils import (
         _extract_env_extra_info,
+        extract_cuda_agent_kernel_code,
         normalize_env_feedback,
         postprocess_turn_samples,
         precheck_response,
@@ -397,6 +399,13 @@ def _get_entry_point(sample: Sample) -> str:
     return "Model"
 
 
+def _kernel_eval_config_value(args, config: dict[str, Any], name: str, default: Any = None) -> Any:
+    value = getattr(args, name, None)
+    if value is not None:
+        return value
+    return config.get(name, default)
+
+
 async def cuda_kernel_env(
     args,
     sample: Sample,
@@ -429,31 +438,40 @@ async def cuda_kernel_env(
         env_config = CUDA_AGENT_CONFIGS["env"]
         payload = {
             "task_id": task_id,
-            "response": response,
-            "ground_truth": _get_label_value(sample, "ground_truth"),
-            "kernel_backend": kernel_backend,
+            "reference_code": _get_label_value(sample, "ground_truth"),
+            "kernel_code": extract_cuda_agent_kernel_code(response),
+            "backend": kernel_backend,
             "reference_backend": reference_backend,
             "entry_point": entry_point,
             "uuid": (sample.metadata or {}).get("uuid"),
-            "return_full_state": True,
-            "metadata": sample.metadata,
-            "turn_idx": turn_idx,
-            # Timing controls forwarded to KernelGYM /evaluate. Reference and kernel
-            # are both timed under these identical settings.
             "num_correct_trials": env_config.get("num_correct_trials"),
             "num_perf_trials": env_config.get("num_perf_trials"),
             "num_warmup": env_config.get("num_warmup"),
             "perf_trim_count": env_config.get("perf_trim_count"),
-            # Adaptive kernel-perf trials (default off) + optional separate reference count.
             "adaptive_perf_trials": env_config.get("adaptive_perf_trials"),
             "perf_min_trials": env_config.get("perf_min_trials"),
             "perf_cv_threshold": env_config.get("perf_cv_threshold"),
-            "refer_num_perf_trials": env_config.get("refer_num_perf_trials"),
-            # Correctness-stage timeout overrides (None -> server config/formula).
-            "correctness_timeout": env_config.get("correctness_timeout"),
-            "correctness_timeout_enabled": env_config.get("correctness_timeout_enabled"),
+            "timeout": _kernel_eval_config_value(args, env_config, "kernel_eval_task_timeout"),
+            "priority": "normal",
+            "is_valid": False,
+            "verbose_errors": _kernel_eval_config_value(args, env_config, "verbose_errors", True),
+            "enable_profiling": _kernel_eval_config_value(args, env_config, "enable_profiling", True),
+            "enable_ncu": bool(env_config.get("enable_ncu", False)),
+            "detect_decoy_kernel": _kernel_eval_config_value(args, env_config, "detect_decoy_kernel", True),
         }
-        kernel_eval_result = await run_kernel_eval(args, sample, payload, CUDA_AGENT_CONFIGS["env"])
+        use_reference_cache = _kernel_eval_config_value(args, env_config, "use_reference_cache", False)
+        if use_reference_cache and payload["uuid"] is not None:
+            payload["use_reference_cache"] = True
+        if _kernel_eval_config_value(args, env_config, "split_compile_and_execute", True):
+            payload["split_compile_and_execute"] = True
+        if _kernel_eval_config_value(args, env_config, "enable_compile_artifact_cache", True):
+            payload["enable_compile_artifact_cache"] = True
+        for name in ("refer_num_perf_trials", "correctness_timeout", "correctness_timeout_enabled"):
+            value = env_config.get(name)
+            if value is not None:
+                payload[name] = value
+
+        kernel_eval_result = await run_kernel_eval(args, sample, payload, env_config)
         raw_env_state = kernel_eval_result.get("env_state") if isinstance(kernel_eval_result, dict) else None
         if not isinstance(raw_env_state, dict):
             raw_env_state = kernel_eval_result

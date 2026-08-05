@@ -21,6 +21,7 @@ PRECHECK_ERROR = "PRECHECK_ERROR"
 COMPILATION_ERROR = "COMPILATION_ERROR"
 DECOY_KERNEL_DETECTED = "DECOY_KERNEL_DETECTED"
 KERNEL_EVAL_FAILED = "KERNEL_EVAL_FAILED"
+CORRECTNESS_ERROR = "CORRECTNESS_ERROR"
 KERNEL_EVAL_TIMEOUT = "KERNEL_EVAL_TIMEOUT"
 
 CUDA_SECTIONS = ("CUDA_KERNELS", "APPLY_BINDINGS", "MODEL_NEW")
@@ -46,15 +47,12 @@ METADATA_POP_KEYS = (
     "correctness_current_trial",
     "correctness_current_substage",
     "correctness_early_stopped",
+    "correctness_issue_name",
     "kernel_task_id",
     "coverage_backend",
     "reference_task_id",
     "split_compile_and_execute",
     "cpu_worker_run_s",
-    "correctness_tf32_state_before",
-    "correctness_tf32_state_forced",
-    "correctness_atol",
-    "correctness_rtol",
     "runtime_error",
 )
 
@@ -77,7 +75,31 @@ COMPILE_ARTIFACT_POP_KEYS = (
     "target_gpu_worker_id",
     "target_gpu_selection_strategy",
     "device",
+    "precompiled_artifact_used",
 )
+
+NCU_POP_KEYS = (
+    "profile_version",
+    "tool_version",
+    "requested_metrics",
+    "csv_source",
+    "wall_time_s",
+)
+
+NCU_METRIC_SHORT_FIELDS = {
+    "gpu__time_duration.sum": "duration",
+    "dram__cycles_active.avg.pct_of_peak_sustained_elapsed": "dram_cycles_active",
+    "gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed": "dram_throughput",
+    "l1tex__throughput.avg.pct_of_peak_sustained_active": "l1_throughput",
+    "lts__throughput.avg.pct_of_peak_sustained_elapsed": "l2_throughput",
+    "gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed": "compute_memory_throughput",
+    "sm__throughput.avg.pct_of_peak_sustained_elapsed": "sm_throughput",
+    "sm__issue_active.avg.pct_of_peak_sustained_elapsed": "sm_issue_active",
+    "sm__warps_active.avg.pct_of_peak_sustained_active": "sm_warps_active",
+    "launch__occupancy_per_block_size": "occupancy_per_block_size",
+    "launch__registers_per_thread": "registers_per_thread",
+    "launch__shared_mem_per_block": "shared_mem_per_block",
+}
 
 
 def _format_compilation_error_message(env_state: dict[str, Any]) -> str:
@@ -118,6 +140,72 @@ def _as_float_or_none(value: Any) -> float | None:
     return float(value)
 
 
+def _round_numeric(value: Any, digits: int = 4) -> Any:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    return round(float(value), digits)
+
+
+def _format_ncu_metric_value(value: Any, unit: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        formatted_value = f"{value:.4f}".rstrip("0").rstrip(".")
+    else:
+        formatted_value = str(value)
+    return " ".join(part for part in (formatted_value, str(unit or "").strip()) if part)
+
+
+def _normalize_ncu_metadata(ncu_metadata: Any) -> Any:
+    if not isinstance(ncu_metadata, dict):
+        return ncu_metadata
+
+    normalized_ncu = dict(ncu_metadata)
+    for key in NCU_POP_KEYS:
+        normalized_ncu.pop(key, None)
+
+    kernels = normalized_ncu.get("kernels")
+    if not isinstance(kernels, list):
+        return normalized_ncu
+
+    normalized_kernels = []
+    for kernel in kernels:
+        if not isinstance(kernel, dict):
+            normalized_kernels.append(kernel)
+            continue
+        normalized_kernel = dict(kernel)
+        metrics = normalized_kernel.pop("metrics", None)
+        if isinstance(metrics, dict):
+            for metric_name, metric_payload in metrics.items():
+                field = NCU_METRIC_SHORT_FIELDS.get(metric_name, metric_name)
+                if isinstance(metric_payload, dict):
+                    value = metric_payload.get("value")
+                    unit = metric_payload.get("unit")
+                else:
+                    value = metric_payload
+                    unit = None
+                normalized_kernel[field] = _format_ncu_metric_value(value, unit)
+        normalized_kernels.append(normalized_kernel)
+    normalized_ncu["kernels"] = normalized_kernels
+    return normalized_ncu
+
+
+def _compact_aten_ops(operators: Any) -> Any:
+    if not isinstance(operators, list):
+        return operators
+
+    compacted = []
+    for operator in operators:
+        if isinstance(operator, dict):
+            operator = {
+                key: value
+                for key, value in operator.items()
+                if key not in ("cpu_time_us", "allowed", "normalized_name")
+            }
+        compacted.append(operator)
+    return compacted
+
+
 def _get_env_metadata(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata") if isinstance(env_state, dict) else None
     return metadata if isinstance(metadata, dict) else {}
@@ -147,6 +235,11 @@ def _extract_detail_env_time(env_state: dict[str, Any]) -> dict[str, float]:
     profile_time = _as_float_or_none(metadata.get("kg_kernel_perf_profile_s"))
     if profile_time is not None:
         detail_env_time["profile_time"] = profile_time
+
+    ncu_metadata = metadata.get("ncu")
+    ncu_wall_time = _as_float_or_none(ncu_metadata.get("wall_time_s")) if isinstance(ncu_metadata, dict) else None
+    if ncu_wall_time is not None and ncu_wall_time > 0.0:
+        detail_env_time["ncu_profile_time_s"] = round(ncu_wall_time, 4)
 
     reference_warmup_time = _as_float_or_none(metadata.get("kg_reference_perf_warmup_s"))
     reference_measure_time = _as_float_or_none(metadata.get("kg_reference_perf_measure_wall_s"))
@@ -213,6 +306,7 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     runtime_error = metadata.get("runtime_error")
     metadata_error = metadata.get("error")
+    correctness_issue = metadata.get("correctness_issue")
     error_message = env_state.get("error_message") or env_state.get("error")
     env_precheck_error_message = _extract_env_precheck_error_message(env_state)
 
@@ -266,6 +360,19 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
                 "error_message": error_message,
             }
         )
+    elif env_state.get("error_code") == CORRECTNESS_ERROR:
+        correctness_error_message = str(error_message or "Kernel produced incorrect results")
+        if correctness_issue not in (None, ""):
+            correctness_detail = f"correctness error ：{correctness_issue}"
+            if correctness_detail not in correctness_error_message:
+                correctness_error_message = f"{correctness_error_message}\n{correctness_detail}"
+        env_state.update(
+            {
+                "success": False,
+                "error": CORRECTNESS_ERROR,
+                "error_message": correctness_error_message,
+            }
+        )
     elif env_state.get("status") == "failed" or error_message is not None:
         env_state.update(
             {
@@ -274,10 +381,13 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
                 "error_message": error_message or "Task failed: Kernel evaluation error.",
             }
         )
+
     if runtime_error:
         runtime_error = str(runtime_error)
         current_error_message = str(env_state.get("error_message") or "")
-        if runtime_error not in current_error_message:
+        if runtime_error == current_error_message:
+            env_state["error_message"] = f"runtime error: \n{runtime_error}"
+        elif runtime_error not in current_error_message:
             env_state["error_message"] = "\n".join(
                 part for part in (current_error_message, "other error message:", runtime_error) if part
             )
@@ -288,6 +398,8 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
             env_state["error_message"] = "\n".join(
                 part for part in (current_error_message, "other error message:", metadata_error) if part
             )
+    if "speedup" in env_state:
+        env_state["speedup"] = _round_numeric(env_state["speedup"])
     return env_state
 
 
@@ -298,18 +410,29 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
+        for key in ("aten_detection_trials", "aten_ops"):
+            metadata.pop(key, None)
+        for key in ("allowed_aten_ops", "forbidden_aten_ops"):
+            if key in metadata:
+                metadata[key] = _compact_aten_ops(metadata[key])
         if "device_info" in metadata:
             for key in ("gpu_name", "hardware"):
                 metadata.pop(key, None)
         for key in METADATA_POP_KEYS:
             metadata.pop(key, None)
         for key in list(metadata):
-            if key.startswith(("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_")):
+            if key.startswith(("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_")) or (
+                key.startswith("correctness_") and key.endswith("_trial_s")
+            ):
                 metadata.pop(key, None)
             elif key.startswith("kg_kernel_") and key != "kg_kernel_total_s":
                 metadata.pop(key, None)
+        if "kg_kernel_total_s" in metadata:
+            metadata["kg_kernel_total_s"] = _round_numeric(metadata["kg_kernel_total_s"])
         if "entry_point" in metadata:
             metadata["refer_entry_point"] = metadata.pop("entry_point")
+        if "ncu" in metadata:
+            metadata["ncu"] = _normalize_ncu_metadata(metadata["ncu"])
         compile_artifact = metadata.get("compile_artifact")
         if isinstance(compile_artifact, dict):
             compile_artifact = dict(compile_artifact)

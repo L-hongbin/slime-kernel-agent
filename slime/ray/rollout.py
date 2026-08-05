@@ -1522,6 +1522,7 @@ def _compute_kernel_agent_metrics(samples):
         "detail_env_time/compile_time": [],
         "detail_env_time/kernel_runtime": [],
         "detail_env_time/profile_time": [],
+        "detail_env_time/ncu_profile_time_s": [],
         "detail_env_time/refer_runtime": [],
     }
     total_count = len(samples)
@@ -1569,7 +1570,13 @@ def _compute_kernel_agent_metrics(samples):
 
             detail_env_time = env_extra_info.get("detail_env_time")
             if isinstance(detail_env_time, dict):
-                for key in ("compile_time", "kernel_runtime", "profile_time", "refer_runtime"):
+                for key in (
+                    "compile_time",
+                    "kernel_runtime",
+                    "profile_time",
+                    "ncu_profile_time_s",
+                    "refer_runtime",
+                ):
                     value = detail_env_time.get(key)
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         continue

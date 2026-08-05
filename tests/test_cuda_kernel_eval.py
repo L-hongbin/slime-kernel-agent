@@ -393,6 +393,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_ncu", False)
 
     captured_payload = {}
 
@@ -439,8 +440,14 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     format_feedback = _format_feedback_for_test(env_result)
     print(f"\n[cuda_agent][test][format_feedback][{case['uuid']}]\n{format_feedback}")
     assert captured_payload["uuid"] == case["uuid"]
-    assert captured_payload["turn_idx"] == 0
-    assert captured_payload["response"] == VALID_CUDA_AGENT_RESPONSE
+    assert captured_payload["reference_code"] == "class Model: pass"
+    assert captured_payload["kernel_code"] == extract_cuda_agent_kernel_code(VALID_CUDA_AGENT_RESPONSE)
+    assert captured_payload["backend"] == "cuda"
+    assert captured_payload["enable_ncu"] is False
+    assert "turn_idx" not in captured_payload
+    assert "response" not in captured_payload
+    assert "ground_truth" not in captured_payload
+    assert "kernel_backend" not in captured_payload
     assert env_state["compiled"] is case["feedback_compiled"]
     assert env_state["status"] == "completed"
     assert "error_code" not in env_state
