@@ -12,11 +12,13 @@ dimension.  All slots in a group affect the same non-empty factory set once
 per factory on distinct axes.  That structure gives the exact storage model
 ``constant + coefficient * product(slot values)``.
 
-The solver prefers the largest supported group for each parent and falls back
-to smaller groups only when necessary.  Power-of-two values are independent
-per-slot soft preferences, not a per-child pattern or acceptance condition.
-Static output is not training-approved: the aggregate 30%-50% power-of-two
-occurrence range must be re-audited after target-GPU filtering.
+The generic mode prefers the largest supported group for each parent.  The
+opt-in nonleading scope first tries groups that touch neither a leading axis
+nor an explicit batch symbol, then uses a bounded generic fallback.  Power-of-
+two values are independent per-slot soft preferences, not a per-child pattern
+or acceptance condition.  Static output is not training-approved: the
+aggregate 30%-50% power-of-two occurrence range must be re-audited after
+target-GPU filtering.
 """
 
 from __future__ import annotations
@@ -86,7 +88,15 @@ from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
 
 
 CONTRACT_VERSION = "shape_variable_multislot_solver_v5"
+NONBATCH_CONTRACT_VERSION = "shape_variable_multislot_solver_v6"
+BALANCED_NONBATCH_CONTRACT_VERSION = "shape_variable_multislot_solver_v7"
 GENERATOR_VERSION = "same_factory_product_variable_2_to_5_soft_p2_50_v3"
+NONBATCH_GENERATOR_VERSION = (
+    "same_factory_product_variable_2_to_5_nonleading_no_explicit_batch_soft_p2_50_v1"
+)
+BALANCED_NONBATCH_GENERATOR_VERSION = (
+    "same_factory_product_variable_2_to_5_balanced_nonleading_soft_p2_50_v1"
+)
 DELTA_SELECTION_CONTRACT_VERSION = "shape_variable_multislot_delta_selection_v1"
 DEFAULT_SELECTED = (
     _REPO_ROOT
@@ -99,13 +109,29 @@ DEFAULT_RUN_DIR = (
 MIN_GROUP_SLOTS = 2
 MAX_GROUP_SLOTS = 5
 MAX_GROUPS_PER_SIZE = 12
+MIN_GENERAL_GROUPS_PER_SIZE = 4
 MAX_CANDIDATES_PER_GROUP = 4
 MAX_CHILD_FAKE_ATTEMPTS = 6
+MAX_SCOPE_CHILD_FAKE_ATTEMPTS = 4
+MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS = 2
 MAX_PREFERRED_CARDINALITY_ATTEMPTS = 3
 MAX_REVIEW_EXAMPLES = 20
 POWER_OF_TWO_PREFERENCE_NUMERATOR = 1
 POWER_OF_TWO_PREFERENCE_DENOMINATOR = 2
 TARGET_ERROR_EQUIVALENCE_DENOMINATOR = 1_000
+GENERIC_GROUP_SCOPE = "generic"
+NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE = "nonleading_no_explicit_batch"
+BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE = (
+    "balanced_nonleading_no_explicit_batch"
+)
+GROUP_SCOPE_CHOICES = (
+    GENERIC_GROUP_SCOPE,
+    NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+    BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+)
+EXPLICIT_BATCH_SYMBOLS = frozenset(
+    {"batch_size", "batchsize", "batch", "bs", "n_batch"}
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,6 +180,56 @@ def _slot_factory_axes(slot: ShapeSlot) -> dict[int, list[int]]:
     for occurrence in slot.occurrences:
         result[occurrence.factory_index].append(occurrence.axis)
     return dict(result)
+
+
+def _group_scope_evidence(slots: Sequence[ShapeSlot]) -> dict[str, Any]:
+    leading_occurrences = sum(
+        occurrence.axis == 0
+        for slot in slots
+        for occurrence in slot.occurrences
+    )
+    explicit_batch_symbols = sorted(
+        {
+            slot.symbol_name.strip().lower()
+            for slot in slots
+            if isinstance(slot.symbol_name, str)
+            and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS
+        }
+    )
+    return {
+        "touches_leading_axis": leading_occurrences > 0,
+        "leading_axis_occurrences": leading_occurrences,
+        "touches_explicit_batch_symbol": bool(explicit_batch_symbols),
+        "explicit_batch_symbols": explicit_batch_symbols,
+        "matches_nonleading_no_explicit_batch": (
+            leading_occurrences == 0 and not explicit_batch_symbols
+        ),
+    }
+
+
+def _slots_match_scope(
+    slots: Sequence[ShapeSlot],
+    group_scope: str,
+) -> bool:
+    if group_scope == GENERIC_GROUP_SCOPE:
+        return True
+    if group_scope in {
+        NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+    }:
+        evidence = _group_scope_evidence(slots)
+        return bool(evidence["matches_nonleading_no_explicit_batch"])
+    raise ValueError(f"unknown_group_scope:{group_scope}")
+
+
+def _group_matches_scope(
+    profiles: Sequence[AffineProfile],
+    group_scope: str,
+) -> bool:
+    return _slots_match_scope(
+        tuple(profile.slot for profile in profiles),
+        group_scope,
+    )
 
 
 def relaxed_structural_pair(slot_a: ShapeSlot, slot_b: ShapeSlot) -> bool:
@@ -206,12 +282,16 @@ def _structural_group(slots: Sequence[ShapeSlot]) -> bool:
     return True
 
 
-def variable_slot_groups(
+def variable_slot_group_inventory(
     affine_profiles: Sequence[AffineProfile],
     *,
     parent_uuid: str,
-) -> list[tuple[AffineProfile, ...]]:
-    """Enumerate bounded same-factory groups, largest cardinality first."""
+    group_scope: str = GENERIC_GROUP_SCOPE,
+) -> tuple[list[tuple[AffineProfile, ...]], dict[str, dict[str, int]]]:
+    """Enumerate bounded groups and retain auditable scope counts around the cap."""
+
+    if group_scope not in GROUP_SCOPE_CHOICES:
+        raise ValueError(f"unknown_group_scope:{group_scope}")
 
     buckets: dict[tuple[int, ...], list[AffineProfile]] = collections.defaultdict(list)
     for profile in affine_profiles:
@@ -237,6 +317,12 @@ def variable_slot_groups(
                 by_size[size].append(group)
 
     result: list[tuple[AffineProfile, ...]] = []
+    scope_before_cap: dict[str, int] = {}
+    scope_after_cap: dict[str, int] = {}
+    scope_discarded_by_cap: dict[str, int] = {}
+    general_before_cap: dict[str, int] = {}
+    general_after_cap: dict[str, int] = {}
+    general_discarded_by_cap: dict[str, int] = {}
     for size in range(MAX_GROUP_SLOTS, MIN_GROUP_SLOTS - 1, -1):
         ranked = sorted(
             by_size.get(size, []),
@@ -247,8 +333,60 @@ def variable_slot_groups(
                 ).encode("utf-8")
             ),
         )
-        result.extend(ranked[:MAX_GROUPS_PER_SIZE])
-    return result
+        if group_scope == GENERIC_GROUP_SCOPE:
+            retained = ranked[:MAX_GROUPS_PER_SIZE]
+        else:
+            matching = [
+                group
+                for group in ranked
+                if _group_matches_scope(group, group_scope)
+            ]
+            fallback = [
+                group
+                for group in ranked
+                if not _group_matches_scope(group, group_scope)
+            ]
+            reserved_general = min(MIN_GENERAL_GROUPS_PER_SIZE, len(fallback))
+            maximum_scope = MAX_GROUPS_PER_SIZE - reserved_general
+            retained_matching = matching[:maximum_scope]
+            retained_fallback = fallback[
+                : MAX_GROUPS_PER_SIZE - len(retained_matching)
+            ]
+            retained = retained_matching + retained_fallback
+            key = str(size)
+            scope_before_cap[key] = len(matching)
+            scope_after_cap[key] = len(retained_matching)
+            scope_discarded_by_cap[key] = len(matching) - len(retained_matching)
+            general_before_cap[key] = len(fallback)
+            general_after_cap[key] = len(retained_fallback)
+            general_discarded_by_cap[key] = len(fallback) - len(retained_fallback)
+        result.extend(retained)
+    return result, {
+        "scope_group_count_before_cap_by_logical_slot_count": scope_before_cap,
+        "scope_group_count_after_cap_by_logical_slot_count": scope_after_cap,
+        "scope_group_count_discarded_by_cap_by_logical_slot_count": (
+            scope_discarded_by_cap
+        ),
+        "general_group_count_before_cap_by_logical_slot_count": general_before_cap,
+        "general_group_count_after_cap_by_logical_slot_count": general_after_cap,
+        "general_group_count_discarded_by_cap_by_logical_slot_count": (
+            general_discarded_by_cap
+        ),
+    }
+
+
+def variable_slot_groups(
+    affine_profiles: Sequence[AffineProfile],
+    *,
+    parent_uuid: str,
+    group_scope: str = GENERIC_GROUP_SCOPE,
+) -> list[tuple[AffineProfile, ...]]:
+    groups, _inventory = variable_slot_group_inventory(
+        affine_profiles,
+        parent_uuid=parent_uuid,
+        group_scope=group_scope,
+    )
+    return groups
 
 
 def _product_profile(
@@ -562,6 +700,25 @@ def _candidate_key(candidate: VariableCandidate, parent_uuid: str) -> tuple[Any,
     )
 
 
+def _batch_like_growth_dominates(candidate: VariableCandidate) -> bool:
+    growth = [
+        math.log(value / slot.old_value)
+        for slot, value in zip(candidate.profile.slots, candidate.values)
+    ]
+    batch_like = [
+        any(occurrence.axis == 0 for occurrence in slot.occurrences)
+        or (
+            isinstance(slot.symbol_name, str)
+            and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS
+        )
+        for slot in candidate.profile.slots
+    ]
+    return bool(growth) and any(
+        is_batch_like and value >= max(growth)
+        for value, is_batch_like in zip(growth, batch_like)
+    )
+
+
 def _diverse_candidate_attempts(
     candidates: Sequence[VariableCandidate],
 ) -> list[VariableCandidate]:
@@ -606,6 +763,120 @@ def _diverse_candidate_attempts(
     return preferred + fallback + remaining
 
 
+def _ordered_candidate_attempts(
+    candidates: Sequence[VariableCandidate],
+    *,
+    parent_uuid: str,
+    group_scope: str,
+) -> tuple[list[VariableCandidate], str, dict[str, Any]]:
+    """Return the bounded attempt order and its preferred lane."""
+
+    if group_scope == GENERIC_GROUP_SCOPE:
+        ranked = sorted(
+            candidates,
+            key=lambda candidate: _candidate_key(candidate, parent_uuid),
+        )
+        selected = _diverse_candidate_attempts(ranked)[:MAX_CHILD_FAKE_ATTEMPTS]
+        return selected, "generic", {
+            "preference_reason": "generic_ranking",
+            "scope_candidate_count_before_bound": None,
+            "general_candidate_count_before_bound": None,
+            "maximum_scope_logical_slot_count": None,
+            "best_general_batch_like_growth_dominates": None,
+        }
+    if group_scope not in {
+        NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
+    }:
+        raise ValueError(f"unknown_group_scope:{group_scope}")
+
+    matching = [
+        candidate
+        for candidate in candidates
+        if _slots_match_scope(candidate.profile.slots, group_scope)
+    ]
+    fallback = [
+        candidate
+        for candidate in candidates
+        if not _slots_match_scope(candidate.profile.slots, group_scope)
+    ]
+
+    def ranked_diverse(values: Sequence[VariableCandidate]) -> list[VariableCandidate]:
+        ranked = sorted(
+            values,
+            key=lambda candidate: _candidate_key(candidate, parent_uuid),
+        )
+        return _diverse_candidate_attempts(ranked)
+
+    ordered_matching = ranked_diverse(matching)
+    ordered_fallback = ranked_diverse(fallback)
+    if not ordered_matching:
+        return ordered_fallback[:MAX_CHILD_FAKE_ATTEMPTS], "general", {
+            "preference_reason": "no_scope_static_candidate",
+            "scope_candidate_count_before_bound": 0,
+            "general_candidate_count_before_bound": len(ordered_fallback),
+            "maximum_scope_logical_slot_count": None,
+            "best_general_batch_like_growth_dominates": (
+                _batch_like_growth_dominates(ordered_fallback[0])
+                if ordered_fallback
+                else None
+            ),
+        }
+    if not ordered_fallback:
+        return ordered_matching[:MAX_CHILD_FAKE_ATTEMPTS], "scope", {
+            "preference_reason": "no_general_static_candidate",
+            "scope_candidate_count_before_bound": len(ordered_matching),
+            "general_candidate_count_before_bound": 0,
+            "maximum_scope_logical_slot_count": max(
+                len(candidate.profile.slots) for candidate in ordered_matching
+            ),
+            "best_general_batch_like_growth_dominates": None,
+        }
+
+    prefer_scope = group_scope == NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+    maximum_scope_size = max(
+        len(candidate.profile.slots) for candidate in ordered_matching
+    )
+    general_batch_like_growth_dominates = _batch_like_growth_dominates(
+        ordered_fallback[0]
+    )
+    preference_reason = "strict_scope_preference"
+    if group_scope == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE:
+        prefer_scope = (
+            maximum_scope_size >= 3 or general_batch_like_growth_dominates
+        )
+        if maximum_scope_size >= 3:
+            preference_reason = "scope_cardinality_at_least_three"
+        elif general_batch_like_growth_dominates:
+            preference_reason = "best_general_batch_like_growth_dominates"
+        else:
+            preference_reason = "balanced_general_preference"
+    preferred = ordered_matching if prefer_scope else ordered_fallback
+    secondary = ordered_fallback if prefer_scope else ordered_matching
+    selected_preferred = preferred[:MAX_SCOPE_CHILD_FAKE_ATTEMPTS]
+    selected_secondary = secondary[:MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS]
+    remaining = MAX_CHILD_FAKE_ATTEMPTS - len(selected_preferred) - len(
+        selected_secondary
+    )
+    if remaining > 0:
+        selected_secondary.extend(
+            secondary[
+                len(selected_secondary) : len(selected_secondary) + remaining
+            ]
+        )
+    return selected_preferred + selected_secondary, (
+        "scope" if prefer_scope else "general"
+    ), {
+        "preference_reason": preference_reason,
+        "scope_candidate_count_before_bound": len(ordered_matching),
+        "general_candidate_count_before_bound": len(ordered_fallback),
+        "maximum_scope_logical_slot_count": maximum_scope_size,
+        "best_general_batch_like_growth_dominates": (
+            general_batch_like_growth_dominates
+        ),
+    }
+
+
 def _slot_assignment_manifest(
     parent_uuid: str,
     slot: ShapeSlot,
@@ -624,6 +895,7 @@ def _candidate_manifest(
     candidate: VariableCandidate,
 ) -> dict[str, Any]:
     profile = candidate.profile
+    group_scope = _group_scope_evidence(profile.slots)
     return {
         "kind": "same_factory_product_variable_multislot",
         "logical_slot_count": len(profile.slots),
@@ -652,6 +924,7 @@ def _candidate_manifest(
             "expression": "constant_bytes + product_coefficient * product(values)",
         },
         "affected_factory_indices": list(profile.factory_indices),
+        "group_scope": group_scope,
         "dimension_balance_guard": copy.deepcopy(dict(candidate.balance_evidence)),
     }
 
@@ -716,6 +989,7 @@ def solve_variable_shape_delta(
     *,
     max_parents: int | None = None,
     fake_gate_timeout_seconds: float = DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
+    group_scope: str = GENERIC_GROUP_SCOPE,
 ) -> dict[str, Any]:
     if not selected_path.is_file():
         raise FileNotFoundError(selected_path)
@@ -725,6 +999,23 @@ def solve_variable_shape_delta(
         raise ValueError("max_parents must be positive")
     if not math.isfinite(fake_gate_timeout_seconds) or fake_gate_timeout_seconds <= 0:
         raise ValueError("fake_gate_timeout_seconds_must_be_finite_and_positive")
+    if group_scope not in GROUP_SCOPE_CHOICES:
+        raise ValueError(f"unknown_group_scope:{group_scope}")
+    solver_contract_version = {
+        GENERIC_GROUP_SCOPE: CONTRACT_VERSION,
+        NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: NONBATCH_CONTRACT_VERSION,
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (
+            BALANCED_NONBATCH_CONTRACT_VERSION
+        ),
+    }[group_scope]
+    generator_version = {
+        GENERIC_GROUP_SCOPE: GENERATOR_VERSION,
+        NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: NONBATCH_GENERATOR_VERSION,
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (
+            BALANCED_NONBATCH_GENERATOR_VERSION
+        ),
+    }[group_scope]
+    scoped_mode = group_scope != GENERIC_GROUP_SCOPE
 
     source = pq.read_table(selected_path)
     source_selection_rows = _delta_selection_rows(selected_path, source.num_rows)
@@ -758,7 +1049,7 @@ def solve_variable_shape_delta(
         source_selection = json.loads(source_selection_path.read_text(encoding="utf-8"))
         selection = {
             **source_selection,
-            "derivation_contract_version": CONTRACT_VERSION,
+            "derivation_contract_version": solver_contract_version,
             "source_selection_manifest": str(source_selection_path.resolve()),
             "source_selection_manifest_sha256": _sha256_file(source_selection_path),
             "selected_path": str(final_paths.selected),
@@ -829,6 +1120,12 @@ def solve_variable_shape_delta(
                 "input_bytes_before": parent_analysis.input_bytes,
                 "accepted": False,
                 "parent_fake_gate": parent_fake.as_dict(),
+                "group_scope_mode": group_scope,
+                "group_scope_status": (
+                    "not_evaluated_parent_fake_failed"
+                    if scoped_mode
+                    else "not_applicable"
+                ),
                 "attempts": [],
             }
             if not parent_fake.passed:
@@ -849,8 +1146,10 @@ def solve_variable_shape_delta(
                     parent_analysis.input_bytes,
                     slots,
                 )
-                groups = variable_slot_groups(
-                    affine_profiles, parent_uuid=parent_uuid
+                groups, group_scope_inventory = variable_slot_group_inventory(
+                    affine_profiles,
+                    parent_uuid=parent_uuid,
+                    group_scope=group_scope,
                 )
                 product_profiles: list[ProductProfile] = []
                 product_rejections: list[dict[str, Any]] = []
@@ -875,6 +1174,14 @@ def solve_variable_shape_delta(
                 slots = []
                 affine_profiles = []
                 groups = []
+                group_scope_inventory = {
+                    "scope_group_count_before_cap_by_logical_slot_count": {},
+                    "scope_group_count_after_cap_by_logical_slot_count": {},
+                    "scope_group_count_discarded_by_cap_by_logical_slot_count": {},
+                    "general_group_count_before_cap_by_logical_slot_count": {},
+                    "general_group_count_after_cap_by_logical_slot_count": {},
+                    "general_group_count_discarded_by_cap_by_logical_slot_count": {},
+                }
                 product_profiles = []
                 guard_rejections = []
                 affine_rejections = []
@@ -885,8 +1192,29 @@ def solve_variable_shape_delta(
             profile_counts = collections.Counter(
                 len(profile.slots) for profile in product_profiles
             )
+            scope_group_counts = (
+                collections.Counter(
+                    len(group)
+                    for group in groups
+                    if _group_matches_scope(group, group_scope)
+                )
+                if scoped_mode
+                else collections.Counter()
+            )
+            scope_profile_counts = (
+                collections.Counter(
+                    len(profile.slots)
+                    for profile in product_profiles
+                    if _slots_match_scope(profile.slots, group_scope)
+                )
+                if scoped_mode
+                else collections.Counter()
+            )
             decision.update(
                 {
+                    "group_scope_status": (
+                        "evaluated" if scoped_mode else "not_applicable"
+                    ),
                     "slot_count": len(slots),
                     "affine_slot_count": len(affine_profiles),
                     "maximum_compatible_logical_slot_count": max(
@@ -901,6 +1229,15 @@ def solve_variable_shape_delta(
                     "product_profile_count_by_logical_slot_count": {
                         str(key): value for key, value in sorted(profile_counts.items())
                     },
+                    "scope_matching_group_count_by_logical_slot_count": {
+                        str(key): value
+                        for key, value in sorted(scope_group_counts.items())
+                    },
+                    "scope_matching_product_profile_count_by_logical_slot_count": {
+                        str(key): value
+                        for key, value in sorted(scope_profile_counts.items())
+                    },
+                    **group_scope_inventory,
                     "slot_rejections": guard_rejections + affine_rejections,
                     "group_rejections": product_rejections,
                 }
@@ -927,10 +1264,41 @@ def solve_variable_shape_delta(
                         rejection_counts=candidate_rejections,
                     )
                 )
-            candidates.sort(key=lambda item: _candidate_key(item, parent_uuid))
-            candidates = _diverse_candidate_attempts(candidates)
             counters["static_solved_candidates"] += len(candidates)
             decision["static_solved_candidate_count"] = len(candidates)
+            scope_candidate_count = (
+                sum(
+                    _slots_match_scope(candidate.profile.slots, group_scope)
+                    for candidate in candidates
+                )
+                if scoped_mode
+                else 0
+            )
+            decision["scope_matching_static_solved_candidate_count"] = (
+                scope_candidate_count
+            )
+            (
+                candidates,
+                preferred_attempt_lane,
+                attempt_plan_evidence,
+            ) = _ordered_candidate_attempts(
+                candidates,
+                parent_uuid=parent_uuid,
+                group_scope=group_scope,
+            )
+            decision["bounded_candidate_attempt_count"] = len(candidates)
+            decision["preferred_attempt_lane"] = preferred_attempt_lane
+            decision["attempt_plan_evidence"] = attempt_plan_evidence
+            decision["scope_candidate_attempt_count"] = sum(
+                scoped_mode
+                and _slots_match_scope(candidate.profile.slots, group_scope)
+                for candidate in candidates
+            )
+            decision["general_fallback_candidate_attempt_count"] = sum(
+                scoped_mode
+                and not _slots_match_scope(candidate.profile.slots, group_scope)
+                for candidate in candidates
+            )
             decision["candidate_rejection_counts"] = dict(
                 sorted(candidate_rejections.items())
             )
@@ -943,8 +1311,20 @@ def solve_variable_shape_delta(
                 continue
 
             parent_sections = _section_hashes(ast.parse(parent_code), entry_point)
-            for candidate in candidates[:MAX_CHILD_FAKE_ATTEMPTS]:
+            for attempt_index, candidate in enumerate(candidates):
                 attempt = _candidate_manifest(parent_uuid, candidate)
+                attempt_scope_match = (
+                    _slots_match_scope(candidate.profile.slots, group_scope)
+                    if scoped_mode
+                    else None
+                )
+                attempt["attempt_index"] = attempt_index
+                attempt_lane = (
+                    "scope"
+                    if attempt_scope_match
+                    else ("general" if scoped_mode else "generic")
+                )
+                attempt["attempt_lane"] = attempt_lane
                 try:
                     child_sections = _section_hashes(
                         ast.parse(candidate.child_code), entry_point
@@ -976,6 +1356,33 @@ def solve_variable_shape_delta(
                     child_uuid = str(_nested(child, "extra_info.uuid"))
                     attempt["accepted"] = True
                     solver_evidence = _candidate_manifest(parent_uuid, candidate)
+                    selected_scope_match = attempt_scope_match
+                    used_group_scope_fallback = bool(
+                        scoped_mode
+                        and not selected_scope_match
+                        and (
+                            preferred_attempt_lane == "scope"
+                            or scope_candidate_count == 0
+                        )
+                    )
+                    group_scope_fallback_reason = None
+                    if used_group_scope_fallback:
+                        if not scope_group_counts:
+                            group_scope_fallback_reason = (
+                                "no_compatible_scope_group"
+                            )
+                        elif not scope_profile_counts:
+                            group_scope_fallback_reason = (
+                                "no_exact_scope_product_profile"
+                            )
+                        elif scope_candidate_count == 0:
+                            group_scope_fallback_reason = (
+                                "no_scope_static_solution"
+                            )
+                        else:
+                            group_scope_fallback_reason = (
+                                "scope_candidate_attempts_exhausted"
+                            )
                     children.append(child)
                     paired.extend((copy.deepcopy(parent), child))
                     decision.update(
@@ -994,6 +1401,24 @@ def solve_variable_shape_delta(
                             "fake_gate": fake.as_dict(),
                             "selected_logical_slot_count": len(
                                 candidate.profile.slots
+                            ),
+                            "selected_group_scope_match": selected_scope_match,
+                            "selected_candidate_attempt_index": attempt_index,
+                            "used_group_scope_fallback": used_group_scope_fallback,
+                            "used_preferred_attempt_lane_fallback": (
+                                preferred_attempt_lane not in {"generic", attempt_lane}
+                            ),
+                            "group_scope_fallback_reason": (
+                                group_scope_fallback_reason
+                            ),
+                            "preferred_attempt_lane_fallback_reason": (
+                                None
+                                if preferred_attempt_lane in {"generic", attempt_lane}
+                                else (
+                                    "scope_candidate_attempts_exhausted"
+                                    if preferred_attempt_lane == "scope"
+                                    else "general_candidate_attempts_exhausted"
+                                )
                             ),
                             "used_smaller_compatible_group_fallback": (
                                 len(candidate.profile.slots)
@@ -1027,6 +1452,12 @@ def solve_variable_shape_delta(
                         }
                     )
                     counters[f"accepted_{variant}"] += 1
+                    accepted_lane = (
+                        "generic"
+                        if not scoped_mode
+                        else ("scope_match" if selected_scope_match else "general")
+                    )
+                    counters[f"accepted_{accepted_lane}"] += 1
                     counters[
                         f"accepted_logical_slot_count_{len(candidate.profile.slots)}"
                     ] += 1
@@ -1098,8 +1529,8 @@ def solve_variable_shape_delta(
         counters["paired_rows_written"] = len(paired)
         target_map_sha256 = _logical_target_map_sha256(target_map_records)
         manifest = {
-            "contract_version": CONTRACT_VERSION,
-            "generator_version": GENERATOR_VERSION,
+            "contract_version": solver_contract_version,
+            "generator_version": generator_version,
             "solver_source_path": str(Path(__file__).resolve()),
             "solver_source_sha256": _sha256_file(Path(__file__)),
             "v3_helper_source_path": str(
@@ -1159,13 +1590,79 @@ def solve_variable_shape_delta(
             },
             "group_contract": {
                 "logical_slot_count_range": [MIN_GROUP_SLOTS, MAX_GROUP_SLOTS],
-                "preference": "largest supported structural group first",
+                "preference": (
+                    "scope match first, then largest supported structural group"
+                    if group_scope
+                    == NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                    else (
+                        "preserve scope groups with at least three slots; prefer a "
+                        "two-slot scope group only when general batch-like growth dominates"
+                        if group_scope
+                        == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                        else "largest supported structural group first"
+                    )
+                ),
                 "factory_set": "same non-empty set for every slot",
                 "per_factory": "every slot occurs once on a distinct axis",
                 "patch_spans": "pairwise disjoint",
                 "module_scope_linked_names": "allowed after shape-only load proof",
                 "storage_model": "exact constant + coefficient * product(values)",
                 "slot_values": "all strictly greater than parent values",
+            },
+            "scope_selection_contract": {
+                "mode": group_scope,
+                "scope_definition": (
+                    "all occurrences of every selected slot have axis > 0 and no "
+                    "selected linked-name slot is an explicit batch symbol"
+                    if group_scope != GENERIC_GROUP_SCOPE
+                    else None
+                ),
+                "balanced_two_slot_scope_preference": (
+                    "prefer scope when the best general candidate has a leading-axis "
+                    "or explicit-batch slot tied for maximum logical log growth"
+                    if group_scope
+                    == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                    else None
+                ),
+                "explicit_batch_symbols": sorted(EXPLICIT_BATCH_SYMBOLS),
+                "group_retention": (
+                    "scope groups precede a reserved general lane before the "
+                    "per-cardinality cap; unused scope capacity is filled by general "
+                    "groups"
+                    if group_scope != GENERIC_GROUP_SCOPE
+                    else "deterministic hash order before the per-cardinality cap"
+                ),
+                "maximum_groups_per_cardinality": MAX_GROUPS_PER_SIZE,
+                "minimum_general_groups_per_cardinality_when_available": (
+                    MIN_GENERAL_GROUPS_PER_SIZE if scoped_mode else None
+                ),
+                "maximum_child_attempts_per_parent": MAX_CHILD_FAKE_ATTEMPTS,
+                "maximum_preferred_lane_attempts_when_both_lanes_exist": (
+                    MAX_SCOPE_CHILD_FAKE_ATTEMPTS if scoped_mode else None
+                ),
+                "reserved_secondary_lane_attempts_when_both_lanes_exist": (
+                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS
+                    if scoped_mode
+                    else None
+                ),
+                "one_child_per_parent": True,
+                "attempt_plan_evidence_fields": [
+                    "preference_reason",
+                    "scope_candidate_count_before_bound",
+                    "general_candidate_count_before_bound",
+                    "maximum_scope_logical_slot_count",
+                    "best_general_batch_like_growth_dominates",
+                ],
+                "fallback_reason_values": (
+                    [
+                        "no_compatible_scope_group",
+                        "no_exact_scope_product_profile",
+                        "no_scope_static_solution",
+                        "scope_candidate_attempts_exhausted",
+                    ]
+                    if scoped_mode
+                    else []
+                ),
             },
             "distribution_contract": {
                 "dimension_occurrence": "one changed direct input-factory axis",
@@ -1189,6 +1686,12 @@ def solve_variable_shape_delta(
                 "scope": "this unmerged solver invocation only",
             },
             "candidate_ranking_contract": [
+                *(
+                    ["contract-selected preferred lane before bounded secondary lane"]
+                    if group_scope
+                    != GENERIC_GROUP_SCOPE
+                    else []
+                ),
                 "larger_logical_slot_count",
                 "smaller_target_error_0.1_percent_bucket",
                 "fewer_occurrence_weighted_soft_preference_mismatches",
@@ -1209,6 +1712,14 @@ def solve_variable_shape_delta(
                 "parent_and_child_required": True,
                 "timeout_seconds_per_invocation": fake_gate_timeout_seconds,
                 "maximum_child_attempts_per_parent": MAX_CHILD_FAKE_ATTEMPTS,
+                "preferred_lane_attempt_limit_when_both_lanes_exist": (
+                    MAX_SCOPE_CHILD_FAKE_ATTEMPTS if scoped_mode else None
+                ),
+                "secondary_lane_attempt_reservation_when_both_lanes_exist": (
+                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS
+                    if scoped_mode
+                    else None
+                ),
             },
             "selected_source": str(selected_path.resolve()),
             "selected_source_sha256": _sha256_file(selected_path),
@@ -1270,6 +1781,16 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        "--group-scope",
+        choices=GROUP_SCOPE_CHOICES,
+        default=GENERIC_GROUP_SCOPE,
+        help=(
+            "candidate group preference; scoped modes retain non-leading, "
+            "non-explicit-batch groups before truncation, and the balanced mode "
+            "preserves multi-slot coverage unless batch-like growth dominates"
+        ),
+    )
     return parser
 
 
@@ -1280,6 +1801,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         args.run_dir,
         max_parents=args.max_parents,
         fake_gate_timeout_seconds=args.fake_gate_timeout_seconds,
+        group_scope=args.group_scope,
     )
     print(
         json.dumps(

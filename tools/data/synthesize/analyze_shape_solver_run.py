@@ -45,7 +45,7 @@ from tools.data.synthesize.solve_shape_coverage import _shape_slots
 
 DEFAULT_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_random_targets_v3/run.1000"
 DEFAULT_AI_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000"
-SCHEMA_VERSION = "shape-solver-analysis-v5"
+SCHEMA_VERSION = "shape-solver-analysis-v6"
 REFERENCE_CONTRACT_VERSION = "kernelgym-reference-self-train-mode-v3"
 REGION_CONTRACT_VERSION = "shape_changed_region_liveness_v3"
 PERTURBATION_CONTRACT_VERSION = "seeded_bounded_non_affine_mix_v1"
@@ -58,6 +58,9 @@ LEGACY_REGION_CONTRACT_VERSION = "shape_changed_region_liveness_v1"
 MIB = 1024**2
 DIMENSION_ANCHORS = frozenset({64, 128, 256, 512, 1024, 2048, 4096})
 CAPACITY_ANCHORS = frozenset(value * MIB for value in DIMENSION_ANCHORS)
+EXPLICIT_BATCH_SYMBOLS = frozenset(
+    {"batch_size", "batchsize", "batch", "bs", "n_batch"}
+)
 MAX_REVIEW_ACCEPTED = 20
 MAX_REVIEW_FAILURES = 12
 POWER_OF_TWO_MIN_NUMERATOR = 3
@@ -76,6 +79,30 @@ STATIC_MANIFEST_ARTIFACTS = {
     "review": Path("analysis/review_samples.md"),
 }
 
+VARIABLE_SOLVER_MANIFEST_CONTRACTS = {
+    "shape_variable_multislot_solver_v5": {
+        "generator_version": "same_factory_product_variable_2_to_5_soft_p2_50_v3",
+        "scope_mode": "generic",
+        "scope_contract_required": False,
+    },
+    "shape_variable_multislot_solver_v6": {
+        "generator_version": (
+            "same_factory_product_variable_2_to_5_"
+            "nonleading_no_explicit_batch_soft_p2_50_v1"
+        ),
+        "scope_mode": "nonleading_no_explicit_batch",
+        "scope_contract_required": True,
+    },
+    "shape_variable_multislot_solver_v7": {
+        "generator_version": (
+            "same_factory_product_variable_2_to_5_"
+            "balanced_nonleading_soft_p2_50_v1"
+        ),
+        "scope_mode": "balanced_nonleading_no_explicit_batch",
+        "scope_contract_required": True,
+    },
+}
+
 
 def _nested(value: Any, path: str, default: Any = None) -> Any:
     current = value
@@ -84,6 +111,377 @@ def _nested(value: Any, path: str, default: Any = None) -> Any:
             return default
         current = current[part]
     return current
+
+
+def _validate_variable_solver_manifest_contract(
+    manifest: Mapping[str, Any],
+) -> None:
+    """Fail closed when a variable-solver version is paired with another mode."""
+
+    contract_version = manifest.get("contract_version")
+    expected = VARIABLE_SOLVER_MANIFEST_CONTRACTS.get(contract_version)
+    if expected is None:
+        return
+    generator_version = manifest.get("generator_version")
+    if generator_version != expected["generator_version"]:
+        raise ValueError(
+            "variable_solver_manifest_generator_mismatch:"
+            f"{contract_version}:{generator_version!r}:"
+            f"expected={expected['generator_version']!r}"
+        )
+    scope_contract = manifest.get("scope_selection_contract")
+    if scope_contract is None and not expected["scope_contract_required"]:
+        # Historical v5 manifests predate scope selection.  Do not require or
+        # synthesize scope semantics for them.
+        return
+    if not isinstance(scope_contract, Mapping):
+        raise ValueError(
+            f"{contract_version} requires scope_selection_contract"
+        )
+    scope_mode = scope_contract.get("mode")
+    if scope_mode != expected["scope_mode"]:
+        raise ValueError(
+            "variable_solver_manifest_scope_mode_mismatch:"
+            f"{contract_version}:{scope_mode!r}:"
+            f"expected={expected['scope_mode']!r}"
+        )
+
+
+def _validate_scoped_decision_evidence(
+    manifest: Mapping[str, Any],
+    decisions: Sequence[Any],
+) -> None:
+    """Validate the bounded scope/general lane contract recorded by v6/v7."""
+
+    contract_version = manifest.get("contract_version")
+    if contract_version not in {
+        "shape_variable_multislot_solver_v6",
+        "shape_variable_multislot_solver_v7",
+    }:
+        return
+    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version][
+        "scope_mode"
+    ]
+    scope_contract = manifest["scope_selection_contract"]
+    expected_contract_fields = {
+        "maximum_groups_per_cardinality": 12,
+        "minimum_general_groups_per_cardinality_when_available": 4,
+        "maximum_child_attempts_per_parent": 6,
+        "maximum_preferred_lane_attempts_when_both_lanes_exist": 4,
+        "reserved_secondary_lane_attempts_when_both_lanes_exist": 2,
+        "one_child_per_parent": True,
+    }
+    for field, expected_value in expected_contract_fields.items():
+        observed = scope_contract.get(field)
+        if observed != expected_value:
+            raise ValueError(
+                f"scoped_solver_contract_field_mismatch:{field}:"
+                f"{observed!r}:expected={expected_value!r}"
+            )
+    allowed_fallback_reasons = set(scope_contract.get("fallback_reason_values", []))
+    inventory_fields = (
+        "scope_group_count_before_cap_by_logical_slot_count",
+        "scope_group_count_after_cap_by_logical_slot_count",
+        "scope_group_count_discarded_by_cap_by_logical_slot_count",
+        "general_group_count_before_cap_by_logical_slot_count",
+        "general_group_count_after_cap_by_logical_slot_count",
+        "general_group_count_discarded_by_cap_by_logical_slot_count",
+    )
+
+    def nonnegative_int(value: Any, *, field: str, identity: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"invalid_scoped_decision_count:{identity}:{field}:{value!r}"
+            )
+        return value
+
+    for decision_index, decision in enumerate(decisions):
+        if not isinstance(decision, Mapping):
+            raise ValueError(f"decision_must_be_an_object:{decision_index}")
+        identity = str(decision.get("parent_uuid", decision_index))
+        if decision.get("group_scope_mode") != expected_scope:
+            raise ValueError(f"decision_scope_mode_mismatch:{identity}")
+        attempts = decision.get("attempts")
+        if not isinstance(attempts, list):
+            raise ValueError(f"decision_attempts_must_be_a_list:{identity}")
+        if decision.get("group_scope_status") == "evaluated":
+            for field in inventory_fields:
+                if not isinstance(decision.get(field), Mapping):
+                    raise ValueError(
+                        f"scoped_decision_inventory_missing:{identity}:{field}"
+                    )
+            inventory = {field: decision[field] for field in inventory_fields}
+            cardinalities = set().union(
+                *(set(values) for values in inventory.values())
+            )
+            for cardinality in cardinalities:
+                values = {
+                    field: nonnegative_int(
+                        inventory[field].get(cardinality, 0),
+                        field=f"{field}:{cardinality}",
+                        identity=identity,
+                    )
+                    for field in inventory_fields
+                }
+                scope_before = values[inventory_fields[0]]
+                scope_after = values[inventory_fields[1]]
+                scope_discarded = values[inventory_fields[2]]
+                general_before = values[inventory_fields[3]]
+                general_after = values[inventory_fields[4]]
+                general_discarded = values[inventory_fields[5]]
+                reserved_general = min(4, general_before)
+                expected_scope_after = min(scope_before, 12 - reserved_general)
+                expected_general_after = min(
+                    general_before, 12 - expected_scope_after
+                )
+                if (
+                    scope_before != scope_after + scope_discarded
+                    or general_before != general_after + general_discarded
+                    or scope_after != expected_scope_after
+                    or general_after != expected_general_after
+                    or scope_after + general_after > 12
+                ):
+                    raise ValueError(
+                        f"scoped_group_cap_arithmetic_mismatch:{identity}:"
+                        f"{cardinality}"
+                    )
+        if "bounded_candidate_attempt_count" not in decision:
+            if attempts:
+                raise ValueError(f"attempts_without_bounded_count:{identity}")
+            continue
+
+        bounded = nonnegative_int(
+            decision.get("bounded_candidate_attempt_count"),
+            field="bounded_candidate_attempt_count",
+            identity=identity,
+        )
+        scope_count = nonnegative_int(
+            decision.get("scope_candidate_attempt_count"),
+            field="scope_candidate_attempt_count",
+            identity=identity,
+        )
+        general_count = nonnegative_int(
+            decision.get("general_fallback_candidate_attempt_count"),
+            field="general_fallback_candidate_attempt_count",
+            identity=identity,
+        )
+        if bounded != scope_count + general_count or bounded > 6:
+            raise ValueError(f"bounded_attempt_lane_count_mismatch:{identity}")
+        preferred_lane = decision.get("preferred_attempt_lane")
+        if preferred_lane not in {"scope", "general"}:
+            raise ValueError(f"invalid_preferred_attempt_lane:{identity}")
+        plan_evidence = decision.get("attempt_plan_evidence")
+        if not isinstance(plan_evidence, Mapping):
+            raise ValueError(f"attempt_plan_evidence_missing:{identity}")
+        raw_scope_count = nonnegative_int(
+            plan_evidence.get("scope_candidate_count_before_bound"),
+            field="scope_candidate_count_before_bound",
+            identity=identity,
+        )
+        raw_general_count = nonnegative_int(
+            plan_evidence.get("general_candidate_count_before_bound"),
+            field="general_candidate_count_before_bound",
+            identity=identity,
+        )
+        if raw_scope_count != decision.get(
+            "scope_matching_static_solved_candidate_count"
+        ) or raw_scope_count + raw_general_count != decision.get(
+            "static_solved_candidate_count"
+        ):
+            raise ValueError(f"attempt_plan_raw_count_mismatch:{identity}")
+        maximum_scope_size = plan_evidence.get(
+            "maximum_scope_logical_slot_count"
+        )
+        general_growth_dominates = plan_evidence.get(
+            "best_general_batch_like_growth_dominates"
+        )
+        preference_reason = plan_evidence.get("preference_reason")
+        if raw_scope_count == 0:
+            expected_preferred_lane = "general"
+            expected_preference_reason = "no_scope_static_candidate"
+            if maximum_scope_size is not None:
+                raise ValueError(f"unexpected_maximum_scope_size:{identity}")
+        elif raw_general_count == 0:
+            expected_preferred_lane = "scope"
+            expected_preference_reason = "no_general_static_candidate"
+            if not isinstance(maximum_scope_size, int) or maximum_scope_size < 2:
+                raise ValueError(f"invalid_maximum_scope_size:{identity}")
+            if general_growth_dominates is not None:
+                raise ValueError(f"unexpected_general_growth_evidence:{identity}")
+        else:
+            if not isinstance(maximum_scope_size, int) or maximum_scope_size < 2:
+                raise ValueError(f"invalid_maximum_scope_size:{identity}")
+            if not isinstance(general_growth_dominates, bool):
+                raise ValueError(f"general_growth_evidence_missing:{identity}")
+            if contract_version == "shape_variable_multislot_solver_v6":
+                expected_preferred_lane = "scope"
+                expected_preference_reason = "strict_scope_preference"
+            elif maximum_scope_size >= 3:
+                expected_preferred_lane = "scope"
+                expected_preference_reason = "scope_cardinality_at_least_three"
+            elif general_growth_dominates:
+                expected_preferred_lane = "scope"
+                expected_preference_reason = (
+                    "best_general_batch_like_growth_dominates"
+                )
+            else:
+                expected_preferred_lane = "general"
+                expected_preference_reason = "balanced_general_preference"
+        if (
+            preferred_lane != expected_preferred_lane
+            or preference_reason != expected_preference_reason
+        ):
+            raise ValueError(f"attempt_plan_preference_mismatch:{identity}")
+        if raw_scope_count == 0 or raw_general_count == 0:
+            expected_scope_count = min(raw_scope_count, 6)
+            expected_general_count = min(raw_general_count, 6)
+        else:
+            raw_preferred_count = (
+                raw_scope_count
+                if preferred_lane == "scope"
+                else raw_general_count
+            )
+            raw_secondary_count = (
+                raw_general_count
+                if preferred_lane == "scope"
+                else raw_scope_count
+            )
+            planned_preferred_count = min(raw_preferred_count, 4)
+            planned_secondary_count = min(raw_secondary_count, 2)
+            remaining = 6 - planned_preferred_count - planned_secondary_count
+            planned_secondary_count += min(
+                raw_secondary_count - planned_secondary_count, remaining
+            )
+            if preferred_lane == "scope":
+                expected_scope_count = planned_preferred_count
+                expected_general_count = planned_secondary_count
+            else:
+                expected_scope_count = planned_secondary_count
+                expected_general_count = planned_preferred_count
+        if (
+            scope_count != expected_scope_count
+            or general_count != expected_general_count
+        ):
+            raise ValueError(f"bounded_attempt_plan_mismatch:{identity}")
+        if scope_count and general_count:
+            preferred_count = (
+                scope_count if preferred_lane == "scope" else general_count
+            )
+            if preferred_count > 4:
+                raise ValueError(f"preferred_attempt_lane_exceeds_limit:{identity}")
+
+        attempted_lanes: list[str] = []
+        accepted_attempts: list[Mapping[str, Any]] = []
+        for attempt_index, attempt in enumerate(attempts):
+            if not isinstance(attempt, Mapping):
+                raise ValueError(f"attempt_must_be_an_object:{identity}")
+            if attempt.get("attempt_index") != attempt_index:
+                raise ValueError(f"attempt_index_mismatch:{identity}")
+            scope_match = _nested(
+                attempt, "group_scope.matches_nonleading_no_explicit_batch"
+            )
+            if not isinstance(scope_match, bool):
+                raise ValueError(f"attempt_scope_evidence_missing:{identity}")
+            expected_lane = "scope" if scope_match else "general"
+            if attempt.get("attempt_lane") != expected_lane:
+                raise ValueError(f"attempt_lane_evidence_mismatch:{identity}")
+            attempted_lanes.append(expected_lane)
+            if attempt.get("accepted") is True:
+                accepted_attempts.append(attempt)
+        preferred_count = (
+            scope_count if preferred_lane == "scope" else general_count
+        )
+        secondary_lane = "general" if preferred_lane == "scope" else "scope"
+        secondary_count = (
+            general_count if preferred_lane == "scope" else scope_count
+        )
+        planned_lanes = [preferred_lane] * preferred_count + [
+            secondary_lane
+        ] * secondary_count
+        if attempted_lanes != planned_lanes[: len(attempted_lanes)]:
+            raise ValueError(f"attempt_lane_order_mismatch:{identity}")
+        if len(attempts) > bounded:
+            raise ValueError(f"attempt_count_exceeds_bound:{identity}")
+        if decision.get("accepted") is True:
+            if len(accepted_attempts) != 1:
+                raise ValueError(f"accepted_decision_attempt_count_mismatch:{identity}")
+            accepted_attempt = accepted_attempts[0]
+            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get(
+                "attempt_index"
+            ):
+                raise ValueError(f"selected_attempt_index_mismatch:{identity}")
+            selected_scope = _nested(
+                accepted_attempt,
+                "group_scope.matches_nonleading_no_explicit_batch",
+            )
+            if decision.get("selected_group_scope_match") != selected_scope:
+                raise ValueError(f"selected_scope_evidence_mismatch:{identity}")
+            used_fallback = decision.get("used_group_scope_fallback")
+            fallback_reason = decision.get("group_scope_fallback_reason")
+            expected_fallback = bool(
+                not selected_scope
+                and (preferred_lane == "scope" or raw_scope_count == 0)
+            )
+            expected_fallback_reason = None
+            if expected_fallback:
+                scope_group_count = sum(
+                    int(value)
+                    for value in decision[
+                        "scope_matching_group_count_by_logical_slot_count"
+                    ].values()
+                )
+                scope_profile_count = sum(
+                    int(value)
+                    for value in decision[
+                        "scope_matching_product_profile_count_by_logical_slot_count"
+                    ].values()
+                )
+                if scope_group_count == 0:
+                    expected_fallback_reason = "no_compatible_scope_group"
+                elif scope_profile_count == 0:
+                    expected_fallback_reason = "no_exact_scope_product_profile"
+                elif raw_scope_count == 0:
+                    expected_fallback_reason = "no_scope_static_solution"
+                else:
+                    expected_fallback_reason = (
+                        "scope_candidate_attempts_exhausted"
+                    )
+            if used_fallback is not expected_fallback:
+                raise ValueError(f"invalid_group_scope_fallback_flag:{identity}")
+            if (
+                fallback_reason != expected_fallback_reason
+                or (
+                    fallback_reason is not None
+                    and fallback_reason not in allowed_fallback_reasons
+                )
+            ):
+                raise ValueError(f"invalid_group_scope_fallback_reason:{identity}")
+            selected_lane = "scope" if selected_scope else "general"
+            expected_preferred_fallback = selected_lane != preferred_lane
+            expected_preferred_reason = (
+                None
+                if not expected_preferred_fallback
+                else (
+                    "scope_candidate_attempts_exhausted"
+                    if preferred_lane == "scope"
+                    else "general_candidate_attempts_exhausted"
+                )
+            )
+            if decision.get(
+                "used_preferred_attempt_lane_fallback"
+            ) is not expected_preferred_fallback or decision.get(
+                "preferred_attempt_lane_fallback_reason"
+            ) != expected_preferred_reason:
+                raise ValueError(f"invalid_preferred_lane_fallback:{identity}")
+        elif accepted_attempts:
+            raise ValueError(f"rejected_decision_has_accepted_attempt:{identity}")
+
+
+def _is_explicit_batch_symbol(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in EXPLICIT_BATCH_SYMBOLS
+    )
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -498,13 +896,23 @@ def _logical_slot_count_range(
 
     contract = manifest.get("group_contract")
     if contract is None:
-        if manifest.get("contract_version") == "shape_variable_multislot_solver_v5":
-            raise ValueError(
-                "shape_variable_multislot_solver_v5 requires group_contract"
-            )
+        if manifest.get("contract_version") in {
+            "shape_variable_multislot_solver_v5",
+            "shape_variable_multislot_solver_v6",
+            "shape_variable_multislot_solver_v7",
+        }:
+            raise ValueError("variable multislot solver requires group_contract")
         return None
     if not isinstance(contract, Mapping):
         raise ValueError("group_contract_must_be_an_object")
+    if (
+        manifest.get("contract_version") in {
+            "shape_variable_multislot_solver_v6",
+            "shape_variable_multislot_solver_v7",
+        }
+        and not isinstance(manifest.get("scope_selection_contract"), Mapping)
+    ):
+        raise ValueError("scoped variable multislot solver requires scope_selection_contract")
     raw = contract.get("logical_slot_count_range")
     if (
         not isinstance(raw, list)
@@ -1405,6 +1813,14 @@ def _decision_failure_category(decision: Mapping[str, Any]) -> str:
             if isinstance(profile_counts, Mapping)
             else 0
         )
+        rejection_counts = decision.get("candidate_rejection_counts", {})
+        if (
+            profile_count > 0
+            and isinstance(rejection_counts, Mapping)
+            and set(rejection_counts)
+            == {"ValueError:dimension_balance_guard_rejected"}
+        ):
+            return "all_numeric_candidates_rejected_by_dimension_balance_guard"
         return (
             "no_exact_product_profile"
             if profile_count == 0
@@ -2382,6 +2798,17 @@ def _runtime_eligible_bias_profile(
         for decision in eligible_decisions
     )
     leading_occurrences = sum(bool(row["leading"]) for row in eligible_rows)
+    children_with_explicit_batch = sum(
+        any(
+            _is_explicit_batch_symbol(row.get("symbol_name"))
+            for row in rows_by_child[str(decision["child_uuid"])]
+        )
+        for decision in eligible_decisions
+    )
+    explicit_batch_occurrences = sum(
+        _is_explicit_batch_symbol(row.get("symbol_name"))
+        for row in eligible_rows
+    )
     axis_counts = collections.Counter(int(row["axis"]) for row in eligible_rows)
     axis_from_right_counts = collections.Counter(
         int(row["axis_from_right"]) for row in eligible_rows
@@ -2459,6 +2886,12 @@ def _runtime_eligible_bias_profile(
             ),
             "leading_occurrence_fraction": _fraction(
                 leading_occurrences, len(eligible_rows)
+            ),
+            "children_with_explicit_batch_fraction": _fraction(
+                children_with_explicit_batch, len(eligible_decisions)
+            ),
+            "explicit_batch_occurrence_fraction": _fraction(
+                explicit_batch_occurrences, len(eligible_rows)
             ),
             "axis_counts": _counter(axis_counts),
             "axis_from_right_counts": _counter(axis_from_right_counts),
@@ -3108,6 +3541,8 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
             f"| One axis-from-right per child | {position['single_axis_from_right_child_fraction']:.2%} |",
             f"| Children touching a leading axis | {position['children_with_leading_fraction']:.2%} |",
             f"| Leading occurrence fraction | {position['leading_occurrence_fraction']:.2%} |",
+            f"| Children touching an explicit batch symbol | {position['children_with_explicit_batch_fraction']:.2%} |",
+            f"| Explicit batch occurrence fraction | {position['explicit_batch_occurrence_fraction']:.2%} |",
             f"| Dominant axis-from-right fraction | {position['dominant_axis_from_right_fraction']:.2%} |",
             "",
             f"Slot kinds: `{json.dumps(bias['slot_kind_counts'], sort_keys=True)}`",
@@ -3179,6 +3614,7 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
                 f"| Multiple-of-8 fraction | {_format_percent(values['multiple_fractions']['8'])} | {_format_percent(eligible_values['multiple_fractions']['8'])} |",
                 f"| Multiple-of-32 fraction | {_format_percent(values['multiple_fractions']['32'])} | {_format_percent(eligible_values['multiple_fractions']['32'])} |",
                 f"| Leading occurrence fraction | {_format_percent(position['leading_occurrence_fraction'])} | {_format_percent(eligible_position['leading_occurrence_fraction'])} |",
+                f"| Explicit batch occurrence fraction | {_format_percent(position['explicit_batch_occurrence_fraction'])} | {_format_percent(eligible_position['explicit_batch_occurrence_fraction'])} |",
                 f"| Dominant axis-from-right fraction | {_format_percent(position['dominant_axis_from_right_fraction'])} | {_format_percent(eligible_position['dominant_axis_from_right_fraction'])} |",
                 "",
                 "Eligible axis-from-right distribution:",
@@ -3501,10 +3937,14 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
     target_rows = pq.read_table(targets_path).to_pylist()
     child_rows = pq.read_table(children_path).to_pylist()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise ValueError("solver manifest must be an object")
+    _validate_variable_solver_manifest_contract(manifest)
     _verify_static_manifest_artifacts(run_dir, manifest)
     decisions = manifest.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError("solver manifest decisions must be a list")
+    _validate_scoped_decision_evidence(manifest, decisions)
     dimension_balance_ratio_limit = _dimension_balance_ratio_limit(manifest)
     required_logical_slots = _required_logical_slot_count(manifest)
     logical_slot_range = _logical_slot_count_range(manifest)
@@ -3577,6 +4017,8 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
     unique_axes_per_child: list[int] = []
     children_with_leading = 0
     leading_occurrences = 0
+    children_with_explicit_batch = 0
+    explicit_batch_occurrences = 0
     axis_from_right_counts: collections.Counter[int] = collections.Counter()
     slot_kind_counts: collections.Counter[str] = collections.Counter()
     dimension_balance_audits: list[dict[str, Any]] = []
@@ -3691,13 +4133,22 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         unique_axes_per_child.append(len(axis_set))
         if any(int(occurrence["axis"]) == 0 for occurrence in annotated_changes):
             children_with_leading += 1
+        if any(
+            _is_explicit_batch_symbol(edit["slot"].get("symbol_name"))
+            for edit in edits
+        ):
+            children_with_explicit_batch += 1
         for edit in edits:
             slot_kind_counts[str(edit["slot"].get("kind"))] += 1
         for occurrence_index, occurrence in enumerate(annotated_changes):
             slot = occurrence["slot"]
             declared_occurrence = occurrence["declared_occurrence"]
             leading = int(occurrence["axis"]) == 0
+            explicit_batch_symbol = _is_explicit_batch_symbol(
+                slot.get("symbol_name")
+            )
             leading_occurrences += int(leading)
+            explicit_batch_occurrences += int(explicit_batch_symbol)
             axis_from_right_counts[int(occurrence["axis_from_right"])] += 1
             new_values.append(int(occurrence["new_value"]))
             changed_rows.append(
@@ -3722,6 +4173,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
                     "rank": occurrence["rank"],
                     "axis_from_right": occurrence["axis_from_right"],
                     "leading": leading,
+                    "explicit_batch_symbol": explicit_batch_symbol,
                     "source_span": json.dumps(
                         declared_occurrence.get("source_span"), sort_keys=True
                     ),
@@ -3995,6 +4447,10 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
                 "shared slots contribute once per actual factory occurrence"
             ),
             "leading": "axis index zero within its input factory",
+            "explicit_batch_symbol": (
+                "selected linked-name slot normalized to one of: "
+                + ", ".join(sorted(EXPLICIT_BATCH_SYMBOLS))
+            ),
             "one_axis": "one unique axis-from-right value among a child's changed occurrences",
         },
         "changed_dimensions": _value_profile(new_values, len(accepted)),
@@ -4021,6 +4477,12 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             ) or 0.0,
             "children_with_leading_fraction": _fraction(children_with_leading, len(accepted)) or 0.0,
             "leading_occurrence_fraction": _fraction(leading_occurrences, len(new_values)) or 0.0,
+            "children_with_explicit_batch_fraction": _fraction(
+                children_with_explicit_batch, len(accepted)
+            ) or 0.0,
+            "explicit_batch_occurrence_fraction": _fraction(
+                explicit_batch_occurrences, len(new_values)
+            ) or 0.0,
             "axis_from_right_counts": _counter(axis_from_right_counts),
             "dominant_axis_from_right_fraction": _fraction(dominant_axis_count, len(new_values)) or 0.0,
         },
@@ -4060,7 +4522,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         "slot_index", "slot_occurrence_index", "slot_id", "slot_kind", "symbol_name",
         "symbol_scope", "old_value", "new_value", "occurrence_index", "factory_index",
         "factory_name", "axis", "rank", "axis_from_right",
-        "leading", "source_span", "input_bytes_before", "input_bytes_after", "input_scale",
+        "leading", "explicit_batch_symbol", "source_span", "input_bytes_before", "input_bytes_after", "input_scale",
         "target_input_bytes", "target_delta_bytes", "target_relative_error",
     ]
     buffer = io.StringIO()

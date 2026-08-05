@@ -77,6 +77,30 @@ MAX_DEVICE_MEMORY_GIB = 64.0
 _DRIVER_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _ACTIVE_WORKER_PROCESS: subprocess.Popen[str] | None = None
 
+VARIABLE_SOLVER_MANIFEST_CONTRACTS = {
+    "shape_variable_multislot_solver_v5": {
+        "generator_version": "same_factory_product_variable_2_to_5_soft_p2_50_v3",
+        "scope_mode": "generic",
+        "scope_contract_required": False,
+    },
+    "shape_variable_multislot_solver_v6": {
+        "generator_version": (
+            "same_factory_product_variable_2_to_5_"
+            "nonleading_no_explicit_batch_soft_p2_50_v1"
+        ),
+        "scope_mode": "nonleading_no_explicit_batch",
+        "scope_contract_required": True,
+    },
+    "shape_variable_multislot_solver_v7": {
+        "generator_version": (
+            "same_factory_product_variable_2_to_5_"
+            "balanced_nonleading_soft_p2_50_v1"
+        ),
+        "scope_mode": "balanced_nonleading_no_explicit_batch",
+        "scope_contract_required": True,
+    },
+}
+
 
 def _raise_driver_interrupt(signum: int, _frame: Any) -> None:
     """Turn inherited shell signals into cleanup-capable exceptions."""
@@ -120,6 +144,361 @@ def _nested(value: Any, path: str, default: Any = None) -> Any:
             return default
         current = current[part]
     return current
+
+
+def _validate_variable_solver_manifest_contract(
+    manifest: Mapping[str, Any],
+) -> None:
+    """Validate the version/generator/scope-mode tuple for variable solvers."""
+
+    contract_version = manifest.get("contract_version")
+    expected = VARIABLE_SOLVER_MANIFEST_CONTRACTS.get(contract_version)
+    if expected is None:
+        return
+    generator_version = manifest.get("generator_version")
+    if generator_version != expected["generator_version"]:
+        raise ValueError(
+            "variable solver manifest generator mismatch: "
+            f"{contract_version} declares {generator_version!r}; "
+            f"expected {expected['generator_version']!r}"
+        )
+    scope_contract = manifest.get("scope_selection_contract")
+    if scope_contract is None and not expected["scope_contract_required"]:
+        # Historical v5 manifests have no scope-selection contract.
+        return
+    if not isinstance(scope_contract, Mapping):
+        raise ValueError(
+            f"{contract_version} requires scope_selection_contract"
+        )
+    scope_mode = scope_contract.get("mode")
+    if scope_mode != expected["scope_mode"]:
+        raise ValueError(
+            "variable solver manifest scope mode mismatch: "
+            f"{contract_version} declares {scope_mode!r}; "
+            f"expected {expected['scope_mode']!r}"
+        )
+
+
+def _validate_scoped_decision_evidence(
+    manifest: Mapping[str, Any],
+    decisions: Sequence[Any],
+) -> None:
+    """Fail closed on malformed v6/v7 bounded-lane evidence."""
+
+    contract_version = manifest.get("contract_version")
+    if contract_version not in {
+        "shape_variable_multislot_solver_v6",
+        "shape_variable_multislot_solver_v7",
+    }:
+        return
+    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version][
+        "scope_mode"
+    ]
+    scope_contract = manifest["scope_selection_contract"]
+    expected_contract_fields = {
+        "maximum_groups_per_cardinality": 12,
+        "minimum_general_groups_per_cardinality_when_available": 4,
+        "maximum_child_attempts_per_parent": 6,
+        "maximum_preferred_lane_attempts_when_both_lanes_exist": 4,
+        "reserved_secondary_lane_attempts_when_both_lanes_exist": 2,
+        "one_child_per_parent": True,
+    }
+    for field, expected_value in expected_contract_fields.items():
+        if scope_contract.get(field) != expected_value:
+            raise ValueError(f"scoped solver contract field mismatch: {field}")
+    allowed_fallback_reasons = set(scope_contract.get("fallback_reason_values", []))
+    inventory_fields = (
+        "scope_group_count_before_cap_by_logical_slot_count",
+        "scope_group_count_after_cap_by_logical_slot_count",
+        "scope_group_count_discarded_by_cap_by_logical_slot_count",
+        "general_group_count_before_cap_by_logical_slot_count",
+        "general_group_count_after_cap_by_logical_slot_count",
+        "general_group_count_discarded_by_cap_by_logical_slot_count",
+    )
+
+    def count(value: Any, *, field: str, identity: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid scoped decision count: {identity}:{field}")
+        return value
+
+    for decision_index, decision in enumerate(decisions):
+        if not isinstance(decision, Mapping):
+            raise ValueError(f"decision must be an object: {decision_index}")
+        identity = str(decision.get("parent_uuid", decision_index))
+        if decision.get("group_scope_mode") != expected_scope:
+            raise ValueError(f"decision scope mode mismatch: {identity}")
+        attempts = decision.get("attempts")
+        if not isinstance(attempts, list):
+            raise ValueError(f"decision attempts must be a list: {identity}")
+        if decision.get("group_scope_status") == "evaluated":
+            for field in inventory_fields:
+                if not isinstance(decision.get(field), Mapping):
+                    raise ValueError(
+                        f"scoped decision inventory missing: {identity}:{field}"
+                    )
+            inventory = {field: decision[field] for field in inventory_fields}
+            cardinalities = set().union(
+                *(set(values) for values in inventory.values())
+            )
+            for cardinality in cardinalities:
+                values = {
+                    field: count(
+                        inventory[field].get(cardinality, 0),
+                        field=f"{field}:{cardinality}",
+                        identity=identity,
+                    )
+                    for field in inventory_fields
+                }
+                scope_before = values[inventory_fields[0]]
+                scope_after = values[inventory_fields[1]]
+                scope_discarded = values[inventory_fields[2]]
+                general_before = values[inventory_fields[3]]
+                general_after = values[inventory_fields[4]]
+                general_discarded = values[inventory_fields[5]]
+                reserved_general = min(4, general_before)
+                expected_scope_after = min(scope_before, 12 - reserved_general)
+                expected_general_after = min(
+                    general_before, 12 - expected_scope_after
+                )
+                if (
+                    scope_before != scope_after + scope_discarded
+                    or general_before != general_after + general_discarded
+                    or scope_after != expected_scope_after
+                    or general_after != expected_general_after
+                    or scope_after + general_after > 12
+                ):
+                    raise ValueError(
+                        f"scoped group cap arithmetic mismatch: "
+                        f"{identity}:{cardinality}"
+                    )
+        if "bounded_candidate_attempt_count" not in decision:
+            if attempts:
+                raise ValueError(f"attempts without bounded count: {identity}")
+            continue
+        bounded = count(
+            decision.get("bounded_candidate_attempt_count"),
+            field="bounded_candidate_attempt_count",
+            identity=identity,
+        )
+        scope_count = count(
+            decision.get("scope_candidate_attempt_count"),
+            field="scope_candidate_attempt_count",
+            identity=identity,
+        )
+        general_count = count(
+            decision.get("general_fallback_candidate_attempt_count"),
+            field="general_fallback_candidate_attempt_count",
+            identity=identity,
+        )
+        if bounded != scope_count + general_count or bounded > 6:
+            raise ValueError(f"bounded attempt lane count mismatch: {identity}")
+        preferred_lane = decision.get("preferred_attempt_lane")
+        if preferred_lane not in {"scope", "general"}:
+            raise ValueError(f"invalid preferred attempt lane: {identity}")
+        plan_evidence = decision.get("attempt_plan_evidence")
+        if not isinstance(plan_evidence, Mapping):
+            raise ValueError(f"attempt plan evidence missing: {identity}")
+        raw_scope_count = count(
+            plan_evidence.get("scope_candidate_count_before_bound"),
+            field="scope_candidate_count_before_bound",
+            identity=identity,
+        )
+        raw_general_count = count(
+            plan_evidence.get("general_candidate_count_before_bound"),
+            field="general_candidate_count_before_bound",
+            identity=identity,
+        )
+        if raw_scope_count != decision.get(
+            "scope_matching_static_solved_candidate_count"
+        ) or raw_scope_count + raw_general_count != decision.get(
+            "static_solved_candidate_count"
+        ):
+            raise ValueError(f"attempt plan raw count mismatch: {identity}")
+        maximum_scope_size = plan_evidence.get(
+            "maximum_scope_logical_slot_count"
+        )
+        general_growth_dominates = plan_evidence.get(
+            "best_general_batch_like_growth_dominates"
+        )
+        preference_reason = plan_evidence.get("preference_reason")
+        if raw_scope_count == 0:
+            expected_preferred_lane = "general"
+            expected_preference_reason = "no_scope_static_candidate"
+            if maximum_scope_size is not None:
+                raise ValueError(f"unexpected maximum scope size: {identity}")
+        elif raw_general_count == 0:
+            expected_preferred_lane = "scope"
+            expected_preference_reason = "no_general_static_candidate"
+            if not isinstance(maximum_scope_size, int) or maximum_scope_size < 2:
+                raise ValueError(f"invalid maximum scope size: {identity}")
+            if general_growth_dominates is not None:
+                raise ValueError(f"unexpected general growth evidence: {identity}")
+        else:
+            if not isinstance(maximum_scope_size, int) or maximum_scope_size < 2:
+                raise ValueError(f"invalid maximum scope size: {identity}")
+            if not isinstance(general_growth_dominates, bool):
+                raise ValueError(f"general growth evidence missing: {identity}")
+            if contract_version == "shape_variable_multislot_solver_v6":
+                expected_preferred_lane = "scope"
+                expected_preference_reason = "strict_scope_preference"
+            elif maximum_scope_size >= 3:
+                expected_preferred_lane = "scope"
+                expected_preference_reason = "scope_cardinality_at_least_three"
+            elif general_growth_dominates:
+                expected_preferred_lane = "scope"
+                expected_preference_reason = (
+                    "best_general_batch_like_growth_dominates"
+                )
+            else:
+                expected_preferred_lane = "general"
+                expected_preference_reason = "balanced_general_preference"
+        if (
+            preferred_lane != expected_preferred_lane
+            or preference_reason != expected_preference_reason
+        ):
+            raise ValueError(f"attempt plan preference mismatch: {identity}")
+        if raw_scope_count == 0 or raw_general_count == 0:
+            expected_scope_count = min(raw_scope_count, 6)
+            expected_general_count = min(raw_general_count, 6)
+        else:
+            raw_preferred_count = (
+                raw_scope_count
+                if preferred_lane == "scope"
+                else raw_general_count
+            )
+            raw_secondary_count = (
+                raw_general_count
+                if preferred_lane == "scope"
+                else raw_scope_count
+            )
+            planned_preferred_count = min(raw_preferred_count, 4)
+            planned_secondary_count = min(raw_secondary_count, 2)
+            remaining = 6 - planned_preferred_count - planned_secondary_count
+            planned_secondary_count += min(
+                raw_secondary_count - planned_secondary_count, remaining
+            )
+            if preferred_lane == "scope":
+                expected_scope_count = planned_preferred_count
+                expected_general_count = planned_secondary_count
+            else:
+                expected_scope_count = planned_secondary_count
+                expected_general_count = planned_preferred_count
+        if (
+            scope_count != expected_scope_count
+            or general_count != expected_general_count
+        ):
+            raise ValueError(f"bounded attempt plan mismatch: {identity}")
+        if scope_count and general_count:
+            preferred_count = (
+                scope_count if preferred_lane == "scope" else general_count
+            )
+            if preferred_count > 4:
+                raise ValueError(f"preferred attempt lane exceeds limit: {identity}")
+        attempted_lanes: list[str] = []
+        accepted_attempts: list[Mapping[str, Any]] = []
+        for attempt_index, attempt in enumerate(attempts):
+            if not isinstance(attempt, Mapping):
+                raise ValueError(f"attempt must be an object: {identity}")
+            if attempt.get("attempt_index") != attempt_index:
+                raise ValueError(f"attempt index mismatch: {identity}")
+            scope_match = _nested(
+                attempt, "group_scope.matches_nonleading_no_explicit_batch"
+            )
+            if not isinstance(scope_match, bool):
+                raise ValueError(f"attempt scope evidence missing: {identity}")
+            expected_lane = "scope" if scope_match else "general"
+            if attempt.get("attempt_lane") != expected_lane:
+                raise ValueError(f"attempt lane evidence mismatch: {identity}")
+            attempted_lanes.append(expected_lane)
+            if attempt.get("accepted") is True:
+                accepted_attempts.append(attempt)
+        preferred_count = (
+            scope_count if preferred_lane == "scope" else general_count
+        )
+        secondary_lane = "general" if preferred_lane == "scope" else "scope"
+        secondary_count = (
+            general_count if preferred_lane == "scope" else scope_count
+        )
+        planned_lanes = [preferred_lane] * preferred_count + [
+            secondary_lane
+        ] * secondary_count
+        if attempted_lanes != planned_lanes[: len(attempted_lanes)]:
+            raise ValueError(f"attempt lane order mismatch: {identity}")
+        if len(attempts) > bounded:
+            raise ValueError(f"attempt count exceeds bound: {identity}")
+        if decision.get("accepted") is True:
+            if len(accepted_attempts) != 1:
+                raise ValueError(f"accepted attempt count mismatch: {identity}")
+            accepted_attempt = accepted_attempts[0]
+            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get(
+                "attempt_index"
+            ):
+                raise ValueError(f"selected attempt index mismatch: {identity}")
+            selected_scope = _nested(
+                accepted_attempt,
+                "group_scope.matches_nonleading_no_explicit_batch",
+            )
+            if decision.get("selected_group_scope_match") != selected_scope:
+                raise ValueError(f"selected scope evidence mismatch: {identity}")
+            used_fallback = decision.get("used_group_scope_fallback")
+            fallback_reason = decision.get("group_scope_fallback_reason")
+            expected_fallback = bool(
+                not selected_scope
+                and (preferred_lane == "scope" or raw_scope_count == 0)
+            )
+            expected_fallback_reason = None
+            if expected_fallback:
+                scope_group_count = sum(
+                    int(value)
+                    for value in decision[
+                        "scope_matching_group_count_by_logical_slot_count"
+                    ].values()
+                )
+                scope_profile_count = sum(
+                    int(value)
+                    for value in decision[
+                        "scope_matching_product_profile_count_by_logical_slot_count"
+                    ].values()
+                )
+                if scope_group_count == 0:
+                    expected_fallback_reason = "no_compatible_scope_group"
+                elif scope_profile_count == 0:
+                    expected_fallback_reason = "no_exact_scope_product_profile"
+                elif raw_scope_count == 0:
+                    expected_fallback_reason = "no_scope_static_solution"
+                else:
+                    expected_fallback_reason = (
+                        "scope_candidate_attempts_exhausted"
+                    )
+            if used_fallback is not expected_fallback:
+                raise ValueError(f"invalid scope fallback flag: {identity}")
+            if (
+                fallback_reason != expected_fallback_reason
+                or (
+                    fallback_reason is not None
+                    and fallback_reason not in allowed_fallback_reasons
+                )
+            ):
+                raise ValueError(f"invalid scope fallback reason: {identity}")
+            selected_lane = "scope" if selected_scope else "general"
+            expected_preferred_fallback = selected_lane != preferred_lane
+            expected_preferred_reason = (
+                None
+                if not expected_preferred_fallback
+                else (
+                    "scope_candidate_attempts_exhausted"
+                    if preferred_lane == "scope"
+                    else "general_candidate_attempts_exhausted"
+                )
+            )
+            if decision.get(
+                "used_preferred_attempt_lane_fallback"
+            ) is not expected_preferred_fallback or decision.get(
+                "preferred_attempt_lane_fallback_reason"
+            ) != expected_preferred_reason:
+                raise ValueError(f"invalid preferred lane fallback: {identity}")
+        elif accepted_attempts:
+            raise ValueError(f"rejected decision has accepted attempt: {identity}")
 
 
 def _exception_detail(exc: BaseException) -> str:
@@ -1095,13 +1474,23 @@ def _declared_logical_slot_range(
 ) -> tuple[int, int] | None:
     contract = manifest.get("group_contract")
     if contract is None:
-        if manifest.get("contract_version") == "shape_variable_multislot_solver_v5":
-            raise ValueError(
-                "shape_variable_multislot_solver_v5 requires group_contract"
-            )
+        if manifest.get("contract_version") in {
+            "shape_variable_multislot_solver_v5",
+            "shape_variable_multislot_solver_v6",
+            "shape_variable_multislot_solver_v7",
+        }:
+            raise ValueError("variable multislot solver requires group_contract")
         return None
     if not isinstance(contract, Mapping):
         raise ValueError("group_contract must be an object")
+    if (
+        manifest.get("contract_version") in {
+            "shape_variable_multislot_solver_v6",
+            "shape_variable_multislot_solver_v7",
+        }
+        and not isinstance(manifest.get("scope_selection_contract"), Mapping)
+    ):
+        raise ValueError("scoped variable multislot solver requires scope_selection_contract")
     raw = contract.get("logical_slot_count_range")
     if (
         not isinstance(raw, list)
@@ -1122,6 +1511,9 @@ def _accepted_tasks(
     parents = _rows_by_uuid(selected_path)
     children = _rows_by_uuid(children_path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping):
+        raise ValueError("manifest must be an object")
+    _validate_variable_solver_manifest_contract(manifest)
     solver_contract_version = manifest.get("contract_version")
     if not isinstance(solver_contract_version, str) or not solver_contract_version:
         raise ValueError("manifest contract_version must be a non-empty string")
@@ -1129,6 +1521,7 @@ def _accepted_tasks(
     decisions = manifest.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError("manifest decisions must be a list")
+    _validate_scoped_decision_evidence(manifest, decisions)
     tasks: list[dict[str, Any]] = []
     for decision in decisions:
         if not isinstance(decision, Mapping) or decision.get("accepted") is not True:

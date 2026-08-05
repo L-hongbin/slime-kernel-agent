@@ -14,6 +14,13 @@ workers=${SHAPE_CPU_WORKERS:-32}
 fake_timeout=${SHAPE_FAKE_TIMEOUT_SECONDS:-30}
 solver_module=${SHAPE_SOLVER_MODULE:-tools.data.synthesize.solve_multidim_shape_coverage}
 expected_solver_contract=${SHAPE_EXPECTED_SOLVER_CONTRACT:-}
+expected_solver_generator=${SHAPE_EXPECTED_SOLVER_GENERATOR:-}
+expected_solver_source_sha256=${SHAPE_EXPECTED_SOLVER_SOURCE_SHA256:-}
+expected_multidim_source_sha256=${SHAPE_EXPECTED_MULTIDIM_SOURCE_SHA256:-}
+expected_shape_helper_source_sha256=${SHAPE_EXPECTED_SHAPE_HELPER_SOURCE_SHA256:-}
+expected_group_scope=${SHAPE_EXPECTED_GROUP_SCOPE:-}
+supports_group_scope=${SHAPE_SOLVER_SUPPORTS_GROUP_SCOPE:-0}
+group_scope=
 
 for value in "${machine_rank}" "${machine_count}" "${workers}"; do
   [[ ${value} =~ ^[0-9]+$ ]] || {
@@ -25,6 +32,27 @@ done
   echo "require machine_count/workers > 0 and 0 <= machine_rank < machine_count" >&2
   exit 2
 }
+case ${supports_group_scope} in
+  0) ;;
+  1) group_scope=${SHAPE_GROUP_SCOPE:-generic} ;;
+  *)
+    echo "SHAPE_SOLVER_SUPPORTS_GROUP_SCOPE must be 0 or 1" >&2
+    exit 2
+    ;;
+esac
+if [[ -n ${expected_group_scope} && ${supports_group_scope} != 1 ]]; then
+  echo "SHAPE_EXPECTED_GROUP_SCOPE requires a scope-capable solver" >&2
+  exit 2
+fi
+if [[ ${supports_group_scope} == 1 ]]; then
+  case ${group_scope} in
+    generic|nonleading_no_explicit_batch|balanced_nonleading_no_explicit_batch) ;;
+    *)
+      echo "unknown SHAPE_GROUP_SCOPE: ${group_scope}" >&2
+      exit 2
+      ;;
+  esac
+fi
 [[ -f ${input_root}/shards.json ]] || {
   echo "missing shard manifest: ${input_root}/shards.json" >&2
   exit 2
@@ -66,22 +94,91 @@ PY
   exit 2
 }
 
+validate_solver_manifest() {
+  local manifest=$1
+  if [[ -z ${expected_solver_contract} \
+    && -z ${expected_solver_generator} \
+    && -z ${expected_solver_source_sha256} \
+    && -z ${expected_multidim_source_sha256} \
+    && -z ${expected_shape_helper_source_sha256} \
+    && -z ${expected_group_scope} ]]; then
+    return 0
+  fi
+  python - \
+    "${manifest}" \
+    "${expected_solver_contract}" \
+    "${expected_solver_generator}" \
+    "${expected_solver_source_sha256}" \
+    "${expected_group_scope}" \
+    "${expected_multidim_source_sha256}" \
+    "${expected_shape_helper_source_sha256}" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = {
+    "contract_version": sys.argv[2],
+    "generator_version": sys.argv[3],
+    "solver_source_sha256": sys.argv[4],
+}
+for field, value in expected.items():
+    if value and manifest.get(field) != value:
+        raise SystemExit(
+            f"solver manifest mismatch for {field}: "
+            f"expected={value} observed={manifest.get(field)}"
+        )
+expected_scope = sys.argv[5]
+if expected_scope:
+    scope_contract = manifest.get("scope_selection_contract")
+    observed_scope = (
+        scope_contract.get("mode") if isinstance(scope_contract, dict) else None
+    )
+    if observed_scope != expected_scope:
+        raise SystemExit(
+            "solver manifest mismatch for scope mode: "
+            f"expected={expected_scope} observed={observed_scope}"
+        )
+dependency_contract = manifest.get("dependency_source_contract")
+expected_multidim = sys.argv[6]
+if expected_multidim:
+    observed_multidim = (
+        dependency_contract.get("solve_multidim_shape_coverage_sha256")
+        if isinstance(dependency_contract, dict)
+        else None
+    )
+    if observed_multidim != expected_multidim:
+        raise SystemExit(
+            "solver dependency mismatch for solve_multidim_shape_coverage: "
+            f"expected={expected_multidim} observed={observed_multidim}"
+        )
+expected_shape_helper = sys.argv[7]
+if expected_shape_helper:
+    observed_shape_helper = (
+        dependency_contract.get("solve_shape_coverage_sha256")
+        if isinstance(dependency_contract, dict)
+        else None
+    )
+    observed_v3_helper = manifest.get("v3_helper_source_sha256")
+    if (
+        observed_shape_helper != expected_shape_helper
+        or observed_v3_helper != expected_shape_helper
+    ):
+        raise SystemExit(
+            "solver dependency mismatch for solve_shape_coverage: "
+            f"expected={expected_shape_helper} "
+            f"observed_dependency={observed_shape_helper} "
+            f"observed_v3_helper={observed_v3_helper}"
+        )
+PY
+}
+
 run_shard() {
   local name=$1
   local input_dir=${input_root}/${name}
   local output_dir=${run_root}/${name}
   local log=${run_root}/logs/${name}.log
   if [[ -f ${output_dir}/static/manifest.json ]]; then
-    if [[ -n ${expected_solver_contract} ]]; then
-      python - "${output_dir}/static/manifest.json" "${expected_solver_contract}" <<'PY'
-import json
-import sys
-
-observed = json.load(open(sys.argv[1], encoding="utf-8")).get("contract_version")
-if observed != sys.argv[2]:
-    raise SystemExit(f"solver contract mismatch: expected={sys.argv[2]} observed={observed}")
-PY
-    fi
+    validate_solver_manifest "${output_dir}/static/manifest.json" || return 1
     echo "resume: ${name}" >"${log}"
     return 0
   fi
@@ -89,24 +186,23 @@ PY
     echo "incomplete existing shard output: ${output_dir}" >&2
     return 1
   fi
-  python -m "${solver_module}" \
-    "${output_dir}" \
-    --selected "${input_dir}/selected.parquet" \
-    --fake-gate-timeout-seconds "${fake_timeout}" \
-    >"${log}" 2>&1
-  if [[ -n ${expected_solver_contract} ]]; then
-    python - "${output_dir}/static/manifest.json" "${expected_solver_contract}" <<'PY'
-import json
-import sys
-
-observed = json.load(open(sys.argv[1], encoding="utf-8")).get("contract_version")
-if observed != sys.argv[2]:
-    raise SystemExit(f"solver contract mismatch: expected={sys.argv[2]} observed={observed}")
-PY
+  local -a solver_args=(
+    "${output_dir}"
+    --selected "${input_dir}/selected.parquet"
+    --fake-gate-timeout-seconds "${fake_timeout}"
+  )
+  if [[ -n ${group_scope} ]]; then
+    solver_args+=(--group-scope "${group_scope}")
   fi
+  python -m "${solver_module}" "${solver_args[@]}" >"${log}" 2>&1 || return 1
+  validate_solver_manifest "${output_dir}/static/manifest.json" || return 1
 }
+export -f validate_solver_manifest
 export -f run_shard
 export input_root run_root fake_timeout solver_module expected_solver_contract
+export expected_solver_generator expected_solver_source_sha256 expected_group_scope
+export expected_multidim_source_sha256 expected_shape_helper_source_sha256
+export supports_group_scope group_scope
 
 printf '%s\n' "${shard_names[@]}" | xargs -r -n1 -P "${workers}" bash -c 'run_shard "$1"' _
 

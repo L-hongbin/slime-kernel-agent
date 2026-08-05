@@ -1,261 +1,147 @@
-# 可变多 slot shape solver：12,318 条恢复集 handoff
+# 可变多维 shape 扩展：12,318 条恢复集
 
 ## 摘要
 
-这条 follow-up lane 处理上一轮 full static solver 中因严格双 slot / 固定 2 的幂模式而未生成 child、但放宽词法位置限制后仍有正 storage witness 的 12,318 个 parent。它不改动已完成的 `run.full53896`，也没有把任何新行并入训练数据。
+这条 lane 用静态 solver 扩展 12,318 个旧 exact-two lane 无法处理的 parent，不调用生成模型。每个 parent 只分配一个确定性随机 `Medium` 或 `Large` target，只生成一个 child；solver 同时修改 2--5 个逻辑 shape slot，并用 source-span identity、FakeTensor、4 GiB 容量上限和 1000:1 维度比例门禁拒绝不可靠结果。
 
-已完成精确输入选择、2–5 logical slot solver、最终 128-parent static/FakeTensor canary，以及同一 canary 的 8-shard CPU 运行和 deterministic merge。12,318 条全量 CPU solver 也已完成 1,024/1,024 shard manifest：node69_slime rank 0 和 node70_dspark rank 1 各保留 512 个 node-local shard。两边结果尚未汇集和 merge，因此没有 full static 统计或 canonical `run.recoverable12318`；canary 与全量 H20 reference / changed-region 都未启动，`training_approved=false`。
+全量 CPU 阶段接受 11,877 个 child，覆盖率 96.42%。所有 child 都通过独立源码重放与 AST/factory/rank 校验；静态分布门禁通过。1,000-parent canary 的 H20 paired reference 与 changed-region liveness 最终接受 713 个 child，也通过 runtime 分布门禁。全量 H20 reference 已按固定 2×8 H20、128 shard 合同启动，但 reference、region 和最终 runtime analyzer 尚未全部完成，因此当前产物仍是 review-only，`training_approved=false`。
 
-| 阶段 | 状态 | 结果 |
-| --- | --- | --- |
-| 精确 delta 输入 | 已完成 | 12,318 parent；`Medium=6,151`，`Large=6,167` |
-| 1,024-way 全量输入分片 | 已完成 | 只含输入与 global-index ledger，未运行 solver |
-| 最终 128-parent static canary | 已完成 | 121 child，94.53% parent coverage |
-| 8-shard CPU + merge canary | 已完成 | 四个 parquet 与非分片 canary 逐字节一致 |
-| Canary H20 reference / region | 未启动 | 没有 runtime evidence |
-| 12,318 条全量 CPU solver | 已完成分片 | 1,024/1,024 manifest；node69/node70 各 512，等待汇集 |
-| 全量 CPU merge / analysis | 未启动 | 没有 canonical merged run 或 full static count |
-| 全量 H20 reference / region | 未启动 | 没有 runtime-eligible child |
+| 阶段 | 结果 | 结论 |
+| --- | ---: | --- |
+| 精确输入选择 | 12,318 parent | `Medium=6,151`，`Large=6,167` |
+| 全量 static/FakeTensor | 11,877 child | 96.42%，identity 与 static bias 门禁通过 |
+| 1k canary static | 957 child | 95.70% |
+| 1k canary H20 最终 eligible | 713 child | 74.50% static retention，runtime bias 门禁通过 |
+| 全量 H20 | reference 运行中 | 尚无完整 runtime-eligible 集合 |
 
-## 精确输入与来源约束
+## 输入与变换合同
 
-输入来自已完成的 `Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896`。selector 只考察旧 manifest 中 reason 为 `no_strict_two_slot_exactly_one_power_solution`、至少有两个 affine slot 且旧 strict bilinear profile 数为 0 的 13,536 个 decision。它只移除“patch token 必须物理位于 `get_inputs()` 函数体内”这一条词法限制；slot span 不重叠、同一非空 factory set、每个 slot 在每个 factory 恰好出现一次、axis 互异、occurrence 数相同以及正的 exact bilinear storage witness 都仍需成立。
+输入来自 full 53,896-parent solver 中因 strict exact-two 约束而跳过的候选。selector 重新证明 slot span、factory set、axis、occurrence 数和 exact storage witness，得到 12,318 个可恢复 parent；它只选择 parent，不生成 child。输入固定在：
 
-重新证明后，12,318 个 parent 有正 witness，另 1,218 个为 `no_positive_profile`。selector 校验旧 selected、selection、static manifest、UUID、reference hash 和依赖源码 hash 后才原子发布结果；该阶段只选 parent，不生成 child。
+`Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318/`
 
-| 产物 | SHA-256 |
-| --- | --- |
-| `input.recoverable12318/selected.parquet` | `fc780d5ce11124c732b5edb9b965ceb9f190d43206cd8635ded1fe0a9b1cca1a` |
-| `input.recoverable12318/selection.json` | `7f4a83f974c728d1b2763ef6136a2db8fee8bb31be6955c43fcce27fd0633e63` |
-| `input.recoverable12318/selection_ledger.tsv` | `1eea28ef2b9a50eabf7f0736be8ca6adbd2d078ed6b093c4058a4f5f82b6a108` |
-| 旧 full-run `selected.parquet` | `01eeaa55e91ed92b44ee6de413d6c2c1bddb8794051e6fa79c4907ae98c67f07` |
-| 旧 full-run `selection.json` | `e82375a2095bf1a82a0df2bd96676b40ce2bab8d005fe892b8e32bf2f482de34` |
-| 旧 full-run `static/manifest.json` | `bb9b0a487ac98058056b2fff20991dbe900cc0c13f5815834eaf78d8409546ce` |
+目录名保留历史编号；当前生产合同是 `shape_variable_multislot_solver_v7`，generator 是 `same_factory_product_variable_2_to_5_balanced_nonleading_soft_p2_50_v1`。
 
-全量 modulo 输入已预先拆成 1,024 shards：`Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/shards.1024`。其 `shards.json` SHA-256 为 `5e5ba62394c42a8fb2260aeddb59dd030b4fd2674d27a944d29805773249d81d`，记录的 source selected / selection hash 分别与上表的 `fc780...` / `7f4a...` 一致。
+核心约束如下：
 
-## 新的 2–5 slot 构造合同
+- 每个 parent 只有一个 variant 和一个 child，variant 在 `Medium` 与 `Large` 间确定性分配。
+- `Medium` target 为 64--256 MiB；`Large` 为大于 256 MiB且不超过 4 GiB。允许相对 target 误差最多 25%，不再使用 24×/49 GiB 静态门禁。
+- 每个 child 修改 2--5 个逻辑 slot；linked slot 即使同步出现在多个 input factory 中，逻辑上仍只计一次。
+- 同组 slot 必须作用于相同的非空 direct-input factory set，在每个 factory 中各出现一次且 axis 互异；storage 必须能写成精确的 product 形式。
+- 只允许替换已声明的十进制 shape 整数字面量。`Model`、`get_init_inputs()`、input factory 顺序、dtype、rank 和所有未声明源码 span 必须不变。
+- parent 与 child 都必须通过 FakeTensor。每个最终 rank≥2 direct factory 必须满足最大维不超过第二大维的 1000 倍。
+- 2 的幂只是确定性的 per-slot soft preference，不设“每个 child 恰好几个”的局部模板。最终只要求 changed occurrence 的全局 P2 占比落在 30%--50%。
 
-solver contract 为 `shape_variable_multislot_solver_v5`，generator 为 `same_factory_product_variable_2_to_5_soft_p2_50_v3`。每个 parent 仍只复用旧 lane 已分配的一个 byte-granularity target：`Medium` 为 64–256 MiB，`Large` 为 `[256 MiB + 1 byte, 4 GiB]`；child 至少为 parent input bytes 的 2 倍，target 相对误差上限为 25%。
+`balanced_nonleading_no_explicit_batch` scope 指所有被选 occurrence 都在非 leading axis，且 linked symbol 不属于 `batch_size`、`batchsize`、`batch`、`bs`、`n_batch`。solver 在结构允许时偏向该 scope，同时为 general lane 保留候选与最多两次 bounded attempt，防止为了位置偏好大幅损失覆盖率。每个 parent 总共最多做六次 child FakeTensor 尝试。
 
-每个候选改 2–5 个 logical shape slot，不再要求 exact-2。一个 linked slot 即使同步出现在多个 input factory 中，logical count 仍只计一次。所有 slot 必须满足：
+## 1k H20 canary
 
-- 作用于同一个非空 direct-input factory set；
-- 在每个 factory 中各出现一次且位于互异 axis；
-- patch spans 两两不重叠，新值都严格大于 parent 值；
-- module-scope linked name 只有在所有 load 都被证明是 direct input-shape dimension 时才允许；
-- 精确 storage 形式为 `constant_bytes + product_coefficient * product(values)`；
-- source-span replay 后 `Model`、`get_init_inputs()`、factory 顺序、rank 和未声明 span 保持不变；
-- parent 和 child 都通过 FakeTensor；每个最终 rank≥2 direct factory 满足 `largest <= 1000 × second_largest`。
+权威 canary 位于：
 
-候选优先较大的 structural group；在最大 cardinality 上最多先尝试三个不同候选，随后才尝试较小 cardinality，单 parent 最多进行六次 child FakeTensor 尝试。因此“尽量更多维度”是结构和门禁允许下的 best effort，不是强行把每个 child 做成 3–5 slot。
+`Data/prompt_tvm_v4/shape_solver_variable_multislot_v6/run.canary1000.balanced_v7/`
 
-对 12,318 个输入按当前 group enumerator 做的最大兼容 cardinality 预检如下。7,644 个 parent 的合同内结构上限就是两个 slot；若要让它们也改三个以上维度，必须放宽当前 same-factory/product 证明或允许语义性代码修改，不属于本 lane。
+目录名同样是历史名称；manifest 合同为 v7。静态阶段接受 957/1,000 个 child。H20 reference 共验证 1,914 行 parent/child：763 对 parent 与 child 同时通过，86 对只有 parent 通过，108 对两边都未通过，没有 child-only pass。
 
-| 最大兼容 logical slots | Parent | 占比 |
+region 只处理 763 个 reference 双通过 child，结果为 713 passed、28 OOM、17 rejected、5 unsupported。17 个 rejected 都是 `expanded_region_no_output_effect`，说明扩出来的区域在三次确定性扰动中没有影响输出；这正是原始参数整体 live、扩展后新增 tail 却 dead 的情形。OOM 和 unsupported 保持 inconclusive，不计入 eligible。
+
+| Canary 指标 | Static | Runtime eligible |
+| --- | ---: | ---: |
+| Child | 957 | 713 |
+| Medium | 480 | 400 |
+| Large | 477 | 313 |
+| K2 / K3 / K4 | 707 / 249 / 1 | 512 / 200 / 1 |
+| Changed occurrences | 2,431 | 1,789 |
+| P2 fraction | 36.90% | 37.56% |
+| Effective values | 375.48 | 308.64 |
+| Top-5 value fraction | 21.39% | 22.14% |
+| Explicit-batch child fraction | 74.61% | 72.23% |
+| 1000:1 violation | 0 | 0 |
+
+Runtime retention 显著依赖 variant 与来源：`Medium=83.33%`，`Large=65.62%`；`cuda_agent=51.90%`，`drkernel=76.51%`。这说明 4 GiB input cap 和 FakeTensor 不能替代真实 H20：attention、convolution、reduction 的中间量和 workspace 仍可能 OOM。
+
+## 12,318-parent 全量 static 结果
+
+四台机器的 CPU 各用 64 worker，完成 1,024/1,024 个 deterministic shard；merge 后的 canonical run 为：
+
+`Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.balanced_v7/`
+
+| Variant | Selected | Accepted | Coverage |
+| --- | ---: | ---: | ---: |
+| Medium | 6,151 | 5,920 | 96.24% |
+| Large | 6,167 | 5,957 | 96.59% |
+| 合计 | 12,318 | 11,877 | 96.42% |
+
+| Logical slots | Child | 占 accepted |
 | ---: | ---: | ---: |
-| 2 | 7,644 | 62.06% |
-| 3 | 2,876 | 23.35% |
-| 4 | 1,790 | 14.53% |
-| 5 | 8 | 0.06% |
-| 3–5 合计 | 4,674 | 37.94% |
+| 2 | 8,428 | 70.96% |
+| 3 | 3,440 | 28.96% |
+| 4 | 9 | 0.08% |
+| 5 | 0 | 0% |
 
-2 的幂不再有 per-child hard constraint。每个 logical slot 用 `parent_uuid + logical_slot_id` 独立、确定性地得到 50% soft preference；candidate ranking 先比较 0.1% target-error bucket，再比较 preference mismatch，避免为了吸附到 2 的幂而显著牺牲随机 byte target。最终门禁只看 changed factory-axis occurrence 的全局 2 的幂占比是否在闭区间 30%–50%，而且 H20 筛选后必须重新统计；static 通过不保证 runtime 子集仍通过。
+K2 仍占多数不是 exact-2 硬编码，而是当前 same-factory/product 证明下，很多 parent 没有兼容的 K3--K5 group，或更高 cardinality 候选无法通过 shape coupling 的 FakeTensor 门禁。solver 没有为了追求 slot 数去改 forward 或程序结构。
 
-## 最终 128-parent canary
+441 个未接受 parent 的最终归因是：420 个 child candidate FakeTensor failure、3 个 FakeTensor timeout、17 个所有数值候选都被 1000:1 门禁拒绝、1 个没有可行 product 解。候选级别共观察到 2,177 次 FakeTensor failure 和 12 次 timeout；每个 parent 的 bounded 尝试仍不超过六次。
 
-权威 canary 是 `Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.canary128.v4`。输入为精确 delta 集合的前 128 行，`Medium=60`、`Large=68`；parent FakeTensor 为 128/128，static/FakeTensor 接受 121 个 child，其中 `Medium=56`、`Large=65`。七个失败全部是 child FakeTensor incompatibility，包括 convolution channel 约束、broadcast、fixed reshape/split 和 pixel-shuffle shape 约束；它们不是 H20 结果。
+## 全量偏差与人工复核
 
-| 接受 child 的 logical slots | Child | 占 121 个 child |
-| ---: | ---: | ---: |
-| 2 | 71 | 58.68% |
-| 3 | 32 | 26.45% |
-| 4 | 17 | 14.05% |
-| 5 | 1 | 0.83% |
-| 3–5 合计 | 50 | 41.32% |
+全量 11,877 个 child 共改变 30,462 个 direct-factory dimension occurrences。P2 占 36.82%，不同值 6,513 个，effective values 为 891.17，Top-5 占 20.39%；8 的倍数占 43.45%，32 的倍数占 35.42%。容量 P50 为 271.68 MiB，P90 为 3.24 GiB，最大值恰为 4 GiB。每个 child 的最大维度比 P50/P90/P99 为 2.43/33.60/310.93，最大 1000，越界为 0。
 
-两个 child 在最大 cardinality 的候选未通过后降到较小 group；其余 119 个接受 child 使用其最大兼容 group。独立 analyzer 重放了 121 个 child 的精确 source spans，并重新解析 factory / axis diff、`Model` 和 `get_init_inputs()` AST、hash、lineage、FakeTensor 及 1000:1 balance；invalid、missing、orphan 和 balance violation 都为 0。
+balanced scope 接受 2,909 个 child，general lane 接受 8,968 个。75.51% child 触及 leading axis，74.93% 触及显式 batch symbol；按 occurrence 统计分别是 34.07% 和 33.83%。主要原因不是 selector 忽略偏好，而是 7,232 个已接受 child 根本没有兼容的 scope group，只能 general fallback。该偏差必须在全量 H20 筛选后重新统计，不能用 canary 或 static 比例替代最终结果。
 
-target 相对误差 P50 为 0.0330%，P90 为 0.0831%，最大为 1.5483%。121 个 child 共 328 个 changed factory-axis occurrences，其中 113 个为 2 的幂，占 34.45%；static 30%–50% 门禁通过。新值有 206 个 distinct value，effective values 为 140.44，Top-5 占 18.60%；相比旧 exact-2 lane 的局部固定 50%，此 canary 没有固定 per-child 模式。
+独立 analyzer 对 11,877/11,877 个 child 重放 source spans，并重新解析实际 factory/axis diff；`Model`、`get_init_inputs()`、factory sequence、rank、hash、lineage、parent/child FakeTensor 和 1000:1 contract 全部通过。额外的全量 tokenizer diff 显示 0 个 child 修改了非十进制整数字面量。`analysis/stratified_review_samples.md` 中的 11 个 accepted diff 和全部 9 个稀有 K4 child 均人工复核，只改 shape 数值，没有 docstring、等价重写、4D→2D 或 forward 结构修改。
 
-下表按 logical slot 统计一个 child 有多少个新值是 2 的幂。可见相同 cardinality 下同时存在 0、1、2 或 3 个，而不是“恰好一个是 2 的幂、另一个不是”。
+## 全量 H20 合同与完成边界
 
-| Logical slots | 0 个 P2 | 1 个 P2 | 2 个 P2 | 3 个 P2 |
-| ---: | ---: | ---: | ---: | ---: |
-| 2 | 26 | 45 | 0 | 0 |
-| 3 | 7 | 16 | 9 | 0 |
-| 4 | 2 | 7 | 5 | 3 |
-| 5 | 0 | 0 | 1 | 0 |
+全量 paired reference 的输入为 23,754 行，已固定以下 scheduler contract：
 
-### 人工复核样本
+| 节点 | Rank | GPU | Virtual shards/GPU |
+| --- | ---: | ---: | ---: |
+| `node53_slime` | 0 | 8×H20 | 8 |
+| `node69_slime` | 1 | 8×H20 | 8 |
 
-人工读取的代表性 diff 都只改 module-scope shape integer；没有修改 docstring、程序结构、factory、dtype 或 rank。原源码已有的 shape 注释可能随新数值变旧，但 solver 不改注释文本。
+总 shard 数为 128，单行超时 180 秒，allocator 上限 64 GiB，paired parquet SHA-256 为 `4a9bc3b678508255cfe0a6c6f82304f62459a996de8c40eb9c3df257a935a318`。启动前两台机器的输入与 launcher/validator 源码均逐文件 hash 一致。node64 和 node70 正被与本 lane 无关的任务占用，因此未抢占、未停止其服务；reference topology 一经落盘不能再追加节点。
 
-| Child / parent | Logical slots | Parent shape → child shape | P2 新值 | Target 误差 |
-| --- | ---: | --- | ---: | ---: |
-| `shapesolver_81db59832d86fab765e3e702` / `cuda_agent_ops_6764919bc05ec00942ec` | 5 | `[2,8,512,32,32] → [5,16,1897,86,64]` | 2 | 0.0648% |
-| `shapesolver_e1b5bf1d83a057e23cf86eb3` / `cuda_llm_201824` | 4 | `[64,128,32,32] → [128,512,64,132]` | 3 | 0.0795% |
-| `shapesolver_2470d5c8c9ddfb488971c3aa` / `cuda_llm_653385` | 3 | `[16,256,256] → [29,481,517]` | 0 | 0.0767% |
-| `shapesolver_c1cd6167c665eeef8e9f0a30` / `cuda_llm_789527` | 2 | `[128,512] → [28643,32768]` | 1 | 0.0080% |
+reference 完成后必须先把两个 node-local shard family 无覆盖地汇集到 canonical run，再执行：
 
-共同可审阅证据位于 canary 的 `analysis/summary.md`、`analysis/shape_bias_audit.md`、`analysis/changed_slots.tsv`、`analysis/review_samples.md` 和 `analysis/stratified_review_samples.md`。
+```bash
+python -m tools.data.synthesize.verify_shape_solver_runtime_shards \
+  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.balanced_v7 \
+  reference \
+  --expected-machine-count 2 \
+  --expected-gpus-per-machine 8 \
+  --expected-virtual-shards-per-gpu 8
 
-## 8-shard CPU / merge 验证
+python -m tools.data.synthesize.analyze_shape_solver_run \
+  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.balanced_v7
+```
 
-128 行输入还完成了 8-way modulo shard 集成：
+第一次 analyzer 只负责从完整 reference 生成 parent+child 双通过 allowlist。region 必须使用该精确 allowlist，并重新检查新增区域的 output effect。region 可以按启动时的空闲节点固定自己的 topology；最终 verifier 必须同时显式传入 region topology 和已冻结的 reference `2×8×8` topology。只有 region exact checker 与 `analyze_shape_solver_run --require-runtime-quality` 都通过后，才会产生全量 runtime review 集；它仍不会自动获得训练批准。
 
-- shard input：`shards.canary128.v4.8`，`shards.json` SHA-256 `444d2c746cf1bc353442cb50a17f055fabd14ad2ba81f4786288cddb905d14dd`；
-- shard runs：`run.canary128.v4.sharded8`，8/8 manifest 完成；
-- merge output：`run.canary128.v4.merged8`，contract 为 `shape_solver_shard_merge_v2`。
+## 证据与哈希
 
-合并后 `selected`、`targets`、`children` 和 `paired` 与非分片 `run.canary128.v4` 逐字节相同：
-
-| Artifact | 两个 run 的共同 SHA-256 |
+| Artifact | SHA-256 |
 | --- | --- |
-| `selected.parquet` | `4a662416213d7075fb448aa8f0fafafd545ed27d64775547d6c1c981c4503ee6` |
-| `targets.parquet` | `d49ef464d398e21885c79d345010bebd1fa71d06fafc7677e28c6516ba48caac` |
-| `static/children.parquet` | `39e9c6f17ab626c2a3aea2ae0e6d78570116de6ba245b323bd08d7502a69bfca` |
-| `static/paired.parquet` | `3a074c75c4e5af15810fc8849ee9a0bfe65c1b2d682571c89630cc1c747c1d3c` |
+| 输入 `selected.parquet` | `fc780d5ce11124c732b5edb9b965ceb9f190d43206cd8635ded1fe0a9b1cca1a` |
+| 输入 `selection.json` | `7f4a83f974c728d1b2763ef6136a2db8fee8bb31be6955c43fcce27fd0633e63` |
+| 1,024-way `shards.json` | `5e5ba62394c42a8fb2260aeddb59dd030b4fd2674d27a944d29805773249d81d` |
+| Full `static/children.parquet` | `4982dc0815f5947cd61cfeb01e1d35cfb679ce24e0d7ef96337c942a7abd5e44` |
+| Full `static/paired.parquet` | `4a9bc3b678508255cfe0a6c6f82304f62459a996de8c40eb9c3df257a935a318` |
+| Full `static/manifest.json` | `d2bf7460444633f6c46e0f8715cf7e6733b0796817ca3da02542f09f9aa09a15` |
+| Full `analysis/summary.json` | `751340b58f94f032b68a92abc478b3272745a375e7b76b6d780917085b6e4a08` |
+| Full `analysis/shape_bias_audit.json` | `540e68af560ee0619bc456d897dbe72dddd3add27f6c7dfaa8fc52b6eae33740` |
+| Full `analysis/stratified_review_samples.md` | `8608a16e717f32745aaa3d84af8bae271979ca39ead9fda90805aedbc08543c2` |
+| Canary `static/manifest.json` | `8e0c925aa1527688de3a115cbedc808a5568f4d21a6344ab98ec9ad8d154aefb` |
+| Canary runtime `analysis/summary.json` | `dbb6da841793a081a00745d38a40dde8feb7be4a30a81c52572e894fda99f741` |
 
-去除 merge 新增的 `shard_index` / `shard_source_row_index` provenance 后，两边的 128 个 decision 也一致；counts 和 skip reasons 一致。两个 manifest 本身不应字节相同，因为 merged manifest 额外绑定八个 shard manifest、merge tool、输入 shard ledger，并把 p2 observation scope 写为 globally merged static children。
-
-## 已验证与未验证边界
-
-当前证据只证明：精确 delta membership、确定性 target 复用、2–5 slot structural/storage 合同、源码改动边界、parent/child FakeTensor、自独立重解析的 identity 与 1000:1 balance、static shape-value audit，以及 8-shard merge 的 deterministic equivalence。
-
-当前证据没有证明：
-
-- 121 个 canary child 或未来全量 child 能在 H20 上通过 production KernelGym reference；
-- changed-region 对 output 有效，或不存在扩展后才产生的 dead tail；
-- runtime-eligible 子集仍满足 30%–50% p2 与其他 bias 门禁；
-- 12,318 个 parent 的全量 static 接受数、source/operator bias 或耗时；
-- 任何 CUDA solution correctness、speedup 或训练收益。
-
-因此不得把 canary 的 121 个 child 或未来 static merge 直接接入训练。只有完整 paired reference、changed-region、exact shard checker 和 `--require-runtime-quality` analyzer 都通过后，才可形成 runtime review 集；即使如此，训练仍需另行批准。
-
-## 后续汇集与验证顺序
-
-### 1. 后续运行前的资源和一致性检查
-
-继续 H20 阶段前先核对同一 commit 的工具、`input.recoverable12318`、`shards.1024` 和 merged artifact hash。曾观察到 node53 上有一套与本 lane 无关的 DeepSeek-V4-Flash TP8 vLLM 服务，占用约 93 GiB/卡；该状态可能已经变化。启动 H20 前必须在每台候选节点检查 `nvidia-smi`、compute process、CPU load、磁盘和 validation lock，不要假设 node53 或其他 H20 仍空闲。
-
-H20 launcher 会 fail-closed 检查可见 GPU idle 状态。一次 reference 或 region run 的 machine count / rank mapping 会写入 scheduler contract，启动后不能在同一证据目录中改 machine count 续跑。如果四台都空闲，可使用 4 台；如果 node53 或用户的新扩展任务仍在使用 GPU，可选其余空闲节点并重新连续编号，但要在启动前固定 mapping。
-
-### 2. 先补最终 canary 的 H20 门禁
-
-在一台确认空闲、可见 8 张 H20 的 KernelGym 容器内运行：
-
-```bash
-canary_run=Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.canary128.v4.merged8
-
-SYNTH_MACHINE_COUNT=1 \
-SYNTH_GPUS_PER_MACHINE=8 \
-SYNTH_VIRTUAL_SHARDS_PER_GPU=8 \
-SYNTH_TIMEOUT_SECONDS=180 \
-SYNTH_EXPECTED_MODE_CLASS=any \
-SYNTH_MAX_DEVICE_MEMORY_GIB=64 \
-SYNTH_EXPECTED_INPUT_SHA256=3a074c75c4e5af15810fc8849ee9a0bfe65c1b2d682571c89630cc1c747c1d3c \
-bash tools/data/synthesize/launch_reference_validation_shards.sh \
-  0 "${canary_run}/static/paired.parquet" "${canary_run}/h20/reference"
-
-python -m tools.data.synthesize.verify_shape_solver_runtime_shards \
-  "${canary_run}" reference
-python -m tools.data.synthesize.analyze_shape_solver_run "${canary_run}"
-
-SHAPE_REGION_MACHINE_COUNT=1 \
-SHAPE_REGION_GPUS_PER_MACHINE=8 \
-SHAPE_REGION_VIRTUAL_SHARDS_PER_GPU=8 \
-SHAPE_REGION_TIMEOUT_SECONDS=600 \
-SHAPE_REGION_TRIALS=3 \
-SHAPE_REGION_SEED=17 \
-bash tools/data/synthesize/launch_shape_region_validation.sh 0 "${canary_run}"
-
-python -m tools.data.synthesize.verify_shape_solver_runtime_shards \
-  "${canary_run}" region
-python -m tools.data.synthesize.analyze_shape_solver_run \
-  "${canary_run}" --require-runtime-quality
-```
-
-reference verify 后的第一次 analyzer 会生成 region allowlist。若跨节点运行，必须把 canonical run artifacts、完整 reference evidence 和生成的 allowlist 同步并逐文件校验后再启 region。
-
-### 3. 汇集并合并 12,318 条全量 CPU shards
-
-全量采用已存在的 1,024 个 modulo shards，并已按以下固定参数执行完毕：
-
-| 节点 | Rank | Shard ownership | 完成 manifest |
-| --- | ---: | --- | ---: |
-| node69_slime | 0 | 偶数 shard | 512 |
-| node70_dspark | 1 | 奇数 shard | 512 |
-
-launcher 使用 `SHAPE_CPU_MACHINE_COUNT=2`、`SHAPE_CPU_WORKERS=64` 和 `SHAPE_FAKE_TIMEOUT_SECONDS=30`。两个节点没有残留 solver process；任务正常跑完，没有被停止。输出位于各节点同名的 node-local 路径 `Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.sharded1024`。不要重新运行或覆盖这些目录。
-
-下一步只把 node69 的偶数 shard、node70 的奇数 shard 和各自日志汇集到一个 canonical shard-run root。汇集前后都要核对 1,024 个 manifest、shard ownership、artifact SHA 和 solver source SHA。下面的启动命令只用于说明本轮已使用的配置，不应再次执行：
-
-```bash
-machine_rank=0  # node70 使用 1
-
-SHAPE_CPU_MACHINE_COUNT=2 \
-SHAPE_CPU_WORKERS=64 \
-SHAPE_FAKE_TIMEOUT_SECONDS=30 \
-bash tools/data/synthesize/launch_variable_shape_solver_cpu_shards.sh \
-  "${machine_rank}" \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/shards.1024 \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.sharded1024
-```
-
-专用 wrapper 固定 module 为 `tools.data.synthesize.solve_variable_shape_delta`，并在运行和 resume 时要求 manifest contract 为 `shape_variable_multislot_solver_v5`，防止误用旧 exact-2 solver。两台的 rank-owned shards 完成汇集后再 merge：
-
-```bash
-python -m tools.data.synthesize.merge_shape_solver_shards \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318 \
-  --shard-input-root \
-    Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/shards.1024 \
-  --shard-run-root \
-    Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.sharded1024 \
-  --source-selected \
-    Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318/selected.parquet
-
-python -m tools.data.synthesize.analyze_shape_solver_run \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318
-```
-
-merge 会拒绝缺 shard、global index 重复、source row/hash 不匹配、solver contract/source hash 漂移和 artifact hash 错误。static analyzer 通过后仍需人工读取 source/operator/cardinality、target 尾部、p2/value concentration、fallback 和失败样本；不能把 128 canary 的 94.53% 接受率外推成全量结论。
-
-### 4. 全量 H20 reference 与 region
-
-全量 H20 命令沿用 canary 的两阶段顺序，把 `canary_run` 换成 `run.recoverable12318`，并把 `SYNTH_MACHINE_COUNT` / `SHAPE_REGION_MACHINE_COUNT` 设为实际锁定的空闲节点数。reference 启动前计算 full `static/paired.parquet` SHA-256，并在所有节点用同一个 `SYNTH_EXPECTED_INPUT_SHA256`；各节点使用连续且唯一的 machine rank。reference evidence 汇集并通过 exact checker 和 analyzer 后，再同步 analyzer 生成的 allowlist，启动 region，最后执行：
-
-```bash
-python -m tools.data.synthesize.verify_shape_solver_runtime_shards \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318 region
-python -m tools.data.synthesize.analyze_shape_solver_run \
-  Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318 \
-  --require-runtime-quality
-```
-
-只有这里的 runtime analyzer 才能给出最终 child 数与 runtime bias。不要复用旧 exact-2 lane 的 H20 allowlist、counts 或环境结论。
-
-## 当前源码绑定
-
-| 文件 | SHA-256 |
+| Source | SHA-256 |
 | --- | --- |
-| `prepare_variable_shape_delta.py` | `b1cb3ef5ad3fe0cb1a5f18d40c438285a5232819d4408bfdbe2d3b1072150aa3` |
-| `solve_variable_shape_delta.py` | `0ef18ff7650fee1680ee52d3b9694261ae104357565b5db37d267a9ed62d67ea` |
-| `solve_multidim_shape_coverage.py` | `04079b71e6f1c8f8b7037c19d9de931d9db76cd2e11ce5471db14d092dd7037a` |
-| `solve_shape_coverage.py` | `09bb44a956f3f7cab2a19469df4407baef5909c623f4bf9e9513cc71813bada0` |
-| `ai_shape_coverage.py` | `5d8214ceca39dc88db0518c7d90a49120e86638cada61c2cebcd91b160f7c132` |
-| `augment_prompt_tasks.py` | `ee5514948a46815f00378085a80935d1cf85068b78333925b35882b4e4626857` |
-| `launch_variable_shape_solver_cpu_shards.sh` | `305f1ec6a9646c79491063314e2abd3f0d400598e5551625fefc1f3fa1c9aff1` |
-| `launch_shape_solver_cpu_shards.sh` | `8d002ed80b8f363a2ae27204f2af8a0cb7c04dea5d039c9297db54dd6e8d2086` |
-| `shard_shape_solver_input.py` | `5896d44dfa2f425ec134912d8701a40363951341312a269e1b6c180b488e4395` |
-| `merge_shape_solver_shards.py` | `f35a0ef34354943a9730ca607376034d5f7cacc4754b0731d8f81543f5e922be` |
-| `analyze_shape_solver_run.py` | `3636a8f0b720b2d51902fd13f5886fc6babfb1f047603979d7cdfc573c72f133` |
-| `validate_train_mode_contract.py` | `691b626236b55e1b330534874a73d8f37e0a559fc35c9e788f4a2855981936fd` |
-| `validate_shape_region_liveness.py` | `cd4051e424286c3d8f60b1759daba7fc43b9655c94412b7be425d1d8c4c2536a` |
-| `verify_shape_solver_runtime_shards.py` | `3b44ceb04625f2c09552a88e44759cb62aa145f9362e71b350135cca88aa784f` |
+| `solve_variable_shape_delta.py` | `26c2298d6cb7cf5bfbd1320a56b665c2aa0d6d42d4235ee9c48dfd5efa1e3fe9` |
+| `launch_shape_solver_cpu_shards.sh` | `3ee9e2f4807b29a1f0d7b7157472e65e1e724d65590934d2008a18febcf87470` |
+| `launch_variable_shape_solver_cpu_shards.sh` | `16f1e1697def66020f9e649acdc94f94d79b7ecc0be8df6e4dea07cd57888698` |
+| `analyze_shape_solver_run.py` | `839f00e63bcae976130bfc262d7f563d6b8fbdd9b74d4d49d1b10a6d3ebbd8e7` |
+| `validate_shape_region_liveness.py` | `988e747beede5508aaaa9c5ef0404ce2d2cb55f8716e193b79aeee00f5b5347b` |
+| `verify_shape_solver_runtime_shards.py` | `22e416187b825aafb239b8bcd8e266141d547cb6c336146c6951d3a8835f1a3c` |
 | `launch_reference_validation_shards.sh` | `da63f011263caa0114d754090338304b57283002e814092b9de7ba63d46a4a38` |
 | `launch_shape_region_validation.sh` | `b1fa357bea9a7978a97325826bb1c4cade31eae657c1b323f89c66fe96cdf29f` |
 
-按要求没有为这些生产数据工具新增单元测试。发布 source-bound checkpoint 时保留了上表已被 canary manifest 绑定的源码字节，没有应用会整体改变源码 SHA-256 的 Black/isort/Ruff 自动改写；`py_compile`、四个 launcher 的 `bash -n`、关键 CLI `--help` 和真实 canary/merge 证据均已通过。后续若格式化或修改任一 source-bound 文件，必须从相应 selection/static/runtime 阶段重新生成证据，不能只改 manifest hash。
-
-本 handoff 记录的是 full CPU shard 完成点和后续可恢复边界，不是 runtime 完成报告；`training_approved=false`。
+按要求没有为这些生产数据工具新增单元测试。验证采用 `py_compile`、`bash -n`、CLI smoke、真实 manifest tamper rejection、deterministic replay、完整静态 artifact 和 H20 canary evidence。

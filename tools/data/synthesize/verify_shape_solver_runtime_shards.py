@@ -97,11 +97,10 @@ LAUNCHER_SOURCES = {
     / "tools/data/synthesize/launch_shape_region_validation.sh",
 }
 
-FULL_PROFILE = {
+DEFAULT_PROFILE = {
     "machine_count": 4,
     "gpus_per_machine": 8,
     "virtual_shards_per_gpu": 8,
-    "shard_count": 256,
 }
 REFERENCE_PROFILE = {
     "timeout_seconds": 180.0,
@@ -343,9 +342,20 @@ def _require_canonical_file(
     return path
 
 
-def _verify_full_profile(contract: Mapping[str, Any], *, phase: str) -> None:
+def _verify_profile(
+    contract: Mapping[str, Any],
+    *,
+    phase: str,
+    expected_topology: Mapping[str, int],
+) -> None:
+    expected_shard_count = (
+        expected_topology["machine_count"]
+        * expected_topology["gpus_per_machine"]
+        * expected_topology["virtual_shards_per_gpu"]
+    )
     expected = {
-        **FULL_PROFILE,
+        **expected_topology,
+        "shard_count": expected_shard_count,
         **(REFERENCE_PROFILE if phase == "reference" else REGION_PROFILE),
     }
     mismatches = {
@@ -354,7 +364,7 @@ def _verify_full_profile(contract: Mapping[str, Any], *, phase: str) -> None:
         if contract.get(field) != value
     }
     if mismatches:
-        _fail(f"{phase} scheduler is not the fixed full-run profile: {mismatches}")
+        _fail(f"{phase} scheduler does not match the expected profile: {mismatches}")
 
 
 def _load_scheduler_contracts(
@@ -947,12 +957,20 @@ def _region_tasks(
     return tasks
 
 
-def _verified_canonical_reference_passes(run_dir: Path) -> dict[str, bool]:
+def _verified_canonical_reference_passes(
+    run_dir: Path,
+    *,
+    expected_topology: Mapping[str, int],
+) -> dict[str, bool]:
     output_dir = (run_dir / "h20" / "reference").resolve()
     if not output_dir.is_dir():
         _fail(f"canonical reference evidence is missing: {output_dir}")
     contract, _ = _load_scheduler_contracts(output_dir, phase="reference")
-    _verify_full_profile(contract, phase="reference")
+    _verify_profile(
+        contract,
+        phase="reference",
+        expected_topology=expected_topology,
+    )
     _verify_sources(output_dir, contract, phase="reference")
     _verify_shard_files(
         output_dir, phase="reference", shard_count=int(contract["shard_count"])
@@ -992,6 +1010,8 @@ def _verify_region(
     output_dir: Path,
     canonical_dir: Path,
     contract: Mapping[str, Any],
+    *,
+    expected_reference_topology: Mapping[str, int],
 ) -> dict[str, Any]:
     selected_path = _require_canonical_file(
         contract,
@@ -1018,7 +1038,10 @@ def _verify_region(
         expected_path=run_dir / "analysis" / "region_reference_both_pass_uuids.txt",
     )
     all_tasks = _region_tasks(selected_path, children_path, manifest_path)
-    pass_by_uuid = _verified_canonical_reference_passes(run_dir)
+    pass_by_uuid = _verified_canonical_reference_passes(
+        run_dir,
+        expected_topology=expected_reference_topology,
+    )
     missing_reference_uuids = sorted(
         {
             str(task[field])
@@ -1171,7 +1194,14 @@ def _verify_region(
     }
 
 
-def verify(run_dir: Path, phase: str, output_dir: Path | None) -> dict[str, Any]:
+def verify(
+    run_dir: Path,
+    phase: str,
+    output_dir: Path | None,
+    *,
+    expected_topology: Mapping[str, int] = DEFAULT_PROFILE,
+    expected_reference_topology: Mapping[str, int] | None = None,
+) -> dict[str, Any]:
     resolved_run = run_dir.expanduser().resolve()
     if not resolved_run.is_dir():
         _fail(f"run_dir is not a directory: {resolved_run}")
@@ -1181,9 +1211,18 @@ def verify(run_dir: Path, phase: str, output_dir: Path | None) -> dict[str, Any]
     )
     if not resolved_output.is_dir():
         _fail(f"output_dir is not a directory: {resolved_output}")
+    reference_topology = (
+        expected_topology
+        if expected_reference_topology is None
+        else expected_reference_topology
+    )
 
     contract, contracts = _load_scheduler_contracts(resolved_output, phase=phase)
-    _verify_full_profile(contract, phase=phase)
+    _verify_profile(
+        contract,
+        phase=phase,
+        expected_topology=expected_topology,
+    )
     _verify_sources(resolved_output, contract, phase=phase)
     shard_count = int(contract["shard_count"])
     _verify_shard_files(resolved_output, phase=phase, shard_count=shard_count)
@@ -1192,7 +1231,13 @@ def verify(run_dir: Path, phase: str, output_dir: Path | None) -> dict[str, Any]
             resolved_run, resolved_output, canonical_dir, contract
         )
     else:
-        details = _verify_region(resolved_run, resolved_output, canonical_dir, contract)
+        details = _verify_region(
+            resolved_run,
+            resolved_output,
+            canonical_dir,
+            contract,
+            expected_reference_topology=reference_topology,
+        )
     return {
         "ok": True,
         "phase": phase,
@@ -1206,6 +1251,10 @@ def verify(run_dir: Path, phase: str, output_dir: Path | None) -> dict[str, Any]
         "shards": shard_count,
         "launcher_source_sha256": contract["launcher_source_sha256"],
         "validator_source_sha256": contract["validator_source_sha256"],
+        "expected_topology": dict(expected_topology),
+        "expected_reference_topology": (
+            dict(reference_topology) if phase == "region" else None
+        ),
         **details,
     }
 
@@ -1220,13 +1269,90 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="staged/gathered evidence directory (default: RUN_DIR/h20/PHASE)",
     )
+    parser.add_argument(
+        "--expected-machine-count",
+        type=int,
+        default=DEFAULT_PROFILE["machine_count"],
+    )
+    parser.add_argument(
+        "--expected-gpus-per-machine",
+        type=int,
+        default=DEFAULT_PROFILE["gpus_per_machine"],
+    )
+    parser.add_argument(
+        "--expected-virtual-shards-per-gpu",
+        type=int,
+        default=DEFAULT_PROFILE["virtual_shards_per_gpu"],
+    )
+    parser.add_argument(
+        "--expected-reference-machine-count",
+        type=int,
+        help=(
+            "region only: expected canonical reference machine count "
+            "(default: --expected-machine-count)"
+        ),
+    )
+    parser.add_argument(
+        "--expected-reference-gpus-per-machine",
+        type=int,
+        help=(
+            "region only: expected canonical reference GPUs per machine "
+            "(default: --expected-gpus-per-machine)"
+        ),
+    )
+    parser.add_argument(
+        "--expected-reference-virtual-shards-per-gpu",
+        type=int,
+        help=(
+            "region only: expected canonical reference virtual shards per GPU "
+            "(default: --expected-virtual-shards-per-gpu)"
+        ),
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    expected_topology = {
+        "machine_count": args.expected_machine_count,
+        "gpus_per_machine": args.expected_gpus_per_machine,
+        "virtual_shards_per_gpu": args.expected_virtual_shards_per_gpu,
+    }
+    reference_overrides = {
+        "machine_count": args.expected_reference_machine_count,
+        "gpus_per_machine": args.expected_reference_gpus_per_machine,
+        "virtual_shards_per_gpu": args.expected_reference_virtual_shards_per_gpu,
+    }
+    expected_reference_topology = {
+        field: expected_topology[field] if override is None else override
+        for field, override in reference_overrides.items()
+    }
+    invalid_topology = any(
+        type(value) is not int or value <= 0
+        for topology in (expected_topology, expected_reference_topology)
+        for value in topology.values()
+    )
+    if invalid_topology:
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "phase": args.phase,
+                    "error": "expected topology values must be positive integers",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        )
+        return 2
     try:
-        summary = verify(args.run_dir, args.phase, args.output_dir)
+        summary = verify(
+            args.run_dir,
+            args.phase,
+            args.output_dir,
+            expected_topology=expected_topology,
+            expected_reference_topology=expected_reference_topology,
+        )
     except Exception as exc:  # Fail closed with one machine-readable line.
         summary = {
             "ok": False,
