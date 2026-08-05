@@ -4,6 +4,8 @@
 
 所有 intervention child 统一从 64,315 条 immutable canonical parent 派生，各扩展 lane 独立生成，禁止从其他 child 或已经拼接的 review union 二次派生。每个 child 只承载一个 primary intervention，先用等预算单轴实验测量收益，再决定最终 mixture；当前没有证据支持直接按 KernelBench 频率复制分布，也没有证据支持把多个扩展做 Cartesian product。没有 parent 的 semantic synthetic task 使用独立 generator/provenance root，不能伪装成 intervention child。
 
+执行范围更新（2026-08-05）：另一台 KernelGym 机器只负责小批量构造和验证，任一 non-shape lane 单次最多 5,000 个 parent/child；当前 random/value 以 1,000-parent canary 为交付终点，不在该机器启动 full-lane 扩增。eligible pool 只用于报告可扩展性，不构成继续放量的授权。本轮允许 A800 作为权威 canary 验收环境，只要完整记录 GPU/Torch/CUDA/cuDNN/KernelGym 和 source-bound runtime fingerprint；不要求为了 H20 硬件一致性重跑。
+
 shape 扩展由当前会话继续负责。另一台 KernelGym 机器并行负责 random/value、coherent dtype、layout、semantic/operator 和 source/mode coverage。两边共享同一份 parent、manifest 和验证合同；runtime policy 不一致的结果只算 static candidate，不能直接合并为统一的 runtime-accepted partition。
 
 所有现有 v4 产物都处于 review 状态，`training_approved=false`。当前训练仍使用 40,307 条 v3 数据。最终数据集必须经过 cross-lane 去重、provenance/license 审计、统一 runtime evidence 检查和受控训练 ablation，不能由任一 lane 单独发布。
@@ -37,29 +39,38 @@ KernelBench 只用于诊断覆盖缺口和评测，不作为训练数据来源�
 | row 含 `rand` | 2.5% | 100% | 只表示 factory presence，不等于最终值分布 |
 | row 含 `randint` | 9.5% | 1.2% | factory presence 是多标签统计，各行不能相加 |
 
-tensor numel、所有 direct input 的 aggregate bytes、allocator peak、operator workspace 和 runtime memory 是五种不同口径。shape lane 的目标按 aggregate direct-input bytes 定义，H20 runtime 决定实际可行性。旧的 32×、24×/49 GiB 都不再作为 shape 接受门禁。
+tensor numel、所有 direct input 的 aggregate bytes、allocator peak、operator workspace 和 runtime memory 是五种不同口径。shape lane 的目标按 aggregate direct-input bytes 定义，冻结后的目标 runtime 环境决定实际可行性。旧的 32×、24×/49 GiB 都不再作为 shape 接受门禁。
 
 ## 分工和边界
 
 | 工作面 | Owner | 当前目标 | 禁止事项 |
 | --- | --- | --- | --- |
 | Shape | 当前会话 | 独立产出 shape partition 和统一交付 manifest | 另一台机器不生成、不验证、不调度 shape，也不等待 shape 进度 |
-| Random/value | 另一台 KernelGym 机器 | value-only 单轴 child；补 Uniform、signed Uniform、boundary，再扩展可证明安全的 value family | 不同时改 shape/dtype/layout；不把 Poisson、multinomial 当通用连续输入替换 |
+| Random/value | 另一台 KernelGym 机器 | value-only 单轴 child；只生成 `uniform_01`、`signed_uniform`、`poisson_counts`、`multinomial_categories` | 不生成 `boundary_pm1`；不同时改 shape/dtype/layout；不把 Poisson、multinomial 当通用连续输入替换 |
 | Dtype | 另一台 KernelGym 机器 | parameter-free/proven-compatible input dtype，或 coherent precision sibling | 不只改 input factory 后让 FP16/BF16 撞 FP32 parameter、buffer 或 operand |
 | Layout | 另一台 KernelGym 机器 | 独立覆盖 transposed stride、slice/storage offset、zero stride、memory format | 不和 value/dtype 先做组合；不只依赖源码形式，必须检查 runtime stride |
 | Semantic/operator | 另一台 KernelGym 机器 | 补薄弱 atomic family 和 heterogeneous graph cell | 不继续堆 shape-preserving pointwise 长链；不从 KernelBench 复制评测题 |
 | Source/mode/provenance | 另一台机器生成，两边共同验收 | 增加合规 lineage 和 mode/interface 覆盖，记录 license/provenance | provenance 不清的数据不得进入 review union |
 | Cross-lane merge 和训练实验 | 统一 owner | 去重、统一 evidence、等预算 ablation、确定 mixture | 任一 lane 不得自行标记 `training_approved=true` |
 
-另一台机器可以完成 static 和 H20 canary。只有 launcher、validator、KernelGym checkout、Torch/CUDA/GPU 环境及 runtime policy fingerprint 全部一致时，它的 H20 结果才是可直接合并的 authoritative evidence；否则应保留完整 raw audit，之后在统一环境重跑。
+另一台机器可以完成 static 和 A800/H20 canary。A800 或 H20 均可产生 authoritative canary evidence，前提是完整绑定 launcher、validator、KernelGym checkout、Torch/CUDA/GPU 环境及 runtime policy fingerprint；环境不同的结果必须作为独立 evidence partition 管理，不能静默混合。
 
 ## 另一台机器负责的构造合同
 
 ### Random/value
 
-下一轮只生成 value-only child，shape、dtype、layout 和 `Model.forward` 保持不变。每个 parent 用 stable hash 指定一个 value family，避免同一 parent 展开全部 family 形成 Cartesian amplification。
+random/value 只生成 value-only child，shape、dtype、layout、`Model.forward` 和 `get_init_inputs` 保持不变。每个 parent 用 stable hash 指定一个 eligible family，避免同一 parent 展开全部 family 形成 Cartesian amplification。本轮使用确定性 solver，不需要 LLM：
 
-优先 family 为 Uniform `[0, 1)`、signed Uniform `[-1, 1)` 和 finite sign/boundary。随后按独立 cell 增加 zero-heavy、sparse、repeated values 和 bounded magnitude tail。NaN/Inf 只用于 operator contract 明确允许的任务。Poisson 需要独立 rate cells；multinomial 只进入 probability/index 语义任务。
+- `uniform_01`：将原 `randn` draw 映射到 `[0, 1)`；
+- `signed_uniform`：将原 draw 映射到 `[-1, 1)`；
+- `poisson_counts`：由原 draw 构造有界正 rate，并用 stable seed 的局部 generator 采样非负整数值；
+- `multinomial_categories`：仅用于静态 last dimension ≥2 的输入，以最后一维构造概率并采样 category id。
+
+Poisson 和 multinomial 的结果仍编码在原浮点 dtype 中，并保持原 shape、layout 和全局 RNG 状态。它们是受约束的 value coverage cell，不是通用连续输入替换；是否可接受必须由 paired parent/child reference、support 检查和 output-liveness 决定，不能仅凭静态构造宣称语义安全。`boundary_pm1` 已从当前合同移除。后续 zero-heavy、sparse、repeated values、bounded magnitude tail 和 NaN/Inf 不属于本轮。
+
+Poisson runtime evidence 必须从 parent 重算同一 rate mapping，报告固定区间的 rate histogram 和 sampled count histogram，并分别校验频次守恒；只报 min/max 不足以验收。Multinomial 必须按实际 runtime dtype 检查 category ID 的精确整数表示上限，并报告 last-dimension cardinality。
+
+2026-08-05 的 1k A800 canary 已完成：1,000 个 candidate 中 850 个 parent/child reference 双通过，792 个再通过 value/output liveness；accepted family 为 Multinomial 205、Poisson 209、signed Uniform 189、Uniform `[0,1)` 189，`boundary_pm1=0`。产物仍为 review-only，详见 `handoffs/data/synthesize/RANDOM_VALUE_CANARY.md`。
 
 旧 pilot 的 306 个 value intervention 中有 260 个 child pass，但其中 208 个同时改了 shape，且没有 paired parent runtime。该结果只能说明构造可执行，不能给出 value intervention 的独立通过率。新 canary 必须 paired 运行 parent/child，并把 evaluator failure、OOM、reference failure 和 intervention-induced failure 分开。
 
@@ -106,18 +117,19 @@ immutable canonical parents or generator/provenance roots
   -> lane-local deterministic selection/generation
   -> source/AST/static feasibility
   -> 1k canary + manual diff review
-  -> paired H20 reference
+  -> paired authoritative runtime reference（本轮 A800 可验收）
   -> intervention-specific liveness
   -> lane bias and failure audit
-  -> full lane run
+  -> ≤1k random/value canary handoff
+  -> any further scale-up requires separate authorization
   -> cross-lane identity/provenance/evidence merge
   -> equal-budget training ablation
   -> mixture decision and explicit training approval
 ```
 
-canary 的 acceptance rate 用于估算 full-run 成本和暴露构造问题，不设成训练价值代理。每轮至少人工复核不同 source、operator、target cell、成功与失败的真实 reference diff 和 raw runtime audit。
+canary 的 acceptance rate 用于估算后续运行成本和暴露构造问题，不设成训练价值代理。本机所有 non-shape 单次构造或验证不超过 5,000；当前 random/value 交付上限为 1,000，不因 eligible pool 大小自动放量。每轮至少人工复核不同 source、operator、target cell、成功与失败的真实 reference diff 和 raw runtime audit。
 
-这些生产数据工具不新增单元测试。验证依赖 `py_compile`、CLI/launcher syntax、真实 canary、deterministic shard merge、exact manifest checker 和人工样本复核；任何 source-bound 工具改动都会使旧 manifest 的 source hash 失效，必须重建相应 evidence。
+生产数据路径不新增单元测试，继续依赖 `py_compile`、CLI/launcher syntax、真实 canary、deterministic shard merge、exact manifest checker 和人工样本复核。任何 source-bound generator/validator 改动都会使旧 manifest 或 runtime binding 的 source hash 失效，必须重建相应 evidence。
 
 ## Lane artifact 和 manifest 合同
 
@@ -150,7 +162,7 @@ manifest 一行对应一行 parquet，顺序固定，并包含：
 
 | Lane | 必报分布 | 必报 failure attribution |
 | --- | --- | --- |
-| Random/value | family、factory、range/sign/zero/sparsity/magnitude、source/operator 条件分布 | evaluator、domain、numerical、OOM、joint contamination |
+| Random/value | family、factory、support、rate/count 分布、category cardinality、source/operator 条件分布；另报 multinomial last-dimension eligibility 和各 family 的 paired/liveness 拒绝率 | evaluator、domain、numerical、OOM、joint contamination |
 | Dtype | target dtype、parameter/buffer/constant 一致性、cast/promotion、source/operator | dtype mismatch、unsupported op、tolerance、implicit FP32 fallback |
 | Layout | pattern、rank、stride、offset、contiguity、source/operator | intervention erased、unsupported stride、evaluator、reference |
 | Semantic/source | family、topology、op count、shape-changing/stateful/structured cells、lineage | invalid graph、dead op、mode/state、provenance/license、evaluator |
@@ -170,7 +182,7 @@ manifest 一行对应一行 parquet，顺序固定，并包含：
 
 当前 assembler 要求 accepted partition 的 `runtime_policy_fingerprint` 和 GPU/Torch/CUDA 环境一致。推荐在统一当前环境重新验证旧 908 行，再和新 lane 合并。另一种方案是实现 versioned semantic-compatible policy projection；该方案需要显式 review，不能通过忽略 tool hash 或放松检查静默合并。
 
-authoritative H20 前先由最终 merge owner 冻结 Git commit、container digest、KernelGym checkout、Torch/CUDA、GPU type、launcher、validator 和 evaluator policy。tuple/structured-output 等 evaluator 修复必须在 freeze 前完成。freeze 前的 H20 结果只算 canary；旧 908 行也在 freeze 后重验，避免反复产生不兼容 evidence。
+authoritative runtime evidence 前先由最终 merge owner 冻结 Git commit、container digest、KernelGym checkout、Torch/CUDA、GPU type、launcher、validator 和 evaluator policy。tuple/structured-output 等 evaluator 修复必须在 freeze 前完成。freeze 前的结果只算 canary；旧 908 行也在 freeze 后重验，避免反复产生不兼容 evidence。
 
 ### Shape partition 的汇合边界
 

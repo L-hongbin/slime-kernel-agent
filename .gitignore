@@ -4,6 +4,15 @@ __pycache__/
 *$py.class
 
 data/
+!tools/data/
+!tools/data/synthesize/
+!tools/data/synthesize/analyze_value_run.py
+!tools/data/synthesize/launch_value_liveness_shards.sh
+!tools/data/synthesize/solve_value_coverage.py
+!tools/data/synthesize/validate_value_liveness.py
+!handoffs/data/
+!handoffs/data/synthesize/
+!handoffs/data/synthesize/RANDOM_VALUE_CANARY.md
 
 # C extensions
 *.so
