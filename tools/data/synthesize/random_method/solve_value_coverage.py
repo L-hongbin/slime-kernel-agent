@@ -53,7 +53,7 @@ from tools.data.synthesize.augment_prompt_tasks import (
     analyze_code,
 )
 
-CONTRACT_VERSION = "random_value_only_solver_v2"
+CONTRACT_VERSION = "random_value_only_solver_v3"
 GENERATOR_VERSION = "isolated_distribution_mapping_v2"
 ASSIGNMENT_VERSION = "stable_parent_hash_single_family_v2"
 SELECTION_VERSION = "source_operator_family_proportional_largest_remainder_v1"
@@ -62,6 +62,9 @@ EXPECTED_CANONICAL_PARENT_ROWS = 64_315
 VALUE_FAMILIES = ("uniform_01", "signed_uniform", "poisson_counts", "multinomial_categories")
 LOCAL_GENERATOR_MAX_SEED = 2**63 - 1
 MAX_AUTHORIZED_CANDIDATES = 5_000
+SOURCE_BINDING_VERSION = "random_value_input_source_binding_v1"
+SHAPE_RESAMPLE_CONTRACT = "shape_runtime_single_changed_tensor_coverage_resample_v3"
+SHAPE_RESAMPLE_SELECTION = "shape_cells_proportional_quota_with_secondary_marginals_v3"
 REAL_FLOAT_DTYPES = frozenset(
     {
         "torch.bfloat16",
@@ -107,6 +110,13 @@ class EligibleParent:
     @property
     def stratum(self) -> tuple[str, str, str]:
         return (self.source_family, self.operator_bucket, self.assigned_family)
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceContext:
+    kind: str
+    binding: Mapping[str, Any]
+    resample_manifests: tuple[Mapping[str, Any], ...] | None
 
 
 def _canonical_json(value: Any) -> str:
@@ -311,6 +321,294 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
         ),
         "eligible",
     )
+
+
+def _read_jsonl_objects(path: Path, *, label: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"cannot read {label}: {path}") from exc
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid JSON in {label} at {path}:{line_number}") from exc
+        if not isinstance(row, dict):
+            raise ValueError(f"non-object JSON in {label} at {path}:{line_number}")
+        rows.append(row)
+    return rows
+
+
+def _require_resample_artifact(summary: Mapping[str, Any], key: str, expected_path: Path) -> str:
+    artifacts = summary.get("artifacts")
+    if not isinstance(artifacts, Mapping) or not isinstance(artifacts.get(key), Mapping):
+        raise ValueError(f"shape resample summary lacks artifact binding: {key}")
+    record = artifacts[key]
+    expected_resolved = str(expected_path.resolve())
+    if record.get("path") != expected_resolved:
+        raise ValueError(f"shape resample artifact path mismatch for {key}")
+    recorded_sha256 = record.get("sha256")
+    if not isinstance(recorded_sha256, str) or len(recorded_sha256) != 64:
+        raise ValueError(f"shape resample artifact SHA is invalid for {key}")
+    actual_sha256 = _sha256_file(expected_path)
+    if recorded_sha256 != actual_sha256:
+        raise ValueError(f"shape resample artifact SHA mismatch for {key}")
+    return actual_sha256
+
+
+def _shape_resample_source_context(
+    input_path: Path,
+    source_sha256: str,
+    parquet: pq.ParquetFile,
+) -> SourceContext:
+    output_dir = input_path.resolve().parent
+    summary_path = output_dir / "summary.json"
+    manifest_path = output_dir / "manifest.jsonl"
+    eligibility_path = output_dir / "eligibility.jsonl"
+    for path in (summary_path, manifest_path, eligibility_path):
+        if not path.is_file():
+            raise ValueError(f"non-canonical input lacks complete shape-resample siblings: {path}")
+    try:
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid shape resample summary: {summary_path}") from exc
+    if not isinstance(summary, Mapping):
+        raise ValueError("shape resample summary must be an object")
+    if summary.get("contract_version") != SHAPE_RESAMPLE_CONTRACT:
+        raise ValueError("shape resample contract is not the frozen production version")
+    if summary.get("selection_version") != SHAPE_RESAMPLE_SELECTION:
+        raise ValueError("shape resample selection contract is not the frozen production version")
+    row_count = parquet.metadata.num_rows
+    if row_count != MAX_AUTHORIZED_CANDIDATES:
+        raise ValueError(f"shape resample must contain exactly {MAX_AUTHORIZED_CANDIDATES} rows, found {row_count}")
+    if summary.get("limit") != row_count or summary.get("selected_rows") != row_count:
+        raise ValueError("shape resample selected count does not match its parquet")
+    if summary.get("training_approved") is not False:
+        raise ValueError("shape resample has an invalid training approval state")
+    proof = summary.get("proof")
+    required_true = {
+        "runtime_eligible_shape_children_only",
+        "random_static_eligibility_checked_before_sampling",
+        "unique_shape_child_uuid",
+        "unique_canonical_parent_uuid",
+        "all_occupied_joint_cells_covered",
+        "all_shape_marginals_covered",
+        "sampled_factory_is_shape_changed",
+        "secondary_marginal_drift_gate_passed",
+        "rows_preserved_exactly",
+    }
+    if not isinstance(proof, Mapping) or any(proof.get(key) is not True for key in required_true):
+        raise ValueError("shape resample proof is incomplete or failed")
+    if proof.get("training_approved") is not False:
+        raise ValueError("shape resample proof has an invalid training approval state")
+    maximum_tvd = summary.get("maximum_marginal_total_variation")
+    if type(maximum_tvd) not in (int, float) or not 0 <= float(maximum_tvd) <= 0.05:
+        raise ValueError("shape resample marginal threshold is invalid")
+    marginal_audit = summary.get("marginal_audit")
+    if not isinstance(marginal_audit, Mapping) or not marginal_audit:
+        raise ValueError("shape resample marginal audit is missing")
+    for name, audit in marginal_audit.items():
+        if not isinstance(audit, Mapping) or audit.get("passed") is not True:
+            raise ValueError(f"shape resample marginal failed: {name}")
+        tvd = audit.get("total_variation")
+        if type(tvd) not in (int, float) or not 0 <= float(tvd) <= float(maximum_tvd):
+            raise ValueError(f"shape resample marginal TVD is invalid: {name}")
+    population = summary.get("population")
+    selected = summary.get("selected")
+    if not isinstance(population, Mapping) or not isinstance(selected, Mapping):
+        raise ValueError("shape resample population/selection audit is missing")
+    if selected.get("covered_joint_cells") != population.get("occupied_joint_cells"):
+        raise ValueError("shape resample does not cover every occupied joint cell")
+
+    selected_sha256 = _require_resample_artifact(summary, "selected", input_path)
+    if selected_sha256 != source_sha256:
+        raise ValueError("shape resample selected SHA differs from the input SHA")
+    manifest_sha256 = _require_resample_artifact(summary, "manifest", manifest_path)
+    eligibility_sha256 = _require_resample_artifact(summary, "eligibility", eligibility_path)
+    _require_resample_artifact(summary, "review", output_dir / "review_samples.md")
+    manifests = _read_jsonl_objects(manifest_path, label="shape resample manifest")
+    if len(manifests) != row_count:
+        raise ValueError("shape resample manifest row count differs from selected parquet")
+    eligibility = _read_jsonl_objects(eligibility_path, label="shape resample eligibility")
+    if len(eligibility) != summary.get("runtime_eligible_shape_children"):
+        raise ValueError("shape resample eligibility row count differs from its summary")
+    if sum(row.get("random_static_eligible") is True for row in eligibility) != summary.get(
+        "random_static_eligible_shape_children"
+    ):
+        raise ValueError("shape resample random-static eligibility count differs from its summary")
+    if any(row.get("eligibility_universe") != "shape_runtime_eligible_children" for row in eligibility):
+        raise ValueError("shape resample eligibility contains a row outside its declared universe")
+
+    source_runs = summary.get("source_runs")
+    if not isinstance(source_runs, list) or not source_runs:
+        raise ValueError("shape resample source-run binding is missing")
+    for source_index, source in enumerate(source_runs):
+        if not isinstance(source, Mapping):
+            raise ValueError(f"shape resample source run is invalid: {source_index}")
+        for path_field, sha_field in (
+            ("run_summary_path", "run_summary_sha256"),
+            ("changed_slots_path", "changed_slots_sha256"),
+            ("children_path", "children_sha256"),
+        ):
+            path_value = source.get(path_field)
+            sha_value = source.get(sha_field)
+            if not isinstance(path_value, str) or not Path(path_value).is_absolute():
+                raise ValueError(f"shape resample source path is invalid: {source_index}:{path_field}")
+            if not isinstance(sha_value, str) or _sha256_file(Path(path_value)) != sha_value:
+                raise ValueError(f"shape resample source SHA mismatch: {source_index}:{sha_field}")
+
+    provenance = summary.get("provenance")
+    if not isinstance(provenance, Mapping):
+        raise ValueError("shape resample source-code provenance is missing")
+    git_commit = provenance.get("git_commit")
+    if not isinstance(git_commit, str) or len(git_commit) != 40:
+        raise ValueError("shape resample Git commit is invalid")
+    resampler_path = _REPO_ROOT / "tools/data/synthesize/resample_shape_coverage.py"
+    augment_path = _REPO_ROOT / "tools/data/synthesize/augment_prompt_tasks.py"
+    dependencies = provenance.get("dependency_source_sha256")
+    if not isinstance(dependencies, Mapping):
+        raise ValueError("shape resample dependency provenance is missing")
+    expected_sources = {
+        "resampler_source_sha256": (resampler_path, provenance.get("resampler_source_sha256")),
+        "augment_prompt_tasks.py": (augment_path, dependencies.get("augment_prompt_tasks.py")),
+        "solve_value_coverage.py": (Path(__file__).resolve(), dependencies.get("solve_value_coverage.py")),
+    }
+    for label, (path, recorded_sha256) in expected_sources.items():
+        actual_sha256 = _sha256_file(path)
+        if recorded_sha256 != actual_sha256 or _git_blob_sha256(git_commit, path) != actual_sha256:
+            raise ValueError(f"shape resample source provenance mismatch: {label}")
+
+    binding = {
+        "contract_version": SOURCE_BINDING_VERSION,
+        "source_kind": "shape_coverage_resample",
+        "source_artifact_path": str(input_path.resolve()),
+        "source_artifact_sha256": source_sha256,
+        "source_rows": row_count,
+        "resample_contract_version": SHAPE_RESAMPLE_CONTRACT,
+        "resample_selection_version": SHAPE_RESAMPLE_SELECTION,
+        "resample_summary_path": str(summary_path.resolve()),
+        "resample_summary_sha256": _sha256_file(summary_path),
+        "resample_manifest_path": str(manifest_path.resolve()),
+        "resample_manifest_sha256": manifest_sha256,
+        "resample_eligibility_path": str(eligibility_path.resolve()),
+        "resample_eligibility_sha256": eligibility_sha256,
+        "resampler_git_commit": git_commit,
+        "resampler_source_sha256": provenance["resampler_source_sha256"],
+    }
+    return SourceContext(
+        kind="shape_coverage_resample",
+        binding=binding,
+        resample_manifests=tuple(manifests),
+    )
+
+
+def _source_context(input_path: Path, source_sha256: str, parquet: pq.ParquetFile) -> SourceContext:
+    if source_sha256 == EXPECTED_CANONICAL_PARENT_SHA256:
+        if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
+            raise ValueError(
+                f"canonical parent row mismatch: expected {EXPECTED_CANONICAL_PARENT_ROWS}, "
+                f"found {parquet.metadata.num_rows}"
+            )
+        return SourceContext(
+            kind="canonical_parent",
+            binding={
+                "contract_version": SOURCE_BINDING_VERSION,
+                "source_kind": "canonical_parent",
+                "source_artifact_path": str(input_path.resolve()),
+                "source_artifact_sha256": source_sha256,
+                "source_rows": parquet.metadata.num_rows,
+            },
+            resample_manifests=None,
+        )
+    return _shape_resample_source_context(input_path, source_sha256, parquet)
+
+
+def _resample_stable_sha256(*parts: object) -> str:
+    return _sha256_bytes(":".join(str(part) for part in parts).encode("utf-8"))
+
+
+def _verify_shape_resample_row(
+    row: Mapping[str, Any],
+    eligible: EligibleParent,
+    manifest: Mapping[str, Any],
+) -> None:
+    index = eligible.source_row_index
+    if manifest.get("contract_version") != SHAPE_RESAMPLE_CONTRACT:
+        raise ValueError(f"shape resample manifest contract mismatch at row {index}")
+    if manifest.get("selection_version") != SHAPE_RESAMPLE_SELECTION:
+        raise ValueError(f"shape resample selection contract mismatch at row {index}")
+    if manifest.get("selected_index") != index:
+        raise ValueError(f"shape resample selected index mismatch at row {index}")
+    if manifest.get("shape_child_uuid") != eligible.parent_uuid:
+        raise ValueError(f"shape resample child UUID mismatch at row {index}")
+    canonical_parent_uuid = _nested(row, "extra_info.v4.parent_uuid")
+    if not isinstance(canonical_parent_uuid, str) or canonical_parent_uuid != manifest.get("canonical_parent_uuid"):
+        raise ValueError(f"shape resample canonical parent mismatch at row {index}")
+    if manifest.get("reference_sha256") != eligible.parent_reference_sha256:
+        raise ValueError(f"shape resample reference SHA mismatch at row {index}")
+    if manifest.get("assigned_random_family") != eligible.assigned_family:
+        raise ValueError(f"shape resample random family mismatch at row {index}")
+    if manifest.get("aggregate_input_bytes") != eligible.input_bytes:
+        raise ValueError(f"shape resample aggregate input bytes mismatch at row {index}")
+    changed_indices = manifest.get("changed_factory_indices")
+    sampled_index = manifest.get("sampled_factory_index")
+    if (
+        not isinstance(changed_indices, list)
+        or any(type(value) is not int for value in changed_indices)
+        or type(sampled_index) is not int
+        or sampled_index not in changed_indices
+    ):
+        raise ValueError(f"shape resample sampled factory is not shape-changed at row {index}")
+    code = _nested(row, "reward_model.ground_truth")
+    if not isinstance(code, str):
+        raise ValueError(f"shape resample code is missing at row {index}")
+    tree = ast.parse(code)
+    get_inputs = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "get_inputs"
+        ),
+        None,
+    )
+    if get_inputs is None:
+        raise ValueError(f"shape resample get_inputs is missing at row {index}")
+    records, _ = _factory_records(tree, get_inputs, _module_constant_environment(tree))
+    records = sorted(records, key=lambda record: (record.line_number, record.column_offset))
+    if sampled_index < 0 or sampled_index >= len(records):
+        raise ValueError(f"shape resample sampled factory index is invalid at row {index}")
+    sampled = records[sampled_index]
+    if (
+        manifest.get("sampled_factory_name") != sampled.name
+        or manifest.get("sampled_factory_dtype") != sampled.dtype_name
+        or manifest.get("sampled_shape") != list(sampled.shape)
+    ):
+        raise ValueError(f"shape resample sampled factory evidence mismatch at row {index}")
+    original_source_sha256 = manifest.get("source_artifact_sha256")
+    expected_sample_hash = _resample_stable_sha256(
+        SHAPE_RESAMPLE_CONTRACT,
+        original_source_sha256,
+        eligible.parent_uuid,
+        eligible.parent_reference_sha256,
+    )
+    expected_sampled_index = changed_indices[int(expected_sample_hash[:16], 16) % len(changed_indices)]
+    if sampled_index != expected_sampled_index:
+        raise ValueError(f"shape resample sampled factory choice mismatch at row {index}")
+    expected_selection_sha256 = _resample_stable_sha256(
+        SHAPE_RESAMPLE_SELECTION,
+        original_source_sha256,
+        eligible.parent_uuid,
+        eligible.parent_reference_sha256,
+        sampled_index,
+        sampled.shape,
+    )
+    if manifest.get("selection_sha256") != expected_selection_sha256:
+        raise ValueError(f"shape resample selection SHA mismatch at row {index}")
+    if manifest.get("training_approved") is not False:
+        raise ValueError(f"shape resample row has an invalid training approval state: {index}")
 
 
 def _select_stratified(eligible: Sequence[EligibleParent], limit: int | None) -> list[EligibleParent]:
@@ -636,6 +934,8 @@ def _make_child(
     generator_sha256: str,
     dependency_sha256: str,
     git_commit: str,
+    source_binding: Mapping[str, Any],
+    source_row_binding: Mapping[str, Any] | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     child = copy.deepcopy(dict(parent))
     parent_code = _nested(parent, "reward_model.ground_truth")
@@ -744,14 +1044,41 @@ def _make_child(
     if fatal:
         raise ValueError(f"child_schema_failed:{','.join(fatal)}")
     row_sha256 = _canonical_json_sha256(child)
+    source_kind = source_binding.get("source_kind")
+    if source_kind == "shape_coverage_resample":
+        if source_row_binding is None:
+            raise ValueError("shape-resample child lacks its upstream manifest row")
+        canonical_parent_uuid = source_row_binding.get("canonical_parent_uuid")
+        if not isinstance(canonical_parent_uuid, str) or not canonical_parent_uuid:
+            raise ValueError("shape-resample child lacks its canonical parent UUID")
+        inherited_shape_intervention = True
+        upstream_resample_selected_index = source_row_binding.get("selected_index")
+        upstream_resample_manifest_row_sha256 = _canonical_json_sha256(source_row_binding)
+        lineage = "canonical_parent_shape_child_random_value_grandchild"
+    elif source_kind == "canonical_parent":
+        if source_row_binding is not None:
+            raise ValueError("canonical child unexpectedly has an upstream resample row")
+        canonical_parent_uuid = eligible.parent_uuid
+        inherited_shape_intervention = False
+        upstream_resample_selected_index = None
+        upstream_resample_manifest_row_sha256 = None
+        lineage = "canonical_parent_value_only_child"
+    else:
+        raise ValueError(f"unsupported source binding kind: {source_kind!r}")
     manifest = {
-        "manifest_contract_version": "random_value_lane_manifest_v2",
+        "manifest_contract_version": "random_value_lane_manifest_v3",
         "candidate_row_index": None,
+        "source_kind": source_kind,
+        "source_binding": dict(source_binding),
         "source_artifact_path": str(source_path.resolve()),
         "source_artifact_sha256": source_sha256,
         "source_row_index": eligible.source_row_index,
         "parent_uuid": eligible.parent_uuid,
+        "canonical_parent_uuid": canonical_parent_uuid,
         "child_uuid": child_uuid,
+        "inherited_shape_intervention": inherited_shape_intervention,
+        "upstream_resample_selected_index": upstream_resample_selected_index,
+        "upstream_resample_manifest_row_sha256": upstream_resample_manifest_row_sha256,
         "parent_reference_sha256": eligible.parent_reference_sha256,
         "parent_normalized_ast_sha256": eligible.parent_normalized_ast_sha256,
         "child_reference_sha256": child_reference_sha256,
@@ -792,7 +1119,7 @@ def _make_child(
         "runtime_policy_fingerprint": None,
         "provenance_status": _nested(parent, "extra_info.v4.provenance_status"),
         "licenses": _nested(parent, "extra_info.v4.licenses", []),
-        "lineage": "canonical_parent_value_only_child",
+        "lineage": lineage,
         "row_sha256": row_sha256,
         "training_approved": False,
     }
@@ -844,14 +1171,11 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
         raise FileNotFoundError(input_path)
     source_sha256 = _sha256_file(input_path)
     parquet = pq.ParquetFile(input_path)
-    if source_sha256 != EXPECTED_CANONICAL_PARENT_SHA256:
+    source_context = _source_context(input_path, source_sha256, parquet)
+    if source_context.kind == "shape_coverage_resample" and limit != parquet.metadata.num_rows:
         raise ValueError(
-            f"canonical parent SHA mismatch: expected {EXPECTED_CANONICAL_PARENT_SHA256}, found {source_sha256}"
-        )
-    if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
-        raise ValueError(
-            f"canonical parent row mismatch: expected {EXPECTED_CANONICAL_PARENT_ROWS}, "
-            f"found {parquet.metadata.num_rows}"
+            "shape-resample input must be consumed in full without downstream resampling: "
+            f"limit={limit}, rows={parquet.metadata.num_rows}"
         )
     output_paths = {
         "parents": output_dir / "parents.parquet",
@@ -871,11 +1195,11 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
     generator_sha256 = _sha256_file(generator_path)
     dependency_sha256 = _sha256_file(dependency_path)
     git_commit = _git_commit()
-    for source_path, source_sha256 in (
+    for source_path, source_code_sha256 in (
         (generator_path, generator_sha256),
         (dependency_path, dependency_sha256),
     ):
-        if _git_blob_sha256(git_commit, source_path) != source_sha256:
+        if _git_blob_sha256(git_commit, source_path) != source_code_sha256:
             raise RuntimeError(f"source differs from Git commit {git_commit}: {source_path}")
 
     eligible: list[EligibleParent] = []
@@ -886,6 +1210,11 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
         for row in batch.to_pylist():
             item, reason = _analyze_parent(row, row_index)
             if item is None:
+                if source_context.kind == "shape_coverage_resample":
+                    raise ValueError(
+                        f"shape resample contains a row rejected by the current random solver: "
+                        f"{row_index}:{reason}"
+                    )
                 skip_counts[reason] += 1
                 decisions.append(
                     {
@@ -897,6 +1226,12 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
                     }
                 )
             else:
+                if source_context.resample_manifests is not None:
+                    _verify_shape_resample_row(
+                        row,
+                        item,
+                        source_context.resample_manifests[row_index],
+                    )
                 eligible.append(item)
                 decisions.append(
                     {
@@ -909,7 +1244,12 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
                     }
                 )
             row_index += 1
-    selected = _select_stratified(eligible, limit)
+    if source_context.kind == "shape_coverage_resample":
+        if len(eligible) != parquet.metadata.num_rows:
+            raise ValueError("shape resample was not fully retained by the static solver")
+        selected = sorted(eligible, key=lambda item: item.source_row_index)
+    else:
+        selected = _select_stratified(eligible, limit)
     selected_by_row = {item.source_row_index: item for item in selected}
     for decision in decisions:
         if decision["eligible"]:
@@ -938,6 +1278,12 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
                     generator_sha256=generator_sha256,
                     dependency_sha256=dependency_sha256,
                     git_commit=git_commit,
+                    source_binding=source_context.binding,
+                    source_row_binding=(
+                        source_context.resample_manifests[row_index]
+                        if source_context.resample_manifests is not None
+                        else None
+                    ),
                 )
                 parent = copy.deepcopy(row)
                 parent["extra_info"] = dict(parent["extra_info"])
@@ -999,6 +1345,7 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
         "input": str(input_path.resolve()),
         "input_sha256": source_sha256,
         "input_rows": parquet.metadata.num_rows,
+        "source_binding": dict(source_context.binding),
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -1020,6 +1367,7 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
             "primary_intervention": "random_value",
             "one_family_per_parent": True,
             "shape_changed": False,
+            "inherited_shape_intervention": source_context.kind == "shape_coverage_resample",
             "dtype_changed": False,
             "layout_changed": False,
             "model_changed": False,
