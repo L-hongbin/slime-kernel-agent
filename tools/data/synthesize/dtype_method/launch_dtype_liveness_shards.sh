@@ -24,6 +24,27 @@ for path in "${parents_path}" "${children_path}" "${manifest_path}" "${allowlist
     exit 2
   fi
 done
+
+if ! coherence_class=$(python - "${manifest_path}" <<'PY'
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+classes = {
+    json.loads(line)["coherence_class"]
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+    if line.strip()
+}
+if len(classes) != 1 or next(iter(classes)) not in {"parameter_free", "module_state"}:
+    raise SystemExit(f"manifest must contain one supported coherence class: {sorted(map(str, classes))}")
+print(next(iter(classes)))
+PY
+); then
+  echo "failed to resolve coherence class from manifest" >&2
+  exit 2
+fi
 if ! [[ ${gpus_per_machine} =~ ^[1-9][0-9]*$ ]]; then
   echo "SYNTH_GPUS_PER_MACHINE must be a positive integer" >&2
   exit 2
@@ -115,7 +136,7 @@ python - "${scheduler_contract_tmp}" "${launcher_sha256}" "${validator_sha256}" 
   "$(realpath "${children_path}")" "${children_sha256}" \
   "$(realpath "${manifest_path}")" "${manifest_sha256}" \
   "$(realpath "${allowlist_path}")" "${allowlist_sha256}" \
-  "${gpus_per_machine}" "${trials}" "${seed}" "${timeout_seconds}" <<'PY'
+  "${gpus_per_machine}" "${trials}" "${seed}" "${timeout_seconds}" "${coherence_class}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -138,9 +159,11 @@ from pathlib import Path
     trials,
     seed,
     timeout_seconds,
+    coherence_class,
 ) = sys.argv[1:]
 payload = {
-    "contract_version": "dtype_parameter_free_runtime_liveness_scheduler_v1",
+    "contract_version": "dtype_runtime_liveness_scheduler_v2",
+    "coherence_class": coherence_class,
     "launcher_source_sha256": launcher_sha256,
     "validator_source_sha256": validator_sha256,
     "parents_path": parents_path,
@@ -234,7 +257,8 @@ if (( status != 0 )); then
   exit "${status}"
 fi
 
-python - "${run_dir}" "${gpus_per_machine}" "${launcher_sha256}" "${validator_sha256}" <<'PY'
+python - "${run_dir}" "${gpus_per_machine}" "${launcher_sha256}" "${validator_sha256}" \
+  "${coherence_class}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -245,6 +269,7 @@ run_dir = Path(sys.argv[1])
 shard_count = int(sys.argv[2])
 launcher_sha256 = sys.argv[3]
 validator_sha256 = sys.argv[4]
+coherence_class = sys.argv[5]
 summaries = []
 for shard_index in range(shard_count):
     log_path = run_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.log"
@@ -258,9 +283,12 @@ for shard_index in range(shard_count):
         raise SystemExit(f"launcher hash mismatch: {log_path}")
     if summary.get("validator_source_sha256") != validator_sha256:
         raise SystemExit(f"validator hash mismatch: {log_path}")
+    if summary.get("coherence_class") != coherence_class:
+        raise SystemExit(f"coherence class mismatch: {log_path}")
     summaries.append(summary)
 payload = {
-    "contract_version": "dtype_parameter_free_runtime_liveness_launcher_summary_v1",
+    "contract_version": "dtype_runtime_liveness_launcher_summary_v2",
+    "coherence_class": coherence_class,
     "launcher_source_sha256": launcher_sha256,
     "validator_source_sha256": validator_sha256,
     "shard_count": shard_count,
