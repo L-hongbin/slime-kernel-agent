@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""Validate parameter-free dtype realization, semantics, and no-FP32 fallback.
+"""Validate dtype realization, coherent model state, and no-FP32 fallback.
 
 Each row is isolated in a subprocess under the 64-GiB allocator guard.  Three
-deterministic trials prove that every transformed direct input is realized in
-the assigned low precision, model parameters/buffers/tensor state are empty,
-post-``get_inputs`` RNG state is unchanged, cast-equivalent parent/child
-outputs agree under the KernelGym low-precision tolerance, and the child
-dispatcher trace never produces a floating tensor outside the assigned dtype.
+deterministic trials prove direct-input realization, construction RNG equality,
+the selected model-state coherence contract, cast-equivalent outputs, and a
+child dispatcher trace with no floating output outside the assigned dtype.
 """
 
 from __future__ import annotations
@@ -47,8 +45,17 @@ from tools.data.cleaning.runtime_validation import (
 )
 from tools.data.synthesize.validate_train_mode_contract import _cuda_memory_guard, _CudaMemoryGuardFailure
 
-CONTRACT_VERSION = "dtype_parameter_free_runtime_liveness_v1"
-RUN_BINDING_VERSION = "dtype_parameter_free_runtime_binding_v1"
+PARAMETER_FREE = "parameter_free"
+MODULE_STATE = "module_state"
+COHERENCE_CLASSES = frozenset({PARAMETER_FREE, MODULE_STATE})
+CONTRACT_VERSIONS = {
+    PARAMETER_FREE: "dtype_parameter_free_runtime_liveness_v2",
+    MODULE_STATE: "dtype_module_state_runtime_liveness_v1",
+}
+RUN_BINDING_VERSIONS = {
+    PARAMETER_FREE: "dtype_parameter_free_runtime_binding_v2",
+    MODULE_STATE: "dtype_module_state_runtime_binding_v1",
+}
 RESULT_MARKER = "__DTYPE_LIVENESS_RESULT__="
 MAX_DEVICE_MEMORY_GIB = 64.0
 MAX_AUTHORIZED_CANDIDATES = 5_000
@@ -59,6 +66,20 @@ TARGET_DTYPES = frozenset({"float16", "bfloat16"})
 MAX_RECORDED_DISPATCH_TRANSITIONS = 256
 _DRIVER_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _ACTIVE_WORKER_PROCESS: subprocess.Popen[str] | None = None
+
+
+def contract_version(coherence_class: str) -> str:
+    try:
+        return CONTRACT_VERSIONS[coherence_class]
+    except KeyError as exc:
+        raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
+
+
+def binding_version(coherence_class: str) -> str:
+    try:
+        return RUN_BINDING_VERSIONS[coherence_class]
+    except KeyError as exc:
+        raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
 
 
 class UnsupportedCase(RuntimeError):
@@ -271,10 +292,224 @@ def _assert_parameter_free(model: Any, torch: Any) -> dict[str, int]:
         raise UnsupportedCase(f"runtime_state_dict_not_empty:{len(state)}")
     if len(modules) != 1:
         raise UnsupportedCase(f"runtime_submodule_count_not_zero:{len(modules) - 1}")
-    tensor_attributes = [name for name, value in vars(model).items() if isinstance(value, torch.Tensor)]
-    if tensor_attributes:
-        raise UnsupportedCase(f"runtime_unregistered_tensor_state:{','.join(sorted(tensor_attributes))}")
+    _assert_no_unregistered_tensors(model, torch)
     return {"parameter_count": 0, "buffer_count": 0, "state_dict_entries": 0, "submodule_count": 0}
+
+
+def _assert_no_unregistered_tensors(model: Any, torch: Any) -> None:
+    seen_modules: set[int] = set()
+    seen_containers: set[int] = set()
+
+    def inspect(value: Any, path: str) -> None:
+        if isinstance(value, torch.Tensor):
+            raise UnsupportedCase(f"runtime_unregistered_tensor_state:{path}")
+        if isinstance(value, torch.nn.Module):
+            raise UnsupportedCase(f"runtime_unregistered_module_state:{path}")
+        if isinstance(value, (str, bytes, int, float, bool, type(None))):
+            return
+        if isinstance(value, Mapping):
+            if id(value) in seen_containers:
+                return
+            seen_containers.add(id(value))
+            for key, item in value.items():
+                inspect(item, f"{path}.{key}")
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            if id(value) in seen_containers:
+                return
+            seen_containers.add(id(value))
+            for index, item in enumerate(value):
+                inspect(item, f"{path}[{index}]")
+
+    def visit(module: Any, path: str) -> None:
+        if id(module) in seen_modules:
+            return
+        seen_modules.add(id(module))
+        ignored = {"_parameters", "_buffers", "_modules"}
+        for name, value in vars(module).items():
+            if name not in ignored:
+                inspect(value, f"{path}.{name}")
+        for name, child in module._modules.items():
+            if child is not None:
+                visit(child, f"{path}.{name}")
+
+    visit(model, "model")
+
+
+def _logical_registered_state(model: Any, torch: Any) -> dict[str, dict[str, Any]]:
+    entries: dict[str, dict[str, Any]] = {}
+
+    def visit(module: Any, path: str, ancestry: frozenset[int]) -> None:
+        if id(module) in ancestry:
+            raise UnsupportedCase(f"cyclic_module_graph:{path or '<root>'}")
+        next_ancestry = ancestry | {id(module)}
+        for kind, values in (("parameter", module._parameters), ("buffer", module._buffers)):
+            for name, tensor in values.items():
+                logical_name = f"{path}.{name}" if path else name
+                key = f"{kind}:{logical_name}"
+                if key in entries:
+                    raise UnsupportedCase(f"duplicate_logical_state_name:{key}")
+                entries[key] = {
+                    "kind": kind,
+                    "name": logical_name,
+                    "tensor": tensor,
+                    "persistent": kind == "parameter" or name not in module._non_persistent_buffers_set,
+                }
+        for name, child in module._modules.items():
+            if child is not None:
+                visit(child, f"{path}.{name}" if path else name, next_ancestry)
+
+    visit(model, "", frozenset())
+    if len(entries) > 4096:
+        raise UnsupportedCase(f"registered_state_entry_limit_exceeded:{len(entries)}")
+    return entries
+
+
+def _validate_state_tensor(tensor: Any, path: str, torch: Any) -> None:
+    uninitialized_types = tuple(
+        value
+        for value in (
+            getattr(torch.nn.parameter, "UninitializedParameter", None),
+            getattr(torch.nn.parameter, "UninitializedBuffer", None),
+        )
+        if isinstance(value, type)
+    )
+    if uninitialized_types and isinstance(tensor, uninitialized_types):
+        raise UnsupportedCase(f"lazy_or_uninitialized_state:{path}")
+    if tensor.layout != torch.strided or tensor.is_sparse or tensor.is_quantized:
+        raise UnsupportedCase(f"unsupported_state_layout:{path}:{tensor.layout}")
+    if tensor.dtype.is_complex:
+        raise UnsupportedCase(f"complex_state_not_supported:{path}:{tensor.dtype}")
+
+
+def _alias_groups(entries: Mapping[str, Mapping[str, Any]]) -> tuple[list[list[str]], list[list[str]]]:
+    object_groups: dict[int, list[str]] = collections.defaultdict(list)
+    storage_groups: dict[int, list[str]] = collections.defaultdict(list)
+    for key, entry in entries.items():
+        tensor = entry["tensor"]
+        if tensor is None:
+            continue
+        object_groups[id(tensor)].append(key)
+        storage_groups[int(tensor.untyped_storage()._cdata)].append(key)
+    objects = sorted(sorted(group) for group in object_groups.values() if len(group) > 1)
+    storages = sorted(sorted(group) for group in storage_groups.values() if len(group) > 1)
+    return objects, storages
+
+
+def _unique_state_bytes(entries: Mapping[str, Mapping[str, Any]]) -> int:
+    storages: dict[int, int] = {}
+    for entry in entries.values():
+        tensor = entry["tensor"]
+        if tensor is not None:
+            storage = tensor.untyped_storage()
+            storages[int(storage._cdata)] = int(storage.nbytes())
+    return sum(storages.values())
+
+
+def _assert_module_state_pair(parent: Any, child: Any, target_dtype: Any, torch: Any) -> dict[str, Any]:
+    _assert_no_unregistered_tensors(parent, torch)
+    _assert_no_unregistered_tensors(child, torch)
+    parent_entries = _logical_registered_state(parent, torch)
+    child_entries = _logical_registered_state(child, torch)
+    if set(parent_entries) != set(child_entries):
+        raise UnsupportedCase("registered_state_names_changed")
+    floating_entries = 0
+    nonfloating_entries = 0
+    parameter_entries = 0
+    buffer_entries = 0
+    schema: list[dict[str, Any]] = []
+    for key in sorted(parent_entries):
+        parent_entry = parent_entries[key]
+        child_entry = child_entries[key]
+        if parent_entry["kind"] != child_entry["kind"] or parent_entry["persistent"] != child_entry["persistent"]:
+            raise UnsupportedCase(f"registered_state_kind_or_persistence_changed:{key}")
+        parameter_entries += parent_entry["kind"] == "parameter"
+        buffer_entries += parent_entry["kind"] == "buffer"
+        left = parent_entry["tensor"]
+        right = child_entry["tensor"]
+        if (left is None) != (right is None):
+            raise UnsupportedCase(f"registered_none_state_changed:{key}")
+        if left is None:
+            schema.append({"key": key, "persistent": parent_entry["persistent"], "none": True})
+            continue
+        _validate_state_tensor(left, key, torch)
+        _validate_state_tensor(right, key, torch)
+        left_metadata = (
+            tuple(left.shape),
+            left.device,
+            left.layout,
+            tuple(left.stride()),
+            left.storage_offset(),
+            left.requires_grad,
+        )
+        right_metadata = (
+            tuple(right.shape),
+            right.device,
+            right.layout,
+            tuple(right.stride()),
+            right.storage_offset(),
+            right.requires_grad,
+        )
+        if left_metadata != right_metadata:
+            raise UnsupportedCase(f"registered_state_metadata_changed:{key}")
+        if left.dtype.is_floating_point:
+            floating_entries += 1
+            if left.dtype != torch.float32 or right.dtype != target_dtype:
+                raise UnsupportedCase(f"registered_float_state_dtype_mismatch:{key}:{left.dtype}:{right.dtype}")
+            if not torch.equal(left.to(dtype=target_dtype), right):
+                raise UnsupportedCase(f"registered_float_state_not_exact_parent_cast:{key}")
+            dtype_class = "floating"
+        else:
+            nonfloating_entries += 1
+            if left.dtype != right.dtype or not torch.equal(left, right):
+                raise UnsupportedCase(f"registered_nonfloat_state_changed:{key}")
+            dtype_class = str(left.dtype)
+        schema.append(
+            {
+                "key": key,
+                "persistent": parent_entry["persistent"],
+                "none": False,
+                "shape": list(left.shape),
+                "stride": list(left.stride()),
+                "storage_offset": left.storage_offset(),
+                "requires_grad": left.requires_grad,
+                "dtype_class": dtype_class,
+            }
+        )
+    if floating_entries <= 0:
+        raise UnsupportedCase("registered_floating_state_count_not_positive")
+    parent_objects, parent_storages = _alias_groups(parent_entries)
+    child_objects, child_storages = _alias_groups(child_entries)
+    if parent_objects != child_objects or parent_storages != child_storages:
+        raise UnsupportedCase("registered_state_alias_graph_changed")
+    parent_bytes = _unique_state_bytes(parent_entries)
+    child_bytes = _unique_state_bytes(child_entries)
+    if parent_bytes + child_bytes > int(MAX_DEVICE_MEMORY_GIB * 1024**3):
+        raise UnsupportedCase(f"registered_state_memory_budget_exceeded:{parent_bytes}:{child_bytes}")
+    return {
+        "parameter_entries": parameter_entries,
+        "buffer_entries": buffer_entries,
+        "floating_entries": floating_entries,
+        "nonfloating_entries": nonfloating_entries,
+        "state_bytes_parent": parent_bytes,
+        "state_bytes_child": child_bytes,
+        "object_alias_groups": len(parent_objects),
+        "storage_alias_groups": len(parent_storages),
+        "state_schema_sha256": _canonical_sha256(schema),
+        "values_equal_to_parent_cast": True,
+        "nonfloat_values_equal": True,
+        "unregistered_tensor_count": 0,
+    }
+
+
+def _assert_model_state_dtype(model: Any, target_dtype: Any, torch: Any) -> None:
+    _assert_no_unregistered_tensors(model, torch)
+    for key, entry in _logical_registered_state(model, torch).items():
+        tensor = entry["tensor"]
+        if tensor is None:
+            continue
+        _validate_state_tensor(tensor, key, torch)
+        if tensor.dtype.is_floating_point and tensor.dtype != target_dtype:
+            raise UnsupportedCase(f"post_forward_registered_state_dtype_mismatch:{key}:{tensor.dtype}")
 
 
 def _run_arm(model: Any, inputs: Sequence[Any], rng_state: Mapping[str, Any]) -> Any:
@@ -298,6 +533,7 @@ def _run_traced_arm(
     rng_state: Mapping[str, Any],
     *,
     target_dtype: Any,
+    coherence_class: str,
     torch: Any,
 ) -> tuple[Any, dict[str, Any]]:
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -336,6 +572,10 @@ def _run_traced_arm(
         _restore_rng_states(rng_state)
         with torch.no_grad(), mode:
             raw_output = _invoke_model(trial_model, inputs)
+        if coherence_class == MODULE_STATE:
+            _assert_model_state_dtype(trial_model, target_dtype, torch)
+        else:
+            _assert_parameter_free(trial_model, torch)
         output = _snapshot_output(raw_output)
         if not _all_finite(output):
             raise UnsupportedCase("non_finite_traced_output")
@@ -459,7 +699,9 @@ def _compare_outputs(
     return []
 
 
-def _build_parameter_free_model(namespace: Mapping[str, Any], device: Any, seed: int, torch: Any) -> Any:
+def _build_model_instance(
+    namespace: Mapping[str, Any], device: Any, seed: int, coherence_class: str, torch: Any
+) -> tuple[Any, Any, Mapping[str, Any]]:
     _seed_torch(seed, str(device))
     init_inputs = namespace["get_init_inputs"]()
     init_inputs = [] if init_inputs is None else init_inputs
@@ -470,8 +712,11 @@ def _build_parameter_free_model(namespace: Mapping[str, Any], device: Any, seed:
         raise UnsupportedCase("entry_point_did_not_build_torch_module")
     model = model.to(device)
     model.train(True)
-    _assert_parameter_free(model, torch)
-    return model
+    if coherence_class == PARAMETER_FREE:
+        _assert_parameter_free(model, torch)
+    elif coherence_class != MODULE_STATE:
+        raise UnsupportedCase(f"unsupported_coherence_class:{coherence_class}")
+    return model, init_inputs, _snapshot_rng_states(str(device))
 
 
 def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -484,6 +729,9 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     target = str(payload["assigned_dtype"])
+    coherence_class = str(payload["coherence_class"])
+    if coherence_class not in COHERENCE_CLASSES:
+        raise UnsupportedCase(f"unsupported_coherence_class:{coherence_class}")
     target_dtype = _target_dtype(target, torch)
     tolerance = LOW_PRECISION_TOLERANCES[target]
     parent_namespace = _exec_ops_code(
@@ -519,15 +767,47 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
             cast_inputs = _normalize_forward_inputs(cast_raw, str(device))
             del parent_raw, child_raw, cast_raw
 
-            parent_model = _build_parameter_free_model(parent_namespace, device, trial_seed + 1, torch)
-            child_model = _build_parameter_free_model(child_namespace, device, trial_seed + 1, torch)
+            parent_model, parent_init_inputs, parent_construct_rng = _build_model_instance(
+                parent_namespace, device, trial_seed + 1, coherence_class, torch
+            )
+            child_model, child_init_inputs, child_construct_rng = _build_model_instance(
+                child_namespace, device, trial_seed + 1, coherence_class, torch
+            )
+            if not _rng_states_equal(parent_init_inputs, child_init_inputs, torch):
+                raise UnsupportedCase("get_init_inputs_values_changed")
+            if not _rng_states_equal(parent_construct_rng, child_construct_rng, torch):
+                raise UnsupportedCase("post_model_construction_rng_state_changed")
+            if coherence_class == MODULE_STATE:
+                model_state = _assert_module_state_pair(parent_model, child_model, target_dtype, torch)
+            else:
+                model_state = {
+                    "parameter_entries": 0,
+                    "buffer_entries": 0,
+                    "floating_entries": 0,
+                    "nonfloating_entries": 0,
+                    "state_bytes_parent": 0,
+                    "state_bytes_child": 0,
+                    "object_alias_groups": 0,
+                    "storage_alias_groups": 0,
+                    "state_schema_sha256": _canonical_sha256([]),
+                    "values_equal_to_parent_cast": True,
+                    "nonfloat_values_equal": True,
+                    "unregistered_tensor_count": 0,
+                }
+            model_state["coherence_class"] = coherence_class
+            model_state["construction_rng_equal"] = True
             forward_rng = _snapshot_rng_states(str(device))
             parent_output = _run_arm(parent_model, parent_inputs, forward_rng)
             parent_control = _run_arm(parent_model, parent_inputs, forward_rng)
             if not _outputs_allclose(parent_output, parent_control, rtol=0.0, atol=0.0):
                 raise UnsupportedCase("unchanged_parent_control_is_not_exact")
             semantic_output, semantic_trace = _run_traced_arm(
-                child_model, cast_inputs, forward_rng, target_dtype=target_dtype, torch=torch
+                child_model,
+                cast_inputs,
+                forward_rng,
+                target_dtype=target_dtype,
+                coherence_class=coherence_class,
+                torch=torch,
             )
             output_records = _compare_outputs(
                 parent_output,
@@ -538,7 +818,12 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
                 torch=torch,
             )
             realized_output, realized_trace = _run_traced_arm(
-                child_model, child_inputs, forward_rng, target_dtype=target_dtype, torch=torch
+                child_model,
+                child_inputs,
+                forward_rng,
+                target_dtype=target_dtype,
+                coherence_class=coherence_class,
+                torch=torch,
             )
             realized_control = _run_arm(child_model, child_inputs, forward_rng)
             if not _outputs_allclose(realized_output, realized_control, rtol=0.0, atol=0.0):
@@ -549,6 +834,7 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
                     "seed": trial_seed,
                     "changed_dtype_tensors": changed_tensors,
                     "inputs": input_records,
+                    "model_state": model_state,
                     "cast_equivalent_outputs": output_records,
                     "semantic_dispatch": semantic_trace,
                     "realized_dispatch": realized_trace,
@@ -560,6 +846,8 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
                 cast_inputs,
                 parent_model,
                 child_model,
+                parent_init_inputs,
+                child_init_inputs,
                 parent_output,
                 parent_control,
                 semantic_output,
@@ -604,7 +892,14 @@ def _evaluate(payload: Mapping[str, Any]) -> dict[str, Any]:
 def _identity(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {
         key: payload.get(key)
-        for key in ("candidate_row_index", "child_uuid", "parent_uuid", "assigned_dtype", "transformed_factory_count")
+        for key in (
+            "candidate_row_index",
+            "child_uuid",
+            "parent_uuid",
+            "assigned_dtype",
+            "transformed_factory_count",
+            "coherence_class",
+        )
     }
 
 
@@ -620,7 +915,7 @@ def _worker(payload: Mapping[str, Any]) -> dict[str, Any]:
     except BaseException as exc:  # noqa: BLE001 - each row failure is evidence
         result = {"status": "failed", "passed": False, "reason": _exception_detail(exc)}
     return {
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version(str(payload["coherence_class"])),
         **_identity(payload),
         **result,
         "duration_seconds": time.monotonic() - started,
@@ -651,7 +946,7 @@ def _run_subprocess(payload: Mapping[str, Any], timeout_seconds: float) -> dict[
             pass
         stdout, stderr = process.communicate()
         return {
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": contract_version(str(payload["coherence_class"])),
             **_identity(payload),
             "status": "timeout",
             "passed": False,
@@ -666,7 +961,7 @@ def _run_subprocess(payload: Mapping[str, Any], timeout_seconds: float) -> dict[
     markers = [line[len(RESULT_MARKER) :] for line in stdout.splitlines() if line.startswith(RESULT_MARKER)]
     if process.returncode != 0 or len(markers) != 1:
         return {
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": contract_version(str(payload["coherence_class"])),
             **_identity(payload),
             "status": "worker_protocol_error",
             "passed": False,
@@ -705,13 +1000,19 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
         if manifest.get("primary_intervention") != "dtype":
             raise ValueError(f"manifest intervention mismatch:{index}")
         realized = manifest.get("realized_intervention")
-        if (
-            not isinstance(realized, Mapping)
-            or realized.get("coherence_class") != "parameter_free_all_direct_float_inputs"
-        ):
+        coherence_class = manifest.get("coherence_class")
+        if coherence_class not in COHERENCE_CLASSES:
+            raise ValueError(f"manifest coherence class unsupported:{index}:{coherence_class}")
+        if not isinstance(realized, Mapping) or realized.get("coherence_class") != coherence_class:
             raise ValueError(f"manifest coherence class mismatch:{index}")
-        if manifest.get("model_parameter_count") != 0 or manifest.get("model_buffer_count") != 0:
+        if coherence_class == PARAMETER_FREE and (
+            manifest.get("model_parameter_count") != 0 or manifest.get("model_buffer_count") != 0
+        ):
             raise ValueError(f"manifest parameter-free proof mismatch:{index}")
+        if coherence_class == MODULE_STATE and (
+            manifest.get("model_parameter_count") is not None or manifest.get("model_buffer_count") is not None
+        ):
+            raise ValueError(f"manifest module-state runtime-pending proof mismatch:{index}")
         if not all(isinstance(value, str) and value for value in (parent_code, child_code, entry_point)):
             raise ValueError(f"invalid code fields:{index}")
         if _sha256_bytes(parent_code.encode()) != manifest.get("parent_reference_sha256"):
@@ -731,8 +1032,12 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
                 "entry_point": entry_point,
                 "assigned_dtype": target,
                 "transformed_factory_count": manifest["transformed_factory_count"],
+                "coherence_class": coherence_class,
             }
         )
+    coherence_classes = {task["coherence_class"] for task in tasks}
+    if len(coherence_classes) != 1:
+        raise ValueError(f"mixed coherence classes in one validation lane:{sorted(coherence_classes)}")
     return tasks
 
 
@@ -803,9 +1108,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         if args.limit <= 0:
             raise ValueError("limit must be positive")
         tasks = tasks[: args.limit]
+    if not tasks:
+        raise ValueError("shard selection produced no dtype validation tasks")
+    coherence_class = str(tasks[0]["coherence_class"])
+    runtime_contract = contract_version(coherence_class)
     evidence = {
-        "contract_version": CONTRACT_VERSION,
-        "binding_version": RUN_BINDING_VERSION,
+        "contract_version": runtime_contract,
+        "binding_version": binding_version(coherence_class),
+        "coherence_class": coherence_class,
         "validator_source_sha256": _sha256_file(Path(__file__).resolve()),
         "launcher_source_sha256": args.launcher_sha256,
         "parents_sha256": _sha256_file(args.parents),
@@ -874,7 +1184,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     print(
         json.dumps(
             {
-                "contract_version": CONTRACT_VERSION,
+                "contract_version": runtime_contract,
+                "coherence_class": coherence_class,
                 "selected": len(tasks),
                 "executed": executed,
                 "resumed": resumed,

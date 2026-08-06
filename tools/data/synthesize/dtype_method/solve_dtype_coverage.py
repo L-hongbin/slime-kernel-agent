@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Build deterministic low-precision siblings for statically parameter-free tasks.
+"""Build deterministic low-precision siblings for proof-friendly dtype tasks.
 
-The canary deliberately implements only the proof-friendly half of the dtype
-plan: every floating direct input factory is FP32, every returned input factory
-has exact provenance, and the reference ``Model`` has no statically visible
-parameter, buffer, tensor state, tensor constant, or dtype cast.  One target
-(``float16`` or ``bfloat16``) is assigned per parent.  ``Model`` and
-``get_init_inputs`` remain byte-for-byte equivalent at the AST level.
+Every floating direct input factory is FP32 and has exact returned-input
+provenance.  The ``parameter_free`` class leaves ``Model`` unchanged.  The
+``module_state`` class admits only canonical built-in ``torch.nn`` registered
+state and appends one explicit base-class conversion to ``Model.__init__``.
+One target (``float16`` or ``bfloat16``) is assigned per parent.
 
 Runtime validation is still mandatory.  In particular, this static solver does
 not claim that an operator supports the target dtype or that its implementation
@@ -52,8 +51,17 @@ from tools.data.synthesize.augment_prompt_tasks import (
     transform_code,
 )
 
-CONTRACT_VERSION = "dtype_parameter_free_solver_v1"
-GENERATOR_VERSION = "all_direct_float_inputs_low_precision_v1"
+PARAMETER_FREE = "parameter_free"
+MODULE_STATE = "module_state"
+COHERENCE_CLASSES = (PARAMETER_FREE, MODULE_STATE)
+CONTRACT_VERSIONS = {
+    PARAMETER_FREE: "dtype_parameter_free_solver_v2",
+    MODULE_STATE: "dtype_module_state_solver_v1",
+}
+GENERATOR_VERSIONS = {
+    PARAMETER_FREE: "all_direct_float_inputs_low_precision_v2",
+    MODULE_STATE: "registered_module_state_low_precision_v1",
+}
 ASSIGNMENT_VERSION = "stable_parent_hash_single_dtype_v1"
 SELECTION_VERSION = "source_operator_dtype_proportional_largest_remainder_v1"
 EXPECTED_CANONICAL_PARENT_SHA256 = "b07205fcadc543964cfc7ee5fd9c1e4d011f0f3481447f656e5297e40b4b99f4"
@@ -113,6 +121,39 @@ _MODEL_TENSOR_FACTORIES = frozenset(
 )
 _CAST_METHODS = frozenset({"bfloat16", "double", "float", "half", "to", "type", "type_as"})
 _SAFE_INIT_CALLS = frozenset({"bool", "float", "int", "len", "list", "str", "super", "tuple"})
+_STATEFUL_NN_CONSTRUCTORS = frozenset(
+    {
+        "BatchNorm1d",
+        "BatchNorm2d",
+        "BatchNorm3d",
+        "Bilinear",
+        "Conv1d",
+        "Conv2d",
+        "Conv3d",
+        "ConvTranspose1d",
+        "ConvTranspose2d",
+        "ConvTranspose3d",
+        "Embedding",
+        "EmbeddingBag",
+        "GRU",
+        "GRUCell",
+        "GroupNorm",
+        "LayerNorm",
+        "Linear",
+        "LSTM",
+        "LSTMCell",
+        "MultiheadAttention",
+        "PReLU",
+        "RMSNorm",
+        "RNN",
+        "RNNCell",
+        "Transformer",
+        "TransformerDecoder",
+        "TransformerDecoderLayer",
+        "TransformerEncoder",
+        "TransformerEncoderLayer",
+    }
+)
 DTYPE_POLICY = AugmentationPolicy(
     shape_scales=(),
     value_families=(),
@@ -124,6 +165,7 @@ DTYPE_POLICY = AugmentationPolicy(
 
 @dataclasses.dataclass(frozen=True)
 class EligibleParent:
+    coherence_class: str
     source_row_index: int
     parent_uuid: str
     parent_reference_sha256: str
@@ -143,6 +185,20 @@ class EligibleParent:
     @property
     def stratum(self) -> tuple[str, str, str]:
         return (self.source_family, self.operator_bucket, self.assigned_dtype)
+
+
+def contract_version(coherence_class: str) -> str:
+    try:
+        return CONTRACT_VERSIONS[coherence_class]
+    except KeyError as exc:
+        raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
+
+
+def generator_version(coherence_class: str) -> str:
+    try:
+        return GENERATOR_VERSIONS[coherence_class]
+    except KeyError as exc:
+        raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
 
 
 def _canonical_json(value: Any) -> str:
@@ -273,6 +329,159 @@ def _parameter_free_model_proof(tree: ast.Module, entry_point: str) -> tuple[boo
     return True, None
 
 
+def _canonical_torch_imports(tree: ast.Module) -> bool:
+    has_torch = False
+    has_nn = False
+    for statement in tree.body:
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                bound = alias.asname or alias.name.split(".", 1)[0]
+                canonical_torch = alias.name == "torch" and alias.asname in {None, "torch"}
+                canonical_nn = alias.name == "torch.nn" and alias.asname == "nn"
+                if bound in {"torch", "nn"} and not (canonical_torch or canonical_nn):
+                    return False
+                has_torch |= canonical_torch
+                has_nn |= canonical_nn
+        elif isinstance(statement, ast.ImportFrom):
+            for alias in statement.names:
+                if (alias.asname or alias.name) in {"torch", "nn"}:
+                    return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id in {"torch", "nn"}:
+            return False
+        if isinstance(node, ast.arg) and node.arg in {"torch", "nn"}:
+            return False
+        if isinstance(node, ast.Attribute) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            root = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if isinstance(root, ast.Name) and root.id in {"torch", "nn"}:
+                return False
+    return has_torch and has_nn
+
+
+def _is_registration_wrapper(call: ast.Call) -> bool:
+    name = _call_name(call.func)
+    return name in {"nn.Parameter", "torch.nn.Parameter"} or name.endswith(".register_buffer")
+
+
+def _module_state_model_proof(tree: ast.Module, entry_point: str) -> tuple[bool, str | None]:
+    """Admit only state whose dtype conversion has a closed runtime proof."""
+
+    if _has_default_dtype_mutation(tree):
+        return False, "dynamic_default_dtype"
+    if not _canonical_torch_imports(tree):
+        return False, "noncanonical_torch_imports"
+    models = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == entry_point]
+    if len(models) != 1:
+        return False, "model_class_count_not_one"
+    model = models[0]
+    if model.decorator_list or model.keywords:
+        return False, "decorated_or_dynamic_model_class"
+    if len(model.bases) != 1 or _call_name(model.bases[0]) not in {"nn.Module", "torch.nn.Module"}:
+        return False, "model_base_not_canonical_nn_module"
+    forbidden_methods = {"to", "_apply", "__getattr__", "__getattribute__", "__setattr__"}
+    defined_methods = {node.name for node in model.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    conflict = sorted(forbidden_methods & defined_methods)
+    if conflict:
+        return False, f"model_overrides_conversion_dispatch:{conflict[0]}"
+    init_methods = [
+        node
+        for node in model.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "__init__"
+    ]
+    if len(init_methods) != 1 or not isinstance(init_methods[0], ast.FunctionDef):
+        return False, "model_init_not_one_synchronous_function"
+    init = init_methods[0]
+    if init.decorator_list:
+        return False, "decorated_model_init"
+    if any(isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom, ast.Await)) for node in ast.walk(init)):
+        return False, "model_init_has_early_exit_or_async_control"
+    super_calls = [node for node in ast.walk(init) if isinstance(node, ast.Call) and _is_super_init(node)]
+    if len(super_calls) != 1 or super_calls[0].args or super_calls[0].keywords:
+        return False, "model_init_not_one_canonical_super_init"
+    for node in ast.walk(init):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for target in targets:
+            if (
+                isinstance(target, ast.Attribute)
+                and isinstance(target.value, ast.Name)
+                and target.value.id == "self"
+                and target.attr in forbidden_methods
+            ):
+                return False, f"model_assigns_conversion_dispatch:{target.attr}"
+
+    get_inputs = _top_level_function(tree, "get_inputs")
+    get_init_inputs = _top_level_function(tree, "get_init_inputs")
+    for node in ast.walk(get_init_inputs):
+        if isinstance(node, ast.Call):
+            return False, f"get_init_inputs_call_not_scalar_proven:{_call_name(node.func) or 'dynamic'}"
+        if isinstance(node, ast.Attribute) and _call_name(node) in _MODEL_DTYPE_NAMES:
+            return False, "get_init_inputs_contains_dtype_literal"
+
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(model):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def inside_registration(node: ast.AST) -> bool:
+        current = node
+        while id(current) in parents:
+            current = parents[id(current)]
+            if isinstance(current, ast.Call) and _is_registration_wrapper(current):
+                return True
+            if current is init:
+                break
+        return False
+
+    state_evidence = 0
+    init_ids = {id(node) for node in ast.walk(init)}
+    for node in ast.walk(model):
+        if isinstance(node, ast.Attribute) and _call_name(node) in _MODEL_DTYPE_NAMES:
+            return False, f"model_dtype_literal:{_call_name(node)}"
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if any(keyword.arg == "dtype" for keyword in node.keywords):
+            return False, "model_explicit_dtype_keyword"
+        if isinstance(node.func, ast.Attribute) and node.func.attr in _CAST_METHODS:
+            return False, f"model_dtype_cast_or_to:{node.func.attr}"
+        if name in _MODEL_TENSOR_FACTORIES:
+            if id(node) not in init_ids or not inside_registration(node):
+                return False, f"unregistered_or_runtime_tensor_factory:{name}"
+            continue
+        if id(node) not in init_ids:
+            continue
+        if _is_super_init(node) or name in _SAFE_INIT_CALLS:
+            continue
+        if name in {"nn.Parameter", "torch.nn.Parameter"}:
+            state_evidence += 1
+            continue
+        if name.endswith(".register_buffer"):
+            state_evidence += 1
+            continue
+        if name.startswith("nn.") or name.startswith("torch.nn."):
+            constructor = name.rsplit(".", 1)[-1]
+            if constructor and constructor[0].isupper() and constructor != "Module":
+                state_evidence += constructor in _STATEFUL_NN_CONSTRUCTORS
+                continue
+        return False, f"model_init_call_not_builtin_registered_state:{name or 'dynamic'}"
+    if not state_evidence:
+        return False, "no_static_registered_state_evidence"
+
+    excluded_ids = {id(node) for root in (model, get_inputs, get_init_inputs) for node in ast.walk(root)}
+    for node in ast.walk(tree):
+        if id(node) in excluded_ids:
+            continue
+        if isinstance(node, ast.Call) and _call_name(node.func) in _MODEL_TENSOR_FACTORIES:
+            return False, f"module_tensor_constant:{_call_name(node.func)}"
+        if isinstance(node, ast.Attribute) and _call_name(node) in _MODEL_DTYPE_NAMES:
+            return False, f"module_dtype_literal:{_call_name(node)}"
+    return True, None
+
+
 def _resolved_factory_specs(tree: ast.Module) -> tuple[tuple[str, tuple[int, ...], str], ...]:
     get_inputs = _top_level_function(tree, "get_inputs")
     records, environment = _factory_records(tree, get_inputs, _module_constant_environment(tree))
@@ -281,10 +490,11 @@ def _resolved_factory_specs(tree: ast.Module) -> tuple[tuple[str, tuple[int, ...
     return tuple((record.name, record.shape, record.dtype_name) for record in records)
 
 
-def _assignment(parent_uuid: str, reference_sha256: str) -> tuple[str, str]:
+def _assignment(parent_uuid: str, reference_sha256: str, coherence_class: str) -> tuple[str, str]:
     payload = {
         "assignment_version": ASSIGNMENT_VERSION,
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version(coherence_class),
+        "coherence_class": coherence_class,
         "parent_uuid": parent_uuid,
         "parent_reference_sha256": reference_sha256,
     }
@@ -292,18 +502,21 @@ def _assignment(parent_uuid: str, reference_sha256: str) -> tuple[str, str]:
     return DTYPE_TARGETS[int(digest[:16], 16) % len(DTYPE_TARGETS)], digest
 
 
-def _selection_hash(parent_uuid: str, reference_sha256: str, target: str) -> str:
+def _selection_hash(parent_uuid: str, reference_sha256: str, target: str, coherence_class: str) -> str:
     return _canonical_sha256(
         {
             "selection_version": SELECTION_VERSION,
             "parent_uuid": parent_uuid,
             "parent_reference_sha256": reference_sha256,
             "assigned_dtype": target,
+            "coherence_class": coherence_class,
         }
     )
 
 
-def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[EligibleParent | None, str]:
+def _analyze_parent(
+    row: Mapping[str, Any], source_row_index: int, coherence_class: str = PARAMETER_FREE
+) -> tuple[EligibleParent | None, str]:
     parent_uuid = _nested(row, "extra_info.uuid")
     code = _nested(row, "reward_model.ground_truth")
     entry_point = _nested(row, "extra_info.entry_point", "Model")
@@ -322,9 +535,10 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
         return None, analysis.dtype_skip_reason or "dtype_transform_not_proven"
     if not analysis.floating_input_dtypes or any(name not in _FP32_NAMES for name in analysis.floating_input_dtypes):
         return None, "floating_direct_inputs_not_all_fp32"
-    compatible, reason = _parameter_free_model_proof(analysis.tree, entry_point)
+    proof = _parameter_free_model_proof if coherence_class == PARAMETER_FREE else _module_state_model_proof
+    compatible, reason = proof(analysis.tree, entry_point)
     if not compatible:
-        return None, reason or "parameter_free_model_not_proven"
+        return None, reason or f"{coherence_class}_model_not_proven"
     try:
         specs = _resolved_factory_specs(analysis.tree)
     except ValueError as exc:
@@ -334,7 +548,7 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
         return None, "transformed_factory_count_mismatch"
     if not transformed:
         return None, "no_fp32_direct_input_factory"
-    target, assignment_sha256 = _assignment(parent_uuid, reference_sha256)
+    target, assignment_sha256 = _assignment(parent_uuid, reference_sha256, coherence_class)
     input_bytes_after = analysis.input_bytes - sum(2 * _numel(shape) for _, shape, _ in transformed)
     if math.ceil(input_bytes_after * DTYPE_POLICY.working_set_multiplier) > DTYPE_POLICY.memory_budget_bytes:
         return None, "memory_budget_exceeded"
@@ -349,13 +563,14 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
         operator_count = None
     return (
         EligibleParent(
+            coherence_class=coherence_class,
             source_row_index=source_row_index,
             parent_uuid=parent_uuid,
             parent_reference_sha256=reference_sha256,
             parent_normalized_ast_sha256=_normalized_ast_sha256(code),
             assigned_dtype=target,
             assignment_sha256=assignment_sha256,
-            selection_sha256=_selection_hash(parent_uuid, reference_sha256, target),
+            selection_sha256=_selection_hash(parent_uuid, reference_sha256, target, coherence_class),
             source_family=source_family,
             operator_bucket=operator_bucket,
             operator_count=operator_count,
@@ -436,7 +651,31 @@ def _extend_schema(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields, metadata=schema.metadata)
 
 
-def _transform_dtype(code: str, entry_point: str, target: str, expected: int) -> tuple[str, int, int]:
+def _inject_module_conversion(code: str, entry_point: str, target: str) -> str:
+    shared_tree = ast.parse(code)
+    child_tree = copy.deepcopy(shared_tree)
+    model = _top_level_class(child_tree, entry_point)
+    init = next(node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    statement = ast.parse(f"torch.nn.Module.to(self, dtype=torch.{target})").body[0]
+    init.body.append(statement)
+    ast.fix_missing_locations(child_tree)
+
+    replay_tree = copy.deepcopy(child_tree)
+    replay_model = _top_level_class(replay_tree, entry_point)
+    replay_init = next(
+        node for node in replay_model.body if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    if ast.dump(replay_init.body[-1], include_attributes=False) != ast.dump(statement, include_attributes=False):
+        raise ValueError("module_conversion_statement_not_exact")
+    replay_init.body.pop()
+    if ast.dump(replay_tree, include_attributes=False) != ast.dump(shared_tree, include_attributes=False):
+        raise ValueError("module_conversion_changed_unapproved_ast")
+    return ast.unparse(child_tree) + "\n"
+
+
+def _transform_dtype(
+    code: str, entry_point: str, target: str, expected: int, coherence_class: str
+) -> tuple[str, int, int]:
     analysis = analyze_code(code, entry_point)
     parent_sections = _section_hashes(analysis.tree, entry_point)
     child_code, child_analysis, metadata = transform_code(
@@ -452,6 +691,10 @@ def _transform_dtype(code: str, entry_point: str, target: str, expected: int) ->
         raise ValueError("model_or_get_init_inputs_changed")
     if tuple(child_analysis.floating_input_dtypes) not in tuple((name,) for name in _LOW_PRECISION_NAMES[target]):
         raise ValueError(f"child_input_dtype_not_exact_target:{child_analysis.floating_input_dtypes}")
+    if coherence_class == MODULE_STATE:
+        child_code = _inject_module_conversion(child_code, entry_point, target)
+    elif coherence_class != PARAMETER_FREE:
+        raise ValueError(f"unsupported coherence class:{coherence_class}")
     return child_code, analysis.input_bytes, child_analysis.input_bytes
 
 
@@ -466,12 +709,19 @@ def _make_child(
     git_commit: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     child = copy.deepcopy(dict(parent))
+    coherence_class = eligible.coherence_class
+    solver_contract = contract_version(coherence_class)
+    solver_generator = generator_version(coherence_class)
     parent_code = _nested(parent, "reward_model.ground_truth")
     entry_point = _nested(parent, "extra_info.entry_point", "Model")
     if not isinstance(parent_code, str) or not isinstance(entry_point, str):
         raise ValueError("invalid_parent_code_or_entry_point")
     child_code, input_bytes_before, input_bytes_after = _transform_dtype(
-        parent_code, entry_point, eligible.assigned_dtype, eligible.transformed_factory_count
+        parent_code,
+        entry_point,
+        eligible.assigned_dtype,
+        eligible.transformed_factory_count,
+        coherence_class,
     )
     if input_bytes_before != eligible.input_bytes_before or input_bytes_after != eligible.input_bytes_after:
         raise ValueError("input_byte_accounting_changed_during_replay")
@@ -479,12 +729,16 @@ def _make_child(
     child_ast_sha256 = _normalized_ast_sha256(child_code)
     intervention = {
         "primary_intervention": "dtype",
-        "coherence_class": "parameter_free_all_direct_float_inputs",
+        "coherence_class": coherence_class,
         "dtype_before": "float32",
         "dtype_after": eligible.assigned_dtype,
         "factory_count": eligible.transformed_factory_count,
-        "model_parameter_policy": "runtime_must_be_empty",
-        "model_buffer_policy": "runtime_must_be_empty",
+        "model_parameter_policy": (
+            "runtime_must_be_empty" if coherence_class == PARAMETER_FREE else "registered_fp32_parent_exact_cast"
+        ),
+        "model_buffer_policy": (
+            "runtime_must_be_empty" if coherence_class == PARAMETER_FREE else "registered_state_exact_cast_or_equal"
+        ),
         "explicit_cast_policy": "none_in_model",
         "fp32_fallback_policy": "runtime_trace_reject",
     }
@@ -492,7 +746,7 @@ def _make_child(
     child_uuid = (
         "dtype_"
         + _sha256_bytes(
-            f"{CONTRACT_VERSION}:{eligible.parent_uuid}:{eligible.parent_reference_sha256}:{intervention_sha256}".encode()
+            f"{solver_contract}:{eligible.parent_uuid}:{eligible.parent_reference_sha256}:{intervention_sha256}".encode()
         )[:24]
     )
     child["reward_model"] = dict(child["reward_model"])
@@ -511,14 +765,14 @@ def _make_child(
             "reference_sha256": child_reference_sha256,
             "normalized_ast_sha256": child_ast_sha256,
             "included_in_review_train": False,
-            "runtime_validation_status": "dtype_parameter_free_paired_runtime_pending",
+            "runtime_validation_status": f"dtype_{coherence_class}_paired_runtime_pending",
             "governance_status": "dtype_intervention_review_only",
         }
     )
     extra["v4"] = v4
     extra["augmentation"] = {
-        "contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "contract_version": solver_contract,
+        "generator_version": solver_generator,
         "parent_uuid": eligible.parent_uuid,
         "child_uuid": child_uuid,
         "source_artifact_sha256": source_sha256,
@@ -530,7 +784,7 @@ def _make_child(
         "intervention_id": f"dtype_{intervention_sha256[:20]}",
         "intervention_sha256": intervention_sha256,
         "intervention_kind": "dtype",
-        "coverage_cell": f"dtype_parameter_free_{eligible.assigned_dtype}",
+        "coverage_cell": f"dtype_{coherence_class}_{eligible.assigned_dtype}",
         "shape_scale": None,
         "value_family_before": None,
         "value_family_after": None,
@@ -552,8 +806,11 @@ def _make_child(
         "compatibility_proof": (
             "all_unique_returned_float_factories_are_fp32;model_and_get_init_inputs_unchanged;"
             "no_static_parameter_buffer_tensor_state_or_model_dtype_cast"
+            if coherence_class == PARAMETER_FREE
+            else "all_unique_returned_float_factories_are_fp32;get_init_inputs_unchanged;"
+            "canonical_builtin_registered_state;single_explicit_base_module_dtype_conversion"
         ),
-        "validation_status": "static_parameter_free_dtype_pass_paired_runtime_required",
+        "validation_status": f"static_{coherence_class}_dtype_pass_paired_runtime_required",
     }
     child["extra_info"] = extra
     fatal, _ = inspect_row_schema(child, child_code)
@@ -574,13 +831,14 @@ def _make_child(
         "primary_intervention": "dtype",
         "assigned_target": eligible.assigned_dtype,
         "realized_intervention": intervention,
+        "coherence_class": coherence_class,
         "reject_reason": None,
         "assignment_version": ASSIGNMENT_VERSION,
         "assignment_sha256": eligible.assignment_sha256,
         "selection_version": SELECTION_VERSION,
         "selection_sha256": eligible.selection_sha256,
-        "generator_contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "generator_contract_version": solver_contract,
+        "generator_version": solver_generator,
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -592,7 +850,7 @@ def _make_child(
         "value_changed": False,
         "dtype_changed": True,
         "layout_changed": False,
-        "model_changed": False,
+        "model_changed": coherence_class == MODULE_STATE,
         "get_init_inputs_changed": False,
         "rng_consumption_status": "runtime_pending",
         "factory_count": eligible.factory_count,
@@ -605,8 +863,8 @@ def _make_child(
         "factory_specs_before": [
             {"factory": name, "shape": list(shape), "dtype": dtype} for name, shape, dtype in eligible.factory_specs
         ],
-        "model_parameter_count": 0,
-        "model_buffer_count": 0,
+        "model_parameter_count": 0 if coherence_class == PARAMETER_FREE else None,
+        "model_buffer_count": 0 if coherence_class == PARAMETER_FREE else None,
         "explicit_model_casts": [],
         "runtime_promotion_status": "pending",
         "static_status": "passed",
@@ -617,7 +875,7 @@ def _make_child(
         "runtime_policy_fingerprint": None,
         "provenance_status": _nested(parent, "extra_info.v4.provenance_status"),
         "licenses": _nested(parent, "extra_info.v4.licenses", []),
-        "lineage": "canonical_parent_parameter_free_dtype_child",
+        "lineage": f"canonical_parent_{coherence_class}_dtype_child",
         "row_sha256": _canonical_sha256(child),
         "training_approved": False,
     }
@@ -632,7 +890,8 @@ def _atomic_text(path: Path, text: str) -> None:
 
 
 def _review_markdown(samples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]]) -> str:
-    lines = ["# Parameter-free dtype solver review samples", ""]
+    coherence_class = samples[0][2]["coherence_class"] if samples else "unknown"
+    lines = [f"# {coherence_class} dtype solver review samples", ""]
     for parent, child, manifest in samples:
         before = str(_nested(parent, "reward_model.ground_truth", ""))
         after = str(_nested(child, "reward_model.ground_truth", ""))
@@ -656,9 +915,18 @@ def _review_markdown(samples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any
     return "\n".join(lines)
 
 
-def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: bool) -> dict[str, Any]:
+def build_lane(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    limit: int,
+    overwrite: bool,
+    coherence_class: str = PARAMETER_FREE,
+) -> dict[str, Any]:
     if type(limit) is not int or not 1 <= limit <= MAX_AUTHORIZED_CANDIDATES:
         raise ValueError(f"limit must be an integer in [1, {MAX_AUTHORIZED_CANDIDATES}]")
+    solver_contract = contract_version(coherence_class)
+    solver_generator = generator_version(coherence_class)
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
     source_sha256 = _sha256_file(input_path)
@@ -695,7 +963,7 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
     row_index = 0
     for batch in parquet.iter_batches(batch_size=256, use_threads=False):
         for row in batch.to_pylist():
-            item, reason = _analyze_parent(row, row_index)
+            item, reason = _analyze_parent(row, row_index, coherence_class)
             if item is None:
                 skip_counts[reason] += 1
                 decisions.append(
@@ -717,7 +985,7 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
                         "eligible": True,
                         "assigned_target": item.assigned_dtype,
                         "assignment_sha256": item.assignment_sha256,
-                        "reason": "static_parameter_free_dtype_eligible",
+                        "reason": f"static_{coherence_class}_dtype_eligible",
                     }
                 )
             row_index += 1
@@ -778,8 +1046,9 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
         return dict(sorted(collections.Counter(str(getattr(item, attribute)) for item in items).items()))
 
     summary: dict[str, Any] = {
-        "contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "contract_version": solver_contract,
+        "generator_version": solver_generator,
+        "coherence_class": coherence_class,
         "assignment_version": ASSIGNMENT_VERSION,
         "selection_version": SELECTION_VERSION,
         "input": str(input_path.resolve()),
@@ -802,12 +1071,12 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
         "skip_reason_counts": dict(sorted(skip_counts.items())),
         "proof": {
             "primary_intervention": "dtype",
-            "coherence_class": "parameter_free_all_direct_float_inputs",
+            "coherence_class": coherence_class,
             "one_dtype_per_parent": True,
             "shape_changed": False,
             "value_family_changed": False,
             "layout_changed": False,
-            "model_changed": False,
+            "model_changed": coherence_class == MODULE_STATE,
             "get_init_inputs_changed": False,
             "runtime_boundary": (
                 "paired parent/child reference, exact target realization, no-FP32 dispatch trace, "
@@ -829,13 +1098,25 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("input", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--limit", type=int, required=True, help="Canary size in [1, 5000]")
+    parser.add_argument("--coherence-class", choices=COHERENCE_CLASSES, default=PARAMETER_FREE)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    print(json.dumps(build_lane(args.input, args.output_dir, limit=args.limit, overwrite=args.overwrite), indent=2))
+    print(
+        json.dumps(
+            build_lane(
+                args.input,
+                args.output_dir,
+                limit=args.limit,
+                overwrite=args.overwrite,
+                coherence_class=args.coherence_class,
+            ),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

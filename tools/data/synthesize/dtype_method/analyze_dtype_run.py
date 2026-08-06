@@ -19,11 +19,13 @@ from tools.data.synthesize.dtype_method import solve_dtype_coverage as dtype_sol
 from tools.data.synthesize.dtype_method import validate_dtype_liveness as dtype_validator
 from tools.data.synthesize.random_method import analyze_value_run as evidence_common
 
-ANALYSIS_CONTRACT = "dtype_parameter_free_exact_analysis_v1"
+ANALYSIS_CONTRACTS = {
+    dtype_solver.PARAMETER_FREE: "dtype_parameter_free_exact_analysis_v2",
+    dtype_solver.MODULE_STATE: "dtype_module_state_exact_analysis_v1",
+}
 EXPECTED_DTYPES = frozenset({"float16", "bfloat16"})
 MAX_AUTHORIZED_CANDIDATES = 5_000
 MIN_LIVENESS_TRIALS = 3
-ACCEPTED_RUNTIME_STATUS = "dtype_parameter_free_reference_and_liveness_passed"
 ACCEPTED_GOVERNANCE_STATUS = "dtype_intervention_review_only"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 LIVENESS_CONFIG_FIELDS = frozenset(
@@ -79,6 +81,35 @@ OUTPUT_RECORD_FIELDS = frozenset(
         "atol",
     }
 )
+MODEL_STATE_FIELDS = frozenset(
+    {
+        "coherence_class",
+        "construction_rng_equal",
+        "parameter_entries",
+        "buffer_entries",
+        "floating_entries",
+        "nonfloating_entries",
+        "state_bytes_parent",
+        "state_bytes_child",
+        "object_alias_groups",
+        "storage_alias_groups",
+        "state_schema_sha256",
+        "values_equal_to_parent_cast",
+        "nonfloat_values_equal",
+        "unregistered_tensor_count",
+    }
+)
+
+
+def _analysis_contract(coherence_class: str) -> str:
+    try:
+        return ANALYSIS_CONTRACTS[coherence_class]
+    except KeyError as exc:
+        raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
+
+
+def _accepted_runtime_status(coherence_class: str) -> str:
+    return f"dtype_{coherence_class}_reference_and_liveness_passed"
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -196,12 +227,17 @@ def _verify_static(
     children: list[dict[str, Any]],
     manifests: list[dict[str, Any]],
     paired: list[dict[str, Any]],
-) -> None:
+) -> str:
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError("aligned dtype artifact count mismatch")
     expected_paired = [row for pair in zip(parents, children, strict=True) for row in pair]
     if _canonical_bytes(expected_paired) != _canonical_bytes(paired):
         raise ValueError("paired parquet is not the exact parent/child interleave")
+    coherence_classes = {manifest.get("coherence_class") for manifest in manifests}
+    if len(coherence_classes) != 1:
+        raise ValueError(f"dtype manifests mix coherence classes:{sorted(map(str, coherence_classes))}")
+    coherence_class = str(next(iter(coherence_classes)))
+    solver_contract = dtype_solver.contract_version(coherence_class)
     generator_path = Path(dtype_solver.__file__).resolve()
     dependency_path = generator_path.parent.parent / "augment_prompt_tasks.py"
     current_generator_sha = _sha256_file(generator_path)
@@ -228,19 +264,25 @@ def _verify_static(
             raise ValueError(f"manifest index mismatch:{index}")
         if manifest.get("primary_intervention") != "dtype" or manifest.get("assigned_target") not in EXPECTED_DTYPES:
             raise ValueError(f"manifest dtype intervention mismatch:{index}")
-        if manifest.get("generator_contract_version") != dtype_solver.CONTRACT_VERSION:
+        if manifest.get("generator_contract_version") != solver_contract:
             raise ValueError(f"manifest solver contract mismatch:{index}")
         if manifest.get("generator_source_sha256") != current_generator_sha:
             raise ValueError(f"manifest solver SHA mismatch:{index}")
         if manifest.get("dependency_source_sha256") != current_dependency_sha:
             raise ValueError(f"manifest dependency SHA mismatch:{index}")
-        for field in ("shape_changed", "value_changed", "layout_changed", "model_changed", "get_init_inputs_changed"):
+        for field in ("shape_changed", "value_changed", "layout_changed", "get_init_inputs_changed"):
             if manifest.get(field) is not False:
                 raise ValueError(f"non-dtype axis changed:{index}:{field}")
+        if manifest.get("model_changed") != (coherence_class == dtype_solver.MODULE_STATE):
+            raise ValueError(f"model change declaration mismatch:{index}:{coherence_class}")
         if manifest.get("dtype_changed") is not True:
             raise ValueError(f"dtype axis not declared changed:{index}")
-        if manifest.get("model_parameter_count") != 0 or manifest.get("model_buffer_count") != 0:
-            raise ValueError(f"parameter-free manifest proof mismatch:{index}")
+        expected_static_count = 0 if coherence_class == dtype_solver.PARAMETER_FREE else None
+        if (
+            manifest.get("model_parameter_count") != expected_static_count
+            or manifest.get("model_buffer_count") != expected_static_count
+        ):
+            raise ValueError(f"model-state manifest proof mismatch:{index}:{coherence_class}")
         if manifest.get("explicit_model_casts") != [] or manifest.get("runtime_promotion_status") != "pending":
             raise ValueError(f"static cast/promotion status mismatch:{index}")
         parent_uuid = _nested(parent, "extra_info.uuid")
@@ -260,7 +302,7 @@ def _verify_static(
         source_index = manifest.get("source_row_index")
         if _canonical_bytes(canonical[source_index]) != _canonical_bytes(parent):
             raise ValueError(f"parent differs from canonical source:{index}")
-        replay_item, reason = dtype_solver._analyze_parent(parent, source_index)
+        replay_item, reason = dtype_solver._analyze_parent(parent, source_index, coherence_class)
         if replay_item is None:
             raise ValueError(f"current dtype solver rejects parent:{index}:{reason}")
         replay_child, replay_manifest = dtype_solver._make_child(
@@ -282,6 +324,7 @@ def _verify_static(
             if value in uniqueness[field]:
                 raise ValueError(f"duplicate dtype manifest field:{field}:{value}")
             uniqueness[field].add(value)
+    return coherence_class
 
 
 def _verify_dispatch(value: Any, *, target: str, label: str) -> dict[str, Any]:
@@ -392,20 +435,76 @@ def _verify_output_record(value: Any, *, target: str, label: str) -> dict[str, A
     return dict(record)
 
 
+def _verify_model_state(value: Any, *, coherence_class: str, label: str) -> dict[str, Any]:
+    state = _require_exact_mapping(value, MODEL_STATE_FIELDS, label=label)
+    if state["coherence_class"] != coherence_class:
+        raise ValueError(f"{label} coherence class differs")
+    for field in (
+        "parameter_entries",
+        "buffer_entries",
+        "floating_entries",
+        "nonfloating_entries",
+        "state_bytes_parent",
+        "state_bytes_child",
+        "object_alias_groups",
+        "storage_alias_groups",
+        "unregistered_tensor_count",
+    ):
+        if type(state[field]) is not int or state[field] < 0:
+            raise ValueError(f"{label} has invalid {field}")
+    if (
+        state["construction_rng_equal"] is not True
+        or state["values_equal_to_parent_cast"] is not True
+        or state["nonfloat_values_equal"] is not True
+        or state["unregistered_tensor_count"] != 0
+        or not isinstance(state["state_schema_sha256"], str)
+        or SHA256_RE.fullmatch(state["state_schema_sha256"]) is None
+    ):
+        raise ValueError(f"{label} has invalid coherence proof")
+    if coherence_class == dtype_solver.MODULE_STATE:
+        if (
+            state["floating_entries"] <= 0
+            or state["parameter_entries"] + state["buffer_entries"] <= 0
+            or state["state_bytes_parent"] <= 0
+            or state["state_bytes_child"] <= 0
+        ):
+            raise ValueError(f"{label} has no realized floating registered state")
+        state_budget_bytes = int(dtype_validator.MAX_DEVICE_MEMORY_GIB * 1024**3)
+        if state["state_bytes_parent"] + state["state_bytes_child"] > state_budget_bytes:
+            raise ValueError(f"{label} exceeds the registered-state memory budget")
+    elif any(
+        state[field] != 0
+        for field in (
+            "parameter_entries",
+            "buffer_entries",
+            "floating_entries",
+            "nonfloating_entries",
+            "state_bytes_parent",
+            "state_bytes_child",
+            "object_alias_groups",
+            "storage_alias_groups",
+        )
+    ):
+        raise ValueError(f"{label} parameter-free state evidence is nonempty")
+    return dict(state)
+
+
 def _verify_trial(
     value: Any,
     *,
     trial_index: int,
     target: str,
     expected_changed: int,
+    coherence_class: str,
     label: str,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], int, dict[str, Any]]:
     fields = frozenset(
         {
             "trial",
             "seed",
             "changed_dtype_tensors",
             "inputs",
+            "model_state",
             "cast_equivalent_outputs",
             "semantic_dispatch",
             "realized_dispatch",
@@ -434,7 +533,15 @@ def _verify_trial(
         raise ValueError(f"{label} repeats an input path")
     semantic = _verify_dispatch(trial["semantic_dispatch"], target=target, label=f"{label}.semantic_dispatch")
     realized = _verify_dispatch(trial["realized_dispatch"], target=target, label=f"{label}.realized_dispatch")
-    return verified_inputs, verified_outputs, semantic["total_dispatch_calls"] + realized["total_dispatch_calls"]
+    model_state = _verify_model_state(
+        trial["model_state"], coherence_class=coherence_class, label=f"{label}.model_state"
+    )
+    return (
+        verified_inputs,
+        verified_outputs,
+        semantic["total_dispatch_calls"] + realized["total_dispatch_calls"],
+        model_state,
+    )
 
 
 def _verify_liveness(
@@ -447,6 +554,12 @@ def _verify_liveness(
     manifest_path: Path,
     allowlist_path: Path,
 ) -> tuple[dict[str, Any], set[str], dict[str, dict[str, Any]]]:
+    coherence_classes = {manifest.get("coherence_class") for manifest in manifests}
+    if len(coherence_classes) != 1:
+        raise ValueError("liveness manifests mix coherence classes")
+    coherence_class = str(next(iter(coherence_classes)))
+    runtime_contract = dtype_validator.contract_version(coherence_class)
+    runtime_binding = dtype_validator.binding_version(coherence_class)
     shard_count, raw = evidence_common._shard_records(liveness_dir)
     if len(raw) != len(both_pass):
         raise ValueError(f"liveness row count mismatch:{len(raw)}:{len(both_pass)}")
@@ -480,15 +593,18 @@ def _verify_liveness(
     cast_equal_observations: collections.Counter[str] = collections.Counter()
     max_factory_difference: collections.defaultdict[str, float] = collections.defaultdict(float)
     max_output_difference: collections.defaultdict[str, float] = collections.defaultdict(float)
+    state_observations: collections.Counter[str] = collections.Counter()
+    max_parent_state_bytes: collections.Counter[str] = collections.Counter()
+    max_child_state_bytes: collections.Counter[str] = collections.Counter()
     for shard_index, line_number, record in raw:
         uuid = record.get("child_uuid")
         if uuid not in both_pass or uuid in by_uuid:
             raise ValueError(f"invalid liveness UUID:{shard_index}:{line_number}:{uuid}")
         if selected_position[uuid] % shard_count != shard_index:
             raise ValueError(f"liveness UUID assigned to wrong shard:{uuid}")
-        if record.get("contract_version") != dtype_validator.CONTRACT_VERSION:
+        if record.get("contract_version") != runtime_contract:
             raise ValueError(f"liveness contract mismatch:{uuid}")
-        if record.get("binding_version") != dtype_validator.RUN_BINDING_VERSION:
+        if record.get("binding_version") != runtime_binding or record.get("coherence_class") != coherence_class:
             raise ValueError(f"liveness binding version mismatch:{uuid}")
         if type(record.get("passed")) is not bool:
             raise ValueError(f"liveness verdict is not boolean:{uuid}")
@@ -520,6 +636,7 @@ def _verify_liveness(
         evidence = {
             "contract_version": record["contract_version"],
             "binding_version": record["binding_version"],
+            "coherence_class": coherence_class,
             "validator_source_sha256": record["validator_source_sha256"],
             "launcher_source_sha256": record["launcher_source_sha256"],
             **expected_artifacts,
@@ -536,6 +653,7 @@ def _verify_liveness(
             record.get("parent_uuid") != manifest["parent_uuid"]
             or record.get("assigned_dtype") != target
             or record.get("transformed_factory_count") != expected_changed
+            or record.get("coherence_class") != coherence_class
         ):
             raise ValueError(f"liveness identity mismatch:{uuid}")
         status = str(record.get("status"))
@@ -559,12 +677,14 @@ def _verify_liveness(
             if not isinstance(trials, list) or len(trials) != config["trials"]:
                 raise ValueError(f"passed liveness trial count mismatch:{uuid}")
             frozen_input_schema: list[dict[str, Any]] | None = None
+            frozen_model_state: dict[str, Any] | None = None
             for trial_index, trial in enumerate(trials):
-                inputs, outputs, calls = _verify_trial(
+                inputs, outputs, calls, model_state = _verify_trial(
                     trial,
                     trial_index=trial_index,
                     target=target,
                     expected_changed=expected_changed,
+                    coherence_class=coherence_class,
                     label=f"{uuid}.trials[{trial_index}]",
                 )
                 input_schema = [
@@ -587,10 +707,17 @@ def _verify_liveness(
                     frozen_input_schema = input_schema
                 elif frozen_input_schema != input_schema:
                     raise ValueError(f"dtype input schema changes across trials:{uuid}")
+                if frozen_model_state is None:
+                    frozen_model_state = model_state
+                elif frozen_model_state != model_state:
+                    raise ValueError(f"dtype model-state proof changes across trials:{uuid}")
                 trial_counts[target] += 1
                 input_observations[target] += len(inputs)
                 output_observations[target] += len(outputs)
                 dispatch_calls[target] += calls
+                state_observations[target] += 1
+                max_parent_state_bytes[target] = max(max_parent_state_bytes[target], model_state["state_bytes_parent"])
+                max_child_state_bytes[target] = max(max_child_state_bytes[target], model_state["state_bytes_child"])
                 cast_equal_observations[target] += sum(item["factory_values_equal_to_parent_cast"] for item in inputs)
                 max_factory_difference[target] = max(
                     max_factory_difference[target], *(item["maximum_factory_cast_difference"] for item in inputs)
@@ -618,7 +745,8 @@ def _verify_liveness(
         return dict(result)
 
     summary = {
-        "contract_version": dtype_validator.CONTRACT_VERSION,
+        "contract_version": runtime_contract,
+        "coherence_class": coherence_class,
         "shard_count": shard_count,
         "selected": len(by_uuid),
         "passed": len(passed),
@@ -636,6 +764,9 @@ def _verify_liveness(
                 "factory_equal_to_parent_cast_observations": cast_equal_observations[target],
                 "output_tensor_observations": output_observations[target],
                 "dispatch_calls": dispatch_calls[target],
+                "model_state_observations": state_observations[target],
+                "maximum_parent_state_bytes": max_parent_state_bytes[target],
+                "maximum_child_state_bytes": max_child_state_bytes[target],
                 "maximum_factory_cast_difference": max_factory_difference[target],
                 "maximum_cast_equivalent_output_difference": max_output_difference[target],
                 "fp32_or_complex_fallback_calls": 0,
@@ -652,8 +783,13 @@ def _verify_liveness(
 
 
 def _materialize_accepted(
-    children_table: pa.Table, indices: Sequence[int], *, runtime_policy_fingerprint: str
+    children_table: pa.Table,
+    indices: Sequence[int],
+    *,
+    runtime_policy_fingerprint: str,
+    coherence_class: str,
 ) -> pa.Table:
+    accepted_runtime_status = _accepted_runtime_status(coherence_class)
     accepted = children_table.take(pa.array(list(indices), type=pa.int64()))
     rows = accepted.to_pylist()
     for index, row in enumerate(rows):
@@ -664,16 +800,17 @@ def _materialize_accepted(
             or not isinstance(extra.get("augmentation"), dict)
         ):
             raise ValueError(f"accepted dtype row lacks status structs:{index}")
-        extra["v4"]["runtime_validation_status"] = ACCEPTED_RUNTIME_STATUS
+        extra["v4"]["runtime_validation_status"] = accepted_runtime_status
         extra["v4"]["governance_status"] = ACCEPTED_GOVERNANCE_STATUS
         extra["v4"]["included_in_review_train"] = False
         extra["augmentation"]["validation_status"] = ACCEPTED_GOVERNANCE_STATUS
     metadata = dict(children_table.schema.metadata or {})
     metadata.update(
         {
-            b"dtype.analysis_contract": ANALYSIS_CONTRACT.encode(),
+            b"dtype.analysis_contract": _analysis_contract(coherence_class).encode(),
+            b"dtype.coherence_class": coherence_class.encode(),
             b"dtype.runtime_policy_fingerprint": runtime_policy_fingerprint.encode(),
-            b"dtype.runtime_validation_status": ACCEPTED_RUNTIME_STATUS.encode(),
+            b"dtype.runtime_validation_status": accepted_runtime_status.encode(),
             b"dtype.governance_status": ACCEPTED_GOVERNANCE_STATUS.encode(),
             b"dtype.training_approved": b"false",
         }
@@ -723,8 +860,9 @@ def _write_report(
     manifests: list[dict[str, Any]],
     accepted: set[str] | None,
 ) -> None:
+    coherence_class = str(manifests[0]["coherence_class"])
     lines = [
-        "# Parameter-free dtype canary audit",
+        f"# {coherence_class} dtype canary audit",
         "",
         f"- Candidate pairs: {reference['candidate_pairs']}",
         f"- Reference both-pass: {reference['both_pass_children']}",
@@ -783,7 +921,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     children = children_table.to_pylist()
     paired = pq.read_table(paired_path).to_pylist()
     manifests = _read_manifest(manifest_path)
-    _verify_static(parents, children, manifests, paired)
+    coherence_class = _verify_static(parents, children, manifests, paired)
     reference, both_pass, child_reference_records = evidence_common._verify_reference(
         reference_dir=args.reference_dir,
         paired_path=paired_path,
@@ -814,6 +952,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         analyzer_sha = _sha256_file(Path(__file__).resolve())
         common_reference_analyzer_sha = _sha256_file(Path(evidence_common.__file__).resolve())
         policy = {
+            "coherence_class": coherence_class,
             "analyzer_source_sha256": analyzer_sha,
             "common_reference_analyzer_sha256": common_reference_analyzer_sha,
             "reference_contract_fingerprint": reference["contract_fingerprint"],
@@ -823,7 +962,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         }
         runtime_policy_fingerprint = _canonical_sha256(policy)
         accepted_table = _materialize_accepted(
-            children_table, accepted_indices, runtime_policy_fingerprint=runtime_policy_fingerprint
+            children_table,
+            accepted_indices,
+            runtime_policy_fingerprint=runtime_policy_fingerprint,
+            coherence_class=coherence_class,
         )
         accepted_path = args.lane_dir / "runtime/accepted.parquet"
         accepted_path.parent.mkdir(parents=True, exist_ok=True)
@@ -861,7 +1003,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         _write_json(
             args.lane_dir / "runtime/final_summary.json",
             {
-                "contract_version": ANALYSIS_CONTRACT,
+                "contract_version": _analysis_contract(coherence_class),
+                "coherence_class": coherence_class,
                 "scope": "small_batch_canary_only",
                 "maximum_authorized_candidates": MAX_AUTHORIZED_CANDIDATES,
                 "candidate_rows": len(children),
