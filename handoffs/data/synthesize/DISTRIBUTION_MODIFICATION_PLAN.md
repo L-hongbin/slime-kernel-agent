@@ -93,14 +93,15 @@ manifest 必须记录每类 tensor 的实际 dtype、显式 cast 和 runtime pro
 
 每个 layout pattern 单独成 cell，保持 logical shape、值和 dtype 不变。现有 transpose-contiguous-transpose pilot 通过 31/41，10 个 failure 都受 tuple-output evaluator 缺口影响，不能据此判定 layout 无效。
 
-下一轮分别覆盖：
+2026-08-06 的 1k A800 canary 已完成前三类 deterministic solver cell：
 
 - transpose/permute 后的非 contiguous stride；
 - slice 产生的 stride 和 non-zero storage offset；
 - expand 产生的 zero stride；
-- operator contract 允许时的 channels-last 或其他 memory format。
 
-runtime gate 必须读取实际 size、stride、storage offset 和 contiguity，确认 intervention 没有在进入被测计算前被 `.contiguous()` 消除。
+1,000 个 candidate 中 851 个 parent/child reference 双通过，584 个再通过三轮 raw-direct layout/output liveness：transpose 262、slice 314、expand 8。Static 和 runtime gate 均保持 logical value、shape、dtype、RNG 与原 factory 求值顺序，并检查实际 stride/offset/zero stride、alias、forward 后 immutability、semantic consumer 和 exact output；unknown dispatch 或 intervention 在 consumer 前被 materialize 均 fail-closed。结果为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/LAYOUT_CANARY.md`。
+
+channels-last 或其他 memory format 仍需逐 operator 证明 memory-format contract，本 canary 未覆盖。后续 runtime gate 仍必须读取实际 size、stride、storage offset 和 contiguity，确认 intervention 没有在进入被测计算前被 `.contiguous()` 或等价 materializer 消除。
 
 ### Semantic/operator 和 source/mode
 
