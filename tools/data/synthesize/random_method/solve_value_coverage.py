@@ -65,7 +65,7 @@ LOCAL_GENERATOR_MAX_SEED = 2**63 - 1
 MAX_AUTHORIZED_CANDIDATES = 5_000
 SOURCE_BINDING_VERSION = "random_value_input_source_binding_v1"
 SHAPE_RESAMPLE_CONTRACT = "shape_runtime_single_changed_tensor_coverage_resample_v3"
-SHAPE_RESAMPLE_SELECTION = "shape_cells_proportional_quota_with_secondary_marginals_v3"
+SHAPE_RESAMPLE_SELECTION = "shape_cells_proportional_quota_with_secondary_marginals_v4"
 REAL_FLOAT_DTYPES = frozenset(
     {
         "torch.bfloat16",

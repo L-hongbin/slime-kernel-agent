@@ -38,9 +38,10 @@ from tools.data.synthesize.augment_prompt_tasks import (
 from tools.data.synthesize.random_method.solve_value_coverage import _analyze_parent, _git_blob_sha256, _git_commit
 
 CONTRACT_VERSION = "shape_runtime_single_changed_tensor_coverage_resample_v3"
-SELECTION_VERSION = "shape_cells_proportional_quota_with_secondary_marginals_v3"
+SELECTION_VERSION = "shape_cells_proportional_quota_with_secondary_marginals_v4"
 DEFAULT_LIMIT = 5_000
 MAX_MARGINAL_TOTAL_VARIATION = 0.05
+MARGINAL_REPAIR_TARGET = 0.045
 MIB = 1024**2
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -569,6 +570,176 @@ def _select(candidates: Sequence[Candidate], limit: int) -> list[Candidate]:
             )
 
         add(max(options, key=candidate_score))
+
+    # Main-cell quotas exactly preserve the four primary shape marginals, but
+    # correlated secondary attributes can still drift after the greedy fill.
+    # Repair that drift with deterministic swaps inside the same main cell.
+    # A same-cell swap cannot change aggregate/sample size, rank, aspect, or
+    # occupied-cell coverage.
+    population_counts = {
+        attribute: collections.Counter(str(getattr(candidate, attribute)) for candidate in candidates)
+        for attribute in _SECONDARY_MARGINALS
+    }
+    expected_counts = {
+        attribute: {value: count * limit / len(candidates) for value, count in population_counts[attribute].items()}
+        for attribute in _SECONDARY_MARGINALS
+    }
+
+    def marginal_tvds() -> dict[str, float]:
+        return {
+            attribute: 0.5
+            * sum(
+                abs(selected_marginals[attribute][value] - expected) / limit
+                for value, expected in expected_counts[attribute].items()
+            )
+            for attribute in _SECONDARY_MARGINALS
+        }
+
+    def objective(tvds: Mapping[str, float]) -> tuple[int, float, float]:
+        return (
+            sum(value > MARGINAL_REPAIR_TARGET for value in tvds.values()),
+            max(tvds.values()),
+            sum(tvds.values()),
+        )
+
+    def signature(candidate: Candidate) -> tuple[str, ...]:
+        return tuple(str(getattr(candidate, attribute)) for attribute in _SECONDARY_MARGINALS)
+
+    def distinct_delta(counter: Mapping[Any, int], old: Any, new: Any) -> int:
+        if old == new:
+            return 0
+        return int(counter.get(new, 0) == 0) - int(counter.get(old, 0) == 1)
+
+    for _ in range(limit):
+        current_tvds = marginal_tvds()
+        current_objective = objective(current_tvds)
+        if current_objective[0] == 0:
+            break
+        target_attribute = max(
+            _SECONDARY_MARGINALS,
+            key=lambda attribute: (current_tvds[attribute], attribute),
+        )
+        target_index = _SECONDARY_MARGINALS.index(target_attribute)
+        over_values = {
+            value
+            for value, expected in expected_counts[target_attribute].items()
+            if selected_marginals[target_attribute][value] > expected
+        }
+        under_values = {
+            value
+            for value, expected in expected_counts[target_attribute].items()
+            if selected_marginals[target_attribute][value] < expected
+        }
+
+        selected_signatures: dict[tuple[str, ...], dict[tuple[str, ...], list[Candidate]]] = collections.defaultdict(
+            lambda: collections.defaultdict(list)
+        )
+        remaining_signatures: dict[tuple[str, ...], dict[tuple[str, ...], list[Candidate]]] = collections.defaultdict(
+            lambda: collections.defaultdict(list)
+        )
+        for candidate in candidates:
+            destination = selected_signatures if candidate.child_uuid in chosen else remaining_signatures
+            destination[candidate.main_cell][signature(candidate)].append(candidate)
+
+        best: (
+            tuple[
+                tuple[tuple[int, float, float], int, int, str, str],
+                Candidate,
+                Candidate,
+            ]
+            | None
+        ) = None
+        for cell in sorted(selected_signatures):
+            if cell not in remaining_signatures:
+                continue
+            for old_signature, old_candidates in selected_signatures[cell].items():
+                if old_signature[target_index] not in over_values:
+                    continue
+                for new_signature, new_candidates in remaining_signatures[cell].items():
+                    if new_signature[target_index] not in under_values:
+                        continue
+                    if any(
+                        old_value != new_value and selected_marginals[attribute][old_value] <= 1
+                        for attribute, old_value, new_value in zip(
+                            _SECONDARY_MARGINALS,
+                            old_signature,
+                            new_signature,
+                            strict=True,
+                        )
+                    ):
+                        continue
+                    swapped_tvds = dict(current_tvds)
+                    for attribute, old_value, new_value in zip(
+                        _SECONDARY_MARGINALS,
+                        old_signature,
+                        new_signature,
+                        strict=True,
+                    ):
+                        if old_value == new_value:
+                            continue
+                        counts = selected_marginals[attribute]
+                        expected = expected_counts[attribute]
+                        absolute_error = 2 * limit * current_tvds[attribute]
+                        absolute_error -= abs(counts[old_value] - expected[old_value])
+                        absolute_error -= abs(counts[new_value] - expected[new_value])
+                        absolute_error += abs(counts[old_value] - 1 - expected[old_value])
+                        absolute_error += abs(counts[new_value] + 1 - expected[new_value])
+                        swapped_tvds[attribute] = absolute_error / (2 * limit)
+                    swapped_objective = objective(swapped_tvds)
+                    if swapped_objective >= current_objective:
+                        continue
+                    old_candidate = max(
+                        old_candidates,
+                        key=lambda candidate: (
+                            selected_geometries[candidate.geometry_signature] > 1,
+                            selected_exact_shapes[candidate.sampled_shape] > 1,
+                            candidate.selection_sha256,
+                        ),
+                    )
+                    new_candidate = max(
+                        new_candidates,
+                        key=lambda candidate: (
+                            selected_geometries[candidate.geometry_signature] == 0,
+                            selected_exact_shapes[candidate.sampled_shape] == 0,
+                            candidate.selection_sha256,
+                        ),
+                    )
+                    geometry_delta = distinct_delta(
+                        selected_geometries,
+                        old_candidate.geometry_signature,
+                        new_candidate.geometry_signature,
+                    )
+                    exact_shape_delta = distinct_delta(
+                        selected_exact_shapes,
+                        old_candidate.sampled_shape,
+                        new_candidate.sampled_shape,
+                    )
+                    key = (
+                        swapped_objective,
+                        -geometry_delta,
+                        -exact_shape_delta,
+                        old_candidate.selection_sha256,
+                        new_candidate.selection_sha256,
+                    )
+                    if best is None or key < best[0]:
+                        best = (key, old_candidate, new_candidate)
+        if best is None:
+            raise RuntimeError(
+                "same-cell secondary marginal repair has no improving swap: " f"{dict(sorted(current_tvds.items()))}"
+            )
+        _, old_candidate, new_candidate = best
+        del chosen[old_candidate.child_uuid]
+        chosen[new_candidate.child_uuid] = new_candidate
+        for attribute in _SECONDARY_MARGINALS:
+            selected_marginals[attribute][str(getattr(old_candidate, attribute))] -= 1
+            selected_marginals[attribute][str(getattr(new_candidate, attribute))] += 1
+        selected_geometries[old_candidate.geometry_signature] -= 1
+        selected_geometries[new_candidate.geometry_signature] += 1
+        selected_exact_shapes[old_candidate.sampled_shape] -= 1
+        selected_exact_shapes[new_candidate.sampled_shape] += 1
+    else:
+        raise RuntimeError("same-cell secondary marginal repair exceeded its deterministic bound")
+
     return sorted(chosen.values(), key=lambda item: (item.lane_index, item.source_row_index))
 
 
@@ -892,6 +1063,7 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
         "one_sampled_shape_per_row": True,
         "sampled_shape_selection": "stable_sha256_mod_changed_direct_factory_count",
         "maximum_marginal_total_variation": MAX_MARGINAL_TOTAL_VARIATION,
+        "marginal_repair_target": MARGINAL_REPAIR_TARGET,
         "marginal_audit": marginal_audit,
         "population": {
             "aggregate_size_buckets": _counter(candidates, "aggregate_size_bucket"),
