@@ -22,7 +22,7 @@ from tools.data.synthesize.random_method import solve_value_coverage as value_so
 REFERENCE_CONTRACT = "kernelgym-reference-self-train-mode-v3"
 LIVENESS_CONTRACT = "random_value_runtime_liveness_v2"
 LIVENESS_BINDING_VERSION = "random_value_runtime_liveness_binding_v2"
-ANALYSIS_CONTRACT = "random_value_lane_exact_analysis_v2"
+ANALYSIS_CONTRACT = "random_value_lane_exact_analysis_v3"
 SHARD_RE = re.compile(r"^shard-(\d+)-of-(\d+)\.jsonl$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_VALUE_FAMILIES = frozenset({"uniform_01", "signed_uniform", "poisson_counts", "multinomial_categories"})
@@ -308,30 +308,31 @@ def _shard_records(run_dir: Path) -> tuple[int, list[tuple[int, int, dict[str, A
     return shard_count, records
 
 
-def _normalize_canonical_parent(row: Mapping[str, Any], *, source_row_index: int) -> dict[str, Any]:
-    """Mirror the nullable augmentation field added when canonical parents are written to the lane."""
+def _normalize_source_parent(row: Mapping[str, Any], *, source_row_index: int) -> dict[str, Any]:
+    """Mirror the nullable augmentation field added when source parents enter the lane."""
 
     normalized = dict(row)
     extra_info = normalized.get("extra_info")
     if not isinstance(extra_info, Mapping):
-        raise ValueError(f"canonical source row lacks extra_info: {source_row_index}")
+        raise ValueError(f"source row lacks extra_info: {source_row_index}")
     normalized_extra_info = dict(extra_info)
     if "augmentation" in normalized_extra_info:
-        raise ValueError(f"canonical source unexpectedly contains augmentation metadata: {source_row_index}")
+        raise ValueError(f"source unexpectedly contains augmentation metadata: {source_row_index}")
     normalized_extra_info["augmentation"] = None
     normalized["extra_info"] = normalized_extra_info
     return normalized
 
 
-def _verify_canonical_source_binding(
+def _verify_source_binding(
     manifests: Sequence[Mapping[str, Any]],
-) -> dict[int, dict[str, Any]]:
-    """Reopen the canonical parquet and return the exact source rows used by this lane."""
+) -> tuple[dict[int, dict[str, Any]], value_solver.SourceContext]:
+    """Reopen and revalidate the exact canonical or shape-resampled source artifact."""
 
     if not manifests:
-        raise ValueError("cannot verify canonical source binding for an empty manifest")
+        raise ValueError("cannot verify source binding for an empty manifest")
     source_paths: set[str] = set()
     source_hashes: set[str] = set()
+    source_bindings: set[bytes] = set()
     source_indices: set[int] = set()
     for candidate_index, manifest in enumerate(manifests):
         source_path = manifest.get("source_artifact_path")
@@ -344,35 +345,36 @@ def _verify_canonical_source_binding(
                 label=f"manifest[{candidate_index}].source_artifact_sha256",
             )
         )
+        source_binding = manifest.get("source_binding")
+        if not isinstance(source_binding, Mapping):
+            raise ValueError(f"invalid source binding at row {candidate_index}")
+        source_bindings.add(_canonical_json_bytes(source_binding))
         source_row_index = manifest.get("source_row_index")
         if type(source_row_index) is not int or source_row_index < 0:
             raise ValueError(f"invalid source row index at row {candidate_index}: {source_row_index}")
         source_indices.add(source_row_index)
-    if len(source_paths) != 1 or len(source_hashes) != 1:
-        raise ValueError("lane manifests do not bind exactly one canonical source artifact")
+    if len(source_paths) != 1 or len(source_hashes) != 1 or len(source_bindings) != 1:
+        raise ValueError("lane manifests do not bind exactly one source artifact and contract")
 
     source_path_text = next(iter(source_paths))
     source_path = Path(source_path_text)
     if not source_path.is_absolute() or not source_path.is_file():
-        raise ValueError(f"canonical source artifact is unavailable: {source_path_text}")
+        raise ValueError(f"source artifact is unavailable: {source_path_text}")
     resolved_source_path = source_path.resolve()
     if str(resolved_source_path) != source_path_text:
-        raise ValueError(f"canonical source path is not resolved: {source_path_text}")
+        raise ValueError(f"source path is not resolved: {source_path_text}")
     recorded_source_sha256 = next(iter(source_hashes))
     actual_source_sha256 = _sha256_file(resolved_source_path)
     if actual_source_sha256 != recorded_source_sha256:
-        raise ValueError("canonical source artifact hash differs from the manifest binding")
-    if actual_source_sha256 != value_solver.EXPECTED_CANONICAL_PARENT_SHA256:
-        raise ValueError("canonical source artifact does not match the solver's frozen SHA256")
+        raise ValueError("source artifact hash differs from the manifest binding")
 
     parquet = pq.ParquetFile(resolved_source_path)
-    if parquet.metadata.num_rows != value_solver.EXPECTED_CANONICAL_PARENT_ROWS:
-        raise ValueError(
-            "canonical source row count differs from the solver contract: "
-            f"{parquet.metadata.num_rows}:{value_solver.EXPECTED_CANONICAL_PARENT_ROWS}"
-        )
+    source_context = value_solver._source_context(resolved_source_path, actual_source_sha256, parquet)
+    recorded_binding = json.loads(next(iter(source_bindings)))
+    if _canonical_json_bytes(source_context.binding) != _canonical_json_bytes(recorded_binding):
+        raise ValueError("reconstructed source binding differs from the lane manifest")
     if source_indices and max(source_indices) >= parquet.metadata.num_rows:
-        raise ValueError(f"canonical source row index is out of bounds: {max(source_indices)}")
+        raise ValueError(f"source row index is out of bounds: {max(source_indices)}")
 
     selected_rows: dict[int, dict[str, Any]] = {}
     row_offset = 0
@@ -382,14 +384,14 @@ def _verify_canonical_source_binding(
             source_row_index = row_offset + local_index
             if source_row_index in source_indices:
                 if not isinstance(row, dict):
-                    raise ValueError(f"canonical source row is not an object: {source_row_index}")
-                selected_rows[source_row_index] = _normalize_canonical_parent(row, source_row_index=source_row_index)
+                    raise ValueError(f"source row is not an object: {source_row_index}")
+                selected_rows[source_row_index] = _normalize_source_parent(row, source_row_index=source_row_index)
         row_offset += len(batch_rows)
         if len(selected_rows) == len(source_indices):
             break
     if set(selected_rows) != source_indices:
         raise ValueError("failed to load every source row bound by the lane manifest")
-    return selected_rows
+    return selected_rows, source_context
 
 
 def _failure_kind(record: Mapping[str, Any]) -> str:
@@ -431,7 +433,7 @@ def _verify_aligned_static(
     parents: list[dict[str, Any]],
     children: list[dict[str, Any]],
     manifests: list[dict[str, Any]],
-) -> None:
+) -> value_solver.SourceContext:
     _require_candidate_count(len(children))
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError(f"static artifact count mismatch: {len(parents)}:{len(children)}:{len(manifests)}")
@@ -455,7 +457,7 @@ def _verify_aligned_static(
         raise ValueError("current generator source differs from the manifest commit blob")
     if committed_dependency_sha256 != current_dependency_sha256:
         raise ValueError("current dependency source differs from the manifest commit blob")
-    canonical_rows = _verify_canonical_source_binding(manifests)
+    source_rows, source_context = _verify_source_binding(manifests)
     parent_uuids: set[str] = set()
     child_uuids: set[str] = set()
     child_references: set[str] = set()
@@ -467,6 +469,8 @@ def _verify_aligned_static(
         child_code = _nested(child, "reward_model.ground_truth")
         if type(manifest.get("candidate_row_index")) is not int or manifest["candidate_row_index"] != index:
             raise ValueError(f"manifest index mismatch: {index}")
+        if manifest.get("manifest_contract_version") != "random_value_lane_manifest_v3":
+            raise ValueError(f"manifest contract mismatch at row {index}")
         if manifest.get("generator_source_sha256") != current_generator_sha256:
             raise ValueError(f"current generator source hash mismatch at row {index}")
         if manifest.get("dependency_source_sha256") != current_dependency_sha256:
@@ -514,9 +518,37 @@ def _verify_aligned_static(
             raise ValueError(f"generator source does not match the manifest commit blob at row {index}")
         if manifest["dependency_source_sha256"] != committed_dependency_sha256:
             raise ValueError(f"dependency source does not match the manifest commit blob at row {index}")
-        canonical_parent = canonical_rows[source_row_index]
-        if _canonical_json_bytes(canonical_parent) != _canonical_json_bytes(parent):
-            raise ValueError(f"parent differs from canonical source row at candidate {index}")
+        source_parent = source_rows[source_row_index]
+        if _canonical_json_bytes(source_parent) != _canonical_json_bytes(parent):
+            raise ValueError(f"parent differs from source row at candidate {index}")
+        if manifest.get("source_kind") != source_context.kind:
+            raise ValueError(f"source kind mismatch at row {index}")
+        if _canonical_json_bytes(manifest.get("source_binding")) != _canonical_json_bytes(source_context.binding):
+            raise ValueError(f"source binding mismatch at row {index}")
+        if source_context.resample_manifests is None:
+            source_row_binding = None
+            expected_canonical_parent_uuid = parent_uuid
+            expected_lineage = "canonical_parent_value_only_child"
+            expected_inherited_shape = False
+            expected_upstream_index = None
+            expected_upstream_sha256 = None
+        else:
+            source_row_binding = source_context.resample_manifests[source_row_index]
+            expected_canonical_parent_uuid = source_row_binding.get("canonical_parent_uuid")
+            expected_lineage = "canonical_parent_shape_child_random_value_grandchild"
+            expected_inherited_shape = True
+            expected_upstream_index = source_row_binding.get("selected_index")
+            expected_upstream_sha256 = _canonical_sha256(source_row_binding)
+        if (
+            manifest.get("canonical_parent_uuid") != expected_canonical_parent_uuid
+            or manifest.get("lineage") != expected_lineage
+            or manifest.get("inherited_shape_intervention") is not expected_inherited_shape
+            or manifest.get("upstream_resample_selected_index") != expected_upstream_index
+            or manifest.get("upstream_resample_manifest_row_sha256") != expected_upstream_sha256
+        ):
+            raise ValueError(f"source lineage mismatch at row {index}")
+        if _nested(child, "extra_info.v4.parent_uuid") != parent_uuid:
+            raise ValueError(f"child does not point to its immediate parent at row {index}")
         replay_eligible, replay_reason = value_solver._analyze_parent(parent, source_row_index)
         if replay_eligible is None:
             raise ValueError(f"current solver rejects parent at row {index}: {replay_reason}")
@@ -528,6 +560,8 @@ def _verify_aligned_static(
             generator_sha256=manifest["generator_source_sha256"],
             dependency_sha256=manifest["dependency_source_sha256"],
             git_commit=git_commit,
+            source_binding=source_context.binding,
+            source_row_binding=source_row_binding,
         )
         replay_manifest["candidate_row_index"] = index
         if replay_child != child or _canonical_json_bytes(replay_child) != _canonical_json_bytes(child):
@@ -543,6 +577,7 @@ def _verify_aligned_static(
         raise ValueError("candidate parents are not unique")
     if len(child_uuids) != expected or len(child_references) != expected or len(child_asts) != expected:
         raise ValueError("child UUID/reference/AST uniqueness contract failed")
+    return source_context
 
 
 def _verify_reference_passed_record(record: Mapping[str, Any], *, label: str) -> dict[str, Any]:
@@ -1541,7 +1576,7 @@ def _write_report(
     accepted: set[str] | None,
 ) -> None:
     lines = [
-        "# Random/value canary runtime audit",
+        "# Random/value runtime audit",
         "",
         f"- Candidate pairs: {reference['candidate_pairs']}",
         f"- Reference both-pass: {reference['both_pass_children']}",
@@ -1685,7 +1720,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     children_table = pq.read_table(children_path)
     children = children_table.to_pylist()
     manifests = _read_manifest(manifest_path)
-    _verify_aligned_static(parents, children, manifests)
+    source_context = _verify_aligned_static(parents, children, manifests)
     reference, both_pass, child_reference_records = _verify_reference(
         reference_dir=args.reference_dir,
         paired_path=paired_path,
@@ -1767,9 +1802,14 @@ def main(argv: Sequence[str] | None = None) -> None:
         raw_artifact_manifest = _write_raw_artifact_manifest(args.lane_dir, [args.reference_dir, args.liveness_dir])
         final_summary = {
             "contract_version": ANALYSIS_CONTRACT,
-            "scope": "small_batch_canary_only",
+            "scope": (
+                "shape_coverage_resample_5000_review_lane"
+                if source_context.kind == "shape_coverage_resample"
+                else "canonical_parent_canary"
+            ),
             "maximum_authorized_candidates": 5_000,
             "candidate_rows": len(children),
+            "source_binding": dict(source_context.binding),
             "reference": reference,
             "liveness": liveness,
             "accepted_rows": len(accepted_indices),
