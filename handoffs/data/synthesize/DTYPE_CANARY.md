@@ -1,14 +1,14 @@
-# Dtype 1k canary 交接
+# Dtype 1k canary 交接（parameter-free + module-state）
 
 ## 结论和范围
 
-本轮不需要 LLM。parameter-free dtype sibling 可以由确定性 solver 构造：只选择静态证明无 parameter、buffer、submodule、tensor state、tensor constant 和 model 内 dtype cast 的任务，把所有直接 FP32 floating input factory 统一改为一个稳定分配的 `float16` 或 `bfloat16` target。`Model` 和 `get_init_inputs` 的其他 AST、shape、layout、value family 及 `get_init_inputs` 全局 RNG 消耗保持不变。
+本 lane 不需要 LLM。两个保守子集均由确定性 solver 构造并由 paired reference、三轮 runtime proof 和 dispatch trace 验收：历史 parameter-free canary 得到 638 条；本轮带 parameter/buffer 的 `module_state` coherent canary 得到 479 条。LLM 最多只能提出更宽候选，不能替代静态证明或 runtime 证据。
 
-带 parameter/buffer 的 coherent precision sibling 仍未实现。它原则上也可由 typed AST rewrite + runtime proof 完成，不必默认交给 LLM；但必须同时处理 parameter、buffer、dtype-sensitive constant、explicit cast 和 promotion。LLM 最多用于提出候选 rewrite，不能替代静态证明、paired reference 或 dispatch trace。本 canary 对这类任务 fail-closed，不把 input-only dtype mutation 冒充 coherent precision。
+`module_state` child 同时改写直接 FP32 floating input factory，并在 `Model.__init__` 末尾显式执行基类 `torch.nn.Module.to(self, dtype=target)`。它只接纳可静态归因到内置 `torch.nn` 注册 state 的模型；runtime 再逐项证明 parameter/buffer 是 parent FP32 state 的精确低精度 cast、非浮点 state 不变、alias 保持、无未注册 tensor/module state、构造 RNG 一致、forward 后 state 仍一致且核心 dispatch 没有 FP32/complex fallback。
 
-本机只做小批量验证。solver、liveness 和 exact analyzer 都有 5,000-row 硬门禁；本轮固定为 1,000 个 parent/child，不根据 11,206-row eligible pool 自动放量。最终 638 条 materialized row 全部为 `dtype_intervention_review_only`，且 `training_approved=false`。
+solver、liveness 和 exact analyzer 均有 5,000-row 硬门禁；两个 canary 都固定为 1,000 个 parent/child。所有 materialized row 均为 `dtype_intervention_review_only`、`training_approved=false`，没有进入训练数据。
 
-## Solver 和语义合同
+## Parameter-free solver 和语义合同（历史 canary）
 
 正式入口单独位于 `tools/data/synthesize/dtype_method/`：
 
@@ -133,6 +133,111 @@ PYTHONPATH=. uv run --no-project --with 'pyarrow==24.0.0' \
 
 代码验证包括 Black、Ruff、`py_compile`、shell syntax、CLI/import smoke、static exact replay、A800 targeted negative smoke、2,000-row paired reference 和 830-row liveness。按生产数据 pipeline 约定，本轮没有新增单元测试。
 
+## Module-state coherent 1k canary（本轮）
+
+### 静态合同
+
+`--coherence-class module_state` 复用同一套入口，不另建 v2 pipeline。solver 只接受 canonical `torch.nn.Module`、内置 `nn` state constructor、scalar-only `get_init_inputs`，并拒绝 custom base/decorator、custom `to/_apply/getattr/setattr`、model 内显式 dtype cast、无法归因的 tensor constant/state 和动态 constructor。child 的唯一 dtype intervention 是：
+
+1. 所有直接 FP32 floating input factory 改为稳定分配的 FP16 或 BF16；
+2. 在 `Model.__init__` 末尾注入 `torch.nn.Module.to(self, dtype=torch.<target>)`；
+3. shape、layout、value family、forward AST 和 init inputs 保持不变。
+
+Runtime validator 对相同 init inputs、相同构造 RNG 的 parent/child 各跑 3 trials。每轮要求 registered floating state 精确等于 parent state cast，non-floating state 精确不变，name/metadata/object alias/storage alias 保持；递归扫描并拒绝 list/dict 中隐藏的 tensor/module state，检查 non-persistent buffer 和 forward 后 state；同时拒绝 FP32/complex dispatch fallback。64 GiB guard 同时约束实际 CUDA allocator 以及 parent+child registered-state bytes。
+
+Canonical parent 仍为 `Data/prompt_tvm_v4/train.review.parquet`，64,315 rows。静态 eligible 为 20,567，固定选择 1,000 条：BF16 497、FP16 503；source 为 cuda_agent 120、drkernel 745、kernelbook 91、oubo_generated 44；operator bucket 为 2–5 ops 792、≥6 ops 184、≤1 op 24。generator commit 为 `95c545af54a5264dc7f9c0b8a889be48757fae4e`，generator SHA 为 `a10716de031876941d73a51f19e7dc8ab3730a62971ae9b3300db1ea86ea5dfd`。
+
+23 个静态样本覆盖四个 source、两个 dtype 和三个 operator bucket。人工 diff 确认只有 AST 等价重排/注释丢失、direct factory dtype 和 `Module.to` 注入；1,000 个 parent/child/selection UUID 均唯一。
+
+| Static artifact | SHA-256 |
+| --- | --- |
+| `parents.parquet` | `4cf4c06595d4fef989635d0ed90e4212d80d507beeebcf524cc8e160ef8058e5` |
+| `candidates.parquet` | `678a1edfa5f4b4004d6051836f814422172f18f4b5b548cc4c6b364dae0d6ee3` |
+| `paired.parquet` | `095607f8a4b52ac8476114482cda0efdd5d456d5cb3e970e0028e1e0a3a0fc29` |
+| `manifest.jsonl` | `f371dcda21b88d2257ef09dc1b915e91ab20f5c4d70dcd4137bc4cf72e7c151e` |
+| `decisions.jsonl` | `b6d6956b26655e644803e8c5e038a6c47f87e0b0b77e27b8c3768ab92fac0a9a` |
+| `review_samples.md` | `799de340f4377770e31a617227387619759d0050c297966e512fd87d9fa9c854` |
+
+### A800 reference 和 liveness
+
+运行环境为 node22 的 8× NVIDIA A800-SXM4-80GB、Torch `2.11.0+cu129`、CUDA 12.9、cuDNN 91701、KernelGym commit `26255057463a77b23abac0f3e5eafeeebf2ebbb5`。LSTM 使用 `RUNTIME.md` 记录的 cuDNN 9.17.1 library path；node21 因 CUDA context 异常未参与本轮产出，避免把节点故障混入方法通过率。
+
+Paired reference 使用 persistent train mode、5 trials、180 秒逐行 timeout 和 64 GiB guard。2,000 个 parent/child rows 的结果为：
+
+| Reference class | BF16 | FP16 | Total |
+| --- | ---: | ---: | ---: |
+| both pass | 425 | 438 | 863 |
+| both fail | 61 | 58 | 119 |
+| parent pass / child fail | 11 | 6 | 17 |
+| parent fail / child pass | 0 | 1 | 1 |
+
+只有 863 个 both-pass child 进入 liveness，allowlist SHA 为 `e30237eac7ea24c07382a79d9eda150be649f8995f065590d778925260194877`。其中 479 pass、380 unsupported、4 OOM：
+
+| Target | Passed | Unsupported | OOM |
+| --- | ---: | ---: | ---: |
+| BF16 | 218 | 204 | 3 |
+| FP16 | 261 | 176 | 1 |
+| **Total** | **479** | **380** | **4** |
+
+384 个拒绝按稳定原因前缀归并为：FP32/complex dispatch fallback 178、cast-equivalent output mismatch 91、parent exact control failure 63、runtime unregistered tensor state 31、non-float output mismatch 10、registered floating state missing 5、OOM 4、post-`get_inputs` RNG change 2。通过的 BF16/FP16 分别覆盖 654/783 trials、17,616/13,836 dispatch calls，accepted 的 FP32/complex fallback 均为 0。
+
+最终 accepted 为 BF16 218、FP16 261；source 为 cuda_agent 44、drkernel 345、kernelbook 73、oubo_generated 17；operator bucket 为 2–5 ops 386、≥6 ops 76、≤1 op 17。全量结构统计显示，11 条含 buffer、1 条含 non-floating state、2 条含需要保持的 object/storage alias group；人工抽取的 8 个 source×dtype cell 均有 3 份一致的 state evidence。代表例包括：
+
+- `dtype_e719c10f9a1c2c5151914d75`：2 parameters + 1 buffer，state bytes 640→320；
+- `dtype_2e7c35e7d8cb59f089247a6e`：4 parameters，其中 1 个 non-floating state 精确保持；
+- `dtype_607ce8aa826e38e0fd6e0f78`：8 parameters，4 个 object alias 与 4 个 storage alias 均保持，state bytes 3584→1792。
+
+### Materialization 和审查
+
+不可变 canary 目录为：
+
+`local_artifacts/data_handoffs/prompt_tvm_v4_dtype_module_state_canary1000`
+
+| Artifact | Rows / files | SHA-256 |
+| --- | ---: | --- |
+| `runtime/accepted.parquet` | 479 | `76dbcc21e643d3a2fec6e9962a242c5b852a36d61358edf4c02669c7cb32d46a` |
+| `runtime/accepted.manifest.jsonl` | 479 | `f496078652fa0df83e8f1c9fdc46dc6467728f9df85dfea3caa014d9db74d974` |
+| `runtime/raw_artifact_sha256.json` | raw evidence | `99df85cbd058c675848b04117dc669d6f67e1af8b08235581b7426ba1e2f5e99` |
+| `runtime/final_summary.json` | — | `261a935db58ec72a39cd33d09b401c0af0f2eb6faeb524ceafa8206bac97dccc` |
+| `analysis/reference_summary.json` | — | `4f6f15699b7a834946f1cda70dbd6b36fe83c57b629cb76d561a086fd7f91048` |
+| `analysis/liveness_summary.json` | — | `7a245908214b07e0fb1526985fce2810f99e0a558302a7b599b0c5102cfd0db6` |
+| `analysis/failure_bias_report.md` | — | `38f31b5317ea513f36da0bc51a36145bdb7e4dce89d439cb36c0db8a5d58a4e0` |
+
+Analyzer SHA 为 `5db4b4566805b306a7d004f73b9676e53eddbda9c4dfea714938870979ad3c3d`，runtime policy fingerprint 为 `88575e6625b057d0973cfc7d46982dcf6d1b0a1047a6b9cd4419d07eae020632`。479 条 manifest 均记录 `rng_consumption_status=construction_rng_equal_observed`、`materialization_status=dtype_intervention_review_only`、`training_approved=false`。
+
+Kimip 在实现、静态 1k 和最终证据三个 milestone 做了只读审查。实现阶段发现 list/dict 内隐藏 unregistered module 的 fail-open 路径，已修复；静态审查无 P0/P1；最终审查 verdict 为 PASS、无 P0/P1，并发现 accepted manifest RNG 标签仍为 `runtime_pending` 的 P2。该 P2 已在 analyzer 合并处修复并用 Python 3.12 exact replay 重新 materialize，accepted 集合仍为 479；修复后复核为 P0/P1/P2 均无、verdict PASS。
+
+### Module-state 复现入口
+
+Python 3.12 是 source-bound exact AST replay 环境；Python 3.13 的 `ast.unparse` 文本差异会被 fail-closed 拒绝。
+
+```bash
+lane_dir=local_artifacts/data_handoffs/prompt_tvm_v4_dtype_module_state_canary1000
+PYTHONPATH=. uv run --python 3.12 --no-project --with 'pyarrow==24.0.0' \
+  python tools/data/synthesize/dtype_method/solve_dtype_coverage.py \
+  Data/prompt_tvm_v4/train.review.parquet "${lane_dir}" \
+  --limit 1000 --coherence-class module_state
+```
+
+Reference 双通过 allowlist 生成后：
+
+```bash
+bash tools/data/synthesize/dtype_method/launch_dtype_liveness_shards.sh \
+  "${lane_dir}/parents.parquet" \
+  "${lane_dir}/candidates.parquet" \
+  "${lane_dir}/manifest.jsonl" \
+  "${lane_dir}/analysis/reference_both_pass_child_uuids.txt" \
+  "${lane_dir}/runtime/liveness/node22"
+
+PYTHONPATH=. uv run --python 3.12 --no-project --with 'pyarrow==24.0.0' \
+  python tools/data/synthesize/dtype_method/analyze_dtype_run.py \
+  "${lane_dir}" \
+  --reference-dir "${lane_dir}/runtime/reference/node22" \
+  --liveness-dir "${lane_dir}/runtime/liveness/node22"
+```
+
+代码验证包括 Black、Ruff、`py_compile`、shell syntax、static exact replay、隐藏 state negative smoke、A800 registered-state/alias targeted smoke、2,000-row paired reference 和 863-row liveness。按生产数据 pipeline 约定，本轮没有新增单元测试。
+
 ## 尚未证明的内容
 
-这份 canary 证明的是一个保守 parameter-free 子集在冻结环境下的低精度可执行性和有限 trial 数值行为。它没有证明所有 seed、所有硬件或任意 operator 都保持相同语义，也没有覆盖带参数模型的 coherent conversion。638 条 accepted 仍需人工 use-site review、failure bias 审查、cross-lane evidence 统一和受控训练 ablation；在这些步骤完成前不得设置 `training_approved=true`。
+这两份 canary 证明的是两个保守子集在冻结 A800 环境和有限 trials 下的低精度可执行性与状态合同，不证明所有 seed、硬件、operator 或任意自定义 module 都语义等价。`module_state` 也没有覆盖 dtype-sensitive 常量、自定义 conversion hook、动态/未注册 state；这些 case 应继续 fail-closed，不能用 LLM 文本判断替代证据。638+479 条 accepted 仍需 use-site review、cross-lane evidence 统一和受控训练 ablation；在这些步骤完成前不得设置 `training_approved=true`。

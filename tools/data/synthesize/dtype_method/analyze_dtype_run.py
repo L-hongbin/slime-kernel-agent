@@ -929,6 +929,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         children=children,
         manifests=manifests,
     )
+    if reference.get("contract_version") != evidence_common.ANALYSIS_CONTRACT:
+        raise ValueError("common reference verifier returned an unexpected analysis contract")
+    reference = {
+        **reference,
+        "contract_version": _analysis_contract(coherence_class),
+    }
     analysis_dir = args.lane_dir / "analysis"
     _write_json(analysis_dir / "reference_summary.json", reference)
     allowlist_path = analysis_dir / "reference_both_pass_child_uuids.txt"
@@ -986,6 +992,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "parent_runtime_status": "passed",
                     "child_runtime_status": "passed",
                     "liveness_status": "passed",
+                    "rng_consumption_status": "construction_rng_equal_observed",
                     "runtime_promotion_status": "no_fp32_or_complex_dispatch_fallback",
                     "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
                     "runtime_policy_fingerprint": runtime_policy_fingerprint,

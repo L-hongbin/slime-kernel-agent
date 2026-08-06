@@ -85,7 +85,9 @@ input-only dtype mutation 不再作为通用规则。旧 pilot 只通过 45/92�
 
 manifest 必须记录每类 tensor 的实际 dtype、显式 cast 和 runtime promotion。child 即使 correctness pass，只要核心路径立即隐式回到 FP32，也不能计入目标低精度 coverage。
 
-2026-08-05 的 parameter-free 1k A800 canary 已完成。本轮使用 deterministic solver，不需要 LLM；1,000 个 candidate 中 830 个 parent/child reference 双通过，638 个再通过三次 dtype/output liveness，accepted 为 BF16 308、FP16 330。全部结果仍为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/DTYPE_CANARY.md`。带 parameter/buffer 的 coherent precision sibling 仍未实现，不能把本轮结论外推到该类任务。
+2026-08-05 的 parameter-free 1k A800 canary 已完成。本轮使用 deterministic solver，不需要 LLM；1,000 个 candidate 中 830 个 parent/child reference 双通过，638 个再通过三次 dtype/output liveness，accepted 为 BF16 308、FP16 330。
+
+2026-08-06 的 `module_state` coherent 1k A800 canary 也已完成，仍由 solver 构造，不依赖 LLM。child 同时修改 direct FP32 input factory，并在 `Model.__init__` 末尾显式将 registered parameter/buffer 转成 target dtype；三轮 runtime proof 检查 parent-state exact cast、non-floating state、alias、隐藏/未注册 state、构造 RNG、post-forward state 和 FP32/complex dispatch fallback。1,000 个 candidate 中 863 个 reference 双通过，479 个通过 liveness（BF16 218、FP16 261）。两轮结果均为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/DTYPE_CANARY.md`；custom conversion hook、dtype-sensitive constant、动态或未注册 state 仍不在已证明范围内。
 
 ### Layout
 
