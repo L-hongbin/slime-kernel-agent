@@ -17,8 +17,9 @@ All mappings consume the original ``randn`` draw exactly once.  Stochastic
 mappings use a per-factory local CUDA generator, preserving the global RNG
 position so later unrelated random inputs cannot change as an accidental joint
 intervention.  Shape, dtype, layout, ``Model``, and ``get_init_inputs`` are
-checked structurally. Runtime parent/child correctness and value-liveness
-remain separate gates.
+checked structurally, and only the source spans of the selected ``randn`` calls
+are rewritten. Runtime parent/child correctness and value-liveness remain
+separate gates.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ from tools.data.synthesize.augment_prompt_tasks import (
 )
 
 CONTRACT_VERSION = "random_value_only_solver_v3"
-GENERATOR_VERSION = "isolated_distribution_mapping_v2"
+GENERATOR_VERSION = "isolated_distribution_mapping_v3_source_span_preserving"
 ASSIGNMENT_VERSION = "stable_parent_hash_single_family_v2"
 SELECTION_VERSION = "source_operator_family_proportional_largest_remainder_v1"
 EXPECTED_CANONICAL_PARENT_SHA256 = "b07205fcadc543964cfc7ee5fd9c1e4d011f0f3481447f656e5297e40b4b99f4"
@@ -686,7 +687,7 @@ def _factory_seed(seed_base: int, factory_index: int) -> int:
     return seed or 1
 
 
-def _value_wrapper(base: ast.Call, family: str, local_seed: int) -> ast.Call:
+def _value_wrapper(base: ast.expr, family: str, local_seed: int) -> ast.Call:
     value = ast.Name(id="_value_draw", ctx=ast.Load())
     ones = _torch_call("ones_like", copy.deepcopy(value))
     zeros = _torch_call("zeros_like", copy.deepcopy(value))
@@ -796,6 +797,7 @@ class _ValueTransformer(ast.NodeTransformer):
         self.seed_base = seed_base
         self.in_get_inputs = False
         self.replacements = 0
+        self.source_spans: list[tuple[int, int, int, int]] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
         previous = self.in_get_inputs
@@ -816,6 +818,9 @@ class _ValueTransformer(ast.NodeTransformer):
         assert isinstance(node, ast.Call)
         if not self.in_get_inputs or _call_name(node.func) != "torch.randn":
             return node
+        if node.end_lineno is None or node.end_col_offset is None:
+            raise ValueError("randn_source_span_missing")
+        self.source_spans.append((node.lineno, node.col_offset, node.end_lineno, node.end_col_offset))
         self.replacements += 1
         local_seed = _factory_seed(self.seed_base, self.replacements - 1)
         return ast.copy_location(_value_wrapper(node, self.family, local_seed), node)
@@ -855,7 +860,35 @@ def _transform_code(
         raise ValueError("model_or_get_init_inputs_changed")
     if collections.Counter(_factory_signatures(transformed)) != before_factories:
         raise ValueError("input_factory_shape_dtype_layout_or_rng_call_changed")
-    child_code = ast.unparse(transformed).rstrip() + "\n"
+
+    original_encoded = code.encode("utf-8")
+    encoded = original_encoded
+    line_starts = [0, *(index + 1 for index, byte in enumerate(original_encoded) if byte == 0x0A)]
+    replacements: list[tuple[int, int, bytes]] = []
+    placeholder = "__VALUE_FACTORY_CALL_PLACEHOLDER__"
+    for index, (lineno, col_offset, end_lineno, end_col_offset) in enumerate(transformer.source_spans):
+        start = line_starts[lineno - 1] + col_offset
+        end = line_starts[end_lineno - 1] + end_col_offset
+        if not 0 <= start < end <= len(original_encoded):
+            raise ValueError("randn_source_span_out_of_bounds")
+        original_call = encoded[start:end].decode("utf-8")
+        wrapper = ast.unparse(
+            _value_wrapper(
+                ast.Name(id=placeholder, ctx=ast.Load()),
+                family,
+                _factory_seed(seed_base, index),
+            )
+        )
+        if wrapper.count(placeholder) != 1:
+            raise ValueError("value_wrapper_placeholder_count_mismatch")
+        replacement = wrapper.replace(placeholder, original_call, 1).encode("utf-8")
+        replacements.append((start, end, replacement))
+    for (_, previous_end, _), (next_start, _, _) in zip(replacements, replacements[1:], strict=False):
+        if previous_end > next_start:
+            raise ValueError("overlapping_randn_source_spans")
+    for start, end, replacement in reversed(replacements):
+        encoded = encoded[:start] + replacement + encoded[end:]
+    child_code = encoded.decode("utf-8")
     reparsed = ast.parse(child_code)
     if ast.dump(reparsed, include_attributes=False) != ast.dump(transformed, include_attributes=False):
         raise ValueError("unparse_reparse_ast_mismatch")
@@ -1066,7 +1099,7 @@ def _make_child(
     else:
         raise ValueError(f"unsupported source binding kind: {source_kind!r}")
     manifest = {
-        "manifest_contract_version": "random_value_lane_manifest_v3",
+        "manifest_contract_version": "random_value_lane_manifest_v4",
         "candidate_row_index": None,
         "source_kind": source_kind,
         "source_binding": dict(source_binding),
@@ -1093,6 +1126,7 @@ def _make_child(
         "selection_sha256": eligible.selection_sha256,
         "generator_contract_version": CONTRACT_VERSION,
         "generator_version": GENERATOR_VERSION,
+        "source_text_preserved_outside_factory_spans": True,
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -1373,6 +1407,7 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwri
             "model_changed": False,
             "get_init_inputs_changed": False,
             "global_rng_consumption_preserved": True,
+            "source_text_preserved_outside_factory_spans": True,
             "static_domain": "bare unique returned real-floating all-randn factories",
             "runtime_boundary": "paired parent/child reference plus family/value/output liveness required",
         },

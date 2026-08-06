@@ -469,7 +469,7 @@ def _verify_aligned_static(
         child_code = _nested(child, "reward_model.ground_truth")
         if type(manifest.get("candidate_row_index")) is not int or manifest["candidate_row_index"] != index:
             raise ValueError(f"manifest index mismatch: {index}")
-        if manifest.get("manifest_contract_version") != "random_value_lane_manifest_v3":
+        if manifest.get("manifest_contract_version") != "random_value_lane_manifest_v4":
             raise ValueError(f"manifest contract mismatch at row {index}")
         if manifest.get("generator_source_sha256") != current_generator_sha256:
             raise ValueError(f"current generator source hash mismatch at row {index}")
@@ -495,6 +495,7 @@ def _verify_aligned_static(
         if (
             manifest.get("get_init_inputs_changed") is not False
             or manifest.get("rng_consumption_preserved") is not True
+            or manifest.get("source_text_preserved_outside_factory_spans") is not True
         ):
             raise ValueError(f"value-only static contract failed at row {index}")
         if not all(isinstance(value, str) and value for value in (parent_uuid, child_uuid)):
