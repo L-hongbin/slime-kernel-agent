@@ -9,8 +9,8 @@ a row.  Runtime-ineligible shape children fail closed before sampling, and at
 most one runtime-safe child is retained for each canonical parent.
 
 The repository defaults intentionally name the three static production lanes
-and the model hard-tail lane.  A normal invocation therefore needs only an
-output directory; the downstream random/value lane can consume
+and all three model production lanes.  A normal invocation therefore needs
+only an output directory; the downstream random/value lane can consume
 ``selected.parquet`` directly.
 """
 
@@ -56,6 +56,7 @@ DEFAULT_SHAPE_RUNS = (
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v8/run.remaining22566.balanced_v7",
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v2/run.full17864",
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_full_residual_v3/run.measurable12674",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_relaxed_residual_v2/run.full2321",
 )
 
 _SAMPLED_NUMEL_BOUNDS = (2**12, 2**16, 2**20, 2**24, 2**28, 2**32)
