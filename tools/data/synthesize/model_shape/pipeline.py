@@ -46,6 +46,7 @@ from tools.data.synthesize.model_shape.prompt import (
     VARIANTS,
     render_user_prompt,
     target_input_bytes,
+    target_input_bytes_from_size,
 )
 from tools.data.synthesize.shape_contract import (
     _function,
@@ -54,6 +55,9 @@ from tools.data.synthesize.shape_contract import (
     _shape_numeric_node_ids,
     _validate_target_proximity,
     _validate_variant_storage,
+    relaxed_factory_storage,
+    relaxed_static_gate,
+    relaxed_structure_gate,
     static_gate,
 )
 from tools.data.synthesize.solve_shape_coverage import (
@@ -61,6 +65,7 @@ from tools.data.synthesize.solve_shape_coverage import (
     ShapeSlot,
     SourceSpan,
     _affected_shape_balance_guard,
+    _fake_input_profile,
     _fake_tensor_gate,
     _shape_slots_with_rejections,
 )
@@ -73,6 +78,8 @@ SELECTION_REASON = "no_variable_multislot_product_solution"
 SELECTION_SALT = "dsv4_shape_hardtail_canary_v1"
 FULL_RESIDUAL_SELECTION_CONTRACT_VERSION = "dsv4_shape_full_measurable_residual_selection_v1"
 FULL_RESIDUAL_SELECTION_SALT = "dsv4_shape_full_measurable_residual_v1"
+RELAXED_RESIDUAL_SELECTION_CONTRACT_VERSION = "dsv4_shape_relaxed_provenance_residual_selection_v2"
+RELAXED_STORAGE_CONTRACT = "fake_returned_tensor_storage_v1"
 MODEL_NAME = "deepseek-v4-flash-0731"
 DEFAULT_SOURCE_RUN = (
     REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v8/" "run.remaining22566.balanced_v7"
@@ -84,6 +91,7 @@ DEFAULT_RUNTIME_SHAPE_RUNS = (
     DEFAULT_SOURCE_RUN,
 )
 DEFAULT_PRIOR_MODEL_RUN = REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v2/run.full17864"
+DEFAULT_CANONICAL_PARENTS = REPO_ROOT / "Data/prompt_tvm_v4/train.review.parquet"
 DEFAULT_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v1/run.canary1000"
 DEFAULT_ENDPOINTS = (
     "http://10.11.2.153:31053",
@@ -161,6 +169,10 @@ def _nested(value: Any, path: str, default: Any = None) -> Any:
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _sha256_file(path: Path) -> str:
@@ -486,6 +498,95 @@ def select_full_measurable_residual(
             "selected_parents": len(prior_model_parents),
         },
         "rows": rows_manifest,
+    }
+    _atomic_text(output.selection, json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    return {key: value for key, value in selection.items() if key != "rows"}
+
+
+def select_relaxed_provenance_residual(canonical_parents: Path, run_dir: Path) -> dict[str, Any]:
+    """Select strict-analysis failures whose direct factory storage still resolves."""
+
+    from tools.data.synthesize.augment_prompt_tasks import analyze_code
+
+    selected_rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    strict_failure_reasons: collections.Counter[str] = collections.Counter()
+    factory_resolution_failure_reasons: collections.Counter[str] = collections.Counter()
+    input_profile_failure_reasons: collections.Counter[str] = collections.Counter()
+    strict_measurable = 0
+    already_large = 0
+    for source_row_index, row in _iter_rows(canonical_parents):
+        uuid, code, entry_point = _identity(row)
+        try:
+            analyze_code(code, entry_point)
+            strict_measurable += 1
+            continue
+        except (SyntaxError, ValueError) as exc:
+            strict_reason = f"{type(exc).__name__}:{exc}"
+            strict_failure_reasons[strict_reason] += 1
+        try:
+            _, factory_count = relaxed_factory_storage(code, entry_point)
+        except (SyntaxError, ValueError) as exc:
+            factory_resolution_failure_reasons[f"{type(exc).__name__}:{exc}"] += 1
+            continue
+        input_profile = _fake_input_profile(code, timeout_seconds=DEFAULT_FAKE_TIMEOUT_SECONDS)
+        if not input_profile.passed or input_profile.input_bytes is None:
+            input_profile_failure_reasons[
+                f"{input_profile.status}:{input_profile.exception_type}:{input_profile.reason}"
+            ] += 1
+            continue
+        input_bytes = int(input_profile.input_bytes)
+        if input_bytes >= 128 * 1024**2:
+            already_large += 1
+            continue
+        source, operator = _group(row)
+        selected_index = len(selected_rows)
+        selected_rows.append(row)
+        manifest_rows.append(
+            {
+                "selected_index": selected_index,
+                "source_row_index": source_row_index,
+                "parent_uuid": uuid,
+                "parent_reference_sha256": _sha256_bytes(code.encode()),
+                "source_family": source,
+                "operator_family": operator,
+                "input_bytes_before": input_bytes,
+                "factory_count": factory_count,
+                "strict_analysis_failure": strict_reason,
+                "input_measurement_contract": RELAXED_STORAGE_CONTRACT,
+                "input_profile": input_profile.as_dict(),
+                "target_input_bytes": target_input_bytes_from_size(uuid, input_bytes),
+            }
+        )
+    canonical_count = pq.ParquetFile(canonical_parents).metadata.num_rows
+    factory_unresolved = sum(factory_resolution_failure_reasons.values())
+    input_profile_unresolved = sum(input_profile_failure_reasons.values())
+    relaxed_unresolved = factory_unresolved + input_profile_unresolved
+    if strict_measurable + len(selected_rows) + already_large + relaxed_unresolved != canonical_count:
+        raise RuntimeError("relaxed residual census does not close over canonical parents")
+    output = _paths(run_dir)
+    output.selected.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_parquet(output.selected, selected_rows, pq.ParquetFile(canonical_parents).schema_arrow)
+    selection = {
+        "contract_version": CONTRACT_VERSION,
+        "selection_contract_version": RELAXED_RESIDUAL_SELECTION_CONTRACT_VERSION,
+        "selection_reason": "strict_return_provenance_failed_but_fake_returned_tensor_storage_resolved_below_128MiB",
+        "canonical_parent_count": canonical_count,
+        "strict_measurable_parent_count": strict_measurable,
+        "relaxed_selected_parent_count": len(selected_rows),
+        "relaxed_already_large_parent_count": already_large,
+        "relaxed_unresolved_parent_count": relaxed_unresolved,
+        "factory_shape_unresolved_parent_count": factory_unresolved,
+        "fake_input_profile_unresolved_parent_count": input_profile_unresolved,
+        "selected_parent_count": len(selected_rows),
+        "eligible_parent_count": len(selected_rows),
+        "parent_gate_contract": RELAXED_STORAGE_CONTRACT,
+        "source_path": str(canonical_parents.resolve()),
+        "source_sha256": _sha256_file(canonical_parents),
+        "strict_failure_reasons": dict(strict_failure_reasons.most_common()),
+        "factory_resolution_failure_reasons": dict(factory_resolution_failure_reasons.most_common()),
+        "input_profile_failure_reasons": dict(input_profile_failure_reasons.most_common()),
+        "rows": manifest_rows,
     }
     _atomic_text(output.selection, json.dumps(selection, indent=2, sort_keys=True) + "\n")
     return {key: value for key, value in selection.items() if key != "rows"}
@@ -895,11 +996,16 @@ def _patch_spans(
 
 
 def _canonicalize(
-    parent_code: str, proposal_code: str, entry_point: str
+    parent_code: str,
+    proposal_code: str,
+    entry_point: str,
+    *,
+    relaxed_return_provenance: bool = False,
 ) -> tuple[str, list[dict[str, Any]], list[int]]:
     # This first comparison rejects changed docstrings, equivalent rewrites,
     # rank changes, Model changes, and all non-shape edits before reconstruction.
-    static_gate(parent_code, proposal_code, entry_point)
+    gate = relaxed_structure_gate if relaxed_return_provenance else static_gate
+    gate(parent_code, proposal_code, entry_point)
     shape_changes, init_changes, proposed_values = _aligned_changes(parent_code, proposal_code)
     if not shape_changes:
         raise ValueError("proposal_changes_no_input_shape_literal")
@@ -941,7 +1047,7 @@ def _canonicalize(
     if len(selected) > 8:
         raise ValueError(f"logical_shape_slot_count_above_eight:{len(selected)}")
     canonical = _patch_spans(parent_code, {**shape_changes, **init_changes})
-    canonical_static = static_gate(parent_code, canonical, entry_point)
+    canonical_static = gate(parent_code, canonical, entry_point)
     slots_manifest: list[dict[str, Any]] = []
     for slot, new_value in selected:
         balance = _affected_shape_balance_guard(canonical, slot, new_value)
@@ -1063,6 +1169,31 @@ def _materialize_parent(
             decision["reason"] = str(exc)
         return result
 
+    measurement_contract = selection_row.get("input_measurement_contract")
+    if measurement_contract == RELAXED_STORAGE_CONTRACT:
+        relaxed_return_provenance = True
+    elif measurement_contract in (None, "proven_returned_input_storage_v1"):
+        relaxed_return_provenance = False
+    else:
+        for decision in decisions.values():
+            decision["reason"] = f"unsupported_input_measurement_contract:{measurement_contract}"
+        return result
+    parent_input_profile = None
+    if relaxed_return_provenance:
+        parent_input_profile = _fake_input_profile(
+            parent_code,
+            timeout_seconds=DEFAULT_FAKE_TIMEOUT_SECONDS,
+        )
+        if (
+            not parent_input_profile.passed
+            or parent_input_profile.input_bytes is None
+            or int(parent_input_profile.input_bytes) != int(selection_row.get("input_bytes_before", -1))
+            or _canonical_json(parent_input_profile.as_dict()) != _canonical_json(selection_row.get("input_profile"))
+        ):
+            for decision in decisions.values():
+                decision["reason"] = "parent_fake_input_profile_differs_from_selection"
+            return result
+
     seen_hashes: set[str] = set()
     for variant in VARIANTS:
         decision = decisions[variant]
@@ -1075,8 +1206,43 @@ def _materialize_parent(
                 decision["proposed_changed_values"] = raw_proposed_values
             except (SyntaxError, TypeError, ValueError):
                 pass
-            canonical, slots, _ = _canonicalize(parent_code, proposal, entry_point)
-            static = static_gate(parent_code, canonical, entry_point)
+            canonical, slots, _ = _canonicalize(
+                parent_code,
+                proposal,
+                entry_point,
+                relaxed_return_provenance=relaxed_return_provenance,
+            )
+            child_input_profile = None
+            if relaxed_return_provenance:
+                assert parent_input_profile is not None and parent_input_profile.input_bytes is not None
+                child_input_profile = _fake_input_profile(
+                    canonical,
+                    timeout_seconds=DEFAULT_FAKE_TIMEOUT_SECONDS,
+                )
+                if not child_input_profile.passed or child_input_profile.input_bytes is None:
+                    raise ValueError(
+                        f"child_fake_input_profile_{child_input_profile.status}:" f"{child_input_profile.reason}"
+                    )
+                if child_input_profile.tensor_count != parent_input_profile.tensor_count:
+                    raise ValueError("returned_input_tensor_count_changed")
+                for parent_tensor, child_tensor in zip(
+                    parent_input_profile.tensors,
+                    child_input_profile.tensors,
+                    strict=True,
+                ):
+                    if len(parent_tensor[0]) != len(child_tensor[0]):
+                        raise ValueError("returned_input_tensor_rank_changed")
+                    if parent_tensor[1] != child_tensor[1]:
+                        raise ValueError("returned_input_tensor_dtype_changed")
+                static = relaxed_static_gate(
+                    parent_code,
+                    canonical,
+                    entry_point,
+                    parent_input_bytes=int(parent_input_profile.input_bytes),
+                    child_input_bytes=int(child_input_profile.input_bytes),
+                )
+            else:
+                static = static_gate(parent_code, canonical, entry_point)
             after = int(static["input_bytes_after"])
             _validate_variant_storage(variant, after)
             target_error = _validate_target_proximity(after, target)
@@ -1089,6 +1255,8 @@ def _materialize_parent(
                 "input_bytes_after": after,
                 "target_input_bytes": target,
                 "target_relative_error": target_error,
+                "input_storage_contract": static["input_storage_contract"],
+                "child_input_profile": child_input_profile.as_dict() if child_input_profile else None,
             }
             decision["attempts"] = [attempt]
             if not fake.passed:
@@ -1108,6 +1276,9 @@ def _materialize_parent(
                     "input_bytes_before": int(static["input_bytes_before"]),
                     "input_bytes_after": after,
                     "input_scale": float(static["input_scale"]),
+                    "input_storage_contract": static["input_storage_contract"],
+                    "parent_input_profile": parent_input_profile.as_dict() if parent_input_profile else None,
+                    "child_input_profile": child_input_profile.as_dict() if child_input_profile else None,
                     "target_relative_error": target_error,
                     "solver": {"slots": slots},
                     "logical_slot_count": len(slots),
@@ -1786,6 +1957,10 @@ def _parser() -> argparse.ArgumentParser:
         "select-full-residual",
         help="Select every measurable parent not covered by runtime-safe static or prior model lanes.",
     )
+    subparsers.add_parser(
+        "select-relaxed-residual",
+        help="Select strict-return-proof failures whose factory storage still resolves below 128 MiB.",
+    )
 
     preview_parser = subparsers.add_parser("preview")
     preview_parser.add_argument("--count", type=int, default=8)
@@ -1822,6 +1997,8 @@ def main() -> None:
             DEFAULT_PRIOR_MODEL_RUN,
             args.run_dir,
         )
+    elif args.command == "select-relaxed-residual":
+        result = select_relaxed_provenance_residual(DEFAULT_CANONICAL_PARENTS, args.run_dir)
     elif args.command == "preview":
         result = preview(args.run_dir, args.count)
     elif args.command == "preview-candidate":
