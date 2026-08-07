@@ -207,6 +207,23 @@ class FakeGateResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class FakeInputProfileResult:
+    status: str
+    input_bytes: int | None = None
+    tensor_count: int = 0
+    tensors: tuple[tuple[tuple[int, ...], str, int], ...] = ()
+    reason: str | None = None
+    exception_type: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed"
+
+    def as_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class _FakeGateRuntime:
     torch: Any
     fake_copy_mode_type: Any
@@ -1189,6 +1206,31 @@ def _fake_tensor_gate(
         )
 
 
+def _fake_input_profile(
+    code: str,
+    *,
+    timeout_seconds: float = DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
+) -> FakeInputProfileResult:
+    """Measure tensors actually returned by ``get_inputs`` without allocation."""
+
+    runtime = _load_fake_gate_runtime()
+    if isinstance(runtime, FakeGateResult):
+        return FakeInputProfileResult(
+            "failed",
+            reason=runtime.reason,
+            exception_type=runtime.exception_type,
+        )
+    try:
+        with _fake_gate_wall_clock_deadline(timeout_seconds):
+            return _fake_input_profile_task(code, runtime)
+    except _FakeGateWallClockTimeout:
+        return FakeInputProfileResult(
+            "timeout",
+            reason=f"wall_clock_timeout_exceeded:{timeout_seconds:g}s",
+            exception_type="_FakeGateWallClockTimeout",
+        )
+
+
 def _load_fake_gate_runtime() -> _FakeGateRuntime | FakeGateResult:
     """Load and minimally warm process-global FakeTensor state outside deadlines."""
 
@@ -1307,6 +1349,96 @@ def _fake_tensor_gate_task(
             "failed",
             f"fake_forward_incompatible:{message}",
             exception_type,
+        )
+
+
+def _fake_input_profile_task(
+    code: str,
+    runtime: _FakeGateRuntime,
+) -> FakeInputProfileResult:
+    """Execute only ``get_inputs`` and profile its concrete FakeTensor leaves."""
+
+    torch = runtime.torch
+    try:
+        parsed = _FakeDeviceNormalizer().visit(ast.parse(code, filename="<shape_input_profile>"))
+        ast.fix_missing_locations(parsed)
+        namespace: dict[str, Any] = {"__name__": "__shape_input_profile__"}
+        fake_mode = runtime.fake_tensor_mode_type(
+            allow_fallback_kernels=False,
+            allow_non_fake_inputs=False,
+            static_shapes=True,
+        )
+        with fake_mode, runtime.fake_copy_mode_type(fake_mode), torch.no_grad():
+            exec(compile(parsed, "<shape_input_profile>", "exec"), namespace)  # noqa: S102
+            get_inputs = namespace.get("get_inputs")
+            if not callable(get_inputs):
+                raise TypeError("reference must define get_inputs()")
+            raw_inputs = get_inputs()
+            tensors: list[Any] = []
+            tensor_ids: set[int] = set()
+            container_ids: set[int] = set()
+
+            def collect(value: Any) -> None:
+                if isinstance(value, torch.Tensor):
+                    if id(value) in tensor_ids:
+                        raise ValueError("returned_input_tensor_alias_or_duplicate")
+                    tensor_ids.add(id(value))
+                    tensors.append(value)
+                    return
+                if isinstance(value, Mapping):
+                    if id(value) in container_ids:
+                        raise ValueError("cyclic_returned_input_container")
+                    container_ids.add(id(value))
+                    for item in value.values():
+                        collect(item)
+                    container_ids.remove(id(value))
+                    return
+                if isinstance(value, (list, tuple)):
+                    if id(value) in container_ids:
+                        raise ValueError("cyclic_returned_input_container")
+                    container_ids.add(id(value))
+                    for item in value:
+                        collect(item)
+                    container_ids.remove(id(value))
+                    return
+                if isinstance(value, (str, bytes, int, float, complex, bool, type(None))):
+                    return
+                raise TypeError(f"unsupported returned input leaf: {type(value).__name__}")
+
+            collect(raw_inputs)
+            if not tensors:
+                raise ValueError("get_inputs_returned_no_tensor")
+            profiles: list[tuple[tuple[int, ...], str, int]] = []
+            for tensor in tensors:
+                shape = tuple(int(value) for value in tensor.shape)
+                tensor_bytes = int(tensor.numel()) * int(tensor.element_size())
+                profiles.append((shape, str(tensor.dtype), tensor_bytes))
+        return FakeInputProfileResult(
+            "passed",
+            input_bytes=sum(item[2] for item in profiles),
+            tensor_count=len(profiles),
+            tensors=tuple(profiles),
+        )
+    except Exception as exc:  # noqa: BLE001 - classification is fail-closed
+        chain = _exception_chain(exc)
+        exception_type = type(exc).__name__
+        message = str(exc).replace("\n", " ")[:1000]
+        if any(isinstance(item, runtime.data_dependent_types) for item in chain):
+            return FakeInputProfileResult(
+                "unsupported",
+                reason=f"data_dependent_shape:{message}",
+                exception_type=exception_type,
+            )
+        if any(isinstance(item, runtime.unsupported_types) for item in chain):
+            return FakeInputProfileResult(
+                "unsupported",
+                reason=f"fake_tensor_operator_unsupported:{message}",
+                exception_type=exception_type,
+            )
+        return FakeInputProfileResult(
+            "failed",
+            reason=f"fake_input_profile_failed:{message}",
+            exception_type=exception_type,
         )
 
 

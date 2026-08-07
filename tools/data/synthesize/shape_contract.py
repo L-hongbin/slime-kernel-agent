@@ -18,6 +18,8 @@ from typing import Any
 from tools.data.synthesize.augment_prompt_tasks import (
     _SHAPE_FACTORIES,
     _call_name,
+    _factory_records,
+    _module_constant_environment,
     _normalized_ast_sha256,
     _shape_nodes,
     analyze_code,
@@ -215,8 +217,24 @@ def _factory_names(function: ast.FunctionDef) -> list[str]:
     ]
 
 
-def static_gate(parent_code: str, child_code: str, entry_point: str = "Model") -> dict[str, Any]:
-    """Fail closed unless only proven input-shape numbers changed."""
+def relaxed_factory_storage(code: str, entry_point: str = "Model") -> tuple[int, int]:
+    """Measure resolved factories without requiring bare returned-input provenance.
+
+    This intentionally relaxes only ``analyze_code``'s return-expression proof.
+    Factory shapes, dtypes, and storage still have to resolve exactly.
+    """
+
+    tree = ast.parse(code)
+    _class(tree, entry_point)
+    get_inputs = _function(tree, "get_inputs")
+    records, _ = _factory_records(tree, get_inputs, _module_constant_environment(tree))
+    if not records:
+        raise ValueError("no_resolved_input_factory")
+    return sum(record.bytes for record in records), len(records)
+
+
+def _shape_structure_gate(parent_code: str, child_code: str, entry_point: str) -> dict[str, Any]:
+    """Prove that the two references differ only in input-shape numbers."""
 
     parent_tree, child_tree = ast.parse(parent_code), ast.parse(child_code)
     parent_class, child_class = _class(parent_tree, entry_point), _class(child_tree, entry_point)
@@ -233,23 +251,95 @@ def static_gate(parent_code: str, child_code: str, entry_point: str = "Model") -
     _function(child_tree, "get_init_inputs")
     if _factory_names(parent_inputs) != _factory_names(child_inputs):
         raise ValueError("torch_factory_or_random_method_sequence_changed")
-    parent_analysis = analyze_code(parent_code, entry_point)
-    child_analysis = analyze_code(child_code, entry_point)
-    if parent_analysis.factory_count != child_analysis.factory_count:
-        raise ValueError("input_factory_count_changed")
-    if child_analysis.input_bytes <= parent_analysis.input_bytes:
-        raise ValueError("returned_input_storage_did_not_increase")
-    scale = child_analysis.input_bytes / parent_analysis.input_bytes
-    if scale < MIN_INPUT_SCALE:
-        raise ValueError(f"input_storage_scale_below_minimum:{scale:.4f}")
     return {
-        "input_bytes_before": parent_analysis.input_bytes,
-        "input_bytes_after": child_analysis.input_bytes,
-        "input_scale": scale,
         "parent_reference_sha256": _sha256_bytes(parent_code.encode()),
         "child_reference_sha256": _sha256_bytes(child_code.encode()),
         "child_normalized_ast_sha256": _normalized_ast_sha256(child_code),
     }
+
+
+def relaxed_structure_gate(parent_code: str, child_code: str, entry_point: str = "Model") -> dict[str, Any]:
+    """Apply shape-only identity checks without asserting returned storage."""
+
+    result = _shape_structure_gate(parent_code, child_code, entry_point)
+    _, parent_factory_count = relaxed_factory_storage(parent_code, entry_point)
+    _, child_factory_count = relaxed_factory_storage(child_code, entry_point)
+    if parent_factory_count != child_factory_count:
+        raise ValueError("input_factory_count_changed")
+    return {
+        **result,
+        "factory_count": parent_factory_count,
+        "input_storage_contract": "fake_returned_tensor_storage_v1",
+    }
+
+
+def _static_gate(
+    parent_code: str,
+    child_code: str,
+    entry_point: str,
+    *,
+    relaxed_return_provenance: bool,
+    parent_input_bytes: int | None = None,
+    child_input_bytes: int | None = None,
+) -> dict[str, Any]:
+    """Fail closed unless shape-only identity and storage growth are proven."""
+
+    structure = _shape_structure_gate(parent_code, child_code, entry_point)
+    if relaxed_return_provenance:
+        _, parent_factory_count = relaxed_factory_storage(parent_code, entry_point)
+        _, child_factory_count = relaxed_factory_storage(child_code, entry_point)
+        if parent_input_bytes is None or child_input_bytes is None:
+            raise ValueError("relaxed_gate_requires_fake_returned_tensor_storage")
+        parent_bytes, child_bytes = parent_input_bytes, child_input_bytes
+        storage_contract = "fake_returned_tensor_storage_v1"
+    else:
+        parent_analysis = analyze_code(parent_code, entry_point)
+        child_analysis = analyze_code(child_code, entry_point)
+        parent_bytes, parent_factory_count = parent_analysis.input_bytes, parent_analysis.factory_count
+        child_bytes, child_factory_count = child_analysis.input_bytes, child_analysis.factory_count
+        storage_contract = "proven_returned_input_storage_v1"
+    if parent_factory_count != child_factory_count:
+        raise ValueError("input_factory_count_changed")
+    if parent_bytes <= 0 or child_bytes <= 0:
+        raise ValueError("returned_input_storage_must_be_positive")
+    if child_bytes <= parent_bytes:
+        raise ValueError("returned_input_storage_did_not_increase")
+    scale = child_bytes / parent_bytes
+    if scale < MIN_INPUT_SCALE:
+        raise ValueError(f"input_storage_scale_below_minimum:{scale:.4f}")
+    return {
+        "input_bytes_before": parent_bytes,
+        "input_bytes_after": child_bytes,
+        "input_scale": scale,
+        "input_storage_contract": storage_contract,
+        **structure,
+    }
+
+
+def static_gate(parent_code: str, child_code: str, entry_point: str = "Model") -> dict[str, Any]:
+    """Use the strict returned-input storage proof for established lanes."""
+
+    return _static_gate(parent_code, child_code, entry_point, relaxed_return_provenance=False)
+
+
+def relaxed_static_gate(
+    parent_code: str,
+    child_code: str,
+    entry_point: str = "Model",
+    *,
+    parent_input_bytes: int,
+    child_input_bytes: int,
+) -> dict[str, Any]:
+    """Use exact FakeTensor-returned storage for wrapped-return references."""
+
+    return _static_gate(
+        parent_code,
+        child_code,
+        entry_point,
+        relaxed_return_provenance=True,
+        parent_input_bytes=parent_input_bytes,
+        child_input_bytes=child_input_bytes,
+    )
 
 
 def _validate_variant_storage(variant: str, input_bytes: int) -> None:

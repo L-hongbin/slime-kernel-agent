@@ -105,13 +105,9 @@ def _sample_bytes(identity: str, lower: int, upper: int) -> int:
     return target
 
 
-def target_input_bytes(row: Mapping[str, Any]) -> dict[str, int]:
-    uuid = _nested(row, "extra_info.uuid")
-    reference = _nested(row, "reward_model.ground_truth")
-    entry_point = str(_nested(row, "extra_info.entry_point", "Model"))
-    if not isinstance(uuid, str) or not isinstance(reference, str):
-        raise ValueError("parent_requires_uuid_and_reference")
-    parent_bytes = int(analyze_code(reference, entry_point).input_bytes)
+def target_input_bytes_from_size(uuid: str, parent_bytes: int) -> dict[str, int]:
+    if not uuid or parent_bytes <= 0:
+        raise ValueError("target_sampling_requires_uuid_and_positive_parent_bytes")
     minimum = max(parent_bytes * 2, int(parent_bytes * MIN_INPUT_SCALE))
     medium_lower = max(MEDIUM_INPUT_MIN_BYTES, minimum)
     large_lower = max(MEDIUM_INPUT_MAX_BYTES + 1, minimum)
@@ -119,6 +115,16 @@ def target_input_bytes(row: Mapping[str, Any]) -> dict[str, int]:
         "medium": _sample_bytes(f"{uuid}:medium", medium_lower, MEDIUM_INPUT_MAX_BYTES),
         "large": _sample_bytes(f"{uuid}:large", large_lower, LARGE_INPUT_MAX_BYTES),
     }
+
+
+def target_input_bytes(row: Mapping[str, Any]) -> dict[str, int]:
+    uuid = _nested(row, "extra_info.uuid")
+    reference = _nested(row, "reward_model.ground_truth")
+    entry_point = str(_nested(row, "extra_info.entry_point", "Model"))
+    if not isinstance(uuid, str) or not isinstance(reference, str):
+        raise ValueError("parent_requires_uuid_and_reference")
+    parent_bytes = int(analyze_code(reference, entry_point).input_bytes)
+    return target_input_bytes_from_size(uuid, parent_bytes)
 
 
 def render_user_prompt(
