@@ -4,7 +4,7 @@
 
 本轮不需要 LLM。四种 random/value 方法都可以由确定性 solver 构造：`uniform_01`、`signed_uniform`、`poisson_counts`、`multinomial_categories`。正式实现不生成 `boundary_pm1`，也不把 Poisson 或 multinomial 解释成通用连续输入替换；它们只是保持原 shape/dtype/layout 的受约束 value coverage cell。
 
-本机只负责小批量验证。solver CLI 必须显式传 `--limit`，并在代码中限制为 1–5,000；liveness 和 exact analyzer 另有独立的 5,000-row 硬门禁。本轮固定为 1,000 个 parent/child，不自动扩到 44,380-row eligible pool。所有产物保持 `training_approved=false`。
+历史 canonical-parent canary 仍由 solver 的显式 `--limit` 限制在 1–5,000；本轮历史数字固定为 1,000 个 parent/child，不自动扩到 44,380-row eligible pool。当前 v5 shape-resample 合同另有一条 fail-closed 全量路径：输入必须是经 runtime 证明、每个 canonical parent 至多一个 child、且小 shape 占比严格低于 10% 的完整绑定 artifact，random/value solver、liveness 和 exact analyzer 必须逐行完整消费，不能再次截成 5,000；liveness 对该来源显式拒绝 `--limit`。每道题只抽一个实际改动过的 direct-input shape，KernelBench 基线也按每题稳定抽一个合同兼容 shape 后再计算 support 和 TVD，避免把训练侧 per-question 分布与基线 per-factory-occurrence 分布混比。所有产物保持 `training_approved=false`。
 
 2026-08-05 的代码复核后，random/value 已收敛为四个无版本后缀的正式入口。复核同时加固了 canonical row 锚定、reference fingerprint 重算、至少三次 liveness、单一 runtime partition、动态 dtype 的 Multinomial 精确表示检查和 pinned-memory fail-closed。下文的 1k 数字来自加固前的 source-bound canary，只作为不可变历史观测；由于 generator/analyzer source SHA 已变化，当前代码会拒绝把旧 manifest 重新 materialize。新的训练候选必须用当前正式入口重建，不能给旧 evidence 换名或放松 source hash。
 
@@ -141,7 +141,7 @@ PYTHONPATH=. uv run --no-project --with 'pyarrow==24.0.0' \
   --liveness-dir "${lane_dir}/runtime/liveness/node22"
 ```
 
-当前代码验证包括 Black、Ruff、`py_compile`、shell syntax、CLI/import smoke、A800 上四 family/dtype/pinned-memory/RNG-isolation smoke，不为这套生产数据 pipeline 新增单元测试。由于 source SHA 已变化，历史 1k canary 不能替代一次使用当前入口重建的小批量 GPU run。
+当前代码验证包括 Black、Ruff、`py_compile`、shell syntax、CLI/import smoke、A800 上四 family/dtype/pinned-memory/RNG-isolation smoke，不为这套生产数据 pipeline 新增单元测试。由于 source SHA 已变化，历史 1k canary 不能替代一次使用当前入口重建的小批量 GPU run；shape-resample 全量路径还必须绑定 v5 resample summary/manifest/eligibility 和所有上游 runtime artifact SHA。
 
 ## 语义边界
 

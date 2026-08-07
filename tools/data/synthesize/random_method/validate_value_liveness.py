@@ -59,7 +59,7 @@ CONTRACT_VERSION = "random_value_runtime_liveness_v2"
 RUN_BINDING_VERSION = "random_value_runtime_liveness_binding_v2"
 RESULT_MARKER = "__VALUE_LIVENESS_RESULT__="
 MAX_DEVICE_MEMORY_GIB = 64.0
-MAX_AUTHORIZED_CANDIDATES = 5_000
+MAX_CANONICAL_CANARY_CANDIDATES = 5_000
 MAX_COUNT_HISTOGRAM_BINS = 64
 MIN_LIVENESS_TRIALS = 3
 REQUIRED_LIVENESS_SEED = 17
@@ -586,6 +586,7 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
                 "entry_point": entry_point,
                 "assigned_family": manifest["assigned_target"],
                 "transformed_factory_count": manifest["transformed_factory_count"],
+                "source_kind": _nested(manifest, "source_binding.source_kind"),
             }
         )
     return tasks
@@ -651,8 +652,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         if missing:
             raise ValueError(f"allowlisted child UUIDs not found:{sorted(missing)[:10]}")
         tasks = [task for task in tasks if task["child_uuid"] in allowlist]
-    if not 1 <= len(tasks) <= MAX_AUTHORIZED_CANDIDATES:
-        raise ValueError(f"selected candidate count must be in [1, {MAX_AUTHORIZED_CANDIDATES}]:{len(tasks)}")
+    if not tasks:
+        raise ValueError("selected candidate count must be positive")
+    source_kinds = {task.get("source_kind") for task in tasks}
+    if len(tasks) > MAX_CANONICAL_CANARY_CANDIDATES and source_kinds != {"shape_coverage_resample"}:
+        raise ValueError(
+            f"more than {MAX_CANONICAL_CANARY_CANDIDATES} liveness candidates require one bound "
+            f"shape-resample source, found {len(tasks)}:{sorted(str(value) for value in source_kinds)}"
+        )
+    if args.limit is not None and source_kinds == {"shape_coverage_resample"}:
+        raise ValueError("--limit is forbidden for a bound shape-resample source")
     tasks = [task for index, task in enumerate(tasks) if index % args.shard_count == args.shard_index]
     if args.limit is not None:
         if args.limit <= 0:
