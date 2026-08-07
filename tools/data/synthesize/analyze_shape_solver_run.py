@@ -31,7 +31,6 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.data.synthesize.ai_shape_coverage import _operator_family, static_gate
 from tools.data.synthesize.augment_prompt_tasks import (
     _SHAPE_FACTORIES,
     _call_name,
@@ -40,8 +39,8 @@ from tools.data.synthesize.augment_prompt_tasks import (
     _normalized_ast_sha256,
     _shape_nodes,
 )
+from tools.data.synthesize.shape_contract import _operator_family, static_gate
 from tools.data.synthesize.solve_shape_coverage import _shape_slots
-
 
 DEFAULT_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_random_targets_v3/run.1000"
 DEFAULT_AI_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000"
@@ -50,17 +49,13 @@ REFERENCE_CONTRACT_VERSION = "kernelgym-reference-self-train-mode-v3"
 REGION_CONTRACT_VERSION = "shape_changed_region_liveness_v3"
 PERTURBATION_CONTRACT_VERSION = "seeded_bounded_non_affine_mix_v1"
 REGION_RUN_BINDING_CONTRACT_VERSION = "shape_changed_region_liveness_run_binding_v2"
-PREVIOUS_REGION_RUN_BINDING_CONTRACT_VERSION = (
-    "shape_changed_region_liveness_run_binding_v1"
-)
+PREVIOUS_REGION_RUN_BINDING_CONTRACT_VERSION = "shape_changed_region_liveness_run_binding_v1"
 PREVIOUS_REGION_CONTRACT_VERSION = "shape_changed_region_liveness_v2"
 LEGACY_REGION_CONTRACT_VERSION = "shape_changed_region_liveness_v1"
 MIB = 1024**2
 DIMENSION_ANCHORS = frozenset({64, 128, 256, 512, 1024, 2048, 4096})
 CAPACITY_ANCHORS = frozenset(value * MIB for value in DIMENSION_ANCHORS)
-EXPLICIT_BATCH_SYMBOLS = frozenset(
-    {"batch_size", "batchsize", "batch", "bs", "n_batch"}
-)
+EXPLICIT_BATCH_SYMBOLS = frozenset({"batch_size", "batchsize", "batch", "bs", "n_batch"})
 MAX_REVIEW_ACCEPTED = 20
 MAX_REVIEW_FAILURES = 12
 POWER_OF_TWO_MIN_NUMERATOR = 3
@@ -86,18 +81,12 @@ VARIABLE_SOLVER_MANIFEST_CONTRACTS = {
         "scope_contract_required": False,
     },
     "shape_variable_multislot_solver_v6": {
-        "generator_version": (
-            "same_factory_product_variable_2_to_5_"
-            "nonleading_no_explicit_batch_soft_p2_50_v1"
-        ),
+        "generator_version": ("same_factory_product_variable_2_to_5_" "nonleading_no_explicit_batch_soft_p2_50_v1"),
         "scope_mode": "nonleading_no_explicit_batch",
         "scope_contract_required": True,
     },
     "shape_variable_multislot_solver_v7": {
-        "generator_version": (
-            "same_factory_product_variable_2_to_5_"
-            "balanced_nonleading_soft_p2_50_v1"
-        ),
+        "generator_version": ("same_factory_product_variable_2_to_5_" "balanced_nonleading_soft_p2_50_v1"),
         "scope_mode": "balanced_nonleading_no_explicit_batch",
         "scope_contract_required": True,
     },
@@ -135,9 +124,7 @@ def _validate_variable_solver_manifest_contract(
         # synthesize scope semantics for them.
         return
     if not isinstance(scope_contract, Mapping):
-        raise ValueError(
-            f"{contract_version} requires scope_selection_contract"
-        )
+        raise ValueError(f"{contract_version} requires scope_selection_contract")
     scope_mode = scope_contract.get("mode")
     if scope_mode != expected["scope_mode"]:
         raise ValueError(
@@ -159,9 +146,7 @@ def _validate_scoped_decision_evidence(
         "shape_variable_multislot_solver_v7",
     }:
         return
-    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version][
-        "scope_mode"
-    ]
+    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version]["scope_mode"]
     scope_contract = manifest["scope_selection_contract"]
     expected_contract_fields = {
         "maximum_groups_per_cardinality": 12,
@@ -175,8 +160,7 @@ def _validate_scoped_decision_evidence(
         observed = scope_contract.get(field)
         if observed != expected_value:
             raise ValueError(
-                f"scoped_solver_contract_field_mismatch:{field}:"
-                f"{observed!r}:expected={expected_value!r}"
+                f"scoped_solver_contract_field_mismatch:{field}:" f"{observed!r}:expected={expected_value!r}"
             )
     allowed_fallback_reasons = set(scope_contract.get("fallback_reason_values", []))
     inventory_fields = (
@@ -190,9 +174,7 @@ def _validate_scoped_decision_evidence(
 
     def nonnegative_int(value: Any, *, field: str, identity: str) -> int:
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(
-                f"invalid_scoped_decision_count:{identity}:{field}:{value!r}"
-            )
+            raise ValueError(f"invalid_scoped_decision_count:{identity}:{field}:{value!r}")
         return value
 
     for decision_index, decision in enumerate(decisions):
@@ -207,13 +189,9 @@ def _validate_scoped_decision_evidence(
         if decision.get("group_scope_status") == "evaluated":
             for field in inventory_fields:
                 if not isinstance(decision.get(field), Mapping):
-                    raise ValueError(
-                        f"scoped_decision_inventory_missing:{identity}:{field}"
-                    )
+                    raise ValueError(f"scoped_decision_inventory_missing:{identity}:{field}")
             inventory = {field: decision[field] for field in inventory_fields}
-            cardinalities = set().union(
-                *(set(values) for values in inventory.values())
-            )
+            cardinalities = set().union(*(set(values) for values in inventory.values()))
             for cardinality in cardinalities:
                 values = {
                     field: nonnegative_int(
@@ -231,9 +209,7 @@ def _validate_scoped_decision_evidence(
                 general_discarded = values[inventory_fields[5]]
                 reserved_general = min(4, general_before)
                 expected_scope_after = min(scope_before, 12 - reserved_general)
-                expected_general_after = min(
-                    general_before, 12 - expected_scope_after
-                )
+                expected_general_after = min(general_before, 12 - expected_scope_after)
                 if (
                     scope_before != scope_after + scope_discarded
                     or general_before != general_after + general_discarded
@@ -241,10 +217,7 @@ def _validate_scoped_decision_evidence(
                     or general_after != expected_general_after
                     or scope_after + general_after > 12
                 ):
-                    raise ValueError(
-                        f"scoped_group_cap_arithmetic_mismatch:{identity}:"
-                        f"{cardinality}"
-                    )
+                    raise ValueError(f"scoped_group_cap_arithmetic_mismatch:{identity}:" f"{cardinality}")
         if "bounded_candidate_attempt_count" not in decision:
             if attempts:
                 raise ValueError(f"attempts_without_bounded_count:{identity}")
@@ -285,16 +258,10 @@ def _validate_scoped_decision_evidence(
         )
         if raw_scope_count != decision.get(
             "scope_matching_static_solved_candidate_count"
-        ) or raw_scope_count + raw_general_count != decision.get(
-            "static_solved_candidate_count"
-        ):
+        ) or raw_scope_count + raw_general_count != decision.get("static_solved_candidate_count"):
             raise ValueError(f"attempt_plan_raw_count_mismatch:{identity}")
-        maximum_scope_size = plan_evidence.get(
-            "maximum_scope_logical_slot_count"
-        )
-        general_growth_dominates = plan_evidence.get(
-            "best_general_batch_like_growth_dominates"
-        )
+        maximum_scope_size = plan_evidence.get("maximum_scope_logical_slot_count")
+        general_growth_dominates = plan_evidence.get("best_general_batch_like_growth_dominates")
         preference_reason = plan_evidence.get("preference_reason")
         if raw_scope_count == 0:
             expected_preferred_lane = "general"
@@ -321,52 +288,32 @@ def _validate_scoped_decision_evidence(
                 expected_preference_reason = "scope_cardinality_at_least_three"
             elif general_growth_dominates:
                 expected_preferred_lane = "scope"
-                expected_preference_reason = (
-                    "best_general_batch_like_growth_dominates"
-                )
+                expected_preference_reason = "best_general_batch_like_growth_dominates"
             else:
                 expected_preferred_lane = "general"
                 expected_preference_reason = "balanced_general_preference"
-        if (
-            preferred_lane != expected_preferred_lane
-            or preference_reason != expected_preference_reason
-        ):
+        if preferred_lane != expected_preferred_lane or preference_reason != expected_preference_reason:
             raise ValueError(f"attempt_plan_preference_mismatch:{identity}")
         if raw_scope_count == 0 or raw_general_count == 0:
             expected_scope_count = min(raw_scope_count, 6)
             expected_general_count = min(raw_general_count, 6)
         else:
-            raw_preferred_count = (
-                raw_scope_count
-                if preferred_lane == "scope"
-                else raw_general_count
-            )
-            raw_secondary_count = (
-                raw_general_count
-                if preferred_lane == "scope"
-                else raw_scope_count
-            )
+            raw_preferred_count = raw_scope_count if preferred_lane == "scope" else raw_general_count
+            raw_secondary_count = raw_general_count if preferred_lane == "scope" else raw_scope_count
             planned_preferred_count = min(raw_preferred_count, 4)
             planned_secondary_count = min(raw_secondary_count, 2)
             remaining = 6 - planned_preferred_count - planned_secondary_count
-            planned_secondary_count += min(
-                raw_secondary_count - planned_secondary_count, remaining
-            )
+            planned_secondary_count += min(raw_secondary_count - planned_secondary_count, remaining)
             if preferred_lane == "scope":
                 expected_scope_count = planned_preferred_count
                 expected_general_count = planned_secondary_count
             else:
                 expected_scope_count = planned_secondary_count
                 expected_general_count = planned_preferred_count
-        if (
-            scope_count != expected_scope_count
-            or general_count != expected_general_count
-        ):
+        if scope_count != expected_scope_count or general_count != expected_general_count:
             raise ValueError(f"bounded_attempt_plan_mismatch:{identity}")
         if scope_count and general_count:
-            preferred_count = (
-                scope_count if preferred_lane == "scope" else general_count
-            )
+            preferred_count = scope_count if preferred_lane == "scope" else general_count
             if preferred_count > 4:
                 raise ValueError(f"preferred_attempt_lane_exceeds_limit:{identity}")
 
@@ -377,9 +324,7 @@ def _validate_scoped_decision_evidence(
                 raise ValueError(f"attempt_must_be_an_object:{identity}")
             if attempt.get("attempt_index") != attempt_index:
                 raise ValueError(f"attempt_index_mismatch:{identity}")
-            scope_match = _nested(
-                attempt, "group_scope.matches_nonleading_no_explicit_batch"
-            )
+            scope_match = _nested(attempt, "group_scope.matches_nonleading_no_explicit_batch")
             if not isinstance(scope_match, bool):
                 raise ValueError(f"attempt_scope_evidence_missing:{identity}")
             expected_lane = "scope" if scope_match else "general"
@@ -388,16 +333,10 @@ def _validate_scoped_decision_evidence(
             attempted_lanes.append(expected_lane)
             if attempt.get("accepted") is True:
                 accepted_attempts.append(attempt)
-        preferred_count = (
-            scope_count if preferred_lane == "scope" else general_count
-        )
+        preferred_count = scope_count if preferred_lane == "scope" else general_count
         secondary_lane = "general" if preferred_lane == "scope" else "scope"
-        secondary_count = (
-            general_count if preferred_lane == "scope" else scope_count
-        )
-        planned_lanes = [preferred_lane] * preferred_count + [
-            secondary_lane
-        ] * secondary_count
+        secondary_count = general_count if preferred_lane == "scope" else scope_count
+        planned_lanes = [preferred_lane] * preferred_count + [secondary_lane] * secondary_count
         if attempted_lanes != planned_lanes[: len(attempted_lanes)]:
             raise ValueError(f"attempt_lane_order_mismatch:{identity}")
         if len(attempts) > bounded:
@@ -406,9 +345,7 @@ def _validate_scoped_decision_evidence(
             if len(accepted_attempts) != 1:
                 raise ValueError(f"accepted_decision_attempt_count_mismatch:{identity}")
             accepted_attempt = accepted_attempts[0]
-            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get(
-                "attempt_index"
-            ):
+            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get("attempt_index"):
                 raise ValueError(f"selected_attempt_index_mismatch:{identity}")
             selected_scope = _nested(
                 accepted_attempt,
@@ -418,23 +355,15 @@ def _validate_scoped_decision_evidence(
                 raise ValueError(f"selected_scope_evidence_mismatch:{identity}")
             used_fallback = decision.get("used_group_scope_fallback")
             fallback_reason = decision.get("group_scope_fallback_reason")
-            expected_fallback = bool(
-                not selected_scope
-                and (preferred_lane == "scope" or raw_scope_count == 0)
-            )
+            expected_fallback = bool(not selected_scope and (preferred_lane == "scope" or raw_scope_count == 0))
             expected_fallback_reason = None
             if expected_fallback:
                 scope_group_count = sum(
-                    int(value)
-                    for value in decision[
-                        "scope_matching_group_count_by_logical_slot_count"
-                    ].values()
+                    int(value) for value in decision["scope_matching_group_count_by_logical_slot_count"].values()
                 )
                 scope_profile_count = sum(
                     int(value)
-                    for value in decision[
-                        "scope_matching_product_profile_count_by_logical_slot_count"
-                    ].values()
+                    for value in decision["scope_matching_product_profile_count_by_logical_slot_count"].values()
                 )
                 if scope_group_count == 0:
                     expected_fallback_reason = "no_compatible_scope_group"
@@ -443,17 +372,11 @@ def _validate_scoped_decision_evidence(
                 elif raw_scope_count == 0:
                     expected_fallback_reason = "no_scope_static_solution"
                 else:
-                    expected_fallback_reason = (
-                        "scope_candidate_attempts_exhausted"
-                    )
+                    expected_fallback_reason = "scope_candidate_attempts_exhausted"
             if used_fallback is not expected_fallback:
                 raise ValueError(f"invalid_group_scope_fallback_flag:{identity}")
-            if (
-                fallback_reason != expected_fallback_reason
-                or (
-                    fallback_reason is not None
-                    and fallback_reason not in allowed_fallback_reasons
-                )
+            if fallback_reason != expected_fallback_reason or (
+                fallback_reason is not None and fallback_reason not in allowed_fallback_reasons
             ):
                 raise ValueError(f"invalid_group_scope_fallback_reason:{identity}")
             selected_lane = "scope" if selected_scope else "general"
@@ -467,21 +390,17 @@ def _validate_scoped_decision_evidence(
                     else "general_candidate_attempts_exhausted"
                 )
             )
-            if decision.get(
-                "used_preferred_attempt_lane_fallback"
-            ) is not expected_preferred_fallback or decision.get(
-                "preferred_attempt_lane_fallback_reason"
-            ) != expected_preferred_reason:
+            if (
+                decision.get("used_preferred_attempt_lane_fallback") is not expected_preferred_fallback
+                or decision.get("preferred_attempt_lane_fallback_reason") != expected_preferred_reason
+            ):
                 raise ValueError(f"invalid_preferred_lane_fallback:{identity}")
         elif accepted_attempts:
             raise ValueError(f"rejected_decision_has_accepted_attempt:{identity}")
 
 
 def _is_explicit_batch_symbol(value: Any) -> bool:
-    return (
-        isinstance(value, str)
-        and value.strip().lower() in EXPLICIT_BATCH_SYMBOLS
-    )
+    return isinstance(value, str) and value.strip().lower() in EXPLICIT_BATCH_SYMBOLS
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -511,8 +430,7 @@ def _verify_static_manifest_artifacts(
         actual = _sha256_file(path)
         if declared != actual:
             raise ValueError(
-                f"solver manifest artifact hash mismatch for {name}:"
-                f" expected {declared}, found {actual}"
+                f"solver manifest artifact hash mismatch for {name}:" f" expected {declared}, found {actual}"
             )
 
 
@@ -543,10 +461,7 @@ def _percentile(values: Sequence[int | float], fraction: float) -> float | None:
 
 
 def _counter(counter: Mapping[Any, int]) -> dict[str, int]:
-    return {
-        str(key): int(counter[key])
-        for key in sorted(counter, key=lambda item: (type(item).__name__, repr(item)))
-    }
+    return {str(key): int(counter[key]) for key in sorted(counter, key=lambda item: (type(item).__name__, repr(item)))}
 
 
 def _distribution(values: Sequence[int | float]) -> dict[str, Any]:
@@ -564,9 +479,7 @@ def _distribution(values: Sequence[int | float]) -> dict[str, Any]:
 def _value_profile(values: Sequence[int], sample_count: int) -> dict[str, Any]:
     counts = collections.Counter(values)
     total = len(values)
-    entropy = -sum(
-        (count / total) * math.log2(count / total) for count in counts.values()
-    ) if total else 0.0
+    entropy = -sum((count / total) * math.log2(count / total) for count in counts.values()) if total else 0.0
     top = counts.most_common(20)
     hhi = sum((count / total) ** 2 for count in counts.values()) if total else 0.0
     return {
@@ -581,23 +494,19 @@ def _value_profile(values: Sequence[int], sample_count: int) -> dict[str, Any]:
         "top1_fraction": _fraction(sum(count for _, count in top[:1]), total),
         "top5_fraction": _fraction(sum(count for _, count in top[:5]), total),
         "top10_fraction": _fraction(sum(count for _, count in top[:10]), total),
-        "power_of_two_count": sum(
-            count for value, count in counts.items() if value > 0 and value & (value - 1) == 0
-        ),
+        "power_of_two_count": sum(count for value, count in counts.items() if value > 0 and value & (value - 1) == 0),
         "power_of_two_fraction": _fraction(
             sum(count for value, count in counts.items() if value > 0 and value & (value - 1) == 0),
             total,
         ),
         "multiple_fractions": {
-            str(multiple): _fraction(sum(value % multiple == 0 for value in values), total)
-            for multiple in (8, 32)
+            str(multiple): _fraction(sum(value % multiple == 0 for value in values), total) for multiple in (8, 32)
         },
         "residue_histograms": {
             str(modulus): {
                 "expected_uniform_fraction": 1 / modulus,
                 "counts": {
-                    str(residue): sum(value % modulus == residue for value in values)
-                    for residue in range(modulus)
+                    str(residue): sum(value % modulus == residue for value in values) for residue in range(modulus)
                 },
                 "fractions": {
                     str(residue): _fraction(
@@ -615,10 +524,7 @@ def _value_profile(values: Sequence[int], sample_count: int) -> dict[str, Any]:
         },
         "anchor_count": sum(value in DIMENSION_ANCHORS for value in values),
         "anchor_fraction": _fraction(sum(value in DIMENSION_ANCHORS for value in values), total),
-        "top_values": [
-            {"value": value, "count": count, "fraction": _fraction(count, total)}
-            for value, count in top
-        ],
+        "top_values": [{"value": value, "count": count, "fraction": _fraction(count, total)} for value, count in top],
     }
 
 
@@ -627,9 +533,7 @@ def _partitioned_value_profiles(
     sample_count: int,
 ) -> dict[str, dict[str, Any]]:
     power_of_two = [value for value in values if value > 0 and value & (value - 1) == 0]
-    non_power_of_two = [
-        value for value in values if not (value > 0 and value & (value - 1) == 0)
-    ]
+    non_power_of_two = [value for value in values if not (value > 0 and value & (value - 1) == 0)]
     return {
         "power_of_two": _value_profile(power_of_two, sample_count),
         "non_power_of_two": _value_profile(non_power_of_two, sample_count),
@@ -726,9 +630,7 @@ def _independent_shape_diff(parent_code: str, child_code: str) -> list[dict[str,
     parent_factories = _resolved_direct_factories(parent_code)
     child_factories = _resolved_direct_factories(child_code)
     if len(parent_factories) != len(child_factories):
-        raise ValueError(
-            f"direct_factory_count_changed:{len(parent_factories)}:{len(child_factories)}"
-        )
+        raise ValueError(f"direct_factory_count_changed:{len(parent_factories)}:{len(child_factories)}")
     changed: list[dict[str, Any]] = []
     for parent, child in zip(parent_factories, child_factories, strict=True):
         factory_index = int(parent["factory_index"])
@@ -736,22 +638,16 @@ def _independent_shape_diff(parent_code: str, child_code: str) -> list[dict[str,
             raise ValueError(f"direct_factory_index_changed:{factory_index}")
         if child["factory_name"] != parent["factory_name"]:
             raise ValueError(
-                f"direct_factory_name_changed:{factory_index}:"
-                f"{parent['factory_name']}:{child['factory_name']}"
+                f"direct_factory_name_changed:{factory_index}:" f"{parent['factory_name']}:{child['factory_name']}"
             )
         if child["dtype_name"] != parent["dtype_name"] or child["dtype_bytes"] != parent["dtype_bytes"]:
             raise ValueError(f"direct_factory_dtype_changed:{factory_index}")
         parent_shape = tuple(parent["shape"])
         child_shape = tuple(child["shape"])
         if len(parent_shape) != len(child_shape):
-            raise ValueError(
-                f"direct_factory_rank_changed:{factory_index}:"
-                f"{len(parent_shape)}:{len(child_shape)}"
-            )
+            raise ValueError(f"direct_factory_rank_changed:{factory_index}:" f"{len(parent_shape)}:{len(child_shape)}")
         rank = len(parent_shape)
-        for axis, (old_value, new_value) in enumerate(
-            zip(parent_shape, child_shape, strict=True)
-        ):
+        for axis, (old_value, new_value) in enumerate(zip(parent_shape, child_shape, strict=True)):
             if old_value == new_value:
                 continue
             changed.append(
@@ -796,12 +692,8 @@ def _solver_slot_edits(decision: Mapping[str, Any]) -> list[dict[str, Any]]:
             if not isinstance(slot, Mapping):
                 raise ValueError(f"solver_slot_edit_missing_slot:{edit_index}")
             if type(new_value) is not int or new_value <= 0:
-                raise ValueError(
-                    f"solver_slot_edit_invalid_new_value:{edit_index}:{new_value!r}"
-                )
-            edits.append(
-                {"slot_index": edit_index, "slot": slot, "new_value": new_value}
-            )
+                raise ValueError(f"solver_slot_edit_invalid_new_value:{edit_index}:{new_value!r}")
+            edits.append({"slot_index": edit_index, "slot": slot, "new_value": new_value})
     else:
         slot = solver.get("slot")
         new_value = solver.get("slot_value")
@@ -828,27 +720,19 @@ def _declared_occurrences(
         slot = edit["slot"]
         occurrences = slot.get("occurrences")
         if not isinstance(occurrences, list) or not occurrences:
-            raise ValueError(
-                f"accepted_slot_has_no_occurrences:{slot.get('slot_id')}"
-            )
+            raise ValueError(f"accepted_slot_has_no_occurrences:{slot.get('slot_id')}")
         for slot_occurrence_index, occurrence in enumerate(occurrences):
             if not isinstance(occurrence, Mapping):
-                raise ValueError(
-                    f"slot_occurrence_not_an_object:{slot.get('slot_id')}:"
-                    f"{slot_occurrence_index}"
-                )
+                raise ValueError(f"slot_occurrence_not_an_object:{slot.get('slot_id')}:" f"{slot_occurrence_index}")
             factory_index = occurrence.get("factory_index")
             axis = occurrence.get("axis")
             if type(factory_index) is not int or type(axis) is not int:
                 raise ValueError(
-                    f"slot_occurrence_has_invalid_key:{slot.get('slot_id')}:"
-                    f"{factory_index!r}:{axis!r}"
+                    f"slot_occurrence_has_invalid_key:{slot.get('slot_id')}:" f"{factory_index!r}:{axis!r}"
                 )
             key = (factory_index, axis)
             if key in result:
-                raise ValueError(
-                    f"changed_occurrence_declared_by_multiple_slots:{factory_index}:{axis}"
-                )
+                raise ValueError(f"changed_occurrence_declared_by_multiple_slots:{factory_index}:{axis}")
             result[key] = {
                 "slot_index": int(edit["slot_index"]),
                 "slot_occurrence_index": slot_occurrence_index,
@@ -868,11 +752,7 @@ def _dimension_balance_ratio_limit(manifest: Mapping[str, Any]) -> int | float |
     if not isinstance(contract, Mapping):
         raise ValueError("dimension_balance_guard_contract_must_be_an_object")
     ratio_limit = contract.get("ratio_limit")
-    if (
-        type(ratio_limit) not in (int, float)
-        or not math.isfinite(float(ratio_limit))
-        or ratio_limit <= 0
-    ):
+    if type(ratio_limit) not in (int, float) or not math.isfinite(float(ratio_limit)) or ratio_limit <= 0:
         raise ValueError(f"invalid_dimension_balance_ratio_limit:{ratio_limit!r}")
     return ratio_limit
 
@@ -905,13 +785,10 @@ def _logical_slot_count_range(
         return None
     if not isinstance(contract, Mapping):
         raise ValueError("group_contract_must_be_an_object")
-    if (
-        manifest.get("contract_version") in {
-            "shape_variable_multislot_solver_v6",
-            "shape_variable_multislot_solver_v7",
-        }
-        and not isinstance(manifest.get("scope_selection_contract"), Mapping)
-    ):
+    if manifest.get("contract_version") in {
+        "shape_variable_multislot_solver_v6",
+        "shape_variable_multislot_solver_v7",
+    } and not isinstance(manifest.get("scope_selection_contract"), Mapping):
         raise ValueError("scoped variable multislot solver requires scope_selection_contract")
     raw = contract.get("logical_slot_count_range")
     if (
@@ -934,9 +811,7 @@ def _dimension_balance_child_audit(
     """Resolve every final direct factory without trusting solver shape evidence."""
 
     try:
-        declared_occurrence_count = len(
-            _declared_occurrences(_solver_slot_edits(decision))
-        )
+        declared_occurrence_count = len(_declared_occurrences(_solver_slot_edits(decision)))
     except (TypeError, ValueError):
         declared_occurrence_count = 0
     result: dict[str, Any] = {
@@ -963,9 +838,7 @@ def _dimension_balance_child_audit(
             for field in ("factory_index", "axis", "rank", "axis_from_right"):
                 value = occurrence.get(field)
                 if type(value) is not int:
-                    raise ValueError(
-                        f"occurrence_{field}_not_an_integer:{occurrence_index}:{value!r}"
-                    )
+                    raise ValueError(f"occurrence_{field}_not_an_integer:{occurrence_index}:{value!r}")
                 integer_fields[field] = value
             factory_index = integer_fields["factory_index"]
             axis = integer_fields["axis"]
@@ -975,32 +848,22 @@ def _dimension_balance_child_audit(
             if not isinstance(factory_name, str) or not factory_name:
                 raise ValueError(f"invalid_occurrence_factory_name:{occurrence_index}")
             if not 0 <= factory_index < len(child_factories):
-                raise ValueError(
-                    f"occurrence_factory_index_out_of_range:{factory_index}:"
-                    f"{len(child_factories)}"
-                )
+                raise ValueError(f"occurrence_factory_index_out_of_range:{factory_index}:" f"{len(child_factories)}")
             if (factory_index, axis) in seen_occurrences:
-                raise ValueError(
-                    f"duplicate_independent_occurrence:{factory_index}:{axis}"
-                )
+                raise ValueError(f"duplicate_independent_occurrence:{factory_index}:{axis}")
             seen_occurrences.add((factory_index, axis))
 
             factory = child_factories[factory_index]
             actual_factory_name = str(factory["factory_name"])
             if actual_factory_name != factory_name:
                 raise ValueError(
-                    f"occurrence_factory_name_mismatch:{factory_index}:"
-                    f"{factory_name}:{actual_factory_name}"
+                    f"occurrence_factory_name_mismatch:{factory_index}:" f"{factory_name}:{actual_factory_name}"
                 )
             shape = tuple(int(value) for value in factory["shape"])
             if len(shape) != expected_rank:
-                raise ValueError(
-                    f"occurrence_rank_mismatch:{factory_index}:{expected_rank}:{len(shape)}"
-                )
+                raise ValueError(f"occurrence_rank_mismatch:{factory_index}:{expected_rank}:{len(shape)}")
             if not 0 <= axis < expected_rank:
-                raise ValueError(
-                    f"occurrence_axis_out_of_range:{factory_index}:{axis}:{expected_rank}"
-                )
+                raise ValueError(f"occurrence_axis_out_of_range:{factory_index}:{axis}:{expected_rank}")
             if expected_axis_from_right != expected_rank - axis - 1:
                 raise ValueError(
                     f"occurrence_axis_from_right_mismatch:{factory_index}:{axis}:"
@@ -1010,8 +873,7 @@ def _dimension_balance_child_audit(
             actual_new_value = occurrence.get("new_value")
             if type(actual_new_value) is not int or actual_new_value <= 0:
                 raise ValueError(
-                    f"independent_occurrence_new_value_invalid:{factory_index}:{axis}:"
-                    f"{actual_new_value!r}"
+                    f"independent_occurrence_new_value_invalid:{factory_index}:{axis}:" f"{actual_new_value!r}"
                 )
             if shape[axis] != actual_new_value:
                 raise ValueError(
@@ -1096,11 +958,7 @@ def _dimension_balance_child_audit(
                     "factory_name": factory_name,
                     "rank": len(shape),
                     "shape": list(shape),
-                    "affected_axes": (
-                        sorted(affected["affected_axes"])
-                        if affected is not None
-                        else []
-                    ),
+                    "affected_axes": (sorted(affected["affected_axes"]) if affected is not None else []),
                     "largest_dimension": largest,
                     "second_largest_dimension": second_largest,
                     "ratio": ratio,
@@ -1109,11 +967,7 @@ def _dimension_balance_child_audit(
                 }
             )
         result["factories"] = final_factories
-        factory_ratios = [
-            float(factory["ratio"])
-            for factory in result["factories"]
-            if factory["ratio"] is not None
-        ]
+        factory_ratios = [float(factory["ratio"]) for factory in result["factories"] if factory["ratio"] is not None]
         result["child_max_ratio"] = max(factory_ratios) if factory_ratios else None
         if ratio_limit is not None:
             result["boundary"] = any(factory["boundary"] for factory in result["factories"])
@@ -1146,34 +1000,17 @@ def _dimension_balance_summary(
         if isinstance(occurrence, Mapping)
     ]
     factory_evidence = [
-        factory
-        for audit in resolved
-        for factory in audit.get("factories", [])
-        if isinstance(factory, Mapping)
+        factory for audit in resolved for factory in audit.get("factories", []) if isinstance(factory, Mapping)
     ]
     occurrence_ratios = [
-        float(occurrence["ratio"])
-        for occurrence in occurrence_evidence
-        if occurrence.get("ratio") is not None
+        float(occurrence["ratio"]) for occurrence in occurrence_evidence if occurrence.get("ratio") is not None
     ]
-    factory_ratios = [
-        float(factory["ratio"])
-        for factory in factory_evidence
-        if factory.get("ratio") is not None
-    ]
-    affected_factory_evidence = [
-        factory for factory in factory_evidence if factory.get("affected_axes")
-    ]
+    factory_ratios = [float(factory["ratio"]) for factory in factory_evidence if factory.get("ratio") is not None]
+    affected_factory_evidence = [factory for factory in factory_evidence if factory.get("affected_axes")]
     affected_factory_ratios = [
-        float(factory["ratio"])
-        for factory in affected_factory_evidence
-        if factory.get("ratio") is not None
+        float(factory["ratio"]) for factory in affected_factory_evidence if factory.get("ratio") is not None
     ]
-    child_ratios = [
-        float(audit["child_max_ratio"])
-        for audit in resolved
-        if audit.get("child_max_ratio") is not None
-    ]
+    child_ratios = [float(audit["child_max_ratio"]) for audit in resolved if audit.get("child_max_ratio") is not None]
     resolution_failures = [
         {
             "child_uuid": audit.get("child_uuid"),
@@ -1195,9 +1032,7 @@ def _dimension_balance_summary(
     else:
         boundary = {
             "children": sum(audit.get("boundary") is True for audit in resolved),
-            "occurrences": sum(
-                occurrence.get("boundary") is True for occurrence in occurrence_evidence
-            ),
+            "occurrences": sum(occurrence.get("boundary") is True for occurrence in occurrence_evidence),
             "factories": sum(factory.get("boundary") is True for factory in factory_evidence),
         }
         violating_factories = [
@@ -1211,9 +1046,7 @@ def _dimension_balance_summary(
         ]
         violations = {
             "children": sum(audit.get("violation") is True for audit in resolved),
-            "occurrences": sum(
-                occurrence.get("violation") is True for occurrence in occurrence_evidence
-            ),
+            "occurrences": sum(occurrence.get("violation") is True for occurrence in occurrence_evidence),
             "factories": len(violating_factories),
             "details": violating_factories[:100],
         }
@@ -1230,17 +1063,13 @@ def _dimension_balance_summary(
         "enforced": ratio_limit is not None,
         "ratio_limit": ratio_limit,
         "comparison": (
-            f"largest_dimension <= {ratio_limit} * second_largest_dimension"
-            if ratio_limit is not None
-            else None
+            f"largest_dimension <= {ratio_limit} * second_largest_dimension" if ratio_limit is not None else None
         ),
         "accepted_children": len(audits),
         "resolved_children": len(resolved),
         "resolution_failure_children": len(resolution_failures),
         "resolution_failures": resolution_failures[:100],
-        "declared_occurrences": sum(
-            int(audit.get("declared_occurrence_count", 0)) for audit in audits
-        ),
+        "declared_occurrences": sum(int(audit.get("declared_occurrence_count", 0)) for audit in audits),
         "resolved_occurrences": len(occurrence_evidence),
         "rank_ge_2_occurrences": len(occurrence_ratios),
         "final_direct_factories": len(factory_evidence),
@@ -1277,19 +1106,14 @@ def _apply_declared_patches(
         new_value = edit["new_value"]
         old_value = slot.get("old_value")
         if type(old_value) is not int or old_value <= 0:
-            raise ValueError(
-                f"declared_patch_invalid_old_value:{slot.get('slot_id')}:{old_value!r}"
-            )
+            raise ValueError(f"declared_patch_invalid_old_value:{slot.get('slot_id')}:{old_value!r}")
         raw_spans = slot.get("patch_spans")
         if not isinstance(raw_spans, list) or not raw_spans:
             raise ValueError(f"declared_patch_has_no_spans:{slot.get('slot_id')}")
         for raw_span in raw_spans:
             if not isinstance(raw_span, Mapping):
                 raise ValueError(f"declared_patch_span_not_an_object:{slot.get('slot_id')}")
-            span = {
-                key: int(raw_span[key])
-                for key in ("lineno", "col_offset", "end_lineno", "end_col_offset")
-            }
+            span = {key: int(raw_span[key]) for key in ("lineno", "col_offset", "end_lineno", "end_col_offset")}
             if not 1 <= span["lineno"] <= len(lines) or not 1 <= span["end_lineno"] <= len(lines):
                 raise ValueError("declared_patch_line_out_of_range")
             start = line_offsets[span["lineno"] - 1] + span["col_offset"]
@@ -1297,9 +1121,7 @@ def _apply_declared_patches(
             token = raw[start:end].decode("utf-8")
             parsed = ast.literal_eval(token)
             if type(parsed) is not int or parsed != old_value:
-                raise ValueError(
-                    f"declared_patch_old_value_mismatch:{token!r}:{old_value}"
-                )
+                raise ValueError(f"declared_patch_old_value_mismatch:{token!r}:{old_value}")
             replacements.append((start, end, str(new_value).encode("ascii")))
     if not replacements:
         raise ValueError("declared_patch_has_no_spans")
@@ -1336,16 +1158,13 @@ def _annotate_independent_changes(
     for occurrence in changed_occurrences:
         key = (int(occurrence["factory_index"]), int(occurrence["axis"]))
         if key in actual_by_key:
-            raise ValueError(
-                f"independent_shape_diff_duplicate:{key[0]}:{key[1]}"
-            )
+            raise ValueError(f"independent_shape_diff_duplicate:{key[0]}:{key[1]}")
         actual_by_key[key] = occurrence
     if set(declared) != set(actual_by_key):
         missing = sorted(set(actual_by_key) - set(declared))
         extra = sorted(set(declared) - set(actual_by_key))
         raise ValueError(
-            f"declared_vs_actual_changed_occurrence_mismatch:missing={missing[:20]}:"
-            f"extra={extra[:20]}"
+            f"declared_vs_actual_changed_occurrence_mismatch:missing={missing[:20]}:" f"extra={extra[:20]}"
         )
 
     annotated: list[dict[str, Any]] = []
@@ -1453,8 +1272,7 @@ def _verify_child(
         record(
             "declared_slots_exact_match",
             lambda: all(
-                _canonical_slot(edit["slot"])
-                == _canonical_slot(extracted_slots[str(edit["slot"].get("slot_id"))])
+                _canonical_slot(edit["slot"]) == _canonical_slot(extracted_slots[str(edit["slot"].get("slot_id"))])
                 for edit in edits
             ),
         )
@@ -1539,10 +1357,7 @@ def _variant_cardinality_contract(
         for parent_uuid in sorted(selected & set(grouped)):
             rows = grouped[parent_uuid]
             if len(rows) != expected_per_parent:
-                errors.append(
-                    f"{label}_cardinality:{parent_uuid}:{len(rows)}:"
-                    f"expected={expected_per_parent}"
-                )
+                errors.append(f"{label}_cardinality:{parent_uuid}:{len(rows)}:" f"expected={expected_per_parent}")
             variants = [row.get("variant") for row in rows]
             if any(variant not in {"medium", "large"} for variant in variants):
                 errors.append(f"{label}_invalid_variant:{parent_uuid}:{variants}")
@@ -1551,14 +1366,9 @@ def _variant_cardinality_contract(
 
     for parent_uuid in sorted(selected & set(targets_by_parent) & set(decisions_by_parent)):
         target_variants = sorted(str(row.get("variant")) for row in targets_by_parent[parent_uuid])
-        decision_variants = sorted(
-            str(row.get("variant")) for row in decisions_by_parent[parent_uuid]
-        )
+        decision_variants = sorted(str(row.get("variant")) for row in decisions_by_parent[parent_uuid])
         if target_variants != decision_variants:
-            errors.append(
-                f"target_decision_variant_mismatch:{parent_uuid}:"
-                f"{target_variants}:{decision_variants}"
-            )
+            errors.append(f"target_decision_variant_mismatch:{parent_uuid}:" f"{target_variants}:{decision_variants}")
 
     accepted_by_parent: dict[str, list[Mapping[str, Any]]] = collections.defaultdict(list)
     for decision in decisions:
@@ -1567,10 +1377,7 @@ def _variant_cardinality_contract(
     accepted_limit = 2 if legacy_v3 else 1
     for parent_uuid, rows in sorted(accepted_by_parent.items()):
         if len(rows) > accepted_limit:
-            errors.append(
-                f"accepted_child_cardinality:{parent_uuid}:{len(rows)}:"
-                f"limit={accepted_limit}"
-            )
+            errors.append(f"accepted_child_cardinality:{parent_uuid}:{len(rows)}:" f"limit={accepted_limit}")
         child_uuids = [row.get("child_uuid") for row in rows]
         if any(not isinstance(value, str) or not value for value in child_uuids):
             errors.append(f"accepted_child_missing_uuid:{parent_uuid}:{child_uuids}")
@@ -1587,12 +1394,8 @@ def _variant_cardinality_contract(
         "target_rows": len(target_rows),
         "decision_rows": len(decisions),
         "accepted_parents": len(accepted_by_parent),
-        "target_variant_counts": _counter(
-            collections.Counter(str(row.get("variant")) for row in target_rows)
-        ),
-        "decision_variant_counts": _counter(
-            collections.Counter(str(row.get("variant")) for row in decisions)
-        ),
+        "target_variant_counts": _counter(collections.Counter(str(row.get("variant")) for row in target_rows)),
+        "decision_variant_counts": _counter(collections.Counter(str(row.get("variant")) for row in decisions)),
         "errors": errors[:200],
         "error_count": len(errors),
         "passed": not errors,
@@ -1628,22 +1431,14 @@ def _shape_quality_gate(
         axis = row.get("axis")
         new_value = row.get("new_value")
         if type(factory_index) is not int or type(axis) is not int:
-            errors.append(
-                f"quality_invalid_occurrence_key:{child_uuid}:"
-                f"{factory_index!r}:{axis!r}"
-            )
+            errors.append(f"quality_invalid_occurrence_key:{child_uuid}:" f"{factory_index!r}:{axis!r}")
             continue
         if type(new_value) is not int or new_value <= 0:
-            errors.append(
-                f"quality_invalid_new_dimension:{child_uuid}:{factory_index}:{axis}:"
-                f"{new_value!r}"
-            )
+            errors.append(f"quality_invalid_new_dimension:{child_uuid}:{factory_index}:{axis}:" f"{new_value!r}")
             continue
         key = (child_uuid, factory_index, axis)
         if key in seen_keys:
-            errors.append(
-                f"quality_duplicate_changed_occurrence:{child_uuid}:{factory_index}:{axis}"
-            )
+            errors.append(f"quality_duplicate_changed_occurrence:{child_uuid}:{factory_index}:{axis}")
             continue
         seen_keys.add(key)
         rows_by_child[child_uuid].append(row)
@@ -1658,18 +1453,14 @@ def _shape_quality_gate(
         child_uuid: logical_slot_counts.get(child_uuid)
         for child_uuid in sorted(unique_children)
         if child_uuid in logical_slot_counts
-        and (
-            type(logical_slot_counts[child_uuid]) is not int
-            or logical_slot_counts[child_uuid] <= 0
-        )
+        and (type(logical_slot_counts[child_uuid]) is not int or logical_slot_counts[child_uuid] <= 0)
     }
     if invalid_slot_counts:
         errors.append(f"quality_invalid_logical_slot_counts:{invalid_slot_counts}")
     valid_slot_counts = [
         int(logical_slot_counts[child_uuid])
         for child_uuid in unique_children
-        if type(logical_slot_counts.get(child_uuid)) is int
-        and logical_slot_counts[child_uuid] > 0
+        if type(logical_slot_counts.get(child_uuid)) is int and logical_slot_counts[child_uuid] > 0
     ]
     exact_required_slot_children = (
         sum(value == required_logical_slots for value in valid_slot_counts)
@@ -1677,24 +1468,15 @@ def _shape_quality_gate(
         else None
     )
     within_declared_range_children = (
-        sum(
-            logical_slot_range[0] <= value <= logical_slot_range[1]
-            for value in valid_slot_counts
-        )
+        sum(logical_slot_range[0] <= value <= logical_slot_range[1] for value in valid_slot_counts)
         if logical_slot_range is not None
         else None
     )
     logical_slot_cardinality_passed = bool(
         not missing_slot_counts
         and not invalid_slot_counts
-        and (
-            required_logical_slots is None
-            or exact_required_slot_children == len(unique_children)
-        )
-        and (
-            logical_slot_range is None
-            or within_declared_range_children == len(unique_children)
-        )
+        and (required_logical_slots is None or exact_required_slot_children == len(unique_children))
+        and (logical_slot_range is None or within_declared_range_children == len(unique_children))
     )
 
     occurrence_count = sum(len(rows_by_child[child_uuid]) for child_uuid in unique_children)
@@ -1704,24 +1486,19 @@ def _shape_quality_gate(
         for row in rows_by_child[child_uuid]
         if int(row["new_value"]) & (int(row["new_value"]) - 1) == 0
     )
-    single_changed_children = sum(
-        len(rows_by_child[child_uuid]) == 1 for child_uuid in unique_children
-    )
+    single_changed_children = sum(len(rows_by_child[child_uuid]) == 1 for child_uuid in unique_children)
     child_count = len(unique_children)
     power_lower_passed = (
         occurrence_count > 0
-        and POWER_OF_TWO_MIN_DENOMINATOR * power_of_two_count
-        >= POWER_OF_TWO_MIN_NUMERATOR * occurrence_count
+        and POWER_OF_TWO_MIN_DENOMINATOR * power_of_two_count >= POWER_OF_TWO_MIN_NUMERATOR * occurrence_count
     )
     power_upper_passed = (
         occurrence_count > 0
-        and POWER_OF_TWO_MAX_DENOMINATOR * power_of_two_count
-        <= POWER_OF_TWO_MAX_NUMERATOR * occurrence_count
+        and POWER_OF_TWO_MAX_DENOMINATOR * power_of_two_count <= POWER_OF_TWO_MAX_NUMERATOR * occurrence_count
     )
     single_upper_passed = (
         child_count > 0
-        and SINGLE_CHANGED_MAX_DENOMINATOR * single_changed_children
-        <= SINGLE_CHANGED_MAX_NUMERATOR * child_count
+        and SINGLE_CHANGED_MAX_DENOMINATOR * single_changed_children <= SINGLE_CHANGED_MAX_NUMERATOR * child_count
     )
     complete = bool(available and evidence_complete and not errors)
     passed = bool(
@@ -1805,27 +1582,18 @@ def _decision_failure_category(decision: Mapping[str, Any]) -> str:
                 return "no_structural_pair"
             return "no_power_of_two_feasible_solution"
     if reason == "no_variable_multislot_product_solution":
-        profile_counts = decision.get(
-            "product_profile_count_by_logical_slot_count", {}
-        )
+        profile_counts = decision.get("product_profile_count_by_logical_slot_count", {})
         profile_count = (
-            sum(int(value) for value in profile_counts.values())
-            if isinstance(profile_counts, Mapping)
-            else 0
+            sum(int(value) for value in profile_counts.values()) if isinstance(profile_counts, Mapping) else 0
         )
         rejection_counts = decision.get("candidate_rejection_counts", {})
         if (
             profile_count > 0
             and isinstance(rejection_counts, Mapping)
-            and set(rejection_counts)
-            == {"ValueError:dimension_balance_guard_rejected"}
+            and set(rejection_counts) == {"ValueError:dimension_balance_guard_rejected"}
         ):
             return "all_numeric_candidates_rejected_by_dimension_balance_guard"
-        return (
-            "no_exact_product_profile"
-            if profile_count == 0
-            else "no_numeric_product_solution"
-        )
+        return "no_exact_product_profile" if profile_count == 0 else "no_numeric_product_solution"
     if int(decision.get("slot_count", 0)) == 0:
         return "no_patchable_shape_slot"
     if int(decision.get("affine_slot_count", 0)) == 0:
@@ -1907,9 +1675,7 @@ def _load_ai_baseline(
         "distribution_scope": "full AI run accepted distribution",
         "attempted_parents": len(attempted_parents),
         "attempted_variant_decisions": len(decisions),
-        "attempted_parents_overlapping_solver_selection": len(
-            attempted_parents & selected
-        ),
+        "attempted_parents_overlapping_solver_selection": len(attempted_parents & selected),
         "accepted_children": len(accepted),
         "accepted_parents": len(accepted_parents),
         "parent_coverage": _fraction(len(accepted_parents), len(attempted_parents)),
@@ -1922,9 +1688,7 @@ def _load_ai_baseline(
         "effective_values": changed.get("effective_values"),
         "hhi": changed.get("hhi"),
         "top5_fraction": changed.get("top5_fraction"),
-        "single_changed_dimension_fraction": _fraction(
-            int(changed_per.get("1", 0)), full_accepted_count
-        ),
+        "single_changed_dimension_fraction": _fraction(int(changed_per.get("1", 0)), full_accepted_count),
     }
 
 
@@ -2003,8 +1767,7 @@ def _is_oom(record: Mapping[str, Any]) -> bool:
         return True
     runtime_error_name = (_kernelgym_runtime_error_name(record) or "").lower()
     runtime_error_class = "".join(
-        character for character in runtime_error_name.rsplit(".", 1)[-1]
-        if character.isalnum()
+        character for character in runtime_error_name.rsplit(".", 1)[-1] if character.isalnum()
     )
     if runtime_error_class in {"outofmemoryerror", "cudaoutofmemoryerror"}:
         return True
@@ -2027,11 +1790,7 @@ def _runtime_child_groups(
     grouped: dict[str, list[Mapping[str, Any]]] = collections.defaultdict(list)
     for decision in accepted:
         parent_uuid = str(decision["parent_uuid"])
-        group = (
-            str(decision.get("variant", "unknown"))
-            if key == "variant"
-            else str(parent_meta[parent_uuid][key])
-        )
+        group = str(decision.get("variant", "unknown")) if key == "variant" else str(parent_meta[parent_uuid][key])
         grouped[group].append(decision)
     result: dict[str, dict[str, Any]] = {}
     for group, decisions in sorted(grouped.items()):
@@ -2173,9 +1932,7 @@ def _reference_runtime_summary(
     if launcher_archive_path.is_file():
         launcher_archive_sha256 = _sha256_file(launcher_archive_path)
         launcher_archive["sha256"] = launcher_archive_sha256
-        launcher_archive["matches_records"] = (
-            launcher_archive_sha256 == launcher_source_sha256
-        )
+        launcher_archive["matches_records"] = launcher_archive_sha256 == launcher_source_sha256
         if launcher_archive_sha256 != launcher_source_sha256:
             raise ValueError(
                 "reference launcher source archive hash differs from runtime records:"
@@ -2204,20 +1961,16 @@ def _reference_runtime_summary(
         parent_passed = _runtime_passed(parent_record)
         child_passed = _runtime_passed(child_record)
         causal[
-            "both_pass"
-            if parent_passed and child_passed
-            else "parent_only"
-            if parent_passed
-            else "child_only"
-            if child_passed
-            else "neither"
+            (
+                "both_pass"
+                if parent_passed and child_passed
+                else "parent_only" if parent_passed else "child_only" if child_passed else "neither"
+            )
         ] += 1
 
     status_counts = collections.Counter(str(record.get("status", "missing")) for record in records.values())
     kernelgym_runtime_errors = collections.Counter(
-        error_name
-        for record in records.values()
-        if (error_name := _kernelgym_runtime_error_name(record)) is not None
+        error_name for record in records.values() if (error_name := _kernelgym_runtime_error_name(record)) is not None
     )
     failure_reasons: collections.Counter[str] = collections.Counter()
     for record in records.values():
@@ -2266,7 +2019,11 @@ def _reference_runtime_summary(
         "timeout_count": status_counts["timeout"],
         "oom_count": sum(_is_oom(record) for record in records.values()),
         "duration_seconds": _distribution(
-            [float(record["duration_seconds"]) for record in records.values() if isinstance(record.get("duration_seconds"), (int, float))]
+            [
+                float(record["duration_seconds"])
+                for record in records.values()
+                if isinstance(record.get("duration_seconds"), (int, float))
+            ]
         ),
     }, records
 
@@ -2279,8 +2036,7 @@ def _decision_slot_ids(decision: Mapping[str, Any]) -> list[str]:
     attempts = decision.get("attempts")
     if isinstance(attempts, list):
         accepted_attempts = [
-            attempt for attempt in attempts
-            if isinstance(attempt, Mapping) and attempt.get("accepted") is True
+            attempt for attempt in attempts if isinstance(attempt, Mapping) and attempt.get("accepted") is True
         ]
         if len(accepted_attempts) == 1:
             value = _nested(accepted_attempts[0], "slot.slot_id")
@@ -2315,9 +2071,7 @@ def _reference_both_pass_children(
             reason = (
                 "missing_both"
                 if parent_record is None and child_record is None
-                else "missing_parent"
-                if parent_record is None
-                else "missing_child"
+                else "missing_parent" if parent_record is None else "missing_child"
             )
             incomplete[reason].append(child_uuid)
             continue
@@ -2335,19 +2089,14 @@ def _write_region_reference_allowlist(
     if reference_summary.get("available") is not True:
         return {"available": False, "count": 0}
     expected, incomplete = _reference_both_pass_children(accepted, reference_records)
-    ordered = [
-        str(decision["child_uuid"])
-        for decision in accepted
-        if str(decision["child_uuid"]) in expected
-    ]
+    ordered = [str(decision["child_uuid"]) for decision in accepted if str(decision["child_uuid"]) in expected]
     content = "".join(f"{child_uuid}\n" for child_uuid in ordered)
     path = run_dir / "analysis" / "region_reference_both_pass_uuids.txt"
     _atomic_write(path, content)
     return {
         "available": True,
         "derivation": "accepted decision order filtered by parent and child reference pass",
-        "derivation_complete": bool(reference_summary.get("coverage_complete"))
-        and not incomplete,
+        "derivation_complete": bool(reference_summary.get("coverage_complete")) and not incomplete,
         "path": str(path.resolve()),
         "sha256": _sha256_bytes(content.encode("utf-8")),
         "count": len(ordered),
@@ -2373,9 +2122,11 @@ def _region_runtime_summary(
         reference_records,
     )
     reference_incomplete_count = sum(len(values) for values in reference_incomplete.values())
-    allowlist_derivation_complete = bool(reference_summary.get("available")) and bool(
-        reference_summary.get("coverage_complete")
-    ) and not reference_incomplete
+    allowlist_derivation_complete = (
+        bool(reference_summary.get("available"))
+        and bool(reference_summary.get("coverage_complete"))
+        and not reference_incomplete
+    )
     if not paths:
         return {
             "available": False,
@@ -2387,20 +2138,15 @@ def _region_runtime_summary(
             "allowlist_derivation_complete": allowlist_derivation_complete,
             "expected_children": len(reference_expected),
             "excluded_static_children": (
-                len(accepted_by_child)
-                - len(reference_expected)
-                - reference_incomplete_count
+                len(accepted_by_child) - len(reference_expected) - reference_incomplete_count
             ),
             "unclassified_static_children": reference_incomplete_count,
         }, {}
 
     loaded_records = _load_jsonl_files(paths)
-    observed_contracts = collections.Counter(
-        str(record.get("contract_version")) for _, _, record in loaded_records
-    )
+    observed_contracts = collections.Counter(str(record.get("contract_version")) for _, _, record in loaded_records)
     observed_perturbation_contracts = collections.Counter(
-        str(record.get("perturbation_contract_version"))
-        for _, _, record in loaded_records
+        str(record.get("perturbation_contract_version")) for _, _, record in loaded_records
     )
     observed_contract_set = set(observed_contracts)
     if observed_contracts and observed_contract_set == {LEGACY_REGION_CONTRACT_VERSION}:
@@ -2415,9 +2161,7 @@ def _region_runtime_summary(
             "expected_contract_version": REGION_CONTRACT_VERSION,
             "expected_perturbation_contract_version": PERTURBATION_CONTRACT_VERSION,
             "observed_contract_versions": _counter(observed_contracts),
-            "observed_perturbation_contract_versions": _counter(
-                observed_perturbation_contracts
-            ),
+            "observed_perturbation_contract_versions": _counter(observed_perturbation_contracts),
             "files": {str(path.relative_to(run_dir)): _sha256_file(path) for path in paths},
             "expected_children": len(accepted_by_child),
             "observed_children": len(loaded_records),
@@ -2425,8 +2169,7 @@ def _region_runtime_summary(
     supported_contracts = {REGION_CONTRACT_VERSION, PREVIOUS_REGION_CONTRACT_VERSION}
     if len(observed_contract_set) != 1 or not observed_contract_set <= supported_contracts:
         raise ValueError(
-            f"region contract versions must contain exactly one supported version: "
-            f"{sorted(observed_contract_set)}"
+            f"region contract versions must contain exactly one supported version: " f"{sorted(observed_contract_set)}"
         )
     contract_version = next(iter(observed_contract_set))
     current_contract = contract_version == REGION_CONTRACT_VERSION
@@ -2455,9 +2198,7 @@ def _region_runtime_summary(
         if decision is None:
             raise ValueError(f"{context}: unexpected region child UUID: {child_uuid}")
         if child_uuid not in expected_child_uuids:
-            raise ValueError(
-                f"{context}: region child UUID is outside {expected_scope}: {child_uuid}"
-            )
+            raise ValueError(f"{context}: region child UUID is outside {expected_scope}: {child_uuid}")
         if record.get("contract_version") != contract_version:
             raise ValueError(f"{context}: unexpected region contract version")
         if record.get("perturbation_contract_version") != PERTURBATION_CONTRACT_VERSION:
@@ -2481,9 +2222,7 @@ def _region_runtime_summary(
             raise ValueError(f"{context}: missing validator_source_sha256")
         validator_hashes.add(validator_hash)
         if current_contract:
-            binding_contract_version = record.get(
-                "validation_binding_contract_version"
-            )
+            binding_contract_version = record.get("validation_binding_contract_version")
             supported_binding_contracts = {
                 REGION_RUN_BINDING_CONTRACT_VERSION,
                 PREVIOUS_REGION_RUN_BINDING_CONTRACT_VERSION,
@@ -2522,10 +2261,7 @@ def _region_runtime_summary(
     if len(launcher_hashes) > 1:
         raise ValueError(f"region launcher hashes differ: {sorted(launcher_hashes)}")
     if len(binding_contract_versions) > 1:
-        raise ValueError(
-            "region validation binding contracts differ:"
-            f" {sorted(binding_contract_versions)}"
-        )
+        raise ValueError("region validation binding contracts differ:" f" {sorted(binding_contract_versions)}")
     if len(binding_hashes) > 1:
         raise ValueError(f"region validation bindings differ: {sorted(binding_hashes)}")
 
@@ -2541,13 +2277,9 @@ def _region_runtime_summary(
         launcher_archive_sha256 = _sha256_file(launcher_archive_path)
         launcher_archive["sha256"] = launcher_archive_sha256
         launcher_archive["matches_records"] = (
-            launcher_source_sha256 is not None
-            and launcher_archive_sha256 == launcher_source_sha256
+            launcher_source_sha256 is not None and launcher_archive_sha256 == launcher_source_sha256
         )
-        if (
-            launcher_source_sha256 is not None
-            and launcher_archive_sha256 != launcher_source_sha256
-        ):
+        if launcher_source_sha256 is not None and launcher_archive_sha256 != launcher_source_sha256:
             raise ValueError(
                 "region launcher source archive hash differs from runtime records:"
                 f" {launcher_archive_sha256}:{launcher_source_sha256}"
@@ -2555,9 +2287,7 @@ def _region_runtime_summary(
 
     raw_status = collections.Counter(str(record.get("status", "missing")) for record in records.values())
     kernelgym_runtime_errors = collections.Counter(
-        error_name
-        for record in records.values()
-        if (error_name := _kernelgym_runtime_error_name(record)) is not None
+        error_name for record in records.values() if (error_name := _kernelgym_runtime_error_name(record)) is not None
     )
     buckets = collections.Counter(_region_bucket(record.get("status")) for record in records.values())
     reasons: collections.Counter[str] = collections.Counter()
@@ -2565,14 +2295,8 @@ def _region_runtime_summary(
         if not _runtime_passed(record):
             reasons.update(_failure_reasons(record))
     by_variant: dict[str, dict[str, Any]] = {}
-    expected_decisions = [
-        decision
-        for decision in accepted
-        if str(decision["child_uuid"]) in expected_child_uuids
-    ]
-    variants = sorted(
-        {str(decision.get("variant", "unknown")) for decision in expected_decisions}
-    )
+    expected_decisions = [decision for decision in accepted if str(decision["child_uuid"]) in expected_child_uuids]
+    variants = sorted({str(decision.get("variant", "unknown")) for decision in expected_decisions})
     for variant in variants:
         expected = [
             str(decision["child_uuid"])
@@ -2604,11 +2328,11 @@ def _region_runtime_summary(
         "launcher_source_archive": launcher_archive,
         "expected_scope": expected_scope,
         "allowlist_derivation_complete": derivation_complete,
-        "allowlist_derivation_incomplete": {
-            key: sorted(values)[:100] for key, values in sorted(reference_incomplete.items())
-        }
-        if current_contract
-        else {},
+        "allowlist_derivation_incomplete": (
+            {key: sorted(values)[:100] for key, values in sorted(reference_incomplete.items())}
+            if current_contract
+            else {}
+        ),
         "static_accepted_children": len(accepted_by_child),
         "expected_children": len(expected_child_uuids),
         "excluded_static_children": (
@@ -2616,22 +2340,22 @@ def _region_runtime_summary(
             - len(expected_child_uuids)
             - (reference_incomplete_count if current_contract else 0)
         ),
-        "unclassified_static_children": (
-            reference_incomplete_count if current_contract else 0
-        ),
+        "unclassified_static_children": (reference_incomplete_count if current_contract else 0),
         "observed_children": len(records),
         "coverage_complete": derivation_complete and not missing,
         "missing_child_uuids": missing,
-        "status_buckets": {
-            key: buckets[key] for key in ("passed", "rejected", "unsupported", "failed", "timeout")
-        },
+        "status_buckets": {key: buckets[key] for key in ("passed", "rejected", "unsupported", "failed", "timeout")},
         "raw_status_counts": _counter(raw_status),
         "kernelgym_runtime_error_counts": _counter(kernelgym_runtime_errors),
         "reason_counts": _counter(reasons),
         "oom_count": sum(_is_oom(record) for record in records.values()),
         "by_variant": by_variant,
         "duration_seconds": _distribution(
-            [float(record["duration_seconds"]) for record in records.values() if isinstance(record.get("duration_seconds"), (int, float))]
+            [
+                float(record["duration_seconds"])
+                for record in records.values()
+                if isinstance(record.get("duration_seconds"), (int, float))
+            ]
         ),
     }, records
 
@@ -2665,20 +2389,14 @@ def _eligible_runtime_summary(
     for decision in eligible_decisions:
         variants_by_parent[str(decision["parent_uuid"])].add(str(decision.get("variant")))
     both_variants = {
-        parent_uuid
-        for parent_uuid, variants in variants_by_parent.items()
-        if {"medium", "large"}.issubset(variants)
+        parent_uuid for parent_uuid, variants in variants_by_parent.items() if {"medium", "large"}.issubset(variants)
     }
 
     def eligible_groups(key: str) -> dict[str, dict[str, Any]]:
         groups: dict[str, list[Mapping[str, Any]]] = collections.defaultdict(list)
         for decision in accepted:
             parent_uuid = str(decision["parent_uuid"])
-            group = (
-                str(decision.get("variant", "unknown"))
-                if key == "variant"
-                else str(parent_meta[parent_uuid][key])
-            )
+            group = str(decision.get("variant", "unknown")) if key == "variant" else str(parent_meta[parent_uuid][key])
             groups[group].append(decision)
         return {
             group: {
@@ -2748,20 +2466,14 @@ def _runtime_eligible_bias_profile(
     if len(eligible_uuids) != len(raw_eligible_uuids):
         raise ValueError("runtime eligible child UUIDs contain duplicates")
     declared_eligible_children = runtime_eligible.get("eligible_children")
-    if type(declared_eligible_children) is not int or declared_eligible_children != len(
-        eligible_uuids
-    ):
+    if type(declared_eligible_children) is not int or declared_eligible_children != len(eligible_uuids):
         raise ValueError("runtime eligible child count does not match UUID coverage")
 
     accepted_by_child = _accepted_by_child(accepted)
     unknown_eligible = sorted(eligible_uuids - set(accepted_by_child))
     if unknown_eligible:
         raise ValueError(f"runtime eligible UUIDs are not accepted children: {unknown_eligible[:20]}")
-    eligible_decisions = [
-        decision
-        for decision in accepted
-        if str(decision["child_uuid"]) in eligible_uuids
-    ]
+    eligible_decisions = [decision for decision in accepted if str(decision["child_uuid"]) in eligible_uuids]
 
     rows_by_child: dict[str, list[Mapping[str, Any]]] = collections.defaultdict(list)
     for row in changed_rows:
@@ -2770,14 +2482,10 @@ def _runtime_eligible_bias_profile(
             rows_by_child[child_uuid].append(row)
     missing_changed_rows = sorted(eligible_uuids - set(rows_by_child))
     if missing_changed_rows:
-        raise ValueError(
-            f"runtime eligible children have no changed-dimension rows: {missing_changed_rows[:20]}"
-        )
+        raise ValueError(f"runtime eligible children have no changed-dimension rows: {missing_changed_rows[:20]}")
     for decision in eligible_decisions:
         child_uuid = str(decision["child_uuid"])
-        expected_occurrences = len(
-            _declared_occurrences(_solver_slot_edits(decision))
-        )
+        expected_occurrences = len(_declared_occurrences(_solver_slot_edits(decision)))
         if expected_occurrences != len(rows_by_child[child_uuid]):
             raise ValueError(f"runtime eligible occurrence coverage mismatch: {child_uuid}")
 
@@ -2785,12 +2493,7 @@ def _runtime_eligible_bias_profile(
     new_values = [int(row["new_value"]) for row in eligible_rows]
     occurrence_counts = [len(rows_by_child[str(decision["child_uuid"])]) for decision in eligible_decisions]
     unique_axes_per_child = [
-        len(
-            {
-                int(row["axis_from_right"])
-                for row in rows_by_child[str(decision["child_uuid"])]
-            }
-        )
+        len({int(row["axis_from_right"]) for row in rows_by_child[str(decision["child_uuid"])]})
         for decision in eligible_decisions
     ]
     children_with_leading = sum(
@@ -2799,20 +2502,12 @@ def _runtime_eligible_bias_profile(
     )
     leading_occurrences = sum(bool(row["leading"]) for row in eligible_rows)
     children_with_explicit_batch = sum(
-        any(
-            _is_explicit_batch_symbol(row.get("symbol_name"))
-            for row in rows_by_child[str(decision["child_uuid"])]
-        )
+        any(_is_explicit_batch_symbol(row.get("symbol_name")) for row in rows_by_child[str(decision["child_uuid"])])
         for decision in eligible_decisions
     )
-    explicit_batch_occurrences = sum(
-        _is_explicit_batch_symbol(row.get("symbol_name"))
-        for row in eligible_rows
-    )
+    explicit_batch_occurrences = sum(_is_explicit_batch_symbol(row.get("symbol_name")) for row in eligible_rows)
     axis_counts = collections.Counter(int(row["axis"]) for row in eligible_rows)
-    axis_from_right_counts = collections.Counter(
-        int(row["axis_from_right"]) for row in eligible_rows
-    )
+    axis_from_right_counts = collections.Counter(int(row["axis_from_right"]) for row in eligible_rows)
     dominant_axis_count = max(axis_from_right_counts.values(), default=0)
     slot_kind_counts: collections.Counter[str] = collections.Counter()
     seen_slots: set[tuple[str, int]] = set()
@@ -2833,12 +2528,8 @@ def _runtime_eligible_bias_profile(
         audits_by_child[child_uuid] = audit
     missing_audits = sorted(eligible_uuids - set(audits_by_child))
     if missing_audits:
-        raise ValueError(
-            f"runtime eligible children have no dimension-balance audit: {missing_audits[:20]}"
-        )
-    eligible_audits = [
-        audits_by_child[str(decision["child_uuid"])] for decision in eligible_decisions
-    ]
+        raise ValueError(f"runtime eligible children have no dimension-balance audit: {missing_audits[:20]}")
+    eligible_audits = [audits_by_child[str(decision["child_uuid"])] for decision in eligible_decisions]
 
     return {
         "available": True,
@@ -2859,9 +2550,7 @@ def _runtime_eligible_bias_profile(
         "eligible_children": len(eligible_decisions),
         "retention_fraction": _fraction(len(eligible_decisions), len(accepted)),
         "changed_dimensions": _value_profile(new_values, len(eligible_decisions)),
-        "changed_dimension_value_partitions": _partitioned_value_profiles(
-            new_values, len(eligible_decisions)
-        ),
+        "changed_dimension_value_partitions": _partitioned_value_profiles(new_values, len(eligible_decisions)),
         "slot_kind_counts": _counter(slot_kind_counts),
         "position": {
             "eligible_children": len(eligible_decisions),
@@ -2881,27 +2570,15 @@ def _runtime_eligible_bias_profile(
                 sum(value == 1 for value in unique_axes_per_child),
                 len(unique_axes_per_child),
             ),
-            "children_with_leading_fraction": _fraction(
-                children_with_leading, len(eligible_decisions)
-            ),
-            "leading_occurrence_fraction": _fraction(
-                leading_occurrences, len(eligible_rows)
-            ),
-            "children_with_explicit_batch_fraction": _fraction(
-                children_with_explicit_batch, len(eligible_decisions)
-            ),
-            "explicit_batch_occurrence_fraction": _fraction(
-                explicit_batch_occurrences, len(eligible_rows)
-            ),
+            "children_with_leading_fraction": _fraction(children_with_leading, len(eligible_decisions)),
+            "leading_occurrence_fraction": _fraction(leading_occurrences, len(eligible_rows)),
+            "children_with_explicit_batch_fraction": _fraction(children_with_explicit_batch, len(eligible_decisions)),
+            "explicit_batch_occurrence_fraction": _fraction(explicit_batch_occurrences, len(eligible_rows)),
             "axis_counts": _counter(axis_counts),
             "axis_from_right_counts": _counter(axis_from_right_counts),
-            "dominant_axis_from_right_fraction": _fraction(
-                dominant_axis_count, len(eligible_rows)
-            ),
+            "dominant_axis_from_right_fraction": _fraction(dominant_axis_count, len(eligible_rows)),
         },
-        "capacity": _capacity_profile(
-            [int(decision["input_bytes_after"]) for decision in eligible_decisions]
-        ),
+        "capacity": _capacity_profile([int(decision["input_bytes_after"]) for decision in eligible_decisions]),
         "dimension_balance": _dimension_balance_summary(eligible_audits, ratio_limit),
         "retention": {
             "by_variant": runtime_eligible.get("by_variant", {}),
@@ -3008,10 +2685,7 @@ def _quality_markdown(quality: Mapping[str, Any]) -> list[str]:
         "",
         "## Shape distribution quality gates",
         "",
-        (
-            f"Variant cardinality mode: `{variant['mode']}`; "
-            f"passed: **{variant['passed']}**."
-        ),
+        (f"Variant cardinality mode: `{variant['mode']}`; " f"passed: **{variant['passed']}**."),
         "",
         "| Scope | Available | Complete | Children | Logical slots | Changed occurrences | Power-of-two | Single changed dimension | Passed |",
         "| --- | :---: | :---: | ---: | ---: | ---: | ---: | ---: | :---: |",
@@ -3049,10 +2723,7 @@ def _quality_markdown(quality: Mapping[str, Any]) -> list[str]:
         if exact_slot_requirements
         else (
             "This manifest requires logical-slot counts in the inclusive range "
-            + ", ".join(
-                f"[{minimum}, {maximum}]"
-                for minimum, maximum in sorted(range_requirements)
-            )
+            + ", ".join(f"[{minimum}, {maximum}]" for minimum, maximum in sorted(range_requirements))
             + "."
             if range_requirements
             else "This manifest accepts any positive logical-slot count per child."
@@ -3071,11 +2742,7 @@ def _quality_markdown(quality: Mapping[str, Any]) -> list[str]:
         ]
     )
     if variant.get("errors"):
-        lines.append(
-            "Variant cardinality errors: `"
-            + json.dumps(variant["errors"][:20], sort_keys=True)
-            + "`"
-        )
+        lines.append("Variant cardinality errors: `" + json.dumps(variant["errors"][:20], sort_keys=True) + "`")
         lines.append("")
     for key in ("static", "runtime"):
         gate = quality[key]
@@ -3093,11 +2760,7 @@ def _runtime_markdown(runtime: Mapping[str, Any]) -> list[str]:
     reference = runtime["reference"]
     region = runtime["region"]
     eligible = runtime["eligible"]
-    if (
-        not reference.get("available")
-        and not region.get("available")
-        and not region.get("evidence_present")
-    ):
+    if not reference.get("available") and not region.get("available") and not region.get("evidence_present"):
         return []
     lines = ["", "## H20 runtime validation", ""]
     if eligible.get("available"):
@@ -3293,9 +2956,7 @@ def _runtime_markdown(runtime: Mapping[str, Any]) -> list[str]:
             )
         if region["reason_counts"]:
             lines.extend(["", "Top region failure reasons:", "", "| Reason | Occurrences |", "| --- | ---: |"])
-            for reason, count in sorted(
-                region["reason_counts"].items(), key=lambda item: (-item[1], item[0])
-            )[:20]:
+            for reason, count in sorted(region["reason_counts"].items(), key=lambda item: (-item[1], item[0]))[:20]:
                 lines.append(f"| `{reason.replace('|', '&#124;')}` | {count} |")
     elif region.get("contract_compatible") is False:
         lines.extend(
@@ -3334,8 +2995,7 @@ def _summary_markdown(summary: Mapping[str, Any]) -> str:
     ]
     for variant, row in summary["by_variant"].items():
         lines.append(
-            f"| {variant} | {row['accepted_children']} | {row['selected_parents']} | "
-            f"{row['coverage']:.2%} |"
+            f"| {variant} | {row['accepted_children']} | {row['selected_parents']} | " f"{row['coverage']:.2%} |"
         )
     lines.extend(_quality_markdown(summary["quality"]))
     lines.extend(_runtime_markdown(summary["runtime"]))
@@ -3511,9 +3171,7 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
             f"{_format_percent(profile['multiple_fractions']['32'])} | "
             f"{_format_percent(profile['anchor_fraction'])} |"
         )
-    non_power_residues = value_partitions["non_power_of_two"][
-        "residue_histograms"
-    ]
+    non_power_residues = value_partitions["non_power_of_two"]["residue_histograms"]
     lines.extend(
         [
             "",
@@ -3578,9 +3236,7 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
         )
     else:
         eligible_values = runtime_eligible["changed_dimensions"]
-        eligible_value_partitions = runtime_eligible[
-            "changed_dimension_value_partitions"
-        ]
+        eligible_value_partitions = runtime_eligible["changed_dimension_value_partitions"]
         eligible_position = runtime_eligible["position"]
         eligible_capacity = runtime_eligible["capacity"]
         lines.extend(
@@ -3624,9 +3280,7 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
             ]
         )
         for axis, count in eligible_position["axis_from_right_counts"].items():
-            lines.append(
-                f"| {axis} | {count} | {_format_percent(_fraction(count, eligible_values['count']))} |"
-            )
+            lines.append(f"| {axis} | {count} | {_format_percent(_fraction(count, eligible_values['count']))} |")
         lines.extend(
             [
                 "",
@@ -3637,9 +3291,7 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
             ]
         )
         for row in eligible_values["top_values"][:10]:
-            lines.append(
-                f"| {row['value']} | {row['count']} | {_format_percent(row['fraction'])} |"
-            )
+            lines.append(f"| {row['value']} | {row['count']} | {_format_percent(row['fraction'])} |")
         lines.extend(
             [
                 "",
@@ -3662,12 +3314,8 @@ def _bias_markdown(bias: Mapping[str, Any]) -> str:
                 f"{_format_percent(profile['multiple_fractions']['8'])} | "
                 f"{_format_percent(profile['multiple_fractions']['32'])} |"
             )
-        static_residues = value_partitions["non_power_of_two"][
-            "residue_histograms"
-        ]
-        eligible_residues = eligible_value_partitions["non_power_of_two"][
-            "residue_histograms"
-        ]
+        static_residues = value_partitions["non_power_of_two"]["residue_histograms"]
+        eligible_residues = eligible_value_partitions["non_power_of_two"]["residue_histograms"]
         lines.extend(
             [
                 "",
@@ -3787,11 +3435,7 @@ def _review_markdown(
     add("largest_child", sorted(accepted_samples, key=lambda item: -item["decision"]["input_bytes_after"]))
     add("largest_scale", sorted(accepted_samples, key=lambda item: -item["decision"]["input_scale"]))
     slot_kinds = sorted(
-        {
-            str(edit["slot"].get("kind"))
-            for item in accepted_samples
-            for edit in item.get("slot_edits", [])
-        }
+        {str(edit["slot"].get("kind")) for item in accepted_samples for edit in item.get("slot_edits", [])}
     )
     for slot_kind in slot_kinds:
         add(
@@ -3799,10 +3443,7 @@ def _review_markdown(
             [
                 item
                 for item in accepted_samples
-                if any(
-                    str(edit["slot"].get("kind")) == slot_kind
-                    for edit in item.get("slot_edits", [])
-                )
+                if any(str(edit["slot"].get("kind")) == slot_kind for edit in item.get("slot_edits", []))
             ],
         )
     for source in sorted({str(item["source_family"]) for item in accepted_samples}):
@@ -3812,19 +3453,12 @@ def _review_markdown(
         [
             item
             for item in accepted_samples
-            if any(
-                int(occurrence["axis"]) > 0
-                for occurrence in item.get("changed_occurrences", [])
-            )
+            if any(int(occurrence["axis"]) > 0 for occurrence in item.get("changed_occurrences", []))
         ],
     )
     add(
         "multi_changed_dimension",
-        [
-            item
-            for item in accepted_samples
-            if len(item.get("changed_occurrences", [])) > 1
-        ],
+        [item for item in accepted_samples if len(item.get("changed_occurrences", [])) > 1],
     )
 
     lines = [
@@ -3876,10 +3510,7 @@ def _review_markdown(
                     f"{decision['target_relative_error']:.6%}."
                 ),
                 "",
-                (
-                    "Independent changed occurrences: `"
-                    f"{json.dumps(changed_summaries, sort_keys=True)}`"
-                ),
+                ("Independent changed occurrences: `" f"{json.dumps(changed_summaries, sort_keys=True)}`"),
                 "",
                 "```diff",
             ]
@@ -3920,7 +3551,16 @@ def _review_markdown(
         )
         attempts = decision.get("attempts")
         if attempts:
-            lines.extend(["Last candidate attempt:", "", "```json", json.dumps(attempts[-1], indent=2, sort_keys=True)[:8000], "```", ""])
+            lines.extend(
+                [
+                    "Last candidate attempt:",
+                    "",
+                    "```json",
+                    json.dumps(attempts[-1], indent=2, sort_keys=True)[:8000],
+                    "```",
+                    "",
+                ]
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -3999,12 +3639,11 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             "coverage": _fraction(
                 sum(str(item.get("variant")) == variant for item in accepted),
                 assigned_parents,
-            ) or 0.0,
+            )
+            or 0.0,
         }
         for variant in ("medium", "large")
-        for assigned_parents in (
-            sum(str(row.get("variant")) == variant for row in target_rows),
-        )
+        for assigned_parents in (sum(str(row.get("variant")) == variant for row in target_rows),)
     }
 
     verification_errors: dict[str, list[str]] = {}
@@ -4031,17 +3670,11 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         child = child_by_uuid.get(child_uuid)
         if parent is None or child is None:
             try:
-                declared_occurrence_count = len(
-                    _declared_occurrences(_solver_slot_edits(decision))
-                )
+                declared_occurrence_count = len(_declared_occurrences(_solver_slot_edits(decision)))
             except (TypeError, ValueError):
                 declared_occurrence_count = 0
-            missing_reason = (
-                "accepted_parent_missing" if parent is None else "accepted_child_missing"
-            )
-            verification_errors[child_uuid] = [
-                missing_reason
-            ]
+            missing_reason = "accepted_parent_missing" if parent is None else "accepted_child_missing"
+            verification_errors[child_uuid] = [missing_reason]
             shape_diff_errors[child_uuid] = missing_reason
             dimension_balance_audits.append(
                 {
@@ -4061,9 +3694,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         child_code = str(_nested(child, "reward_model.ground_truth"))
         if parent_uuid not in slot_cache:
             try:
-                slot_cache[parent_uuid] = {
-                    slot.slot_id: slot.as_dict() for slot in _shape_slots(parent_code)
-                }
+                slot_cache[parent_uuid] = {slot.slot_id: slot.as_dict() for slot in _shape_slots(parent_code)}
             except (SyntaxError, TypeError, ValueError) as exc:
                 slot_cache[parent_uuid] = {}
                 verification_errors.setdefault(child_uuid, []).append(
@@ -4083,9 +3714,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         except (SyntaxError, TypeError, ValueError) as exc:
             reason = f"{type(exc).__name__}:{exc}"
             shape_diff_errors[child_uuid] = reason
-            verification_errors.setdefault(child_uuid, []).append(
-                f"independent_shape_diff_failed:{reason}"
-            )
+            verification_errors.setdefault(child_uuid, []).append(f"independent_shape_diff_failed:{reason}")
         checks, errors = _verify_child(
             parent,
             child,
@@ -4108,10 +3737,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         if dimension_balance_audit["resolved"]:
             check_counts["dimension_balance_reparsed"] += 1
         if dimension_balance_ratio_limit is not None:
-            if (
-                dimension_balance_audit["resolved"]
-                and dimension_balance_audit["violation"] is False
-            ):
+            if dimension_balance_audit["resolved"] and dimension_balance_audit["violation"] is False:
                 check_counts["dimension_balance_contract_passed"] += 1
             else:
                 reason = dimension_balance_audit.get("reason")
@@ -4122,21 +3748,13 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
                         if factory.get("violation") is True
                     ]
                     reason = f"ratio_exceeded:{violating_factories[:3]}"
-                verification_errors.setdefault(child_uuid, []).append(
-                    f"dimension_balance_fail_closed:{reason}"
-                )
+                verification_errors.setdefault(child_uuid, []).append(f"dimension_balance_fail_closed:{reason}")
         occurrence_counts.append(len(annotated_changes))
-        axis_set = {
-            int(occurrence["axis_from_right"])
-            for occurrence in annotated_changes
-        }
+        axis_set = {int(occurrence["axis_from_right"]) for occurrence in annotated_changes}
         unique_axes_per_child.append(len(axis_set))
         if any(int(occurrence["axis"]) == 0 for occurrence in annotated_changes):
             children_with_leading += 1
-        if any(
-            _is_explicit_batch_symbol(edit["slot"].get("symbol_name"))
-            for edit in edits
-        ):
+        if any(_is_explicit_batch_symbol(edit["slot"].get("symbol_name")) for edit in edits):
             children_with_explicit_batch += 1
         for edit in edits:
             slot_kind_counts[str(edit["slot"].get("kind"))] += 1
@@ -4144,9 +3762,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             slot = occurrence["slot"]
             declared_occurrence = occurrence["declared_occurrence"]
             leading = int(occurrence["axis"]) == 0
-            explicit_batch_symbol = _is_explicit_batch_symbol(
-                slot.get("symbol_name")
-            )
+            explicit_batch_symbol = _is_explicit_batch_symbol(slot.get("symbol_name"))
             leading_occurrences += int(leading)
             explicit_batch_occurrences += int(explicit_batch_symbol)
             axis_from_right_counts[int(occurrence["axis_from_right"])] += 1
@@ -4174,9 +3790,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
                     "axis_from_right": occurrence["axis_from_right"],
                     "leading": leading,
                     "explicit_batch_symbol": explicit_batch_symbol,
-                    "source_span": json.dumps(
-                        declared_occurrence.get("source_span"), sort_keys=True
-                    ),
+                    "source_span": json.dumps(declared_occurrence.get("source_span"), sort_keys=True),
                     "input_bytes_before": decision.get("input_bytes_before"),
                     "input_bytes_after": decision.get("input_bytes_after"),
                     "input_scale": decision.get("input_scale"),
@@ -4204,13 +3818,8 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
     if missing_children:
         verification_errors["__missing_children__"] = missing_children[:50]
     if not variant_cardinality["passed"]:
-        verification_errors["__variant_cardinality_contract__"] = list(
-            variant_cardinality["errors"]
-        )
-    if (
-        variant_cardinality["mode"] == "one_variant_per_parent"
-        and dimension_balance_ratio_limit is None
-    ):
+        verification_errors["__variant_cardinality_contract__"] = list(variant_cardinality["errors"])
+    if variant_cardinality["mode"] == "one_variant_per_parent" and dimension_balance_ratio_limit is None:
         verification_errors["__dimension_balance_contract__"] = [
             "v4_one_variant_manifest_missing_dimension_balance_ratio_limit"
         ]
@@ -4270,9 +3879,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         reference_records,
     )
     if region_runtime.get("expected_scope") == "reference_parent_and_child_both_pass":
-        region_runtime["expected_allowlist_artifact"] = reference_runtime[
-            "region_allowlist"
-        ]
+        region_runtime["expected_allowlist_artifact"] = reference_runtime["region_allowlist"]
     runtime = {
         "reference": reference_runtime,
         "region": region_runtime,
@@ -4304,21 +3911,14 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         changed_rows=changed_rows,
         available=True,
         evidence_complete=not shape_diff_errors,
-        evidence_errors=[
-            f"{child_uuid}:{reason}"
-            for child_uuid, reason in sorted(shape_diff_errors.items())
-        ],
+        evidence_errors=[f"{child_uuid}:{reason}" for child_uuid, reason in sorted(shape_diff_errors.items())],
         logical_slot_counts=logical_slot_counts,
         required_logical_slots=required_logical_slots,
         logical_slot_range=logical_slot_range,
     )
     runtime_eligible = runtime["eligible"]
     raw_runtime_eligible_uuids = runtime_eligible.get("eligible_child_uuids", [])
-    runtime_eligible_uuids = (
-        list(raw_runtime_eligible_uuids)
-        if isinstance(raw_runtime_eligible_uuids, list)
-        else []
-    )
+    runtime_eligible_uuids = list(raw_runtime_eligible_uuids) if isinstance(raw_runtime_eligible_uuids, list) else []
     runtime_shape_errors = {
         child_uuid: reason
         for child_uuid, reason in shape_diff_errors.items()
@@ -4334,10 +3934,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             and runtime_eligible.get("coverage_complete") is True
             and not runtime_shape_errors
         ),
-        evidence_errors=[
-            f"{child_uuid}:{reason}"
-            for child_uuid, reason in sorted(runtime_shape_errors.items())
-        ],
+        evidence_errors=[f"{child_uuid}:{reason}" for child_uuid, reason in sorted(runtime_shape_errors.items())],
         logical_slot_counts=logical_slot_counts,
         required_logical_slots=required_logical_slots,
         logical_slot_range=logical_slot_range,
@@ -4385,15 +3982,9 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             "children_parquet_rows": len(child_rows),
         },
         "by_variant": by_variant,
-        "by_source_family": _group_coverage(
-            selected_uuids, parent_meta, accepted, "source_family"
-        ),
-        "by_operator_family": _group_coverage(
-            selected_uuids, parent_meta, accepted, "operator_family"
-        ),
-        "by_operator_bucket": _group_coverage(
-            selected_uuids, parent_meta, accepted, "operator_bucket"
-        ),
+        "by_source_family": _group_coverage(selected_uuids, parent_meta, accepted, "source_family"),
+        "by_operator_family": _group_coverage(selected_uuids, parent_meta, accepted, "operator_family"),
+        "by_operator_bucket": _group_coverage(selected_uuids, parent_meta, accepted, "operator_bucket"),
         "target": {
             "absolute_error_bytes": _distribution(target_abs_bytes),
             "relative_error": _distribution(target_errors),
@@ -4418,9 +4009,7 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             "manifest_skip_reason_counts": manifest.get("skip_reason_counts", {}),
             "missing_variant_decisions": max(
                 0,
-                len(selected_rows)
-                * int(variant_cardinality["expected_decisions_per_parent"])
-                - len(decisions),
+                len(selected_rows) * int(variant_cardinality["expected_decisions_per_parent"]) - len(decisions),
             ),
         },
         "verification": {
@@ -4448,15 +4037,12 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             ),
             "leading": "axis index zero within its input factory",
             "explicit_batch_symbol": (
-                "selected linked-name slot normalized to one of: "
-                + ", ".join(sorted(EXPLICIT_BATCH_SYMBOLS))
+                "selected linked-name slot normalized to one of: " + ", ".join(sorted(EXPLICIT_BATCH_SYMBOLS))
             ),
             "one_axis": "one unique axis-from-right value among a child's changed occurrences",
         },
         "changed_dimensions": _value_profile(new_values, len(accepted)),
-        "changed_dimension_value_partitions": _partitioned_value_profiles(
-            new_values, len(accepted)
-        ),
+        "changed_dimension_value_partitions": _partitioned_value_profiles(new_values, len(accepted)),
         "slot_kind_counts": _counter(slot_kind_counts),
         "position": {
             "accepted_children": len(accepted),
@@ -4467,22 +4053,20 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
             },
             "single_occurrence_child_fraction": _fraction(
                 sum(value == 1 for value in occurrence_counts), len(occurrence_counts)
-            ) or 0.0,
+            )
+            or 0.0,
             "unique_axis_from_right_per_child": {
                 **_distribution(unique_axes_per_child),
                 "counts": _counter(collections.Counter(unique_axes_per_child)),
             },
             "single_axis_from_right_child_fraction": _fraction(
                 sum(value == 1 for value in unique_axes_per_child), len(unique_axes_per_child)
-            ) or 0.0,
+            )
+            or 0.0,
             "children_with_leading_fraction": _fraction(children_with_leading, len(accepted)) or 0.0,
             "leading_occurrence_fraction": _fraction(leading_occurrences, len(new_values)) or 0.0,
-            "children_with_explicit_batch_fraction": _fraction(
-                children_with_explicit_batch, len(accepted)
-            ) or 0.0,
-            "explicit_batch_occurrence_fraction": _fraction(
-                explicit_batch_occurrences, len(new_values)
-            ) or 0.0,
+            "children_with_explicit_batch_fraction": _fraction(children_with_explicit_batch, len(accepted)) or 0.0,
+            "explicit_batch_occurrence_fraction": _fraction(explicit_batch_occurrences, len(new_values)) or 0.0,
             "axis_from_right_counts": _counter(axis_from_right_counts),
             "dominant_axis_from_right_fraction": _fraction(dominant_axis_count, len(new_values)) or 0.0,
         },
@@ -4493,12 +4077,8 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
         "by_variant": {
             variant: {
                 "accepted_children": len(items := [item for item in accepted if item["variant"] == variant]),
-                "target_relative_error": _distribution(
-                    [float(item["target_relative_error"]) for item in items]
-                ),
-                "input_bytes_after": _capacity_profile(
-                    [int(item["input_bytes_after"]) for item in items]
-                ),
+                "target_relative_error": _distribution([float(item["target_relative_error"]) for item in items]),
+                "input_bytes_after": _capacity_profile([int(item["input_bytes_after"]) for item in items]),
             }
             for variant in ("medium", "large")
         },
@@ -4518,12 +4098,34 @@ def analyze(run_dir: Path, ai_run_dir: Path = DEFAULT_AI_RUN_DIR) -> dict[str, A
     _atomic_write(bias_json, json.dumps(bias, indent=2, sort_keys=True) + "\n")
     _atomic_write(bias_md, _bias_markdown(bias))
     columns = [
-        "parent_uuid", "child_uuid", "source_family", "operator_family", "variant",
-        "slot_index", "slot_occurrence_index", "slot_id", "slot_kind", "symbol_name",
-        "symbol_scope", "old_value", "new_value", "occurrence_index", "factory_index",
-        "factory_name", "axis", "rank", "axis_from_right",
-        "leading", "explicit_batch_symbol", "source_span", "input_bytes_before", "input_bytes_after", "input_scale",
-        "target_input_bytes", "target_delta_bytes", "target_relative_error",
+        "parent_uuid",
+        "child_uuid",
+        "source_family",
+        "operator_family",
+        "variant",
+        "slot_index",
+        "slot_occurrence_index",
+        "slot_id",
+        "slot_kind",
+        "symbol_name",
+        "symbol_scope",
+        "old_value",
+        "new_value",
+        "occurrence_index",
+        "factory_index",
+        "factory_name",
+        "axis",
+        "rank",
+        "axis_from_right",
+        "leading",
+        "explicit_batch_symbol",
+        "source_span",
+        "input_bytes_before",
+        "input_bytes_after",
+        "input_scale",
+        "target_input_bytes",
+        "target_delta_bytes",
+        "target_relative_error",
     ]
     buffer = io.StringIO()
     writer = csv.DictWriter(buffer, fieldnames=columns, dialect="excel-tab", lineterminator="\n")
@@ -4556,32 +4158,36 @@ def main() -> int:
     static_quality_passed = summary["quality"]["static"]["passed"] is True
     runtime_quality_passed = summary["quality"]["runtime"]["passed"] is True
     variant_cardinality_passed = summary["variant_cardinality"]["passed"] is True
-    print(json.dumps({
-        "coverage": summary["coverage"],
-        "runtime": {
-            "reference_available": summary["runtime"]["reference"]["available"],
-            "region_available": summary["runtime"]["region"]["available"],
-            "region_contract_compatible": summary["runtime"]["region"].get(
-                "contract_compatible"
-            ),
-            "eligible_children": eligible.get("eligible_children"),
-            "covered_parents": eligible.get("covered_parents"),
-            "both_variants_parents": eligible.get("both_variants_parents"),
-            "coverage_complete": eligible.get("coverage_complete"),
-        },
-        "verification": {
-            "children_checked": summary["verification"]["children_checked"],
-            "invalid_children": summary["verification"]["invalid_children"],
-            "all_passed": summary["verification"]["all_passed"],
-        },
-        "quality": {
-            "variant_cardinality_passed": variant_cardinality_passed,
-            "static_passed": static_quality_passed,
-            "runtime_passed": runtime_quality_passed,
-            "runtime_required": bool(args.require_runtime_quality),
-        },
-        "analysis_dir": str((args.run_dir / "analysis").resolve()),
-    }, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "coverage": summary["coverage"],
+                "runtime": {
+                    "reference_available": summary["runtime"]["reference"]["available"],
+                    "region_available": summary["runtime"]["region"]["available"],
+                    "region_contract_compatible": summary["runtime"]["region"].get("contract_compatible"),
+                    "eligible_children": eligible.get("eligible_children"),
+                    "covered_parents": eligible.get("covered_parents"),
+                    "both_variants_parents": eligible.get("both_variants_parents"),
+                    "coverage_complete": eligible.get("coverage_complete"),
+                },
+                "verification": {
+                    "children_checked": summary["verification"]["children_checked"],
+                    "invalid_children": summary["verification"]["invalid_children"],
+                    "all_passed": summary["verification"]["all_passed"],
+                },
+                "quality": {
+                    "variant_cardinality_passed": variant_cardinality_passed,
+                    "static_passed": static_quality_passed,
+                    "runtime_passed": runtime_quality_passed,
+                    "runtime_required": bool(args.require_runtime_quality),
+                },
+                "analysis_dir": str((args.run_dir / "analysis").resolve()),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     passed = (
         summary["verification"]["all_passed"]
         and variant_cardinality_passed
