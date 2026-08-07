@@ -71,10 +71,19 @@ GENERATION_CONTRACT_VERSION = "dsv4_shape_hardtail_generation_v2"
 GENERATION_CONTRACT_VERSIONS = frozenset({GENERATION_CONTRACT_VERSION_V1, GENERATION_CONTRACT_VERSION})
 SELECTION_REASON = "no_variable_multislot_product_solution"
 SELECTION_SALT = "dsv4_shape_hardtail_canary_v1"
+FULL_RESIDUAL_SELECTION_CONTRACT_VERSION = "dsv4_shape_full_measurable_residual_selection_v1"
+FULL_RESIDUAL_SELECTION_SALT = "dsv4_shape_full_measurable_residual_v1"
 MODEL_NAME = "deepseek-v4-flash-0731"
 DEFAULT_SOURCE_RUN = (
     REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v8/" "run.remaining22566.balanced_v7"
 )
+DEFAULT_MEASURABLE_SOURCE_RUN = REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896"
+DEFAULT_RUNTIME_SHAPE_RUNS = (
+    DEFAULT_MEASURABLE_SOURCE_RUN,
+    REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.balanced_v7",
+    DEFAULT_SOURCE_RUN,
+)
+DEFAULT_PRIOR_MODEL_RUN = REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v2/run.full17864"
 DEFAULT_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v1/run.canary1000"
 DEFAULT_ENDPOINTS = (
     "http://10.11.2.153:31053",
@@ -310,6 +319,176 @@ def select(source_run: Path, run_dir: Path, count: int) -> dict[str, Any]:
     }
     _atomic_text(output.selection, json.dumps(selection, indent=2, sort_keys=True) + "\n")
     return selection
+
+
+def _runtime_parent_uuids(run_dir: Path) -> tuple[set[str], dict[str, Any]]:
+    summary_path = run_dir / "analysis/summary.json"
+    children_path = run_dir / "static/children.parquet"
+    if not summary_path.is_file() or not children_path.is_file():
+        raise FileNotFoundError(f"runtime shape lane is incomplete: {run_dir}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    eligible = _nested(summary, "runtime.eligible")
+    if not isinstance(eligible, Mapping) or eligible.get("available") is not True:
+        raise ValueError(f"runtime shape lane has no eligible partition: {run_dir}")
+    if eligible.get("coverage_complete") is not True:
+        raise ValueError(f"runtime shape lane coverage is incomplete: {run_dir}")
+    raw_child_uuids = eligible.get("eligible_child_uuids")
+    if not isinstance(raw_child_uuids, list) or any(
+        not isinstance(value, str) or not value for value in raw_child_uuids
+    ):
+        raise ValueError(f"runtime shape lane eligible UUIDs are invalid: {run_dir}")
+    child_uuids = set(raw_child_uuids)
+    if len(child_uuids) != len(raw_child_uuids):
+        raise ValueError(f"runtime shape lane eligible UUIDs are duplicated: {run_dir}")
+    parents: set[str] = set()
+    found: set[str] = set()
+    for row in _rows(children_path):
+        child_uuid = _nested(row, "extra_info.uuid")
+        if child_uuid not in child_uuids:
+            continue
+        found.add(str(child_uuid))
+        parent_uuid = _nested(row, "extra_info.v4.parent_uuid")
+        if not isinstance(parent_uuid, str) or not parent_uuid:
+            raise ValueError(f"runtime child lacks canonical parent UUID: {child_uuid}")
+        if parent_uuid in parents:
+            raise ValueError(f"runtime lane has more than one eligible child for parent: {parent_uuid}")
+        parents.add(parent_uuid)
+    if found != child_uuids:
+        raise ValueError(f"runtime eligible children are absent from parquet: {run_dir}")
+    if len(parents) != int(eligible.get("eligible_children", -1)):
+        raise ValueError(f"runtime eligible parent/child cardinality differs: {run_dir}")
+    return parents, {
+        "run_dir": str(run_dir.resolve()),
+        "summary_path": str(summary_path.resolve()),
+        "summary_sha256": _sha256_file(summary_path),
+        "children_path": str(children_path.resolve()),
+        "children_sha256": _sha256_file(children_path),
+        "runtime_eligible_parents": len(parents),
+    }
+
+
+def select_full_measurable_residual(
+    measurable_source_run: Path,
+    runtime_shape_runs: Sequence[Path],
+    prior_model_run: Path,
+    run_dir: Path,
+) -> dict[str, Any]:
+    """Select every measurable parent not covered by prior runtime-safe or model lanes."""
+
+    source_selected = measurable_source_run / "selected.parquet"
+    source_selection = measurable_source_run / "selection.json"
+    prior_selected = prior_model_run / "selected.parquet"
+    prior_selection = prior_model_run / "selection.json"
+    for path in (source_selected, source_selection, prior_selected, prior_selection):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    source_manifest = json.loads(source_selection.read_text(encoding="utf-8"))
+    if source_manifest.get("selected_count") != 53_896:
+        raise ValueError("measurable source must be the complete 53,896-parent lane")
+    if source_manifest.get("selected_sha256") != _sha256_file(source_selected):
+        raise ValueError("measurable source selected SHA mismatch")
+
+    runtime_parents: set[str] = set()
+    runtime_sources: list[dict[str, Any]] = []
+    for source_index, source_run in enumerate(runtime_shape_runs):
+        parents, record = _runtime_parent_uuids(source_run)
+        overlap = runtime_parents & parents
+        if overlap:
+            raise ValueError(f"runtime shape lanes overlap on parent: {sorted(overlap)[:3]}")
+        runtime_parents.update(parents)
+        runtime_sources.append({"source_index": source_index, **record})
+
+    prior_manifest = json.loads(prior_selection.read_text(encoding="utf-8"))
+    prior_rows = prior_manifest.get("rows")
+    if not isinstance(prior_rows, list):
+        raise ValueError("prior model selection rows are missing")
+    prior_model_parents = {
+        str(row.get("parent_uuid"))
+        for row in prior_rows
+        if isinstance(row, Mapping) and isinstance(row.get("parent_uuid"), str)
+    }
+    if len(prior_model_parents) != prior_manifest.get("selected_parent_count"):
+        raise ValueError("prior model selection parent count differs")
+    if prior_manifest.get("selected_parent_count") != pq.ParquetFile(prior_selected).metadata.num_rows:
+        raise ValueError("prior model selected parquet count differs")
+    overlap = runtime_parents & prior_model_parents
+    if overlap:
+        raise ValueError(f"prior model selection overlaps runtime-safe parent: {sorted(overlap)[:3]}")
+
+    selected_rows: list[dict[str, Any]] = []
+    rows_manifest: list[dict[str, Any]] = []
+    source_parent_uuids: set[str] = set()
+    for source_index, row in _iter_rows(source_selected):
+        uuid, code, _ = _identity(row)
+        if uuid in source_parent_uuids:
+            raise ValueError(f"measurable source contains duplicate parent UUID: {uuid}")
+        source_parent_uuids.add(uuid)
+        if uuid in runtime_parents or uuid in prior_model_parents:
+            continue
+        source, operator = _group(row)
+        selected_index = len(selected_rows)
+        selected_rows.append(row)
+        rows_manifest.append(
+            {
+                "selected_index": selected_index,
+                "source_row_index": source_index,
+                "parent_uuid": uuid,
+                "parent_reference_sha256": _sha256_bytes(code.encode()),
+                "source_family": source,
+                "operator_family": operator,
+                "target_input_bytes": target_input_bytes(row),
+            }
+        )
+    missing_runtime = runtime_parents - source_parent_uuids
+    missing_prior = prior_model_parents - source_parent_uuids
+    if missing_runtime or missing_prior:
+        raise ValueError(
+            f"excluded parents are outside measurable source: runtime={len(missing_runtime)} prior={len(missing_prior)}"
+        )
+    expected = len(source_parent_uuids) - len(runtime_parents) - len(prior_model_parents)
+    if len(selected_rows) != expected:
+        raise AssertionError(f"full measurable residual cardinality mismatch: {len(selected_rows)}:{expected}")
+
+    output = _paths(run_dir)
+    output.selected.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_parquet(output.selected, selected_rows, pq.ParquetFile(source_selected).schema_arrow)
+    selection = {
+        "contract_version": CONTRACT_VERSION,
+        "selection_contract_version": FULL_RESIDUAL_SELECTION_CONTRACT_VERSION,
+        "selection_reason": "full_measurable_residual_after_runtime_and_prior_model_exclusion",
+        "selection_salt": FULL_RESIDUAL_SELECTION_SALT,
+        "representative_for_projection": False,
+        "source_run": str(measurable_source_run.resolve()),
+        "source_selected_path": str(source_selected.resolve()),
+        "source_selected_sha256": _sha256_file(source_selected),
+        "source_selection_path": str(source_selection.resolve()),
+        "source_selection_sha256": _sha256_file(source_selection),
+        "measurable_parent_count": len(source_parent_uuids),
+        "excluded_runtime_safe_parent_count": len(runtime_parents),
+        "excluded_prior_model_parent_count": len(prior_model_parents),
+        "eligible_parent_count": len(selected_rows),
+        "selected_parent_count": len(selected_rows),
+        "parent_gate_contract": "statically_measurable_below_128MiB; upstream FakeTensor pass not required",
+        "scope_boundary": {
+            "canonical_parent_count": BASELINE_FULL_ROWS,
+            "already_large_parent_count": int(source_manifest.get("already_large_parent_count", -1)),
+            "statically_unmeasurable_parent_count": BASELINE_FULL_ROWS
+            - len(source_parent_uuids)
+            - int(source_manifest.get("already_large_parent_count", -1)),
+        },
+        "runtime_shape_sources": runtime_sources,
+        "prior_model_source": {
+            "run_dir": str(prior_model_run.resolve()),
+            "selected_path": str(prior_selected.resolve()),
+            "selected_sha256": _sha256_file(prior_selected),
+            "selection_path": str(prior_selection.resolve()),
+            "selection_sha256": _sha256_file(prior_selection),
+            "selected_parents": len(prior_model_parents),
+        },
+        "rows": rows_manifest,
+    }
+    _atomic_text(output.selection, json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    return {key: value for key, value in selection.items() if key != "rows"}
 
 
 def preview(run_dir: Path, count: int, *, candidate: bool = False) -> dict[str, Any]:
@@ -1044,7 +1223,7 @@ def materialize(run_dir: Path, workers: int) -> dict[str, Any]:
             "power_of_two_quota": None,
             "maximum_dimension_imbalance_ratio": MAX_DIMENSION_IMBALANCE_RATIO,
         },
-        "upstream_parent_fake_gate": "passed_in_source_manifest",
+        "upstream_parent_fake_gate": selection.get("parent_gate_contract", "passed_in_source_manifest"),
         "child_fake_gate_timeout_seconds": DEFAULT_FAKE_TIMEOUT_SECONDS,
         "parent_count": len(parents),
         "variant_decision_count": len(decisions),
@@ -1603,6 +1782,10 @@ def _parser() -> argparse.ArgumentParser:
 
     select_parser = subparsers.add_parser("select")
     select_parser.add_argument("--count", type=int, default=DEFAULT_COUNT)
+    subparsers.add_parser(
+        "select-full-residual",
+        help="Select every measurable parent not covered by runtime-safe static or prior model lanes.",
+    )
 
     preview_parser = subparsers.add_parser("preview")
     preview_parser.add_argument("--count", type=int, default=8)
@@ -1632,6 +1815,13 @@ def main() -> None:
     args = _parser().parse_args()
     if args.command == "select":
         result = select(DEFAULT_SOURCE_RUN, args.run_dir, args.count)
+    elif args.command == "select-full-residual":
+        result = select_full_measurable_residual(
+            DEFAULT_MEASURABLE_SOURCE_RUN,
+            DEFAULT_RUNTIME_SHAPE_RUNS,
+            DEFAULT_PRIOR_MODEL_RUN,
+            args.run_dir,
+        )
     elif args.command == "preview":
         result = preview(args.run_dir, args.count)
     elif args.command == "preview-candidate":
