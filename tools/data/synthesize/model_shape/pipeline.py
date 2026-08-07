@@ -1308,7 +1308,14 @@ def materialize(run_dir: Path, workers: int) -> dict[str, Any]:
 
     results: list[dict[str, Any]] = []
     context = multiprocessing.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+    # FakeTensor keeps dispatcher-mode state process-wide.  A malformed parent
+    # can leave that state poisoned even after its structured rejection path;
+    # never reuse the process for a different canonical parent.
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=workers,
+        mp_context=context,
+        max_tasks_per_child=1,
+    ) as executor:
         for result in executor.map(_materialize_parent, tasks, chunksize=1):
             results.append(result)
     results.sort(key=lambda item: int(item["selected_index"]))
