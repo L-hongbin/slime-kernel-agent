@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Select a deterministic, coverage-balanced subset of runtime-safe shape children.
+"""Build the full one-child-per-parent runtime-safe shape population.
 
 Each source row can expose several direct input tensors.  This tool assigns one
-stable sampled tensor occurrence to the row, then balances rows over aggregate
-input size, sampled-tensor size, rank, aspect ratio, coarse ordered geometry,
-and the random/value family that the downstream solver would assign.  It never
-rewrites a row.  Runtime-ineligible shape children fail closed before sampling.
+stable sampled tensor occurrence to the row, then audits aggregate input size,
+sampled-tensor size, rank, aspect ratio, coarse ordered geometry, and the
+random/value family that the downstream solver would assign.  It never rewrites
+a row.  Runtime-ineligible shape children fail closed before sampling, and at
+most one runtime-safe child is retained for each canonical parent.
 
-The repository defaults intentionally name the two production shape runs.  A
-normal invocation therefore needs only an output directory; the downstream
-random/value lane can consume ``selected.parquet`` directly.
+The repository defaults intentionally name the three static production lanes
+and all three model production lanes.  A normal invocation therefore needs
+only an output directory; the downstream random/value lane can consume
+``selected.parquet`` directly.
 """
 
 from __future__ import annotations
@@ -37,17 +39,24 @@ from tools.data.synthesize.augment_prompt_tasks import (
 )
 from tools.data.synthesize.random_method.solve_value_coverage import _analyze_parent, _git_blob_sha256, _git_commit
 
-CONTRACT_VERSION = "shape_runtime_single_changed_tensor_coverage_resample_v3"
-SELECTION_VERSION = "shape_cells_proportional_quota_with_secondary_marginals_v4"
-DEFAULT_LIMIT = 5_000
+CONTRACT_VERSION = "shape_runtime_single_changed_tensor_coverage_resample_v5"
+SELECTION_VERSION = "shape_full_population_one_child_per_parent_v5"
 MAX_MARGINAL_TOTAL_VARIATION = 0.05
-MARGINAL_REPAIR_TARGET = 0.045
+SMALL_NUMEL_THRESHOLD = 1_000_000
+MAX_SMALL_SHAPE_SHARE = 0.10
 MIB = 1024**2
+MAX_AGGREGATE_INPUT_BYTES = 4 * 1024**3
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+KERNELBENCH_BASELINE = _REPO_ROOT / "Data/external/converted/kernelbench_level1_2_3.reference.parquet"
+KERNELBENCH_BASELINE_SHA256 = "b4de490253a0f5a1f5e971f0f723cffd1de2cc2506ceabe97a369804e3a3d7f2"
 DEFAULT_SHAPE_RUNS = (
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896",
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318.balanced_v7",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v8/run.remaining22566.balanced_v7",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v2/run.full17864",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_full_residual_v3/run.measurable12674",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_relaxed_residual_v2/run.full2321",
 )
 
 _SAMPLED_NUMEL_BOUNDS = (2**12, 2**16, 2**20, 2**24, 2**28, 2**32)
@@ -121,7 +130,7 @@ class ChildShapeProfile:
     changed_factories: tuple[ChangedFactoryEvidence, ...]
     touches_leading: bool
     touches_nonleading: bool
-    touches_explicit_batch: bool
+    touches_explicit_batch: bool | None
 
     @property
     def changed_factory_indices(self) -> tuple[int, ...]:
@@ -337,6 +346,90 @@ def _load_child_profiles(path: Path) -> dict[str, ChildShapeProfile]:
     return profiles
 
 
+def _load_model_child_profiles(path: Path) -> dict[str, ChildShapeProfile]:
+    """Reconstruct the same profile from the model lane's exact slot manifest."""
+
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid model-shape manifest: {path}") from exc
+    raw_decisions = manifest.get("decisions")
+    if not isinstance(raw_decisions, list):
+        raise ValueError(f"model-shape manifest has no decisions: {path}")
+    profiles: dict[str, ChildShapeProfile] = {}
+    for decision in raw_decisions:
+        if not isinstance(decision, Mapping) or decision.get("accepted") is not True:
+            continue
+        child_uuid = decision.get("child_uuid")
+        slots = _nested(decision, "solver.slots")
+        if not isinstance(child_uuid, str) or not child_uuid or not isinstance(slots, list) or not slots:
+            raise ValueError(f"invalid accepted model-shape decision: {child_uuid!r}")
+        if child_uuid in profiles:
+            raise ValueError(f"duplicate model-shape child decision: {child_uuid}")
+        factory_rows: dict[int, list[Mapping[str, Any]]] = collections.defaultdict(list)
+        leading: list[bool] = []
+        for slot in slots:
+            occurrences = slot.get("occurrences") if isinstance(slot, Mapping) else None
+            if not isinstance(occurrences, list) or not occurrences:
+                raise ValueError(f"model-shape slot has no occurrences: {child_uuid}")
+            for occurrence in occurrences:
+                if not isinstance(occurrence, Mapping):
+                    raise ValueError(f"invalid model-shape occurrence: {child_uuid}")
+                try:
+                    factory_index = int(occurrence["factory_index"])
+                    axis = int(occurrence["axis"])
+                    rank = int(occurrence["rank"])
+                    factory_name = str(occurrence["factory_name"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError(f"invalid model-shape occurrence fields: {child_uuid}") from exc
+                if factory_index < 0 or rank <= 0 or axis < 0 or axis >= rank or not factory_name:
+                    raise ValueError(f"invalid model-shape occurrence geometry: {child_uuid}")
+                factory_rows[factory_index].append(occurrence)
+                leading.append(axis == 0)
+        changed_factories: list[ChangedFactoryEvidence] = []
+        for factory_index, occurrences in sorted(factory_rows.items()):
+            names = {str(item["factory_name"]) for item in occurrences}
+            ranks = {int(item["rank"]) for item in occurrences}
+            axes = tuple(sorted({int(item["axis"]) for item in occurrences}))
+            if len(names) != 1 or len(ranks) != 1 or not axes:
+                raise ValueError(f"inconsistent model-shape factory evidence: {child_uuid}:{factory_index}")
+            changed_factories.append(
+                ChangedFactoryEvidence(
+                    factory_index=factory_index,
+                    factory_name=next(iter(names)),
+                    rank=next(iter(ranks)),
+                    changed_axes=axes,
+                )
+            )
+        logical_slot_count = decision.get("logical_slot_count")
+        if logical_slot_count != len(slots):
+            raise ValueError(f"model-shape logical slot count mismatch: {child_uuid}")
+        variant = str(decision.get("variant", "")).split(":")[-1]
+        if variant not in {"medium", "large"}:
+            raise ValueError(f"invalid model-shape variant: {child_uuid}:{variant}")
+        try:
+            before = int(decision["input_bytes_before"])
+            after = int(decision["input_bytes_after"])
+            scale = float(decision["input_scale"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid model-shape storage evidence: {child_uuid}") from exc
+        profiles[child_uuid] = ChildShapeProfile(
+            child_uuid=child_uuid,
+            variant=variant,
+            input_bytes_before=before,
+            input_bytes_after=after,
+            input_scale=scale,
+            logical_slots=len(slots),
+            changed_factories=tuple(changed_factories),
+            touches_leading=any(leading),
+            touches_nonleading=not all(leading),
+            # The model manifest proves exact factory/axis occurrences but does
+            # not claim that a linked module constant was named like a batch.
+            touches_explicit_batch=None,
+        )
+    return profiles
+
+
 def _load_runtime_eligible(run_dir: Path) -> tuple[set[str], Mapping[str, Any], Path]:
     summary_path = run_dir / "analysis/summary.json"
     children_path = run_dir / "static/children.parquet"
@@ -364,6 +457,95 @@ def _load_runtime_eligible(run_dir: Path) -> tuple[set[str], Mapping[str, Any], 
             f"found {actual_children_sha}"
         )
     return eligible_uuids, summary, children_path
+
+
+def _load_runtime_lane(
+    run_dir: Path,
+) -> tuple[
+    set[str],
+    Mapping[str, Any],
+    Path,
+    Path,
+    Path,
+    dict[str, ChildShapeProfile],
+    str,
+]:
+    """Load either a static-solver lane or the model lane without weakening evidence."""
+
+    static_summary_path = run_dir / "analysis/summary.json"
+    if static_summary_path.is_file():
+        eligible, summary, children_path = _load_runtime_eligible(run_dir)
+        profile_path = run_dir / "analysis/changed_slots.tsv"
+        return (
+            eligible,
+            summary,
+            children_path,
+            static_summary_path,
+            profile_path,
+            _load_child_profiles(profile_path),
+            "static_solver",
+        )
+
+    runtime_summary_path = run_dir / "analysis/runtime_final.json"
+    accepted_path = run_dir / "runtime/accepted.parquet"
+    accepted_manifest_path = run_dir / "runtime/accepted_manifest.json"
+    static_manifest_path = run_dir / "static/manifest.json"
+    static_children_path = run_dir / "static/children.parquet"
+    for path in (
+        runtime_summary_path,
+        accepted_path,
+        accepted_manifest_path,
+        static_manifest_path,
+        static_children_path,
+    ):
+        if not path.is_file():
+            raise FileNotFoundError(f"shape run lacks a complete runtime lane: {run_dir} ({path.name})")
+    try:
+        runtime_summary = json.loads(runtime_summary_path.read_text(encoding="utf-8"))
+        accepted_manifest = json.loads(accepted_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"invalid model runtime evidence: {run_dir}") from exc
+    if runtime_summary.get("contract_version") != "model_shape_runtime_final_analysis_v1":
+        raise ValueError(f"unexpected model runtime summary contract: {run_dir}")
+    for verifier_name in ("reference_verifier", "region_verifier"):
+        verifier = runtime_summary.get(verifier_name)
+        if not isinstance(verifier, Mapping) or verifier.get("ok") is not True:
+            raise ValueError(f"model runtime {verifier_name} is incomplete: {run_dir}")
+    if accepted_manifest.get("contract_version") != "model_shape_runtime_accepted_v1":
+        raise ValueError(f"unexpected model accepted manifest contract: {run_dir}")
+    if runtime_summary.get("accepted_sha256") != _sha256_file(accepted_path):
+        raise ValueError(f"model runtime accepted parquet SHA mismatch: {run_dir}")
+    if runtime_summary.get("accepted_manifest_sha256") != _sha256_file(accepted_manifest_path):
+        raise ValueError(f"model runtime accepted manifest SHA mismatch: {run_dir}")
+    if accepted_manifest.get("source_manifest_sha256") != _sha256_file(static_manifest_path):
+        raise ValueError(f"model runtime source manifest SHA mismatch: {run_dir}")
+    if accepted_manifest.get("source_children_sha256") != _sha256_file(static_children_path):
+        raise ValueError(f"model runtime source children SHA mismatch: {run_dir}")
+    if accepted_manifest.get("accepted_sha256") != _sha256_file(accepted_path):
+        raise ValueError(f"model accepted manifest parquet SHA mismatch: {run_dir}")
+    raw_rows = accepted_manifest.get("rows")
+    if not isinstance(raw_rows, list):
+        raise ValueError(f"model accepted manifest has no rows: {run_dir}")
+    eligible = [row.get("child_uuid") for row in raw_rows if isinstance(row, Mapping)]
+    if any(not isinstance(value, str) or not value for value in eligible) or len(set(eligible)) != len(eligible):
+        raise ValueError(f"model accepted UUIDs are invalid or duplicated: {run_dir}")
+    if accepted_manifest.get("accepted_children") != len(eligible):
+        raise ValueError(f"model accepted child count mismatch: {run_dir}")
+    if pq.ParquetFile(accepted_path).metadata.num_rows != len(eligible):
+        raise ValueError(f"model accepted parquet row count mismatch: {run_dir}")
+    profiles = _load_model_child_profiles(static_manifest_path)
+    missing_profiles = sorted(set(eligible) - set(profiles))
+    if missing_profiles:
+        raise ValueError(f"model accepted children lack slot profiles: {missing_profiles[:3]}")
+    return (
+        set(eligible),
+        runtime_summary,
+        accepted_path,
+        runtime_summary_path,
+        static_manifest_path,
+        profiles,
+        "model_shape",
+    )
 
 
 def _candidate_from_row(
@@ -456,7 +638,9 @@ def _candidate_from_row(
                 else "touches_leading" if profile.touches_leading else "nonleading_only"
             ),
             explicit_batch_bucket=(
-                "touches_explicit_batch" if profile.touches_explicit_batch else "no_explicit_batch"
+                "unknown_explicit_batch"
+                if profile.touches_explicit_batch is None
+                else "touches_explicit_batch" if profile.touches_explicit_batch else "no_explicit_batch"
             ),
             changed_factory_indices=profile.changed_factory_indices,
             direct_factory_count=len(records),
@@ -507,6 +691,8 @@ def _target_quotas(groups: Mapping[Any, Sequence[Any]], limit: int) -> dict[Any,
 def _select(candidates: Sequence[Candidate], limit: int) -> list[Candidate]:
     if not 1 <= limit <= len(candidates):
         raise ValueError(f"limit must be in [1, {len(candidates)}], found {limit}")
+    if limit == len(candidates):
+        return sorted(candidates, key=lambda item: (item.lane_index, item.source_row_index))
     groups: dict[tuple[str, ...], list[Candidate]] = collections.defaultdict(list)
     for candidate in candidates:
         groups[candidate.main_cell].append(candidate)
@@ -570,182 +756,251 @@ def _select(candidates: Sequence[Candidate], limit: int) -> list[Candidate]:
             )
 
         add(max(options, key=candidate_score))
-
-    # Main-cell quotas exactly preserve the four primary shape marginals, but
-    # correlated secondary attributes can still drift after the greedy fill.
-    # Repair that drift with deterministic swaps inside the same main cell.
-    # A same-cell swap cannot change aggregate/sample size, rank, aspect, or
-    # occupied-cell coverage.
-    population_counts = {
-        attribute: collections.Counter(str(getattr(candidate, attribute)) for candidate in candidates)
-        for attribute in _SECONDARY_MARGINALS
-    }
-    expected_counts = {
-        attribute: {value: count * limit / len(candidates) for value, count in population_counts[attribute].items()}
-        for attribute in _SECONDARY_MARGINALS
-    }
-
-    def marginal_tvds() -> dict[str, float]:
-        return {
-            attribute: 0.5
-            * sum(
-                abs(selected_marginals[attribute][value] - expected) / limit
-                for value, expected in expected_counts[attribute].items()
-            )
-            for attribute in _SECONDARY_MARGINALS
-        }
-
-    def objective(tvds: Mapping[str, float]) -> tuple[int, float, float]:
-        return (
-            sum(value > MARGINAL_REPAIR_TARGET for value in tvds.values()),
-            max(tvds.values()),
-            sum(tvds.values()),
-        )
-
-    def signature(candidate: Candidate) -> tuple[str, ...]:
-        return tuple(str(getattr(candidate, attribute)) for attribute in _SECONDARY_MARGINALS)
-
-    def distinct_delta(counter: Mapping[Any, int], old: Any, new: Any) -> int:
-        if old == new:
-            return 0
-        return int(counter.get(new, 0) == 0) - int(counter.get(old, 0) == 1)
-
-    for _ in range(limit):
-        current_tvds = marginal_tvds()
-        current_objective = objective(current_tvds)
-        if current_objective[0] == 0:
-            break
-        target_attribute = max(
-            _SECONDARY_MARGINALS,
-            key=lambda attribute: (current_tvds[attribute], attribute),
-        )
-        target_index = _SECONDARY_MARGINALS.index(target_attribute)
-        over_values = {
-            value
-            for value, expected in expected_counts[target_attribute].items()
-            if selected_marginals[target_attribute][value] > expected
-        }
-        under_values = {
-            value
-            for value, expected in expected_counts[target_attribute].items()
-            if selected_marginals[target_attribute][value] < expected
-        }
-
-        selected_signatures: dict[tuple[str, ...], dict[tuple[str, ...], list[Candidate]]] = collections.defaultdict(
-            lambda: collections.defaultdict(list)
-        )
-        remaining_signatures: dict[tuple[str, ...], dict[tuple[str, ...], list[Candidate]]] = collections.defaultdict(
-            lambda: collections.defaultdict(list)
-        )
-        for candidate in candidates:
-            destination = selected_signatures if candidate.child_uuid in chosen else remaining_signatures
-            destination[candidate.main_cell][signature(candidate)].append(candidate)
-
-        best: (
-            tuple[
-                tuple[tuple[int, float, float], int, int, str, str],
-                Candidate,
-                Candidate,
-            ]
-            | None
-        ) = None
-        for cell in sorted(selected_signatures):
-            if cell not in remaining_signatures:
-                continue
-            for old_signature, old_candidates in selected_signatures[cell].items():
-                if old_signature[target_index] not in over_values:
-                    continue
-                for new_signature, new_candidates in remaining_signatures[cell].items():
-                    if new_signature[target_index] not in under_values:
-                        continue
-                    if any(
-                        old_value != new_value and selected_marginals[attribute][old_value] <= 1
-                        for attribute, old_value, new_value in zip(
-                            _SECONDARY_MARGINALS,
-                            old_signature,
-                            new_signature,
-                            strict=True,
-                        )
-                    ):
-                        continue
-                    swapped_tvds = dict(current_tvds)
-                    for attribute, old_value, new_value in zip(
-                        _SECONDARY_MARGINALS,
-                        old_signature,
-                        new_signature,
-                        strict=True,
-                    ):
-                        if old_value == new_value:
-                            continue
-                        counts = selected_marginals[attribute]
-                        expected = expected_counts[attribute]
-                        absolute_error = 2 * limit * current_tvds[attribute]
-                        absolute_error -= abs(counts[old_value] - expected[old_value])
-                        absolute_error -= abs(counts[new_value] - expected[new_value])
-                        absolute_error += abs(counts[old_value] - 1 - expected[old_value])
-                        absolute_error += abs(counts[new_value] + 1 - expected[new_value])
-                        swapped_tvds[attribute] = absolute_error / (2 * limit)
-                    swapped_objective = objective(swapped_tvds)
-                    if swapped_objective >= current_objective:
-                        continue
-                    old_candidate = max(
-                        old_candidates,
-                        key=lambda candidate: (
-                            selected_geometries[candidate.geometry_signature] > 1,
-                            selected_exact_shapes[candidate.sampled_shape] > 1,
-                            candidate.selection_sha256,
-                        ),
-                    )
-                    new_candidate = max(
-                        new_candidates,
-                        key=lambda candidate: (
-                            selected_geometries[candidate.geometry_signature] == 0,
-                            selected_exact_shapes[candidate.sampled_shape] == 0,
-                            candidate.selection_sha256,
-                        ),
-                    )
-                    geometry_delta = distinct_delta(
-                        selected_geometries,
-                        old_candidate.geometry_signature,
-                        new_candidate.geometry_signature,
-                    )
-                    exact_shape_delta = distinct_delta(
-                        selected_exact_shapes,
-                        old_candidate.sampled_shape,
-                        new_candidate.sampled_shape,
-                    )
-                    key = (
-                        swapped_objective,
-                        -geometry_delta,
-                        -exact_shape_delta,
-                        old_candidate.selection_sha256,
-                        new_candidate.selection_sha256,
-                    )
-                    if best is None or key < best[0]:
-                        best = (key, old_candidate, new_candidate)
-        if best is None:
-            raise RuntimeError(
-                "same-cell secondary marginal repair has no improving swap: " f"{dict(sorted(current_tvds.items()))}"
-            )
-        _, old_candidate, new_candidate = best
-        del chosen[old_candidate.child_uuid]
-        chosen[new_candidate.child_uuid] = new_candidate
-        for attribute in _SECONDARY_MARGINALS:
-            selected_marginals[attribute][str(getattr(old_candidate, attribute))] -= 1
-            selected_marginals[attribute][str(getattr(new_candidate, attribute))] += 1
-        selected_geometries[old_candidate.geometry_signature] -= 1
-        selected_geometries[new_candidate.geometry_signature] += 1
-        selected_exact_shapes[old_candidate.sampled_shape] -= 1
-        selected_exact_shapes[new_candidate.sampled_shape] += 1
-    else:
-        raise RuntimeError("same-cell secondary marginal repair exceeded its deterministic bound")
-
     return sorted(chosen.values(), key=lambda item: (item.lane_index, item.source_row_index))
+
+
+def _choose_one_per_parent(candidates: Sequence[Candidate]) -> tuple[list[Candidate], int]:
+    """Resolve the rare multi-variant parent while favoring underused shape cells."""
+
+    groups: dict[str, list[Candidate]] = collections.defaultdict(list)
+    for candidate in candidates:
+        groups[candidate.canonical_parent_uuid].append(candidate)
+    selected: list[Candidate] = []
+    multi_groups: list[tuple[str, list[Candidate]]] = []
+    cell_counts: collections.Counter[tuple[str, ...]] = collections.Counter()
+    size_counts: collections.Counter[str] = collections.Counter()
+    variant_counts: collections.Counter[str] = collections.Counter()
+    family_counts: collections.Counter[str] = collections.Counter()
+    exact_counts: collections.Counter[tuple[int, ...]] = collections.Counter()
+
+    def add(candidate: Candidate) -> None:
+        selected.append(candidate)
+        cell_counts[candidate.main_cell] += 1
+        size_counts[candidate.sampled_size_bucket] += 1
+        variant_counts[candidate.variant] += 1
+        family_counts[candidate.assigned_random_family] += 1
+        exact_counts[candidate.sampled_shape] += 1
+
+    for parent_uuid, options in groups.items():
+        if len(options) == 1:
+            add(options[0])
+        else:
+            multi_groups.append((parent_uuid, options))
+    multi_groups.sort(key=lambda item: _stable_sha256(SELECTION_VERSION, item[0]))
+    for _, options in multi_groups:
+        choice = min(
+            options,
+            key=lambda item: (
+                cell_counts[item.main_cell],
+                size_counts[item.sampled_size_bucket],
+                variant_counts[item.variant],
+                family_counts[item.assigned_random_family],
+                exact_counts[item.sampled_shape],
+                item.selection_sha256,
+            ),
+        )
+        add(choice)
+    if len({item.canonical_parent_uuid for item in selected}) != len(selected):
+        raise AssertionError("one-child-per-parent selection retained a duplicate parent")
+    return selected, len(multi_groups)
 
 
 def _counter(items: Sequence[Candidate], key: str) -> dict[str, int]:
     counts = collections.Counter(str(getattr(item, key)) for item in items)
     return dict(sorted(counts.items()))
+
+
+def _distribution_tvd(left: Mapping[str, int], right: Mapping[str, int]) -> float:
+    left_total, right_total = sum(left.values()), sum(right.values())
+    if left_total <= 0 or right_total <= 0:
+        raise ValueError("distribution TVD requires two non-empty count maps")
+    values = set(left) | set(right)
+    return 0.5 * sum(abs(left.get(value, 0) / left_total - right.get(value, 0) / right_total) for value in values)
+
+
+def _one_shape_per_question_cover(
+    questions: Sequence[Mapping[str, Any]],
+    support: set[tuple[str, str]],
+) -> tuple[list[int], int]:
+    """Choose one compatible factory per question while retaining marginal support."""
+
+    assignments: dict[int, int] = {}
+    covered: set[tuple[str, str]] = set()
+
+    def search() -> bool:
+        missing = support - covered
+        if not missing:
+            return True
+        candidate_counts: dict[tuple[str, str], int] = {}
+        for label in missing:
+            candidate_counts[label] = sum(
+                label in choice["labels"]
+                for question_index, question in enumerate(questions)
+                if question_index not in assignments
+                for choice in question["choices"]
+            )
+        target = min(missing, key=lambda label: (candidate_counts[label], label))
+        options: list[tuple[int, int, Mapping[str, Any]]] = []
+        for question_index, question in enumerate(questions):
+            if question_index in assignments:
+                continue
+            for choice_index, choice in enumerate(question["choices"]):
+                if target in choice["labels"]:
+                    options.append((question_index, choice_index, choice))
+        options.sort(
+            key=lambda item: (
+                -len(item[2]["labels"] & missing),
+                _stable_sha256(
+                    "kernelbench_question_support_choice_v1",
+                    questions[item[0]]["sample_sha256"],
+                    item[2]["factory_index"],
+                ),
+            )
+        )
+        for question_index, choice_index, choice in options:
+            assignments[question_index] = choice_index
+            newly_covered = choice["labels"] - covered
+            covered.update(newly_covered)
+            if search():
+                return True
+            covered.difference_update(newly_covered)
+            del assignments[question_index]
+        return False
+
+    if not search():
+        raise ValueError("one-shape-per-question selection cannot retain KernelBench marginal support")
+    coverage_forced_questions = len(assignments)
+    for question_index, question in enumerate(questions):
+        if question_index in assignments:
+            continue
+        assignments[question_index] = int(question["sample_sha256"][:16], 16) % len(question["choices"])
+    return [assignments[index] for index in range(len(questions))], coverage_forced_questions
+
+
+def _kernelbench_profile(path: Path) -> dict[str, Any]:
+    if _sha256_file(path) != KERNELBENCH_BASELINE_SHA256:
+        raise ValueError(f"KernelBench baseline SHA mismatch: {path}")
+    parquet = pq.ParquetFile(path)
+    all_counts = {
+        "sampled_size_bucket": collections.Counter(),
+        "rank_bucket": collections.Counter(),
+        "aspect_bucket": collections.Counter(),
+    }
+    compatible_occurrence_counts = {key: collections.Counter() for key in all_counts}
+    compatible_question_counts = {key: collections.Counter() for key in all_counts}
+    resolved_occurrences = 0
+    compatible_occurrences = 0
+    resolved_rows = 0
+    unresolved_rows = 0
+    rows_without_compatible_shape = 0
+    compatible_questions: list[dict[str, Any]] = []
+    row_index = 0
+    for batch in parquet.iter_batches(batch_size=64, use_threads=False):
+        for row in batch.to_pylist():
+            code = _nested(row, "reward_model.ground_truth")
+            if not isinstance(code, str):
+                unresolved_rows += 1
+                row_index += 1
+                continue
+            try:
+                tree = ast.parse(code)
+                get_inputs = _top_level_function(tree, "get_inputs")
+                records, _ = _factory_records(tree, get_inputs, _module_constant_environment(tree))
+            except (SyntaxError, ValueError):
+                unresolved_rows += 1
+                row_index += 1
+                continue
+            if not records:
+                unresolved_rows += 1
+                row_index += 1
+                continue
+            resolved_rows += 1
+            compatible_records: list[dict[str, Any]] = []
+            for factory_index, record in enumerate(records):
+                numel = math.prod(record.shape)
+                labels = {
+                    "sampled_size_bucket": _sampled_size_bucket(numel),
+                    "rank_bucket": _rank_bucket(len(record.shape)),
+                    "aspect_bucket": _aspect_bucket(record.shape),
+                }
+                for key, label in labels.items():
+                    all_counts[key][label] += 1
+                resolved_occurrences += 1
+                compatible = record.bytes <= MAX_AGGREGATE_INPUT_BYTES and labels["aspect_bucket"] != "gt1000"
+                if compatible:
+                    for key, label in labels.items():
+                        compatible_occurrence_counts[key][label] += 1
+                    compatible_records.append(
+                        {
+                            "factory_index": factory_index,
+                            "label_map": labels,
+                            "labels": frozenset(labels.items()),
+                            "numel": numel,
+                        }
+                    )
+                    compatible_occurrences += 1
+            if compatible_records:
+                row_uuid = _nested(row, "extra_info.uuid", "")
+                code_sha256 = hashlib.sha256(code.encode("utf-8")).hexdigest()
+                compatible_questions.append(
+                    {
+                        "sample_sha256": _stable_sha256(
+                            "kernelbench_contract_compatible_one_shape_per_question_v2",
+                            KERNELBENCH_BASELINE_SHA256,
+                            row_index,
+                            row_uuid,
+                            code_sha256,
+                        ),
+                        "choices": compatible_records,
+                    }
+                )
+            else:
+                rows_without_compatible_shape += 1
+            row_index += 1
+    if not compatible_occurrences:
+        raise ValueError("KernelBench baseline has no contract-compatible resolved shapes")
+    if not compatible_questions:
+        raise ValueError("KernelBench baseline has no contract-compatible question-level shape sample")
+    occurrence_support = {(key, label) for key, counts in compatible_occurrence_counts.items() for label in counts}
+    question_choices, coverage_forced_questions = _one_shape_per_question_cover(
+        compatible_questions, occurrence_support
+    )
+    compatible_question_numel: list[int] = []
+    for question, choice_index in zip(compatible_questions, question_choices, strict=True):
+        choice = question["choices"][choice_index]
+        for key, label in choice["label_map"].items():
+            compatible_question_counts[key][label] += 1
+        compatible_question_numel.append(choice["numel"])
+    question_support = {(key, label) for key, counts in compatible_question_counts.items() for label in counts}
+    if question_support != occurrence_support:
+        raise AssertionError("KernelBench one-shape-per-question sample lost compatible marginal support")
+    return {
+        "path": str(path.resolve()),
+        "sha256": KERNELBENCH_BASELINE_SHA256,
+        "rows": parquet.metadata.num_rows,
+        "resolved_rows": resolved_rows,
+        "resolved_factory_occurrences": resolved_occurrences,
+        "unresolved_rows": unresolved_rows,
+        "compatible_contract": ("factory storage <=4 GiB and, for rank>=2, largest dimension <=1000x second-largest"),
+        "compatible_factory_occurrences": compatible_occurrences,
+        "compatible_questions": len(compatible_question_numel),
+        "resolved_rows_without_compatible_shape": rows_without_compatible_shape,
+        "all_counts": {key: dict(sorted(value.items())) for key, value in all_counts.items()},
+        "compatible_factory_occurrence_counts": {
+            key: dict(sorted(value.items())) for key, value in compatible_occurrence_counts.items()
+        },
+        "compatible_one_shape_per_question_sampling": (
+            "marginal_support_backtracking_then_stable_sha256_mod_compatible_factory_count_v2"
+        ),
+        "compatible_one_shape_per_question_support_preserved": True,
+        "compatible_one_shape_per_question_coverage_forced_questions": coverage_forced_questions,
+        "compatible_one_shape_per_question_counts": {
+            key: dict(sorted(value.items())) for key, value in compatible_question_counts.items()
+        },
+        "compatible_one_shape_per_question_small_share": (
+            sum(value < SMALL_NUMEL_THRESHOLD for value in compatible_question_numel) / len(compatible_question_numel)
+        ),
+    }
 
 
 def _joint_counter(items: Sequence[Candidate]) -> dict[str, int]:
@@ -878,7 +1133,7 @@ def _atomic_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, overwrite: bool) -> dict[str, Any]:
+def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], overwrite: bool) -> dict[str, Any]:
     output_paths = {
         "selected": output_dir / "selected.parquet",
         "manifest": output_dir / "manifest.jsonl",
@@ -912,14 +1167,18 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
     source_records: list[dict[str, Any]] = []
     output_schema: pa.Schema | None = None
     seen_child_uuids: set[str] = set()
-    seen_parent_uuids: set[str] = set()
     for lane_index, run_dir in enumerate(shape_runs):
-        eligible_uuids, summary, children_path = _load_runtime_eligible(run_dir)
+        (
+            eligible_uuids,
+            summary,
+            children_path,
+            summary_path,
+            profile_path,
+            child_profiles,
+            lane_kind,
+        ) = _load_runtime_lane(run_dir)
         children_sha256 = _sha256_file(children_path)
         lane_id = f"shape_lane_{lane_index}_{_stable_sha256(run_dir.resolve(), children_sha256)[:12]}"
-        summary_path = run_dir / "analysis/summary.json"
-        changed_slots_path = run_dir / "analysis/changed_slots.tsv"
-        child_profiles = _load_child_profiles(changed_slots_path)
         parquet = pq.ParquetFile(children_path)
         if output_schema is None:
             output_schema = parquet.schema_arrow
@@ -952,6 +1211,11 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
                         "shape_lane_id": lane_id,
                         "source_row_index": row_index,
                         "shape_child_uuid": child_uuid,
+                        "canonical_parent_uuid": (
+                            candidate.canonical_parent_uuid
+                            if candidate is not None
+                            else _nested(row, "extra_info.v4.parent_uuid")
+                        ),
                         "eligibility_universe": "shape_runtime_eligible_children",
                         "random_static_eligible": candidate is not None,
                         "reason": reason,
@@ -960,13 +1224,7 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
                 if candidate is not None:
                     if candidate.child_uuid in seen_child_uuids:
                         raise ValueError(f"duplicate shape child UUID across lanes: {candidate.child_uuid}")
-                    if candidate.canonical_parent_uuid in seen_parent_uuids:
-                        raise ValueError(
-                            "multiple runtime shape children share canonical parent: "
-                            f"{candidate.canonical_parent_uuid}"
-                        )
                     seen_child_uuids.add(candidate.child_uuid)
-                    seen_parent_uuids.add(candidate.canonical_parent_uuid)
                     candidates.append(candidate)
                     lane_candidate_count += 1
                 row_index += 1
@@ -976,24 +1234,60 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
         source_records.append(
             {
                 "lane_id": lane_id,
+                "lane_kind": lane_kind,
                 "run_dir": str(run_dir.resolve()),
                 "run_summary_path": str(summary_path.resolve()),
                 "run_summary_sha256": _sha256_file(summary_path),
-                "changed_slots_path": str(changed_slots_path.resolve()),
-                "changed_slots_sha256": _sha256_file(changed_slots_path),
+                "profile_evidence_path": str(profile_path.resolve()),
+                "profile_evidence_sha256": _sha256_file(profile_path),
                 "children_path": str(children_path.resolve()),
                 "children_sha256": children_sha256,
                 "runtime_eligible_children": len(eligible_uuids),
                 "random_static_eligible_children": lane_candidate_count,
-                "shape_contract": summary.get("schema_version"),
+                "shape_contract": summary.get("schema_version", summary.get("contract_version")),
             }
         )
     if output_schema is None:
         raise ValueError("no shape run was provided")
-    if limit > len(candidates):
-        raise ValueError(f"requested {limit} rows but only {len(candidates)} are random-static-eligible")
-
-    selected = _select(candidates, limit)
+    raw_candidate_count = len(candidates)
+    candidates, multi_variant_parents = _choose_one_per_parent(candidates)
+    selected = _select(candidates, len(candidates))
+    selected_child_uuids = {item.child_uuid for item in selected}
+    for row in eligibility_rows:
+        row["selected_for_canonical_parent"] = (
+            row["shape_child_uuid"] in selected_child_uuids if row["random_static_eligible"] else None
+        )
+    limit = len(selected)
+    small_shape_count = sum(item.sampled_numel < SMALL_NUMEL_THRESHOLD for item in selected)
+    small_shape_share = small_shape_count / len(selected)
+    if small_shape_share >= MAX_SMALL_SHAPE_SHARE:
+        raise RuntimeError(
+            f"small sampled-shape share must be below {MAX_SMALL_SHAPE_SHARE:.0%}: "
+            f"{small_shape_count}/{len(selected)}={small_shape_share:.4%}"
+        )
+    kernelbench = _kernelbench_profile(KERNELBENCH_BASELINE)
+    selected_kernelbench_counts = {
+        "sampled_size_bucket": _counter(selected, "sampled_size_bucket"),
+        "rank_bucket": _counter(selected, "rank_bucket"),
+        "aspect_bucket": _counter(selected, "aspect_bucket"),
+    }
+    missing_kernelbench_support = {
+        key: sorted(
+            set(kernelbench["compatible_one_shape_per_question_counts"][key]) - set(selected_kernelbench_counts[key])
+        )
+        for key in selected_kernelbench_counts
+    }
+    kernelbench_support_passed = not any(missing_kernelbench_support.values())
+    if not kernelbench_support_passed:
+        raise RuntimeError(
+            f"selected shape rows miss contract-compatible KernelBench support: {missing_kernelbench_support}"
+        )
+    kernelbench_tvd = {
+        key: _distribution_tvd(
+            selected_kernelbench_counts[key], kernelbench["compatible_one_shape_per_question_counts"][key]
+        )
+        for key in selected_kernelbench_counts
+    }
     selected_rows = [dict(item.row) for item in selected]
     manifest_rows = [_manifest_row(item, index) for index, item in enumerate(selected)]
     selected_joint = set(item.main_cell for item in selected)
@@ -1028,6 +1322,8 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
         ),
         "unique_shape_child_uuid": len({item.child_uuid for item in candidates}) == len(candidates),
         "unique_canonical_parent_uuid": len({item.canonical_parent_uuid for item in candidates}) == len(candidates),
+        "one_runtime_child_per_canonical_parent": len(selected) == len(candidates),
+        "kernelbench_contract_compatible_support_covered": kernelbench_support_passed,
         "all_occupied_joint_cells_covered": selected_joint == population_joint,
         "all_shape_marginals_covered": all(
             {getattr(item, attribute) for item in selected} == {getattr(item, attribute) for item in candidates}
@@ -1058,12 +1354,35 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
         "limit": limit,
         "source_runs": source_records,
         "runtime_eligible_shape_children": len(eligibility_rows),
+        "random_static_eligible_shape_children_before_parent_dedup": raw_candidate_count,
         "random_static_eligible_shape_children": len(candidates),
+        "multi_variant_parents_resolved": multi_variant_parents,
         "selected_rows": len(selected),
         "one_sampled_shape_per_row": True,
         "sampled_shape_selection": "stable_sha256_mod_changed_direct_factory_count",
+        "parent_variant_selection": ("underused_joint_cell_then_size_variant_random_family_exact_shape_then_sha256"),
+        "small_shape_contract": {
+            "measurement": "one stable sampled shape-changed direct-input factory per selected row",
+            "threshold_numel_exclusive": SMALL_NUMEL_THRESHOLD,
+            "required_share_strictly_below": MAX_SMALL_SHAPE_SHARE,
+            "count": small_shape_count,
+            "share": small_shape_share,
+            "passed": small_shape_share < MAX_SMALL_SHAPE_SHARE,
+        },
+        "kernelbench_comparison": {
+            "comparison_unit": "one_contract_compatible_shape_per_question_v1",
+            "baseline": kernelbench,
+            "selected_counts": selected_kernelbench_counts,
+            "missing_contract_compatible_support": missing_kernelbench_support,
+            "support_coverage_passed": kernelbench_support_passed,
+            "distribution_tvd": kernelbench_tvd,
+            "interpretation": (
+                "Both sides use one stable shape per question. TVD is reported, not minimized by "
+                "dropping otherwise eligible parent questions; support coverage and the <10% "
+                "small-shape gate are hard requirements."
+            ),
+        },
         "maximum_marginal_total_variation": MAX_MARGINAL_TOTAL_VARIATION,
-        "marginal_repair_target": MARGINAL_REPAIR_TARGET,
         "marginal_audit": marginal_audit,
         "population": {
             "aggregate_size_buckets": _counter(candidates, "aggregate_size_bucket"),
@@ -1125,7 +1444,6 @@ def build_resample(output_dir: Path, *, shape_runs: Sequence[Path], limit: int, 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output_dir", type=Path)
-    parser.add_argument("--limit", type=int, default=DEFAULT_LIMIT)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
@@ -1135,7 +1453,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     summary = build_resample(
         args.output_dir,
         shape_runs=DEFAULT_SHAPE_RUNS,
-        limit=args.limit,
         overwrite=args.overwrite,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))

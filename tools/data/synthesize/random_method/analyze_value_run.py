@@ -26,7 +26,7 @@ ANALYSIS_CONTRACT = "random_value_lane_exact_analysis_v3"
 SHARD_RE = re.compile(r"^shard-(\d+)-of-(\d+)\.jsonl$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_VALUE_FAMILIES = frozenset({"uniform_01", "signed_uniform", "poisson_counts", "multinomial_categories"})
-MAX_AUTHORIZED_CANDIDATES = 5_000
+MAX_CANONICAL_CANARY_CANDIDATES = 5_000
 MIN_LIVENESS_TRIALS = 3
 MAX_COUNT_HISTOGRAM_BINS = 64
 EXPECTED_KERNELGYM_COMMIT = "26255057463a77b23abac0f3e5eafeeebf2ebbb5"
@@ -240,9 +240,15 @@ def _verify_kernelgym_installation(root_value: Any) -> dict[str, Any]:
     return observed
 
 
-def _require_candidate_count(count: int) -> None:
-    if not 1 <= count <= MAX_AUTHORIZED_CANDIDATES:
-        raise ValueError(f"candidate count must be in [1, {MAX_AUTHORIZED_CANDIDATES}], found {count}")
+def _require_candidate_count(count: int, manifests: Sequence[Mapping[str, Any]]) -> None:
+    if count < 1 or len(manifests) != count:
+        raise ValueError(f"candidate/manifest count must be positive and aligned: {count}:{len(manifests)}")
+    source_kinds = {_nested(manifest, "source_binding.source_kind") for manifest in manifests}
+    if count > MAX_CANONICAL_CANARY_CANDIDATES and source_kinds != {"shape_coverage_resample"}:
+        raise ValueError(
+            f"more than {MAX_CANONICAL_CANARY_CANDIDATES} candidates require one bound shape-resample "
+            f"source, found {count}:{sorted(str(value) for value in source_kinds)}"
+        )
 
 
 def _nested_counts(counter: Mapping[tuple[str, str], int]) -> dict[str, dict[str, int]]:
@@ -434,7 +440,7 @@ def _verify_aligned_static(
     children: list[dict[str, Any]],
     manifests: list[dict[str, Any]],
 ) -> value_solver.SourceContext:
-    _require_candidate_count(len(children))
+    _require_candidate_count(len(children), manifests)
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError(f"static artifact count mismatch: {len(parents)}:{len(children)}:{len(manifests)}")
 
@@ -1716,11 +1722,11 @@ def main(argv: Sequence[str] | None = None) -> None:
     children_path = args.lane_dir / "candidates.parquet"
     paired_path = args.lane_dir / "paired.parquet"
     manifest_path = args.lane_dir / "manifest.jsonl"
-    _require_candidate_count(pq.ParquetFile(children_path).metadata.num_rows)
     parents = pq.read_table(parents_path).to_pylist()
     children_table = pq.read_table(children_path)
     children = children_table.to_pylist()
     manifests = _read_manifest(manifest_path)
+    _require_candidate_count(children_table.num_rows, manifests)
     source_context = _verify_aligned_static(parents, children, manifests)
     reference, both_pass, child_reference_records = _verify_reference(
         reference_dir=args.reference_dir,
@@ -1804,11 +1810,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         final_summary = {
             "contract_version": ANALYSIS_CONTRACT,
             "scope": (
-                "shape_coverage_resample_5000_review_lane"
+                "shape_coverage_resample_full_review_lane"
                 if source_context.kind == "shape_coverage_resample"
                 else "canonical_parent_canary"
             ),
-            "maximum_authorized_candidates": 5_000,
+            "candidate_authorization": (
+                "exact_full_bound_shape_resample"
+                if source_context.kind == "shape_coverage_resample"
+                else f"canonical_canary_at_most_{MAX_CANONICAL_CANARY_CANDIDATES}"
+            ),
             "candidate_rows": len(children),
             "source_binding": dict(source_context.binding),
             "reference": reference,

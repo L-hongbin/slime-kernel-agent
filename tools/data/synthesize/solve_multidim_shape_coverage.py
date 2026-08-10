@@ -49,15 +49,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.data.synthesize.ai_shape_coverage import (  # noqa: E402
-    LARGE_INPUT_MAX_BYTES,
-    MEDIUM_INPUT_MAX_BYTES,
-    MEDIUM_INPUT_MIN_BYTES,
-    MIN_INPUT_SCALE,
-    _validate_target_proximity,
-    _validate_variant_storage,
-    static_gate,
-)
 from tools.data.synthesize.augment_prompt_tasks import (  # noqa: E402
     _SHAPE_FACTORIES,
     _call_name,
@@ -66,6 +57,15 @@ from tools.data.synthesize.augment_prompt_tasks import (  # noqa: E402
     _section_hashes,
     _top_level_function,
     analyze_code,
+)
+from tools.data.synthesize.shape_contract import (  # noqa: E402
+    LARGE_INPUT_MAX_BYTES,
+    MEDIUM_INPUT_MAX_BYTES,
+    MEDIUM_INPUT_MIN_BYTES,
+    MIN_INPUT_SCALE,
+    _validate_target_proximity,
+    _validate_variant_storage,
+    static_gate,
 )
 from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
     DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
@@ -79,18 +79,12 @@ from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
     _shape_slots_with_rejections,
 )
 
-
 CONTRACT_VERSION = "shape_multidim_solver_v4"
 GENERATOR_VERSION = "strict_structural_two_slot_exactly_one_power_v3"
 VARIANT_ASSIGNMENT_SALT = "shape_multidim_solver_v4_single_variant_v1"
 TARGET_BYTE_SALT = "shape_multidim_solver_v4_byte_target_v1"
-DEFAULT_SELECTED = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000/selected.parquet"
-)
-DEFAULT_RUN_DIR = (
-    _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4/run.500"
-)
+DEFAULT_SELECTED = _REPO_ROOT / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000/selected.parquet"
+DEFAULT_RUN_DIR = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4/run.500"
 VARIANTS = ("medium", "large")
 MIB = 1024**2
 TARGET_ERROR_EQUIVALENCE_DENOMINATOR = 1_000
@@ -130,12 +124,7 @@ class BilinearProfile:
     xy_bytes: int
 
     def input_bytes(self, x: int, y: int) -> int:
-        return (
-            self.constant_bytes
-            + self.x_bytes * x
-            + self.y_bytes * y
-            + self.xy_bytes * x * y
-        )
+        return self.constant_bytes + self.x_bytes * x + self.y_bytes * y + self.xy_bytes * x * y
 
 
 @dataclasses.dataclass(frozen=True)
@@ -201,10 +190,9 @@ def _nested(value: Any, path: str, default: Any = None) -> Any:
 
 
 def _logical_target_map_sha256(records: Sequence[Mapping[str, Any]]) -> str:
-    canonical = "".join(
-        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        for record in records
-    ).encode("utf-8")
+    canonical = "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records).encode(
+        "utf-8"
+    )
     return _sha256_bytes(canonical)
 
 
@@ -221,10 +209,14 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 def _span_inside(span: SourceSpan, node: ast.AST) -> bool:
     start = (getattr(node, "lineno", -1), getattr(node, "col_offset", -1))
     end = (getattr(node, "end_lineno", -1), getattr(node, "end_col_offset", -1))
-    return start <= (span.lineno, span.col_offset) and (
-        span.end_lineno,
-        span.end_col_offset,
-    ) <= end
+    return (
+        start <= (span.lineno, span.col_offset)
+        and (
+            span.end_lineno,
+            span.end_col_offset,
+        )
+        <= end
+    )
 
 
 def _spans_overlap(left: SourceSpan, right: SourceSpan) -> bool:
@@ -260,10 +252,7 @@ def _patch_integer_spans_many(
             raise ValueError(f"duplicate_shape_slot_assignment:{slot.slot_id}")
         seen_slot_ids.add(slot.slot_id)
         if type(new_value) is not int or new_value <= slot.old_value:
-            raise ValueError(
-                f"shape_slot_must_strictly_increase:{slot.slot_id}:"
-                f"{slot.old_value}:{new_value}"
-            )
+            raise ValueError(f"shape_slot_must_strictly_increase:{slot.slot_id}:" f"{slot.old_value}:{new_value}")
         for span in slot.patch_spans:
             if not 1 <= span.lineno <= len(lines):
                 raise ValueError("shape_slot_source_line_out_of_range")
@@ -275,9 +264,7 @@ def _patch_integer_spans_many(
             except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
                 raise ValueError("shape_slot_source_span_is_not_a_literal") from exc
             if type(observed) is not int or observed != slot.old_value:
-                raise ValueError(
-                    f"shape_slot_source_value_mismatch:{slot.old_value}:{observed!r}"
-                )
+                raise ValueError(f"shape_slot_source_value_mismatch:{slot.old_value}:{observed!r}")
             replacements.append((start, end, str(new_value).encode("ascii")))
 
     replacements.sort(reverse=True)
@@ -318,9 +305,7 @@ def _resolved_factories(
     for record in records:
         location = (record.line_number, record.column_offset)
         if location in records_by_location:
-            raise ValueError(
-                f"duplicate_direct_factory_location:{location[0]}:{location[1]}"
-            )
+            raise ValueError(f"duplicate_direct_factory_location:{location[0]}:{location[1]}")
         records_by_location[location] = record
 
     resolved: list[ResolvedFactory] = []
@@ -331,8 +316,7 @@ def _resolved_factories(
         record = records_by_location.get(location)
         if record is None:
             raise ValueError(
-                f"direct_factory_shape_unresolved:{factory_index}:"
-                f"line{call.lineno}:col{call.col_offset}"
+                f"direct_factory_shape_unresolved:{factory_index}:" f"line{call.lineno}:col{call.col_offset}"
             )
         name = _call_name(call.func)
         if record.name != name:
@@ -354,17 +338,9 @@ def _structural_pair(
 ) -> bool:
     if slot_a.slot_id == slot_b.slot_id:
         return False
-    if any(
-        _spans_overlap(left, right)
-        for left in slot_a.patch_spans
-        for right in slot_b.patch_spans
-    ):
+    if any(_spans_overlap(left, right) for left in slot_a.patch_spans for right in slot_b.patch_spans):
         return False
-    if not all(
-        _span_inside(span, get_inputs)
-        for slot in (slot_a, slot_b)
-        for span in slot.patch_spans
-    ):
+    if not all(_span_inside(span, get_inputs) for slot in (slot_a, slot_b) for span in slot.patch_spans):
         return False
 
     by_factory_a: dict[int, list[int]] = collections.defaultdict(list)
@@ -509,8 +485,7 @@ def _affected_shape_balance_guard(
             (
                 node
                 for node in ast.walk(get_inputs_node)
-                if isinstance(node, ast.Call)
-                and _call_name(node.func) in _SHAPE_FACTORIES
+                if isinstance(node, ast.Call) and _call_name(node.func) in _SHAPE_FACTORIES
             ),
             key=lambda node: (node.lineno, node.col_offset),
         )
@@ -529,14 +504,10 @@ def _affected_shape_balance_guard(
             for axis in axes:
                 value, rank, slot_id = expected[(factory_index, axis)]
                 if rank != len(factory.shape):
-                    raise ValueError(
-                        f"affected_rank_mismatch:{factory_index}:{axis}:{rank}:"
-                        f"{len(factory.shape)}"
-                    )
+                    raise ValueError(f"affected_rank_mismatch:{factory_index}:{axis}:{rank}:" f"{len(factory.shape)}")
                 if factory.shape[axis] != value:
                     raise ValueError(
-                        f"affected_value_mismatch:{slot_id}:{factory_index}:{axis}:"
-                        f"{value}:{factory.shape[axis]}"
+                        f"affected_value_mismatch:{slot_id}:{factory_index}:{axis}:" f"{value}:{factory.shape[axis]}"
                     )
             evidence: dict[str, Any] = {
                 "factory_index": factory_index,
@@ -585,9 +556,7 @@ def _variant_and_target(
 ) -> tuple[str, int, int, int]:
     """Choose one stable variant and sample its legal interval at byte granularity."""
 
-    digest = _sha256_bytes(
-        f"{VARIANT_ASSIGNMENT_SALT}:{parent_uuid}".encode("utf-8")
-    )
+    digest = _sha256_bytes(f"{VARIANT_ASSIGNMENT_SALT}:{parent_uuid}".encode())
     variant = VARIANTS[int(digest[:16], 16) % len(VARIANTS)]
     minimum_growth_mib = math.ceil(MIN_INPUT_SCALE * parent_input_bytes / MIB)
     if variant == "medium":
@@ -597,17 +566,11 @@ def _variant_and_target(
         lower_mib = max(MEDIUM_INPUT_MAX_BYTES // MIB + 1, minimum_growth_mib)
         upper_mib = LARGE_INPUT_MAX_BYTES // MIB
     if lower_mib > upper_mib:
-        raise ValueError(
-            f"assigned_variant_has_no_2x_target_band:{variant}:{lower_mib}:{upper_mib}"
-        )
+        raise ValueError(f"assigned_variant_has_no_2x_target_band:{variant}:{lower_mib}:{upper_mib}")
     lower_bytes = lower_mib * MIB
     upper_bytes = upper_mib * MIB
-    target_digest = _sha256_bytes(
-        f"{TARGET_BYTE_SALT}:{parent_uuid}:{variant}".encode("utf-8")
-    )
-    target = lower_bytes + int(target_digest[:16], 16) % (
-        upper_bytes - lower_bytes + 1
-    )
+    target_digest = _sha256_bytes(f"{TARGET_BYTE_SALT}:{parent_uuid}:{variant}".encode())
+    target = lower_bytes + int(target_digest[:16], 16) % (upper_bytes - lower_bytes + 1)
     return variant, target, lower_mib, upper_mib
 
 
@@ -747,11 +710,7 @@ def _solve_profile(
         fixed_denominator = fixed_linear + profile.xy_bytes * solved_minimum
         if fixed_denominator <= 0:
             continue
-        fixed_maximum = (
-            storage_upper
-            - profile.constant_bytes
-            - solved_linear * solved_minimum
-        ) // fixed_denominator
+        fixed_maximum = (storage_upper - profile.constant_bytes - solved_linear * solved_minimum) // fixed_denominator
         for power_value in _powers_between(fixed_slot.old_value, fixed_maximum):
             solved_slope = solved_linear + profile.xy_bytes * power_value
             solved_fixed = profile.constant_bytes + fixed_linear * power_value
@@ -777,11 +736,7 @@ def _solve_profile(
                     if solved_lower <= nearby <= solved_upper and not _is_power_of_two(nearby):
                         solved_values.add(nearby)
             for solved_value in solved_values:
-                value_a, value_b = (
-                    (power_value, solved_value)
-                    if power_is_a
-                    else (solved_value, power_value)
-                )
+                value_a, value_b = (power_value, solved_value) if power_is_a else (solved_value, power_value)
                 candidate = _candidate_from_values(
                     parent_code,
                     entry_point,
@@ -815,8 +770,7 @@ def _candidate_key(candidate: SolvedCandidate, parent_uuid: str) -> tuple[Any, .
         )
     )
     tie = _sha256_bytes(
-        f"{parent_uuid}:{candidate.variant}:{pair_id}:"
-        f"{candidate.value_a}:{candidate.value_b}".encode("utf-8")
+        f"{parent_uuid}:{candidate.variant}:{pair_id}:" f"{candidate.value_a}:{candidate.value_b}".encode()
     )
     return (
         abs(candidate.target_delta_bytes) // error_bucket,
@@ -875,9 +829,7 @@ def _candidate_manifest(candidate: SolvedCandidate) -> dict[str, Any]:
         ],
         "changed_occurrences": candidate.changed_occurrences,
         "power_of_two_occurrences": candidate.power_of_two_occurrences,
-        "power_of_two_occurrence_fraction": (
-            candidate.power_of_two_occurrences / candidate.changed_occurrences
-        ),
+        "power_of_two_occurrence_fraction": (candidate.power_of_two_occurrences / candidate.changed_occurrences),
         "relative_growth_ratio": float(candidate.relative_growth_ratio),
         "maximum_dimension_ratio": float(candidate.maximum_dimension_ratio),
         "storage_polynomial": {
@@ -947,9 +899,7 @@ def solve_multidim_shape_coverage(
     rows = selected.to_pylist()
     final_paths = _run_paths(run_dir.resolve())
     run_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent)
-    )
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent))
     temporary_paths = _run_paths(temporary_dir)
     temporary_paths.children.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths.review.parent.mkdir(parents=True, exist_ok=True)
@@ -980,14 +930,10 @@ def solve_multidim_shape_coverage(
             **source_selection,
             "derivation_contract_version": CONTRACT_VERSION,
             "source_selection_manifest": (
-                str(source_selection_path.resolve())
-                if source_selection_path.is_file()
-                else None
+                str(source_selection_path.resolve()) if source_selection_path.is_file() else None
             ),
             "source_selection_manifest_sha256": (
-                _sha256_file(source_selection_path)
-                if source_selection_path.is_file()
-                else None
+                _sha256_file(source_selection_path) if source_selection_path.is_file() else None
             ),
             "selected_path": str(final_paths.selected),
             "selected_sha256": _sha256_file(temporary_paths.selected),
@@ -1052,9 +998,7 @@ def solve_multidim_shape_coverage(
                 "attempts": [],
             }
             if not parent_fake.passed:
-                decision["reason"] = (
-                    f"parent_fake_gate_{parent_fake.status}:{parent_fake.reason}"
-                )
+                decision["reason"] = f"parent_fake_gate_{parent_fake.status}:{parent_fake.reason}"
                 skip_reasons[str(decision["reason"])] += 1
                 decisions.append(decision)
                 continue
@@ -1082,9 +1026,7 @@ def solve_multidim_shape_coverage(
                 bilinear_profiles = []
                 guard_rejections = []
                 affine_rejections = []
-                pair_rejections = [
-                    {"slot_ids": [], "reason": f"{type(exc).__name__}:{exc}"}
-                ]
+                pair_rejections = [{"slot_ids": [], "reason": f"{type(exc).__name__}:{exc}"}]
             decision.update(
                 {
                     "slot_count": len(slots),
@@ -1164,12 +1106,8 @@ def solve_multidim_shape_coverage(
                         {
                             "accepted": True,
                             "child_uuid": child_uuid,
-                            "child_reference_sha256": static[
-                                "child_reference_sha256"
-                            ],
-                            "child_normalized_ast_sha256": static[
-                                "child_normalized_ast_sha256"
-                            ],
+                            "child_reference_sha256": static["child_reference_sha256"],
+                            "child_normalized_ast_sha256": static["child_normalized_ast_sha256"],
                             "input_bytes_after": static["input_bytes_after"],
                             "input_scale": static["input_scale"],
                             "target_delta_bytes": candidate.target_delta_bytes,
@@ -1203,12 +1141,8 @@ def solve_multidim_shape_coverage(
                     decision["attempts"].append(attempt)
 
             if not decision["accepted"]:
-                reasons = [
-                    str(attempt.get("reason")) for attempt in decision["attempts"]
-                ]
-                decision["reason"] = (
-                    reasons[-1] if reasons else "all_candidate_attempts_rejected"
-                )
+                reasons = [str(attempt.get("reason")) for attempt in decision["attempts"]]
+                decision["reason"] = reasons[-1] if reasons else "all_candidate_attempts_rejected"
                 skip_reasons[str(decision["reason"])] += 1
             decisions.append(decision)
 
@@ -1217,20 +1151,11 @@ def solve_multidim_shape_coverage(
         accepted = [decision for decision in decisions if decision["accepted"]]
         if len({decision["parent_uuid"] for decision in accepted}) != len(accepted):
             raise ValueError("more_than_one_accepted_child_per_parent")
-        changed_occurrences = sum(
-            int(_nested(decision, "solver.changed_occurrences", 0))
-            for decision in accepted
-        )
-        power_occurrences = sum(
-            int(_nested(decision, "solver.power_of_two_occurrences", 0))
-            for decision in accepted
-        )
+        changed_occurrences = sum(int(_nested(decision, "solver.changed_occurrences", 0)) for decision in accepted)
+        power_occurrences = sum(int(_nested(decision, "solver.power_of_two_occurrences", 0)) for decision in accepted)
         if accepted and 2 * power_occurrences != changed_occurrences:
             raise ValueError("aggregate_power_of_two_occurrence_contract_failed")
-        if any(
-            int(_nested(decision, "solver.changed_occurrences", 0)) < 2
-            for decision in accepted
-        ):
+        if any(int(_nested(decision, "solver.changed_occurrences", 0)) < 2 for decision in accepted):
             raise ValueError("single_changed_occurrence_contract_failed")
 
         pq.write_table(
@@ -1263,12 +1188,8 @@ def solve_multidim_shape_coverage(
             "generator_version": GENERATOR_VERSION,
             "solver_source_path": str(Path(__file__).resolve()),
             "solver_source_sha256": _sha256_file(Path(__file__)),
-            "v3_helper_source_path": str(
-                (_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()
-            ),
-            "v3_helper_source_sha256": _sha256_file(
-                _REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"
-            ),
+            "v3_helper_source_path": str((_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()),
+            "v3_helper_source_sha256": _sha256_file(_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"),
             "method_boundary": (
                 "one stable-hash Medium/Large target per parent; strict get_inputs "
                 "structural two-slot positive bilinear solver; exactly one new slot "

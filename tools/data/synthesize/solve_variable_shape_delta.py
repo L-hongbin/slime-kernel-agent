@@ -29,7 +29,6 @@ import collections
 import copy
 import dataclasses
 import difflib
-import hashlib
 import itertools
 import json
 import math
@@ -49,7 +48,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.data.synthesize.ai_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.augment_prompt_tasks import _section_hashes, analyze_code  # noqa: E402
+from tools.data.synthesize.shape_contract import (  # noqa: E402
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,
@@ -57,10 +57,6 @@ from tools.data.synthesize.ai_shape_coverage import (  # noqa: E402
     _validate_target_proximity,
     _validate_variant_storage,
     static_gate,
-)
-from tools.data.synthesize.augment_prompt_tasks import (  # noqa: E402
-    _section_hashes,
-    analyze_code,
 )
 from tools.data.synthesize.solve_multidim_shape_coverage import (  # noqa: E402
     TARGET_SCHEMA,
@@ -86,26 +82,17 @@ from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
     _shape_slots_with_rejections,
 )
 
-
 CONTRACT_VERSION = "shape_variable_multislot_solver_v5"
 NONBATCH_CONTRACT_VERSION = "shape_variable_multislot_solver_v6"
 BALANCED_NONBATCH_CONTRACT_VERSION = "shape_variable_multislot_solver_v7"
 GENERATOR_VERSION = "same_factory_product_variable_2_to_5_soft_p2_50_v3"
-NONBATCH_GENERATOR_VERSION = (
-    "same_factory_product_variable_2_to_5_nonleading_no_explicit_batch_soft_p2_50_v1"
-)
-BALANCED_NONBATCH_GENERATOR_VERSION = (
-    "same_factory_product_variable_2_to_5_balanced_nonleading_soft_p2_50_v1"
-)
+NONBATCH_GENERATOR_VERSION = "same_factory_product_variable_2_to_5_nonleading_no_explicit_batch_soft_p2_50_v1"
+BALANCED_NONBATCH_GENERATOR_VERSION = "same_factory_product_variable_2_to_5_balanced_nonleading_soft_p2_50_v1"
 DELTA_SELECTION_CONTRACT_VERSION = "shape_variable_multislot_delta_selection_v1"
 DEFAULT_SELECTED = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318/selected.parquet"
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318/selected.parquet"
 )
-DEFAULT_RUN_DIR = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318"
-)
+DEFAULT_RUN_DIR = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/run.recoverable12318"
 MIN_GROUP_SLOTS = 2
 MAX_GROUP_SLOTS = 5
 MAX_GROUPS_PER_SIZE = 12
@@ -121,17 +108,13 @@ POWER_OF_TWO_PREFERENCE_DENOMINATOR = 2
 TARGET_ERROR_EQUIVALENCE_DENOMINATOR = 1_000
 GENERIC_GROUP_SCOPE = "generic"
 NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE = "nonleading_no_explicit_batch"
-BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE = (
-    "balanced_nonleading_no_explicit_batch"
-)
+BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE = "balanced_nonleading_no_explicit_batch"
 GROUP_SCOPE_CHOICES = (
     GENERIC_GROUP_SCOPE,
     NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
     BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
 )
-EXPLICIT_BATCH_SYMBOLS = frozenset(
-    {"batch_size", "batchsize", "batch", "bs", "n_batch"}
-)
+EXPLICIT_BATCH_SYMBOLS = frozenset({"batch_size", "batchsize", "batch", "bs", "n_batch"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -183,17 +166,12 @@ def _slot_factory_axes(slot: ShapeSlot) -> dict[int, list[int]]:
 
 
 def _group_scope_evidence(slots: Sequence[ShapeSlot]) -> dict[str, Any]:
-    leading_occurrences = sum(
-        occurrence.axis == 0
-        for slot in slots
-        for occurrence in slot.occurrences
-    )
+    leading_occurrences = sum(occurrence.axis == 0 for slot in slots for occurrence in slot.occurrences)
     explicit_batch_symbols = sorted(
         {
             slot.symbol_name.strip().lower()
             for slot in slots
-            if isinstance(slot.symbol_name, str)
-            and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS
+            if isinstance(slot.symbol_name, str) and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS
         }
     )
     return {
@@ -201,9 +179,7 @@ def _group_scope_evidence(slots: Sequence[ShapeSlot]) -> dict[str, Any]:
         "leading_axis_occurrences": leading_occurrences,
         "touches_explicit_batch_symbol": bool(explicit_batch_symbols),
         "explicit_batch_symbols": explicit_batch_symbols,
-        "matches_nonleading_no_explicit_batch": (
-            leading_occurrences == 0 and not explicit_batch_symbols
-        ),
+        "matches_nonleading_no_explicit_batch": (leading_occurrences == 0 and not explicit_batch_symbols),
     }
 
 
@@ -237,11 +213,7 @@ def relaxed_structural_pair(slot_a: ShapeSlot, slot_b: ShapeSlot) -> bool:
 
     if slot_a.slot_id == slot_b.slot_id:
         return False
-    if any(
-        _spans_overlap(left, right)
-        for left in slot_a.patch_spans
-        for right in slot_b.patch_spans
-    ):
+    if any(_spans_overlap(left, right) for left in slot_a.patch_spans for right in slot_b.patch_spans):
         return False
     by_factory_a = _slot_factory_axes(slot_a)
     by_factory_b = _slot_factory_axes(slot_b)
@@ -327,31 +299,20 @@ def variable_slot_group_inventory(
         ranked = sorted(
             by_size.get(size, []),
             key=lambda group: _sha256_bytes(
-                (
-                    f"{parent_uuid}:{size}:"
-                    + ":".join(sorted(profile.slot.slot_id for profile in group))
-                ).encode("utf-8")
+                (f"{parent_uuid}:{size}:" + ":".join(sorted(profile.slot.slot_id for profile in group))).encode(
+                    "utf-8"
+                )
             ),
         )
         if group_scope == GENERIC_GROUP_SCOPE:
             retained = ranked[:MAX_GROUPS_PER_SIZE]
         else:
-            matching = [
-                group
-                for group in ranked
-                if _group_matches_scope(group, group_scope)
-            ]
-            fallback = [
-                group
-                for group in ranked
-                if not _group_matches_scope(group, group_scope)
-            ]
+            matching = [group for group in ranked if _group_matches_scope(group, group_scope)]
+            fallback = [group for group in ranked if not _group_matches_scope(group, group_scope)]
             reserved_general = min(MIN_GENERAL_GROUPS_PER_SIZE, len(fallback))
             maximum_scope = MAX_GROUPS_PER_SIZE - reserved_general
             retained_matching = matching[:maximum_scope]
-            retained_fallback = fallback[
-                : MAX_GROUPS_PER_SIZE - len(retained_matching)
-            ]
+            retained_fallback = fallback[: MAX_GROUPS_PER_SIZE - len(retained_matching)]
             retained = retained_matching + retained_fallback
             key = str(size)
             scope_before_cap[key] = len(matching)
@@ -364,14 +325,10 @@ def variable_slot_group_inventory(
     return result, {
         "scope_group_count_before_cap_by_logical_slot_count": scope_before_cap,
         "scope_group_count_after_cap_by_logical_slot_count": scope_after_cap,
-        "scope_group_count_discarded_by_cap_by_logical_slot_count": (
-            scope_discarded_by_cap
-        ),
+        "scope_group_count_discarded_by_cap_by_logical_slot_count": (scope_discarded_by_cap),
         "general_group_count_before_cap_by_logical_slot_count": general_before_cap,
         "general_group_count_after_cap_by_logical_slot_count": general_after_cap,
-        "general_group_count_discarded_by_cap_by_logical_slot_count": (
-            general_discarded_by_cap
-        ),
+        "general_group_count_discarded_by_cap_by_logical_slot_count": (general_discarded_by_cap),
     }
 
 
@@ -427,7 +384,7 @@ def _product_profile(
         tuple(value + 1 + (index % 2) for index, value in enumerate(old_values)),
     ]
     for values in probes:
-        child = _patch_integer_spans_many(code, tuple(zip(slots, values)))
+        child = _patch_integer_spans_many(code, tuple(zip(slots, values, strict=True)))
         observed = analyze_code(child, entry_point).input_bytes
         if profile.input_bytes(values) != observed:
             raise ValueError("shape_group_storage_is_not_exact_product_affine")
@@ -435,13 +392,8 @@ def _product_profile(
 
 
 def _power_preference(parent_uuid: str, slot_id: str) -> bool:
-    digest = _sha256_bytes(
-        f"shape-variable-p2-v1:{parent_uuid}:{slot_id}".encode("utf-8")
-    )
-    return (
-        int(digest[:16], 16) % POWER_OF_TWO_PREFERENCE_DENOMINATOR
-        < POWER_OF_TWO_PREFERENCE_NUMERATOR
-    )
+    digest = _sha256_bytes(f"shape-variable-p2-v1:{parent_uuid}:{slot_id}".encode())
+    return int(digest[:16], 16) % POWER_OF_TWO_PREFERENCE_DENOMINATOR < POWER_OF_TWO_PREFERENCE_NUMERATOR
 
 
 def _nearest_powers(value: int, minimum: int, maximum: int) -> set[int]:
@@ -480,7 +432,7 @@ def _rounded_nonpivot_value(
                 choices,
                 key=lambda value: (
                     abs(value - rounded),
-                    _sha256_bytes(f"{salt}:{value}".encode("utf-8")),
+                    _sha256_bytes(f"{salt}:{value}".encode()),
                 ),
             )
     if _is_power_of_two(rounded):
@@ -490,7 +442,7 @@ def _rounded_nonpivot_value(
                 alternatives,
                 key=lambda value: (
                     abs(value - rounded),
-                    _sha256_bytes(f"{salt}:{value}".encode("utf-8")),
+                    _sha256_bytes(f"{salt}:{value}".encode()),
                 ),
             )
     return rounded
@@ -510,17 +462,15 @@ def _candidate_from_values(
 ) -> VariableCandidate | None:
     values_tuple = tuple(int(value) for value in values)
     if len(values_tuple) != len(profile.slots) or any(
-        value <= slot.old_value for slot, value in zip(profile.slots, values_tuple)
+        value <= slot.old_value for slot, value in zip(profile.slots, values_tuple, strict=True)
     ):
         rejection_counts["not_a_strict_expansion"] += 1
         return None
     input_bytes_after = profile.input_bytes(values_tuple)
-    assignments = tuple(zip(profile.slots, values_tuple))
+    assignments = tuple(zip(profile.slots, values_tuple, strict=True))
     try:
         _validate_variant_storage(variant, input_bytes_after)
-        relative_error = _validate_target_proximity(
-            input_bytes_after, target_input_bytes
-        )
+        relative_error = _validate_target_proximity(input_bytes_after, target_input_bytes)
         if input_bytes_after < math.ceil(MIN_INPUT_SCALE * parent_input_bytes):
             raise ValueError("minimum_input_growth_not_met")
         child_code = _patch_integer_spans_many(parent_code, assignments)
@@ -537,18 +487,15 @@ def _candidate_from_values(
     changed_occurrences = sum(len(slot.occurrences) for slot in profile.slots)
     power_occurrences = sum(
         len(slot.occurrences)
-        for slot, value in zip(profile.slots, values_tuple)
+        for slot, value in zip(profile.slots, values_tuple, strict=True)
         if _is_power_of_two(value)
     )
     mismatch_occurrences = sum(
         len(slot.occurrences)
-        for slot, value in zip(profile.slots, values_tuple)
+        for slot, value in zip(profile.slots, values_tuple, strict=True)
         if _is_power_of_two(value) != _power_preference(parent_uuid, slot.slot_id)
     )
-    growth = [
-        Fraction(value, slot.old_value)
-        for slot, value in zip(profile.slots, values_tuple)
-    ]
+    growth = [Fraction(value, slot.old_value) for slot, value in zip(profile.slots, values_tuple, strict=True)]
     ratios = [
         Fraction(
             int(factory["largest_dimension"]),
@@ -586,9 +533,7 @@ def _solve_product_profile(
     parent_input_bytes: int,
     rejection_counts: collections.Counter[str],
 ) -> list[VariableCandidate]:
-    storage_lower, storage_upper = _storage_interval(
-        variant, target_input_bytes, parent_input_bytes
-    )
+    storage_lower, storage_upper = _storage_interval(variant, target_input_bytes, parent_input_bytes)
     coefficient = profile.product_coefficient
     desired_product = max(
         1,
@@ -603,8 +548,7 @@ def _solve_product_profile(
         raw_weights: list[float] = []
         for slot in profile.slots:
             digest = _sha256_bytes(
-                f"shape-variable-weight-v1:{parent_uuid}:{allocation_index}:"
-                f"{slot.slot_id}".encode("utf-8")
+                f"shape-variable-weight-v1:{parent_uuid}:{allocation_index}:" f"{slot.slot_id}".encode()
             )
             raw_weights.append(0.85 + (int(digest[:8], 16) % 301) / 1000.0)
         mean_weight = sum(raw_weights) / len(raw_weights)
@@ -613,8 +557,7 @@ def _solve_product_profile(
         pivot_order = sorted(
             range(len(profile.slots)),
             key=lambda index: _sha256_bytes(
-                f"shape-variable-pivot-v1:{parent_uuid}:{allocation_index}:"
-                f"{profile.slots[index].slot_id}".encode("utf-8")
+                f"shape-variable-pivot-v1:{parent_uuid}:{allocation_index}:" f"{profile.slots[index].slot_id}".encode()
             ),
         )
         for pivot_index in pivot_order:
@@ -629,9 +572,7 @@ def _solve_product_profile(
                     prefer_power=_power_preference(parent_uuid, slot.slot_id),
                     salt=f"{parent_uuid}:{allocation_index}:{slot.slot_id}",
                 )
-            nonpivot_product = math.prod(
-                int(value) for value in values if value is not None
-            )
+            nonpivot_product = math.prod(int(value) for value in values if value is not None)
             slope = coefficient * nonpivot_product
             pivot = profile.slots[pivot_index]
             minimum = max(
@@ -656,8 +597,7 @@ def _solve_product_profile(
                 raw_pivots.update(_non_power_near(quotient, minimum, maximum))
             for pivot_value in raw_pivots:
                 complete = tuple(
-                    pivot_value if index == pivot_index else int(value)
-                    for index, value in enumerate(values)
+                    pivot_value if index == pivot_index else int(value) for index, value in enumerate(values)
                 )
                 candidate = _candidate_from_values(
                     parent_code,
@@ -686,9 +626,7 @@ def _candidate_key(candidate: VariableCandidate, parent_uuid: str) -> tuple[Any,
         candidate.target_input_bytes // TARGET_ERROR_EQUIVALENCE_DENOMINATOR,
     )
     identity = ":".join(slot.slot_id for slot in candidate.profile.slots)
-    tie = _sha256_bytes(
-        f"{parent_uuid}:{identity}:{candidate.values}".encode("utf-8")
-    )
+    tie = _sha256_bytes(f"{parent_uuid}:{identity}:{candidate.values}".encode())
     return (
         -len(candidate.profile.slots),
         abs(candidate.target_delta_bytes) // error_bucket,
@@ -702,20 +640,15 @@ def _candidate_key(candidate: VariableCandidate, parent_uuid: str) -> tuple[Any,
 
 def _batch_like_growth_dominates(candidate: VariableCandidate) -> bool:
     growth = [
-        math.log(value / slot.old_value)
-        for slot, value in zip(candidate.profile.slots, candidate.values)
+        math.log(value / slot.old_value) for slot, value in zip(candidate.profile.slots, candidate.values, strict=True)
     ]
     batch_like = [
         any(occurrence.axis == 0 for occurrence in slot.occurrences)
-        or (
-            isinstance(slot.symbol_name, str)
-            and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS
-        )
+        or (isinstance(slot.symbol_name, str) and slot.symbol_name.strip().lower() in EXPLICIT_BATCH_SYMBOLS)
         for slot in candidate.profile.slots
     ]
     return bool(growth) and any(
-        is_batch_like and value >= max(growth)
-        for value, is_batch_like in zip(growth, batch_like)
+        is_batch_like and value >= max(growth) for value, is_batch_like in zip(growth, batch_like, strict=True)
     )
 
 
@@ -727,11 +660,7 @@ def _diverse_candidate_attempts(
     if not candidates:
         return []
     maximum_size = len(candidates[0].profile.slots)
-    maximum_candidates = [
-        candidate
-        for candidate in candidates
-        if len(candidate.profile.slots) == maximum_size
-    ]
+    maximum_candidates = [candidate for candidate in candidates if len(candidate.profile.slots) == maximum_size]
     preferred: list[VariableCandidate] = []
     seen_groups: set[tuple[str, ...]] = set()
     for candidate in maximum_candidates:
@@ -740,11 +669,7 @@ def _diverse_candidate_attempts(
             seen_groups.add(group)
             preferred.append(candidate)
     preferred_ids = {id(candidate) for candidate in preferred}
-    preferred.extend(
-        candidate
-        for candidate in maximum_candidates
-        if id(candidate) not in preferred_ids
-    )
+    preferred.extend(candidate for candidate in maximum_candidates if id(candidate) not in preferred_ids)
     preferred = preferred[:MAX_PREFERRED_CARDINALITY_ATTEMPTS]
 
     fallback: list[VariableCandidate] = []
@@ -757,9 +682,7 @@ def _diverse_candidate_attempts(
         seen_fallback_sizes.add(size)
         fallback.append(candidate)
     selected_ids = preferred_ids | {id(candidate) for candidate in fallback}
-    remaining = [
-        candidate for candidate in candidates if id(candidate) not in selected_ids
-    ]
+    remaining = [candidate for candidate in candidates if id(candidate) not in selected_ids]
     return preferred + fallback + remaining
 
 
@@ -777,29 +700,25 @@ def _ordered_candidate_attempts(
             key=lambda candidate: _candidate_key(candidate, parent_uuid),
         )
         selected = _diverse_candidate_attempts(ranked)[:MAX_CHILD_FAKE_ATTEMPTS]
-        return selected, "generic", {
-            "preference_reason": "generic_ranking",
-            "scope_candidate_count_before_bound": None,
-            "general_candidate_count_before_bound": None,
-            "maximum_scope_logical_slot_count": None,
-            "best_general_batch_like_growth_dominates": None,
-        }
+        return (
+            selected,
+            "generic",
+            {
+                "preference_reason": "generic_ranking",
+                "scope_candidate_count_before_bound": None,
+                "general_candidate_count_before_bound": None,
+                "maximum_scope_logical_slot_count": None,
+                "best_general_batch_like_growth_dominates": None,
+            },
+        )
     if group_scope not in {
         NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
         BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE,
     }:
         raise ValueError(f"unknown_group_scope:{group_scope}")
 
-    matching = [
-        candidate
-        for candidate in candidates
-        if _slots_match_scope(candidate.profile.slots, group_scope)
-    ]
-    fallback = [
-        candidate
-        for candidate in candidates
-        if not _slots_match_scope(candidate.profile.slots, group_scope)
-    ]
+    matching = [candidate for candidate in candidates if _slots_match_scope(candidate.profile.slots, group_scope)]
+    fallback = [candidate for candidate in candidates if not _slots_match_scope(candidate.profile.slots, group_scope)]
 
     def ranked_diverse(values: Sequence[VariableCandidate]) -> list[VariableCandidate]:
         ranked = sorted(
@@ -811,40 +730,40 @@ def _ordered_candidate_attempts(
     ordered_matching = ranked_diverse(matching)
     ordered_fallback = ranked_diverse(fallback)
     if not ordered_matching:
-        return ordered_fallback[:MAX_CHILD_FAKE_ATTEMPTS], "general", {
-            "preference_reason": "no_scope_static_candidate",
-            "scope_candidate_count_before_bound": 0,
-            "general_candidate_count_before_bound": len(ordered_fallback),
-            "maximum_scope_logical_slot_count": None,
-            "best_general_batch_like_growth_dominates": (
-                _batch_like_growth_dominates(ordered_fallback[0])
-                if ordered_fallback
-                else None
-            ),
-        }
+        return (
+            ordered_fallback[:MAX_CHILD_FAKE_ATTEMPTS],
+            "general",
+            {
+                "preference_reason": "no_scope_static_candidate",
+                "scope_candidate_count_before_bound": 0,
+                "general_candidate_count_before_bound": len(ordered_fallback),
+                "maximum_scope_logical_slot_count": None,
+                "best_general_batch_like_growth_dominates": (
+                    _batch_like_growth_dominates(ordered_fallback[0]) if ordered_fallback else None
+                ),
+            },
+        )
     if not ordered_fallback:
-        return ordered_matching[:MAX_CHILD_FAKE_ATTEMPTS], "scope", {
-            "preference_reason": "no_general_static_candidate",
-            "scope_candidate_count_before_bound": len(ordered_matching),
-            "general_candidate_count_before_bound": 0,
-            "maximum_scope_logical_slot_count": max(
-                len(candidate.profile.slots) for candidate in ordered_matching
-            ),
-            "best_general_batch_like_growth_dominates": None,
-        }
+        return (
+            ordered_matching[:MAX_CHILD_FAKE_ATTEMPTS],
+            "scope",
+            {
+                "preference_reason": "no_general_static_candidate",
+                "scope_candidate_count_before_bound": len(ordered_matching),
+                "general_candidate_count_before_bound": 0,
+                "maximum_scope_logical_slot_count": max(
+                    len(candidate.profile.slots) for candidate in ordered_matching
+                ),
+                "best_general_batch_like_growth_dominates": None,
+            },
+        )
 
     prefer_scope = group_scope == NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
-    maximum_scope_size = max(
-        len(candidate.profile.slots) for candidate in ordered_matching
-    )
-    general_batch_like_growth_dominates = _batch_like_growth_dominates(
-        ordered_fallback[0]
-    )
+    maximum_scope_size = max(len(candidate.profile.slots) for candidate in ordered_matching)
+    general_batch_like_growth_dominates = _batch_like_growth_dominates(ordered_fallback[0])
     preference_reason = "strict_scope_preference"
     if group_scope == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE:
-        prefer_scope = (
-            maximum_scope_size >= 3 or general_batch_like_growth_dominates
-        )
+        prefer_scope = maximum_scope_size >= 3 or general_batch_like_growth_dominates
         if maximum_scope_size >= 3:
             preference_reason = "scope_cardinality_at_least_three"
         elif general_batch_like_growth_dominates:
@@ -855,26 +774,20 @@ def _ordered_candidate_attempts(
     secondary = ordered_fallback if prefer_scope else ordered_matching
     selected_preferred = preferred[:MAX_SCOPE_CHILD_FAKE_ATTEMPTS]
     selected_secondary = secondary[:MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS]
-    remaining = MAX_CHILD_FAKE_ATTEMPTS - len(selected_preferred) - len(
-        selected_secondary
-    )
+    remaining = MAX_CHILD_FAKE_ATTEMPTS - len(selected_preferred) - len(selected_secondary)
     if remaining > 0:
-        selected_secondary.extend(
-            secondary[
-                len(selected_secondary) : len(selected_secondary) + remaining
-            ]
-        )
-    return selected_preferred + selected_secondary, (
-        "scope" if prefer_scope else "general"
-    ), {
-        "preference_reason": preference_reason,
-        "scope_candidate_count_before_bound": len(ordered_matching),
-        "general_candidate_count_before_bound": len(ordered_fallback),
-        "maximum_scope_logical_slot_count": maximum_scope_size,
-        "best_general_batch_like_growth_dominates": (
-            general_batch_like_growth_dominates
-        ),
-    }
+        selected_secondary.extend(secondary[len(selected_secondary) : len(selected_secondary) + remaining])
+    return (
+        selected_preferred + selected_secondary,
+        ("scope" if prefer_scope else "general"),
+        {
+            "preference_reason": preference_reason,
+            "scope_candidate_count_before_bound": len(ordered_matching),
+            "general_candidate_count_before_bound": len(ordered_fallback),
+            "maximum_scope_logical_slot_count": maximum_scope_size,
+            "best_general_batch_like_growth_dominates": (general_batch_like_growth_dominates),
+        },
+    )
 
 
 def _slot_assignment_manifest(
@@ -906,16 +819,12 @@ def _candidate_manifest(
         "target_relative_error": candidate.target_relative_error,
         "slots": [
             _slot_assignment_manifest(parent_uuid, slot, value)
-            for slot, value in zip(profile.slots, candidate.values)
+            for slot, value in zip(profile.slots, candidate.values, strict=True)
         ],
         "changed_occurrences": candidate.changed_occurrences,
         "power_of_two_occurrences": candidate.power_of_two_occurrences,
-        "power_of_two_occurrence_fraction": (
-            candidate.power_of_two_occurrences / candidate.changed_occurrences
-        ),
-        "power_of_two_preference_mismatch_occurrences": (
-            candidate.preference_mismatch_occurrences
-        ),
+        "power_of_two_occurrence_fraction": (candidate.power_of_two_occurrences / candidate.changed_occurrences),
+        "power_of_two_preference_mismatch_occurrences": (candidate.preference_mismatch_occurrences),
         "relative_growth_spread": float(candidate.relative_growth_spread),
         "maximum_dimension_ratio": float(candidate.maximum_dimension_ratio),
         "storage_polynomial": {
@@ -939,10 +848,7 @@ def _review_markdown(records: Sequence[Mapping[str, Any]]) -> str:
     for record in records[:MAX_REVIEW_EXAMPLES]:
         lines.extend(
             [
-                (
-                    f"## {record['child_uuid']} ({record['variant']}, "
-                    f"{record['logical_slot_count']} logical slots)"
-                ),
+                (f"## {record['child_uuid']} ({record['variant']}, " f"{record['logical_slot_count']} logical slots)"),
                 "",
                 (
                     f"Parent `{record['parent_uuid']}`; "
@@ -969,9 +875,7 @@ def _review_markdown(records: Sequence[Mapping[str, Any]]) -> str:
 def _delta_selection_rows(selected_path: Path, expected_count: int) -> list[Mapping[str, Any]]:
     selection_path = selected_path.with_name("selection.json")
     if not selection_path.is_file():
-        raise FileNotFoundError(
-            f"variable solver requires the delta selection manifest: {selection_path}"
-        )
+        raise FileNotFoundError(f"variable solver requires the delta selection manifest: {selection_path}")
     loaded = json.loads(selection_path.read_text(encoding="utf-8"))
     if not isinstance(loaded, dict):
         raise ValueError("delta_selection_manifest_must_be_an_object")
@@ -1004,16 +908,12 @@ def solve_variable_shape_delta(
     solver_contract_version = {
         GENERIC_GROUP_SCOPE: CONTRACT_VERSION,
         NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: NONBATCH_CONTRACT_VERSION,
-        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (
-            BALANCED_NONBATCH_CONTRACT_VERSION
-        ),
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (BALANCED_NONBATCH_CONTRACT_VERSION),
     }[group_scope]
     generator_version = {
         GENERIC_GROUP_SCOPE: GENERATOR_VERSION,
         NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: NONBATCH_GENERATOR_VERSION,
-        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (
-            BALANCED_NONBATCH_GENERATOR_VERSION
-        ),
+        BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE: (BALANCED_NONBATCH_GENERATOR_VERSION),
     }[group_scope]
     scoped_mode = group_scope != GENERIC_GROUP_SCOPE
 
@@ -1024,9 +924,7 @@ def solve_variable_shape_delta(
     selection_rows = source_selection_rows[: len(rows)]
     final_paths = _run_paths(run_dir.resolve())
     run_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent)
-    )
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent))
     temporary_paths = _run_paths(temporary_dir)
     temporary_paths.children.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths.review.parent.mkdir(parents=True, exist_ok=True)
@@ -1057,13 +955,9 @@ def solve_variable_shape_delta(
             "selected_count": len(rows),
             "rows": selection_rows,
         }
-        temporary_paths.selection.write_text(
-            json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        temporary_paths.selection.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
-        for source_row_index, (parent, selection_row) in enumerate(
-            zip(rows, selection_rows)
-        ):
+        for source_row_index, (parent, selection_row) in enumerate(zip(rows, selection_rows, strict=True)):
             counters["parents_scanned"] += 1
             parent_uuid = str(_nested(parent, "extra_info.uuid", ""))
             parent_code = _nested(parent, "reward_model.ground_truth")
@@ -1077,9 +971,7 @@ def solve_variable_shape_delta(
             if delta.get("parent_reference_sha256") != parent_reference_hash:
                 raise ValueError(f"delta_selection_reference_mismatch:{source_row_index}")
             parent_analysis = analyze_code(parent_code, entry_point)
-            variant, target, lower_mib, upper_mib = _variant_and_target(
-                parent_uuid, parent_analysis.input_bytes
-            )
+            variant, target, lower_mib, upper_mib = _variant_and_target(parent_uuid, parent_analysis.input_bytes)
             if variant != delta.get("variant") or target != int(delta["target_input_bytes"]):
                 raise ValueError(f"delta_selection_target_mismatch:{source_row_index}")
             target_record = {
@@ -1121,25 +1013,17 @@ def solve_variable_shape_delta(
                 "accepted": False,
                 "parent_fake_gate": parent_fake.as_dict(),
                 "group_scope_mode": group_scope,
-                "group_scope_status": (
-                    "not_evaluated_parent_fake_failed"
-                    if scoped_mode
-                    else "not_applicable"
-                ),
+                "group_scope_status": ("not_evaluated_parent_fake_failed" if scoped_mode else "not_applicable"),
                 "attempts": [],
             }
             if not parent_fake.passed:
-                decision["reason"] = (
-                    f"parent_fake_gate_{parent_fake.status}:{parent_fake.reason}"
-                )
+                decision["reason"] = f"parent_fake_gate_{parent_fake.status}:{parent_fake.reason}"
                 skip_reasons[str(decision["reason"])] += 1
                 decisions.append(decision)
                 continue
 
             try:
-                slots, guard_rejections = _shape_slots_with_rejections(
-                    parent_code, entry_point
-                )
+                slots, guard_rejections = _shape_slots_with_rejections(parent_code, entry_point)
                 affine_profiles, affine_rejections = _affine_profiles(
                     parent_code,
                     entry_point,
@@ -1185,19 +1069,11 @@ def solve_variable_shape_delta(
                 product_profiles = []
                 guard_rejections = []
                 affine_rejections = []
-                product_rejections = [
-                    {"slot_ids": [], "reason": f"{type(exc).__name__}:{exc}"}
-                ]
+                product_rejections = [{"slot_ids": [], "reason": f"{type(exc).__name__}:{exc}"}]
             group_counts = collections.Counter(len(group) for group in groups)
-            profile_counts = collections.Counter(
-                len(profile.slots) for profile in product_profiles
-            )
+            profile_counts = collections.Counter(len(profile.slots) for profile in product_profiles)
             scope_group_counts = (
-                collections.Counter(
-                    len(group)
-                    for group in groups
-                    if _group_matches_scope(group, group_scope)
-                )
+                collections.Counter(len(group) for group in groups if _group_matches_scope(group, group_scope))
                 if scoped_mode
                 else collections.Counter()
             )
@@ -1212,17 +1088,11 @@ def solve_variable_shape_delta(
             )
             decision.update(
                 {
-                    "group_scope_status": (
-                        "evaluated" if scoped_mode else "not_applicable"
-                    ),
+                    "group_scope_status": ("evaluated" if scoped_mode else "not_applicable"),
                     "slot_count": len(slots),
                     "affine_slot_count": len(affine_profiles),
-                    "maximum_compatible_logical_slot_count": max(
-                        group_counts, default=0
-                    ),
-                    "maximum_product_profile_logical_slot_count": max(
-                        profile_counts, default=0
-                    ),
+                    "maximum_compatible_logical_slot_count": max(group_counts, default=0),
+                    "maximum_product_profile_logical_slot_count": max(profile_counts, default=0),
                     "variable_group_count_by_logical_slot_count": {
                         str(key): value for key, value in sorted(group_counts.items())
                     },
@@ -1230,12 +1100,10 @@ def solve_variable_shape_delta(
                         str(key): value for key, value in sorted(profile_counts.items())
                     },
                     "scope_matching_group_count_by_logical_slot_count": {
-                        str(key): value
-                        for key, value in sorted(scope_group_counts.items())
+                        str(key): value for key, value in sorted(scope_group_counts.items())
                     },
                     "scope_matching_product_profile_count_by_logical_slot_count": {
-                        str(key): value
-                        for key, value in sorted(scope_profile_counts.items())
+                        str(key): value for key, value in sorted(scope_profile_counts.items())
                     },
                     **group_scope_inventory,
                     "slot_rejections": guard_rejections + affine_rejections,
@@ -1267,16 +1135,11 @@ def solve_variable_shape_delta(
             counters["static_solved_candidates"] += len(candidates)
             decision["static_solved_candidate_count"] = len(candidates)
             scope_candidate_count = (
-                sum(
-                    _slots_match_scope(candidate.profile.slots, group_scope)
-                    for candidate in candidates
-                )
+                sum(_slots_match_scope(candidate.profile.slots, group_scope) for candidate in candidates)
                 if scoped_mode
                 else 0
             )
-            decision["scope_matching_static_solved_candidate_count"] = (
-                scope_candidate_count
-            )
+            decision["scope_matching_static_solved_candidate_count"] = scope_candidate_count
             (
                 candidates,
                 preferred_attempt_lane,
@@ -1290,18 +1153,13 @@ def solve_variable_shape_delta(
             decision["preferred_attempt_lane"] = preferred_attempt_lane
             decision["attempt_plan_evidence"] = attempt_plan_evidence
             decision["scope_candidate_attempt_count"] = sum(
-                scoped_mode
-                and _slots_match_scope(candidate.profile.slots, group_scope)
-                for candidate in candidates
+                scoped_mode and _slots_match_scope(candidate.profile.slots, group_scope) for candidate in candidates
             )
             decision["general_fallback_candidate_attempt_count"] = sum(
-                scoped_mode
-                and not _slots_match_scope(candidate.profile.slots, group_scope)
+                scoped_mode and not _slots_match_scope(candidate.profile.slots, group_scope)
                 for candidate in candidates
             )
-            decision["candidate_rejection_counts"] = dict(
-                sorted(candidate_rejections.items())
-            )
+            decision["candidate_rejection_counts"] = dict(sorted(candidate_rejections.items()))
             for reason, count in candidate_rejections.items():
                 counters[f"candidate_rejection:{reason}"] += count
             if not candidates:
@@ -1313,33 +1171,19 @@ def solve_variable_shape_delta(
             parent_sections = _section_hashes(ast.parse(parent_code), entry_point)
             for attempt_index, candidate in enumerate(candidates):
                 attempt = _candidate_manifest(parent_uuid, candidate)
-                attempt_scope_match = (
-                    _slots_match_scope(candidate.profile.slots, group_scope)
-                    if scoped_mode
-                    else None
-                )
+                attempt_scope_match = _slots_match_scope(candidate.profile.slots, group_scope) if scoped_mode else None
                 attempt["attempt_index"] = attempt_index
-                attempt_lane = (
-                    "scope"
-                    if attempt_scope_match
-                    else ("general" if scoped_mode else "generic")
-                )
+                attempt_lane = "scope" if attempt_scope_match else ("general" if scoped_mode else "generic")
                 attempt["attempt_lane"] = attempt_lane
                 try:
-                    child_sections = _section_hashes(
-                        ast.parse(candidate.child_code), entry_point
-                    )
+                    child_sections = _section_hashes(ast.parse(candidate.child_code), entry_point)
                     if parent_sections != child_sections:
                         raise ValueError("model_or_get_init_inputs_changed")
-                    static = static_gate(
-                        parent_code, candidate.child_code, entry_point
-                    )
+                    static = static_gate(parent_code, candidate.child_code, entry_point)
                     if int(static["input_bytes_after"]) != candidate.input_bytes_after:
                         raise ValueError("static_gate_storage_mismatch")
                     _validate_variant_storage(variant, candidate.input_bytes_after)
-                    relative_error = _validate_target_proximity(
-                        candidate.input_bytes_after, target
-                    )
+                    relative_error = _validate_target_proximity(candidate.input_bytes_after, target)
                     fake = _fake_tensor_gate(
                         candidate.child_code,
                         entry_point,
@@ -1360,29 +1204,18 @@ def solve_variable_shape_delta(
                     used_group_scope_fallback = bool(
                         scoped_mode
                         and not selected_scope_match
-                        and (
-                            preferred_attempt_lane == "scope"
-                            or scope_candidate_count == 0
-                        )
+                        and (preferred_attempt_lane == "scope" or scope_candidate_count == 0)
                     )
                     group_scope_fallback_reason = None
                     if used_group_scope_fallback:
                         if not scope_group_counts:
-                            group_scope_fallback_reason = (
-                                "no_compatible_scope_group"
-                            )
+                            group_scope_fallback_reason = "no_compatible_scope_group"
                         elif not scope_profile_counts:
-                            group_scope_fallback_reason = (
-                                "no_exact_scope_product_profile"
-                            )
+                            group_scope_fallback_reason = "no_exact_scope_product_profile"
                         elif scope_candidate_count == 0:
-                            group_scope_fallback_reason = (
-                                "no_scope_static_solution"
-                            )
+                            group_scope_fallback_reason = "no_scope_static_solution"
                         else:
-                            group_scope_fallback_reason = (
-                                "scope_candidate_attempts_exhausted"
-                            )
+                            group_scope_fallback_reason = "scope_candidate_attempts_exhausted"
                     children.append(child)
                     paired.extend((copy.deepcopy(parent), child))
                     decision.update(
@@ -1390,27 +1223,21 @@ def solve_variable_shape_delta(
                             "accepted": True,
                             "child_uuid": child_uuid,
                             "child_reference_sha256": static["child_reference_sha256"],
-                            "child_normalized_ast_sha256": static[
-                                "child_normalized_ast_sha256"
-                            ],
+                            "child_normalized_ast_sha256": static["child_normalized_ast_sha256"],
                             "input_bytes_after": static["input_bytes_after"],
                             "input_scale": static["input_scale"],
                             "target_delta_bytes": candidate.target_delta_bytes,
                             "target_relative_error": relative_error,
                             "solver": solver_evidence,
                             "fake_gate": fake.as_dict(),
-                            "selected_logical_slot_count": len(
-                                candidate.profile.slots
-                            ),
+                            "selected_logical_slot_count": len(candidate.profile.slots),
                             "selected_group_scope_match": selected_scope_match,
                             "selected_candidate_attempt_index": attempt_index,
                             "used_group_scope_fallback": used_group_scope_fallback,
                             "used_preferred_attempt_lane_fallback": (
                                 preferred_attempt_lane not in {"generic", attempt_lane}
                             ),
-                            "group_scope_fallback_reason": (
-                                group_scope_fallback_reason
-                            ),
+                            "group_scope_fallback_reason": (group_scope_fallback_reason),
                             "preferred_attempt_lane_fallback_reason": (
                                 None
                                 if preferred_attempt_lane in {"generic", attempt_lane}
@@ -1421,20 +1248,11 @@ def solve_variable_shape_delta(
                                 )
                             ),
                             "used_smaller_compatible_group_fallback": (
-                                len(candidate.profile.slots)
-                                < int(
-                                    decision[
-                                        "maximum_compatible_logical_slot_count"
-                                    ]
-                                )
+                                len(candidate.profile.slots) < int(decision["maximum_compatible_logical_slot_count"])
                             ),
                             "used_smaller_product_profile_fallback": (
                                 len(candidate.profile.slots)
-                                < int(
-                                    decision[
-                                        "maximum_product_profile_logical_slot_count"
-                                    ]
-                                )
+                                < int(decision["maximum_product_profile_logical_slot_count"])
                             ),
                         }
                     )
@@ -1453,14 +1271,10 @@ def solve_variable_shape_delta(
                     )
                     counters[f"accepted_{variant}"] += 1
                     accepted_lane = (
-                        "generic"
-                        if not scoped_mode
-                        else ("scope_match" if selected_scope_match else "general")
+                        "generic" if not scoped_mode else ("scope_match" if selected_scope_match else "general")
                     )
                     counters[f"accepted_{accepted_lane}"] += 1
-                    counters[
-                        f"accepted_logical_slot_count_{len(candidate.profile.slots)}"
-                    ] += 1
+                    counters[f"accepted_logical_slot_count_{len(candidate.profile.slots)}"] += 1
                     break
                 except (SyntaxError, TypeError, ValueError) as exc:
                     attempt["accepted"] = False
@@ -1469,12 +1283,8 @@ def solve_variable_shape_delta(
                     decision["attempts"].append(attempt)
 
             if not decision["accepted"]:
-                reasons = [
-                    str(attempt.get("reason")) for attempt in decision["attempts"]
-                ]
-                decision["reason"] = (
-                    reasons[-1] if reasons else "all_candidate_attempts_rejected"
-                )
+                reasons = [str(attempt.get("reason")) for attempt in decision["attempts"]]
+                decision["reason"] = reasons[-1] if reasons else "all_candidate_attempts_rejected"
                 skip_reasons[str(decision["reason"])] += 1
             decisions.append(decision)
 
@@ -1483,26 +1293,12 @@ def solve_variable_shape_delta(
         accepted = [decision for decision in decisions if decision["accepted"]]
         if len({decision["parent_uuid"] for decision in accepted}) != len(accepted):
             raise ValueError("more_than_one_accepted_child_per_parent")
-        if any(
-            int(_nested(decision, "solver.changed_occurrences", 0)) < 2
-            for decision in accepted
-        ):
+        if any(int(_nested(decision, "solver.changed_occurrences", 0)) < 2 for decision in accepted):
             raise ValueError("single_changed_occurrence_contract_failed")
-        changed_occurrences = sum(
-            int(_nested(decision, "solver.changed_occurrences", 0))
-            for decision in accepted
-        )
-        power_occurrences = sum(
-            int(_nested(decision, "solver.power_of_two_occurrences", 0))
-            for decision in accepted
-        )
-        observed_power_fraction = (
-            power_occurrences / changed_occurrences if changed_occurrences else None
-        )
-        static_power_range_passed = (
-            observed_power_fraction is not None
-            and 0.30 <= observed_power_fraction <= 0.50
-        )
+        changed_occurrences = sum(int(_nested(decision, "solver.changed_occurrences", 0)) for decision in accepted)
+        power_occurrences = sum(int(_nested(decision, "solver.power_of_two_occurrences", 0)) for decision in accepted)
+        observed_power_fraction = power_occurrences / changed_occurrences if changed_occurrences else None
+        static_power_range_passed = observed_power_fraction is not None and 0.30 <= observed_power_fraction <= 0.50
 
         pq.write_table(
             pa.Table.from_pylist(targets, schema=TARGET_SCHEMA),
@@ -1520,9 +1316,7 @@ def solve_variable_shape_delta(
             temporary_paths.paired,
             compression="zstd",
         )
-        temporary_paths.review.write_text(
-            _review_markdown(review_records), encoding="utf-8"
-        )
+        temporary_paths.review.write_text(_review_markdown(review_records), encoding="utf-8")
 
         counters["parents_with_children"] = len(accepted)
         counters["children_written"] = len(children)
@@ -1533,27 +1327,17 @@ def solve_variable_shape_delta(
             "generator_version": generator_version,
             "solver_source_path": str(Path(__file__).resolve()),
             "solver_source_sha256": _sha256_file(Path(__file__)),
-            "v3_helper_source_path": str(
-                (_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()
-            ),
-            "v3_helper_source_sha256": _sha256_file(
-                _REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"
-            ),
+            "v3_helper_source_path": str((_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()),
+            "v3_helper_source_sha256": _sha256_file(_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"),
             "dependency_source_contract": {
                 "solve_multidim_shape_coverage_path": str(
-                    (
-                        _REPO_ROOT
-                        / "tools/data/synthesize/solve_multidim_shape_coverage.py"
-                    ).resolve()
+                    (_REPO_ROOT / "tools/data/synthesize/solve_multidim_shape_coverage.py").resolve()
                 ),
                 "solve_multidim_shape_coverage_sha256": _sha256_file(
-                    _REPO_ROOT
-                    / "tools/data/synthesize/solve_multidim_shape_coverage.py"
+                    _REPO_ROOT / "tools/data/synthesize/solve_multidim_shape_coverage.py"
                 ),
                 "solve_shape_coverage_path": str(
-                    (
-                        _REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"
-                    ).resolve()
+                    (_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()
                 ),
                 "solve_shape_coverage_sha256": _sha256_file(
                     _REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"
@@ -1592,13 +1376,11 @@ def solve_variable_shape_delta(
                 "logical_slot_count_range": [MIN_GROUP_SLOTS, MAX_GROUP_SLOTS],
                 "preference": (
                     "scope match first, then largest supported structural group"
-                    if group_scope
-                    == NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                    if group_scope == NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
                     else (
                         "preserve scope groups with at least three slots; prefer a "
                         "two-slot scope group only when general batch-like growth dominates"
-                        if group_scope
-                        == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                        if group_scope == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
                         else "largest supported structural group first"
                     )
                 ),
@@ -1620,8 +1402,7 @@ def solve_variable_shape_delta(
                 "balanced_two_slot_scope_preference": (
                     "prefer scope when the best general candidate has a leading-axis "
                     "or explicit-batch slot tied for maximum logical log growth"
-                    if group_scope
-                    == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
+                    if group_scope == BALANCED_NONLEADING_NO_EXPLICIT_BATCH_GROUP_SCOPE
                     else None
                 ),
                 "explicit_batch_symbols": sorted(EXPLICIT_BATCH_SYMBOLS),
@@ -1641,9 +1422,7 @@ def solve_variable_shape_delta(
                     MAX_SCOPE_CHILD_FAKE_ATTEMPTS if scoped_mode else None
                 ),
                 "reserved_secondary_lane_attempts_when_both_lanes_exist": (
-                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS
-                    if scoped_mode
-                    else None
+                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS if scoped_mode else None
                 ),
                 "one_child_per_parent": True,
                 "attempt_plan_evidence_fields": [
@@ -1670,8 +1449,7 @@ def solve_variable_shape_delta(
                 "constructed_single_changed_occurrence_child_fraction": 0.0,
                 "power_of_two_occurrence_fraction_range": [0.30, 0.50],
                 "power_of_two_soft_preference_probability": (
-                    POWER_OF_TWO_PREFERENCE_NUMERATOR
-                    / POWER_OF_TWO_PREFERENCE_DENOMINATOR
+                    POWER_OF_TWO_PREFERENCE_NUMERATOR / POWER_OF_TWO_PREFERENCE_DENOMINATOR
                 ),
                 "preference_independence_key": "parent_uuid + logical_slot_id",
                 "per_child_power_of_two_constraint": None,
@@ -1688,8 +1466,7 @@ def solve_variable_shape_delta(
             "candidate_ranking_contract": [
                 *(
                     ["contract-selected preferred lane before bounded secondary lane"]
-                    if group_scope
-                    != GENERIC_GROUP_SCOPE
+                    if group_scope != GENERIC_GROUP_SCOPE
                     else []
                 ),
                 "larger_logical_slot_count",
@@ -1716,9 +1493,7 @@ def solve_variable_shape_delta(
                     MAX_SCOPE_CHILD_FAKE_ATTEMPTS if scoped_mode else None
                 ),
                 "secondary_lane_attempt_reservation_when_both_lanes_exist": (
-                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS
-                    if scoped_mode
-                    else None
+                    MAX_SCOPE_FALLBACK_CHILD_FAKE_ATTEMPTS if scoped_mode else None
                 ),
             },
             "selected_source": str(selected_path.resolve()),
@@ -1746,9 +1521,7 @@ def solve_variable_shape_delta(
             "training_approved": False,
             "decisions": decisions,
         }
-        temporary_paths.manifest.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        temporary_paths.manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_dir, run_dir)
         return manifest
     except BaseException:

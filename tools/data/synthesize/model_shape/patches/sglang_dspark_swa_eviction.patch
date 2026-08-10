@@ -1,0 +1,20 @@
+diff --git a/python/sglang/srt/speculative/dflash_info_v2.py b/python/sglang/srt/speculative/dflash_info_v2.py
+--- a/python/sglang/srt/speculative/dflash_info_v2.py
++++ b/python/sglang/srt/speculative/dflash_info_v2.py
+@@ -125,6 +125,8 @@ class DFlashDraftInputV2(SpecInput):
+         lags by one iteration; keep it separate from the reserved upper bound that backs
+         the overallocated mapping.
+         """
++        batch.maybe_evict_swa()
++
+         plan_stream, plan_stream_ctx = _get_overlap_plan_stream(batch.device)
+
+         bs = batch.batch_size()
+@@ -232,6 +234,7 @@ class DFlashDraftInputV2(SpecInput):
+         # reclaim any DFLASH over-allocation if the request finishes later.
+         for i, req in enumerate(batch.reqs):
+             req.kv_allocated_len = max(req.kv_allocated_len, int(nxt_kv_lens_cpu_t[i]))
++            req.decode_batch_idx += 1
+
+         # Seed committed; overlap's resolve overwrites it with the published value.
+         batch.seq_lens_cpu = batch_seq_lens_cpu_t

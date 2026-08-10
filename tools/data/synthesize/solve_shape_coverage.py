@@ -33,8 +33,8 @@ import json
 import logging
 import math
 import os
-import signal
 import shutil
+import signal
 import sys
 import tempfile
 from collections.abc import Mapping, Sequence
@@ -49,7 +49,18 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.data.cleaning.pipeline import inspect_row_schema
-from tools.data.synthesize.ai_shape_coverage import (
+from tools.data.synthesize.augment_prompt_tasks import (
+    _SHAPE_FACTORIES,
+    _call_name,
+    _factory_records,
+    _module_constant_environment,
+    _replace_reference,
+    _section_hashes,
+    _shape_nodes,
+    _top_level_function,
+    analyze_code,
+)
+from tools.data.synthesize.shape_contract import (
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,
@@ -60,25 +71,10 @@ from tools.data.synthesize.ai_shape_coverage import (
     _validate_variant_storage,
     static_gate,
 )
-from tools.data.synthesize.augment_prompt_tasks import (
-    _SHAPE_FACTORIES,
-    _call_name,
-    _factory_records,
-    _module_constant_environment,
-    _normalized_ast_sha256,
-    _replace_reference,
-    _section_hashes,
-    _shape_nodes,
-    _top_level_function,
-    analyze_code,
-)
 
 CONTRACT_VERSION = "shape_affine_solver_v3"
 GENERATOR_VERSION = "whole_dimension_fixed_record_balance_solver_guard_fakecopy_timeout_v6"
-DEFAULT_SELECTED = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000/selected.parquet"
-)
+DEFAULT_SELECTED = _REPO_ROOT / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000/selected.parquet"
 DEFAULT_RUN_DIR = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_random_targets_v3/run.1000"
 DEFAULT_TARGET_MAP_SHA256 = "b60b37a5f0f43e752575ae7cec760ba82e864ef2b854deccf4dc0673c721be0f"
 VARIANTS = ("medium", "large")
@@ -211,6 +207,23 @@ class FakeGateResult:
 
 
 @dataclasses.dataclass(frozen=True)
+class FakeInputProfileResult:
+    status: str
+    input_bytes: int | None = None
+    tensor_count: int = 0
+    tensors: tuple[tuple[tuple[int, ...], str, int], ...] = ()
+    reason: str | None = None
+    exception_type: str | None = None
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "passed"
+
+    def as_dict(self) -> dict[str, Any]:
+        return dataclasses.asdict(self)
+
+
+@dataclasses.dataclass(frozen=True)
 class _FakeGateRuntime:
     torch: Any
     fake_copy_mode_type: Any
@@ -289,10 +302,9 @@ def _sha256_file(path: Path) -> str:
 
 
 def _logical_target_map_sha256(records: Sequence[Mapping[str, Any]]) -> str:
-    canonical = "".join(
-        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        for record in records
-    ).encode("utf-8")
+    canonical = "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records).encode(
+        "utf-8"
+    )
     return _sha256_bytes(canonical)
 
 
@@ -320,8 +332,36 @@ def _direct_name_assignment(
     tree: ast.Module,
     get_inputs: ast.FunctionDef,
     name: str,
+    *,
+    allow_destructuring: bool = False,
 ) -> tuple[str, ast.Constant] | None:
-    """Find one literal assignment without changing expression topology."""
+    """Find one literal binding without changing expression topology.
+
+    The opt-in model lane also recognizes tuple unpacking (for example
+    ``height, width = 32, 32``).  Historical static-solver callers retain the
+    narrower simple-assignment behavior by default.
+    """
+
+    def bound_literal(target: ast.AST, value: ast.AST) -> ast.Constant | None:
+        if isinstance(target, ast.Name):
+            if target.id == name and _positive_integer_constant(value) is not None:
+                assert isinstance(value, ast.Constant)
+                return value
+            return None
+        if (
+            allow_destructuring
+            and isinstance(target, (ast.Tuple, ast.List))
+            and isinstance(value, (ast.Tuple, ast.List))
+        ):
+            if len(target.elts) != len(value.elts):
+                return None
+            matches = [
+                match
+                for target_item, value_item in zip(target.elts, value.elts, strict=True)
+                if (match := bound_literal(target_item, value_item)) is not None
+            ]
+            return matches[0] if len(matches) == 1 else None
+        return None
 
     def direct_matches(statements: Sequence[ast.stmt]) -> list[ast.Constant]:
         matches: list[ast.Constant] = []
@@ -332,9 +372,10 @@ def _direct_name_assignment(
                 target, value = statement.targets[0], statement.value
             elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
                 target, value = statement.target, statement.value
-            if isinstance(target, ast.Name) and target.id == name and _positive_integer_constant(value) is not None:
-                assert isinstance(value, ast.Constant)
-                matches.append(value)
+            if target is not None and value is not None:
+                match = bound_literal(target, value)
+                if match is not None:
+                    matches.append(match)
         return matches
 
     local_stores = [
@@ -364,7 +405,11 @@ def _slot_id(kind: str, old_value: int, spans: Sequence[SourceSpan]) -> str:
     return f"slot_{_sha256_bytes(encoded)[:16]}"
 
 
-def _raw_shape_slots(code: str) -> list[ShapeSlot]:
+def _raw_shape_slots(
+    code: str,
+    *,
+    allow_coupled_consumers: bool = False,
+) -> list[ShapeSlot]:
     """Return fail-closed whole-dimension literals and linked name slots."""
 
     tree = ast.parse(code)
@@ -436,28 +481,34 @@ def _raw_shape_slots(code: str) -> list[ShapeSlot]:
         )
 
     for name, named_occurrences in names.items():
-        assignment = _direct_name_assignment(tree, get_inputs, name)
+        assignment = _direct_name_assignment(
+            tree,
+            get_inputs,
+            name,
+            allow_destructuring=allow_coupled_consumers,
+        )
         if assignment is None:
             continue
         scope, value_node = assignment
         old_value = _positive_integer_constant(value_node)
         assert old_value is not None
         allowed_load_ids = {id(node) for node, _ in named_occurrences}
-        get_inputs_loads = [
-            node
-            for node in ast.walk(get_inputs)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name
-        ]
-        if any(id(node) not in allowed_load_ids for node in get_inputs_loads):
-            continue
-        if scope == "module":
-            tree_loads = [
+        if not allow_coupled_consumers:
+            get_inputs_loads = [
                 node
-                for node in ast.walk(tree)
+                for node in ast.walk(get_inputs)
                 if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name
             ]
-            if any(id(node) not in allowed_load_ids for node in tree_loads):
+            if any(id(node) not in allowed_load_ids for node in get_inputs_loads):
                 continue
+            if scope == "module":
+                tree_loads = [
+                    node
+                    for node in ast.walk(tree)
+                    if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == name
+                ]
+                if any(id(node) not in allowed_load_ids for node in tree_loads):
+                    continue
         patch_span = SourceSpan.from_node(value_node)
         slots.append(
             ShapeSlot(
@@ -500,9 +551,7 @@ def _subscript_axis_component(
 ) -> ast.AST | None:
     """Map a direct subscript component to a tensor axis, if unambiguous."""
 
-    components = (
-        list(slice_node.elts) if isinstance(slice_node, ast.Tuple) else [slice_node]
-    )
+    components = list(slice_node.elts) if isinstance(slice_node, ast.Tuple) else [slice_node]
     ellipses = [
         index
         for index, component in enumerate(components)
@@ -512,21 +561,14 @@ def _subscript_axis_component(
         return None
 
     def consumes_axis(component: ast.AST) -> bool:
-        return not (
-            isinstance(component, ast.Constant)
-            and (component.value is None or component.value is Ellipsis)
-        )
+        return not (isinstance(component, ast.Constant) and (component.value is None or component.value is Ellipsis))
 
     explicit_axes = sum(consumes_axis(component) for component in components)
     if explicit_axes > rank:
         return None
     if ellipses:
         expansion = rank - explicit_axes
-        expanded = (
-            components[: ellipses[0]]
-            + [ast.Slice()] * expansion
-            + components[ellipses[0] + 1 :]
-        )
+        expanded = components[: ellipses[0]] + [ast.Slice()] * expansion + components[ellipses[0] + 1 :]
     else:
         expanded = components + [ast.Slice()] * (rank - explicit_axes)
 
@@ -548,18 +590,13 @@ def _returned_factory_parameters(
 ) -> dict[int, str]:
     """Map simple returned factory origins to positional ``forward`` args."""
 
-    model_classes = [
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == entry_point
-    ]
+    model_classes = [node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == entry_point]
     if len(model_classes) != 1:
         return {}
     forwards = [
         node
         for node in model_classes[0].body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name == "forward"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
     ]
     if len(forwards) != 1:
         return {}
@@ -636,18 +673,12 @@ def _fixed_record_axes(
         ),
         key=lambda node: (node.lineno, node.col_offset),
     )
-    factory_parameters = _returned_factory_parameters(
-        tree, get_inputs_node, entry_point, calls
-    )
+    factory_parameters = _returned_factory_parameters(tree, get_inputs_node, entry_point, calls)
     if not factory_parameters:
         return {}
 
     model = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == entry_point
-        ),
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == entry_point),
         None,
     )
     if model is None:
@@ -656,16 +687,13 @@ def _fixed_record_axes(
         (
             node
             for node in model.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "forward"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
         ),
         None,
     )
     if forward is None:
         return {}
-    parents = {
-        id(child): node for node in ast.walk(forward) for child in ast.iter_child_nodes(node)
-    }
+    parents = {id(child): node for node in ast.walk(forward) for child in ast.iter_child_nodes(node)}
 
     axis_shapes: dict[tuple[int, int], tuple[int, int, str]] = {}
     for slot in slots:
@@ -681,18 +709,14 @@ def _fixed_record_axes(
     fixed_axes: dict[tuple[int, int], dict[str, Any]] = {}
     for key, (rank, old_value, parameter) in axis_shapes.items():
         if any(
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Store)
-            and node.id == parameter
+            isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store) and node.id == parameter
             for node in ast.walk(forward)
         ):
             continue
         loads = [
             node
             for node in ast.walk(forward)
-            if isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and node.id == parameter
+            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == parameter
         ]
         if not loads:
             continue
@@ -703,9 +727,7 @@ def _fixed_record_axes(
             if not isinstance(parent, ast.Subscript) or parent.value is not load:
                 all_uses_fixed = False
                 break
-            component = _subscript_axis_component(
-                parent.slice, rank=rank, axis=key[1]
-            )
+            component = _subscript_axis_component(parent.slice, rank=rank, axis=key[1])
             index = _integer_constant(component) if component is not None else None
             if index is None or not -old_value <= index < old_value:
                 all_uses_fixed = False
@@ -726,8 +748,13 @@ def _fixed_record_axes(
 def _shape_slots_with_rejections(
     code: str,
     entry_point: str,
+    *,
+    allow_coupled_consumers: bool = False,
 ) -> tuple[list[ShapeSlot], list[dict[str, Any]]]:
-    slots = _raw_shape_slots(code)
+    slots = _raw_shape_slots(
+        code,
+        allow_coupled_consumers=allow_coupled_consumers,
+    )
     fixed_axes = _fixed_record_axes(code, entry_point, slots)
     accepted: list[ShapeSlot] = []
     rejected: list[dict[str, Any]] = []
@@ -774,9 +801,7 @@ def _affected_shape_balance_guard(
         "resolved": False,
         "reason": None,
         "ratio_limit": MAX_DIMENSION_IMBALANCE_RATIO,
-        "comparison": (
-            "largest_dimension <= 1000 * second_largest_dimension"
-        ),
+        "comparison": ("largest_dimension <= 1000 * second_largest_dimension"),
         "expected_slot_value": expected_slot_value,
         "affected_occurrence_count": len(slot.occurrences),
         "affected_factory_count": len(affected_axes),
@@ -796,8 +821,7 @@ def _affected_shape_balance_guard(
             (
                 node
                 for node in ast.walk(get_inputs_node)
-                if isinstance(node, ast.Call)
-                and _call_name(node.func) in _SHAPE_FACTORIES
+                if isinstance(node, ast.Call) and _call_name(node.func) in _SHAPE_FACTORIES
             ),
             key=lambda node: (node.lineno, node.col_offset),
         )
@@ -810,16 +834,12 @@ def _affected_shape_balance_guard(
         for record in records:
             location = (record.line_number, record.column_offset)
             if location in records_by_location:
-                raise ValueError(
-                    f"duplicate_direct_factory_location:{location[0]}:{location[1]}"
-                )
+                raise ValueError(f"duplicate_direct_factory_location:{location[0]}:{location[1]}")
             records_by_location[location] = record
 
         for factory_index in sorted(affected_axes):
             if not 0 <= factory_index < len(calls):
-                raise ValueError(
-                    f"affected_factory_index_out_of_range:{factory_index}:{len(calls)}"
-                )
+                raise ValueError(f"affected_factory_index_out_of_range:{factory_index}:{len(calls)}")
             call = calls[factory_index]
             location = (call.lineno, call.col_offset)
             record = records_by_location.get(location)
@@ -829,24 +849,18 @@ def _affected_shape_balance_guard(
                     f"line{call.lineno}:col{call.col_offset}"
                 )
             if record.name != _call_name(call.func):
-                raise ValueError(
-                    f"affected_direct_factory_identity_mismatch:{factory_index}"
-                )
+                raise ValueError(f"affected_direct_factory_identity_mismatch:{factory_index}")
             ranks = expected_ranks[factory_index]
             if ranks != {len(record.shape)}:
                 raise ValueError(
-                    f"affected_direct_factory_rank_mismatch:{factory_index}:"
-                    f"{sorted(ranks)}:{len(record.shape)}"
+                    f"affected_direct_factory_rank_mismatch:{factory_index}:" f"{sorted(ranks)}:{len(record.shape)}"
                 )
             axes = sorted(affected_axes[factory_index])
             if any(not 0 <= axis < len(record.shape) for axis in axes):
                 raise ValueError(
-                    f"affected_direct_factory_axis_out_of_range:{factory_index}:"
-                    f"{axes}:{len(record.shape)}"
+                    f"affected_direct_factory_axis_out_of_range:{factory_index}:" f"{axes}:{len(record.shape)}"
                 )
-            mismatched_axes = [
-                axis for axis in axes if record.shape[axis] != expected_slot_value
-            ]
+            mismatched_axes = [axis for axis in axes if record.shape[axis] != expected_slot_value]
             if mismatched_axes:
                 raise ValueError(
                     f"affected_direct_factory_slot_value_mismatch:{factory_index}:"
@@ -866,10 +880,7 @@ def _affected_shape_balance_guard(
             }
             if len(shape) >= 2:
                 largest, second_largest = sorted(shape, reverse=True)[:2]
-                balanced = (
-                    largest
-                    <= MAX_DIMENSION_IMBALANCE_RATIO * second_largest
-                )
+                balanced = largest <= MAX_DIMENSION_IMBALANCE_RATIO * second_largest
                 factory_evidence.update(
                     {
                         "largest_dimension": largest,
@@ -881,10 +892,7 @@ def _affected_shape_balance_guard(
                     evidence["violations"].append(copy.deepcopy(factory_evidence))
             evidence["affected_factories"].append(factory_evidence)
     except (SyntaxError, TypeError, ValueError) as exc:
-        evidence["reason"] = (
-            "affected_direct_factory_shape_resolution_failed:"
-            f"{type(exc).__name__}:{exc}"
-        )
+        evidence["reason"] = "affected_direct_factory_shape_resolution_failed:" f"{type(exc).__name__}:{exc}"
         return evidence
 
     evidence["resolved"] = True
@@ -937,30 +945,20 @@ def _dimension_balance_slot_value_bounds(
         }
         if len(shape) >= 2:
             fixed_dimensions = sorted(
-                (
-                    dimension
-                    for axis, dimension in enumerate(shape)
-                    if axis not in affected_axes
-                ),
+                (dimension for axis, dimension in enumerate(shape) if axis not in affected_axes),
                 reverse=True,
             )
             if not affected_axes:
-                result["reason"] = (
-                    "affected_factory_has_no_affected_axes:"
-                    f"{factory['factory_index']}"
-                )
+                result["reason"] = "affected_factory_has_no_affected_axes:" f"{factory['factory_index']}"
                 return result
 
             factory_minimum = 1
             if fixed_dimensions:
                 fixed_largest = fixed_dimensions[0]
-                fixed_second_largest = (
-                    fixed_dimensions[1] if len(fixed_dimensions) >= 2 else None
-                )
+                fixed_second_largest = fixed_dimensions[1] if len(fixed_dimensions) >= 2 else None
                 fixed_pair_is_balanced = (
                     fixed_second_largest is not None
-                    and fixed_largest
-                    <= MAX_DIMENSION_IMBALANCE_RATIO * fixed_second_largest
+                    and fixed_largest <= MAX_DIMENSION_IMBALANCE_RATIO * fixed_second_largest
                 )
                 if not fixed_pair_is_balanced:
                     factory_minimum = _ceil_div(
@@ -968,22 +966,14 @@ def _dimension_balance_slot_value_bounds(
                         MAX_DIMENSION_IMBALANCE_RATIO,
                     )
                 factory_bound["fixed_largest_dimension"] = fixed_largest
-                factory_bound["fixed_second_largest_dimension"] = (
-                    fixed_second_largest
-                )
+                factory_bound["fixed_second_largest_dimension"] = fixed_second_largest
                 if len(affected_axes) == 1:
-                    factory_bound["maximum_slot_value"] = (
-                        MAX_DIMENSION_IMBALANCE_RATIO * fixed_largest
-                    )
+                    factory_bound["maximum_slot_value"] = MAX_DIMENSION_IMBALANCE_RATIO * fixed_largest
             factory_bound["minimum_slot_value"] = factory_minimum
             minimum = max(minimum, factory_minimum)
             factory_maximum = factory_bound["maximum_slot_value"]
             if factory_maximum is not None:
-                maximum = (
-                    factory_maximum
-                    if maximum is None
-                    else min(maximum, factory_maximum)
-                )
+                maximum = factory_maximum if maximum is None else min(maximum, factory_maximum)
         result["factory_bounds"].append(factory_bound)
 
     result["minimum_slot_value"] = minimum
@@ -1020,9 +1010,7 @@ def _patch_integer_spans(code: str, slot: ShapeSlot, new_value: int) -> str:
         except (SyntaxError, UnicodeDecodeError, ValueError) as exc:
             raise ValueError("shape_slot_source_span_is_not_a_literal") from exc
         if type(observed) is not int or observed != slot.old_value:
-            raise ValueError(
-                f"shape_slot_source_value_mismatch:{slot.old_value}:{observed!r}"
-            )
+            raise ValueError(f"shape_slot_source_value_mismatch:{slot.old_value}:{observed!r}")
         replacements.append((start, end, str(new_value).encode("ascii")))
 
     replacements.sort(reverse=True)
@@ -1048,12 +1036,8 @@ def _affine_profiles(
     rejected: list[dict[str, Any]] = []
     for slot in slots:
         try:
-            plus_one = analyze_code(
-                _patch_integer_spans(code, slot, slot.old_value + 1), entry_point
-            ).input_bytes
-            plus_two = analyze_code(
-                _patch_integer_spans(code, slot, slot.old_value + 2), entry_point
-            ).input_bytes
+            plus_one = analyze_code(_patch_integer_spans(code, slot, slot.old_value + 1), entry_point).input_bytes
+            plus_two = analyze_code(_patch_integer_spans(code, slot, slot.old_value + 2), entry_point).input_bytes
             slope = plus_one - parent_input_bytes
             if slope <= 0:
                 raise ValueError("shape_slot_does_not_increase_returned_input_storage")
@@ -1109,9 +1093,7 @@ def _solve_profile(
     balance_maximum = dimension_balance_value_bounds.get("maximum_slot_value")
     if type(balance_minimum) is not int or balance_minimum <= 0:
         raise ValueError("invalid_dimension_balance_minimum_slot_value")
-    if balance_maximum is not None and (
-        type(balance_maximum) is not int or balance_maximum <= 0
-    ):
+    if balance_maximum is not None and (type(balance_maximum) is not int or balance_maximum <= 0):
         raise ValueError("invalid_dimension_balance_maximum_slot_value")
     minimum_value = max(minimum_value, balance_minimum)
     if balance_maximum is not None:
@@ -1129,9 +1111,7 @@ def _solve_profile(
 
     def key(value: int) -> tuple[int, str]:
         after = profile.input_bytes(value)
-        tie = _sha256_bytes(
-            f"{tie_salt}:{variant}:{profile.slot.slot_id}:{value}".encode()
-        )
+        tie = _sha256_bytes(f"{tie_salt}:{variant}:{profile.slot.slot_id}:{value}".encode())
         return abs(after - target_input_bytes), tie
 
     value = min(values, key=key)
@@ -1145,9 +1125,7 @@ def _solve_profile(
         target_delta_bytes=delta,
         target_relative_error=abs(delta) / target_input_bytes,
         profile=profile,
-        dimension_balance_value_bounds=copy.deepcopy(
-            dict(dimension_balance_value_bounds)
-        ),
+        dimension_balance_value_bounds=copy.deepcopy(dict(dimension_balance_value_bounds)),
     )
 
 
@@ -1155,9 +1133,7 @@ class _FakeDeviceNormalizer(ast.NodeTransformer):
     """Keep the FakeTensor compatibility probe device-agnostic."""
 
     def visit_Constant(self, node: ast.Constant) -> ast.AST:  # noqa: N802
-        if isinstance(node.value, str) and (
-            node.value == "cuda" or node.value.startswith("cuda:")
-        ):
+        if isinstance(node.value, str) and (node.value == "cuda" or node.value.startswith("cuda:")):
             return ast.copy_location(ast.Constant(value="cpu"), node)
         return node
 
@@ -1176,11 +1152,7 @@ def _prepare_init_inputs(raw: Any, torch: Any) -> tuple[str, Any]:
     if not isinstance(raw, (list, tuple)):
         raise TypeError("get_init_inputs() must return list, tuple, or mapping")
     values = list(raw)
-    if (
-        len(values) > 1
-        and isinstance(values[0], (list, tuple))
-        and len(values[0]) == 0
-    ):
+    if len(values) > 1 and isinstance(values[0], (list, tuple)) and len(values[0]) == 0:
         if not isinstance(values[1], Mapping):
             raise TypeError("[[], kwargs] get_init_inputs convention requires a mapping")
         return "kwargs", dict(values[1])
@@ -1195,11 +1167,7 @@ def _invoke_model(model: Any, raw_inputs: Any) -> Any:
     if not isinstance(raw_inputs, (list, tuple)):
         raise TypeError("get_inputs() must return list, tuple, or mapping")
     values = list(raw_inputs)
-    if (
-        len(values) == 2
-        and isinstance(values[0], (list, tuple))
-        and isinstance(values[1], Mapping)
-    ):
+    if len(values) == 2 and isinstance(values[0], (list, tuple)) and isinstance(values[1], Mapping):
         return model(*list(values[0]), **dict(values[1]))
     return model(*values)
 
@@ -1235,6 +1203,31 @@ def _fake_tensor_gate(
             "timeout",
             f"wall_clock_timeout_exceeded:{timeout_seconds:g}s",
             "_FakeGateWallClockTimeout",
+        )
+
+
+def _fake_input_profile(
+    code: str,
+    *,
+    timeout_seconds: float = DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
+) -> FakeInputProfileResult:
+    """Measure tensors actually returned by ``get_inputs`` without allocation."""
+
+    runtime = _load_fake_gate_runtime()
+    if isinstance(runtime, FakeGateResult):
+        return FakeInputProfileResult(
+            "failed",
+            reason=runtime.reason,
+            exception_type=runtime.exception_type,
+        )
+    try:
+        with _fake_gate_wall_clock_deadline(timeout_seconds):
+            return _fake_input_profile_task(code, runtime)
+    except _FakeGateWallClockTimeout:
+        return FakeInputProfileResult(
+            "timeout",
+            reason=f"wall_clock_timeout_exceeded:{timeout_seconds:g}s",
+            exception_type="_FakeGateWallClockTimeout",
         )
 
 
@@ -1330,11 +1323,7 @@ def _fake_tensor_gate_task(
             if not callable(get_inputs) or not callable(get_init_inputs):
                 raise TypeError("reference must define get_inputs() and get_init_inputs()")
             init_kind, init_inputs = _prepare_init_inputs(get_init_inputs(), torch)
-            model = (
-                model_type(*init_inputs)
-                if init_kind == "args"
-                else model_type(**init_inputs)
-            )
+            model = model_type(*init_inputs) if init_kind == "args" else model_type(**init_inputs)
             raw_inputs = get_inputs()
             copied_model = copy.deepcopy(model)
             copied_model.train(True)
@@ -1363,6 +1352,96 @@ def _fake_tensor_gate_task(
         )
 
 
+def _fake_input_profile_task(
+    code: str,
+    runtime: _FakeGateRuntime,
+) -> FakeInputProfileResult:
+    """Execute only ``get_inputs`` and profile its concrete FakeTensor leaves."""
+
+    torch = runtime.torch
+    try:
+        parsed = _FakeDeviceNormalizer().visit(ast.parse(code, filename="<shape_input_profile>"))
+        ast.fix_missing_locations(parsed)
+        namespace: dict[str, Any] = {"__name__": "__shape_input_profile__"}
+        fake_mode = runtime.fake_tensor_mode_type(
+            allow_fallback_kernels=False,
+            allow_non_fake_inputs=False,
+            static_shapes=True,
+        )
+        with fake_mode, runtime.fake_copy_mode_type(fake_mode), torch.no_grad():
+            exec(compile(parsed, "<shape_input_profile>", "exec"), namespace)  # noqa: S102
+            get_inputs = namespace.get("get_inputs")
+            if not callable(get_inputs):
+                raise TypeError("reference must define get_inputs()")
+            raw_inputs = get_inputs()
+            tensors: list[Any] = []
+            tensor_ids: set[int] = set()
+            container_ids: set[int] = set()
+
+            def collect(value: Any) -> None:
+                if isinstance(value, torch.Tensor):
+                    if id(value) in tensor_ids:
+                        raise ValueError("returned_input_tensor_alias_or_duplicate")
+                    tensor_ids.add(id(value))
+                    tensors.append(value)
+                    return
+                if isinstance(value, Mapping):
+                    if id(value) in container_ids:
+                        raise ValueError("cyclic_returned_input_container")
+                    container_ids.add(id(value))
+                    for item in value.values():
+                        collect(item)
+                    container_ids.remove(id(value))
+                    return
+                if isinstance(value, (list, tuple)):
+                    if id(value) in container_ids:
+                        raise ValueError("cyclic_returned_input_container")
+                    container_ids.add(id(value))
+                    for item in value:
+                        collect(item)
+                    container_ids.remove(id(value))
+                    return
+                if isinstance(value, (str, bytes, int, float, complex, bool, type(None))):
+                    return
+                raise TypeError(f"unsupported returned input leaf: {type(value).__name__}")
+
+            collect(raw_inputs)
+            if not tensors:
+                raise ValueError("get_inputs_returned_no_tensor")
+            profiles: list[tuple[tuple[int, ...], str, int]] = []
+            for tensor in tensors:
+                shape = tuple(int(value) for value in tensor.shape)
+                tensor_bytes = int(tensor.numel()) * int(tensor.element_size())
+                profiles.append((shape, str(tensor.dtype), tensor_bytes))
+        return FakeInputProfileResult(
+            "passed",
+            input_bytes=sum(item[2] for item in profiles),
+            tensor_count=len(profiles),
+            tensors=tuple(profiles),
+        )
+    except Exception as exc:  # noqa: BLE001 - classification is fail-closed
+        chain = _exception_chain(exc)
+        exception_type = type(exc).__name__
+        message = str(exc).replace("\n", " ")[:1000]
+        if any(isinstance(item, runtime.data_dependent_types) for item in chain):
+            return FakeInputProfileResult(
+                "unsupported",
+                reason=f"data_dependent_shape:{message}",
+                exception_type=exception_type,
+            )
+        if any(isinstance(item, runtime.unsupported_types) for item in chain):
+            return FakeInputProfileResult(
+                "unsupported",
+                reason=f"fake_tensor_operator_unsupported:{message}",
+                exception_type=exception_type,
+            )
+        return FakeInputProfileResult(
+            "failed",
+            reason=f"fake_input_profile_failed:{message}",
+            exception_type=exception_type,
+        )
+
+
 def _make_child(
     parent: Mapping[str, Any],
     child_code: str,
@@ -1377,9 +1456,7 @@ def _make_child(
     child_hash = str(static["child_reference_sha256"])
     child_uuid = f"shapesolver_{_sha256_bytes(f'{parent_uuid}:{child_hash}'.encode())[:24]}"
     child["reward_model"]["ground_truth"] = child_code
-    child["prompt"] = _replace_reference(
-        child.get("prompt"), parent_code, child_code, required=True
-    )
+    child["prompt"] = _replace_reference(child.get("prompt"), parent_code, child_code, required=True)
     extra = child["extra_info"]
     if extra.get("original_prompt") is not None:
         extra["original_prompt"] = _replace_reference(
@@ -1391,9 +1468,7 @@ def _make_child(
     v4["reference_sha256"] = child_hash
     v4["normalized_ast_sha256"] = str(static["child_normalized_ast_sha256"])
     v4["included_in_review_train"] = False
-    v4["runtime_validation_status"] = (
-        "shape_solver_static_fake_pass_runtime_validation_required"
-    )
+    v4["runtime_validation_status"] = "shape_solver_static_fake_pass_runtime_validation_required"
     v4["governance_status"] = "shape_solver_review_only"
     extra["v4"] = v4
     fatal, _ = inspect_row_schema(child, child_code)
@@ -1410,19 +1485,10 @@ def _candidate_key(
     candidate: SolvedCandidate,
     parent_uuid: str,
 ) -> tuple[int, float, int, int, str]:
-    error_bucket_bytes = max(
-        1, candidate.target_input_bytes // TARGET_ERROR_EQUIVALENCE_DENOMINATOR
-    )
+    error_bucket_bytes = max(1, candidate.target_input_bytes // TARGET_ERROR_EQUIVALENCE_DENOMINATOR)
     relative_slot_growth = candidate.slot_value / candidate.profile.slot.old_value
-    propagated_factories = len(
-        {
-            occurrence.factory_index
-            for occurrence in candidate.profile.slot.occurrences
-        }
-    )
-    tie = _sha256_bytes(
-        f"{parent_uuid}:{candidate.variant}:{candidate.profile.slot.slot_id}".encode()
-    )
+    propagated_factories = len({occurrence.factory_index for occurrence in candidate.profile.slot.occurrences})
+    tie = _sha256_bytes(f"{parent_uuid}:{candidate.variant}:{candidate.profile.slot.slot_id}".encode())
     return (
         abs(candidate.target_delta_bytes) // error_bucket_bytes,
         relative_slot_growth,
@@ -1444,16 +1510,12 @@ def _candidate_manifest(candidate: SolvedCandidate) -> dict[str, Any]:
         "fixed_bytes": profile.fixed_bytes,
         "bytes_per_slot_unit": profile.bytes_per_slot_unit,
         "slot_growth_factor": candidate.slot_value / profile.slot.old_value,
-        "propagated_factory_count": len(
-            {occurrence.factory_index for occurrence in profile.slot.occurrences}
-        ),
+        "propagated_factory_count": len({occurrence.factory_index for occurrence in profile.slot.occurrences}),
         "target_error_equivalence_bytes": max(
             1,
             candidate.target_input_bytes // TARGET_ERROR_EQUIVALENCE_DENOMINATOR,
         ),
-        "dimension_balance_value_bounds": copy.deepcopy(
-            dict(candidate.dimension_balance_value_bounds)
-        ),
+        "dimension_balance_value_bounds": copy.deepcopy(dict(candidate.dimension_balance_value_bounds)),
         "slot": profile.slot.as_dict(),
     }
 
@@ -1504,10 +1566,7 @@ def solve_shape_coverage(
         raise FileExistsError(f"refusing to overwrite existing run directory: {run_dir}")
     if max_parents is not None and max_parents <= 0:
         raise ValueError("max_parents must be positive")
-    if (
-        not math.isfinite(fake_gate_timeout_seconds)
-        or fake_gate_timeout_seconds <= 0
-    ):
+    if not math.isfinite(fake_gate_timeout_seconds) or fake_gate_timeout_seconds <= 0:
         raise ValueError("fake_gate_timeout_seconds_must_be_finite_and_positive")
 
     source = pq.read_table(selected_path)
@@ -1515,9 +1574,7 @@ def solve_shape_coverage(
     rows = selected.to_pylist()
     final_paths = _run_paths(run_dir.resolve())
     run_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent)
-    )
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{run_dir.name}.tmp-", dir=run_dir.parent))
     temporary_paths = _run_paths(temporary_dir)
     temporary_paths.children.parent.mkdir(parents=True, exist_ok=True)
     temporary_paths.review.parent.mkdir(parents=True, exist_ok=True)
@@ -1559,9 +1616,7 @@ def solve_shape_coverage(
             "selected_count": len(rows),
             "rows": list(source_selection.get("rows", []))[: len(rows)],
         }
-        temporary_paths.selection.write_text(
-            json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        temporary_paths.selection.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         for source_row_index, parent in enumerate(rows):
             counters["parents_scanned"] += 1
             parent_uuid = str(_nested(parent, "extra_info.uuid", ""))
@@ -1586,9 +1641,7 @@ def solve_shape_coverage(
                     "target_input_bytes": target_map,
                 }
             )
-            minimum_growth_mib = math.ceil(
-                MIN_INPUT_SCALE * parent_analysis.input_bytes / MIB
-            )
+            minimum_growth_mib = math.ceil(MIN_INPUT_SCALE * parent_analysis.input_bytes / MIB)
             for variant in VARIANTS:
                 target_rows.append(
                     {
@@ -1598,15 +1651,15 @@ def solve_shape_coverage(
                         "parent_input_bytes": parent_analysis.input_bytes,
                         "variant": variant,
                         "target_lower_mib": max(
-                            MEDIUM_INPUT_MIN_BYTES // MIB
-                            if variant == "medium"
-                            else MEDIUM_INPUT_MAX_BYTES // MIB + 1,
+                            (
+                                MEDIUM_INPUT_MIN_BYTES // MIB
+                                if variant == "medium"
+                                else MEDIUM_INPUT_MAX_BYTES // MIB + 1
+                            ),
                             minimum_growth_mib,
                         ),
                         "target_upper_mib": (
-                            MEDIUM_INPUT_MAX_BYTES // MIB
-                            if variant == "medium"
-                            else LARGE_INPUT_MAX_BYTES // MIB
+                            MEDIUM_INPUT_MAX_BYTES // MIB if variant == "medium" else LARGE_INPUT_MAX_BYTES // MIB
                         ),
                         "target_input_bytes": int(target_map[variant]),
                     }
@@ -1619,9 +1672,7 @@ def solve_shape_coverage(
             )
             counters[f"parent_fake_{parent_fake.status}"] += 1
             try:
-                slots, guard_rejections = _shape_slots_with_rejections(
-                    parent_code, entry_point
-                )
+                slots, guard_rejections = _shape_slots_with_rejections(parent_code, entry_point)
                 profiles, rejected_profiles = _affine_profiles(
                     parent_code,
                     entry_point,
@@ -1632,15 +1683,12 @@ def solve_shape_coverage(
             except (SyntaxError, TypeError, ValueError) as exc:
                 slots = []
                 profiles = []
-                rejected_profiles = [
-                    {"slot_id": None, "reason": f"{type(exc).__name__}:{exc}"}
-                ]
+                rejected_profiles = [{"slot_id": None, "reason": f"{type(exc).__name__}:{exc}"}]
             counters["slots_found"] += len(slots)
             counters["affine_slots"] += len(profiles)
             counters["non_affine_or_unpatchable_slots"] += len(rejected_profiles)
             counters["fixed_record_guard_rejected_slots"] += sum(
-                rejection.get("reason") == "fixed_record_dead_tail_guard"
-                for rejection in rejected_profiles
+                rejection.get("reason") == "fixed_record_dead_tail_guard" for rejection in rejected_profiles
             )
             dimension_balance_bounds: dict[str, dict[str, Any]] = {}
             dimension_balance_bound_rejections: list[dict[str, Any]] = []
@@ -1655,13 +1703,9 @@ def solve_shape_coverage(
                     )
                     dimension_balance_bounds[slot_id] = bounds
                     if bounds["resolved"] and bounds["feasible"]:
-                        counters[
-                            "dimension_balance_feasible_affine_slots"
-                        ] += 1
+                        counters["dimension_balance_feasible_affine_slots"] += 1
                     else:
-                        counters[
-                            "dimension_balance_infeasible_or_unresolved_affine_slots"
-                        ] += 1
+                        counters["dimension_balance_infeasible_or_unresolved_affine_slots"] += 1
                         dimension_balance_bound_rejections.append(
                             {
                                 "slot_id": slot_id,
@@ -1684,9 +1728,7 @@ def solve_shape_coverage(
                     "slot_count": len(slots),
                     "affine_slot_count": len(profiles),
                     "rejected_profiles": rejected_profiles,
-                    "dimension_balance_bound_rejections": (
-                        dimension_balance_bound_rejections
-                    ),
+                    "dimension_balance_bound_rejections": (dimension_balance_bound_rejections),
                     "attempts": [],
                 }
                 if not parent_fake.passed:
@@ -1705,18 +1747,14 @@ def solve_shape_coverage(
                             target_input_bytes=int(target_map[variant]),
                             parent_input_bytes=parent_analysis.input_bytes,
                             tie_salt=parent_uuid,
-                            dimension_balance_value_bounds=(
-                                dimension_balance_bounds[profile.slot.slot_id]
-                            ),
+                            dimension_balance_value_bounds=(dimension_balance_bounds[profile.slot.slot_id]),
                         )
                     )
                     is not None
                 ]
                 candidates.sort(key=lambda candidate: _candidate_key(candidate, parent_uuid))
                 if not candidates:
-                    decision["reason"] = (
-                        "no_balance_feasible_affine_slot_solution_in_variant_band"
-                    )
+                    decision["reason"] = "no_balance_feasible_affine_slot_solution_in_variant_band"
                     skip_reasons[str(decision["reason"])] += 1
                     decisions.append(decision)
                     continue
@@ -1736,25 +1774,15 @@ def solve_shape_coverage(
                         )
                         attempt["dimension_balance_guard"] = shape_balance
                         if not shape_balance["passed"]:
-                            counters[
-                                "dimension_balance_guard_rejected_candidates"
-                            ] += 1
-                            raise ValueError(
-                                f"dimension_balance_guard_rejected:{shape_balance['reason']}"
-                            )
+                            counters["dimension_balance_guard_rejected_candidates"] += 1
+                            raise ValueError(f"dimension_balance_guard_rejected:{shape_balance['reason']}")
                         counters["dimension_balance_guard_passed_candidates"] += 1
-                        parent_sections = _section_hashes(
-                            ast.parse(parent_code), entry_point
-                        )
-                        child_sections = _section_hashes(
-                            ast.parse(child_code), entry_point
-                        )
+                        parent_sections = _section_hashes(ast.parse(parent_code), entry_point)
+                        child_sections = _section_hashes(ast.parse(child_code), entry_point)
                         if parent_sections != child_sections:
                             raise ValueError("model_or_get_init_inputs_changed")
                         static = static_gate(parent_code, child_code, entry_point)
-                        _validate_variant_storage(
-                            variant, int(static["input_bytes_after"])
-                        )
+                        _validate_variant_storage(variant, int(static["input_bytes_after"]))
                         relative_error = _validate_target_proximity(
                             int(static["input_bytes_after"]), int(target_map[variant])
                         )
@@ -1782,16 +1810,11 @@ def solve_shape_coverage(
                             {
                                 "accepted": True,
                                 "child_uuid": child_uuid,
-                                "child_reference_sha256": static[
-                                    "child_reference_sha256"
-                                ],
-                                "child_normalized_ast_sha256": static[
-                                    "child_normalized_ast_sha256"
-                                ],
+                                "child_reference_sha256": static["child_reference_sha256"],
+                                "child_normalized_ast_sha256": static["child_normalized_ast_sha256"],
                                 "input_bytes_after": static["input_bytes_after"],
                                 "input_scale": static["input_scale"],
-                                "target_delta_bytes": int(static["input_bytes_after"])
-                                - int(target_map[variant]),
+                                "target_delta_bytes": int(static["input_bytes_after"]) - int(target_map[variant]),
                                 "target_relative_error": relative_error,
                                 "solver": solver_evidence,
                                 "fake_gate": fake.as_dict(),
@@ -1836,10 +1859,7 @@ def solve_shape_coverage(
             and len(rows) == source.num_rows == 1000
             and target_map_sha256 != DEFAULT_TARGET_MAP_SHA256
         ):
-            raise ValueError(
-                "default_target_map_sha256_mismatch:"
-                f"{DEFAULT_TARGET_MAP_SHA256}:{target_map_sha256}"
-            )
+            raise ValueError("default_target_map_sha256_mismatch:" f"{DEFAULT_TARGET_MAP_SHA256}:{target_map_sha256}")
         pq.write_table(
             pa.Table.from_pylist(target_rows, schema=TARGET_SCHEMA),
             temporary_paths.targets,
@@ -1856,9 +1876,7 @@ def solve_shape_coverage(
             temporary_paths.paired,
             compression="zstd",
         )
-        temporary_paths.review.write_text(
-            _review_markdown(review_records), encoding="utf-8"
-        )
+        temporary_paths.review.write_text(_review_markdown(review_records), encoding="utf-8")
 
         counters["parents_with_children"] = len(parents_with_children)
         counters["children_written"] = len(children)
@@ -1876,11 +1894,10 @@ def solve_shape_coverage(
                 "validation"
             ),
             "source_edit_contract": (
-                "replace existing positive integer token spans only; preserve Model and "
-                "get_init_inputs exactly"
+                "replace existing positive integer token spans only; preserve Model and " "get_init_inputs exactly"
             ),
             "target_contract": {
-                "source": "ai_shape_coverage._target_input_bytes",
+                "source": "shape_contract._target_input_bytes",
                 "target_salt": TARGET_SALT,
                 "logical_target_map_sha256": target_map_sha256,
                 "variants": list(VARIANTS),
@@ -1897,9 +1914,7 @@ def solve_shape_coverage(
                     "integer slot value with affine input storage nearest the target within "
                     "that feasible intersection, including a clipped balance boundary"
                 ),
-                "target_error_equivalence_fraction": (
-                    f"1/{TARGET_ERROR_EQUIVALENCE_DENOMINATOR}"
-                ),
+                "target_error_equivalence_fraction": (f"1/{TARGET_ERROR_EQUIVALENCE_DENOMINATOR}"),
                 "within_equivalent_error": [
                     "smaller_slot_growth_factor",
                     "more_propagated_input_factories",
@@ -1915,18 +1930,12 @@ def solve_shape_coverage(
                 "ambiguous_dataflow": "fail_open_to_fake_and_runtime_gates",
             },
             "dimension_balance_guard_contract": {
-                "scope": (
-                    "every final rank>=2 direct input-factory tensor shape affected by "
-                    "the candidate slot"
-                ),
-                "comparison": (
-                    "largest_dimension <= 1000 * second_largest_dimension"
-                ),
+                "scope": ("every final rank>=2 direct input-factory tensor shape affected by " "the candidate slot"),
+                "comparison": ("largest_dimension <= 1000 * second_largest_dimension"),
                 "ratio_limit": MAX_DIMENSION_IMBALANCE_RATIO,
                 "limit_expression": "10^3",
                 "slot_reuse": (
-                    "check every affected factory and verify every affected axis has the "
-                    "candidate slot value"
+                    "check every affected factory and verify every affected axis has the " "candidate slot value"
                 ),
                 "unresolved_affected_direct_factory": "fail_closed",
                 "balance_aware_solver": {
@@ -1935,9 +1944,7 @@ def solve_shape_coverage(
                         "all affected axes equal the slot value; every unaffected axis is "
                         "fixed by the directly resolved parent factory shape"
                     ),
-                    "result": (
-                        "exact intersection of per-factory minimum and maximum slot values"
-                    ),
+                    "result": ("exact intersection of per-factory minimum and maximum slot values"),
                     "post_patch_check": (
                         "independently resolve every final affected shape and reapply the "
                         "hard comparison before static/FakeTensor gates"
@@ -1965,9 +1972,7 @@ def solve_shape_coverage(
                         "and allocation-free Linear/FakeCopyMode warm-up"
                     ),
                     "failure_status": "failed",
-                    "failure_reason": (
-                        "fake_gate_runtime_initialization_failed:<message>"
-                    ),
+                    "failure_reason": ("fake_gate_runtime_initialization_failed:<message>"),
                 },
                 "wall_clock_timeout": {
                     "seconds_per_invocation": fake_gate_timeout_seconds,
@@ -1979,16 +1984,11 @@ def solve_shape_coverage(
                     ),
                     "excluded_scope": "process-level FakeTensor initialization and warm-up",
                     "status": "timeout",
-                    "reason": (
-                        "wall_clock_timeout_exceeded:<seconds>s"
-                    ),
+                    "reason": ("wall_clock_timeout_exceeded:<seconds>s"),
                     "exception_semantics": (
-                        "BaseException subclass bypasses ordinary internal "
-                        "except Exception handlers"
+                        "BaseException subclass bypasses ordinary internal " "except Exception handlers"
                     ),
-                    "cleanup": (
-                        "previous SIGALRM handler and ITIMER_REAL timer restored in finally"
-                    ),
+                    "cleanup": ("previous SIGALRM handler and ITIMER_REAL timer restored in finally"),
                 },
             },
             "selected_source": str(selected_path.resolve()),
@@ -2016,9 +2016,7 @@ def solve_shape_coverage(
             "training_approved": False,
             "decisions": decisions,
         }
-        temporary_paths.manifest.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        temporary_paths.manifest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_dir, run_dir)
         return manifest
     except BaseException:

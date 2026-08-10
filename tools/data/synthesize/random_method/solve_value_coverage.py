@@ -60,12 +60,13 @@ ASSIGNMENT_VERSION = "stable_parent_hash_single_family_v2"
 SELECTION_VERSION = "source_operator_family_proportional_largest_remainder_v1"
 EXPECTED_CANONICAL_PARENT_SHA256 = "b07205fcadc543964cfc7ee5fd9c1e4d011f0f3481447f656e5297e40b4b99f4"
 EXPECTED_CANONICAL_PARENT_ROWS = 64_315
+EXPECTED_KERNELBENCH_BASELINE_SHA256 = "b4de490253a0f5a1f5e971f0f723cffd1de2cc2506ceabe97a369804e3a3d7f2"
 VALUE_FAMILIES = ("uniform_01", "signed_uniform", "poisson_counts", "multinomial_categories")
 LOCAL_GENERATOR_MAX_SEED = 2**63 - 1
-MAX_AUTHORIZED_CANDIDATES = 5_000
+MAX_CANONICAL_CANARY_CANDIDATES = 5_000
 SOURCE_BINDING_VERSION = "random_value_input_source_binding_v1"
-SHAPE_RESAMPLE_CONTRACT = "shape_runtime_single_changed_tensor_coverage_resample_v3"
-SHAPE_RESAMPLE_SELECTION = "shape_cells_proportional_quota_with_secondary_marginals_v4"
+SHAPE_RESAMPLE_CONTRACT = "shape_runtime_single_changed_tensor_coverage_resample_v5"
+SHAPE_RESAMPLE_SELECTION = "shape_full_population_one_child_per_parent_v5"
 REAL_FLOAT_DTYPES = frozenset(
     {
         "torch.bfloat16",
@@ -383,8 +384,8 @@ def _shape_resample_source_context(
     if summary.get("selection_version") != SHAPE_RESAMPLE_SELECTION:
         raise ValueError("shape resample selection contract is not the frozen production version")
     row_count = parquet.metadata.num_rows
-    if row_count != MAX_AUTHORIZED_CANDIDATES:
-        raise ValueError(f"shape resample must contain exactly {MAX_AUTHORIZED_CANDIDATES} rows, found {row_count}")
+    if row_count <= 0:
+        raise ValueError("shape resample must contain at least one row")
     if summary.get("limit") != row_count or summary.get("selected_rows") != row_count:
         raise ValueError("shape resample selected count does not match its parquet")
     if summary.get("training_approved") is not False:
@@ -395,6 +396,8 @@ def _shape_resample_source_context(
         "random_static_eligibility_checked_before_sampling",
         "unique_shape_child_uuid",
         "unique_canonical_parent_uuid",
+        "one_runtime_child_per_canonical_parent",
+        "kernelbench_contract_compatible_support_covered",
         "all_occupied_joint_cells_covered",
         "all_shape_marginals_covered",
         "sampled_factory_is_shape_changed",
@@ -423,6 +426,50 @@ def _shape_resample_source_context(
         raise ValueError("shape resample population/selection audit is missing")
     if selected.get("covered_joint_cells") != population.get("occupied_joint_cells"):
         raise ValueError("shape resample does not cover every occupied joint cell")
+    small_contract = summary.get("small_shape_contract")
+    if (
+        not isinstance(small_contract, Mapping)
+        or small_contract.get("threshold_numel_exclusive") != 1_000_000
+        or small_contract.get("required_share_strictly_below") != 0.10
+        or small_contract.get("passed") is not True
+    ):
+        raise ValueError("shape resample small-shape contract is missing or failed")
+    small_share = small_contract.get("share")
+    if type(small_share) not in (int, float) or not 0 <= float(small_share) < 0.10:
+        raise ValueError("shape resample small-shape share is invalid")
+    kernelbench = summary.get("kernelbench_comparison")
+    baseline = kernelbench.get("baseline") if isinstance(kernelbench, Mapping) else None
+    if (
+        not isinstance(kernelbench, Mapping)
+        or kernelbench.get("comparison_unit") != "one_contract_compatible_shape_per_question_v1"
+        or kernelbench.get("support_coverage_passed") is not True
+        or not isinstance(baseline, Mapping)
+        or baseline.get("sha256") != EXPECTED_KERNELBENCH_BASELINE_SHA256
+        or baseline.get("compatible_one_shape_per_question_support_preserved") is not True
+    ):
+        raise ValueError("shape resample KernelBench coverage contract is missing or failed")
+    baseline_counts = baseline.get("compatible_one_shape_per_question_counts")
+    baseline_questions = baseline.get("compatible_questions")
+    if (
+        not isinstance(baseline_counts, Mapping)
+        or type(baseline_questions) is not int
+        or baseline_questions <= 0
+        or any(
+            not isinstance(counts, Mapping) or sum(counts.values()) != baseline_questions
+            for counts in baseline_counts.values()
+        )
+    ):
+        raise ValueError("shape resample KernelBench question-level baseline is invalid")
+    baseline_path = baseline.get("path")
+    if (
+        not isinstance(baseline_path, str)
+        or not Path(baseline_path).is_absolute()
+        or _sha256_file(Path(baseline_path)) != EXPECTED_KERNELBENCH_BASELINE_SHA256
+    ):
+        raise ValueError("shape resample KernelBench baseline binding is invalid")
+    missing_support = kernelbench.get("missing_contract_compatible_support")
+    if not isinstance(missing_support, Mapping) or any(value != [] for value in missing_support.values()):
+        raise ValueError("shape resample is missing contract-compatible KernelBench support")
 
     selected_sha256 = _require_resample_artifact(summary, "selected", input_path)
     if selected_sha256 != source_sha256:
@@ -437,9 +484,25 @@ def _shape_resample_source_context(
     if len(eligibility) != summary.get("runtime_eligible_shape_children"):
         raise ValueError("shape resample eligibility row count differs from its summary")
     if sum(row.get("random_static_eligible") is True for row in eligibility) != summary.get(
-        "random_static_eligible_shape_children"
+        "random_static_eligible_shape_children_before_parent_dedup"
     ):
         raise ValueError("shape resample random-static eligibility count differs from its summary")
+    if sum(row.get("selected_for_canonical_parent") is True for row in eligibility) != row_count:
+        raise ValueError("shape resample canonical-parent selection count differs from its parquet")
+    selected_parent_uuids = [
+        row.get("canonical_parent_uuid") for row in eligibility if row.get("selected_for_canonical_parent") is True
+    ]
+    if (
+        any(not isinstance(value, str) or not value for value in selected_parent_uuids)
+        or len(set(selected_parent_uuids)) != row_count
+    ):
+        raise ValueError("shape resample selected canonical-parent UUIDs are invalid or duplicated")
+    if any(
+        row.get("selected_for_canonical_parent") is not None
+        for row in eligibility
+        if row.get("random_static_eligible") is not True
+    ):
+        raise ValueError("shape resample ineligible child has a canonical-parent selection state")
     if any(row.get("eligibility_universe") != "shape_runtime_eligible_children" for row in eligibility):
         raise ValueError("shape resample eligibility contains a row outside its declared universe")
 
@@ -451,7 +514,7 @@ def _shape_resample_source_context(
             raise ValueError(f"shape resample source run is invalid: {source_index}")
         for path_field, sha_field in (
             ("run_summary_path", "run_summary_sha256"),
-            ("changed_slots_path", "changed_slots_sha256"),
+            ("profile_evidence_path", "profile_evidence_sha256"),
             ("children_path", "children_sha256"),
         ):
             path_value = source.get(path_field)
@@ -860,7 +923,6 @@ def _transform_code(
         raise ValueError("model_or_get_init_inputs_changed")
     if collections.Counter(_factory_signatures(transformed)) != before_factories:
         raise ValueError("input_factory_shape_dtype_layout_or_rng_call_changed")
-
     original_encoded = code.encode("utf-8")
     encoded = original_encoded
     line_starts = [0, *(index + 1 for index, byte in enumerate(original_encoded) if byte == 0x0A)]
@@ -1199,13 +1261,17 @@ def _review_markdown(samples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any
 
 
 def build_lane(input_path: Path, output_dir: Path, *, limit: int | None, overwrite: bool) -> dict[str, Any]:
-    if type(limit) is not int or not 1 <= limit <= MAX_AUTHORIZED_CANDIDATES:
-        raise ValueError(f"limit must be an integer in [1, {MAX_AUTHORIZED_CANDIDATES}]")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("limit must be a positive integer")
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
     source_sha256 = _sha256_file(input_path)
     parquet = pq.ParquetFile(input_path)
     source_context = _source_context(input_path, source_sha256, parquet)
+    if source_context.kind == "canonical_parent" and limit > MAX_CANONICAL_CANARY_CANDIDATES:
+        raise ValueError(
+            f"canonical-parent canaries remain capped at {MAX_CANONICAL_CANARY_CANDIDATES}; " f"found {limit}"
+        )
     if source_context.kind == "shape_coverage_resample" and limit != parquet.metadata.num_rows:
         raise ValueError(
             "shape-resample input must be consumed in full without downstream resampling: "
@@ -1433,7 +1499,10 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--limit",
         type=int,
         required=True,
-        help=f"Deterministic stratified canary size in [1, {MAX_AUTHORIZED_CANDIDATES}]",
+        help=(
+            f"Canonical-parent canary size in [1, {MAX_CANONICAL_CANARY_CANDIDATES}], or the exact "
+            "full row count of a bound v5 shape-resample input."
+        ),
     )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)

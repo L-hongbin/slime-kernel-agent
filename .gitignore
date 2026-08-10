@@ -248,3 +248,10 @@ gpu_mem_trend.png
 wandb/
 local_artifacts/
 .slime-v4-source-provenance
+
+# Repository-owned dataset tooling (the generic data/ rule above is for outputs).
+!tools/data/
+!tools/data/*.py
+!handoffs/data/
+!handoffs/data/*.md
+!handoffs/data/*.svg
