@@ -37,8 +37,8 @@ _SEMANTIC_VALIDATOR_PATH = _REPO_ROOT / "tools/data/synthesize/semantic_operator
 from tools.data.synthesize.frontier_operator_method import generate_frontier_operator as generator  # noqa: E402
 from tools.data.synthesize.semantic_operator_method import validate_semantic_liveness as _semantic  # noqa: E402
 
-CONTRACT_VERSION = "frontier_operator_runtime_liveness_v1"
-RUN_BINDING_VERSION = "frontier_operator_runtime_binding_v1"
+CONTRACT_VERSION = "frontier_operator_runtime_liveness_v2"
+RUN_BINDING_VERSION = "frontier_operator_runtime_binding_v2"
 RESULT_MARKER = "__FRONTIER_OPERATOR_RESULT__="
 MAX_AUTHORIZED_CANDIDATES = 1_000
 MIN_LIVENESS_TRIALS = 3
@@ -253,6 +253,8 @@ def _verify_semantic_source() -> None:
 _ORIGINAL_TO_DEVICE = _semantic._to_device
 _ORIGINAL_NORMALIZE_FORWARD_INPUTS = _semantic._normalize_forward_inputs
 _ORIGINAL_SNAPSHOT_OUTPUT = _semantic._snapshot_output
+_ORIGINAL_EVALUATE_WITHOUT_GUARD = _semantic._evaluate_without_guard
+_OUTPUT_DEVICE_SNAPSHOTS: list[str] = []
 
 
 def _require_dense_external_values(value: Any, device: str) -> Any:
@@ -298,6 +300,30 @@ def _snapshot_dense_output(value: Any) -> Any:
         )
     if result.device.type != "cuda":
         raise _semantic.UnsupportedCase(f"final_output_not_cuda:{result.device}")
+    _OUTPUT_DEVICE_SNAPSHOTS.append(str(result.device))
+    return result
+
+
+def _evaluate_with_output_device_evidence(payload: Mapping[str, Any], torch: Any, device: Any) -> dict[str, Any]:
+    """Bind both control and traced final outputs to the requested CUDA device."""
+
+    _OUTPUT_DEVICE_SNAPSHOTS.clear()
+    result = _ORIGINAL_EVALUATE_WITHOUT_GUARD(payload, torch, device)
+    trials = result.get("trials")
+    if not isinstance(trials, list) or len(_OUTPUT_DEVICE_SNAPSHOTS) != 2 * len(trials):
+        raise _semantic.UnsupportedCase(f"final_output_device_evidence_count_mismatch:{len(_OUTPUT_DEVICE_SNAPSHOTS)}")
+    expected_device = str(device)
+    for ordinal, trial in enumerate(trials):
+        control_device, traced_device = _OUTPUT_DEVICE_SNAPSHOTS[2 * ordinal : 2 * ordinal + 2]
+        if control_device != expected_device or traced_device != expected_device:
+            raise _semantic.UnsupportedCase(
+                "final_output_device_mismatch:"
+                f"expected={expected_device}:control={control_device}:traced={traced_device}"
+            )
+        trial["output_device"] = expected_device
+        trial["control_output_device"] = control_device
+        trial["traced_output_device"] = traced_device
+    result["final_output_device"] = expected_device
     return result
 
 
@@ -319,6 +345,7 @@ def _configure_semantic_wrapper() -> None:
     _semantic._to_device = _require_dense_external_values
     _semantic._normalize_forward_inputs = _normalize_dense_forward_inputs
     _semantic._snapshot_output = _snapshot_dense_output
+    _semantic._evaluate_without_guard = _evaluate_with_output_device_evidence
 
 
 def _identity_schemas(declared_ops: Sequence[Mapping[str, Any]]) -> set[str]:

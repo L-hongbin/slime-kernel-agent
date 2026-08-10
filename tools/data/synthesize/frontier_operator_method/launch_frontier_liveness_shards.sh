@@ -129,14 +129,15 @@ import json, sys
 from pathlib import Path
 (out, launcher, validator, generator, semantic, cp, ch, mp, mh, ap, ah, shards, trials, seed, timeout) = sys.argv[1:]
 payload = {
-    "contract_version": "frontier_operator_liveness_scheduler_v1", "launcher_source_sha256": launcher,
+    "contract_version": "frontier_operator_liveness_scheduler_v2", "launcher_source_sha256": launcher,
     "validator_source_sha256": validator, "generator_source_sha256": generator,
     "semantic_validator_source_sha256": semantic, "candidates_path": cp, "candidates_sha256": ch,
     "manifest_path": mp, "manifest_sha256": mh, "allowlist_path": ap, "allowlist_sha256": ah,
     "shard_count": int(shards), "trials": int(trials), "seed": int(seed), "timeout_seconds": float(timeout),
     "max_device_memory_gib": 64.0, "persistent_train_mode_models": True,
     "fresh_python_bytecode_cache": True,
-    "single_dense_tensor_final_output": True, "external_sparse_quant_inputs": "forbidden",
+    "single_dense_tensor_final_output": True, "final_output_device": "must_equal_requested_cuda_device",
+    "external_sparse_quant_inputs": "forbidden",
     "tainted_dispatch": "fail_closed_except_reviewed_frontier_registry",
 }
 Path(out).write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -221,7 +222,7 @@ bindings={record.get("contract_binding_sha256") for record in summaries}
 if len(bindings) != 1 or not isinstance(next(iter(bindings)), str):
     raise SystemExit("mixed validation bindings across shards")
 payload={
-    "contract_version":"frontier_operator_liveness_launcher_summary_v1", "launcher_source_sha256":launcher,
+    "contract_version":"frontier_operator_liveness_launcher_summary_v2", "launcher_source_sha256":launcher,
     "validator_source_sha256":validator, "semantic_validator_source_sha256":semantic,
     "contract_binding_sha256":next(iter(bindings)), "shard_count":count,
     "selected":sum(item["selected"] for item in summaries), "executed":sum(item["executed"] for item in summaries),

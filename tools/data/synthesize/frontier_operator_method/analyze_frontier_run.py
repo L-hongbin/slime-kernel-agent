@@ -671,6 +671,18 @@ def _verify_liveness_pass(record: Mapping[str, Any], manifest: Mapping[str, Any]
     trials = _first(record, "trials", "evidence.trials", default=[])
     if not isinstance(trials, list) or len(trials) != 3:
         raise ValueError(f"liveness must carry exactly three trials:{record.get('uuid')}")
+    gpu = _first(record, "gpu", "evidence.gpu", default={})
+    expected_device = gpu.get("device") if isinstance(gpu, Mapping) else None
+    binding_evidence = _binding_evidence(record)
+    validation_config = binding_evidence.get("validation_config")
+    configured_device = validation_config.get("device") if isinstance(validation_config, Mapping) else None
+    if (
+        not isinstance(expected_device, str)
+        or not re.fullmatch(r"cuda:[0-9]+", expected_device)
+        or configured_device != expected_device
+        or _first(record, "final_output_device", "evidence.final_output_device") != expected_device
+    ):
+        raise ValueError(f"liveness final CUDA device evidence invalid:{record.get('uuid')}")
     expected: dict[str, tuple[set[str], int]] = {}
     for declared in manifest["declared_ops"]:
         expected[str(declared["op_id"])] = (
@@ -710,6 +722,9 @@ def _verify_liveness_pass(record: Mapping[str, Any], manifest: Mapping[str, Any]
         if (
             _first(trial, "single_tensor_output", "trace.single_tensor_output") is not True
             or _first(trial, "output_finite", "trace.output_finite") is not True
+            or trial.get("output_device") != expected_device
+            or trial.get("control_output_device") != expected_device
+            or trial.get("traced_output_device") != expected_device
         ):
             raise ValueError(f"liveness trial output evidence invalid:{record.get('uuid')}:{ordinal}")
     return _realized_identities(record)
