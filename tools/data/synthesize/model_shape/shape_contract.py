@@ -273,6 +273,21 @@ def relaxed_structure_gate(parent_code: str, child_code: str, entry_point: str =
     }
 
 
+def profiled_structure_gate(parent_code: str, child_code: str, entry_point: str = "Model") -> dict[str, Any]:
+    """Apply shape-only identity checks when storage comes from a runtime profile.
+
+    Unlike :func:`relaxed_structure_gate`, this does not require the static
+    factory grammar to understand every constructor.  The caller must pair it
+    with returned-tensor count, rank, dtype, and byte checks from an exact
+    FakeTensor or real-device profile before accepting the child.
+    """
+
+    return {
+        **_shape_structure_gate(parent_code, child_code, entry_point),
+        "input_storage_contract": "profiled_returned_tensor_storage_v1",
+    }
+
+
 def _static_gate(
     parent_code: str,
     child_code: str,
@@ -281,17 +296,24 @@ def _static_gate(
     relaxed_return_provenance: bool,
     parent_input_bytes: int | None = None,
     child_input_bytes: int | None = None,
+    parent_tensor_count: int | None = None,
+    child_tensor_count: int | None = None,
 ) -> dict[str, Any]:
     """Fail closed unless shape-only identity and storage growth are proven."""
 
     structure = _shape_structure_gate(parent_code, child_code, entry_point)
     if relaxed_return_provenance:
-        _, parent_factory_count = relaxed_factory_storage(parent_code, entry_point)
-        _, child_factory_count = relaxed_factory_storage(child_code, entry_point)
+        if parent_tensor_count is None or child_tensor_count is None:
+            _, parent_factory_count = relaxed_factory_storage(parent_code, entry_point)
+            _, child_factory_count = relaxed_factory_storage(child_code, entry_point)
+            storage_contract = "fake_returned_tensor_storage_v1"
+        else:
+            parent_factory_count = parent_tensor_count
+            child_factory_count = child_tensor_count
+            storage_contract = "profiled_returned_tensor_storage_v1"
         if parent_input_bytes is None or child_input_bytes is None:
             raise ValueError("relaxed_gate_requires_fake_returned_tensor_storage")
         parent_bytes, child_bytes = parent_input_bytes, child_input_bytes
-        storage_contract = "fake_returned_tensor_storage_v1"
     else:
         parent_analysis = analyze_code(parent_code, entry_point)
         child_analysis = analyze_code(child_code, entry_point)
@@ -339,6 +361,30 @@ def relaxed_static_gate(
         relaxed_return_provenance=True,
         parent_input_bytes=parent_input_bytes,
         child_input_bytes=child_input_bytes,
+    )
+
+
+def profiled_static_gate(
+    parent_code: str,
+    child_code: str,
+    entry_point: str = "Model",
+    *,
+    parent_input_bytes: int,
+    child_input_bytes: int,
+    parent_tensor_count: int,
+    child_tensor_count: int,
+) -> dict[str, Any]:
+    """Use exact returned-tensor profiles without static factory resolution."""
+
+    return _static_gate(
+        parent_code,
+        child_code,
+        entry_point,
+        relaxed_return_provenance=True,
+        parent_input_bytes=parent_input_bytes,
+        child_input_bytes=child_input_bytes,
+        parent_tensor_count=parent_tensor_count,
+        child_tensor_count=child_tensor_count,
     )
 
 

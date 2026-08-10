@@ -6,9 +6,14 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[4]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pyarrow.parquet as pq
 from tools.data.synthesize.model_shape.pipeline import (
@@ -20,8 +25,11 @@ from tools.data.synthesize.model_shape.pipeline import (
     _sha256_bytes,
     _sha256_file,
 )
-from tools.data.synthesize.validate_shape_region_liveness import _accepted_tasks
-from tools.data.synthesize.verify_shape_solver_runtime_shards import _verified_canonical_reference_passes, verify
+from tools.data.synthesize.model_shape.validate_shape_region_liveness import _accepted_tasks
+from tools.data.synthesize.model_shape.verify_shape_solver_runtime_shards import (
+    _verified_canonical_reference_passes,
+    verify,
+)
 
 
 def _topology(machine_count: int, virtual_shards_per_gpu: int) -> dict[str, int]:

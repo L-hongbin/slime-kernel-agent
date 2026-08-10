@@ -7,7 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from tools.data.synthesize.augment_prompt_tasks import analyze_code
-from tools.data.synthesize.shape_contract import (
+from tools.data.synthesize.model_shape.shape_contract import (
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,
@@ -16,6 +16,12 @@ from tools.data.synthesize.shape_contract import (
 
 PROMPT_VERSION_V1 = "dsv4_shape_hardtail_user_only_v1"
 PROMPT_VERSION = "dsv4_shape_hardtail_user_only_v2"
+PROMPT_VERSION_RETRY_V1 = "dsv4_shape_retry_user_only_v1"
+PROMPT_VERSION_RETRY_V2 = "dsv4_shape_retry_user_only_v2"
+PROMPT_VERSION_RETRY = "dsv4_shape_retry_user_only_v3"
+PROMPT_VERSION_UNPROFILED_V1 = "dsv4_shape_unprofiled_user_only_v1"
+PROMPT_VERSION_UNPROFILED_V2 = "dsv4_shape_unprofiled_user_only_v2"
+PROMPT_VERSION_UNPROFILED = "dsv4_shape_unprofiled_user_only_v3"
 TARGET_SALT = "dsv4_shape_hardtail_byte_targets_v1"
 VARIANTS = ("medium", "large")
 
@@ -78,9 +84,140 @@ PyTorch reference:
 ```
 """
 
+USER_TEMPLATE_RETRY_V1 = """A previous shape-only proposal for this PyTorch reference did not pass validation. Solve it again from the source and return two complete variants.
+
+Hard constraints, in priority order:
+1. Preserve the complete program exactly except for positive integer input-shape values in get_inputs(), and matching integer values in get_init_inputs() only when the same logical dimension must remain coupled. Do not edit imports, comments, formatting, names, operations, statements, dtypes, control flow, ranks, or the forward computation.
+2. Trace the actual operator constraints before choosing values. Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Increase changed dimensions, preserve every required equality/divisibility/product relation, and avoid unused/dead tails or oversized intermediates.
+3. Total storage of tensors returned by get_inputs() must be at least 2x the original and within 25% of the target while remaining in the named band:
+   - Medium: target {medium_target_bytes} bytes ({medium_target_mib:.6f} MiB); band 64-256 MiB inclusive.
+   - Large: target {large_target_bytes} bytes ({large_target_mib:.6f} MiB); band above 256 MiB through 4096 MiB inclusive.
+4. Use however many coupled shape values correctness requires. Do not impose a fixed slot count or a power-of-two pattern, and do not systematically snap values to familiar binary or decimal anchors.
+5. In every returned input tensor with rank at least 2, the largest dimension must be no more than 1000 times its second-largest dimension.
+
+If the exact target is infeasible, choose the closest safe in-band shape within the tolerance. Check each full reference against the unchanged source before returning it. Output exactly these Markdown sections, with no JSON and no prose outside them:
+
+## Medium
+```python
+<complete reference>
+```
+
+## Large
+```python
+<complete reference>
+```
+
+PyTorch reference:
+```python
+{reference}
+```
+"""
+
+USER_TEMPLATE_RETRY_V2 = """A previous shape-only proposal for this PyTorch reference did not pass validation. Solve it again from the source and return two complete variants.
+
+Hard constraints, in priority order:
+1. Preserve the complete program exactly except for positive integer input-shape values in get_inputs(), and matching integer values in get_init_inputs() only when the same logical dimension must remain coupled. Do not edit imports, comments, formatting, names, operations, statements, dtypes, control flow, ranks, or the forward computation.
+2. Trace the actual operator constraints before choosing values. Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Increase changed dimensions, preserve every required equality/divisibility/product relation, and do not create unused/dead tails.
+3. Keep each complete program realistically runnable on one H20. Estimate parameter, intermediate, temporary, and final-output shapes, especially when an operation grows faster than its input. Runtime correctness and feasible peak storage take priority over target proximity: when a target would make any materialized tensor or peak live storage impractical, choose a smaller safe increased shape instead.
+4. Subject to runtime feasibility, total storage of tensors returned by get_inputs() should be within 25% of the target and in the named band:
+   - Medium: target {medium_target_bytes} bytes ({medium_target_mib:.6f} MiB); band 64-256 MiB inclusive.
+   - Large: target {large_target_bytes} bytes ({large_target_mib:.6f} MiB); band above 256 MiB through 4096 MiB inclusive.
+   If no safe shape exists in the requested band, return the closest safe increased shape rather than an un-runnable target-sized input.
+5. Use however many coupled shape values correctness requires. Do not impose a fixed slot count or a power-of-two pattern, and do not systematically snap values to familiar binary or decimal anchors.
+6. In every returned input tensor with rank at least 2, the largest dimension must be no more than 1000 times its second-largest dimension.
+
+Check shape coupling and estimated peak storage for each full reference before returning it. Output exactly these Markdown sections, with no JSON and no prose outside them:
+
+## Medium
+```python
+<complete reference>
+```
+
+## Large
+```python
+<complete reference>
+```
+
+PyTorch reference:
+```python
+{reference}
+```
+"""
+
+USER_TEMPLATE_RETRY = USER_TEMPLATE_RETRY_V2.replace(
+    "Do not impose a fixed slot count or a power-of-two pattern, and do not systematically snap values to familiar binary or decimal anchors.",
+    "Do not impose a fixed slot count and do not optimize for or against binary or decimal anchors. Never perturb a naturally valid anchored value by a small amount merely to appear irregular; choose anchored or irregular values only from the operator constraints and storage target.",
+)
+
+USER_TEMPLATE_UNPROFILED_V1 = """Modify only the input shapes in this PyTorch reference and return two complete variants. Automatic tooling could not establish this source's input profile, so infer its tensor factories, dtypes, shape coupling, and operator constraints directly from the code.
+
+Hard constraints, in priority order:
+1. Preserve the complete program exactly except for positive integer input-shape values in get_inputs(), and matching integer values in get_init_inputs() only when the same logical dimension must remain coupled. Do not edit imports, comments, formatting, names, operations, statements, dtypes, control flow, ranks, or the forward computation.
+2. Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Increase changed dimensions, preserve every required equality/divisibility/product relation, and avoid unused/dead tails or oversized intermediates.
+3. Infer aggregate input storage from the source and aim within 25% of these deliberately irregular targets:
+   - Medium: target {medium_target_bytes} bytes ({medium_target_mib:.6f} MiB); band 64-256 MiB inclusive.
+   - Large: target {large_target_bytes} bytes ({large_target_mib:.6f} MiB); band above 256 MiB through 4096 MiB inclusive.
+   Prefer correctness and an increased input over exact arithmetic when the automatic-profile failure makes a target infeasible.
+4. Use however many coupled shape values correctness requires. Do not impose a fixed slot count or a power-of-two pattern, and do not systematically snap values to familiar binary or decimal anchors.
+5. In every returned input tensor with rank at least 2, the largest dimension must be no more than 1000 times its second-largest dimension.
+
+Check each full reference against the unchanged source before returning it. Output exactly these Markdown sections, with no JSON and no prose outside them:
+
+## Medium
+```python
+<complete reference>
+```
+
+## Large
+```python
+<complete reference>
+```
+
+PyTorch reference:
+```python
+{reference}
+```
+"""
+
+USER_TEMPLATE_UNPROFILED_V2 = (
+    USER_TEMPLATE_UNPROFILED_V1.replace(
+        "Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Increase changed dimensions, preserve every required equality/divisibility/product relation, and avoid unused/dead tails or oversized intermediates.",
+        "Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Increase changed dimensions, preserve every required equality/divisibility/product relation, and avoid unused/dead tails. Keep each complete program realistically runnable on one H20: estimate parameter, intermediate, temporary, and final-output shapes, and prioritize feasible peak storage over target proximity.",
+    )
+    .replace(
+        "Prefer correctness and an increased input over exact arithmetic when the automatic-profile failure makes a target infeasible.",
+        "Prefer correctness, feasible peak storage, and an increased input over exact arithmetic. If no safe shape exists in a requested band, return the closest safe increased shape rather than an un-runnable target-sized input.",
+    )
+    .replace(
+        "Do not impose a fixed slot count or a power-of-two pattern, and do not systematically snap values to familiar binary or decimal anchors.",
+        "Do not impose a fixed slot count and do not optimize for or against binary or decimal anchors. Never perturb a naturally valid anchored value by a small amount merely to appear irregular; choose anchored or irregular values only from the operator constraints and storage target.",
+    )
+)
+
+USER_TEMPLATE_UNPROFILED = (
+    USER_TEMPLATE_UNPROFILED_V2.replace(
+        "Do not edit imports, comments, formatting, names, operations, statements, dtypes, control flow, ranks, or the forward computation.",
+        "Do not edit imports, comments, formatting, names, operations, statements, dtypes, control flow, ranks, or the forward computation. At every shape site preserve the existing Name, Subscript, BinOp, Tuple, and call structure exactly: replace only an existing integer token in place. If a shape uses a name or expression, edit its defining integer literal; never inline, expand, simplify, or constant-fold that name or expression.",
+    )
+    .replace(
+        "Every changed integer must affect a returned input tensor shape or be a necessary coupled init value.",
+        "Every changed integer must affect a returned input tensor shape or be a necessary coupled init value. Leave dead, redundant, or merely shape-looking assignments unchanged.",
+    )
+    .replace(
+        "Check each full reference against the unchanged source before returning it.",
+        "Do not enumerate or repeat factor searches; once safe values are found, output immediately. Check each full reference against the unchanged source before returning it.",
+    )
+)
+
 USER_TEMPLATES = {
     PROMPT_VERSION_V1: USER_TEMPLATE_V1,
     PROMPT_VERSION: USER_TEMPLATE,
+    PROMPT_VERSION_RETRY_V1: USER_TEMPLATE_RETRY_V1,
+    PROMPT_VERSION_RETRY_V2: USER_TEMPLATE_RETRY_V2,
+    PROMPT_VERSION_RETRY: USER_TEMPLATE_RETRY,
+    PROMPT_VERSION_UNPROFILED_V1: USER_TEMPLATE_UNPROFILED_V1,
+    PROMPT_VERSION_UNPROFILED_V2: USER_TEMPLATE_UNPROFILED_V2,
+    PROMPT_VERSION_UNPROFILED: USER_TEMPLATE_UNPROFILED,
 }
 
 
@@ -114,6 +251,21 @@ def target_input_bytes_from_size(uuid: str, parent_bytes: int) -> dict[str, int]
     return {
         "medium": _sample_bytes(f"{uuid}:medium", medium_lower, MEDIUM_INPUT_MAX_BYTES),
         "large": _sample_bytes(f"{uuid}:large", large_lower, LARGE_INPUT_MAX_BYTES),
+    }
+
+
+def target_input_bytes_without_profile(uuid: str) -> dict[str, int]:
+    """Sample both target bands when source storage cannot be established."""
+
+    if not uuid:
+        raise ValueError("target_sampling_requires_uuid")
+    return {
+        "medium": _sample_bytes(f"unprofiled:{uuid}:medium", MEDIUM_INPUT_MIN_BYTES, MEDIUM_INPUT_MAX_BYTES),
+        "large": _sample_bytes(
+            f"unprofiled:{uuid}:large",
+            MEDIUM_INPUT_MAX_BYTES + 1,
+            LARGE_INPUT_MAX_BYTES,
+        ),
     }
 
 

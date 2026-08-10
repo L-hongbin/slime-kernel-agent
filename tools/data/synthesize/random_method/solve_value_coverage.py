@@ -530,7 +530,7 @@ def _shape_resample_source_context(
     git_commit = provenance.get("git_commit")
     if not isinstance(git_commit, str) or len(git_commit) != 40:
         raise ValueError("shape resample Git commit is invalid")
-    resampler_path = _REPO_ROOT / "tools/data/synthesize/resample_shape_coverage.py"
+    resampler_path = _REPO_ROOT / "tools/data/synthesize/model_shape/resample_shape_coverage.py"
     augment_path = _REPO_ROOT / "tools/data/synthesize/augment_prompt_tasks.py"
     dependencies = provenance.get("dependency_source_sha256")
     if not isinstance(dependencies, Mapping):

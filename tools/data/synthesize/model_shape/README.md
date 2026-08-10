@@ -1,70 +1,70 @@
-# Model-assisted shape hard-tail lane
+# Shape expansion
 
-This is the only supported model-generation path for shape augmentation. It
-targets parents that the three historical static-solver rounds could not solve;
-those solver implementations remain in place only so their existing artifacts
-can be reproduced.
+This directory is the maintained implementation boundary for shape-only data
+expansion. It contains the static solver, the DSV4F fallback, target-GPU
+validation, final resampling, and distribution/semantic audits.
 
-The workflow is deliberately staged:
+The method, contracts, results, and known limitations are documented in
+[`handoffs/data/synthesize/SHAPE_EXPANSION.md`](../../../../handoffs/data/synthesize/SHAPE_EXPANSION.md).
 
-1. `pipeline.py select` chooses a deterministic, source/operator-stratified
-   canary from upstream `no_variable_multislot_product_solution` decisions.
-2. `pipeline.py preview` writes the exact user-only prompts pinned by an
-   existing run. `preview-candidate` separately renders the current candidate
-   prompt without changing an existing run. Targets are sampled at byte
-   granularity rather than integer MiB granularity.
-3. `deploy_four.sh preflight` verifies node53/node64/node69/node70 as four idle
-   8-H20 hosts, official 48-shard weights, the frozen image, both source
-   patches, pure TP8, DSPARK, and the low/high/max effort mapping. `start` is a
-   separate action.
-4. `pipeline.py generate` sends explicit `reasoning_effort=low` requests, with
-   no system message, at at most 64 concurrent requests per endpoint.
-5. `pipeline.py materialize` rejects non-shape edits, reconstructs every child
-   from the original source using only approved integer-span replacements, and
-   applies storage, target, balance, dead-tail, and FakeTensor gates.
-6. `pipeline.py analyze-bias` reports proposal and accepted anchor bias,
-   concentration, slot cardinality, target snapping, source/operator/endpoint
-   acceptance, and the projected effect on the known 64,315-row distribution.
+## Components
 
-No stage mutates the immutable parent parquet. Static acceptance is review-only;
-paired target-GPU reference and changed-region validation remain mandatory.
+- `solve_shape_coverage.py`, `solve_multidim_shape_coverage.py`, and
+  `solve_variable_shape_delta.py`: AST analysis, integer shape solving, and
+  FakeTensor gates.
+- `pipeline.py` and `prompt.py`: DSV4F selection, user-only prompts,
+  generation, shape-only materialization, and proposal/acceptance bias.
+- `validate_shape_region_liveness.py` and
+  `verify_shape_solver_runtime_shards.py`: changed-region H20 validation and
+  fail-closed evidence verification.
+- `resample_shape_coverage.py`: combine runtime-valid static/model lanes and
+  choose at most one child per canonical parent.
+- `plot_shape_child_vs_kernelbench.py` and
+  `sample_shape_semantic_audit.py`: final distribution and semantic-audit
+  evidence. Their JSON/TSV details default to `local_artifacts/`.
+- `deploy_four.sh` and `deploy_one.sh`: TP8 SGLang deployment with DSPARK and
+  the repository's reasoning-effort/SWA fixes. Eager mode is not used.
 
-## Why this lane exists
+Cross-method utilities remain one level above: `augment_prompt_tasks.py`,
+`profile_prompt_tvm_distribution.py`, `launch_reference_validation_shards.sh`,
+and `validate_train_mode_contract.py` are also used by value, dtype, layout, or
+general dataset construction.
 
-The latest analysis-only 64,315-row substitution still leaves 40,957 parents
-(63.68%) unchanged. Current versus KernelBench per-tensor numel P50/P90/P99 is
-0.79M/399.5M/1.02B versus 33.6M/1.61B/2.15B. Changed occurrences are also
-concentrated: 44.45% are powers of two and the top ten values account for
-41.04%. Replacement coverage is 12.85% for CUDA-Agent, 31.95% for DrKernel,
-63.91% for KernelBook, and 31.28% for Oubo; operator-dense parents are harder.
+## DSV4F pipeline
 
-The model lane therefore samples from the 17,864 upstream no-product-solution
-decisions, uses byte-granularity targets, avoids source/operator-to-endpoint
-confounding, and measures proposal bias separately from accepted-child bias.
-The 4 GiB aggregate cap remains intentional, so this lane can reduce but cannot
-eliminate the extreme KernelBench right-tail gap.
-
-Recommended first run size is 1,000 parents. Do not run `deploy_four.sh start`
-or `pipeline.py generate` until the code and rendered prompt have been reviewed.
-
-After review, the staged commands are:
+Use exactly one selection command for a new run, followed by the common
+generation and materialization stages:
 
 ```bash
-python -m tools.data.synthesize.model_shape.pipeline select
-python -m tools.data.synthesize.model_shape.pipeline preview
-python -m tools.data.synthesize.model_shape.pipeline preview-candidate
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN select
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN select-full-residual
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN select-relaxed-residual
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN select-unprofiled-residual
+
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN preview
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN generate
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN materialize
+python -m tools.data.synthesize.model_shape.pipeline --run-dir RUN analyze-bias
+```
+
+`preview-candidate` renders the current candidate template without changing a
+run pinned to an older prompt version. Generation uses a user message only,
+`reasoning_effort=low`, a 128K maximum completion budget, and up to 64
+concurrent requests per endpoint.
+
+Materialization reconstructs each child from the immutable parent using only
+approved integer-span replacements. Static/FakeTensor acceptance is not final:
+paired parent/child H20 reference validation and changed-region validation are
+required before a child enters the final census.
+
+## Deployment
+
+```bash
 bash tools/data/synthesize/model_shape/deploy_four.sh preflight
 bash tools/data/synthesize/model_shape/deploy_four.sh start
 bash tools/data/synthesize/model_shape/deploy_four.sh wait
 bash tools/data/synthesize/model_shape/deploy_four.sh smoke
-python -m tools.data.synthesize.model_shape.pipeline generate
-python -m tools.data.synthesize.model_shape.pipeline materialize
-python -m tools.data.synthesize.model_shape.pipeline analyze-bias
 ```
 
-Each command consumes the fixed run-directory layout from the prior stage.
-Transport failures are append-retryable; a successful generation is never
-silently overwritten. Use `--run-dir` only when creating a separate experiment.
-Generation records carry the prompt version and prompt hash. Preview,
-generation, and materialization fail closed on mixed or unknown versions, so a
-new candidate template cannot silently alter replay of an existing run.
+`preflight` verifies the configured H20 hosts, official model shards,
+container image, SGLang patches, TP8, DSPARK, and reasoning-effort mapping.

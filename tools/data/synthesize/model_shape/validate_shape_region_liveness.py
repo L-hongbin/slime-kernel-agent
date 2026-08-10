@@ -38,7 +38,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -57,16 +57,9 @@ from tools.data.cleaning.runtime_validation import (
     _snapshot_rng_states,
     _to_device,
 )
-from tools.data.synthesize.augment_prompt_tasks import (
-    _SHAPE_FACTORIES,
-    _call_name,
-    _top_level_function,
-)
-from tools.data.synthesize.solve_shape_coverage import _returned_factory_parameters
-from tools.data.synthesize.validate_train_mode_contract import (
-    _CudaMemoryGuardFailure,
-    _cuda_memory_guard,
-)
+from tools.data.synthesize.augment_prompt_tasks import _SHAPE_FACTORIES, _call_name, _top_level_function
+from tools.data.synthesize.model_shape.solve_shape_coverage import _returned_factory_parameters
+from tools.data.synthesize.validate_train_mode_contract import _cuda_memory_guard, _CudaMemoryGuardFailure
 
 CONTRACT_VERSION = "shape_changed_region_liveness_v3"
 PERTURBATION_CONTRACT_VERSION = "seeded_bounded_non_affine_mix_v1"
@@ -84,18 +77,12 @@ VARIABLE_SOLVER_MANIFEST_CONTRACTS = {
         "scope_contract_required": False,
     },
     "shape_variable_multislot_solver_v6": {
-        "generator_version": (
-            "same_factory_product_variable_2_to_5_"
-            "nonleading_no_explicit_batch_soft_p2_50_v1"
-        ),
+        "generator_version": ("same_factory_product_variable_2_to_5_" "nonleading_no_explicit_batch_soft_p2_50_v1"),
         "scope_mode": "nonleading_no_explicit_batch",
         "scope_contract_required": True,
     },
     "shape_variable_multislot_solver_v7": {
-        "generator_version": (
-            "same_factory_product_variable_2_to_5_"
-            "balanced_nonleading_soft_p2_50_v1"
-        ),
+        "generator_version": ("same_factory_product_variable_2_to_5_" "balanced_nonleading_soft_p2_50_v1"),
         "scope_mode": "balanced_nonleading_no_explicit_batch",
         "scope_contract_required": True,
     },
@@ -167,9 +154,7 @@ def _validate_variable_solver_manifest_contract(
         # Historical v5 manifests have no scope-selection contract.
         return
     if not isinstance(scope_contract, Mapping):
-        raise ValueError(
-            f"{contract_version} requires scope_selection_contract"
-        )
+        raise ValueError(f"{contract_version} requires scope_selection_contract")
     scope_mode = scope_contract.get("mode")
     if scope_mode != expected["scope_mode"]:
         raise ValueError(
@@ -191,9 +176,7 @@ def _validate_scoped_decision_evidence(
         "shape_variable_multislot_solver_v7",
     }:
         return
-    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version][
-        "scope_mode"
-    ]
+    expected_scope = VARIABLE_SOLVER_MANIFEST_CONTRACTS[contract_version]["scope_mode"]
     scope_contract = manifest["scope_selection_contract"]
     expected_contract_fields = {
         "maximum_groups_per_cardinality": 12,
@@ -233,13 +216,9 @@ def _validate_scoped_decision_evidence(
         if decision.get("group_scope_status") == "evaluated":
             for field in inventory_fields:
                 if not isinstance(decision.get(field), Mapping):
-                    raise ValueError(
-                        f"scoped decision inventory missing: {identity}:{field}"
-                    )
+                    raise ValueError(f"scoped decision inventory missing: {identity}:{field}")
             inventory = {field: decision[field] for field in inventory_fields}
-            cardinalities = set().union(
-                *(set(values) for values in inventory.values())
-            )
+            cardinalities = set().union(*(set(values) for values in inventory.values()))
             for cardinality in cardinalities:
                 values = {
                     field: count(
@@ -257,9 +236,7 @@ def _validate_scoped_decision_evidence(
                 general_discarded = values[inventory_fields[5]]
                 reserved_general = min(4, general_before)
                 expected_scope_after = min(scope_before, 12 - reserved_general)
-                expected_general_after = min(
-                    general_before, 12 - expected_scope_after
-                )
+                expected_general_after = min(general_before, 12 - expected_scope_after)
                 if (
                     scope_before != scope_after + scope_discarded
                     or general_before != general_after + general_discarded
@@ -267,10 +244,7 @@ def _validate_scoped_decision_evidence(
                     or general_after != expected_general_after
                     or scope_after + general_after > 12
                 ):
-                    raise ValueError(
-                        f"scoped group cap arithmetic mismatch: "
-                        f"{identity}:{cardinality}"
-                    )
+                    raise ValueError(f"scoped group cap arithmetic mismatch: " f"{identity}:{cardinality}")
         if "bounded_candidate_attempt_count" not in decision:
             if attempts:
                 raise ValueError(f"attempts without bounded count: {identity}")
@@ -310,16 +284,10 @@ def _validate_scoped_decision_evidence(
         )
         if raw_scope_count != decision.get(
             "scope_matching_static_solved_candidate_count"
-        ) or raw_scope_count + raw_general_count != decision.get(
-            "static_solved_candidate_count"
-        ):
+        ) or raw_scope_count + raw_general_count != decision.get("static_solved_candidate_count"):
             raise ValueError(f"attempt plan raw count mismatch: {identity}")
-        maximum_scope_size = plan_evidence.get(
-            "maximum_scope_logical_slot_count"
-        )
-        general_growth_dominates = plan_evidence.get(
-            "best_general_batch_like_growth_dominates"
-        )
+        maximum_scope_size = plan_evidence.get("maximum_scope_logical_slot_count")
+        general_growth_dominates = plan_evidence.get("best_general_batch_like_growth_dominates")
         preference_reason = plan_evidence.get("preference_reason")
         if raw_scope_count == 0:
             expected_preferred_lane = "general"
@@ -346,52 +314,32 @@ def _validate_scoped_decision_evidence(
                 expected_preference_reason = "scope_cardinality_at_least_three"
             elif general_growth_dominates:
                 expected_preferred_lane = "scope"
-                expected_preference_reason = (
-                    "best_general_batch_like_growth_dominates"
-                )
+                expected_preference_reason = "best_general_batch_like_growth_dominates"
             else:
                 expected_preferred_lane = "general"
                 expected_preference_reason = "balanced_general_preference"
-        if (
-            preferred_lane != expected_preferred_lane
-            or preference_reason != expected_preference_reason
-        ):
+        if preferred_lane != expected_preferred_lane or preference_reason != expected_preference_reason:
             raise ValueError(f"attempt plan preference mismatch: {identity}")
         if raw_scope_count == 0 or raw_general_count == 0:
             expected_scope_count = min(raw_scope_count, 6)
             expected_general_count = min(raw_general_count, 6)
         else:
-            raw_preferred_count = (
-                raw_scope_count
-                if preferred_lane == "scope"
-                else raw_general_count
-            )
-            raw_secondary_count = (
-                raw_general_count
-                if preferred_lane == "scope"
-                else raw_scope_count
-            )
+            raw_preferred_count = raw_scope_count if preferred_lane == "scope" else raw_general_count
+            raw_secondary_count = raw_general_count if preferred_lane == "scope" else raw_scope_count
             planned_preferred_count = min(raw_preferred_count, 4)
             planned_secondary_count = min(raw_secondary_count, 2)
             remaining = 6 - planned_preferred_count - planned_secondary_count
-            planned_secondary_count += min(
-                raw_secondary_count - planned_secondary_count, remaining
-            )
+            planned_secondary_count += min(raw_secondary_count - planned_secondary_count, remaining)
             if preferred_lane == "scope":
                 expected_scope_count = planned_preferred_count
                 expected_general_count = planned_secondary_count
             else:
                 expected_scope_count = planned_secondary_count
                 expected_general_count = planned_preferred_count
-        if (
-            scope_count != expected_scope_count
-            or general_count != expected_general_count
-        ):
+        if scope_count != expected_scope_count or general_count != expected_general_count:
             raise ValueError(f"bounded attempt plan mismatch: {identity}")
         if scope_count and general_count:
-            preferred_count = (
-                scope_count if preferred_lane == "scope" else general_count
-            )
+            preferred_count = scope_count if preferred_lane == "scope" else general_count
             if preferred_count > 4:
                 raise ValueError(f"preferred attempt lane exceeds limit: {identity}")
         attempted_lanes: list[str] = []
@@ -401,9 +349,7 @@ def _validate_scoped_decision_evidence(
                 raise ValueError(f"attempt must be an object: {identity}")
             if attempt.get("attempt_index") != attempt_index:
                 raise ValueError(f"attempt index mismatch: {identity}")
-            scope_match = _nested(
-                attempt, "group_scope.matches_nonleading_no_explicit_batch"
-            )
+            scope_match = _nested(attempt, "group_scope.matches_nonleading_no_explicit_batch")
             if not isinstance(scope_match, bool):
                 raise ValueError(f"attempt scope evidence missing: {identity}")
             expected_lane = "scope" if scope_match else "general"
@@ -412,16 +358,10 @@ def _validate_scoped_decision_evidence(
             attempted_lanes.append(expected_lane)
             if attempt.get("accepted") is True:
                 accepted_attempts.append(attempt)
-        preferred_count = (
-            scope_count if preferred_lane == "scope" else general_count
-        )
+        preferred_count = scope_count if preferred_lane == "scope" else general_count
         secondary_lane = "general" if preferred_lane == "scope" else "scope"
-        secondary_count = (
-            general_count if preferred_lane == "scope" else scope_count
-        )
-        planned_lanes = [preferred_lane] * preferred_count + [
-            secondary_lane
-        ] * secondary_count
+        secondary_count = general_count if preferred_lane == "scope" else scope_count
+        planned_lanes = [preferred_lane] * preferred_count + [secondary_lane] * secondary_count
         if attempted_lanes != planned_lanes[: len(attempted_lanes)]:
             raise ValueError(f"attempt lane order mismatch: {identity}")
         if len(attempts) > bounded:
@@ -430,9 +370,7 @@ def _validate_scoped_decision_evidence(
             if len(accepted_attempts) != 1:
                 raise ValueError(f"accepted attempt count mismatch: {identity}")
             accepted_attempt = accepted_attempts[0]
-            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get(
-                "attempt_index"
-            ):
+            if decision.get("selected_candidate_attempt_index") != accepted_attempt.get("attempt_index"):
                 raise ValueError(f"selected attempt index mismatch: {identity}")
             selected_scope = _nested(
                 accepted_attempt,
@@ -442,23 +380,15 @@ def _validate_scoped_decision_evidence(
                 raise ValueError(f"selected scope evidence mismatch: {identity}")
             used_fallback = decision.get("used_group_scope_fallback")
             fallback_reason = decision.get("group_scope_fallback_reason")
-            expected_fallback = bool(
-                not selected_scope
-                and (preferred_lane == "scope" or raw_scope_count == 0)
-            )
+            expected_fallback = bool(not selected_scope and (preferred_lane == "scope" or raw_scope_count == 0))
             expected_fallback_reason = None
             if expected_fallback:
                 scope_group_count = sum(
-                    int(value)
-                    for value in decision[
-                        "scope_matching_group_count_by_logical_slot_count"
-                    ].values()
+                    int(value) for value in decision["scope_matching_group_count_by_logical_slot_count"].values()
                 )
                 scope_profile_count = sum(
                     int(value)
-                    for value in decision[
-                        "scope_matching_product_profile_count_by_logical_slot_count"
-                    ].values()
+                    for value in decision["scope_matching_product_profile_count_by_logical_slot_count"].values()
                 )
                 if scope_group_count == 0:
                     expected_fallback_reason = "no_compatible_scope_group"
@@ -467,17 +397,11 @@ def _validate_scoped_decision_evidence(
                 elif raw_scope_count == 0:
                     expected_fallback_reason = "no_scope_static_solution"
                 else:
-                    expected_fallback_reason = (
-                        "scope_candidate_attempts_exhausted"
-                    )
+                    expected_fallback_reason = "scope_candidate_attempts_exhausted"
             if used_fallback is not expected_fallback:
                 raise ValueError(f"invalid scope fallback flag: {identity}")
-            if (
-                fallback_reason != expected_fallback_reason
-                or (
-                    fallback_reason is not None
-                    and fallback_reason not in allowed_fallback_reasons
-                )
+            if fallback_reason != expected_fallback_reason or (
+                fallback_reason is not None and fallback_reason not in allowed_fallback_reasons
             ):
                 raise ValueError(f"invalid scope fallback reason: {identity}")
             selected_lane = "scope" if selected_scope else "general"
@@ -491,11 +415,10 @@ def _validate_scoped_decision_evidence(
                     else "general_candidate_attempts_exhausted"
                 )
             )
-            if decision.get(
-                "used_preferred_attempt_lane_fallback"
-            ) is not expected_preferred_fallback or decision.get(
-                "preferred_attempt_lane_fallback_reason"
-            ) != expected_preferred_reason:
+            if (
+                decision.get("used_preferred_attempt_lane_fallback") is not expected_preferred_fallback
+                or decision.get("preferred_attempt_lane_fallback_reason") != expected_preferred_reason
+            ):
                 raise ValueError(f"invalid preferred lane fallback: {identity}")
         elif accepted_attempts:
             raise ValueError(f"rejected decision has accepted attempt: {identity}")
@@ -521,20 +444,14 @@ def _exact_integer(
     field: str,
     child_uuid: str,
 ) -> int:
-    invalid = [
-        value for value in values if value is not None and type(value) is not int
-    ]
+    invalid = [value for value in values if value is not None and type(value) is not int]
     if invalid:
-        raise ValueError(
-            f"child {child_uuid} has non-integer {field} values: {invalid}"
-        )
+        raise ValueError(f"child {child_uuid} has non-integer {field} values: {invalid}")
     integers = [value for value in values if type(value) is int]
     if not integers:
         raise ValueError(f"child {child_uuid} has no integer {field}")
     if len(set(integers)) != 1:
-        raise ValueError(
-            f"child {child_uuid} has conflicting {field} values: {integers}"
-        )
+        raise ValueError(f"child {child_uuid} has conflicting {field} values: {integers}")
     return integers[0]
 
 
@@ -569,10 +486,7 @@ def _normalize_solver_slot(
         child_uuid=child_uuid,
     )
     if not 0 < old_value < new_value:
-        raise ValueError(
-            f"child {child_uuid} slot {slot_id} is not a strict expansion:"
-            f"{old_value}:{new_value}"
-        )
+        raise ValueError(f"child {child_uuid} slot {slot_id} is not a strict expansion:" f"{old_value}:{new_value}")
     result = {
         "slot_id": slot_id,
         "old_value": old_value,
@@ -581,9 +495,7 @@ def _normalize_solver_slot(
     }
     if "power_of_two" in raw:
         if type(raw["power_of_two"]) is not bool:
-            raise ValueError(
-                f"child {child_uuid} slot {slot_id} has invalid power_of_two"
-            )
+            raise ValueError(f"child {child_uuid} slot {slot_id} has invalid power_of_two")
         result["power_of_two"] = raw["power_of_two"]
     return result
 
@@ -644,18 +556,12 @@ def _decision_solver_slots(
     expected = sources[0][1]
     for label, slots in sources[1:]:
         if slots != expected:
-            raise ValueError(
-                f"child {child_uuid} solver slots conflict between "
-                f"{sources[0][0]} and {label}"
-            )
+            raise ValueError(f"child {child_uuid} solver slots conflict between " f"{sources[0][0]} and {label}")
     if not expected:
-        raise ValueError(
-            f"child {child_uuid} solver slots must be non-empty"
-        )
+        raise ValueError(f"child {child_uuid} solver slots must be non-empty")
     if solver_contract_version == "shape_multidim_solver_v4" and len(expected) != 2:
         raise ValueError(
-            f"child {child_uuid} shape_multidim_solver_v4 must have exactly "
-            f"two slots; found {len(expected)}"
+            f"child {child_uuid} shape_multidim_solver_v4 must have exactly " f"two slots; found {len(expected)}"
         )
     slot_ids = [str(slot["slot_id"]) for slot in expected]
     if len(slot_ids) != len(set(slot_ids)):
@@ -666,11 +572,7 @@ def _decision_solver_slots(
 def _forward_parameter_positions(code: str, entry_point: str) -> dict[str, int]:
     tree = ast.parse(code)
     model = next(
-        (
-            node
-            for node in tree.body
-            if isinstance(node, ast.ClassDef) and node.name == entry_point
-        ),
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == entry_point),
         None,
     )
     if model is None:
@@ -679,8 +581,7 @@ def _forward_parameter_positions(code: str, entry_point: str) -> dict[str, int]:
         (
             node
             for node in model.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "forward"
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "forward"
         ),
         None,
     )
@@ -689,9 +590,7 @@ def _forward_parameter_positions(code: str, entry_point: str) -> dict[str, int]:
     positional = list(forward.args.posonlyargs) + list(forward.args.args)
     if not positional:
         return {}
-    return {
-        argument.arg: index for index, argument in enumerate(positional[1:])
-    }
+    return {argument.arg: index for index, argument in enumerate(positional[1:])}
 
 
 def _factory_argument_positions(code: str, entry_point: str) -> dict[int, int]:
@@ -707,9 +606,7 @@ def _factory_argument_positions(code: str, entry_point: str) -> dict[int, int]:
         ),
         key=lambda node: (node.lineno, node.col_offset),
     )
-    factory_parameters = _returned_factory_parameters(
-        tree, get_inputs_node, entry_point, calls
-    )
+    factory_parameters = _returned_factory_parameters(tree, get_inputs_node, entry_point, calls)
     parameter_positions = _forward_parameter_positions(code, entry_point)
     return {
         factory_index: parameter_positions[parameter]
@@ -719,11 +616,7 @@ def _factory_argument_positions(code: str, entry_point: str) -> dict[int, int]:
 
 
 def _logical_positional_argument(inputs: Sequence[Any], index: int) -> Any:
-    if (
-        len(inputs) == 2
-        and isinstance(inputs[0], (list, tuple))
-        and isinstance(inputs[1], Mapping)
-    ):
+    if len(inputs) == 2 and isinstance(inputs[0], (list, tuple)) and isinstance(inputs[1], Mapping):
         if index >= len(inputs[0]):
             raise UnsupportedCase("mapped_forward_argument_is_not_positional")
         return inputs[0][index]
@@ -732,12 +625,55 @@ def _logical_positional_argument(inputs: Sequence[Any], index: int) -> Any:
     return inputs[index]
 
 
+def _tensor_index_argument_position(
+    inputs: Sequence[Any],
+    tensor_index: int,
+    *,
+    torch: Any,
+) -> int:
+    """Map the profiler's flattened tensor index to a direct positional arg."""
+
+    if tensor_index < 0:
+        raise UnsupportedCase("invalid_profiled_tensor_index")
+    locations: list[int | None] = []
+
+    def collect(value: Any, direct_position: int | None) -> None:
+        if isinstance(value, torch.Tensor):
+            locations.append(direct_position)
+            return
+        if isinstance(value, Mapping):
+            for item in value.values():
+                collect(item, None)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item, None)
+
+    if len(inputs) == 2 and isinstance(inputs[0], (list, tuple)) and isinstance(inputs[1], Mapping):
+        for argument_index, value in enumerate(inputs[0]):
+            collect(value, argument_index)
+        for value in inputs[1].values():
+            collect(value, None)
+    else:
+        for argument_index, value in enumerate(inputs):
+            collect(value, argument_index)
+    if tensor_index >= len(locations):
+        raise UnsupportedCase(f"profiled_tensor_index_out_of_range:{tensor_index}:{len(locations)}")
+    position = locations[tensor_index]
+    if position is None:
+        raise UnsupportedCase(f"profiled_tensor_{tensor_index}_is_not_a_direct_positional_argument")
+    return position
+
+
 def _expanded_arguments(
     parent_code: str,
     entry_point: str,
     occurrences: Sequence[Mapping[str, Any]],
     old_value: int,
     new_value: int,
+    *,
+    inputs: Sequence[Any] | None = None,
+    torch: Any | None = None,
 ) -> dict[int, list[tuple[int, int, int]]]:
     if not 0 < old_value < new_value:
         raise UnsupportedCase("slot_is_not_a_strict_expansion")
@@ -745,14 +681,25 @@ def _expanded_arguments(
     result: dict[int, set[tuple[int, int, int]]] = collections.defaultdict(set)
     for occurrence in occurrences:
         factory_index = occurrence.get("factory_index")
+        tensor_index = occurrence.get("tensor_index")
         axis = occurrence.get("axis")
-        if type(factory_index) is not int or type(axis) is not int:
+        if type(axis) is not int:
             raise UnsupportedCase("invalid_slot_occurrence")
-        if factory_index not in factory_positions:
-            raise UnsupportedCase(
-                f"factory_{factory_index}_cannot_map_to_positional_forward_argument"
+        if type(factory_index) is int and tensor_index is None:
+            if factory_index not in factory_positions:
+                raise UnsupportedCase(f"factory_{factory_index}_cannot_map_to_positional_forward_argument")
+            argument_index = factory_positions[factory_index]
+        elif type(tensor_index) is int and factory_index is None:
+            if inputs is None or torch is None:
+                raise UnsupportedCase("profiled_tensor_mapping_requires_forward_inputs")
+            argument_index = _tensor_index_argument_position(
+                inputs,
+                tensor_index,
+                torch=torch,
             )
-        result[factory_positions[factory_index]].add((axis, old_value, new_value))
+        else:
+            raise UnsupportedCase("invalid_slot_occurrence")
+        result[argument_index].add((axis, old_value, new_value))
     if not result:
         raise UnsupportedCase("slot_has_no_mapped_occurrences")
     return {index: sorted(specs) for index, specs in result.items()}
@@ -762,10 +709,11 @@ def _expanded_arguments_by_slot(
     parent_code: str,
     entry_point: str,
     slots: Sequence[Mapping[str, Any]],
+    *,
+    inputs: Sequence[Any] | None = None,
+    torch: Any | None = None,
 ) -> list[tuple[Mapping[str, Any], dict[int, list[tuple[int, int, int]]]]]:
-    expanded_slots: list[
-        tuple[Mapping[str, Any], dict[int, list[tuple[int, int, int]]]]
-    ] = []
+    expanded_slots: list[tuple[Mapping[str, Any], dict[int, list[tuple[int, int, int]]]]] = []
     occupied_axes: dict[tuple[int, int], str] = {}
     for slot in slots:
         slot_id = str(slot["slot_id"])
@@ -775,6 +723,8 @@ def _expanded_arguments_by_slot(
             slot["occurrences"],
             int(slot["old_value"]),
             int(slot["new_value"]),
+            inputs=inputs,
+            torch=torch,
         )
         for argument_index, specs in expanded.items():
             for axis, _, _ in specs:
@@ -827,9 +777,7 @@ def _perturbation_seed(
             ",".join(str(int(value)) for value in tensor.shape),
         )
     )
-    return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:8], "big") & (
-        (1 << 63) - 1
-    )
+    return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
 
 
 def _finite_component_statistics(component: Any, torch: Any) -> dict[str, float]:
@@ -852,9 +800,7 @@ def _constant_float_alternative(value: float) -> float:
     return value * 0.5
 
 
-def _floating_target_bounds(
-    statistics: Mapping[str, float], *, trial: int
-) -> tuple[float, float]:
+def _floating_target_bounds(statistics: Mapping[str, float], *, trial: int) -> tuple[float, float]:
     minimum = statistics["minimum"]
     maximum = statistics["maximum"]
     mean = statistics["mean"]
@@ -888,15 +834,11 @@ def _floating_region_evidence(view: Any, *, trial: int, torch: Any) -> dict[str,
             "method": "bounded_complex_component_random_mix",
             "real": {
                 **real_statistics,
-                "target_bounds": list(
-                    _floating_target_bounds(real_statistics, trial=trial)
-                ),
+                "target_bounds": list(_floating_target_bounds(real_statistics, trial=trial)),
             },
             "imaginary": {
                 **imaginary_statistics,
-                "target_bounds": list(
-                    _floating_target_bounds(imaginary_statistics, trial=trial)
-                ),
+                "target_bounds": list(_floating_target_bounds(imaginary_statistics, trial=trial)),
             },
         }
     statistics = _finite_component_statistics(view, torch)
@@ -974,8 +916,7 @@ def _perturb_tensor_region(
             raise UnsupportedCase(f"expanded_axis_out_of_range:{axis}:{tensor.ndim}")
         if tensor.shape[resolved_axis] != new_value:
             raise UnsupportedCase(
-                f"expanded_axis_size_mismatch:{resolved_axis}:"
-                f"{tensor.shape[resolved_axis]}:{new_value}"
+                f"expanded_axis_size_mismatch:{resolved_axis}:" f"{tensor.shape[resolved_axis]}:{new_value}"
             )
         normalized.append((resolved_axis, old_value, new_value))
     if len({axis for axis, _, _ in normalized}) != len(normalized):
@@ -1016,9 +957,7 @@ def _perturb_tensor_region(
             maximum = int(view.max().item())
             evidence = {
                 "method": (
-                    "biased_integer_endpoint_resample"
-                    if minimum < maximum
-                    else "constant_integer_neighbor_resample"
+                    "biased_integer_endpoint_resample" if minimum < maximum else "constant_integer_neighbor_resample"
                 ),
                 "minimum": minimum,
                 "maximum": maximum,
@@ -1119,6 +1058,7 @@ def _validate_output_tree(value: Any, torch: Any) -> None:
 
 def _run_arm(model: Any, inputs: Sequence[Any], rng_state: Mapping[str, Any]) -> Any:
     import copy
+
     import torch
 
     trial_model = None
@@ -1165,18 +1105,12 @@ def _evaluate_without_memory_guard(payload: Mapping[str, Any]) -> dict[str, Any]
         raise UnsupportedCase("worker_requires_nonempty_solver_slots")
     if not all(isinstance(slot, Mapping) for slot in slots):
         raise UnsupportedCase("worker_slot_is_not_an_object")
-    expanded_slots = _expanded_arguments_by_slot(
-        parent_code,
-        entry_point,
-        slots,
-    )
     namespace = _exec_ops_code(child_code, entry_point=entry_point, device=device)
     trials = int(payload["trials"])
     seed = int(payload["seed"])
     trial_records: list[dict[str, Any]] = []
-    slot_effects: dict[str, list[bool]] = {
-        str(slot["slot_id"]): [] for slot, _ in expanded_slots
-    }
+    slot_effects: dict[str, list[bool]] = {str(slot["slot_id"]): [] for slot in slots}
+    prior_expanded_signature: list[tuple[str, dict[int, list[tuple[int, int, int]]]]] | None = None
     original_rng = _snapshot_rng_states(device)
     try:
         for trial in range(trials):
@@ -1194,11 +1128,21 @@ def _evaluate_without_memory_guard(payload: Mapping[str, Any]) -> dict[str, Any]
             base_model.train(True)
             del init_inputs
 
-            raw_inputs = _generate_inputs_on_device(
-                namespace, resolved_device, torch
-            )
+            raw_inputs = _generate_inputs_on_device(namespace, resolved_device, torch)
             inputs = _normalize_forward_inputs(raw_inputs, device)
             del raw_inputs
+            expanded_slots = _expanded_arguments_by_slot(
+                parent_code,
+                entry_point,
+                slots,
+                inputs=inputs,
+                torch=torch,
+            )
+            expanded_signature = [(str(slot["slot_id"]), expanded) for slot, expanded in expanded_slots]
+            if prior_expanded_signature is None:
+                prior_expanded_signature = expanded_signature
+            elif expanded_signature != prior_expanded_signature:
+                raise UnsupportedCase("profiled_tensor_argument_mapping_changed_between_trials")
             forward_rng = _snapshot_rng_states(device)
             baseline = _run_arm(base_model, inputs, forward_rng)
             control = _run_arm(base_model, inputs, forward_rng)
@@ -1237,12 +1181,8 @@ def _evaluate_without_memory_guard(payload: Mapping[str, Any]) -> dict[str, Any]
                     )
                     del target
                 changed_output = _run_arm(base_model, perturbed, forward_rng)
-                output_changed = not _outputs_allclose(
-                    baseline, changed_output, rtol=0.0, atol=0.0
-                )
-                activity = _output_change_activity(
-                    baseline, changed_output, rtol=0.0, atol=0.0
-                )
+                output_changed = not _outputs_allclose(baseline, changed_output, rtol=0.0, atol=0.0)
+                activity = _output_change_activity(baseline, changed_output, rtol=0.0, atol=0.0)
                 slot_records.append(
                     {
                         "slot_id": slot_id,
@@ -1273,14 +1213,8 @@ def _evaluate_without_memory_guard(payload: Mapping[str, Any]) -> dict[str, Any]
             torch.cuda.empty_cache()
     finally:
         _restore_rng_states(original_rng)
-    dead_slots = [
-        slot_id for slot_id, effects in slot_effects.items() if not any(effects)
-    ]
-    inconsistent_slots = [
-        slot_id
-        for slot_id, effects in slot_effects.items()
-        if any(effects) and not all(effects)
-    ]
+    dead_slots = [slot_id for slot_id, effects in slot_effects.items() if not any(effects)]
+    inconsistent_slots = [slot_id for slot_id, effects in slot_effects.items() if any(effects) and not all(effects)]
     if dead_slots:
         return {
             "status": "rejected",
@@ -1434,11 +1368,7 @@ def _run_subprocess(payload: Mapping[str, Any], timeout_seconds: float) -> dict[
     finally:
         _ACTIVE_WORKER_PROCESS = None
     assert process is not None
-    markers = [
-        line[len(RESULT_MARKER) :]
-        for line in stdout.splitlines()
-        if line.startswith(RESULT_MARKER)
-    ]
+    markers = [line[len(RESULT_MARKER) :] for line in stdout.splitlines() if line.startswith(RESULT_MARKER)]
     if process.returncode != 0 or len(markers) != 1:
         return {
             "contract_version": CONTRACT_VERSION,
@@ -1483,13 +1413,10 @@ def _declared_logical_slot_range(
         return None
     if not isinstance(contract, Mapping):
         raise ValueError("group_contract must be an object")
-    if (
-        manifest.get("contract_version") in {
-            "shape_variable_multislot_solver_v6",
-            "shape_variable_multislot_solver_v7",
-        }
-        and not isinstance(manifest.get("scope_selection_contract"), Mapping)
-    ):
+    if manifest.get("contract_version") in {
+        "shape_variable_multislot_solver_v6",
+        "shape_variable_multislot_solver_v7",
+    } and not isinstance(manifest.get("scope_selection_contract"), Mapping):
         raise ValueError("scoped variable multislot solver requires scope_selection_contract")
     raw = contract.get("logical_slot_count_range")
     if (
@@ -1534,11 +1461,7 @@ def _accepted_tasks(
             raise ValueError(f"accepted parent missing from selected parquet: {parent_uuid}")
         attempts = decision.get("attempts")
         accepted_attempts = (
-            [
-                attempt
-                for attempt in attempts
-                if isinstance(attempt, Mapping) and attempt.get("accepted") is True
-            ]
+            [attempt for attempt in attempts if isinstance(attempt, Mapping) and attempt.get("accepted") is True]
             if isinstance(attempts, list)
             else []
         )
@@ -1551,9 +1474,7 @@ def _accepted_tasks(
             child_uuid=child_uuid,
             solver_contract_version=solver_contract_version,
         )
-        if logical_slot_range is not None and not (
-            logical_slot_range[0] <= len(slots) <= logical_slot_range[1]
-        ):
+        if logical_slot_range is not None and not (logical_slot_range[0] <= len(slots) <= logical_slot_range[1]):
             raise ValueError(
                 f"child {child_uuid} logical slot count {len(slots)} is outside "
                 f"declared range {logical_slot_range}"
@@ -1599,9 +1520,7 @@ def _accepted_tasks(
             )
         tasks.append(task)
     if len(tasks) != len(children):
-        raise ValueError(
-            f"accepted manifest/children count mismatch:{len(tasks)}:{len(children)}"
-        )
+        raise ValueError(f"accepted manifest/children count mismatch:{len(tasks)}:{len(children)}")
     return tasks
 
 
@@ -1622,15 +1541,9 @@ def _requested_child_uuids(args: argparse.Namespace) -> tuple[bool, set[str]]:
             if not value:
                 continue
             if any(char.isspace() for char in value):
-                raise ValueError(
-                    f"{args.child_uuid_file}:{line_number}: expected one UUID"
-                )
+                raise ValueError(f"{args.child_uuid_file}:{line_number}: expected one UUID")
             requested.append(value)
-    duplicates = [
-        uuid
-        for uuid, count in collections.Counter(requested).items()
-        if count > 1
-    ]
+    duplicates = [uuid for uuid, count in collections.Counter(requested).items() if count > 1]
     if duplicates:
         raise ValueError(f"duplicate requested child UUIDs: {sorted(duplicates)}")
     return bool(args.child_uuid) or args.child_uuid_file is not None, set(requested)
@@ -1782,9 +1695,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("trials and timeout must be positive")
     if args.shard_count <= 0 or not 0 <= args.shard_index < args.shard_count:
         raise ValueError("shard-index must satisfy 0 <= index < shard-count")
-    if (
-        len(args.launcher_sha256) != 64
-        or any(character not in "0123456789abcdef" for character in args.launcher_sha256)
+    if len(args.launcher_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in args.launcher_sha256
     ):
         raise ValueError("launcher-sha256 must be 64 lowercase hexadecimal characters")
     all_tasks = _accepted_tasks(args.selected, args.children, args.manifest)
@@ -1798,11 +1710,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         missing = wanted - set(tasks_by_uuid)
         if missing:
             raise ValueError(f"requested child UUIDs not found: {sorted(missing)}")
-    tasks = [
-        task
-        for index, task in enumerate(tasks)
-        if index % args.shard_count == args.shard_index
-    ]
+    tasks = [task for index, task in enumerate(tasks) if index % args.shard_count == args.shard_index]
     if args.limit is not None:
         if args.limit <= 0:
             raise ValueError("limit must be positive")
@@ -1852,9 +1760,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             }
             result = _run_subprocess(payload, args.timeout_seconds)
             result.update(evidence_hashes)
-            result["validation_binding_contract_version"] = (
-                RUN_BINDING_CONTRACT_VERSION
-            )
+            result["validation_binding_contract_version"] = RUN_BINDING_CONTRACT_VERSION
             result["validation_config"] = binding["validation_config"]
             result["validation_binding_sha256"] = binding_sha256
             _append_jsonl(output_handle, result)
@@ -1888,9 +1794,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "shard_index": args.shard_index,
                 "shard_count": args.shard_count,
                 "launcher_source_sha256": args.launcher_sha256,
-                "validator_source_sha256": evidence_hashes[
-                    "validator_source_sha256"
-                ],
+                "validator_source_sha256": evidence_hashes["validator_source_sha256"],
                 "validation_binding_sha256": binding_sha256,
             },
             sort_keys=True,

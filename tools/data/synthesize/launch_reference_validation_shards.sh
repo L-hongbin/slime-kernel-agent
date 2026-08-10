@@ -280,7 +280,8 @@ import sys
 from pathlib import Path
 
 log_path = Path(sys.argv[1])
-expected_output = str(Path(sys.argv[2]).resolve())
+output_path = Path(sys.argv[2])
+expected_output = str(output_path.resolve())
 expected_shard = int(sys.argv[3])
 expected_count = int(sys.argv[4])
 validator_status = int(sys.argv[5])
@@ -314,6 +315,23 @@ if validator_status == 0 and not all_passed:
     raise SystemExit("validator exited 0 with a failing final JSON summary")
 if validator_status == 1 and all_passed:
     raise SystemExit("validator exited 1 with a passing final JSON summary")
+
+# The row validator intentionally does not open an output file when a shard
+# selects zero rows.  Materialize that one valid empty-shard case so the
+# distributed verifier can require a complete JSONL shard family.  A missing
+# output for any non-empty shard remains an infrastructure failure.
+if counts["selected"] == 0 and not output_path.exists():
+    output_path.touch(exist_ok=False)
+try:
+    records = [
+        json.loads(line)
+        for line in output_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"missing or invalid reference output {output_path}: {exc}")
+if len(records) != counts["selected"]:
+    raise SystemExit("reference output row count differs from selected")
 PY
 }
 

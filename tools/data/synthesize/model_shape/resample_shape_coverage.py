@@ -8,10 +8,10 @@ random/value family that the downstream solver would assign.  It never rewrites
 a row.  Runtime-ineligible shape children fail closed before sampling, and at
 most one runtime-safe child is retained for each canonical parent.
 
-The repository defaults intentionally name the three static production lanes
-and all three model production lanes.  A normal invocation therefore needs
-only an output directory; the downstream random/value lane can consume
-``selected.parquet`` directly.
+The repository defaults intentionally name the three static production lanes,
+the original model production lanes, and the runtime-validated low/128K
+residual lanes.  A normal invocation therefore needs only an output directory;
+the downstream random/value lane can consume ``selected.parquet`` directly.
 """
 
 from __future__ import annotations
@@ -46,8 +46,9 @@ SMALL_NUMEL_THRESHOLD = 1_000_000
 MAX_SMALL_SHAPE_SHARE = 0.10
 MIB = 1024**2
 MAX_AGGREGATE_INPUT_BYTES = 4 * 1024**3
+_PROFILED_TENSOR_FACTORY_NAME = "__profiled_tensor_index__"
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 KERNELBENCH_BASELINE = _REPO_ROOT / "Data/external/converted/kernelbench_level1_2_3.reference.parquet"
 KERNELBENCH_BASELINE_SHA256 = "b4de490253a0f5a1f5e971f0f723cffd1de2cc2506ceabe97a369804e3a3d7f2"
 DEFAULT_SHAPE_RUNS = (
@@ -57,6 +58,13 @@ DEFAULT_SHAPE_RUNS = (
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_hardtail_v2/run.full17864",
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_full_residual_v3/run.measurable12674",
     _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_relaxed_residual_v2/run.full2321",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_retry_single_v3/run.full6460",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_retry_single_v3/run.residual_low128k",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_retry_single_v3/run.final_low128k",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_unprofiled_v3/run.residual_low128k",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_unprofiled_v3/run.final_low128k",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_unprofiled_v3/run.canary128.hash",
+    _REPO_ROOT / "Data/prompt_tvm_v4/shape_model_unprofiled_v3/run.canary32.low128k",
 )
 
 _SAMPLED_NUMEL_BOUNDS = (2**12, 2**16, 2**20, 2**24, 2**28, 2**32)
@@ -366,7 +374,7 @@ def _load_model_child_profiles(path: Path) -> dict[str, ChildShapeProfile]:
             raise ValueError(f"invalid accepted model-shape decision: {child_uuid!r}")
         if child_uuid in profiles:
             raise ValueError(f"duplicate model-shape child decision: {child_uuid}")
-        factory_rows: dict[int, list[Mapping[str, Any]]] = collections.defaultdict(list)
+        factory_rows: dict[tuple[str, int], list[Mapping[str, Any]]] = collections.defaultdict(list)
         leading: list[bool] = []
         for slot in slots:
             occurrences = slot.get("occurrences") if isinstance(slot, Mapping) else None
@@ -376,26 +384,57 @@ def _load_model_child_profiles(path: Path) -> dict[str, ChildShapeProfile]:
                 if not isinstance(occurrence, Mapping):
                     raise ValueError(f"invalid model-shape occurrence: {child_uuid}")
                 try:
-                    factory_index = int(occurrence["factory_index"])
                     axis = int(occurrence["axis"])
                     rank = int(occurrence["rank"])
-                    factory_name = str(occurrence["factory_name"])
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError(f"invalid model-shape occurrence fields: {child_uuid}") from exc
-                if factory_index < 0 or rank <= 0 or axis < 0 or axis >= rank or not factory_name:
+                if rank <= 0 or axis < 0 or axis >= rank:
                     raise ValueError(f"invalid model-shape occurrence geometry: {child_uuid}")
-                factory_rows[factory_index].append(occurrence)
+                factory_index = occurrence.get("factory_index")
+                tensor_index = occurrence.get("tensor_index")
+                if type(factory_index) is int and tensor_index is None:
+                    index_kind = "factory"
+                    index = factory_index
+                    factory_name = occurrence.get("factory_name")
+                    if not isinstance(factory_name, str) or not factory_name:
+                        raise ValueError(f"invalid model-shape factory name: {child_uuid}")
+                elif type(tensor_index) is int and factory_index is None:
+                    index_kind = "profiled_tensor"
+                    index = tensor_index
+                    factory_name = _PROFILED_TENSOR_FACTORY_NAME
+                    child_profile = decision.get("child_input_profile")
+                    tensors = child_profile.get("tensors") if isinstance(child_profile, Mapping) else None
+                    if not isinstance(tensors, list) or index < 0 or index >= len(tensors):
+                        raise ValueError(f"invalid model-shape profiled tensor index: {child_uuid}")
+                    tensor = tensors[index]
+                    if (
+                        not isinstance(tensor, list)
+                        or len(tensor) != 3
+                        or not isinstance(tensor[0], list)
+                        or len(tensor[0]) != rank
+                        or tensor[0][axis] != slot.get("new_value")
+                    ):
+                        raise ValueError(f"inconsistent model-shape profiled tensor: {child_uuid}:{index}")
+                else:
+                    raise ValueError(f"ambiguous model-shape occurrence index: {child_uuid}")
+                if index < 0:
+                    raise ValueError(f"invalid model-shape occurrence geometry: {child_uuid}")
+                factory_rows[(index_kind, index)].append(occurrence)
                 leading.append(axis == 0)
         changed_factories: list[ChangedFactoryEvidence] = []
-        for factory_index, occurrences in sorted(factory_rows.items()):
-            names = {str(item["factory_name"]) for item in occurrences}
+        for (index_kind, index), occurrences in sorted(factory_rows.items()):
+            names = (
+                {str(item["factory_name"]) for item in occurrences}
+                if index_kind == "factory"
+                else {_PROFILED_TENSOR_FACTORY_NAME}
+            )
             ranks = {int(item["rank"]) for item in occurrences}
             axes = tuple(sorted({int(item["axis"]) for item in occurrences}))
             if len(names) != 1 or len(ranks) != 1 or not axes:
-                raise ValueError(f"inconsistent model-shape factory evidence: {child_uuid}:{factory_index}")
+                raise ValueError(f"inconsistent model-shape factory evidence: {child_uuid}:{index}")
             changed_factories.append(
                 ChangedFactoryEvidence(
-                    factory_index=factory_index,
+                    factory_index=index,
                     factory_name=next(iter(names)),
                     rank=next(iter(ranks)),
                     changed_axes=axes,
@@ -585,6 +624,8 @@ def _candidate_from_row(
     if len(locations) != len(set(locations)):
         return None, "duplicate_direct_factory_source_location"
     for evidence in profile.changed_factories:
+        if evidence.factory_name == _PROFILED_TENSOR_FACTORY_NAME:
+            return None, "profiled_tensor_index_not_statically_mapped"
         if evidence.factory_index < 0 or evidence.factory_index >= len(records):
             return None, "changed_factory_index_out_of_range"
         record = records[evidence.factory_index]

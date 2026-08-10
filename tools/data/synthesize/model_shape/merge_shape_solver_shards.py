@@ -18,12 +18,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
-from tools.data.synthesize.shard_shape_solver_input import (
-    CONTRACT_VERSION as SHARD_CONTRACT_VERSION,
-)
-from tools.data.synthesize.shard_shape_solver_input import MANIFEST_NAME, shard_name
-
+from tools.data.synthesize.model_shape.shard_shape_solver_input import CONTRACT_VERSION as SHARD_CONTRACT_VERSION
+from tools.data.synthesize.model_shape.shard_shape_solver_input import MANIFEST_NAME, shard_name
 
 CONTRACT_VERSION = "shape_solver_shard_merge_v2"
 VARIANT_ORDER = {"medium": 0, "large": 1}
@@ -73,10 +69,9 @@ def _row_reference(row: Mapping[str, Any]) -> str:
 
 
 def _logical_target_map_sha256(records: Sequence[Mapping[str, Any]]) -> str:
-    canonical = "".join(
-        json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
-        for record in records
-    ).encode("utf-8")
+    canonical = "".join(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n" for record in records).encode(
+        "utf-8"
+    )
     return _sha256_bytes(canonical)
 
 
@@ -125,11 +120,7 @@ def _review_markdown(
             raw_slots = solver.get("slots")
             if isinstance(raw_slots, list):
                 for raw_edit in raw_slots:
-                    raw_slot = (
-                        raw_edit.get("slot")
-                        if isinstance(raw_edit, Mapping)
-                        else None
-                    )
+                    raw_slot = raw_edit.get("slot") if isinstance(raw_edit, Mapping) else None
                     if isinstance(raw_slot, Mapping):
                         slot_ids.append(str(raw_slot.get("slot_id", "unknown")))
             elif isinstance(solver.get("slot"), Mapping):
@@ -324,11 +315,7 @@ def merge_shards(
             raise ValueError(f"row schema mismatch in {expected_name}")
         local_child_rows = shard_children.to_pylist()
         local_child_uuids = [_row_uuid(row) for row in local_child_rows]
-        accepted_local = [
-            str(decision["child_uuid"])
-            for decision in local_decisions
-            if decision.get("accepted")
-        ]
+        accepted_local = [str(decision["child_uuid"]) for decision in local_decisions if decision.get("accepted")]
         if local_child_uuids != accepted_local:
             raise ValueError(f"children are not in accepted-decision order: {expected_name}")
         for child in local_child_rows:
@@ -340,9 +327,7 @@ def merge_shards(
         accepted_by_local: dict[int, list[str]] = collections.defaultdict(list)
         for decision in local_decisions:
             if decision.get("accepted"):
-                accepted_by_local[int(decision["shard_source_row_index"])].append(
-                    str(decision["child_uuid"])
-                )
+                accepted_by_local[int(decision["shard_source_row_index"])].append(str(decision["child_uuid"]))
         expected_paired_uuids: list[str] = []
         for local_index, global_index in enumerate(global_indices):
             child_uuids = accepted_by_local.get(local_index, [])
@@ -373,9 +358,7 @@ def merge_shards(
             VARIANT_ORDER.get(str(item.get("variant")), 99),
         )
     )
-    decision_keys = [
-        (int(item["source_row_index"]), str(item["variant"])) for item in all_decisions
-    ]
+    decision_keys = [(int(item["source_row_index"]), str(item["variant"])) for item in all_decisions]
     if len(decision_keys) != len(set(decision_keys)):
         raise ValueError("duplicate global decision key")
     all_targets.sort(
@@ -384,9 +367,7 @@ def merge_shards(
             VARIANT_ORDER.get(str(item.get("variant")), 99),
         )
     )
-    target_keys = [
-        (int(item["selected_index"]), str(item["variant"])) for item in all_targets
-    ]
+    target_keys = [(int(item["selected_index"]), str(item["variant"])) for item in all_targets]
     if target_keys != decision_keys:
         raise ValueError("targets and decisions do not have the same global keys")
 
@@ -426,9 +407,7 @@ def merge_shards(
     if counters["parents_with_children"] != len(accepted_by_global):
         raise ValueError("merged parents_with_children count mismatch")
 
-    variants_per_parent = int(
-        _nested(first_manifest, "target_contract.variants_per_parent", 2)
-    )
+    variants_per_parent = int(_nested(first_manifest, "target_contract.variants_per_parent", 2))
     if variants_per_parent not in (1, 2):
         raise ValueError(f"unsupported variants_per_parent: {variants_per_parent}")
     target_indices = sorted({int(row["selected_index"]) for row in all_targets})
@@ -441,9 +420,7 @@ def merge_shards(
             raise ValueError("single-variant decisions are not one-per-selected-parent")
     target_maps: list[dict[str, Any]] = []
     for global_index in target_indices:
-        parent_targets = [
-            row for row in all_targets if int(row["selected_index"]) == global_index
-        ]
+        parent_targets = [row for row in all_targets if int(row["selected_index"]) == global_index]
         if len(parent_targets) != variants_per_parent:
             raise ValueError(
                 f"unexpected target count at global index {global_index}: "
@@ -453,9 +430,7 @@ def merge_shards(
         if variants_per_parent == 1:
             variant = str(first["variant"])
             if variant not in VARIANT_ORDER:
-                raise ValueError(
-                    f"unknown target variant at global index {global_index}: {variant}"
-                )
+                raise ValueError(f"unknown target variant at global index {global_index}: {variant}")
             target_maps.append(
                 {
                     "selected_index": global_index,
@@ -466,14 +441,9 @@ def merge_shards(
                 }
             )
         else:
-            variants = {
-                str(row["variant"]): int(row["target_input_bytes"])
-                for row in parent_targets
-            }
+            variants = {str(row["variant"]): int(row["target_input_bytes"]) for row in parent_targets}
             if set(variants) != set(VARIANT_ORDER):
-                raise ValueError(
-                    f"incomplete target variants at global index {global_index}"
-                )
+                raise ValueError(f"incomplete target variants at global index {global_index}")
             target_maps.append(
                 {
                     "selected_index": global_index,
@@ -485,9 +455,7 @@ def merge_shards(
     logical_target_hash = _logical_target_map_sha256(target_maps)
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
-    )
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent))
     try:
         (temporary_dir / "static").mkdir(parents=True)
         (temporary_dir / "analysis").mkdir(parents=True)
@@ -508,14 +476,10 @@ def merge_shards(
             compression="zstd",
         )
         review_path = temporary_dir / "analysis" / "review_samples.md"
-        review_path.write_text(
-            _review_markdown(source_rows, child_by_uuid, all_decisions), encoding="utf-8"
-        )
+        review_path.write_text(_review_markdown(source_rows, child_by_uuid, all_decisions), encoding="utf-8")
 
         source_selection_path = selected_path.with_name("selection.json")
-        source_selection = (
-            _load_json(source_selection_path) if source_selection_path.is_file() else {}
-        )
+        source_selection = _load_json(source_selection_path) if source_selection_path.is_file() else {}
         source_selection_rows = source_selection.get("rows", [])
         if source_selection_rows and len(source_selection_rows) != source.num_rows:
             raise ValueError("source selection rows do not match source selected parquet")
@@ -524,14 +488,10 @@ def merge_shards(
             "derivation_contract_version": first_manifest["contract_version"],
             "merge_contract_version": CONTRACT_VERSION,
             "source_selection_manifest": (
-                str(source_selection_path.resolve())
-                if source_selection_path.is_file()
-                else None
+                str(source_selection_path.resolve()) if source_selection_path.is_file() else None
             ),
             "source_selection_manifest_sha256": (
-                _sha256_file(source_selection_path)
-                if source_selection_path.is_file()
-                else None
+                _sha256_file(source_selection_path) if source_selection_path.is_file() else None
             ),
             "shard_input_manifest": str(shard_manifest_path),
             "shard_input_manifest_sha256": _sha256_file(shard_manifest_path),
@@ -543,9 +503,7 @@ def merge_shards(
             "rows": source_selection_rows,
         }
         selection_path = temporary_dir / "selection.json"
-        selection_path.write_text(
-            json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        selection_path.write_text(json.dumps(selection, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
         target_contract = copy.deepcopy(first_manifest["target_contract"])
         target_contract["logical_target_map_sha256"] = logical_target_hash
@@ -573,11 +531,7 @@ def merge_shards(
             )
         }
         final_manifest.update(
-            {
-                key: copy.deepcopy(value)
-                for key, value in first_manifest.items()
-                if key.endswith("_contract")
-            }
+            {key: copy.deepcopy(value) for key, value in first_manifest.items() if key.endswith("_contract")}
         )
         final_manifest.update(
             {
@@ -586,9 +540,7 @@ def merge_shards(
                 "selected_source_sha256": _sha256_file(selected_path),
                 "selected_rows": source.num_rows,
                 "artifacts": final_artifacts,
-                "artifact_sha256": {
-                    key: _sha256_file(path) for key, path in temporary_artifacts.items()
-                },
+                "artifact_sha256": {key: _sha256_file(path) for key, path in temporary_artifacts.items()},
                 "counts": dict(sorted(counters.items())),
                 "skip_reason_counts": dict(sorted(skip_reasons.items())),
                 "decisions": all_decisions,
@@ -605,27 +557,19 @@ def merge_shards(
                 },
             }
         )
-        accepted_decisions = [
-            decision for decision in all_decisions if decision.get("accepted") is True
-        ]
+        accepted_decisions = [decision for decision in all_decisions if decision.get("accepted") is True]
         if accepted_decisions and all(
             type(_nested(decision, "solver.changed_occurrences")) is int
             and type(_nested(decision, "solver.power_of_two_occurrences")) is int
             for decision in accepted_decisions
         ):
             changed_occurrences = sum(
-                int(_nested(decision, "solver.changed_occurrences"))
-                for decision in accepted_decisions
+                int(_nested(decision, "solver.changed_occurrences")) for decision in accepted_decisions
             )
             power_occurrences = sum(
-                int(_nested(decision, "solver.power_of_two_occurrences"))
-                for decision in accepted_decisions
+                int(_nested(decision, "solver.power_of_two_occurrences")) for decision in accepted_decisions
             )
-            power_fraction = (
-                power_occurrences / changed_occurrences
-                if changed_occurrences
-                else None
-            )
+            power_fraction = power_occurrences / changed_occurrences if changed_occurrences else None
             declared_range = _nested(
                 final_manifest,
                 "distribution_contract.power_of_two_occurrence_fraction_range",
@@ -635,9 +579,7 @@ def merge_shards(
                 and len(declared_range) == 2
                 and all(type(value) in (int, float) for value in declared_range)
                 and power_fraction is not None
-                and float(declared_range[0])
-                <= power_fraction
-                <= float(declared_range[1])
+                and float(declared_range[0]) <= power_fraction <= float(declared_range[1])
             )
             final_manifest["distribution_observation"] = {
                 "static_changed_occurrences": changed_occurrences,
@@ -685,9 +627,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "output_dir": str(args.output_dir.resolve()),
                 "selected_rows": manifest["selected_rows"],
                 "counts": manifest["counts"],
-                "logical_target_map_sha256": manifest["target_contract"][
-                    "logical_target_map_sha256"
-                ],
+                "logical_target_map_sha256": manifest["target_contract"]["logical_target_map_sha256"],
             },
             indent=2,
             sort_keys=True,

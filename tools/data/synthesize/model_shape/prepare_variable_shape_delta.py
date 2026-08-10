@@ -38,40 +38,30 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools.data.synthesize.augment_prompt_tasks import (  # noqa: E402
-    _top_level_function,
-    analyze_code,
-)
-from tools.data.synthesize.solve_multidim_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.augment_prompt_tasks import _top_level_function, analyze_code  # noqa: E402
+from tools.data.synthesize.model_shape.solve_multidim_shape_coverage import (  # noqa: E402
     _bilinear_profile,
     _span_inside,
     _spans_overlap,
 )
-from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.model_shape.solve_shape_coverage import (  # noqa: E402
     AffineProfile,
     ShapeSlot,
     _affine_profiles,
     _shape_slots_with_rejections,
 )
 
-
 CONTRACT_VERSION = "variable_shape_delta_selection_v1"
 DELTA_CONTRACT_VERSION = "shape_variable_multislot_delta_selection_v1"
 OLD_FAILURE_REASON = "no_strict_two_slot_exactly_one_power_solution"
 DEFAULT_EXPECTED_COUNT = 12_318
 MAX_SELECTION_WORKERS = 32
-DEFAULT_SOURCE_RUN = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896"
-)
-DEFAULT_OUTPUT_DIR = (
-    _REPO_ROOT
-    / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318"
-)
+DEFAULT_SOURCE_RUN = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896"
+DEFAULT_OUTPUT_DIR = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v5/input.recoverable12318"
 
 LEDGER_FIELDS = (
     "output_index",
@@ -132,11 +122,7 @@ def _compatible_without_lexical_inside(slot_a: ShapeSlot, slot_b: ShapeSlot) -> 
 
     if slot_a.slot_id == slot_b.slot_id:
         return False
-    if any(
-        _spans_overlap(left, right)
-        for left in slot_a.patch_spans
-        for right in slot_b.patch_spans
-    ):
+    if any(_spans_overlap(left, right) for left in slot_a.patch_spans for right in slot_b.patch_spans):
         return False
 
     by_factory_a: dict[int, list[int]] = collections.defaultdict(list)
@@ -224,23 +210,11 @@ def _evaluate_candidate(
         raise ValueError(f"get_inputs_is_not_sync_function:{source_row_index}")
     first = positive_profiles[0]
     first_slots = (first.slot_a, first.slot_b)
-    outside_count = sum(
-        not _span_inside(span, get_inputs)
-        for slot in first_slots
-        for span in slot.patch_spans
-    )
+    outside_count = sum(not _span_inside(span, get_inputs) for slot in first_slots for span in slot.patch_spans)
     if outside_count <= 0:
-        raise ValueError(
-            f"relaxation_witness_did_not_relax_lexical_inside:{source_row_index}"
-        )
-    participating_slots = {
-        slot.slot_id
-        for profile in positive_profiles
-        for slot in (profile.slot_a, profile.slot_b)
-    }
-    factory_indices = sorted(
-        {occurrence.factory_index for occurrence in first.slot_a.occurrences}
-    )
+        raise ValueError(f"relaxation_witness_did_not_relax_lexical_inside:{source_row_index}")
+    participating_slots = {slot.slot_id for profile in positive_profiles for slot in (profile.slot_a, profile.slot_b)}
+    factory_indices = sorted({occurrence.factory_index for occurrence in first.slot_a.occurrences})
     return {
         "source_row_index": source_row_index,
         "recomputed_affine_slot_count": len(affine_profiles),
@@ -254,9 +228,7 @@ def _evaluate_candidate(
         "first_slot_b_kind": first.slot_b.kind,
         "first_slot_b_symbol_scope": first.slot_b.symbol_scope or "",
         "first_profile_factory_indices": ",".join(map(str, factory_indices)),
-        "first_profile_changed_occurrences": (
-            len(first.slot_a.occurrences) + len(first.slot_b.occurrences)
-        ),
+        "first_profile_changed_occurrences": (len(first.slot_a.occurrences) + len(first.slot_b.occurrences)),
         "first_profile_outside_get_inputs_patch_spans": outside_count,
         "first_profile_constant_bytes": first.constant_bytes,
         "first_profile_x_bytes": first.x_bytes,
@@ -265,9 +237,7 @@ def _evaluate_candidate(
     }
 
 
-def _manifest_artifact_hash(
-    manifest: Mapping[str, Any], artifact_name: str
-) -> str:
+def _manifest_artifact_hash(manifest: Mapping[str, Any], artifact_name: str) -> str:
     hashes = manifest.get("artifact_sha256")
     if not isinstance(hashes, Mapping):
         raise ValueError("source_manifest_missing_artifact_sha256")
@@ -293,16 +263,12 @@ def _validate_source_provenance(
     recorded_source_hash = source_manifest.get("selected_source_sha256")
     if recorded_source_hash != selected_hash:
         raise ValueError("source_selected_hash_does_not_match_selected_source_hash")
-    if _sha256_file(selection_path) != _manifest_artifact_hash(
-        source_manifest, "selection"
-    ):
+    if _sha256_file(selection_path) != _manifest_artifact_hash(source_manifest, "selection"):
         raise ValueError("source_selection_hash_does_not_match_manifest")
 
     selected_rows = source_manifest.get("selected_rows")
     if selected_rows != source.num_rows:
-        raise ValueError(
-            f"source_selected_row_count_mismatch:{selected_rows}:{source.num_rows}"
-        )
+        raise ValueError(f"source_selected_row_count_mismatch:{selected_rows}:{source.num_rows}")
     if source_selection.get("selected_count") != source.num_rows:
         raise ValueError("source_selection_row_count_mismatch")
 
@@ -350,9 +316,7 @@ def prepare_variable_shape_delta(
         source_manifest = json.load(handle)
     if not isinstance(source_selection, dict) or not isinstance(source_manifest, dict):
         raise ValueError("source_manifests_must_be_objects")
-    decisions = _validate_source_provenance(
-        source_run, source, source_manifest, source_selection
-    )
+    decisions = _validate_source_provenance(source_run, source, source_manifest, source_selection)
 
     extra = source.column("extra_info").combine_chunks()
     reward_model = source.column("reward_model").combine_chunks()
@@ -451,9 +415,7 @@ def prepare_variable_shape_delta(
                 {
                     "output_index": len(selected_indices) - 1,
                     "source_row_index": source_row_index,
-                    "original_source_row_index": selection_record.get(
-                        "row_index", ""
-                    ),
+                    "original_source_row_index": selection_record.get("row_index", ""),
                     "parent_uuid": parent_uuid,
                     "parent_reference_sha256": reference_hash,
                     "source_family": selection_record.get("source_family", ""),
@@ -462,9 +424,7 @@ def prepare_variable_shape_delta(
                     "old_reason": decision["reason"],
                     "old_slot_count": decision.get("slot_count", ""),
                     "old_affine_slot_count": decision["affine_slot_count"],
-                    "old_structural_bilinear_pair_count": decision[
-                        "structural_bilinear_pair_count"
-                    ],
+                    "old_structural_bilinear_pair_count": decision["structural_bilinear_pair_count"],
                     **evidence,
                 }
             )
@@ -472,15 +432,10 @@ def prepare_variable_shape_delta(
     if selected_indices != sorted(selected_indices):
         raise AssertionError("selected_source_indices_are_not_sorted")
     if len(selected_indices) != expected_count:
-        raise ValueError(
-            f"selected_count_mismatch:expected={expected_count}:"
-            f"observed={len(selected_indices)}"
-        )
+        raise ValueError(f"selected_count_mismatch:expected={expected_count}:" f"observed={len(selected_indices)}")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    temporary_dir = Path(
-        tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent)
-    )
+    temporary_dir = Path(tempfile.mkdtemp(prefix=f".{output_dir.name}.tmp-", dir=output_dir.parent))
     try:
         output_selected = temporary_dir / "selected.parquet"
         output_ledger = temporary_dir / "selection_ledger.tsv"

@@ -45,7 +45,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -58,7 +58,7 @@ from tools.data.synthesize.augment_prompt_tasks import (  # noqa: E402
     _top_level_function,
     analyze_code,
 )
-from tools.data.synthesize.shape_contract import (  # noqa: E402
+from tools.data.synthesize.model_shape.shape_contract import (  # noqa: E402
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,
@@ -67,7 +67,7 @@ from tools.data.synthesize.shape_contract import (  # noqa: E402
     _validate_variant_storage,
     static_gate,
 )
-from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.model_shape.solve_shape_coverage import (  # noqa: E402
     DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
     MAX_DIMENSION_IMBALANCE_RATIO,
     AffineProfile,
@@ -1188,8 +1188,12 @@ def solve_multidim_shape_coverage(
             "generator_version": GENERATOR_VERSION,
             "solver_source_path": str(Path(__file__).resolve()),
             "solver_source_sha256": _sha256_file(Path(__file__)),
-            "v3_helper_source_path": str((_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()),
-            "v3_helper_source_sha256": _sha256_file(_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"),
+            "v3_helper_source_path": str(
+                (_REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py").resolve()
+            ),
+            "v3_helper_source_sha256": _sha256_file(
+                _REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py"
+            ),
             "method_boundary": (
                 "one stable-hash Medium/Large target per parent; strict get_inputs "
                 "structural two-slot positive bilinear solver; exactly one new slot "

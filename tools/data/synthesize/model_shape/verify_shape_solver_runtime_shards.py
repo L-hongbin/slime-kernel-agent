@@ -20,7 +20,6 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 CONTRACT_FILE_RE = re.compile(r"scheduler-contract-rank-(\d+)\.json")
 
@@ -74,27 +73,22 @@ REGION_RECORD_CONTRACT = "shape_changed_region_liveness_v3"
 REGION_PERTURBATION_CONTRACT = "seeded_bounded_non_affine_mix_v1"
 REGION_BINDING_CONTRACT = "shape_changed_region_liveness_run_binding_v2"
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from tools.data.synthesize.validate_shape_region_liveness import (  # noqa: E402
-    _accepted_tasks,
-)
+from tools.data.synthesize.model_shape.validate_shape_region_liveness import _accepted_tasks  # noqa: E402
 from tools.data.synthesize.validate_train_mode_contract import (  # noqa: E402
     validate_harness_result,
     validate_memory_guard_evidence,
 )
 
 REFERENCE_SOURCES = {
-    "validator_source_sha256": REPO_ROOT
-    / "tools/data/synthesize/validate_train_mode_contract.py",
+    "validator_source_sha256": REPO_ROOT / "tools/data/synthesize/validate_train_mode_contract.py",
 }
 LAUNCHER_SOURCES = {
-    "reference": REPO_ROOT
-    / "tools/data/synthesize/launch_reference_validation_shards.sh",
-    "region": REPO_ROOT
-    / "tools/data/synthesize/launch_shape_region_validation.sh",
+    "reference": REPO_ROOT / "tools/data/synthesize/launch_reference_validation_shards.sh",
+    "region": REPO_ROOT / "tools/data/synthesize/model_shape/launch_shape_region_validation.sh",
 }
 
 DEFAULT_PROFILE = {
@@ -175,16 +169,11 @@ REFERENCE_KERNELGYM_HASH_FIELDS = {
 }
 GIB_BYTES = 1024**3
 REGION_SOURCES = {
-    "validator_source_sha256": REPO_ROOT
-    / "tools/data/synthesize/validate_shape_region_liveness.py",
-    "runtime_validation_source_sha256": REPO_ROOT
-    / "tools/data/cleaning/runtime_validation.py",
-    "augment_prompt_tasks_source_sha256": REPO_ROOT
-    / "tools/data/synthesize/augment_prompt_tasks.py",
-    "solve_shape_coverage_source_sha256": REPO_ROOT
-    / "tools/data/synthesize/solve_shape_coverage.py",
-    "validate_train_mode_contract_source_sha256": REPO_ROOT
-    / "tools/data/synthesize/validate_train_mode_contract.py",
+    "validator_source_sha256": REPO_ROOT / "tools/data/synthesize/model_shape/validate_shape_region_liveness.py",
+    "runtime_validation_source_sha256": REPO_ROOT / "tools/data/cleaning/runtime_validation.py",
+    "augment_prompt_tasks_source_sha256": REPO_ROOT / "tools/data/synthesize/augment_prompt_tasks.py",
+    "solve_shape_coverage_source_sha256": REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py",
+    "validate_train_mode_contract_source_sha256": REPO_ROOT / "tools/data/synthesize/validate_train_mode_contract.py",
 }
 
 
@@ -283,9 +272,7 @@ def _require_mapping(value: Any, *, context: str) -> Mapping[str, Any]:
     return value
 
 
-def _require_exact_keys(
-    value: Mapping[str, Any], expected: set[str], *, context: str
-) -> None:
+def _require_exact_keys(value: Mapping[str, Any], expected: set[str], *, context: str) -> None:
     observed = set(value)
     if observed != expected:
         _fail(
@@ -367,15 +354,9 @@ def _verify_profile(
         _fail(f"{phase} scheduler does not match the expected profile: {mismatches}")
 
 
-def _load_scheduler_contracts(
-    output_dir: Path, *, phase: str
-) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
-    expected_fields = (
-        REFERENCE_SCHEDULER_FIELDS if phase == "reference" else REGION_SCHEDULER_FIELDS
-    )
-    expected_version = (
-        REFERENCE_CONTRACT_VERSION if phase == "reference" else REGION_CONTRACT_VERSION
-    )
+def _load_scheduler_contracts(output_dir: Path, *, phase: str) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    expected_fields = REFERENCE_SCHEDULER_FIELDS if phase == "reference" else REGION_SCHEDULER_FIELDS
+    expected_version = REFERENCE_CONTRACT_VERSION if phase == "reference" else REGION_CONTRACT_VERSION
     paths = sorted(output_dir.glob("scheduler-contract-rank-*.json"))
     if not paths:
         _fail(f"{output_dir}: no scheduler contracts")
@@ -396,9 +377,7 @@ def _load_scheduler_contracts(
         by_rank[rank] = contract
 
     first = next(iter(by_rank.values()))
-    machine_count = _require_int(
-        first.get("machine_count"), context="machine_count", minimum=1
-    )
+    machine_count = _require_int(first.get("machine_count"), context="machine_count", minimum=1)
     if set(by_rank) != set(range(machine_count)):
         _fail(
             "scheduler contract ranks are incomplete: "
@@ -418,10 +397,7 @@ def _load_scheduler_contracts(
     )
     shard_count = _require_int(first.get("shard_count"), context="shard_count", minimum=1)
     if shard_count != machine_count * gpus * virtual:
-        _fail(
-            "scheduler shard_count mismatch: "
-            f"{shard_count} != {machine_count} * {gpus} * {virtual}"
-        )
+        _fail("scheduler shard_count mismatch: " f"{shard_count} != {machine_count} * {gpus} * {virtual}")
     _require_int(first.get("idle_memory_mib"), context="idle_memory_mib")
     _require_number(first.get("timeout_seconds"), context="timeout_seconds")
     for hash_field in (key for key in first if key.endswith("_sha256")):
@@ -430,9 +406,7 @@ def _load_scheduler_contracts(
         expected_mode = first.get("expected_mode_class")
         if not isinstance(expected_mode, str) or not expected_mode:
             _fail("reference expected_mode_class must be non-empty text")
-        _require_number(
-            first.get("max_device_memory_gib"), context="max_device_memory_gib"
-        )
+        _require_number(first.get("max_device_memory_gib"), context="max_device_memory_gib")
     else:
         _require_int(first.get("trials"), context="trials", minimum=1)
         _require_int(first.get("seed"), context="seed")
@@ -445,9 +419,7 @@ def _verify_sources(
     *,
     phase: str,
 ) -> None:
-    launcher_hash = _require_sha256(
-        contract.get("launcher_source_sha256"), context="launcher_source_sha256"
-    )
+    launcher_hash = _require_sha256(contract.get("launcher_source_sha256"), context="launcher_source_sha256")
     launcher_archive = output_dir / "launcher_source.sh"
     if not launcher_archive.is_file():
         _fail(f"missing launcher archive: {launcher_archive}")
@@ -455,10 +427,7 @@ def _verify_sources(
         _fail(f"launcher archive hash differs from scheduler contract: {launcher_archive}")
     current_launcher = LAUNCHER_SOURCES[phase]
     if not current_launcher.is_file() or _sha256_file(current_launcher) != launcher_hash:
-        _fail(
-            f"launcher archive/contract does not equal current repository launcher: "
-            f"{current_launcher}"
-        )
+        _fail(f"launcher archive/contract does not equal current repository launcher: " f"{current_launcher}")
     sources = REFERENCE_SOURCES if phase == "reference" else REGION_SOURCES
     for field, path in sources.items():
         if not path.is_file():
@@ -466,10 +435,7 @@ def _verify_sources(
         observed = _sha256_file(path)
         expected = contract.get(field)
         if observed != expected:
-            _fail(
-                f"validation source hash mismatch for {field}: "
-                f"expected {expected}, found {observed}"
-            )
+            _fail(f"validation source hash mismatch for {field}: " f"expected {expected}, found {observed}")
 
 
 def _shard_name(phase: str, shard_index: int, shard_count: int, suffix: str) -> str:
@@ -481,18 +447,12 @@ def _shard_name(phase: str, shard_index: int, shard_count: int, suffix: str) -> 
 
 def _verify_shard_files(output_dir: Path, *, phase: str, shard_count: int) -> None:
     for suffix in ("jsonl", "log"):
-        expected = {
-            _shard_name(phase, shard_index, shard_count, suffix)
-            for shard_index in range(shard_count)
-        }
+        expected = {_shard_name(phase, shard_index, shard_count, suffix) for shard_index in range(shard_count)}
         observed = {path.name for path in output_dir.glob(f"shard-*.{suffix}")}
         if observed != expected:
             missing = sorted(expected - observed)
             extra = sorted(observed - expected)
-            _fail(
-                f"{output_dir}: {suffix} shard family differs; "
-                f"missing={missing[:20]}, extra={extra[:20]}"
-            )
+            _fail(f"{output_dir}: {suffix} shard family differs; " f"missing={missing[:20]}, extra={extra[:20]}")
 
 
 def _nested(value: Any, path: str, default: Any = None) -> Any:
@@ -538,12 +498,8 @@ def _verify_64gib_memory(record: Mapping[str, Any], *, context: str) -> None:
             )
 
 
-def _verify_reference_passed_evidence(
-    record: Mapping[str, Any], *, context: str
-) -> None:
-    harness_passed, reasons = validate_harness_result(
-        record, trials=5, training=True
-    )
+def _verify_reference_passed_evidence(record: Mapping[str, Any], *, context: str) -> None:
+    harness_passed, reasons = validate_harness_result(record, trials=5, training=True)
     if not harness_passed:
         _fail(f"{context}: passed reference fails harness validation: {reasons}")
     if record.get("kernelgym_compiled") is not True:
@@ -573,14 +529,12 @@ def _verify_region_passed_evidence(
     if not isinstance(slot_ids, list) or not slot_ids:
         _fail(f"{context}: accepted task has invalid slot_ids")
     declared_slots = task.get("slots")
-    if not isinstance(declared_slots, list) or [
-        slot.get("slot_id") if isinstance(slot, Mapping) else None
-        for slot in declared_slots
-    ] != slot_ids:
+    if (
+        not isinstance(declared_slots, list)
+        or [slot.get("slot_id") if isinstance(slot, Mapping) else None for slot in declared_slots] != slot_ids
+    ):
         _fail(f"{context}: accepted task slots differ from declared slot_ids")
-    effects = _require_mapping(
-        record.get("slot_effects"), context=f"{context}:slot_effects"
-    )
+    effects = _require_mapping(record.get("slot_effects"), context=f"{context}:slot_effects")
     if set(effects) != set(slot_ids):
         _fail(f"{context}: passed region slot_effects keys differ from declared slots")
     for slot_id in slot_ids:
@@ -595,61 +549,38 @@ def _verify_region_passed_evidence(
         if trial.get("trial") != trial_index or trial.get("seed") != expected_seed:
             _fail(f"{context}: trial {trial_index} identity/seed mismatch")
         trial_slots = trial.get("slots")
-        if not isinstance(trial_slots, list) or [
-            slot.get("slot_id") if isinstance(slot, Mapping) else None
-            for slot in trial_slots
-        ] != slot_ids:
-            _fail(f"{context}: trial {trial_index} slot IDs differ from declared slots")
-        for slot_index, (trial_slot, declared_slot) in enumerate(
-            zip(trial_slots, declared_slots, strict=True)
+        if (
+            not isinstance(trial_slots, list)
+            or [slot.get("slot_id") if isinstance(slot, Mapping) else None for slot in trial_slots] != slot_ids
         ):
+            _fail(f"{context}: trial {trial_index} slot IDs differ from declared slots")
+        for slot_index, (trial_slot, declared_slot) in enumerate(zip(trial_slots, declared_slots, strict=True)):
             assert isinstance(trial_slot, Mapping)
             assert isinstance(declared_slot, Mapping)
             slot_id = slot_ids[slot_index]
             for field in ("old_value", "new_value"):
                 if trial_slot.get(field) != declared_slot.get(field):
-                    _fail(
-                        f"{context}: trial {trial_index} slot {slot_id} "
-                        f"{field} differs from declared task"
-                    )
+                    _fail(f"{context}: trial {trial_index} slot {slot_id} " f"{field} differs from declared task")
             output_changed = trial_slot.get("output_changed")
             if (
                 type(output_changed) is not bool
                 or output_changed is not effects[slot_id][trial_index]
                 or output_changed is not True
             ):
-                _fail(
-                    f"{context}: trial {trial_index} slot {slot_id} "
-                    "output_changed contradicts slot_effects"
-                )
+                _fail(f"{context}: trial {trial_index} slot {slot_id} " "output_changed contradicts slot_effects")
             for field in ("changed_region_elements", "expanded_region_elements"):
                 value = trial_slot.get(field)
                 if type(value) is not int or value <= 0:
-                    _fail(
-                        f"{context}: trial {trial_index} slot {slot_id} "
-                        f"has invalid {field}"
-                    )
-            if (
-                trial_slot["changed_region_elements"]
-                > trial_slot["expanded_region_elements"]
-            ):
-                _fail(
-                    f"{context}: trial {trial_index} slot {slot_id} "
-                    "changed region exceeds expanded region"
-                )
+                    _fail(f"{context}: trial {trial_index} slot {slot_id} " f"has invalid {field}")
+            if trial_slot["changed_region_elements"] > trial_slot["expanded_region_elements"]:
+                _fail(f"{context}: trial {trial_index} slot {slot_id} " "changed region exceeds expanded region")
             arguments = trial_slot.get("arguments")
             if not isinstance(arguments, list) or not arguments:
-                _fail(
-                    f"{context}: trial {trial_index} slot {slot_id} "
-                    "has no argument evidence"
-                )
+                _fail(f"{context}: trial {trial_index} slot {slot_id} " "has no argument evidence")
             for argument_index, argument in enumerate(arguments):
                 argument = _require_mapping(
                     argument,
-                    context=(
-                        f"{context}:trial[{trial_index}].slot[{slot_index}]"
-                        f".arguments[{argument_index}]"
-                    ),
+                    context=(f"{context}:trial[{trial_index}].slot[{slot_index}]" f".arguments[{argument_index}]"),
                 )
                 for field in ("changed_region_elements", "expanded_region_elements"):
                     value = argument.get(field)
@@ -658,10 +589,7 @@ def _verify_region_passed_evidence(
                             f"{context}: trial {trial_index} slot {slot_id} "
                             f"argument {argument_index} has invalid {field}"
                         )
-                if (
-                    argument["changed_region_elements"]
-                    > argument["expanded_region_elements"]
-                ):
+                if argument["changed_region_elements"] > argument["expanded_region_elements"]:
                     _fail(
                         f"{context}: trial {trial_index} slot {slot_id} "
                         f"argument {argument_index} changed region exceeds expanded region"
@@ -694,9 +622,7 @@ def _reference_identities(input_path: Path) -> list[dict[str, Any]]:
 
     identities: list[dict[str, Any]] = []
     try:
-        for batch in parquet.iter_batches(
-            batch_size=256, columns=["reward_model", "extra_info"]
-        ):
+        for batch in parquet.iter_batches(batch_size=256, columns=["reward_model", "extra_info"]):
             for row in batch.to_pylist():
                 row_index = len(identities)
                 code = _nested(row, "reward_model.ground_truth")
@@ -739,9 +665,7 @@ def _check_summary_counts(
     for field, expected_value in expected.items():
         value = _require_int(summary.get(field), context=f"{context}:{field}")
         if value != expected_value:
-            _fail(
-                f"{context}: {field} mismatch; expected {expected_value}, found {value}"
-            )
+            _fail(f"{context}: {field} mismatch; expected {expected_value}, found {value}")
     executed = _require_int(summary.get("executed"), context=f"{context}:executed")
     resumed = _require_int(summary.get("resumed"), context=f"{context}:resumed")
     if executed + resumed != selected:
@@ -783,17 +707,13 @@ def _verify_reference(
             try:
                 _, record = next(records)
             except StopIteration:
-                _fail(
-                    f"{path}: row count mismatch; expected {len(expected_rows)}, "
-                    f"found {observed_count}"
-                )
+                _fail(f"{path}: row count mismatch; expected {len(expected_rows)}, " f"found {observed_count}")
             context = f"{path}:{observed_count + 1}"
             observed_count += 1
             for field in ("row_index", "row_key", "uuid", "reference_sha256"):
                 if record.get(field) != expected[field]:
                     _fail(
-                        f"{context}: {field} mismatch; "
-                        f"expected {expected[field]!r}, found {record.get(field)!r}"
+                        f"{context}: {field} mismatch; " f"expected {expected[field]!r}, found {record.get(field)!r}"
                     )
             if record.get("contract_version") != REFERENCE_RECORD_CONTRACT:
                 _fail(f"{context}: wrong reference record contract")
@@ -816,12 +736,8 @@ def _verify_reference(
                 if record.get(field) != expected_value:
                     _fail(f"{context}: top-level {field} policy mismatch")
 
-            payload = _require_mapping(
-                record.get("contract_payload"), context=f"{context}:contract_payload"
-            )
-            _require_exact_keys(
-                payload, REFERENCE_PAYLOAD_FIELDS, context=f"{context}:contract_payload"
-            )
+            payload = _require_mapping(record.get("contract_payload"), context=f"{context}:contract_payload")
+            _require_exact_keys(payload, REFERENCE_PAYLOAD_FIELDS, context=f"{context}:contract_payload")
             fingerprint = _require_sha256(
                 record.get("contract_fingerprint"),
                 context=f"{context}:contract_fingerprint",
@@ -853,9 +769,7 @@ def _verify_reference(
                 common_fingerprint = fingerprint
             elif payload != common_payload or fingerprint != common_fingerprint:
                 _fail(f"{context}: reference runtime contracts differ across records")
-            kernelgym = _require_mapping(
-                record.get("kernelgym"), context=f"{context}:kernelgym"
-            )
+            kernelgym = _require_mapping(record.get("kernelgym"), context=f"{context}:kernelgym")
             for field in REFERENCE_KERNELGYM_HASH_FIELDS:
                 expected_hash = payload.get(f"kernelgym_{field}")
                 _require_sha256(expected_hash, context=f"{context}:kernelgym_{field}")
@@ -972,9 +886,7 @@ def _verified_canonical_reference_passes(
         expected_topology=expected_topology,
     )
     _verify_sources(output_dir, contract, phase="reference")
-    _verify_shard_files(
-        output_dir, phase="reference", shard_count=int(contract["shard_count"])
-    )
+    _verify_shard_files(output_dir, phase="reference", shard_count=int(contract["shard_count"]))
     _, pass_by_uuid = _verify_reference(
         run_dir,
         output_dir,
@@ -1051,24 +963,18 @@ def _verify_region(
         }
     )
     if missing_reference_uuids:
-        _fail(
-            "canonical reference evidence lacks region task UUIDs: "
-            f"{missing_reference_uuids[:20]}"
-        )
+        _fail("canonical reference evidence lacks region task UUIDs: " f"{missing_reference_uuids[:20]}")
     expected_allowlist = [
         str(task["child_uuid"])
         for task in all_tasks
-        if pass_by_uuid[str(task["parent_uuid"])]
-        and pass_by_uuid[str(task["child_uuid"])]
+        if pass_by_uuid[str(task["parent_uuid"])] and pass_by_uuid[str(task["child_uuid"])]
     ]
     observed_allowlist = _read_allowlist(allowlist_path)
     if observed_allowlist != expected_allowlist:
         first_difference = next(
             (
                 index
-                for index, (observed, expected) in enumerate(
-                    zip(observed_allowlist, expected_allowlist, strict=False)
-                )
+                for index, (observed, expected) in enumerate(zip(observed_allowlist, expected_allowlist, strict=False))
                 if observed != expected
             ),
             min(len(observed_allowlist), len(expected_allowlist)),
@@ -1101,10 +1007,7 @@ def _verify_region(
             try:
                 _, record = next(records)
             except StopIteration:
-                _fail(
-                    f"{path}: row count mismatch; expected {len(expected_tasks)}, "
-                    f"found {observed_count}"
-                )
+                _fail(f"{path}: row count mismatch; expected {len(expected_tasks)}, " f"found {observed_count}")
             context = f"{path}:{observed_count + 1}"
             observed_count += 1
             expected_fields = {
@@ -1127,10 +1030,7 @@ def _verify_region(
             }
             for field, expected_value in expected_fields.items():
                 if record.get(field) != expected_value:
-                    _fail(
-                        f"{context}: {field} mismatch; "
-                        f"expected {expected_value!r}, found {record.get(field)!r}"
-                    )
+                    _fail(f"{context}: {field} mismatch; " f"expected {expected_value!r}, found {record.get(field)!r}")
             passed = record.get("passed")
             status = record.get("status")
             if type(passed) is not bool or not isinstance(status, str) or not status:
@@ -1206,16 +1106,10 @@ def verify(
     if not resolved_run.is_dir():
         _fail(f"run_dir is not a directory: {resolved_run}")
     canonical_dir = (resolved_run / "h20" / phase).resolve()
-    resolved_output = (
-        output_dir.expanduser().resolve() if output_dir is not None else canonical_dir
-    )
+    resolved_output = output_dir.expanduser().resolve() if output_dir is not None else canonical_dir
     if not resolved_output.is_dir():
         _fail(f"output_dir is not a directory: {resolved_output}")
-    reference_topology = (
-        expected_topology
-        if expected_reference_topology is None
-        else expected_reference_topology
-    )
+    reference_topology = expected_topology if expected_reference_topology is None else expected_reference_topology
 
     contract, contracts = _load_scheduler_contracts(resolved_output, phase=phase)
     _verify_profile(
@@ -1227,9 +1121,7 @@ def verify(
     shard_count = int(contract["shard_count"])
     _verify_shard_files(resolved_output, phase=phase, shard_count=shard_count)
     if phase == "reference":
-        details, _ = _verify_reference(
-            resolved_run, resolved_output, canonical_dir, contract
-        )
+        details, _ = _verify_reference(resolved_run, resolved_output, canonical_dir, contract)
     else:
         details = _verify_region(
             resolved_run,
@@ -1252,9 +1144,7 @@ def verify(
         "launcher_source_sha256": contract["launcher_source_sha256"],
         "validator_source_sha256": contract["validator_source_sha256"],
         "expected_topology": dict(expected_topology),
-        "expected_reference_topology": (
-            dict(reference_topology) if phase == "region" else None
-        ),
+        "expected_reference_topology": (dict(reference_topology) if phase == "region" else None),
         **details,
     }
 
@@ -1287,18 +1177,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-reference-machine-count",
         type=int,
-        help=(
-            "region only: expected canonical reference machine count "
-            "(default: --expected-machine-count)"
-        ),
+        help=("region only: expected canonical reference machine count " "(default: --expected-machine-count)"),
     )
     parser.add_argument(
         "--expected-reference-gpus-per-machine",
         type=int,
-        help=(
-            "region only: expected canonical reference GPUs per machine "
-            "(default: --expected-gpus-per-machine)"
-        ),
+        help=("region only: expected canonical reference GPUs per machine " "(default: --expected-gpus-per-machine)"),
     )
     parser.add_argument(
         "--expected-reference-virtual-shards-per-gpu",
@@ -1359,11 +1243,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "phase": args.phase,
             "run_dir": str(args.run_dir.expanduser().resolve()),
             "output_dir": str(
-                (
-                    args.output_dir.expanduser().resolve()
-                    if args.output_dir is not None
-                    else (args.run_dir.expanduser().resolve() / "h20" / args.phase)
-                )
+                args.output_dir.expanduser().resolve()
+                if args.output_dir is not None
+                else (args.run_dir.expanduser().resolve() / "h20" / args.phase)
             ),
             "error": f"{type(exc).__name__}: {exc}",
         }

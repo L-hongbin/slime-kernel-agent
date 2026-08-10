@@ -44,12 +44,12 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.data.synthesize.augment_prompt_tasks import _section_hashes, analyze_code  # noqa: E402
-from tools.data.synthesize.shape_contract import (  # noqa: E402
+from tools.data.synthesize.model_shape.shape_contract import (  # noqa: E402
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,
@@ -58,7 +58,7 @@ from tools.data.synthesize.shape_contract import (  # noqa: E402
     _validate_variant_storage,
     static_gate,
 )
-from tools.data.synthesize.solve_multidim_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.model_shape.solve_multidim_shape_coverage import (  # noqa: E402
     TARGET_SCHEMA,
     _affected_shape_balance_guard,
     _logical_target_map_sha256,
@@ -71,7 +71,7 @@ from tools.data.synthesize.solve_multidim_shape_coverage import (  # noqa: E402
     _storage_interval,
     _variant_and_target,
 )
-from tools.data.synthesize.solve_shape_coverage import (  # noqa: E402
+from tools.data.synthesize.model_shape.solve_shape_coverage import (  # noqa: E402
     DEFAULT_FAKE_GATE_TIMEOUT_SECONDS,
     MAX_DIMENSION_IMBALANCE_RATIO,
     AffineProfile,
@@ -1327,20 +1327,24 @@ def solve_variable_shape_delta(
             "generator_version": generator_version,
             "solver_source_path": str(Path(__file__).resolve()),
             "solver_source_sha256": _sha256_file(Path(__file__)),
-            "v3_helper_source_path": str((_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()),
-            "v3_helper_source_sha256": _sha256_file(_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"),
+            "v3_helper_source_path": str(
+                (_REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py").resolve()
+            ),
+            "v3_helper_source_sha256": _sha256_file(
+                _REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py"
+            ),
             "dependency_source_contract": {
                 "solve_multidim_shape_coverage_path": str(
-                    (_REPO_ROOT / "tools/data/synthesize/solve_multidim_shape_coverage.py").resolve()
+                    (_REPO_ROOT / "tools/data/synthesize/model_shape/solve_multidim_shape_coverage.py").resolve()
                 ),
                 "solve_multidim_shape_coverage_sha256": _sha256_file(
-                    _REPO_ROOT / "tools/data/synthesize/solve_multidim_shape_coverage.py"
+                    _REPO_ROOT / "tools/data/synthesize/model_shape/solve_multidim_shape_coverage.py"
                 ),
                 "solve_shape_coverage_path": str(
-                    (_REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py").resolve()
+                    (_REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py").resolve()
                 ),
                 "solve_shape_coverage_sha256": _sha256_file(
-                    _REPO_ROOT / "tools/data/synthesize/solve_shape_coverage.py"
+                    _REPO_ROOT / "tools/data/synthesize/model_shape/solve_shape_coverage.py"
                 ),
             },
             "method_boundary": (

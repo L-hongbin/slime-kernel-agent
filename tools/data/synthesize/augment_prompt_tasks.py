@@ -488,6 +488,12 @@ def _shape_nodes(call: ast.Call, name: str) -> list[ast.AST]:
         return list(shape.elts)
     if isinstance(shape, Sequence):
         return list(shape)
+    if isinstance(shape, ast.AST):
+        # randint commonly receives a tuple-valued name (for example
+        # ``torch.randint(0, 2, target_shape)``).  Preserve that expression as
+        # one shape node so the dependency walker can trace the module-level
+        # tuple and its numeric dimensions.
+        return [shape]
     return []
 
 

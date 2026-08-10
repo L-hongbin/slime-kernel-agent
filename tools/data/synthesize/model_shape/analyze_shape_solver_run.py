@@ -27,7 +27,7 @@ from typing import Any
 
 import pyarrow.parquet as pq
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
+REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -39,8 +39,8 @@ from tools.data.synthesize.augment_prompt_tasks import (
     _normalized_ast_sha256,
     _shape_nodes,
 )
-from tools.data.synthesize.shape_contract import _operator_family, static_gate
-from tools.data.synthesize.solve_shape_coverage import _shape_slots
+from tools.data.synthesize.model_shape.shape_contract import _operator_family, static_gate
+from tools.data.synthesize.model_shape.solve_shape_coverage import _shape_slots
 
 DEFAULT_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_random_targets_v3/run.1000"
 DEFAULT_AI_RUN_DIR = REPO_ROOT / "Data/prompt_tvm_v4/shape_ai_random_targets_low_tp8_v7/run.1000"

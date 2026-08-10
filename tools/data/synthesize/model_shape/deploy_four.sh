@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 action=${1:-status}
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-bundle=/tmp/dsv4-shape-deploy-v10
-container=${SHAPE_SERVER_CONTAINER:-csl_dsv4_0731_shape_tp8_low_v10}
+bundle=/tmp/dsv4-shape-deploy-v13
+container=${SHAPE_SERVER_CONTAINER:-csl_dsv4_0731_shape_tp8_low128k_v13}
 
 hosts=(
   "${SHAPE_NODE53_SSH:-node53}|10.11.2.153|31053|/mnt/md1"

@@ -50,10 +50,10 @@ selected_sha256=$(sha256sum "${selected}" | awk '{print $1}')
 children_sha256=$(sha256sum "${children}" | awk '{print $1}')
 manifest_sha256=$(sha256sum "${manifest}" | awk '{print $1}')
 allowlist_sha256=$(sha256sum "${allowlist}" | awk '{print $1}')
-validator_path=tools/data/synthesize/validate_shape_region_liveness.py
+validator_path=tools/data/synthesize/model_shape/validate_shape_region_liveness.py
 runtime_validation_path=tools/data/cleaning/runtime_validation.py
 augment_path=tools/data/synthesize/augment_prompt_tasks.py
-shape_solver_helper_path=tools/data/synthesize/solve_shape_coverage.py
+shape_solver_helper_path=tools/data/synthesize/model_shape/solve_shape_coverage.py
 memory_guard_path=tools/data/synthesize/validate_train_mode_contract.py
 for path in "${validator_path}" "${runtime_validation_path}" "${augment_path}" \
   "${shape_solver_helper_path}" "${memory_guard_path}"; do
@@ -341,6 +341,11 @@ if sum(raw_counts.values()) != counts["selected"]:
 if int(raw_counts.get("passed", 0)) != counts["passed"]:
     raise SystemExit("final JSON summary raw/passed counts differ")
 
+# As in the reference launcher, the row validator has no reason to open its
+# JSONL when a shard selects zero rows.  Install the canonical empty file only
+# for that proven case; missing output for a non-empty shard still fails below.
+if counts["selected"] == 0 and not output_path.exists():
+    output_path.touch(exist_ok=False)
 try:
     records = [
         json.loads(line)
@@ -393,7 +398,7 @@ run_gpu_queue() {
     output=${output_dir}/shard-$(printf '%03d' "${shard_id}")-of-$(printf '%03d' "${shard_count}").jsonl
     log=${output%.jsonl}.log
     CUDA_VISIBLE_DEVICES=${local_gpu} python \
-      tools/data/synthesize/validate_shape_region_liveness.py \
+      tools/data/synthesize/model_shape/validate_shape_region_liveness.py \
       "${selected}" "${children}" "${manifest}" "${output}" \
       --child-uuid-file "${allowlist}" \
       --device cuda:0 \

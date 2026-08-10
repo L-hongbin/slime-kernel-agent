@@ -447,6 +447,17 @@ python3 tests/tools/data/test_ops_data_cleaning.py
 
 <!-- 复杂度物化和一致性校验命令见独立的 [复杂度配比文档](handoff_drkernel_complexity_mixture_20260731.md)。 -->
 
+## 遗留问题
+
+- gpu-v5 的 dead-state 检查有一个覆盖缺口：`unused_forward_module` 只跟踪 `self.x = nn.*(...)` 或 `torch.nn.*(...)`，`unused_forward_argument` 只检查 `forward` 形参；它不检查“构造参数只写入普通 `self.*` 属性、且该属性无法从 `forward` 及其 helper 到达”的情况。`kernelbook_508_aa2f4ab6a65c3b1f` 中，`raw_msg_dim`、`memory_dim`、`time_dim` 只计算未参与 `forward` 的整数属性 `self.out_channels`，但四个 `forward` tensor 都影响 `torch.cat` 输出，因此静态和 GPU sensitivity 均通过。后续应增加从 `__init__` 参数到普通实例属性、再到 `forward` 可达读取的 AST 数据流检查，并对纯 metadata 的保留口径单独定义。
+- 40 个样本仍超出 300 秒完整审计预算，28 个样本在完整审计中 OOM。这 40 个样本的单次 smoke 全部通过；使用前需要先定义目标时延/显存要求。
+- 当前 `Failed` 中没有纳入延长预算复核的非-timeout 样本尚未统一复查；继续把 OOM、依赖缺失、代码异常和语义拒绝分开，不能用一个 `Failed` 桶代表脏数据。
+- 恢复 `forward_argument_sensitivity_inconclusive` 之前，先做耦合参数和可选参数的探针。
+- CUDA-Agent 的下一步是训练混合比例和增益消融实验。
+- KernelBook 缺 `_paritybench_helpers` 的 454 个样本，补齐并固定依赖后再考虑恢复。
+- 本轮没有测 DrKernel、鸥波合成数据或外部候选与验证集的污染，后续需要单独补。
+
+
 ## 产物清单
 
 ### DrKernel
@@ -512,12 +523,3 @@ python3 tests/tools/data/test_ops_data_cleaning.py
 | 最终物化清单（`manual_testset_manifest.json`） | — | `12636215843d944839492634b56a4dc6324c3bec9f7d914ce42f67c906b7db19` |
 
 最后三个复核证据文件位于 `local_artifacts/kernelbench_gpu_v5_20260730/`。
-
-## 遗留问题
-
-- 40 个样本仍超出 300 秒完整审计预算，28 个样本在完整审计中 OOM。这 40 个样本的单次 smoke 全部通过；使用前需要先定义目标时延/显存要求。
-- 当前 `Failed` 中没有纳入延长预算复核的非-timeout 样本尚未统一复查；继续把 OOM、依赖缺失、代码异常和语义拒绝分开，不能用一个 `Failed` 桶代表脏数据。
-- 恢复 `forward_argument_sensitivity_inconclusive` 之前，先做耦合参数和可选参数的探针。
-- CUDA-Agent 的下一步是训练混合比例和增益消融实验。
-- KernelBook 缺 `_paritybench_helpers` 的 454 个样本，补齐并固定依赖后再考虑恢复。
-- 本轮没有测 DrKernel、鸥波合成数据或外部候选与验证集的污染，后续需要单独补。

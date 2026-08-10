@@ -6,7 +6,7 @@ port=${SHAPE_SERVER_PORT:-31053}
 disk_root=${SHAPE_SERVER_DISK_ROOT:-/mnt/md1}
 container_disk_root=${SHAPE_SERVER_CONTAINER_DISK_ROOT:-/nfs/FM}
 image=${SHAPE_SERVER_IMAGE:-csl/sglang:dspark-r1-eval-snapshot-20260729}
-container=${SHAPE_SERVER_CONTAINER:-csl_dsv4_0731_shape_tp8_low_v10}
+container=${SHAPE_SERVER_CONTAINER:-csl_dsv4_0731_shape_tp8_low128k_v13}
 speculative_algorithm=${SHAPE_SERVER_SPECULATIVE_ALGORITHM:-DSPARK}
 model_host=${SHAPE_SERVER_MODEL:-${disk_root}/chenshuailin/checkpoints/deepseek-ai/DeepSeek-V4-Flash-0731}
 model_container=${container_disk_root}${model_host#${disk_root}}
@@ -227,13 +227,13 @@ import json, sys
 response = json.load(sys.stdin)
 if not isinstance(response.get("choices"), list) or len(response["choices"]) != 1:
     raise SystemExit(f"invalid completion response: {response}")
-print("PASS explicit-low thinking request accepted by live server")
+print("PASS explicit-low thinking request with 128K completion budget accepted by live server")
 '
 import json
 print(json.dumps({
     "model": "deepseek-v4-flash-0731",
     "messages": [{"role": "user", "content": "Reply with OK."}],
-    "max_tokens": 32,
+    "max_tokens": 131072,
     "temperature": 0,
     "chat_template_kwargs": {"thinking": True},
     "reasoning_effort": "low",

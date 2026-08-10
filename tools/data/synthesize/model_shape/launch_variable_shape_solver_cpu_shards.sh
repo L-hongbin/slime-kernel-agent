@@ -2,7 +2,7 @@
 set -euo pipefail
 
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-export SHAPE_SOLVER_MODULE=tools.data.synthesize.solve_variable_shape_delta
+export SHAPE_SOLVER_MODULE=tools.data.synthesize.model_shape.solve_variable_shape_delta
 export SHAPE_SOLVER_SUPPORTS_GROUP_SCOPE=1
 export SHAPE_GROUP_SCOPE=${SHAPE_GROUP_SCOPE:-generic}
 export SHAPE_EXPECTED_GROUP_SCOPE=${SHAPE_GROUP_SCOPE}

@@ -29,13 +29,17 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from tools.data.synthesize.prepare_variable_shape_delta import _sha256_bytes, _sha256_file, _validate_source_provenance
+from tools.data.synthesize.model_shape.prepare_variable_shape_delta import (
+    _sha256_bytes,
+    _sha256_file,
+    _validate_source_provenance,
+)
 
 CONTRACT_VERSION = "variable_shape_all_measurable_remaining_selection_v1"
 DELTA_CONTRACT_VERSION = "shape_variable_multislot_delta_selection_v1"
 DEFAULT_EXPECTED_COUNT = 22_566
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 _SELECTOR_DEPENDENCY = Path(__file__).with_name("prepare_variable_shape_delta.py")
 DEFAULT_SOURCE_RUN = _REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_multidim_v4_byte_targets_v1/run.full53896"
 DEFAULT_PRIOR_SELECTION = (

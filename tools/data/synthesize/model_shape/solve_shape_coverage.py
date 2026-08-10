@@ -44,7 +44,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
@@ -60,7 +60,7 @@ from tools.data.synthesize.augment_prompt_tasks import (
     _top_level_function,
     analyze_code,
 )
-from tools.data.synthesize.shape_contract import (
+from tools.data.synthesize.model_shape.shape_contract import (
     LARGE_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MAX_BYTES,
     MEDIUM_INPUT_MIN_BYTES,

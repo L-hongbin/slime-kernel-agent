@@ -84,16 +84,11 @@ def shard_selected(
         raise ValueError("source selection rows must be a list")
     if source_rows and len(source_rows) != selected.num_rows:
         raise ValueError(
-            "source selection row count does not match selected parquet:"
-            f"{len(source_rows)}:{selected.num_rows}"
+            "source selection row count does not match selected parquet:" f"{len(source_rows)}:{selected.num_rows}"
         )
     source_selected_sha256 = _sha256_file(selected_path)
-    source_selection_manifest = (
-        str(source_selection_path.resolve()) if source_selection_path.is_file() else None
-    )
-    source_selection_manifest_sha256 = (
-        _sha256_file(source_selection_path) if source_selection_path.is_file() else None
-    )
+    source_selection_manifest = str(source_selection_path.resolve()) if source_selection_path.is_file() else None
+    source_selection_manifest_sha256 = _sha256_file(source_selection_path) if source_selection_path.is_file() else None
 
     selected_rows = selected.to_pylist()
     identities: list[dict[str, Any]] = []
@@ -113,9 +108,7 @@ def shard_selected(
         )
 
     output_root.parent.mkdir(parents=True, exist_ok=True)
-    temporary_root = Path(
-        tempfile.mkdtemp(prefix=f".{output_root.name}.tmp-", dir=output_root.parent)
-    )
+    temporary_root = Path(tempfile.mkdtemp(prefix=f".{output_root.name}.tmp-", dir=output_root.parent))
     try:
         shard_records: list[dict[str, Any]] = []
         for shard_index in range(shard_count):
@@ -142,9 +135,7 @@ def shard_selected(
                 "selected_path": str((output_root / name / "selected.parquet").resolve()),
                 "selected_sha256": _sha256_file(shard_selected_path),
                 "selected_count": len(global_indices),
-                "rows": [source_rows[index] for index in global_indices]
-                if source_rows
-                else [],
+                "rows": [source_rows[index] for index in global_indices] if source_rows else [],
             }
             shard_selection_path = shard_dir / "selection.json"
             shard_selection_path.write_text(
@@ -173,14 +164,12 @@ def shard_selected(
             "shard_scheme": "global_index_modulo_shard_count",
             "shards": shard_records,
             "solver_command_template": (
-                "python -m tools.data.synthesize.solve_multidim_shape_coverage "
+                "python -m tools.data.synthesize.model_shape.solve_multidim_shape_coverage "
                 "<run-root>/{name} --selected <shard-root>/{name}/selected.parquet"
             ),
         }
         manifest_path = temporary_root / MANIFEST_NAME
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary_root, output_root)
         return manifest
     except BaseException:

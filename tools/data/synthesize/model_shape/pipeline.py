@@ -42,25 +42,29 @@ from tools.data.cleaning.pipeline import inspect_row_schema
 from tools.data.synthesize.augment_prompt_tasks import _replace_reference
 from tools.data.synthesize.model_shape.prompt import (
     PROMPT_VERSION,
+    PROMPT_VERSION_UNPROFILED,
     USER_TEMPLATES,
     VARIANTS,
     render_user_prompt,
     target_input_bytes,
     target_input_bytes_from_size,
+    target_input_bytes_without_profile,
 )
-from tools.data.synthesize.shape_contract import (
+from tools.data.synthesize.model_shape.shape_contract import (
     _function,
     _numeric_constants,
     _operator_family,
     _shape_numeric_node_ids,
     _validate_target_proximity,
     _validate_variant_storage,
+    profiled_static_gate,
+    profiled_structure_gate,
     relaxed_factory_storage,
     relaxed_static_gate,
     relaxed_structure_gate,
     static_gate,
 )
-from tools.data.synthesize.solve_shape_coverage import (
+from tools.data.synthesize.model_shape.solve_shape_coverage import (
     MAX_DIMENSION_IMBALANCE_RATIO,
     ShapeSlot,
     SourceSpan,
@@ -72,14 +76,25 @@ from tools.data.synthesize.solve_shape_coverage import (
 
 CONTRACT_VERSION = "dsv4_shape_hardtail_v1"
 GENERATION_CONTRACT_VERSION_V1 = "dsv4_shape_hardtail_generation_v1"
-GENERATION_CONTRACT_VERSION = "dsv4_shape_hardtail_generation_v2"
-GENERATION_CONTRACT_VERSIONS = frozenset({GENERATION_CONTRACT_VERSION_V1, GENERATION_CONTRACT_VERSION})
+GENERATION_CONTRACT_VERSION_V2 = "dsv4_shape_hardtail_generation_v2"
+GENERATION_CONTRACT_VERSION_V3 = "dsv4_shape_hardtail_generation_v3"
+GENERATION_CONTRACT_VERSION = "dsv4_shape_hardtail_generation_v4"
+GENERATION_CONTRACT_VERSIONS = frozenset(
+    {
+        GENERATION_CONTRACT_VERSION_V1,
+        GENERATION_CONTRACT_VERSION_V2,
+        GENERATION_CONTRACT_VERSION_V3,
+        GENERATION_CONTRACT_VERSION,
+    }
+)
 SELECTION_REASON = "no_variable_multislot_product_solution"
 SELECTION_SALT = "dsv4_shape_hardtail_canary_v1"
 FULL_RESIDUAL_SELECTION_CONTRACT_VERSION = "dsv4_shape_full_measurable_residual_selection_v1"
 FULL_RESIDUAL_SELECTION_SALT = "dsv4_shape_full_measurable_residual_v1"
 RELAXED_RESIDUAL_SELECTION_CONTRACT_VERSION = "dsv4_shape_relaxed_provenance_residual_selection_v2"
 RELAXED_STORAGE_CONTRACT = "fake_returned_tensor_storage_v1"
+UNPROFILED_STORAGE_CONTRACT = "model_inferred_unprofiled_v1"
+UNPROFILED_SELECTION_CONTRACT_VERSION = "dsv4_shape_unprofiled_selection_v1"
 MODEL_NAME = "deepseek-v4-flash-0731"
 DEFAULT_SOURCE_RUN = (
     REPO_ROOT / "Data/prompt_tvm_v4/shape_solver_variable_multislot_v8/" "run.remaining22566.balanced_v7"
@@ -101,9 +116,12 @@ DEFAULT_ENDPOINTS = (
 )
 DEFAULT_COUNT = 1000
 DEFAULT_CONCURRENCY_PER_ENDPOINT = 64
-DEFAULT_MAX_TOKENS = 32 * 1024
-DEFAULT_TIMEOUT_SECONDS = 2700.0
+DEFAULT_REASONING_EFFORT = "low"
+DEFAULT_MAX_TOKENS = 128 * 1024
+LEGACY_MAX_TOKENS = 32 * 1024
+DEFAULT_TIMEOUT_SECONDS = 2_700.0
 DEFAULT_FAKE_TIMEOUT_SECONDS = 30.0
+MATERIALIZE_PARENT_TIMEOUT_SECONDS = 5 * DEFAULT_FAKE_TIMEOUT_SECONDS + 60.0
 DEFAULT_WORKERS = min(32, max(1, (os.cpu_count() or 4) // 4))
 VARIANT_ORDER = {variant: index for index, variant in enumerate(VARIANTS)}
 SECTION_RE = re.compile(
@@ -592,12 +610,81 @@ def select_relaxed_provenance_residual(canonical_parents: Path, run_dir: Path) -
     return {key: value for key, value in selection.items() if key != "rows"}
 
 
+def select_unprofiled_residual(canonical_parents: Path, run_dir: Path) -> dict[str, Any]:
+    """Select the residual whose input storage cannot be established automatically."""
+
+    from tools.data.synthesize.augment_prompt_tasks import analyze_code
+
+    selected_rows: list[dict[str, Any]] = []
+    manifest_rows: list[dict[str, Any]] = []
+    reasons: collections.Counter[str] = collections.Counter()
+    strict_measurable = 0
+    relaxed_measurable = 0
+    for source_row_index, row in _iter_rows(canonical_parents):
+        uuid, code, entry_point = _identity(row)
+        try:
+            analyze_code(code, entry_point)
+            strict_measurable += 1
+            continue
+        except (SyntaxError, ValueError):
+            pass
+        try:
+            relaxed_factory_storage(code, entry_point)
+        except (SyntaxError, ValueError) as exc:
+            reason = f"factory_shape_unresolved:{type(exc).__name__}:{exc}"
+        else:
+            profile = _fake_input_profile(code, timeout_seconds=DEFAULT_FAKE_TIMEOUT_SECONDS)
+            if profile.passed and profile.input_bytes is not None:
+                relaxed_measurable += 1
+                continue
+            reason = f"fake_input_profile_unresolved:{profile.status}:{profile.exception_type}:{profile.reason}"
+        reasons[reason] += 1
+        source, operator = _group(row)
+        selected_rows.append(row)
+        manifest_rows.append(
+            {
+                "selected_index": len(selected_rows) - 1,
+                "source_row_index": source_row_index,
+                "parent_uuid": uuid,
+                "parent_reference_sha256": _sha256_bytes(code.encode()),
+                "source_family": source,
+                "operator_family": operator,
+                "input_profile_failure": reason,
+                "input_measurement_contract": "model_inferred_unprofiled_v1",
+                "target_input_bytes": target_input_bytes_without_profile(uuid),
+            }
+        )
+    canonical_count = pq.ParquetFile(canonical_parents).metadata.num_rows
+    if strict_measurable + relaxed_measurable + len(selected_rows) != canonical_count:
+        raise RuntimeError("unprofiled census does not close over canonical parents")
+    output = _paths(run_dir)
+    output.selected.parent.mkdir(parents=True, exist_ok=True)
+    _atomic_parquet(output.selected, selected_rows, pq.ParquetFile(canonical_parents).schema_arrow)
+    selection = {
+        "contract_version": CONTRACT_VERSION,
+        "selection_contract_version": UNPROFILED_SELECTION_CONTRACT_VERSION,
+        "selection_reason": "automatic_input_profile_unresolved_model_inference_retry",
+        "prompt_version": PROMPT_VERSION_UNPROFILED,
+        "canonical_parent_count": canonical_count,
+        "strict_measurable_parent_count": strict_measurable,
+        "relaxed_measurable_parent_count": relaxed_measurable,
+        "selected_parent_count": len(selected_rows),
+        "eligible_parent_count": len(selected_rows),
+        "source_path": str(canonical_parents.resolve()),
+        "source_sha256": _sha256_file(canonical_parents),
+        "failure_reasons": dict(reasons.most_common()),
+        "rows": manifest_rows,
+    }
+    _atomic_text(output.selection, json.dumps(selection, indent=2, sort_keys=True) + "\n")
+    return {key: value for key, value in selection.items() if key != "rows"}
+
+
 def preview(run_dir: Path, count: int, *, candidate: bool = False) -> dict[str, Any]:
     output = _paths(run_dir)
     selection = json.loads(output.selection.read_text(encoding="utf-8"))
     by_uuid = {str(item["parent_uuid"]): item for item in selection["rows"]}
     existing = _load_generation(output.generation)
-    prompt_version = PROMPT_VERSION if candidate else _generation_prompt_version(existing)
+    prompt_version = PROMPT_VERSION if candidate else _generation_prompt_version(existing, selection)
     destination = output.candidate_prompts if candidate else output.prompts
     blocks = [
         "# DSV4 shape hard-tail prompt review",
@@ -631,15 +718,39 @@ def preview(run_dir: Path, count: int, *, candidate: bool = False) -> dict[str, 
     }
 
 
-def _request_payload(prompt: str) -> dict[str, Any]:
+def _request_contract(generation_contract_version: str) -> dict[str, Any]:
+    if generation_contract_version in {GENERATION_CONTRACT_VERSION_V1, GENERATION_CONTRACT_VERSION_V2}:
+        effort = "low"
+        max_tokens = LEGACY_MAX_TOKENS
+    elif generation_contract_version == GENERATION_CONTRACT_VERSION_V3:
+        effort = "high"
+        max_tokens = DEFAULT_MAX_TOKENS
+    elif generation_contract_version == GENERATION_CONTRACT_VERSION:
+        effort = DEFAULT_REASONING_EFFORT
+        max_tokens = DEFAULT_MAX_TOKENS
+    else:
+        raise ValueError(f"unsupported_generation_contract_version:{generation_contract_version}")
     return {
         "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": prompt}],
+        "message_roles": ["user"],
+        "reasoning_effort": effort,
+        "thinking": True,
         "temperature": 0.6,
         "top_p": 0.95,
-        "max_tokens": DEFAULT_MAX_TOKENS,
+        "max_tokens": max_tokens,
+    }
+
+
+def _request_payload(prompt: str, generation_contract_version: str) -> dict[str, Any]:
+    contract = _request_contract(generation_contract_version)
+    return {
+        "model": contract["model"],
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": contract["temperature"],
+        "top_p": contract["top_p"],
+        "max_tokens": contract["max_tokens"],
         "chat_template_kwargs": {"thinking": True},
-        "reasoning_effort": "low",
+        "reasoning_effort": contract["reasoning_effort"],
     }
 
 
@@ -697,9 +808,14 @@ def _load_generation(path: Path) -> dict[str, Mapping[str, Any]]:
     return records
 
 
-def _generation_prompt_version(records: Mapping[str, Mapping[str, Any]]) -> str:
+def _generation_prompt_version(
+    records: Mapping[str, Mapping[str, Any]], selection: Mapping[str, Any] | None = None
+) -> str:
     if not records:
-        return PROMPT_VERSION
+        version = str((selection or {}).get("prompt_version", PROMPT_VERSION))
+        if version not in USER_TEMPLATES:
+            raise ValueError(f"unsupported_selection_prompt_version:{version}")
+        return version
     versions = {str(record.get("prompt_version")) for record in records.values()}
     if len(versions) != 1:
         raise ValueError(f"generation_contains_multiple_prompt_versions:{sorted(versions)}")
@@ -769,11 +885,11 @@ def generate(
     metadata = {str(item["parent_uuid"]): item for item in selection["rows"]}
     rows = _rows(output.selected)
     completed = _load_generation(output.generation)
-    prompt_version = _generation_prompt_version(completed)
+    prompt_version = _generation_prompt_version(completed, selection)
     generation_contract_version = _generation_contract_version(completed)
     active_endpoints = list(endpoints)
     endpoint_pool = list(active_endpoints)
-    if completed and generation_contract_version == GENERATION_CONTRACT_VERSION:
+    if completed and generation_contract_version != GENERATION_CONTRACT_VERSION_V1:
         recorded_pools = {
             (
                 tuple(record.get("endpoint_pool", [])),
@@ -831,7 +947,7 @@ def generate(
         index, row, prompt, prompt_hash, targets = item
         uuid, code, _ = _identity(row)
         endpoint = _endpoint_for(uuid, active_endpoints)
-        payload = _request_payload(prompt)
+        payload = _request_payload(prompt, generation_contract_version)
         attempt_index = int(completed.get(uuid, {}).get("attempt_index", -1)) + 1
         started = time.time()
         error = None
@@ -853,15 +969,7 @@ def generate(
             "endpoint": endpoint,
             "endpoint_pool": endpoint_pool,
             "endpoint_pool_sha256": endpoint_pool_sha256,
-            "request_contract": {
-                "model": MODEL_NAME,
-                "message_roles": ["user"],
-                "reasoning_effort": "low",
-                "thinking": True,
-                "temperature": 0.6,
-                "top_p": 0.95,
-                "max_tokens": DEFAULT_MAX_TOKENS,
-            },
+            "request_contract": _request_contract(generation_contract_version),
             "http_status": status,
             "response": response,
             "error": error,
@@ -1001,14 +1109,61 @@ def _canonicalize(
     entry_point: str,
     *,
     relaxed_return_provenance: bool = False,
+    unprofiled_return_provenance: bool = False,
 ) -> tuple[str, list[dict[str, Any]], list[int]]:
     # This first comparison rejects changed docstrings, equivalent rewrites,
     # rank changes, Model changes, and all non-shape edits before reconstruction.
-    gate = relaxed_structure_gate if relaxed_return_provenance else static_gate
+    if unprofiled_return_provenance:
+        gate = profiled_structure_gate
+    elif relaxed_return_provenance:
+        gate = relaxed_structure_gate
+    else:
+        gate = static_gate
     gate(parent_code, proposal_code, entry_point)
     shape_changes, init_changes, proposed_values = _aligned_changes(parent_code, proposal_code)
     if not shape_changes:
         raise ValueError("proposal_changes_no_input_shape_literal")
+    if unprofiled_return_provenance:
+        if len(shape_changes) > 16:
+            raise ValueError(f"profiled_shape_occurrence_count_above_sixteen:{len(shape_changes)}")
+        parent_values = {
+            _span_key(SourceSpan.from_node(node)): int(node.value)
+            for node in ast.walk(ast.parse(parent_code))
+            if isinstance(node, ast.Constant) and type(node.value) is int
+        }
+        grouped: dict[tuple[int, int], list[tuple[int, int, int, int]]] = collections.defaultdict(list)
+        for span, new_value in shape_changes.items():
+            old_value = parent_values[span]
+            if new_value <= old_value:
+                raise ValueError(f"profiled_shape_literal_did_not_strictly_increase:{old_value}:{new_value}")
+            grouped[(old_value, new_value)].append(span)
+        canonical = _patch_spans(parent_code, {**shape_changes, **init_changes})
+        canonical_static = gate(parent_code, canonical, entry_point)
+        slots_manifest = []
+        for index, ((old_value, new_value), spans) in enumerate(sorted(grouped.items())):
+            slots_manifest.append(
+                {
+                    "slot_id": f"profiled_value:{index}:{old_value}:{new_value}",
+                    "kind": "profiled_value",
+                    "old_value": old_value,
+                    "new_value": new_value,
+                    "power_of_two": new_value & (new_value - 1) == 0,
+                    "patch_spans": [
+                        {
+                            "lineno": span[0],
+                            "col_offset": span[1],
+                            "end_lineno": span[2],
+                            "end_col_offset": span[3],
+                        }
+                        for span in sorted(spans)
+                    ],
+                    "occurrences": [],
+                    "dimension_balance_guard": {"passed": None, "reason": "deferred_to_returned_profile"},
+                }
+            )
+        if canonical_static["child_reference_sha256"] != _sha256_bytes(canonical.encode()):
+            raise AssertionError("canonical_child_hash_mismatch")
+        return canonical, slots_manifest, proposed_values
     slots, rejected_slots = _shape_slots_with_rejections(
         parent_code,
         entry_point,
@@ -1152,12 +1307,11 @@ def _materialize_parent(
             decision["reason"] = "generation_prompt_or_effort_contract_mismatch"
         return result
     request_contract = record.get("request_contract")
+    expected_request_contract = _request_contract(str(record.get("generation_contract_version")))
     if (
         record.get("prompt_sha256") != _sha256_bytes(expected_prompt.encode())
         or not isinstance(request_contract, Mapping)
-        or request_contract.get("message_roles") != ["user"]
-        or request_contract.get("reasoning_effort") != "low"
-        or request_contract.get("thinking") is not True
+        or any(request_contract.get(key) != value for key, value in expected_request_contract.items())
     ):
         for decision in decisions.values():
             decision["reason"] = "generation_prompt_or_effort_contract_mismatch"
@@ -1172,8 +1326,19 @@ def _materialize_parent(
     measurement_contract = selection_row.get("input_measurement_contract")
     if measurement_contract == RELAXED_STORAGE_CONTRACT:
         relaxed_return_provenance = True
+        unprofiled_return_provenance = False
+    elif measurement_contract == UNPROFILED_STORAGE_CONTRACT:
+        # The unprofiled selector is deliberately broader than the static
+        # factory resolver.  Many rows in this lane have executable
+        # get_inputs() functions even though their tuple globals, starred
+        # shapes, or tensor constructors are outside the resolver grammar.
+        # Re-establish their returned-tensor profile dynamically here before
+        # accepting any model proposal.
+        relaxed_return_provenance = True
+        unprofiled_return_provenance = True
     elif measurement_contract in (None, "proven_returned_input_storage_v1"):
         relaxed_return_provenance = False
+        unprofiled_return_provenance = False
     else:
         for decision in decisions.values():
             decision["reason"] = f"unsupported_input_measurement_contract:{measurement_contract}"
@@ -1184,14 +1349,25 @@ def _materialize_parent(
             parent_code,
             timeout_seconds=DEFAULT_FAKE_TIMEOUT_SECONDS,
         )
-        if (
-            not parent_input_profile.passed
-            or parent_input_profile.input_bytes is None
-            or int(parent_input_profile.input_bytes) != int(selection_row.get("input_bytes_before", -1))
-            or _canonical_json(parent_input_profile.as_dict()) != _canonical_json(selection_row.get("input_profile"))
-        ):
+        profile_unresolved = not parent_input_profile.passed or parent_input_profile.input_bytes is None
+        profile_changed = (
+            not unprofiled_return_provenance
+            and not profile_unresolved
+            and (
+                int(parent_input_profile.input_bytes) != int(selection_row.get("input_bytes_before", -1))
+                or _canonical_json(parent_input_profile.as_dict())
+                != _canonical_json(selection_row.get("input_profile"))
+            )
+        )
+        if profile_unresolved or profile_changed:
+            reason = (
+                f"parent_fake_input_profile_still_unresolved:{parent_input_profile.status}:"
+                f"{parent_input_profile.reason}"
+                if unprofiled_return_provenance and profile_unresolved
+                else "parent_fake_input_profile_differs_from_selection"
+            )
             for decision in decisions.values():
-                decision["reason"] = "parent_fake_input_profile_differs_from_selection"
+                decision["reason"] = reason
             return result
 
     seen_hashes: set[str] = set()
@@ -1211,6 +1387,7 @@ def _materialize_parent(
                 proposal,
                 entry_point,
                 relaxed_return_provenance=relaxed_return_provenance,
+                unprofiled_return_provenance=unprofiled_return_provenance,
             )
             child_input_profile = None
             if relaxed_return_provenance:
@@ -1234,13 +1411,62 @@ def _materialize_parent(
                         raise ValueError("returned_input_tensor_rank_changed")
                     if parent_tensor[1] != child_tensor[1]:
                         raise ValueError("returned_input_tensor_dtype_changed")
-                static = relaxed_static_gate(
-                    parent_code,
-                    canonical,
-                    entry_point,
-                    parent_input_bytes=int(parent_input_profile.input_bytes),
-                    child_input_bytes=int(child_input_profile.input_bytes),
-                )
+                    child_dimensions = sorted((int(value) for value in child_tensor[0]), reverse=True)
+                    if (
+                        len(child_dimensions) >= 2
+                        and child_dimensions[0] > MAX_DIMENSION_IMBALANCE_RATIO * child_dimensions[1]
+                    ):
+                        raise ValueError(
+                            "returned_input_dimension_balance_exceeded:" f"{child_dimensions[0]}:{child_dimensions[1]}"
+                        )
+                if unprofiled_return_provenance:
+                    for slot in slots:
+                        dynamic_occurrences = []
+                        for tensor_index, (parent_tensor, child_tensor) in enumerate(
+                            zip(parent_input_profile.tensors, child_input_profile.tensors, strict=True)
+                        ):
+                            for axis, (parent_dimension, child_dimension) in enumerate(
+                                zip(parent_tensor[0], child_tensor[0], strict=True)
+                            ):
+                                if int(parent_dimension) == int(slot["old_value"]) and int(child_dimension) == int(
+                                    slot["new_value"]
+                                ):
+                                    dynamic_occurrences.append(
+                                        {
+                                            "tensor_index": tensor_index,
+                                            "axis": axis,
+                                            "rank": len(child_tensor[0]),
+                                            "old_value": int(parent_dimension),
+                                        }
+                                    )
+                        if not dynamic_occurrences:
+                            raise ValueError(
+                                "profiled_shape_slot_has_no_returned_input_occurrence:" f"{slot['slot_id']}"
+                            )
+                        slot["occurrences"] = dynamic_occurrences
+                        slot["dimension_balance_guard"] = {
+                            "passed": True,
+                            "reason": "validated_over_all_returned_tensor_profiles",
+                            "max_ratio": MAX_DIMENSION_IMBALANCE_RATIO,
+                        }
+                if unprofiled_return_provenance:
+                    static = profiled_static_gate(
+                        parent_code,
+                        canonical,
+                        entry_point,
+                        parent_input_bytes=int(parent_input_profile.input_bytes),
+                        child_input_bytes=int(child_input_profile.input_bytes),
+                        parent_tensor_count=parent_input_profile.tensor_count,
+                        child_tensor_count=child_input_profile.tensor_count,
+                    )
+                else:
+                    static = relaxed_static_gate(
+                        parent_code,
+                        canonical,
+                        entry_point,
+                        parent_input_bytes=int(parent_input_profile.input_bytes),
+                        child_input_bytes=int(child_input_profile.input_bytes),
+                    )
             else:
                 static = static_gate(parent_code, canonical, entry_point)
             after = int(static["input_bytes_after"])
@@ -1291,6 +1517,78 @@ def _materialize_parent(
     return result
 
 
+def _materialize_parent_process_entry(task: tuple[Any, ...], connection: Any) -> None:
+    """Run one parent behind an OS-process boundary that contains native aborts."""
+
+    try:
+        connection.send(("result", _materialize_parent(task)))
+    except BaseException as exc:  # noqa: BLE001 - serialized infrastructure evidence
+        connection.send(("error", type(exc).__name__, str(exc).replace(os.linesep, " ")[:1000]))
+    finally:
+        connection.close()
+
+
+def _materialize_parent_failure(task: tuple[Any, ...], reason: str) -> dict[str, Any]:
+    selected_index, parent, record, _ = task
+    decisions = {variant: _decision_base(parent, record, variant) for variant in VARIANTS}
+    for decision in decisions.values():
+        decision["reason"] = reason
+    return {
+        "selected_index": selected_index,
+        "parent": parent,
+        "children": [],
+        "decisions": decisions,
+    }
+
+
+def _materialize_parent_isolated(task: tuple[Any, ...]) -> dict[str, Any]:
+    """Contain FakeTensor TLS corruption, signals, and C++ aborts to one parent."""
+
+    context = multiprocessing.get_context("spawn")
+    receive, send = context.Pipe(duplex=False)
+    process = context.Process(target=_materialize_parent_process_entry, args=(task, send))
+    process.start()
+    send.close()
+    deadline = time.monotonic() + MATERIALIZE_PARENT_TIMEOUT_SECONDS
+    payload = None
+    try:
+        while time.monotonic() < deadline:
+            if receive.poll(0.2):
+                try:
+                    payload = receive.recv()
+                except EOFError:
+                    payload = None
+                break
+            if not process.is_alive():
+                break
+        if payload is None and process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.kill()
+            return _materialize_parent_failure(
+                task,
+                f"materialize_parent_process_timeout:{MATERIALIZE_PARENT_TIMEOUT_SECONDS:g}s",
+            )
+        process.join(timeout=5)
+        if payload is None:
+            return _materialize_parent_failure(
+                task,
+                f"materialize_parent_process_crashed:exitcode={process.exitcode}",
+            )
+        if payload[0] == "error":
+            return _materialize_parent_failure(
+                task,
+                f"materialize_parent_process_error:{payload[1]}:{payload[2]}",
+            )
+        return payload[1]
+    finally:
+        receive.close()
+        if process.is_alive():
+            process.kill()
+        process.join(timeout=5)
+
+
 def materialize(run_dir: Path, workers: int) -> dict[str, Any]:
     if workers <= 0:
         raise ValueError("workers_must_be_positive")
@@ -1307,17 +1605,26 @@ def materialize(run_dir: Path, workers: int) -> dict[str, Any]:
         tasks.append((index, parent, generations.get(uuid), selection_rows[uuid]))
 
     results: list[dict[str, Any]] = []
-    context = multiprocessing.get_context("spawn")
-    # FakeTensor keeps dispatcher-mode state process-wide.  A malformed parent
-    # can leave that state poisoned even after its structured rejection path;
-    # never reuse the process for a different canonical parent.
-    with concurrent.futures.ProcessPoolExecutor(
-        max_workers=workers,
-        mp_context=context,
-        max_tasks_per_child=1,
-    ) as executor:
-        for result in executor.map(_materialize_parent, tasks, chunksize=1):
+    # FakeTensor can leave dispatcher TLS poisoned after an asynchronous timeout
+    # and has native C++ abort paths.  A thread only supervises a fresh child
+    # process; no FakeTensor work executes in the long-lived materializer.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        for completed_count, result in enumerate(
+            executor.map(_materialize_parent_isolated, tasks),
+            start=1,
+        ):
             results.append(result)
+            if completed_count % 64 == 0 or completed_count == len(tasks):
+                print(
+                    json.dumps(
+                        {
+                            "materialized_parents": completed_count,
+                            "total_parents": len(tasks),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
     results.sort(key=lambda item: int(item["selected_index"]))
     children: list[dict[str, Any]] = []
     paired: list[dict[str, Any]] = []
@@ -1596,6 +1903,8 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
     parents_with_child = {str(item["parent_uuid"]) for item in accepted}
     values: list[int] = []
     occurrence_values: list[int] = []
+    source_occurrence_values: list[int] = []
+    returned_occurrence_values: list[int] = []
     proposed_values = [
         int(value)
         for decision in decisions
@@ -1618,7 +1927,16 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
             value = int(slot["new_value"])
             values.append(value)
             occurrences = slot.get("occurrences", [])
-            occurrence_values.extend([value] * len(occurrences))
+            patch_spans = slot.get("patch_spans", [])
+            source_occurrence_values.extend([value] * len(patch_spans))
+            returned_occurrence_values.extend([value] * len(occurrences))
+            # Profiled lanes can prove a changed value causally affects the
+            # returned storage even when the resulting dimension is an
+            # expression rather than the literal itself.  Count those
+            # conservative source occurrences for value-distribution metrics;
+            # axis/rank metrics remain limited to directly matched dimensions.
+            occurrence_count = max(len(occurrences), len(patch_spans))
+            occurrence_values.extend([value] * occurrence_count)
             for occurrence in occurrences:
                 axis_counts[int(occurrence["axis"])] += 1
                 rank_counts[int(occurrence["rank"])] += 1
@@ -1646,6 +1964,35 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
         value >= 8 and _distance_to_power_of_two(value) <= 3 for value in proposed_values
     )
     proposed_top10_share = _fraction(sum(count for _, count in proposed_top), len(proposed_values))
+
+    def value_bias(values_to_measure: Sequence[int]) -> dict[str, Any]:
+        measured_frequency = collections.Counter(values_to_measure)
+        measured_total = len(values_to_measure)
+        measured_top = measured_frequency.most_common(10)
+        measured_hhi = (
+            sum((count / measured_total) ** 2 for count in measured_frequency.values()) if measured_total else None
+        )
+        return {
+            "occurrences": measured_total,
+            "unique_values": len(measured_frequency),
+            "power_of_two_share": _fraction(
+                sum(value & (value - 1) == 0 for value in values_to_measure), measured_total
+            ),
+            "near_decimal_100_grid_share": _fraction(
+                sum(value >= 100 and _distance_to_grid(value, 100) <= 3 for value in values_to_measure),
+                measured_total,
+            ),
+            "near_power_of_two_within_3_share": _fraction(
+                sum(value >= 8 and _distance_to_power_of_two(value) <= 3 for value in values_to_measure),
+                measured_total,
+            ),
+            "top10_share": _fraction(sum(count for _, count in measured_top), measured_total),
+            "top10_values": [{"value": value, "occurrences": count} for value, count in measured_top],
+            "inverse_hhi_effective_values": (1 / measured_hhi if measured_hhi else None),
+        }
+
+    source_bias = value_bias(source_occurrence_values)
+    returned_bias = value_bias(returned_occurrence_values)
 
     def acceptance_table(field: str) -> dict[str, dict[str, Any]]:
         totals: collections.Counter[str] = collections.Counter()
@@ -1696,7 +2043,9 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
         )
     )
     if representative_for_projection and accepted_parent_rate is not None:
-        eligible_for_projection = int(selection["eligible_parent_count"])
+        eligible_for_projection = int(
+            selection.get("projection_eligible_parent_count", selection["eligible_parent_count"])
+        )
         projected_added = round(eligible_for_projection * accepted_parent_rate)
         projected_changed = min(BASELINE_FULL_ROWS, BASELINE_CHANGED_PARENTS + projected_added)
         projected_unchanged = BASELINE_FULL_ROWS - projected_changed
@@ -1763,15 +2112,18 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
     power_share = _fraction(p2, total_occurrences)
     proposal_power_share = _fraction(proposed_p2, len(proposed_values))
     near_decimal_share = _fraction(near_decimal_anchor, total_occurrences)
-    if power_share is not None and power_share < INVERSE_POWER_OF_TWO_WARNING_SHARE:
+    warning_power_share = source_bias["power_of_two_share"]
+    warning_near_decimal_share = source_bias["near_decimal_100_grid_share"]
+    warning_top10_share = source_bias["top10_share"]
+    if warning_power_share is not None and warning_power_share < INVERSE_POWER_OF_TWO_WARNING_SHARE:
         warnings.append("power_of_two_active_avoidance_share_below_5_percent")
     if proposal_power_share is not None and proposal_power_share < INVERSE_POWER_OF_TWO_WARNING_SHARE:
         warnings.append("proposal_power_of_two_active_avoidance_share_below_5_percent")
-    if power_share is not None and power_share > 0.70:
+    if warning_power_share is not None and warning_power_share > 0.70:
         warnings.append("power_of_two_absorption_share_above_70_percent")
-    if near_decimal_share is not None and near_decimal_share > 0.05:
+    if warning_near_decimal_share is not None and warning_near_decimal_share > 0.05:
         warnings.append("near_decimal_100_grid_share_above_5_percent")
-    if top10_share is not None and top10_share > 0.35:
+    if warning_top10_share is not None and warning_top10_share > 0.35:
         warnings.append("top10_changed_value_share_above_35_percent")
     if proposed_top10_share is not None and proposed_top10_share > 0.35:
         warnings.append("proposal_top10_changed_value_share_above_35_percent")
@@ -1843,6 +2195,8 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
             ),
             "changed_logical_values": len(values),
             "changed_occurrences": total_occurrences,
+            "source_occurrence_bias": source_bias,
+            "returned_dimension_bias": returned_bias,
             "proposal_changed_values_observed": len(proposed_values),
             "proposal_unique_changed_values": len(proposed_frequency),
             "proposal_power_of_two_value_share": proposal_power_share,
@@ -1928,10 +2282,17 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
         "",
         f"- Parents with a static+FakeTensor child: {len(parents_with_child)}/{selection['selected_parent_count']} ({(accepted_parent_rate or 0):.2%}).",
         f"- Accepted variants: {len(accepted)}/{len(decisions)}.",
-        f"- Changed occurrences: {total_occurrences}; unique values: {len(frequency)}.",
-        f"- Power-of-two share: {(canary['power_of_two_occurrence_share'] or 0):.2%}; top-10 share: {(top10_share or 0):.2%}.",
-        f"- Near-decimal-100-grid share (within 3): {(canary['near_decimal_100_grid_share'] or 0):.2%}; "
-        f"near-power-of-two share (within 3): {(canary['near_power_of_two_within_3_share'] or 0):.2%}.",
+        f"- Source occurrences: {source_bias['occurrences']}; unique values: {source_bias['unique_values']}.",
+        f"- Source power-of-two share: {(source_bias['power_of_two_share'] or 0):.2%}; "
+        f"top-10 share: {(source_bias['top10_share'] or 0):.2%}.",
+        f"- Source near-decimal-100-grid share (within 3): "
+        f"{(source_bias['near_decimal_100_grid_share'] or 0):.2%}; near-power-of-two share (within 3): "
+        f"{(source_bias['near_power_of_two_within_3_share'] or 0):.2%}.",
+        f"- Returned-dimension occurrences: {returned_bias['occurrences']}; power-of-two share: "
+        f"{(returned_bias['power_of_two_share'] or 0):.2%}; top-10 share: "
+        f"{(returned_bias['top10_share'] or 0):.2%}. These are shape-weighted and may be dominated by one parent.",
+        f"- Legacy max(source, returned) occurrences: {total_occurrences}; power-of-two share: "
+        f"{(canary['power_of_two_occurrence_share'] or 0):.2%}; top-10 share: {(top10_share or 0):.2%}.",
         (
             f"- Projected unchanged parents: {projected_unchanged}/{BASELINE_FULL_ROWS} "
             f"({projected_unchanged / BASELINE_FULL_ROWS:.2%}); diagnostic only."
@@ -1947,8 +2308,8 @@ def analyze_bias(run_dir: Path) -> dict[str, Any]:
     lines.extend(f"- {count}: `{category}`" for category, count in rejection_categories.most_common())
     lines.extend(["", "## Rejection reasons", ""])
     lines.extend(f"- {count}: `{reason}`" for reason, count in reasons.most_common(20))
-    lines.extend(["", "## Top changed values", ""])
-    lines.extend(f"- {value}: {count}" for value, count in top)
+    lines.extend(["", "## Top source-level changed values", ""])
+    lines.extend(f"- {item['value']}: {item['occurrences']}" for item in source_bias["top10_values"])
     _atomic_text(output.bias_markdown, "\n".join(lines).rstrip() + "\n")
     return report
 
@@ -1967,6 +2328,10 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser(
         "select-relaxed-residual",
         help="Select strict-return-proof failures whose factory storage still resolves below 128 MiB.",
+    )
+    subparsers.add_parser(
+        "select-unprofiled-residual",
+        help="Select parents whose input storage cannot be established automatically.",
     )
 
     preview_parser = subparsers.add_parser("preview")
@@ -2006,6 +2371,8 @@ def main() -> None:
         )
     elif args.command == "select-relaxed-residual":
         result = select_relaxed_provenance_residual(DEFAULT_CANONICAL_PARENTS, args.run_dir)
+    elif args.command == "select-unprofiled-residual":
+        result = select_unprofiled_residual(DEFAULT_CANONICAL_PARENTS, args.run_dir)
     elif args.command == "preview":
         result = preview(args.run_dir, args.count)
     elif args.command == "preview-candidate":
