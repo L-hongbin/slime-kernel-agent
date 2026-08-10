@@ -8,7 +8,7 @@
 
 shape 扩展由当前会话继续负责。另一台 KernelGym 机器并行负责 random/value、coherent dtype、layout、semantic/operator 和 source/mode coverage。两边共享同一份 parent、manifest 和验证合同；runtime policy 不一致的结果只算 static candidate，不能直接合并为统一的 runtime-accepted partition。
 
-截至 2026-08-07，另一台机器已完成 random/value、parameter-free dtype、module-state coherent dtype、layout 和 parentless single-Tensor semantic/operator 的各 1k canary；这些结果都没有获得继续放量或训练授权。Source/mode coverage、structured semantic output、cross-lane merge 和训练 ablation 仍待后续。
+截至 2026-08-11，另一台机器已完成 random/value、parameter-free dtype、module-state coherent dtype、layout、parentless single-Tensor semantic/operator 和独立 frontier operator scenario 的各 1k canary。Frontier lane 的 static、A800 reference、fresh liveness v2 和 lane-local final 均已闭合为 1,000/1,000；这些结果都没有获得继续放量或训练授权。Source/mode coverage、structured semantic output、cross-lane merge 和训练 ablation 仍待后续。
 
 所有现有 v4 产物都处于 review 状态，`training_approved=false`。当前训练仍使用 40,307 条 v3 数据。最终数据集必须经过 cross-lane 去重、provenance/license 审计、统一 runtime evidence 检查和受控训练 ablation，不能由任一 lane 单独发布。
 
@@ -113,20 +113,24 @@ channels-last 或其他 memory format 仍需逐 operator 证明 memory-format co
 
 1,000 条在 clean KernelGym authority `2625505...` 的 node22 A800 reference 中 1000/1000 pass，在三轮 operator-liveness 中也 1000/1000 pass，最终 accepted 1000。结果仍为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/SEMANTIC_OPERATOR_CANARY.md`。用户选择方案 B，本 1k 只做单 Tensor families；structured final output 为 `explicitly_deferred`，不属于本轮已覆盖 cell。
 
+#### Frontier operator scenario（独立 lane，1k review-only accepted）
+
+frontier lane 用公开 source 驱动的 taxonomy 和 deterministic closed registry，覆盖 10 family、35 template 与固定 quota；它只借鉴 `tools/data/synthesize/lhb/` 的 diversity-control 思路，不依赖、导入或复制该目录。Sparse family 在 forward 内真实构造并消费 COO、CSR、sampled-addmm、sparse-softmax 和 semi-structured 2:4 intermediates；其他 family 覆盖 MoE、SSM、attention/cache、modern LLM、ragged/graph、QDQ、vision、spectral/scientific 和 retrieval motifs。commit `e120af93` 固化 generator，commit `297e67d5` 修正 runtime output-device evidence。node22 A800 的 source-bound KernelGym reference、fresh liveness v2 和 final accepted 均为 1,000/1,000、0 failed；liveness 每 row 运行三轮并要求 declared ATen provenance 到 returned dense `cuda:0` Tensor。它是独立的 lane-local accepted partition，不能和既有 semantic lane 或不同 runtime policy 静默合并。所有 frontier 结果仍为 `review_only`、`training_approved=false`；structured/multi-rank/backward/native FP8 等均未证明。详见 `handoffs/data/synthesize/FRONTIER_OPERATOR_CANARY.md`。
+
 source coverage 通过合规来源和受控生成扩展。Oubo 数据需先补 provenance/license；KernelBook 需固定 license 和 group split；KernelBench 保持 evaluation-only。6,799 个 mode-variant parent 仍需独立 train-mode gate，不能靠新增 child 绕过。
 
 ## 统一执行流程
 
 另一台机器上的每个新 non-shape 合同都按下列顺序运行，并先做 1,000-row canary；mutation lane 对应 1,000 个 parent/pair，standalone lane 对应 1,000 个 generator task。该流程不依赖 shape lane 的状态。
 
-Random/value、dtype、layout 和 semantic/operator 现在已有 lane-local solver、validator、launcher 和 exact analyzer，并各完成 1k canary；这些工具只授权复现对应 review lane，不授权 full run。旧混合 shape/value generator、input-only dtype pilot、单一 layout pilot 和 pointwise-heavy semantic generator 仍是 legacy，不能代替新合同。Source/mode 尚未形成同等级正式 pipeline。Semantic task 没有 parent，使用 reference correctness、declared-op dependency/provenance 和 decontamination gate；mutation lanes 继续使用 paired parent/child gate。
+Random/value、dtype、layout、既有 semantic/operator 和 frontier operator scenario 现在都有 lane-local solver/generator、validator、launcher 和 exact analyzer，并各完成 1k canary；这些工具只授权复现对应 review lane，不授权 full run。Frontier 已形成独立 source-bound accepted partition，但在 cross-lane runtime-policy、identity、provenance 和 license 合并前不能自动进入其他 partition 或训练。旧混合 shape/value generator、input-only dtype pilot、单一 layout pilot 和 pointwise-heavy semantic generator 仍是 legacy，不能代替新合同。Source/mode 尚未形成同等级正式 pipeline。Standalone semantic/frontier task 使用 reference correctness、declared-op dependency/provenance 和 decontamination gate；mutation lanes 继续使用 paired parent/child gate。
 
 ```text
 immutable canonical parents or generator/provenance roots
   -> lane-local deterministic selection/generation
   -> source/AST/static feasibility
   -> 1k canary + manual diff review
-  -> paired（mutation）或 standalone（semantic）authoritative runtime reference（本轮 A800 可验收）
+  -> paired（mutation）或 standalone（semantic/frontier）authoritative runtime reference（本轮 A800 可验收）
   -> intervention-specific liveness
   -> lane bias and failure audit
   -> 1k lane-local canary handoff
@@ -136,7 +140,7 @@ immutable canonical parents or generator/provenance roots
   -> mixture decision and explicit training approval
 ```
 
-canary 的 acceptance rate 用于估算后续运行成本和暴露构造问题，不设成训练价值代理。本机所有 non-shape 单次构造或验证不超过 5,000；本轮已完成的 random/value、dtype、layout、semantic/operator 均以 1,000-row 为交付上限，不因 eligible pool 大小自动放量。每轮至少人工复核不同 source、operator、target cell、成功与失败的真实 reference diff 和 raw runtime audit。
+canary 的 acceptance rate 用于估算后续运行成本和暴露构造问题，不设成训练价值代理。本机所有 non-shape 单次构造或验证不超过 5,000；本轮已完成的 random/value、dtype、layout、semantic/operator 和 frontier operator 均以 1,000-row 为交付上限，不因 eligible pool 大小自动放量。每轮至少人工复核不同 source、operator、target cell、成功与失败的真实 reference diff 和 raw runtime audit。
 
 生产数据路径不新增单元测试，继续依赖 `py_compile`、CLI/launcher syntax、真实 canary、deterministic shard merge、exact manifest checker 和人工样本复核。任何 source-bound generator/validator 改动都会使旧 manifest 或 runtime binding 的 source hash 失效，必须重建相应 evidence。
 
@@ -231,6 +235,7 @@ materialize/merge 还依赖 decontamination baseline `Data/external/converted/ke
 | Input intervention generator | `tools/data/synthesize/augment_prompt_tasks.py` | legacy 起点；先拆 lane |
 | Coverage selector | `tools/data/synthesize/select_augmentation_coverage_pilot.py` | legacy 起点；先加 lane filter/quota |
 | Semantic/operator 正式 pipeline | `tools/data/synthesize/semantic_operator_method/` | closed registry generator、liveness、launcher 和 exact analyzer |
+| Frontier operator scenario pipeline | `tools/data/synthesize/frontier_operator_method/` | source-driven 10-family/35-template registry；static/reference/liveness/final 1k 已完成，review-only、未批准训练 |
 | 旧 Semantic generator | `tools/data/synthesize/generate_extreme_op_tasks.py` | legacy/diagnostic；不能用于本轮 single-Tensor lane |
 | Reference launcher | `tools/data/synthesize/launch_reference_validation_shards.sh` | 当前 source-bound 入口；支持 mutation pair artifact 或 standalone candidates |
 | Runtime validator | `tools/data/synthesize/validate_train_mode_contract.py` | freeze 后绑定 source SHA |
