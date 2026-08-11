@@ -291,7 +291,7 @@ _ACTIVE_RENDER_KEY = ""
 
 
 def _single(shape: str) -> list[str]:
-    """Return one of five materially different ``torch.rand`` input layouts."""
+    """Return one of five materially different ``torch.rand`` input constructions."""
     key = int(_sha256_bytes(f"{_ACTIVE_RENDER_KEY}|{shape}".encode())[:8], 16)
     source, binding, returning = key % 5, (key // 5) % 4, (key // 20) % 3
     dims = [part.strip() for part in shape.split(",")]
@@ -322,7 +322,13 @@ def _single(shape: str) -> list[str]:
         prefix, source_expr = bound_shape(expanded, "source_shape")
         target_prefix, target_expr = bound_shape(dims, "target_shape")
         prefix.extend(target_prefix)
-        prefix.extend([f"x = torch.rand({source_expr})", f"x = x.expand({target_expr})"])
+        prefix.extend(
+            [
+                f"x = torch.rand({source_expr})",
+                f"x = x.expand({target_expr})",
+                "x = x.clone()",
+            ]
+        )
     else:
         offset = [f"{dims[0]} + 1", *dims[1:]]
         prefix, source_expr = bound_shape(offset, "source_shape")
@@ -1041,7 +1047,7 @@ def _coarse_input_profile(code: str) -> str:
     calls = {_call_name(node.func) for node in ast.walk(function) if isinstance(node, ast.Call)}
     slices = [node.slice for node in ast.walk(function) if isinstance(node, ast.Subscript)]
     if "x.expand" in calls:
-        source = "broadcast_expand"
+        source = "broadcast_repeat"
     elif "x.movedim" in calls:
         source = "channel_last_view"
     elif any(
