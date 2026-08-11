@@ -19,7 +19,6 @@ import difflib
 import json
 import os
 import subprocess
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -43,9 +42,14 @@ from tools.data.synthesize.augment_prompt_tasks import (
     _top_level_class,
     _top_level_function,
 )
+from tools.data.synthesize.serial_random_wrappers import logical_factory_view, root_base_call
+from tools.data.synthesize.serial_source_contract import canonical_sha256 as _serial_canonical_sha256
+from tools.data.synthesize.serial_source_contract import verify_serial_source
 
 CONTRACT_VERSION = "layout_direct_factory_solver_v1"
+SERIAL_CONTRACT_VERSION = "layout_serial_random_factory_solver_v2"
 GENERATOR_VERSION = "exact_layout_wrapper_ast_v1"
+SERIAL_GENERATOR_VERSION = "source_span_layout_wrapper_over_serial_value_dtype_v2"
 ASSIGNMENT_VERSION = "stable_parent_hash_over_eligible_layout_families_v1"
 SELECTION_VERSION = "rare_expand_reserve_then_source_operator_family_proportional_v1"
 EXPECTED_CANONICAL_PARENT_SHA256 = "b07205fcadc543964cfc7ee5fd9c1e4d011f0f3481447f656e5297e40b4b99f4"
@@ -139,6 +143,7 @@ class EligibleParent:
     factory_specs: tuple[tuple[str, tuple[int, ...], str], ...]
     transformed_factory_indices: tuple[int, ...]
     expected_layout: tuple[dict[str, Any], ...]
+    serial_random_wrapper_count: int
 
     @property
     def stratum(self) -> tuple[str, str, str]:
@@ -421,6 +426,52 @@ def _direct_factory_proof(
     return tuple(records), local_environment, None
 
 
+def _logical_factory_proof(
+    tree: ast.Module,
+) -> tuple[
+    tuple[Any, ...] | None,
+    Mapping[str, Any] | None,
+    Mapping[int, ast.Call] | None,
+    tuple[ast.Call, ...] | None,
+    int,
+    str | None,
+]:
+    """Expose frozen random/value wrappers as their one logical input leaf."""
+
+    try:
+        view = logical_factory_view(tree)
+    except ValueError as exc:
+        return None, None, None, None, 0, f"serial_logical_factory_view_failed:{exc}"
+    records, environment, reason = _direct_factory_proof(view.tree)
+    if records is None:
+        return None, None, None, None, view.random_wrapper_count, reason
+    virtual_get_inputs = _top_level_function(view.tree, "get_inputs")
+    virtual_calls = _factory_calls(view.tree, virtual_get_inputs)
+    if len(view.original_roots) != len(records):
+        return (
+            None,
+            None,
+            None,
+            None,
+            view.random_wrapper_count,
+            f"serial_logical_factory_count_mismatch:{len(view.original_roots)}:{len(records)}",
+        )
+    for record, root in zip(records, view.original_roots, strict=True):
+        virtual_call = virtual_calls.get(record.call_node_id)
+        if virtual_call is None or ast.dump(root_base_call(root), include_attributes=False) != ast.dump(
+            virtual_call, include_attributes=False
+        ):
+            return None, None, None, None, view.random_wrapper_count, "serial_logical_factory_order_mismatch"
+    return (
+        records,
+        environment,
+        virtual_calls,
+        view.original_roots,
+        view.random_wrapper_count,
+        None,
+    )
+
+
 def _contiguous_strides(shape: Sequence[int]) -> tuple[int, ...]:
     stride = 1
     result: list[int] = []
@@ -565,7 +616,7 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
         return None, "invalid_entry_point"
     try:
         tree = ast.parse(code)
-        get_inputs = _top_level_function(tree, "get_inputs")
+        _top_level_function(tree, "get_inputs")
     except (SyntaxError, ValueError) as exc:
         return None, f"parent_ast_failed:{type(exc).__name__}:{exc}"
     parent_reference_sha256 = _sha256_bytes(code.encode("utf-8"))
@@ -574,10 +625,10 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
     model_compatible, reason = _model_layout_compatibility_proof(tree, entry_point)
     if not model_compatible:
         return None, reason or "model_layout_compatibility_not_proven"
-    records, environment, reason = _direct_factory_proof(tree)
+    records, environment, calls, _, wrapper_count, reason = _logical_factory_proof(tree)
     if records is None:
         return None, reason or "direct_factory_proof_failed"
-    calls = _factory_calls(tree, get_inputs)
+    assert calls is not None
     eligible_families = _eligible_families(records, calls, environment or {})
     if not eligible_families:
         return None, "no_layout_family_eligible"
@@ -604,6 +655,7 @@ def _analyze_parent(row: Mapping[str, Any], source_row_index: int) -> tuple[Elig
             factory_specs=tuple((record.name, record.shape, record.dtype_name) for record in records),
             transformed_factory_indices=tuple(int(item["factory_index"]) for item in expected_layout),
             expected_layout=expected_layout,
+            serial_random_wrapper_count=wrapper_count,
         ),
         "eligible",
     )
@@ -717,37 +769,25 @@ def _wrapper(base_name: str, family: str, spec: Mapping[str, Any]) -> ast.expr:
     raise ValueError(f"unsupported_family:{family}")
 
 
-def _inline_wrapper(call: ast.Call, base_name: str, family: str, spec: Mapping[str, Any]) -> ast.Call:
-    """Wrap a factory once at its original expression-evaluation position."""
-
-    return ast.Call(
-        func=ast.Lambda(
-            args=ast.arguments(
-                posonlyargs=[],
-                args=[ast.arg(arg=base_name)],
-                vararg=None,
-                kwonlyargs=[],
-                kw_defaults=[],
-                kwarg=None,
-                defaults=[],
-            ),
-            body=_wrapper(base_name, family, spec),
-        ),
-        args=[copy.deepcopy(call)],
-        keywords=[],
-    )
+def _byte_span(code: str, node: ast.AST) -> tuple[int, int]:
+    if None in (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset):
+        raise ValueError("source_span_is_unavailable")
+    lines = code.encode("utf-8").splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: node.lineno - 1]) + node.col_offset
+    end = sum(len(line) for line in lines[: node.end_lineno - 1]) + node.end_col_offset
+    return start, end
 
 
-class _FactoryReferenceRewriter(ast.NodeTransformer):
-    def __init__(self, replacements: Mapping[int, ast.expr]) -> None:
-        self.replacements = replacements
-        self.count = 0
-
-    def visit_Call(self, node: ast.Call) -> ast.AST:
-        if id(node) in self.replacements:
-            self.count += 1
-            return copy.deepcopy(self.replacements[id(node)])
-        return self.generic_visit(node)
+def _replace_byte_spans(code: str, replacements: Sequence[tuple[int, int, bytes]]) -> str:
+    raw = code.encode("utf-8")
+    ordered = sorted(replacements, reverse=True)
+    for index, (start, end, replacement) in enumerate(ordered):
+        if not 0 <= start <= end <= len(raw):
+            raise ValueError("source_replacement_span_is_invalid")
+        if index and end > ordered[index - 1][0]:
+            raise ValueError("source_replacement_spans_overlap")
+        raw = raw[:start] + replacement + raw[end:]
+    return raw.decode("utf-8")
 
 
 def _transform_layout(code: str, entry_point: str, parent: EligibleParent) -> str:
@@ -759,15 +799,16 @@ def _transform_layout(code: str, entry_point: str, parent: EligibleParent) -> st
 
     tree = ast.parse(code)
     before = _section_hashes(tree, entry_point)
-    get_inputs = _top_level_function(tree, "get_inputs")
     if _reserved_layout_name_conflict(tree):
         raise ValueError("reserved_layout_base_identifier_conflict")
-    records, environment, reason = _direct_factory_proof(tree)
+    records, environment, calls, original_roots, wrapper_count, reason = _logical_factory_proof(tree)
     if records is None:
         raise ValueError(reason or "replay_direct_factory_proof_failed")
+    if wrapper_count != parent.serial_random_wrapper_count:
+        raise ValueError("serial_random_wrapper_count_changed_during_replay")
     if _sha256_bytes(code.encode("utf-8")) != parent.parent_reference_sha256:
         raise ValueError("parent_reference_sha_changed_during_replay")
-    calls = _factory_calls(tree, get_inputs)
+    assert calls is not None and original_roots is not None
     replay_eligible = _eligible_families(records, calls, environment or {})
     replay_family, replay_assignment_sha256 = _assignment(
         parent.parent_uuid, parent.parent_reference_sha256, replay_eligible
@@ -786,38 +827,23 @@ def _transform_layout(code: str, entry_point: str, parent: EligibleParent) -> st
     replay_indices = tuple(int(item["factory_index"]) for item in expected)
     if replay_indices != parent.transformed_factory_indices:
         raise ValueError("layout_target_factory_indices_changed_during_replay")
-    record_by_call = {record.call_node_id: index for index, record in enumerate(records)}
     spec_by_index = {int(item["factory_index"]): item for item in parent.expected_layout}
-    rewritten_body: list[ast.stmt] = []
-    for statement in get_inputs.body:
-        present = sorted(
-            [
-                node
-                for node in ast.walk(statement)
-                if isinstance(node, ast.Call)
-                and id(node) in record_by_call
-                and record_by_call[id(node)] in spec_by_index
-            ],
-            key=lambda node: (node.lineno, node.col_offset),
-        )
-        if not present:
-            rewritten_body.append(statement)
+    source_replacements: list[tuple[int, int, bytes]] = []
+    raw = code.encode("utf-8")
+    for index, call in enumerate(original_roots):
+        if index not in spec_by_index:
             continue
-        replacements: dict[int, ast.expr] = {}
-        for call in present:
-            index = record_by_call[id(call)]
-            base_name = f"__layout_base_{index}"
-            replacements[id(call)] = _inline_wrapper(call, base_name, parent.assigned_family, spec_by_index[index])
-        rewriter = _FactoryReferenceRewriter(replacements)
-        changed = rewriter.visit(statement)
-        if rewriter.count != len(present) or not isinstance(changed, ast.stmt):
-            raise ValueError("layout_factory_rewrite_count_mismatch")
-        rewritten_body.append(changed)
-    get_inputs.body = rewritten_body
-    ast.fix_missing_locations(tree)
-    if _section_hashes(tree, entry_point) != before:
+        start, end = _byte_span(code, call)
+        base_name = f"__layout_base_{index}"
+        wrapper_body = ast.unparse(_wrapper(base_name, parent.assigned_family, spec_by_index[index]))
+        replacement = f"(lambda {base_name}: {wrapper_body})(".encode() + raw[start:end] + b")"
+        source_replacements.append((start, end, replacement))
+    if len(source_replacements) != len(parent.transformed_factory_indices):
+        raise ValueError("layout_factory_rewrite_count_mismatch")
+    child_code = _replace_byte_spans(code, source_replacements)
+    if _section_hashes(ast.parse(child_code), entry_point) != before:
         raise ValueError("model_or_get_init_inputs_changed")
-    return ast.unparse(tree) + "\n"
+    return child_code
 
 
 def _extend_schema(schema: pa.Schema) -> pa.Schema:
@@ -825,8 +851,11 @@ def _extend_schema(schema: pa.Schema) -> pa.Schema:
     if index < 0 or not pa.types.is_struct(schema.field(index).type):
         raise ValueError("canonical_schema_has_no_extra_info_struct")
     extra = schema.field(index)
-    if extra.type.get_field_index("augmentation") >= 0:
-        raise ValueError("canonical_input_already_has_augmentation_metadata")
+    augmentation_index = extra.type.get_field_index("augmentation")
+    if augmentation_index >= 0:
+        if extra.type.field(augmentation_index).type != AUGMENTATION_METADATA_TYPE:
+            raise ValueError("input_augmentation_metadata_has_incompatible_type")
+        return schema
     fields = list(schema)
     fields[index] = pa.field(
         "extra_info",
@@ -845,8 +874,23 @@ def _make_child(
     generator_sha256: str,
     dependency_sha256: str,
     git_commit: str,
+    source_binding: Mapping[str, Any] | None = None,
+    source_row_binding: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     child = copy.deepcopy(dict(parent))
+    serial_mode = source_binding is not None
+    solver_contract = SERIAL_CONTRACT_VERSION if serial_mode else CONTRACT_VERSION
+    solver_generator = SERIAL_GENERATOR_VERSION if serial_mode else GENERATOR_VERSION
+    if serial_mode:
+        if source_row_binding is None or source_row_binding.get("row_index") != eligible.source_row_index:
+            raise ValueError("serial layout child lacks its exact upstream manifest row")
+        upstream_manifest_sha256 = _serial_canonical_sha256(source_row_binding)
+        lineage = f"{source_binding.get('stage')}_layout_child"
+    else:
+        if source_row_binding is not None:
+            raise ValueError("canonical layout child unexpectedly has an upstream manifest row")
+        upstream_manifest_sha256 = None
+        lineage = "canonical_parent_layout_child"
     parent_code = _nested(parent, "reward_model.ground_truth")
     entry_point = _nested(parent, "extra_info.entry_point", "Model")
     if not isinstance(parent_code, str) or not isinstance(entry_point, str):
@@ -872,7 +916,7 @@ def _make_child(
     child_uuid = (
         "layout_"
         + _sha256_bytes(
-            f"{CONTRACT_VERSION}:{eligible.parent_uuid}:{eligible.parent_reference_sha256}:{intervention_sha256}".encode()
+            f"{solver_contract}:{eligible.parent_uuid}:{eligible.parent_reference_sha256}:{intervention_sha256}".encode()
         )[:24]
     )
     child["reward_model"] = dict(child["reward_model"])
@@ -897,8 +941,8 @@ def _make_child(
     )
     extra["v4"] = v4
     extra["augmentation"] = {
-        "contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "contract_version": solver_contract,
+        "generator_version": solver_generator,
         "parent_uuid": eligible.parent_uuid,
         "child_uuid": child_uuid,
         "source_artifact_sha256": source_sha256,
@@ -975,8 +1019,8 @@ def _make_child(
             "augment_prompt_tasks_dependency": dependency_sha256,
         },
         "ast_hashes": {"parent": eligible.parent_normalized_ast_sha256, "child": child_ast_sha256},
-        "generator_contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "generator_contract_version": solver_contract,
+        "generator_version": solver_generator,
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -995,6 +1039,10 @@ def _make_child(
         "materialization_status": "review_only",
         "training_approved": False,
     }
+    if source_binding is not None:
+        manifest["source_binding"] = dict(source_binding)
+        manifest["upstream_serial_manifest_row_sha256"] = upstream_manifest_sha256
+        manifest["lineage"] = lineage
     return child, manifest
 
 
@@ -1029,21 +1077,38 @@ def _review_markdown(samples: Sequence[tuple[Mapping[str, Any], Mapping[str, Any
     return "\n".join(lines).rstrip() + "\n"
 
 
-def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: bool) -> dict[str, Any]:
-    if sys.version_info[:2] != (3, 12):
-        raise RuntimeError("layout generation requires Python 3.12 for source-bound ast.unparse")
+def build_lane(
+    input_path: Path,
+    output_dir: Path,
+    *,
+    limit: int,
+    overwrite: bool,
+    serial_source_manifest: Path | None = None,
+    excluded_source_rows: frozenset[int] = frozenset(),
+) -> dict[str, Any]:
     if type(limit) is not int or not 1 <= limit <= MAX_AUTHORIZED_CANDIDATES:
         raise ValueError(f"limit must be an integer in [1, {MAX_AUTHORIZED_CANDIDATES}]")
-    if input_path.resolve() != _CANONICAL_PARENT.resolve():
-        raise ValueError(f"input must be canonical parent:{_CANONICAL_PARENT}")
+    serial_mode = serial_source_manifest is not None
+    if not serial_mode and input_path.resolve() != _CANONICAL_PARENT.resolve():
+        raise ValueError(f"input must be canonical parent unless a serial manifest is supplied:{_CANONICAL_PARENT}")
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
     source_sha256 = _sha256_file(input_path)
     parquet = pq.ParquetFile(input_path)
-    if source_sha256 != EXPECTED_CANONICAL_PARENT_SHA256:
-        raise ValueError(f"canonical_parent_sha_mismatch:{source_sha256}")
-    if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
-        raise ValueError(f"canonical_parent_row_mismatch:{parquet.metadata.num_rows}")
+    if serial_mode:
+        assert serial_source_manifest is not None
+        source_binding, source_row_bindings = verify_serial_source(
+            input_path, serial_source_manifest, expected_stage="dtype_fallback_base"
+        )
+    else:
+        source_binding = None
+        source_row_bindings = None
+        if source_sha256 != EXPECTED_CANONICAL_PARENT_SHA256:
+            raise ValueError(f"canonical_parent_sha_mismatch:{source_sha256}")
+        if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
+            raise ValueError(f"canonical_parent_row_mismatch:{parquet.metadata.num_rows}")
+    if any(type(index) is not int or not 0 <= index < parquet.metadata.num_rows for index in excluded_source_rows):
+        raise ValueError("excluded_source_row_index_out_of_bounds")
     paths = {
         key: output_dir / name
         for key, name in {
@@ -1065,9 +1130,10 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
     generator_sha256 = _sha256_file(generator_path)
     dependency_sha256 = _sha256_file(dependency_path)
     git_commit = _git_commit()
-    for path, digest in ((generator_path, generator_sha256), (dependency_path, dependency_sha256)):
-        if _git_blob_sha256(git_commit, path) != digest:
-            raise RuntimeError(f"source differs from Git commit {git_commit}:{path}")
+    if not serial_mode:
+        for path, digest in ((generator_path, generator_sha256), (dependency_path, dependency_sha256)):
+            if _git_blob_sha256(git_commit, path) != digest:
+                raise RuntimeError(f"source differs from Git commit {git_commit}:{path}")
     eligible: list[EligibleParent] = []
     decisions: list[dict[str, Any]] = []
     skip_counts: collections.Counter[str] = collections.Counter()
@@ -1086,6 +1152,18 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
                         "eligible_families": [],
                         "assigned_family": None,
                         "reason": reason,
+                    }
+                )
+            elif row_index in excluded_source_rows:
+                decisions.append(
+                    {
+                        "source_row_index": row_index,
+                        "parent_uuid": item.parent_uuid,
+                        "eligible": True,
+                        "selected": False,
+                        "eligible_families": list(item.eligible_families),
+                        "assigned_family": item.assigned_family,
+                        "reason": "excluded_by_prior_serial_layout_batch",
                     }
                 )
             else:
@@ -1118,6 +1196,8 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
     selected_by_row = {item.source_row_index: item for item in selected}
     for decision in decisions:
         if decision["eligible"]:
+            if decision["reason"] == "excluded_by_prior_serial_layout_batch":
+                continue
             decision["selected"] = decision["source_row_index"] in selected_by_row
             if not decision["selected"]:
                 decision["reason"] = "eligible_not_selected_by_limit"
@@ -1139,10 +1219,13 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
                     generator_sha256,
                     dependency_sha256,
                     git_commit,
+                    source_binding=source_binding,
+                    source_row_binding=(source_row_bindings[row_index] if source_row_bindings is not None else None),
                 )
                 parent = copy.deepcopy(row)
-                parent["extra_info"] = dict(parent["extra_info"])
-                parent["extra_info"]["augmentation"] = None
+                if not serial_mode:
+                    parent["extra_info"] = dict(parent["extra_info"])
+                    parent["extra_info"]["augmentation"] = None
                 manifest["candidate_row_index"] = len(children)
                 parents.append(parent)
                 children.append(child)
@@ -1169,13 +1252,15 @@ def build_lane(input_path: Path, output_dir: Path, *, limit: int, overwrite: boo
         return dict(sorted(collections.Counter(str(getattr(item, attribute)) for item in items).items()))
 
     summary = {
-        "contract_version": CONTRACT_VERSION,
-        "generator_version": GENERATOR_VERSION,
+        "contract_version": SERIAL_CONTRACT_VERSION if serial_mode else CONTRACT_VERSION,
+        "generator_version": SERIAL_GENERATOR_VERSION if serial_mode else GENERATOR_VERSION,
         "assignment_version": ASSIGNMENT_VERSION,
         "selection_version": SELECTION_VERSION,
         "input": str(input_path.resolve()),
         "input_sha256": source_sha256,
         "input_rows": parquet.metadata.num_rows,
+        "source_binding": source_binding,
+        "excluded_source_rows": len(excluded_source_rows),
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -1220,13 +1305,32 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("input", type=Path)
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--limit", type=int, required=True, help="Canary size in [1, 5000]")
+    parser.add_argument("--serial-source-manifest", type=Path)
+    parser.add_argument("--exclude-source-row-file", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
-    print(json.dumps(build_lane(args.input, args.output_dir, limit=args.limit, overwrite=args.overwrite), indent=2))
+    excluded_source_rows = frozenset()
+    if args.exclude_source_row_file is not None:
+        excluded_source_rows = frozenset(
+            int(line) for line in args.exclude_source_row_file.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
+    print(
+        json.dumps(
+            build_lane(
+                args.input,
+                args.output_dir,
+                limit=args.limit,
+                overwrite=args.overwrite,
+                serial_source_manifest=args.serial_source_manifest,
+                excluded_source_rows=excluded_source_rows,
+            ),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

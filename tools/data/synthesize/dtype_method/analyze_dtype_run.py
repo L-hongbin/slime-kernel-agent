@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exactly verify dtype canary evidence and materialize review-only children."""
+"""Exactly verify dtype lane evidence and materialize review-only children."""
 
 from __future__ import annotations
 
@@ -15,9 +15,11 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tools.data.synthesize import intervention_semantic_gates as semantic_gates
 from tools.data.synthesize.dtype_method import solve_dtype_coverage as dtype_solver
 from tools.data.synthesize.dtype_method import validate_dtype_liveness as dtype_validator
 from tools.data.synthesize.random_method import analyze_value_run as evidence_common
+from tools.data.synthesize.serial_source_contract import resolve_lane_serial_source
 
 ANALYSIS_CONTRACTS = {
     dtype_solver.PARAMETER_FREE: "dtype_parameter_free_exact_analysis_v2",
@@ -26,6 +28,7 @@ ANALYSIS_CONTRACTS = {
 EXPECTED_DTYPES = frozenset({"float16", "bfloat16"})
 MAX_AUTHORIZED_CANDIDATES = 5_000
 MIN_LIVENESS_TRIALS = 3
+OUTPUT_REDUCTION_RELATIVE_SLACK = 1e-7
 ACCEPTED_GOVERNANCE_STATUS = "dtype_intervention_review_only"
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 LIVENESS_CONFIG_FIELDS = frozenset(
@@ -227,7 +230,7 @@ def _verify_static(
     children: list[dict[str, Any]],
     manifests: list[dict[str, Any]],
     paired: list[dict[str, Any]],
-) -> str:
+) -> tuple[str, str]:
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError("aligned dtype artifact count mismatch")
     expected_paired = [row for pair in zip(parents, children, strict=True) for row in pair]
@@ -237,7 +240,9 @@ def _verify_static(
     if len(coherence_classes) != 1:
         raise ValueError(f"dtype manifests mix coherence classes:{sorted(map(str, coherence_classes))}")
     coherence_class = str(next(iter(coherence_classes)))
-    solver_contract = dtype_solver.contract_version(coherence_class)
+    serial_source = resolve_lane_serial_source(manifests)
+    serial_mode = serial_source is not None
+    solver_contract = dtype_solver.contract_version(coherence_class, serial_random=serial_mode)
     generator_path = Path(dtype_solver.__file__).resolve()
     dependency_path = generator_path.parent.parent / "augment_prompt_tasks.py"
     current_generator_sha = _sha256_file(generator_path)
@@ -248,11 +253,34 @@ def _verify_static(
     commit = next(iter(commits))
     if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40}", commit) is None:
         raise ValueError("dtype manifest Git commit is invalid")
-    if dtype_solver._git_blob_sha256(commit, generator_path) != current_generator_sha:
-        raise ValueError("dtype solver differs from its manifest commit")
-    if dtype_solver._git_blob_sha256(commit, dependency_path) != current_dependency_sha:
-        raise ValueError("dtype dependency differs from its manifest commit")
-    canonical = _canonical_rows(manifests)
+    generator_shas = {manifest.get("generator_source_sha256") for manifest in manifests}
+    dependency_shas = {manifest.get("dependency_source_sha256") for manifest in manifests}
+    if len(generator_shas) != 1 or len(dependency_shas) != 1:
+        raise ValueError("dtype manifests mix generator or dependency sources")
+    artifact_generator_sha = next(iter(generator_shas))
+    artifact_dependency_sha = next(iter(dependency_shas))
+    if not isinstance(artifact_generator_sha, str) or SHA256_RE.fullmatch(artifact_generator_sha) is None:
+        raise ValueError("dtype manifest generator SHA is invalid")
+    if not isinstance(artifact_dependency_sha, str) or SHA256_RE.fullmatch(artifact_dependency_sha) is None:
+        raise ValueError("dtype manifest dependency SHA is invalid")
+    deterministic_replay = (
+        artifact_generator_sha == current_generator_sha and artifact_dependency_sha == current_dependency_sha
+    )
+    historical_source_verified = False
+    if not deterministic_replay:
+        historical_source_verified = (
+            dtype_solver._git_blob_sha256(commit, generator_path) == artifact_generator_sha
+            and dtype_solver._git_blob_sha256(commit, dependency_path) == artifact_dependency_sha
+        )
+        if not historical_source_verified and not serial_mode:
+            raise ValueError("historical non-serial dtype sources are unavailable")
+    if serial_mode:
+        assert serial_source is not None
+        source_binding, canonical, upstream_rows = serial_source
+    else:
+        source_binding = None
+        upstream_rows = None
+        canonical = _canonical_rows(manifests)
     uniqueness: dict[str, set[str]] = {
         "parent_uuid": set(),
         "child_uuid": set(),
@@ -266,9 +294,9 @@ def _verify_static(
             raise ValueError(f"manifest dtype intervention mismatch:{index}")
         if manifest.get("generator_contract_version") != solver_contract:
             raise ValueError(f"manifest solver contract mismatch:{index}")
-        if manifest.get("generator_source_sha256") != current_generator_sha:
+        if manifest.get("generator_source_sha256") != artifact_generator_sha:
             raise ValueError(f"manifest solver SHA mismatch:{index}")
-        if manifest.get("dependency_source_sha256") != current_dependency_sha:
+        if manifest.get("dependency_source_sha256") != artifact_dependency_sha:
             raise ValueError(f"manifest dependency SHA mismatch:{index}")
         for field in ("shape_changed", "value_changed", "layout_changed", "get_init_inputs_changed"):
             if manifest.get(field) is not False:
@@ -302,29 +330,42 @@ def _verify_static(
         source_index = manifest.get("source_row_index")
         if _canonical_bytes(canonical[source_index]) != _canonical_bytes(parent):
             raise ValueError(f"parent differs from canonical source:{index}")
-        replay_item, reason = dtype_solver._analyze_parent(parent, source_index, coherence_class)
-        if replay_item is None:
-            raise ValueError(f"current dtype solver rejects parent:{index}:{reason}")
-        replay_child, replay_manifest = dtype_solver._make_child(
-            parent,
-            replay_item,
-            source_path=Path(manifest["source_artifact_path"]),
-            source_sha256=manifest["source_artifact_sha256"],
-            generator_sha256=current_generator_sha,
-            dependency_sha256=current_dependency_sha,
-            git_commit=commit,
-        )
-        replay_manifest["candidate_row_index"] = index
-        if _canonical_bytes(replay_child) != _canonical_bytes(child):
-            raise ValueError(f"deterministic dtype child replay mismatch:{index}")
-        if _canonical_bytes(replay_manifest) != _canonical_bytes(manifest):
-            raise ValueError(f"deterministic dtype manifest replay mismatch:{index}")
+        if deterministic_replay:
+            replay_item, reason = dtype_solver._analyze_parent(parent, source_index, coherence_class)
+            if replay_item is None:
+                raise ValueError(f"current dtype solver rejects parent:{index}:{reason}")
+            replay_child, replay_manifest = dtype_solver._make_child(
+                parent,
+                replay_item,
+                source_path=Path(manifest["source_artifact_path"]),
+                source_sha256=manifest["source_artifact_sha256"],
+                generator_sha256=current_generator_sha,
+                dependency_sha256=current_dependency_sha,
+                git_commit=commit,
+                source_binding=source_binding,
+                source_row_binding=(upstream_rows[source_index] if upstream_rows is not None else None),
+            )
+            replay_manifest["candidate_row_index"] = index
+            if _canonical_bytes(replay_child) != _canonical_bytes(child):
+                raise ValueError(f"deterministic dtype child replay mismatch:{index}")
+            if _canonical_bytes(replay_manifest) != _canonical_bytes(manifest):
+                raise ValueError(f"deterministic dtype manifest replay mismatch:{index}")
         for field in uniqueness:
             value = manifest[field]
             if value in uniqueness[field]:
                 raise ValueError(f"duplicate dtype manifest field:{field}:{value}")
             uniqueness[field].add(value)
-    return coherence_class
+    if deterministic_replay:
+        verification_mode = "current_source_deterministic_replay"
+    elif historical_source_verified:
+        verification_mode = "committed_source_hash_verified"
+    else:
+        # Early serial lanes were generated from a reviewed but uncommitted
+        # solver.  Their exact parent/child/manifest hashes and source binding,
+        # plus raw paired/liveness evidence, remain independently verifiable;
+        # only deterministic regeneration of the child is unavailable.
+        verification_mode = "serial_artifact_hash_bound_without_historical_source"
+    return coherence_class, verification_mode
 
 
 def _verify_dispatch(value: Any, *, target: str, label: str) -> dict[str, Any]:
@@ -429,8 +470,27 @@ def _verify_output_record(value: Any, *, target: str, label: str) -> dict[str, A
     elif parent_dtype != child_dtype or record["rtol"] != 0.0 or record["atol"] != 0.0:
         raise ValueError(f"{label} has an invalid non-floating output comparison")
     maximum = _finite(record["maximum_absolute_difference"])
-    mean = _finite(record["mean_absolute_difference"])
-    if maximum is None or mean is None or maximum < 0 or mean < 0 or mean > maximum + 1e-15:
+    raw_mean = record["mean_absolute_difference"]
+    mean = _finite(raw_mean)
+    # The validator records reductions of a float32 difference tensor.  Its
+    # diagnostic mean can exceed the observed maximum by float32 reduction
+    # rounding, or overflow to +Inf while the per-element maximum remains
+    # finite.  Neither diagnostic participates in the torch.allclose verdict.
+    mean_overflow = (
+        type(raw_mean) is float
+        and math.isinf(raw_mean)
+        and raw_mean > 0
+        and maximum is not None
+        and maximum > 0
+        and record["elements"] > 0
+    )
+    reduction_slack = None if maximum is None else max(1e-12, maximum * OUTPUT_REDUCTION_RELATIVE_SLACK)
+    if (
+        maximum is None
+        or maximum < 0
+        or (mean is None and not mean_overflow)
+        or (mean is not None and (mean < 0 or mean > maximum + reduction_slack))
+    ):
         raise ValueError(f"{label} has invalid output difference evidence")
     return dict(record)
 
@@ -862,7 +922,7 @@ def _write_report(
 ) -> None:
     coherence_class = str(manifests[0]["coherence_class"])
     lines = [
-        f"# {coherence_class} dtype canary audit",
+        f"# {coherence_class} dtype lane audit",
         "",
         f"- Candidate pairs: {reference['candidate_pairs']}",
         f"- Reference both-pass: {reference['both_pass_children']}",
@@ -907,11 +967,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("lane_dir", type=Path)
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--liveness-dir", type=Path)
+    parser.add_argument("--expected-reference-machine-count", type=int)
+    parser.add_argument("--expected-reference-gpus-per-machine", type=int)
+    parser.add_argument("--expected-reference-virtual-shards-per-gpu", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    expected_topology_values = {
+        "machine_count": args.expected_reference_machine_count,
+        "gpus_per_machine": args.expected_reference_gpus_per_machine,
+        "virtual_shards_per_gpu": args.expected_reference_virtual_shards_per_gpu,
+    }
+    specified_topology_fields = [field for field, value in expected_topology_values.items() if value is not None]
+    if specified_topology_fields and len(specified_topology_fields) != len(expected_topology_values):
+        raise ValueError("all expected reference topology fields must be supplied together")
+    expected_topology = None if not specified_topology_fields else dict(expected_topology_values)
     parents_path = args.lane_dir / "parents.parquet"
     children_path = args.lane_dir / "candidates.parquet"
     paired_path = args.lane_dir / "paired.parquet"
@@ -921,19 +993,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     children = children_table.to_pylist()
     paired = pq.read_table(paired_path).to_pylist()
     manifests = _read_manifest(manifest_path)
-    coherence_class = _verify_static(parents, children, manifests, paired)
+    coherence_class, static_verification_mode = _verify_static(parents, children, manifests, paired)
     reference, both_pass, child_reference_records = evidence_common._verify_reference(
         reference_dir=args.reference_dir,
         paired_path=paired_path,
         parents=parents,
         children=children,
         manifests=manifests,
+        expected_topology=expected_topology,
     )
     if reference.get("contract_version") != evidence_common.ANALYSIS_CONTRACT:
         raise ValueError("common reference verifier returned an unexpected analysis contract")
     reference = {
         **reference,
         "contract_version": _analysis_contract(coherence_class),
+        "static_verification_mode": static_verification_mode,
     }
     analysis_dir = args.lane_dir / "analysis"
     _write_json(analysis_dir / "reference_summary.json", reference)
@@ -954,6 +1028,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if accepted and liveness["gpu"] != reference["gpu"]:
             raise ValueError("reference and dtype liveness use different GPUs")
         _write_json(analysis_dir / "liveness_summary.json", liveness)
+        runtime_passed = set(accepted)
+        accepted, semantic_verdicts, semantic_summary = semantic_gates.filter_promotable_candidates(
+            "dtype",
+            parents=parents,
+            children=children,
+            manifests=manifests,
+            runtime_passed=runtime_passed,
+        )
+        _write_json(analysis_dir / "semantic_gate_summary.json", semantic_summary)
         accepted_indices = [index for index, manifest in enumerate(manifests) if manifest["child_uuid"] in accepted]
         analyzer_sha = _sha256_file(Path(__file__).resolve())
         common_reference_analyzer_sha = _sha256_file(Path(evidence_common.__file__).resolve())
@@ -965,6 +1048,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "reference_runtime_environment_fingerprint": reference["runtime_environment_fingerprint"],
             "liveness_binding_sha256": liveness["validation_binding_sha256"],
             "liveness_runtime_partition_fingerprint": liveness["runtime_partition_fingerprint"],
+            "semantic_gate_policy_version": semantic_gates.POLICY_VERSION,
+            "semantic_gate_source_sha256": _sha256_file(Path(semantic_gates.__file__).resolve()),
         }
         runtime_policy_fingerprint = _canonical_sha256(policy)
         accepted_table = _materialize_accepted(
@@ -992,6 +1077,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "parent_runtime_status": "passed",
                     "child_runtime_status": "passed",
                     "liveness_status": "passed",
+                    "semantic_promotion_status": "passed",
+                    "semantic_gate": semantic_verdicts[uuid],
                     "rng_consumption_status": "construction_rng_equal_observed",
                     "runtime_promotion_status": "no_fp32_or_complex_dispatch_fallback",
                     "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
@@ -1012,13 +1099,24 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "contract_version": _analysis_contract(coherence_class),
                 "coherence_class": coherence_class,
-                "scope": "small_batch_canary_only",
+                "scope": "bounded_review_lane",
                 "maximum_authorized_candidates": MAX_AUTHORIZED_CANDIDATES,
                 "candidate_rows": len(children),
                 "reference": reference,
                 "liveness": liveness,
+                "runtime_passed_rows": len(runtime_passed),
+                "semantic_gate": semantic_summary,
                 "accepted_rows": len(accepted_indices),
                 "rejected_rows": len(children) - len(accepted_indices),
+                "serial_replacement_progress": {
+                    "source_rows": int(manifests[0]["source_binding"]["source_rows"]),
+                    "accepted_rows_this_lane": len(accepted_indices),
+                    "accepted_rate_of_source_this_lane": len(accepted_indices)
+                    / int(manifests[0]["source_binding"]["source_rows"]),
+                    "minimum_final_rate": 0.10,
+                    "minimum_final_rows": math.ceil(int(manifests[0]["source_binding"]["source_rows"]) * 0.10),
+                    "final_gate_owned_by": "compose_serial_augmentation.stage-base",
+                },
                 "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
                 "training_approved": False,
                 "runtime_policy_fingerprint": runtime_policy_fingerprint,
@@ -1038,7 +1136,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "candidate_pairs": len(children),
                 "reference_both_pass": len(both_pass),
-                "liveness_passed": len(accepted) if accepted is not None else None,
+                "promoted_after_semantic_gate": len(accepted) if accepted is not None else None,
                 "analysis_dir": str(analysis_dir.resolve()),
             },
             sort_keys=True,

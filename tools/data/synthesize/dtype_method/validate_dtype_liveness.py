@@ -43,6 +43,7 @@ from tools.data.cleaning.runtime_validation import (
     _snapshot_rng_states,
     _to_device,
 )
+from tools.data.synthesize.serial_source_contract import resolve_lane_serial_source
 from tools.data.synthesize.validate_train_mode_contract import _cuda_memory_guard, _CudaMemoryGuardFailure
 
 PARAMETER_FREE = "parameter_free"
@@ -986,6 +987,13 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
     manifests = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError(f"aligned artifact count mismatch:{len(parents)}:{len(children)}:{len(manifests)}")
+    serial_source = resolve_lane_serial_source(manifests)
+    if serial_source is not None:
+        _, source_rows, _ = serial_source
+        for index, (parent, manifest) in enumerate(zip(parents, manifests, strict=True)):
+            source_index = manifest.get("source_row_index")
+            if _canonical_sha256(parent) != _canonical_sha256(source_rows[source_index]):
+                raise ValueError(f"serial dtype parent differs from its source row:{index}")
     tasks: list[dict[str, Any]] = []
     for index, (parent, child, manifest) in enumerate(zip(parents, children, manifests, strict=True)):
         parent_uuid = _nested(parent, "extra_info.uuid")

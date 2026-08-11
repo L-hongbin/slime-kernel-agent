@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail-closed raw-input liveness validation for layout canary children.
+"""Fail-closed raw-input liveness validation for layout children.
 
 Unlike the generic runtime helper this validator intentionally never clones a
 forward input.  Cloning makes a contiguous, offset-zero tensor and would turn
@@ -40,9 +40,10 @@ from tools.data.cleaning.runtime_validation import (  # noqa: E402
     _snapshot_rng_states,
     _to_device,
 )
+from tools.data.synthesize.serial_source_contract import resolve_lane_serial_source  # noqa: E402
 from tools.data.synthesize.validate_train_mode_contract import (  # noqa: E402
-    _CudaMemoryGuardFailure,
     _cuda_memory_guard,
+    _CudaMemoryGuardFailure,
 )
 
 CONTRACT_VERSION = "layout_raw_runtime_liveness_v1"
@@ -1069,7 +1070,13 @@ def _rows(path: Path) -> list[dict[str, Any]]:
     return pq.read_table(path).to_pylist()
 
 
-def _validate_canonical_source_binding(manifests: Sequence[Mapping[str, Any]]) -> None:
+def _validate_source_binding(
+    manifests: Sequence[Mapping[str, Any]],
+) -> tuple[dict[int, dict[str, Any]] | None, int, str]:
+    serial_source = resolve_lane_serial_source(manifests)
+    if serial_source is not None:
+        binding, rows, _ = serial_source
+        return rows, int(binding["source_rows"]), str(binding["source_artifact_sha256"])
     paths = {item.get("source_artifact_path") for item in manifests}
     if len(paths) != 1 or not isinstance(next(iter(paths)), str):
         raise ValueError("manifest canonical source path is not unique")
@@ -1080,6 +1087,7 @@ def _validate_canonical_source_binding(manifests: Sequence[Mapping[str, Any]]) -
         raise ValueError("canonical source row count mismatch")
     if _sha256_file(source) != EXPECTED_CANONICAL_PARENT_SHA256:
         raise ValueError("canonical source SHA-256 mismatch")
+    return None, EXPECTED_CANONICAL_PARENT_ROWS, EXPECTED_CANONICAL_PARENT_SHA256
 
 
 def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list[dict[str, Any]]:
@@ -1091,7 +1099,7 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
     manifests = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     if not (len(parents) == len(children) == len(manifests)):
         raise ValueError(f"aligned artifact count mismatch:{len(parents)}:{len(children)}:{len(manifests)}")
-    _validate_canonical_source_binding(manifests)
+    serial_rows, source_row_count, source_sha256 = _validate_source_binding(manifests)
     tasks: list[dict[str, Any]] = []
     for index, (parent, child, manifest) in enumerate(zip(parents, children, manifests, strict=True)):
         parent_uuid, child_uuid = _nested(parent, "extra_info.uuid"), _nested(child, "extra_info.uuid")
@@ -1111,21 +1119,23 @@ def _tasks(parents_path: Path, children_path: Path, manifest_path: Path) -> list
             raise ValueError(f"manifest identity mismatch:{index}")
         if manifest.get("manifest_contract_version") != "layout_lane_manifest_v1":
             raise ValueError(f"manifest contract mismatch:{index}")
-        if manifest.get("source_artifact_sha256") != EXPECTED_CANONICAL_PARENT_SHA256 or not isinstance(
-            source_hashes, Mapping
-        ):
-            raise ValueError(f"manifest canonical source SHA mismatch:{index}")
+        if manifest.get("source_artifact_sha256") != source_sha256 or not isinstance(source_hashes, Mapping):
+            raise ValueError(f"manifest source SHA mismatch:{index}")
         if (
-            source_hashes.get("canonical_parent_artifact") != EXPECTED_CANONICAL_PARENT_SHA256
+            source_hashes.get("canonical_parent_artifact") != source_sha256
             or source_hashes.get("parent_reference") != manifest.get("parent_reference_sha256")
             or source_hashes.get("child_reference") != manifest.get("child_reference_sha256")
         ):
             raise ValueError(f"manifest source-hash identity mismatch:{index}")
         if (
             not isinstance(manifest.get("source_row_index"), int)
-            or not 0 <= manifest["source_row_index"] < EXPECTED_CANONICAL_PARENT_ROWS
+            or not 0 <= manifest["source_row_index"] < source_row_count
         ):
-            raise ValueError(f"manifest canonical row identity mismatch:{index}")
+            raise ValueError(f"manifest source row identity mismatch:{index}")
+        if serial_rows is not None and _canonical_sha256(parent) != _canonical_sha256(
+            serial_rows[manifest["source_row_index"]]
+        ):
+            raise ValueError(f"serial layout parent differs from its source row:{index}")
         if manifest.get("primary_intervention") != "layout" or family not in LAYOUT_FAMILIES:
             raise ValueError(f"manifest layout family mismatch:{index}:{family}")
         if (

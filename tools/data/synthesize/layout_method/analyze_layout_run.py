@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit source-bound layout canary evidence and materialize review-only rows."""
+"""Audit source-bound layout lane evidence and materialize review-only rows."""
 
 from __future__ import annotations
 
@@ -18,9 +18,11 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tools.data.synthesize import intervention_semantic_gates as semantic_gates
 from tools.data.synthesize.layout_method import solve_layout_coverage as solver
 from tools.data.synthesize.layout_method import validate_layout_liveness as validator
 from tools.data.synthesize.random_method import analyze_value_run as evidence_common
+from tools.data.synthesize.serial_source_contract import resolve_lane_serial_source
 
 MAX_AUTHORIZED_CANDIDATES = 5_000
 FAMILIES = frozenset(solver.LAYOUT_FAMILIES)
@@ -207,7 +209,17 @@ def _verify_static(
         paired
     ):
         raise ValueError("paired parquet is not exact parent/child interleave")
-    canonical = _canonical_source(manifests)
+    serial_source = resolve_lane_serial_source(manifests)
+    serial_mode = serial_source is not None
+    if serial_mode:
+        assert serial_source is not None
+        source_binding, canonical, upstream_rows = serial_source
+        solver_contract = solver.SERIAL_CONTRACT_VERSION
+    else:
+        source_binding = None
+        upstream_rows = None
+        solver_contract = solver.CONTRACT_VERSION
+        canonical = _canonical_source(manifests)
     generator_path = Path(solver.__file__).resolve()
     dependency_path = generator_path.parent.parent / "augment_prompt_tasks.py"
     source_paths = {
@@ -229,9 +241,10 @@ def _verify_static(
     ):
         raise ValueError("manifests do not bind one valid Git commit")
     commit = str(next(iter(commits)))
-    for label, path in source_paths.items():
-        if solver._git_blob_sha256(commit, path) != source_sha256[label]:
-            raise ValueError(f"current {label} source differs from manifest Git commit")
+    if not serial_mode:
+        for label, path in source_paths.items():
+            if solver._git_blob_sha256(commit, path) != source_sha256[label]:
+                raise ValueError(f"current {label} source differs from manifest Git commit")
     seen: dict[str, set[str]] = {
         key: set() for key in ("parent_uuid", "child_uuid", "child_reference_sha256", "child_normalized_ast_sha256")
     }
@@ -291,7 +304,7 @@ def _verify_static(
         if manifest.get("static_status") != "passed" or manifest.get("training_approved") is not False:
             raise ValueError(f"static/training status mismatch:{index}")
         if (
-            manifest.get("generator_contract_version") != solver.CONTRACT_VERSION
+            manifest.get("generator_contract_version") != solver_contract
             or manifest.get("generator_source_sha256") != generator_sha
             or manifest.get("dependency_source_sha256") != dependency_sha
             or manifest.get("git_commit") != commit
@@ -338,6 +351,8 @@ def _verify_static(
             generator_sha,
             dependency_sha,
             commit,
+            source_binding=source_binding,
+            source_row_binding=(upstream_rows[source_index] if upstream_rows is not None else None),
         )
         replay_manifest["candidate_row_index"] = index
         if _canonical_bytes(replay_child) != _canonical_bytes(child) or _canonical_bytes(
@@ -541,6 +556,7 @@ def _verify_liveness(
     position = {uuid: index for index, uuid in enumerate(selected)}
     records: dict[str, dict[str, Any]] = {}
     passed: set[str] = set()
+    raw_statuses: collections.Counter[str] = collections.Counter()
     statuses: collections.Counter[str] = collections.Counter()
     reasons: collections.Counter[str] = collections.Counter()
     family_status: collections.Counter[tuple[str, str]] = collections.Counter()
@@ -603,8 +619,7 @@ def _verify_liveness(
         ):
             raise ValueError(f"liveness manifest identity mismatch:{uuid}")
         status = str(record.get("status"))
-        statuses[status] += 1
-        family_status[(family, status)] += 1
+        raw_statuses[status] += 1
         if record["passed"]:
             if (
                 status != "passed"
@@ -621,12 +636,31 @@ def _verify_liveness(
             trials = record.get("trials")
             if not isinstance(trials, list) or len(trials) != config["trials"]:
                 raise ValueError(f"liveness trial count mismatch:{uuid}")
-            for ordinal, trial in enumerate(trials):
-                observations[family] += _verify_trial(trial, manifest, ordinal, config, f"{uuid}.trials[{ordinal}]")
-            passed.add(uuid)
+            record_observations = 0
+            try:
+                for ordinal, trial in enumerate(trials):
+                    record_observations += _verify_trial(trial, manifest, ordinal, config, f"{uuid}.trials[{ordinal}]")
+            except ValueError as error:
+                # A runtime driver verdict is necessary but not sufficient for
+                # materialization.  The analyzer independently replays the
+                # exact layout proof and conservatively rejects a row when the
+                # recorded evidence does not satisfy that proof.  Keep the raw
+                # record immutable and make the downgrade explicit in the
+                # effective status and failure-reason summaries.
+                effective_status = "analyzer_proof_rejected"
+                statuses[effective_status] += 1
+                family_status[(family, effective_status)] += 1
+                reasons[f"AnalyzerProofRejected:{error}"] += 1
+            else:
+                statuses[status] += 1
+                family_status[(family, status)] += 1
+                observations[family] += record_observations
+                passed.add(uuid)
         elif status == "passed":
             raise ValueError(f"failed row has passed status:{uuid}")
         else:
+            statuses[status] += 1
+            family_status[(family, status)] += 1
             reasons[str(record.get("reason"))] += 1
         records[uuid] = record
     if set(records) != both_pass or len(bindings) != 1 or len(gpus) > 1 or len(runtime_fingerprints) > 1:
@@ -638,6 +672,7 @@ def _verify_liveness(
             "selected": len(records),
             "passed": len(passed),
             "failed": len(records) - len(passed),
+            "raw_status_counts": dict(sorted(raw_statuses.items())),
             "status_counts": dict(sorted(statuses.items())),
             "family_status_counts": {
                 family: {status: count for (name, status), count in sorted(family_status.items()) if name == family}
@@ -724,7 +759,7 @@ def _report(
     candidate_coverage = reference["candidate_factory_coverage"]
     both_pass_coverage = reference["both_pass_factory_coverage"]
     lines = [
-        "# Layout canary audit",
+        "# Layout lane audit",
         "",
         f"- Candidate pairs: {reference['candidate_pairs']}",
         f"- Paired-reference both-pass: {reference['both_pass_children']}",
@@ -777,6 +812,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("lane_dir", type=Path)
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--liveness-dir", type=Path)
+    parser.add_argument("--expected-reference-machine-count", type=int)
+    parser.add_argument("--expected-reference-gpus-per-machine", type=int)
+    parser.add_argument("--expected-reference-virtual-shards-per-gpu", type=int)
     return parser
 
 
@@ -786,7 +824,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             f"layout exact AST replay requires Python 3.12, found {sys.version_info.major}.{sys.version_info.minor}"
         )
     args = _parser().parse_args(argv)
-    lane = args.lane_dir
+    expected_topology_values = {
+        "machine_count": args.expected_reference_machine_count,
+        "gpus_per_machine": args.expected_reference_gpus_per_machine,
+        "virtual_shards_per_gpu": args.expected_reference_virtual_shards_per_gpu,
+    }
+    specified_topology_fields = [field for field, value in expected_topology_values.items() if value is not None]
+    if specified_topology_fields and len(specified_topology_fields) != len(expected_topology_values):
+        raise ValueError("all expected reference topology fields must be supplied together")
+    expected_topology = None if not specified_topology_fields else dict(expected_topology_values)
+    lane = args.lane_dir.resolve()
+    reference_dir = args.reference_dir.resolve()
+    liveness_dir = args.liveness_dir.resolve() if args.liveness_dir is not None else None
     parents_path, children_path, paired_path, manifest_path = (
         lane / "parents.parquet",
         lane / "candidates.parquet",
@@ -810,11 +859,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     # this in-memory alias keeps its strict paired-runtime contract unchanged.
     reference_manifests = [{**row, "assigned_target": row["assigned_family"]} for row in manifests]
     reference, both_pass, reference_records = evidence_common._verify_reference(
-        reference_dir=args.reference_dir,
+        reference_dir=reference_dir,
         paired_path=paired_path,
         parents=parents,
         children=children,
         manifests=reference_manifests,
+        expected_topology=expected_topology,
     )
     reference = {
         **reference,
@@ -829,19 +879,30 @@ def main(argv: Sequence[str] | None = None) -> None:
     allowlist.write_text("".join(f"{uuid}\n" for uuid in sorted(both_pass)), encoding="utf-8")
     liveness = None
     accepted = None
-    if args.liveness_dir is not None:
+    if liveness_dir is not None:
         liveness, accepted, live_records = _verify_liveness(
-            args.liveness_dir, both_pass, manifests, parents_path, children_path, manifest_path, allowlist
+            liveness_dir, both_pass, manifests, parents_path, children_path, manifest_path, allowlist
         )
         if accepted and liveness["gpu"] != reference["gpu"]:
             raise ValueError("reference and liveness GPU differ")
         _write_json(analysis / "liveness_summary.json", liveness)
+        runtime_passed = set(accepted)
+        accepted, semantic_verdicts, semantic_summary = semantic_gates.filter_promotable_candidates(
+            "layout",
+            parents=parents,
+            children=children,
+            manifests=manifests,
+            runtime_passed=runtime_passed,
+        )
+        _write_json(analysis / "semantic_gate_summary.json", semantic_summary)
         indices = [index for index, row in enumerate(manifests) if row["child_uuid"] in accepted]
         policy = {
             **source_binding,
             "reference_contract_fingerprint": reference["contract_fingerprint"],
             "liveness_binding_sha256": liveness["validation_binding_sha256"],
             "liveness_runtime_partition_fingerprint": liveness["runtime_partition_fingerprint"],
+            "semantic_gate_policy_version": semantic_gates.POLICY_VERSION,
+            "semantic_gate_source_sha256": _sha256_file(Path(semantic_gates.__file__).resolve()),
         }
         fingerprint = _canonical_sha256(policy)
         accepted_table = _materialize(children_table, indices, fingerprint)
@@ -869,6 +930,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                                 "child_runtime_status": "passed",
                                 "layout_realization_status": "passed",
                                 "liveness_status": "passed",
+                                "semantic_promotion_status": "passed",
+                                "semantic_gate": semantic_verdicts[row["child_uuid"]],
                                 "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
                                 "runtime_policy_fingerprint": fingerprint,
                                 "training_approved": False,
@@ -883,18 +946,29 @@ def main(argv: Sequence[str] | None = None) -> None:
                         )
                         + "\n"
                     )
-        raw = _raw_manifest(lane, [args.reference_dir, args.liveness_dir])
+        raw = _raw_manifest(lane, [reference_dir, liveness_dir])
         _write_json(
             lane / "runtime/final_summary.json",
             {
                 "contract_version": ANALYSIS_CONTRACT,
-                "scope": "small_batch_canary_only",
+                "scope": "bounded_review_lane",
                 "maximum_authorized_candidates": MAX_AUTHORIZED_CANDIDATES,
                 "candidate_rows": len(children),
                 "reference": reference,
                 "liveness": liveness,
+                "runtime_passed_rows": len(runtime_passed),
+                "semantic_gate": semantic_summary,
                 "accepted_rows": len(indices),
                 "rejected_rows": len(children) - len(indices),
+                "serial_replacement_progress": {
+                    "source_rows": int(manifests[0]["source_binding"]["source_rows"]),
+                    "accepted_rows_this_lane": len(indices),
+                    "accepted_rate_of_source_this_lane": len(indices)
+                    / int(manifests[0]["source_binding"]["source_rows"]),
+                    "minimum_final_rate": 0.10,
+                    "minimum_final_rows": math.ceil(int(manifests[0]["source_binding"]["source_rows"]) * 0.10),
+                    "final_gate_owned_by": "compose_serial_augmentation.stage-base",
+                },
                 "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
                 "training_approved": False,
                 "runtime_policy_fingerprint": fingerprint,
@@ -919,7 +993,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "candidate_pairs": len(children),
                 "reference_both_pass": len(both_pass),
-                "liveness_passed": len(accepted) if accepted is not None else None,
+                "promoted_after_semantic_gate": len(accepted) if accepted is not None else None,
                 "analysis_dir": str(analysis.resolve()),
             },
             sort_keys=True,

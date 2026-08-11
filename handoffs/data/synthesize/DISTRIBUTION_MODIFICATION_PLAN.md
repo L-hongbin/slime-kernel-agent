@@ -87,7 +87,7 @@ manifest 必须记录每类 tensor 的实际 dtype、显式 cast 和 runtime pro
 
 2026-08-05 的 parameter-free 1k A800 canary 已完成。本轮使用 deterministic solver，不需要 LLM；1,000 个 candidate 中 830 个 parent/child reference 双通过，638 个再通过三次 dtype/output liveness，accepted 为 BF16 308、FP16 330。
 
-2026-08-06 的 `module_state` coherent 1k A800 canary 也已完成，仍由 solver 构造，不依赖 LLM。child 同时修改 direct FP32 input factory，并在 `Model.__init__` 末尾显式将 registered parameter/buffer 转成 target dtype；三轮 runtime proof 检查 parent-state exact cast、non-floating state、alias、隐藏/未注册 state、构造 RNG、post-forward state 和 FP32/complex dispatch fallback。1,000 个 candidate 中 863 个 reference 双通过，479 个通过 liveness（BF16 218、FP16 261）。两轮结果均为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/DTYPE_CANARY.md`；custom conversion hook、dtype-sensitive constant、动态或未注册 state 仍不在已证明范围内。
+`module_state` coherent lane 仍由 solver 构造，不依赖 LLM。Child 同时修改 direct FP32 input factory，并在 `Model.__init__` 末尾显式将 registered parameter/buffer 转成 target dtype；三轮 runtime proof 检查 parent-state exact cast、non-floating state、alias、隐藏/未注册 state、构造 RNG、post-forward state 和 FP32/complex dispatch fallback。最终方法、验证合同、数据漏斗和边界统一见 `handoffs/data/synthesize/serial_dtype_layout_augmentation.md`；custom conversion hook、dtype-sensitive constant、动态或未注册 state 仍不在已证明范围内。
 
 ### Layout
 
@@ -99,7 +99,7 @@ manifest 必须记录每类 tensor 的实际 dtype、显式 cast 和 runtime pro
 - slice 产生的 stride 和 non-zero storage offset；
 - expand 产生的 zero stride；
 
-1,000 个 candidate 中 851 个 parent/child reference 双通过，584 个再通过三轮 raw-direct layout/output liveness：transpose 262、slice 314、expand 8。Static 和 runtime gate 均保持 logical value、shape、dtype、RNG 与原 factory 求值顺序，并检查实际 stride/offset/zero stride、alias、forward 后 immutability、semantic consumer 和 exact output；unknown dispatch 或 intervention 在 consumer 前被 materialize 均 fail-closed。结果为 review-only、`training_approved=false`，详见 `handoffs/data/synthesize/LAYOUT_CANARY.md`。
+Layout lane 的 static 和 runtime gate 均保持 logical value、shape、dtype、RNG 与原 factory 求值顺序，并检查实际 stride/offset/zero stride、alias、forward 后 immutability、semantic consumer 和 exact output；unknown dispatch 或 intervention 在 consumer 前被 materialize 均 fail-closed。最终方法、验证合同、数据漏斗和边界统一见 `handoffs/data/synthesize/serial_dtype_layout_augmentation.md`。
 
 channels-last 或其他 memory format 仍需逐 operator 证明 memory-format contract，本 canary 未覆盖。后续 runtime gate 仍必须读取实际 size、stride、storage offset 和 contiguity，确认 intervention 没有在进入被测计算前被 `.contiguous()` 或等价 materializer 消除。
 

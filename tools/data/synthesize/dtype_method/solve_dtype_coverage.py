@@ -30,8 +30,8 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-
 from tools.data.cleaning.pipeline import inspect_row_schema
+from tools.data.synthesize import intervention_semantic_gates as semantic_gates
 from tools.data.synthesize.augment_prompt_tasks import (
     AUGMENTATION_METADATA_TYPE,
     AugmentationPolicy,
@@ -50,6 +50,9 @@ from tools.data.synthesize.augment_prompt_tasks import (
     analyze_code,
     transform_code,
 )
+from tools.data.synthesize.serial_random_wrappers import logical_factory_view, recognize_random_wrapper
+from tools.data.synthesize.serial_source_contract import canonical_sha256 as _serial_canonical_sha256
+from tools.data.synthesize.serial_source_contract import verify_serial_source
 
 PARAMETER_FREE = "parameter_free"
 MODULE_STATE = "module_state"
@@ -58,9 +61,17 @@ CONTRACT_VERSIONS = {
     PARAMETER_FREE: "dtype_parameter_free_solver_v2",
     MODULE_STATE: "dtype_module_state_solver_v1",
 }
+SERIAL_CONTRACT_VERSIONS = {
+    PARAMETER_FREE: "dtype_parameter_free_serial_random_solver_v2",
+    MODULE_STATE: "dtype_module_state_serial_random_solver_v2",
+}
 GENERATOR_VERSIONS = {
     PARAMETER_FREE: "all_direct_float_inputs_low_precision_v2",
     MODULE_STATE: "registered_module_state_low_precision_v1",
+}
+SERIAL_GENERATOR_VERSIONS = {
+    PARAMETER_FREE: "frozen_random_wrapper_source_span_low_precision_v2",
+    MODULE_STATE: "frozen_random_wrapper_and_registered_state_source_span_low_precision_v2",
 }
 ASSIGNMENT_VERSION = "stable_parent_hash_single_dtype_v1"
 SELECTION_VERSION = "source_operator_dtype_proportional_largest_remainder_v1"
@@ -181,22 +192,25 @@ class EligibleParent:
     input_bytes_before: int
     input_bytes_after: int
     factory_specs: tuple[tuple[str, tuple[int, ...], str], ...]
+    serial_random_wrapper_count: int
 
     @property
     def stratum(self) -> tuple[str, str, str]:
         return (self.source_family, self.operator_bucket, self.assigned_dtype)
 
 
-def contract_version(coherence_class: str) -> str:
+def contract_version(coherence_class: str, serial_random: bool = False) -> str:
     try:
-        return CONTRACT_VERSIONS[coherence_class]
+        versions = SERIAL_CONTRACT_VERSIONS if serial_random else CONTRACT_VERSIONS
+        return versions[coherence_class]
     except KeyError as exc:
         raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
 
 
-def generator_version(coherence_class: str) -> str:
+def generator_version(coherence_class: str, serial_random: bool = False) -> str:
     try:
-        return GENERATOR_VERSIONS[coherence_class]
+        versions = SERIAL_GENERATOR_VERSIONS if serial_random else GENERATOR_VERSIONS
+        return versions[coherence_class]
     except KeyError as exc:
         raise ValueError(f"unsupported coherence class:{coherence_class}") from exc
 
@@ -528,7 +542,11 @@ def _analyze_parent(
         return None, "invalid_entry_point"
     reference_sha256 = _sha256_bytes(code.encode())
     try:
-        analysis = analyze_code(code, entry_point)
+        logical_view = logical_factory_view(ast.parse(code))
+        if logical_view.random_wrapper_count and len(logical_view.original_roots) != logical_view.random_wrapper_count:
+            return None, "mixed_random_wrappers_and_direct_factories"
+        analysis_code = ast.unparse(logical_view.tree) + "\n" if logical_view.random_wrapper_count else code
+        analysis = analyze_code(analysis_code, entry_point)
     except (SyntaxError, ValueError) as exc:
         return None, f"parent_static_analysis_failed:{type(exc).__name__}:{exc}"
     if not analysis.dtype_transform_eligible:
@@ -579,6 +597,7 @@ def _analyze_parent(
             input_bytes_before=analysis.input_bytes,
             input_bytes_after=input_bytes_after,
             factory_specs=specs,
+            serial_random_wrapper_count=logical_view.random_wrapper_count,
         ),
         "eligible",
     )
@@ -639,8 +658,11 @@ def _extend_schema(schema: pa.Schema) -> pa.Schema:
     if index < 0 or not pa.types.is_struct(schema.field(index).type):
         raise ValueError("canonical schema has no extra_info struct")
     extra = schema.field(index)
-    if extra.type.get_field_index("augmentation") >= 0:
-        raise ValueError("canonical input already has augmentation metadata")
+    augmentation_index = extra.type.get_field_index("augmentation")
+    if augmentation_index >= 0:
+        if extra.type.field(augmentation_index).type != AUGMENTATION_METADATA_TYPE:
+            raise ValueError("input augmentation metadata has an incompatible type")
+        return schema
     fields = list(schema)
     fields[index] = pa.field(
         "extra_info",
@@ -651,15 +673,41 @@ def _extend_schema(schema: pa.Schema) -> pa.Schema:
     return pa.schema(fields, metadata=schema.metadata)
 
 
+def _byte_span(code: str, node: ast.AST) -> tuple[int, int]:
+    if None in (node.lineno, node.col_offset, node.end_lineno, node.end_col_offset):
+        raise ValueError("source_span_is_unavailable")
+    lines = code.encode("utf-8").splitlines(keepends=True)
+    start = sum(len(line) for line in lines[: node.lineno - 1]) + node.col_offset
+    end = sum(len(line) for line in lines[: node.end_lineno - 1]) + node.end_col_offset
+    return start, end
+
+
+def _replace_byte_spans(code: str, replacements: Sequence[tuple[int, int, bytes]]) -> str:
+    raw = code.encode("utf-8")
+    ordered = sorted(replacements, reverse=True)
+    for index, (start, end, replacement) in enumerate(ordered):
+        if not 0 <= start <= end <= len(raw):
+            raise ValueError("source_replacement_span_is_invalid")
+        if index and end > ordered[index - 1][0]:
+            raise ValueError("source_replacement_spans_overlap")
+        raw = raw[:start] + replacement + raw[end:]
+    return raw.decode("utf-8")
+
+
 def _inject_module_conversion(code: str, entry_point: str, target: str) -> str:
     shared_tree = ast.parse(code)
-    child_tree = copy.deepcopy(shared_tree)
-    model = _top_level_class(child_tree, entry_point)
+    model = _top_level_class(shared_tree, entry_point)
     init = next(node for node in model.body if isinstance(node, ast.FunctionDef) and node.name == "__init__")
+    last = init.body[-1]
+    lines = code.encode("utf-8").splitlines(keepends=True)
+    insertion = sum(len(line) for line in lines[: last.end_lineno])
+    body_line = lines[init.body[0].lineno - 1]
+    indentation = body_line[: len(body_line) - len(body_line.lstrip())]
+    statement_text = indentation + f"torch.nn.Module.to(self, dtype=torch.{target})\n".encode()
+    raw = code.encode("utf-8")
+    child_code = (raw[:insertion] + statement_text + raw[insertion:]).decode("utf-8")
+    child_tree = ast.parse(child_code)
     statement = ast.parse(f"torch.nn.Module.to(self, dtype=torch.{target})").body[0]
-    init.body.append(statement)
-    ast.fix_missing_locations(child_tree)
-
     replay_tree = copy.deepcopy(child_tree)
     replay_model = _top_level_class(replay_tree, entry_point)
     replay_init = next(
@@ -670,12 +718,73 @@ def _inject_module_conversion(code: str, entry_point: str, target: str) -> str:
     replay_init.body.pop()
     if ast.dump(replay_tree, include_attributes=False) != ast.dump(shared_tree, include_attributes=False):
         raise ValueError("module_conversion_changed_unapproved_ast")
-    return ast.unparse(child_tree) + "\n"
+    return child_code
+
+
+def _transform_serial_random_dtype(
+    code: str, entry_point: str, target: str, expected: int, coherence_class: str
+) -> tuple[str, int, int]:
+    tree = ast.parse(code)
+    view = logical_factory_view(tree)
+    if view.random_wrapper_count != expected or expected <= 0:
+        raise ValueError(f"serial_random_wrapper_count_mismatch:{view.random_wrapper_count}:{expected}")
+    parent_analysis = analyze_code(ast.unparse(view.tree) + "\n", entry_point)
+    parent_sections = _section_hashes(tree, entry_point)
+    get_inputs = _top_level_function(tree, "get_inputs")
+    source_replacements: list[tuple[int, int, bytes]] = []
+    for node in ast.walk(get_inputs):
+        if not isinstance(node, ast.Call):
+            continue
+        wrapper = recognize_random_wrapper(node)
+        if wrapper is None:
+            continue
+        base = wrapper.base
+        dtype_keywords = [keyword for keyword in base.keywords if keyword.arg == "dtype"]
+        if len(dtype_keywords) > 1:
+            raise ValueError("serial_random_base_has_duplicate_dtype_keyword")
+        if dtype_keywords:
+            if _call_name(dtype_keywords[0].value) not in _FP32_NAMES:
+                raise ValueError("serial_random_base_dtype_is_not_fp32")
+            start, end = _byte_span(code, dtype_keywords[0].value)
+            source_replacements.append((start, end, f"torch.{target}".encode()))
+        else:
+            start, end = _byte_span(code, base)
+            source = code.encode("utf-8")[start:end]
+            if not source.endswith(b")"):
+                raise ValueError("serial_random_base_source_does_not_end_in_parenthesis")
+            prefix = source[:-1]
+            separator = b" " if prefix.rstrip().endswith(b",") else b", "
+            source_replacements.append((start, end, prefix + separator + f"dtype=torch.{target})".encode()))
+    if len(source_replacements) != expected:
+        raise ValueError(f"serial_random_dtype_replacement_count_mismatch:{len(source_replacements)}:{expected}")
+    child_code = _replace_byte_spans(code, source_replacements)
+    child_view = logical_factory_view(ast.parse(child_code))
+    if child_view.random_wrapper_count != expected:
+        raise ValueError("serial_random_wrapper_contract_changed_after_dtype_transform")
+    child_analysis = analyze_code(ast.unparse(child_view.tree) + "\n", entry_point)
+    if _section_hashes(ast.parse(child_code), entry_point) != parent_sections:
+        raise ValueError("model_or_get_init_inputs_changed")
+    if tuple(child_analysis.floating_input_dtypes) not in tuple((name,) for name in _LOW_PRECISION_NAMES[target]):
+        raise ValueError(f"child_input_dtype_not_exact_target:{child_analysis.floating_input_dtypes}")
+    if coherence_class == MODULE_STATE:
+        child_code = _inject_module_conversion(child_code, entry_point, target)
+    elif coherence_class != PARAMETER_FREE:
+        raise ValueError(f"unsupported coherence class:{coherence_class}")
+    return child_code, parent_analysis.input_bytes, child_analysis.input_bytes
 
 
 def _transform_dtype(
     code: str, entry_point: str, target: str, expected: int, coherence_class: str
 ) -> tuple[str, int, int]:
+    view = logical_factory_view(ast.parse(code))
+    if view.random_wrapper_count:
+        return _transform_serial_random_dtype(
+            code,
+            entry_point,
+            target,
+            view.random_wrapper_count,
+            coherence_class,
+        )
     analysis = analyze_code(code, entry_point)
     parent_sections = _section_hashes(analysis.tree, entry_point)
     child_code, child_analysis, metadata = transform_code(
@@ -707,11 +816,26 @@ def _make_child(
     generator_sha256: str,
     dependency_sha256: str,
     git_commit: str,
+    source_binding: Mapping[str, Any] | None = None,
+    source_row_binding: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     child = copy.deepcopy(dict(parent))
     coherence_class = eligible.coherence_class
-    solver_contract = contract_version(coherence_class)
-    solver_generator = generator_version(coherence_class)
+    serial_mode = source_binding is not None
+    solver_contract = contract_version(coherence_class, serial_random=serial_mode)
+    solver_generator = generator_version(coherence_class, serial_random=serial_mode)
+    if serial_mode:
+        if source_row_binding is None:
+            raise ValueError("serial dtype child lacks its upstream manifest row")
+        if source_row_binding.get("row_index") != eligible.source_row_index:
+            raise ValueError("serial dtype upstream row index mismatch")
+        upstream_manifest_sha256 = _serial_canonical_sha256(source_row_binding)
+        lineage = f"{source_binding.get('stage')}_dtype_child"
+    else:
+        if source_row_binding is not None:
+            raise ValueError("canonical dtype child unexpectedly has an upstream manifest row")
+        upstream_manifest_sha256 = None
+        lineage = f"canonical_parent_{coherence_class}_dtype_child"
     parent_code = _nested(parent, "reward_model.ground_truth")
     entry_point = _nested(parent, "extra_info.entry_point", "Model")
     if not isinstance(parent_code, str) or not isinstance(entry_point, str):
@@ -875,10 +999,13 @@ def _make_child(
         "runtime_policy_fingerprint": None,
         "provenance_status": _nested(parent, "extra_info.v4.provenance_status"),
         "licenses": _nested(parent, "extra_info.v4.licenses", []),
-        "lineage": f"canonical_parent_{coherence_class}_dtype_child",
+        "lineage": lineage,
         "row_sha256": _canonical_sha256(child),
         "training_approved": False,
     }
+    if source_binding is not None:
+        manifest["source_binding"] = dict(source_binding)
+        manifest["upstream_serial_manifest_row_sha256"] = upstream_manifest_sha256
     return child, manifest
 
 
@@ -922,19 +1049,32 @@ def build_lane(
     limit: int,
     overwrite: bool,
     coherence_class: str = PARAMETER_FREE,
+    serial_source_manifest: Path | None = None,
+    excluded_source_rows: frozenset[int] = frozenset(),
 ) -> dict[str, Any]:
     if type(limit) is not int or not 1 <= limit <= MAX_AUTHORIZED_CANDIDATES:
         raise ValueError(f"limit must be an integer in [1, {MAX_AUTHORIZED_CANDIDATES}]")
-    solver_contract = contract_version(coherence_class)
-    solver_generator = generator_version(coherence_class)
+    serial_mode = serial_source_manifest is not None
+    solver_contract = contract_version(coherence_class, serial_random=serial_mode)
+    solver_generator = generator_version(coherence_class, serial_random=serial_mode)
     if not input_path.is_file():
         raise FileNotFoundError(input_path)
     source_sha256 = _sha256_file(input_path)
     parquet = pq.ParquetFile(input_path)
-    if source_sha256 != EXPECTED_CANONICAL_PARENT_SHA256:
-        raise ValueError(f"canonical parent SHA mismatch:{source_sha256}")
-    if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
-        raise ValueError(f"canonical parent row mismatch:{parquet.metadata.num_rows}")
+    if serial_mode:
+        assert serial_source_manifest is not None
+        source_binding, source_row_bindings = verify_serial_source(
+            input_path, serial_source_manifest, expected_stage="random_fallback_base"
+        )
+    else:
+        source_binding = None
+        source_row_bindings = None
+        if source_sha256 != EXPECTED_CANONICAL_PARENT_SHA256:
+            raise ValueError(f"canonical parent SHA mismatch:{source_sha256}")
+        if parquet.metadata.num_rows != EXPECTED_CANONICAL_PARENT_ROWS:
+            raise ValueError(f"canonical parent row mismatch:{parquet.metadata.num_rows}")
+    if any(type(index) is not int or not 0 <= index < parquet.metadata.num_rows for index in excluded_source_rows):
+        raise ValueError("excluded source row index is out of bounds")
     paths = {
         "parents": output_dir / "parents.parquet",
         "candidates": output_dir / "candidates.parquet",
@@ -953,9 +1093,10 @@ def build_lane(
     generator_sha256 = _sha256_file(generator_path)
     dependency_sha256 = _sha256_file(dependency_path)
     git_commit = _git_commit()
-    for path, digest in ((generator_path, generator_sha256), (dependency_path, dependency_sha256)):
-        if _git_blob_sha256(git_commit, path) != digest:
-            raise RuntimeError(f"source differs from Git commit {git_commit}:{path}")
+    if not serial_mode:
+        for path, digest in ((generator_path, generator_sha256), (dependency_path, dependency_sha256)):
+            if _git_blob_sha256(git_commit, path) != digest:
+                raise RuntimeError(f"source differs from Git commit {git_commit}:{path}")
 
     eligible: list[EligibleParent] = []
     decisions: list[dict[str, Any]] = []
@@ -964,6 +1105,25 @@ def build_lane(
     for batch in parquet.iter_batches(batch_size=256, use_threads=False):
         for row in batch.to_pylist():
             item, reason = _analyze_parent(row, row_index, coherence_class)
+            if item is not None:
+                parent_code = _nested(row, "reward_model.ground_truth")
+                if not isinstance(parent_code, str):
+                    raise ValueError(f"eligible dtype parent lacks reference:{row_index}")
+                semantic_verdict = semantic_gates.evaluate_semantic_gate(
+                    "dtype",
+                    parent_code=parent_code,
+                    child_code=parent_code,
+                    manifest={
+                        "assigned_target": item.assigned_dtype,
+                        "factory_specs_before": [
+                            {"factory": name, "shape": list(shape), "dtype": dtype}
+                            for name, shape, dtype in item.factory_specs
+                        ],
+                    },
+                )
+                if semantic_verdict["status"] == "rejected":
+                    reason = "semantic_gate:" + ",".join(semantic_verdict["reasons"])
+                    item = None
             if item is None:
                 skip_counts[reason] += 1
                 decisions.append(
@@ -974,6 +1134,18 @@ def build_lane(
                         "selected": False,
                         "assigned_target": None,
                         "reason": reason,
+                    }
+                )
+            elif row_index in excluded_source_rows:
+                decisions.append(
+                    {
+                        "source_row_index": row_index,
+                        "parent_uuid": item.parent_uuid,
+                        "eligible": True,
+                        "selected": False,
+                        "assigned_target": item.assigned_dtype,
+                        "assignment_sha256": item.assignment_sha256,
+                        "reason": "excluded_by_prior_serial_dtype_batch",
                     }
                 )
             else:
@@ -993,6 +1165,8 @@ def build_lane(
     selected_by_row = {item.source_row_index: item for item in selected}
     for decision in decisions:
         if decision["eligible"]:
+            if decision["reason"] == "excluded_by_prior_serial_dtype_batch":
+                continue
             decision["selected"] = decision["source_row_index"] in selected_by_row
             if not decision["selected"]:
                 decision["reason"] = "eligible_not_selected_by_limit"
@@ -1015,10 +1189,13 @@ def build_lane(
                     generator_sha256=generator_sha256,
                     dependency_sha256=dependency_sha256,
                     git_commit=git_commit,
+                    source_binding=source_binding,
+                    source_row_binding=(source_row_bindings[row_index] if source_row_bindings is not None else None),
                 )
                 parent = copy.deepcopy(row)
-                parent["extra_info"] = dict(parent["extra_info"])
-                parent["extra_info"]["augmentation"] = None
+                if not serial_mode:
+                    parent["extra_info"] = dict(parent["extra_info"])
+                    parent["extra_info"]["augmentation"] = None
                 manifest["candidate_row_index"] = len(children)
                 parents.append(parent)
                 children.append(child)
@@ -1054,6 +1231,8 @@ def build_lane(
         "input": str(input_path.resolve()),
         "input_sha256": source_sha256,
         "input_rows": parquet.metadata.num_rows,
+        "source_binding": source_binding,
+        "excluded_source_rows": len(excluded_source_rows),
         "generator_source_sha256": generator_sha256,
         "dependency_source_sha256": dependency_sha256,
         "git_commit": git_commit,
@@ -1099,12 +1278,19 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("output_dir", type=Path)
     parser.add_argument("--limit", type=int, required=True, help="Canary size in [1, 5000]")
     parser.add_argument("--coherence-class", choices=COHERENCE_CLASSES, default=PARAMETER_FREE)
+    parser.add_argument("--serial-source-manifest", type=Path)
+    parser.add_argument("--exclude-source-row-file", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parse_args(argv)
+    excluded_source_rows = frozenset()
+    if args.exclude_source_row_file is not None:
+        excluded_source_rows = frozenset(
+            int(line) for line in args.exclude_source_row_file.read_text(encoding="utf-8").splitlines() if line.strip()
+        )
     print(
         json.dumps(
             build_lane(
@@ -1113,6 +1299,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                 limit=args.limit,
                 overwrite=args.overwrite,
                 coherence_class=args.coherence_class,
+                serial_source_manifest=args.serial_source_manifest,
+                excluded_source_rows=excluded_source_rows,
             ),
             indent=2,
         )
