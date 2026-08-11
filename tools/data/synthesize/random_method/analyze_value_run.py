@@ -16,6 +16,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tools.data.synthesize import intervention_semantic_gates as semantic_gates
 from tools.data.synthesize import validate_train_mode_contract as reference_validator
 from tools.data.synthesize.random_method import solve_value_coverage as value_solver
 
@@ -24,6 +25,9 @@ LIVENESS_CONTRACT = "random_value_runtime_liveness_v2"
 LIVENESS_BINDING_VERSION = "random_value_runtime_liveness_binding_v2"
 ANALYSIS_CONTRACT = "random_value_lane_exact_analysis_v3"
 SHARD_RE = re.compile(r"^shard-(\d+)-of-(\d+)\.jsonl$")
+REFERENCE_SCHEDULER_RE = re.compile(r"^scheduler-contract-rank-(\d+)\.json$")
+LIVENESS_SCHEDULER_RE = re.compile(r"^scheduler-contract-rank-(\d+)\.json$")
+LIVENESS_LAUNCHER_SUMMARY_RE = re.compile(r"^launcher-summary-rank-(\d+)\.json$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 EXPECTED_VALUE_FAMILIES = frozenset({"uniform_01", "signed_uniform", "poisson_counts", "multinomial_categories"})
 MAX_CANONICAL_CANARY_CANDIDATES = 5_000
@@ -39,6 +43,83 @@ EXPECTED_KERNELGYM_HASHES = {
     "config_settings_sha256": "6bf33dde4269fcd54452de04191d8257069d3da396d5f2f31256a95596c7cf7e",
     "evaluator_bundle_sha256": "135f1758dcfd29ce8e8311a61adacc4a78e7c12433194b21749b37a1882a14ee",
 }
+REFERENCE_SCHEDULER_FIELDS = frozenset(
+    {
+        "contract_version",
+        "launcher_source_sha256",
+        "validator_source_sha256",
+        "machine_rank",
+        "machine_count",
+        "gpus_per_machine",
+        "virtual_shards_per_gpu",
+        "shard_count",
+        "input_path",
+        "input_sha256",
+        "timeout_seconds",
+        "expected_mode_class",
+        "max_device_memory_gib",
+        "idle_memory_mib",
+    }
+)
+LIVENESS_SCHEDULER_FIELDS = frozenset(
+    {
+        "contract_version",
+        "launcher_source_sha256",
+        "validator_source_sha256",
+        "parents_path",
+        "parents_sha256",
+        "children_path",
+        "children_sha256",
+        "manifest_path",
+        "manifest_sha256",
+        "allowlist_path",
+        "allowlist_sha256",
+        "machine_rank",
+        "machine_count",
+        "gpus_per_machine",
+        "virtual_shards_per_gpu",
+        "shard_count",
+        "trials",
+        "seed",
+        "timeout_seconds",
+        "max_device_memory_gib",
+    }
+)
+LIVENESS_LAUNCHER_SUMMARY_FIELDS = frozenset(
+    {
+        "contract_version",
+        "launcher_source_sha256",
+        "validator_source_sha256",
+        "machine_rank",
+        "machine_count",
+        "gpus_per_machine",
+        "virtual_shards_per_gpu",
+        "shard_count",
+        "selected",
+        "executed",
+        "resumed",
+        "passed",
+        "failed",
+        "shards",
+    }
+)
+LIVENESS_SHARD_SUMMARY_FIELDS = frozenset(
+    {
+        "contract_version",
+        "counts",
+        "executed",
+        "failed",
+        "launcher_source_sha256",
+        "output_path",
+        "passed",
+        "resumed",
+        "selected",
+        "shard_count",
+        "shard_index",
+        "validation_binding_sha256",
+        "validator_source_sha256",
+    }
+)
 REFERENCE_GPU_FIELDS = frozenset({"device", "name", "compute_capability", "torch_version", "torch_cuda_version"})
 LIVENESS_TENSOR_FIELDS = frozenset(
     {
@@ -374,11 +455,39 @@ def _verify_source_binding(
     if actual_source_sha256 != recorded_source_sha256:
         raise ValueError("source artifact hash differs from the manifest binding")
 
-    parquet = pq.ParquetFile(resolved_source_path)
-    source_context = value_solver._source_context(resolved_source_path, actual_source_sha256, parquet)
     recorded_binding = json.loads(next(iter(source_bindings)))
-    if _canonical_json_bytes(source_context.binding) != _canonical_json_bytes(recorded_binding):
-        raise ValueError("reconstructed source binding differs from the lane manifest")
+    if (
+        recorded_binding.get("contract_version") != "random_value_input_source_binding_v1"
+        or recorded_binding.get("source_artifact_path") != str(resolved_source_path)
+        or recorded_binding.get("source_artifact_sha256") != actual_source_sha256
+    ):
+        raise ValueError("recorded source binding does not match the source artifact")
+    parquet = pq.ParquetFile(resolved_source_path)
+    if recorded_binding.get("source_rows") != parquet.metadata.num_rows:
+        raise ValueError("recorded source row count differs from the source artifact")
+    source_kind = recorded_binding.get("source_kind")
+    if source_kind == "shape_coverage_resample":
+        for label in ("resample_manifest", "resample_eligibility", "resample_summary"):
+            path = Path(str(recorded_binding.get(f"{label}_path", "")))
+            if (
+                not path.is_absolute()
+                or not path.is_file()
+                or _sha256_file(path) != recorded_binding.get(f"{label}_sha256")
+            ):
+                raise ValueError(f"recorded shape-resample binding mismatch:{label}")
+        resample_manifest_path = Path(recorded_binding["resample_manifest_path"])
+        resample_manifests = tuple(_read_manifest(resample_manifest_path))
+        if len(resample_manifests) != parquet.metadata.num_rows:
+            raise ValueError("shape-resample manifest/source row count mismatch")
+    elif source_kind == "canonical":
+        resample_manifests = None
+    else:
+        raise ValueError(f"unsupported recorded source kind:{source_kind}")
+    source_context = value_solver.SourceContext(
+        kind=source_kind,
+        binding=recorded_binding,
+        resample_manifests=resample_manifests,
+    )
     if source_indices and max(source_indices) >= parquet.metadata.num_rows:
         raise ValueError(f"source row index is out of bounds: {max(source_indices)}")
 
@@ -459,10 +568,10 @@ def _verify_aligned_static(
         raise ValueError("lane manifest source git commit is invalid")
     committed_generator_sha256 = value_solver._git_blob_sha256(source_git_commit, generator_path)
     committed_dependency_sha256 = value_solver._git_blob_sha256(source_git_commit, dependency_path)
-    if committed_generator_sha256 != current_generator_sha256:
-        raise ValueError("current generator source differs from the manifest commit blob")
-    if committed_dependency_sha256 != current_dependency_sha256:
-        raise ValueError("current dependency source differs from the manifest commit blob")
+    replay_with_current_sources = (
+        committed_generator_sha256 == current_generator_sha256
+        and committed_dependency_sha256 == current_dependency_sha256
+    )
     source_rows, source_context = _verify_source_binding(manifests)
     parent_uuids: set[str] = set()
     child_uuids: set[str] = set()
@@ -477,10 +586,10 @@ def _verify_aligned_static(
             raise ValueError(f"manifest index mismatch: {index}")
         if manifest.get("manifest_contract_version") != "random_value_lane_manifest_v4":
             raise ValueError(f"manifest contract mismatch at row {index}")
-        if manifest.get("generator_source_sha256") != current_generator_sha256:
-            raise ValueError(f"current generator source hash mismatch at row {index}")
-        if manifest.get("dependency_source_sha256") != current_dependency_sha256:
-            raise ValueError(f"current dependency source hash mismatch at row {index}")
+        if manifest.get("generator_source_sha256") != committed_generator_sha256:
+            raise ValueError(f"committed generator source hash mismatch at row {index}")
+        if manifest.get("dependency_source_sha256") != committed_dependency_sha256:
+            raise ValueError(f"committed dependency source hash mismatch at row {index}")
         if manifest.get("parent_uuid") != parent_uuid or manifest.get("child_uuid") != child_uuid:
             raise ValueError(f"manifest UUID mismatch: {index}")
         if not isinstance(parent_code, str) or not isinstance(child_code, str):
@@ -556,25 +665,28 @@ def _verify_aligned_static(
             raise ValueError(f"source lineage mismatch at row {index}")
         if _nested(child, "extra_info.v4.parent_uuid") != parent_uuid:
             raise ValueError(f"child does not point to its immediate parent at row {index}")
-        replay_eligible, replay_reason = value_solver._analyze_parent(parent, source_row_index)
-        if replay_eligible is None:
-            raise ValueError(f"current solver rejects parent at row {index}: {replay_reason}")
-        replay_child, replay_manifest = value_solver._make_child(
-            parent,
-            replay_eligible,
-            source_path=Path(source_artifact_path),
-            source_sha256=source_artifact_sha256,
-            generator_sha256=manifest["generator_source_sha256"],
-            dependency_sha256=manifest["dependency_source_sha256"],
-            git_commit=git_commit,
-            source_binding=source_context.binding,
-            source_row_binding=source_row_binding,
-        )
-        replay_manifest["candidate_row_index"] = index
-        if replay_child != child or _canonical_json_bytes(replay_child) != _canonical_json_bytes(child):
-            raise ValueError(f"deterministic child replay mismatch at row {index}")
-        if replay_manifest != manifest or _canonical_json_bytes(replay_manifest) != _canonical_json_bytes(manifest):
-            raise ValueError(f"deterministic manifest replay mismatch at row {index}")
+        if replay_with_current_sources:
+            replay_eligible, replay_reason = value_solver._analyze_parent(parent, source_row_index)
+            if replay_eligible is None:
+                raise ValueError(f"current solver rejects parent at row {index}: {replay_reason}")
+            replay_child, replay_manifest = value_solver._make_child(
+                parent,
+                replay_eligible,
+                source_path=Path(source_artifact_path),
+                source_sha256=source_artifact_sha256,
+                generator_sha256=manifest["generator_source_sha256"],
+                dependency_sha256=manifest["dependency_source_sha256"],
+                git_commit=git_commit,
+                source_binding=source_context.binding,
+                source_row_binding=source_row_binding,
+            )
+            replay_manifest["candidate_row_index"] = index
+            if replay_child != child or _canonical_json_bytes(replay_child) != _canonical_json_bytes(child):
+                raise ValueError(f"deterministic child replay mismatch at row {index}")
+            if replay_manifest != manifest or _canonical_json_bytes(replay_manifest) != _canonical_json_bytes(
+                manifest
+            ):
+                raise ValueError(f"deterministic manifest replay mismatch at row {index}")
         parent_uuids.add(parent_uuid)
         child_uuids.add(child_uuid)
         child_references.add(manifest["child_reference_sha256"])
@@ -681,6 +793,112 @@ def _verify_reference_contract_record(
     return fingerprint, payload
 
 
+def _verify_reference_scheduler_topology(
+    *,
+    reference_dir: Path,
+    paired_path: Path,
+    shard_count: int,
+    raw: Sequence[tuple[int, int, Mapping[str, Any]]],
+    launcher_source_sha256: str,
+    validator_source_sha256: str,
+    expected_topology: Mapping[str, int] | None,
+) -> dict[str, Any]:
+    contracts: dict[int, dict[str, Any]] = {}
+    for path in reference_dir.glob("scheduler-contract-rank-*.json"):
+        match = REFERENCE_SCHEDULER_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        rank = int(match.group(1))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        contract = dict(_require_exact_mapping(value, REFERENCE_SCHEDULER_FIELDS, label=f"reference scheduler {path}"))
+        if rank in contracts or contract.get("machine_rank") != rank:
+            raise ValueError(f"invalid or duplicate reference scheduler rank: {path}")
+        contracts[rank] = contract
+    if not contracts:
+        raise ValueError(f"reference scheduler contracts are missing under {reference_dir}")
+
+    first = contracts[min(contracts)]
+    topology: dict[str, int] = {}
+    for field in ("machine_count", "gpus_per_machine", "virtual_shards_per_gpu", "shard_count"):
+        value = first.get(field)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"reference scheduler has invalid {field}: {value!r}")
+        topology[field] = value
+    if topology["shard_count"] != (
+        topology["machine_count"] * topology["gpus_per_machine"] * topology["virtual_shards_per_gpu"]
+    ):
+        raise ValueError("reference scheduler shard count does not match its topology")
+    if topology["shard_count"] != shard_count:
+        raise ValueError("reference scheduler topology differs from the gathered shard family")
+    if set(contracts) != set(range(topology["machine_count"])):
+        raise ValueError("reference scheduler rank family is incomplete")
+    if expected_topology is not None:
+        for field in ("machine_count", "gpus_per_machine", "virtual_shards_per_gpu"):
+            expected = expected_topology.get(field)
+            if type(expected) is not int or expected <= 0 or topology[field] != expected:
+                raise ValueError(f"reference scheduler topology mismatch for {field}: {topology[field]} != {expected}")
+
+    paired_resolved = str(paired_path.resolve())
+    paired_sha256 = _sha256_file(paired_path)
+    common_fields = REFERENCE_SCHEDULER_FIELDS - {"machine_rank"}
+    common = {field: first[field] for field in common_fields}
+    for rank, contract in sorted(contracts.items()):
+        if {field: contract[field] for field in common_fields} != common:
+            raise ValueError(f"reference scheduler contracts differ at rank {rank}")
+        if contract["contract_version"] != "reference_scheduler_contract_v1":
+            raise ValueError(f"reference scheduler contract version mismatch at rank {rank}")
+        if contract["launcher_source_sha256"] != launcher_source_sha256:
+            raise ValueError(f"reference scheduler launcher hash mismatch at rank {rank}")
+        if contract["validator_source_sha256"] != validator_source_sha256:
+            raise ValueError(f"reference scheduler validator hash mismatch at rank {rank}")
+        if contract["input_path"] != paired_resolved or contract["input_sha256"] != paired_sha256:
+            raise ValueError(f"reference scheduler input binding mismatch at rank {rank}")
+        if contract["expected_mode_class"] != "any":
+            raise ValueError(f"reference scheduler mode contract mismatch at rank {rank}")
+        timeout_seconds = _finite_float(contract["timeout_seconds"])
+        if timeout_seconds is None or timeout_seconds <= 0:
+            raise ValueError(f"reference scheduler timeout is invalid at rank {rank}")
+        if contract["max_device_memory_gib"] != 64.0 or contract["idle_memory_mib"] != 64:
+            raise ValueError(f"reference scheduler memory policy mismatch at rank {rank}")
+
+    raw_by_shard: dict[int, list[Mapping[str, Any]]] = collections.defaultdict(list)
+    for shard_index, _, record in raw:
+        raw_by_shard[shard_index].append(record)
+    for shard_index in range(shard_count):
+        log_path = reference_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.log"
+        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"reference shard log lacks a final summary: {log_path}")
+        summary = json.loads(lines[-1])
+        if not isinstance(summary, Mapping):
+            raise ValueError(f"reference shard final summary is not an object: {log_path}")
+        records = raw_by_shard[shard_index]
+        passed = sum(record.get("passed") is True for record in records)
+        expected = {
+            "shard_index": shard_index,
+            "shard_count": shard_count,
+            "selected": len(records),
+            "passed": passed,
+            "failed": len(records) - passed,
+            "output_path": str((reference_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.jsonl").resolve()),
+        }
+        for field, value in expected.items():
+            if summary.get(field) != value:
+                raise ValueError(f"reference shard final summary mismatch for {field}: {log_path}")
+        if summary.get("executed", 0) + summary.get("resumed", 0) != len(records):
+            raise ValueError(f"reference shard execution counts are inconsistent: {log_path}")
+        if summary.get("all_passed") is not (passed == len(records)):
+            raise ValueError(f"reference shard all_passed is inconsistent: {log_path}")
+
+    return {
+        "machine_count": topology["machine_count"],
+        "gpus_per_machine": topology["gpus_per_machine"],
+        "virtual_shards_per_gpu": topology["virtual_shards_per_gpu"],
+        "shard_count": topology["shard_count"],
+        "timeout_seconds": float(first["timeout_seconds"]),
+    }
+
+
 def _verify_reference(
     *,
     reference_dir: Path,
@@ -688,6 +906,7 @@ def _verify_reference(
     parents: list[dict[str, Any]],
     children: list[dict[str, Any]],
     manifests: list[dict[str, Any]],
+    expected_topology: Mapping[str, int] | None,
 ) -> tuple[dict[str, Any], set[str], dict[str, dict[str, Any]]]:
     shard_count, raw = _shard_records(reference_dir)
     expected_rows = 2 * len(children)
@@ -702,6 +921,15 @@ def _verify_reference(
     if archived_launcher_sha256 != current_launcher_sha256:
         raise ValueError("archived reference launcher differs from the current frozen source")
     current_validator_sha256 = _sha256_file(Path(reference_validator.__file__).resolve())
+    topology = _verify_reference_scheduler_topology(
+        reference_dir=reference_dir,
+        paired_path=paired_path,
+        shard_count=shard_count,
+        raw=raw,
+        launcher_source_sha256=archived_launcher_sha256,
+        validator_source_sha256=current_validator_sha256,
+        expected_topology=expected_topology,
+    )
     by_row: dict[int, dict[str, Any]] = {}
     fingerprints: set[str] = set()
     payloads: set[bytes] = set()
@@ -824,6 +1052,7 @@ def _verify_reference(
         "reference_contract_version": REFERENCE_CONTRACT,
         "paired_sha256": paired_sha256,
         "shard_count": shard_count,
+        "topology": topology,
         "paired_rows": expected_rows,
         "candidate_pairs": len(children),
         "classifications": dict(sorted(classifications.items())),
@@ -1186,6 +1415,170 @@ def _verify_liveness_trial(
     return verified
 
 
+def _verify_liveness_scheduler_topology(
+    *,
+    liveness_dir: Path,
+    shard_count: int,
+    raw: Sequence[tuple[int, int, Mapping[str, Any]]],
+    launcher_source_sha256: str,
+    validator_source_sha256: str,
+    parents_path: Path,
+    children_path: Path,
+    manifest_path: Path,
+    allowlist_path: Path,
+    expected_artifacts: Mapping[str, str],
+) -> dict[str, Any]:
+    contracts: dict[int, dict[str, Any]] = {}
+    for path in liveness_dir.glob("scheduler-contract-rank-*.json"):
+        match = LIVENESS_SCHEDULER_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        rank = int(match.group(1))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        contract = dict(_require_exact_mapping(value, LIVENESS_SCHEDULER_FIELDS, label=f"liveness scheduler {path}"))
+        if rank in contracts or contract.get("machine_rank") != rank:
+            raise ValueError(f"invalid or duplicate liveness scheduler rank: {path}")
+        contracts[rank] = contract
+    if not contracts:
+        raise ValueError(f"liveness scheduler contracts are missing under {liveness_dir}")
+
+    first = contracts[min(contracts)]
+    topology: dict[str, int] = {}
+    for field in ("machine_count", "gpus_per_machine", "virtual_shards_per_gpu", "shard_count"):
+        value = first.get(field)
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"liveness scheduler has invalid {field}: {value!r}")
+        topology[field] = value
+    if topology["shard_count"] != (
+        topology["machine_count"] * topology["gpus_per_machine"] * topology["virtual_shards_per_gpu"]
+    ):
+        raise ValueError("liveness scheduler shard count does not match its topology")
+    if topology["shard_count"] != shard_count:
+        raise ValueError("liveness scheduler topology differs from the gathered shard family")
+    if set(contracts) != set(range(topology["machine_count"])):
+        raise ValueError("liveness scheduler rank family is incomplete")
+
+    artifact_links = {
+        "parents_path": str(parents_path.resolve()),
+        "parents_sha256": expected_artifacts["parents_sha256"],
+        "children_path": str(children_path.resolve()),
+        "children_sha256": expected_artifacts["children_sha256"],
+        "manifest_path": str(manifest_path.resolve()),
+        "manifest_sha256": expected_artifacts["manifest_sha256"],
+        "allowlist_path": str(allowlist_path.resolve()),
+        "allowlist_sha256": expected_artifacts["allowlist_sha256"],
+    }
+    common_fields = LIVENESS_SCHEDULER_FIELDS - {"machine_rank"}
+    common = {field: first[field] for field in common_fields}
+    for rank, contract in sorted(contracts.items()):
+        if {field: contract[field] for field in common_fields} != common:
+            raise ValueError(f"liveness scheduler contracts differ at rank {rank}")
+        if contract["contract_version"] != "random_value_runtime_liveness_scheduler_v3":
+            raise ValueError(f"liveness scheduler contract version mismatch at rank {rank}")
+        if contract["launcher_source_sha256"] != launcher_source_sha256:
+            raise ValueError(f"liveness scheduler launcher hash mismatch at rank {rank}")
+        if contract["validator_source_sha256"] != validator_source_sha256:
+            raise ValueError(f"liveness scheduler validator hash mismatch at rank {rank}")
+        for field, expected in artifact_links.items():
+            if contract[field] != expected:
+                raise ValueError(f"liveness scheduler artifact binding mismatch at rank {rank}: {field}")
+        if contract["trials"] < MIN_LIVENESS_TRIALS or contract["seed"] != 17:
+            raise ValueError(f"liveness scheduler trial policy mismatch at rank {rank}")
+        timeout_seconds = _finite_float(contract["timeout_seconds"])
+        if timeout_seconds is None or timeout_seconds <= 0 or contract["max_device_memory_gib"] != 64.0:
+            raise ValueError(f"liveness scheduler runtime policy mismatch at rank {rank}")
+
+    raw_by_shard: dict[int, list[Mapping[str, Any]]] = collections.defaultdict(list)
+    for shard_index, _, record in raw:
+        raw_by_shard[shard_index].append(record)
+
+    summaries: dict[int, dict[str, Any]] = {}
+    for path in liveness_dir.glob("launcher-summary-rank-*.json"):
+        match = LIVENESS_LAUNCHER_SUMMARY_RE.fullmatch(path.name)
+        if match is None:
+            continue
+        rank = int(match.group(1))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        summary = dict(
+            _require_exact_mapping(value, LIVENESS_LAUNCHER_SUMMARY_FIELDS, label=f"liveness launcher summary {path}")
+        )
+        if rank in summaries or summary.get("machine_rank") != rank:
+            raise ValueError(f"invalid or duplicate liveness launcher summary rank: {path}")
+        summaries[rank] = summary
+    if set(summaries) != set(contracts):
+        raise ValueError("liveness launcher summary rank family is incomplete")
+
+    physical_shards = topology["machine_count"] * topology["gpus_per_machine"]
+    seen_shards: set[int] = set()
+    for rank, summary in sorted(summaries.items()):
+        for field in ("machine_count", "gpus_per_machine", "virtual_shards_per_gpu", "shard_count"):
+            if summary.get(field) != topology[field]:
+                raise ValueError(f"liveness launcher summary topology mismatch at rank {rank}: {field}")
+        if summary.get("contract_version") != "random_value_runtime_liveness_launcher_summary_v3":
+            raise ValueError(f"liveness launcher summary contract mismatch at rank {rank}")
+        if summary.get("launcher_source_sha256") != launcher_source_sha256:
+            raise ValueError(f"liveness launcher summary launcher hash mismatch at rank {rank}")
+        if summary.get("validator_source_sha256") != validator_source_sha256:
+            raise ValueError(f"liveness launcher summary validator hash mismatch at rank {rank}")
+        expected_shards = {
+            rank * topology["gpus_per_machine"] + local_slot + virtual_offset * physical_shards
+            for local_slot in range(topology["gpus_per_machine"])
+            for virtual_offset in range(topology["virtual_shards_per_gpu"])
+        }
+        shard_summaries = summary.get("shards")
+        if not isinstance(shard_summaries, list) or len(shard_summaries) != len(expected_shards):
+            raise ValueError(f"liveness launcher summary has an invalid shard list at rank {rank}")
+        normalized_shards: list[dict[str, Any]] = []
+        for item in shard_summaries:
+            shard_summary = dict(
+                _require_exact_mapping(
+                    item, LIVENESS_SHARD_SUMMARY_FIELDS, label=f"liveness shard summary rank {rank}"
+                )
+            )
+            shard_index = shard_summary.get("shard_index")
+            if shard_index not in expected_shards or shard_index in seen_shards:
+                raise ValueError(f"liveness launcher summary has an invalid shard at rank {rank}: {shard_index}")
+            seen_shards.add(shard_index)
+            records = raw_by_shard[shard_index]
+            status_counts = collections.Counter(str(record.get("status")) for record in records)
+            passed = sum(record.get("passed") is True for record in records)
+            expected = {
+                "contract_version": LIVENESS_CONTRACT,
+                "counts": dict(sorted(status_counts.items())),
+                "selected": len(records),
+                "passed": passed,
+                "failed": len(records) - passed,
+                "shard_index": shard_index,
+                "shard_count": shard_count,
+                "output_path": str((liveness_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.jsonl").resolve()),
+                "launcher_source_sha256": launcher_source_sha256,
+                "validator_source_sha256": validator_source_sha256,
+            }
+            for field, expected_value in expected.items():
+                if shard_summary.get(field) != expected_value:
+                    raise ValueError(f"liveness shard summary mismatch for {field}: shard {shard_index}")
+            if shard_summary.get("executed", 0) + shard_summary.get("resumed", 0) != len(records):
+                raise ValueError(f"liveness shard execution counts are inconsistent: shard {shard_index}")
+            log_path = liveness_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.log"
+            lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            if not lines or json.loads(lines[-1]) != shard_summary:
+                raise ValueError(f"liveness shard log final summary mismatch: {log_path}")
+            normalized_shards.append(shard_summary)
+        for field in ("selected", "executed", "resumed", "passed", "failed"):
+            if summary.get(field) != sum(item[field] for item in normalized_shards):
+                raise ValueError(f"liveness launcher aggregate mismatch at rank {rank}: {field}")
+    if seen_shards != set(range(shard_count)):
+        raise ValueError("liveness launcher summaries do not cover the full shard family")
+
+    return {
+        "machine_count": topology["machine_count"],
+        "gpus_per_machine": topology["gpus_per_machine"],
+        "virtual_shards_per_gpu": topology["virtual_shards_per_gpu"],
+        "shard_count": topology["shard_count"],
+        "timeout_seconds": float(first["timeout_seconds"]),
+    }
+
+
 def _verify_liveness(
     liveness_dir: Path,
     both_pass: set[str],
@@ -1214,6 +1607,18 @@ def _verify_liveness(
         "manifest_sha256": _sha256_file(manifest_path),
         "allowlist_sha256": _sha256_file(allowlist_path),
     }
+    topology = _verify_liveness_scheduler_topology(
+        liveness_dir=liveness_dir,
+        shard_count=shard_count,
+        raw=raw,
+        launcher_source_sha256=archived_launcher_sha256,
+        validator_source_sha256=archived_validator_sha256,
+        parents_path=parents_path,
+        children_path=children_path,
+        manifest_path=manifest_path,
+        allowlist_path=allowlist_path,
+        expected_artifacts=expected_artifacts,
+    )
     by_uuid: dict[str, dict[str, Any]] = {}
     bindings: set[str] = set()
     launchers: set[str] = set()
@@ -1421,6 +1826,7 @@ def _verify_liveness(
     summary = {
         "contract_version": LIVENESS_CONTRACT,
         "shard_count": shard_count,
+        "topology": topology,
         "selected": len(by_uuid),
         "passed": len(passed),
         "failed": len(by_uuid) - len(passed),
@@ -1713,11 +2119,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("lane_dir", type=Path)
     parser.add_argument("--reference-dir", type=Path, required=True)
     parser.add_argument("--liveness-dir", type=Path)
+    parser.add_argument("--expected-reference-machine-count", type=int)
+    parser.add_argument("--expected-reference-gpus-per-machine", type=int)
+    parser.add_argument("--expected-reference-virtual-shards-per-gpu", type=int)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _parser().parse_args(argv)
+    expected_topology_values = {
+        "machine_count": args.expected_reference_machine_count,
+        "gpus_per_machine": args.expected_reference_gpus_per_machine,
+        "virtual_shards_per_gpu": args.expected_reference_virtual_shards_per_gpu,
+    }
+    specified_topology_fields = [field for field, value in expected_topology_values.items() if value is not None]
+    if specified_topology_fields and len(specified_topology_fields) != len(expected_topology_values):
+        raise ValueError("all expected reference topology fields must be supplied together")
+    expected_topology = None if not specified_topology_fields else dict(expected_topology_values)
     parents_path = args.lane_dir / "parents.parquet"
     children_path = args.lane_dir / "candidates.parquet"
     paired_path = args.lane_dir / "paired.parquet"
@@ -1734,6 +2152,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         parents=parents,
         children=children,
         manifests=manifests,
+        expected_topology=expected_topology,
     )
     analysis_dir = args.lane_dir / "analysis"
     _write_json(analysis_dir / "reference_summary.json", reference)
@@ -1755,6 +2174,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         if accepted and liveness["gpu"] != reference["gpu"]:
             raise ValueError("reference and passed liveness evidence use different GPUs")
         _write_json(analysis_dir / "liveness_summary.json", liveness)
+        runtime_passed = set(accepted)
+        accepted, semantic_verdicts, semantic_summary = semantic_gates.filter_promotable_candidates(
+            "random",
+            parents=parents,
+            children=children,
+            manifests=manifests,
+            runtime_passed=runtime_passed,
+        )
+        _write_json(analysis_dir / "semantic_gate_summary.json", semantic_summary)
         accepted_indices = [index for index, manifest in enumerate(manifests) if manifest["child_uuid"] in accepted]
         analyzer_source_sha256 = _sha256_file(Path(__file__).resolve())
         policy = {
@@ -1768,6 +2196,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "liveness_validator_source_sha256": liveness["validator_source_sha256"],
             "liveness_runtime_partition_fingerprint": liveness["runtime_partition_fingerprint"],
             "liveness_gpu_fingerprints": liveness["gpu_fingerprints"],
+            "semantic_gate_policy_version": semantic_gates.POLICY_VERSION,
+            "semantic_gate_source_sha256": _sha256_file(Path(semantic_gates.__file__).resolve()),
         }
         runtime_policy_fingerprint = _canonical_sha256(policy)
         accepted_table = _materialize_accepted_table(
@@ -1794,6 +2224,8 @@ def main(argv: Sequence[str] | None = None) -> None:
                     "parent_runtime_status": "passed",
                     "child_runtime_status": "passed",
                     "liveness_status": "passed",
+                    "semantic_promotion_status": "passed",
+                    "semantic_gate": semantic_verdicts[uuid],
                     "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
                     "runtime_policy_fingerprint": runtime_policy_fingerprint,
                     "runtime_evidence": {
@@ -1823,6 +2255,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             "source_binding": dict(source_context.binding),
             "reference": reference,
             "liveness": liveness,
+            "runtime_passed_rows": len(runtime_passed),
+            "semantic_gate": semantic_summary,
             "accepted_rows": len(accepted_indices),
             "rejected_rows": len(children) - len(accepted_indices),
             "materialization_status": ACCEPTED_GOVERNANCE_STATUS,
@@ -1843,7 +2277,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             {
                 "candidate_pairs": len(children),
                 "reference_both_pass": len(both_pass),
-                "liveness_passed": len(accepted) if accepted is not None else None,
+                "promoted_after_semantic_gate": len(accepted) if accepted is not None else None,
                 "analysis_dir": str(analysis_dir.resolve()),
             },
             sort_keys=True,

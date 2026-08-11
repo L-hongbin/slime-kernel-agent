@@ -11,7 +11,10 @@ children_path=$2
 manifest_path=$3
 allowlist_path=$4
 run_dir=$5
+machine_rank=${SYNTH_MACHINE_RANK:-0}
+machine_count=${SYNTH_MACHINE_COUNT:-1}
 gpus_per_machine=${SYNTH_GPUS_PER_MACHINE:-8}
+virtual_shards_per_gpu=${SYNTH_VIRTUAL_SHARDS_PER_GPU:-1}
 trials=${SYNTH_VALUE_LIVENESS_TRIALS:-3}
 seed=${SYNTH_VALUE_LIVENESS_SEED:-17}
 timeout_seconds=${SYNTH_TIMEOUT_SECONDS:-600}
@@ -26,6 +29,18 @@ for path in "${parents_path}" "${children_path}" "${manifest_path}" "${allowlist
 done
 if ! [[ ${gpus_per_machine} =~ ^[1-9][0-9]*$ ]]; then
   echo "SYNTH_GPUS_PER_MACHINE must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ ${machine_count} =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNTH_MACHINE_COUNT must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ ${machine_rank} =~ ^[0-9]+$ ]] || (( machine_rank >= machine_count )); then
+  echo "SYNTH_MACHINE_RANK must be an integer in [0, $((machine_count - 1))]" >&2
+  exit 2
+fi
+if ! [[ ${virtual_shards_per_gpu} =~ ^[1-9][0-9]*$ ]]; then
+  echo "SYNTH_VIRTUAL_SHARDS_PER_GPU must be a positive integer" >&2
   exit 2
 fi
 if ! [[ ${trials} =~ ^[1-9][0-9]*$ ]] || (( trials < 3 )); then
@@ -71,6 +86,9 @@ verify_expected_hash children "${children_sha256}" "${SYNTH_EXPECTED_CHILDREN_SH
 verify_expected_hash manifest "${manifest_sha256}" "${SYNTH_EXPECTED_MANIFEST_SHA256:-}"
 verify_expected_hash allowlist "${allowlist_sha256}" "${SYNTH_EXPECTED_ALLOWLIST_SHA256:-}"
 
+physical_shard_count=$((machine_count * gpus_per_machine))
+shard_count=$((physical_shard_count * virtual_shards_per_gpu))
+
 mkdir -p "${run_dir}"
 if ! command -v flock >/dev/null 2>&1; then
   echo "flock is required for exclusive validation launch" >&2
@@ -108,14 +126,16 @@ for source_path in "$0" "${validator_path}"; do
   fi
 done
 
-scheduler_contract=${run_dir}/scheduler-contract.json
+scheduler_contract=${run_dir}/scheduler-contract-rank-${machine_rank}.json
 scheduler_contract_tmp=${scheduler_contract}.tmp.$$
 python - "${scheduler_contract_tmp}" "${launcher_sha256}" "${validator_sha256}" \
   "$(realpath "${parents_path}")" "${parents_sha256}" \
   "$(realpath "${children_path}")" "${children_sha256}" \
   "$(realpath "${manifest_path}")" "${manifest_sha256}" \
   "$(realpath "${allowlist_path}")" "${allowlist_sha256}" \
-  "${gpus_per_machine}" "${trials}" "${seed}" "${timeout_seconds}" <<'PY'
+  "${machine_rank}" "${machine_count}" "${gpus_per_machine}" \
+  "${virtual_shards_per_gpu}" "${shard_count}" \
+  "${trials}" "${seed}" "${timeout_seconds}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -134,13 +154,17 @@ from pathlib import Path
     manifest_sha256,
     allowlist_path,
     allowlist_sha256,
+    machine_rank,
+    machine_count,
+    gpus_per_machine,
+    virtual_shards_per_gpu,
     shard_count,
     trials,
     seed,
     timeout_seconds,
 ) = sys.argv[1:]
 payload = {
-    "contract_version": "random_value_runtime_liveness_scheduler_v2",
+    "contract_version": "random_value_runtime_liveness_scheduler_v3",
     "launcher_source_sha256": launcher_sha256,
     "validator_source_sha256": validator_sha256,
     "parents_path": parents_path,
@@ -151,6 +175,10 @@ payload = {
     "manifest_sha256": manifest_sha256,
     "allowlist_path": allowlist_path,
     "allowlist_sha256": allowlist_sha256,
+    "machine_rank": int(machine_rank),
+    "machine_count": int(machine_count),
+    "gpus_per_machine": int(gpus_per_machine),
+    "virtual_shards_per_gpu": int(virtual_shards_per_gpu),
     "shard_count": int(shard_count),
     "trials": int(trials),
     "seed": int(seed),
@@ -193,6 +221,14 @@ for row in "${gpu_rows[@]}"; do
     exit 2
   fi
 done
+if ! compute_processes=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits); then
+  echo "failed to query GPU compute processes" >&2
+  exit 2
+fi
+if [[ -n ${compute_processes//[[:space:]]/} ]]; then
+  echo "container-visible GPUs have active compute processes: ${compute_processes//$'\n'/,}" >&2
+  exit 2
+fi
 if ! runtime_versions=$(CUDA_VISIBLE_DEVICES=0 python -c '
 import torch
 x = torch.randn((2, 3, 16, 16), device="cuda")
@@ -206,20 +242,84 @@ fi
 echo "value liveness runtime preflight: ${runtime_versions}"
 
 pids=()
+queue_dir=$(mktemp -d "/tmp/prompt_tvm_v4_value_liveness_queue.rank-${machine_rank}.XXXXXX") || exit 2
+
+cleanup_queue_dir() {
+  find "${queue_dir}" -mindepth 1 -maxdepth 1 -type d -name 'claim-*' \
+    -exec rmdir -- {} + 2>/dev/null || true
+  rmdir -- "${queue_dir}" 2>/dev/null || true
+}
+
+terminate_children() {
+  local pid
+  trap - INT TERM HUP
+  for pid in "${pids[@]}"; do
+    kill -TERM "${pid}" 2>/dev/null || true
+  done
+  for pid in "${pids[@]}"; do
+    wait "${pid}" 2>/dev/null || true
+  done
+  cleanup_queue_dir
+  exit 130
+}
+trap terminate_children INT TERM HUP
+
+claim_next_shard() {
+  local virtual_offset local_slot shard_id
+  for ((virtual_offset = 0; virtual_offset < virtual_shards_per_gpu; virtual_offset++)); do
+    for ((local_slot = 0; local_slot < gpus_per_machine; local_slot++)); do
+      shard_id=$((machine_rank * gpus_per_machine + local_slot + virtual_offset * physical_shard_count))
+      if mkdir "${queue_dir}/claim-${shard_id}" 2>/dev/null; then
+        printf '%s\n' "${shard_id}"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+run_gpu_queue() {
+  local gpu=$1
+  local shard_id output_path log_path validator_pid=''
+
+  terminate_gpu_queue() {
+    trap - INT TERM HUP
+    if [[ -n ${validator_pid} ]] && kill -0 "${validator_pid}" 2>/dev/null; then
+      kill -TERM "${validator_pid}" 2>/dev/null || true
+      wait "${validator_pid}" 2>/dev/null || true
+    fi
+    exit 130
+  }
+  trap terminate_gpu_queue INT TERM HUP
+
+  while shard_id=$(claim_next_shard); do
+    echo "value-liveness queue claim: rank=${machine_rank} gpu=${gpu} shard=${shard_id}/${shard_count}"
+    output_path=${run_dir}/shard-$(printf '%02d' "${shard_id}")-of-$(printf '%02d' "${shard_count}").jsonl
+    log_path=${run_dir}/shard-$(printf '%02d' "${shard_id}")-of-$(printf '%02d' "${shard_count}").log
+    CUDA_VISIBLE_DEVICES=${gpu} python "${validator_path}" \
+      "${parents_path}" "${children_path}" "${manifest_path}" "${output_path}" \
+      --child-uuid-file "${allowlist_path}" \
+      --device cuda:0 \
+      --trials "${trials}" \
+      --seed "${seed}" \
+      --timeout-seconds "${timeout_seconds}" \
+      --launcher-sha256 "${launcher_sha256}" \
+      --shard-index "${shard_id}" \
+      --shard-count "${shard_count}" \
+      >"${log_path}" 2>&1 &
+    validator_pid=$!
+    if ! wait "${validator_pid}"; then
+      validator_pid=''
+      echo "value-liveness shard ${shard_id} had an infrastructure failure; see ${log_path}" >&2
+      return 2
+    fi
+    validator_pid=''
+  done
+  trap - INT TERM HUP
+}
+
 for ((gpu = 0; gpu < gpus_per_machine; gpu++)); do
-  output_path=${run_dir}/shard-$(printf '%02d' "${gpu}")-of-$(printf '%02d' "${gpus_per_machine}").jsonl
-  log_path=${run_dir}/shard-$(printf '%02d' "${gpu}")-of-$(printf '%02d' "${gpus_per_machine}").log
-  CUDA_VISIBLE_DEVICES=${gpu} python "${validator_path}" \
-    "${parents_path}" "${children_path}" "${manifest_path}" "${output_path}" \
-    --child-uuid-file "${allowlist_path}" \
-    --device cuda:0 \
-    --trials "${trials}" \
-    --seed "${seed}" \
-    --timeout-seconds "${timeout_seconds}" \
-    --launcher-sha256 "${launcher_sha256}" \
-    --shard-index "${gpu}" \
-    --shard-count "${gpus_per_machine}" \
-    >"${log_path}" 2>&1 &
+  run_gpu_queue "${gpu}" &
   pids+=("$!")
 done
 
@@ -229,12 +329,15 @@ for pid in "${pids[@]}"; do
     status=2
   fi
 done
+trap - INT TERM HUP
+cleanup_queue_dir
 if (( status != 0 )); then
   echo "one or more value-liveness shards had an infrastructure failure" >&2
   exit "${status}"
 fi
 
-python - "${run_dir}" "${gpus_per_machine}" "${launcher_sha256}" "${validator_sha256}" <<'PY'
+python - "${run_dir}" "${machine_rank}" "${machine_count}" "${gpus_per_machine}" \
+  "${virtual_shards_per_gpu}" "${shard_count}" "${launcher_sha256}" "${validator_sha256}" <<'PY'
 from __future__ import annotations
 
 import json
@@ -242,27 +345,39 @@ import sys
 from pathlib import Path
 
 run_dir = Path(sys.argv[1])
-shard_count = int(sys.argv[2])
-launcher_sha256 = sys.argv[3]
-validator_sha256 = sys.argv[4]
+machine_rank = int(sys.argv[2])
+machine_count = int(sys.argv[3])
+gpus_per_machine = int(sys.argv[4])
+virtual_shards_per_gpu = int(sys.argv[5])
+shard_count = int(sys.argv[6])
+launcher_sha256 = sys.argv[7]
+validator_sha256 = sys.argv[8]
+physical_shard_count = machine_count * gpus_per_machine
 summaries = []
-for shard_index in range(shard_count):
-    log_path = run_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.log"
-    lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    if not lines:
-        raise SystemExit(f"empty shard log: {log_path}")
-    summary = json.loads(lines[-1])
-    if summary.get("shard_index") != shard_index or summary.get("shard_count") != shard_count:
-        raise SystemExit(f"invalid final shard summary: {log_path}")
-    if summary.get("launcher_source_sha256") != launcher_sha256:
-        raise SystemExit(f"launcher hash mismatch: {log_path}")
-    if summary.get("validator_source_sha256") != validator_sha256:
-        raise SystemExit(f"validator hash mismatch: {log_path}")
-    summaries.append(summary)
+for local_slot in range(gpus_per_machine):
+    base_shard = machine_rank * gpus_per_machine + local_slot
+    for virtual_offset in range(virtual_shards_per_gpu):
+        shard_index = base_shard + virtual_offset * physical_shard_count
+        log_path = run_dir / f"shard-{shard_index:02d}-of-{shard_count:02d}.log"
+        lines = [line for line in log_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if not lines:
+            raise SystemExit(f"empty shard log: {log_path}")
+        summary = json.loads(lines[-1])
+        if summary.get("shard_index") != shard_index or summary.get("shard_count") != shard_count:
+            raise SystemExit(f"invalid final shard summary: {log_path}")
+        if summary.get("launcher_source_sha256") != launcher_sha256:
+            raise SystemExit(f"launcher hash mismatch: {log_path}")
+        if summary.get("validator_source_sha256") != validator_sha256:
+            raise SystemExit(f"validator hash mismatch: {log_path}")
+        summaries.append(summary)
 payload = {
-    "contract_version": "random_value_runtime_liveness_launcher_summary_v2",
+    "contract_version": "random_value_runtime_liveness_launcher_summary_v3",
     "launcher_source_sha256": launcher_sha256,
     "validator_source_sha256": validator_sha256,
+    "machine_rank": machine_rank,
+    "machine_count": machine_count,
+    "gpus_per_machine": gpus_per_machine,
+    "virtual_shards_per_gpu": virtual_shards_per_gpu,
     "shard_count": shard_count,
     "selected": sum(item["selected"] for item in summaries),
     "executed": sum(item["executed"] for item in summaries),
@@ -271,7 +386,7 @@ payload = {
     "failed": sum(item["failed"] for item in summaries),
     "shards": summaries,
 }
-(run_dir / "launcher-summary.json").write_text(
+(run_dir / f"launcher-summary-rank-{machine_rank}.json").write_text(
     json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
 )
 print(json.dumps(payload, sort_keys=True))

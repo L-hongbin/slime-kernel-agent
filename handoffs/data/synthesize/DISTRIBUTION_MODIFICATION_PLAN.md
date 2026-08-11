@@ -4,11 +4,9 @@
 
 所有 intervention child 统一从 64,315 条 immutable canonical parent 派生，各扩展 lane 独立生成，禁止从其他 child 或已经拼接的 review union 二次派生。每个 child 只承载一个 primary intervention，先用等预算单轴实验测量收益，再决定最终 mixture；当前没有证据支持直接按 KernelBench 频率复制分布，也没有证据支持把多个扩展做 Cartesian product。没有 parent 的 semantic synthetic task 使用独立 generator/provenance root，不能伪装成 intervention child。
 
-执行范围更新（2026-08-05）：另一台 KernelGym 机器只负责小批量构造和验证，任一 non-shape lane 单次最多 5,000 个 candidate（mutation pair 或 standalone task）；random/value 及后续 dtype/layout/semantic 均以 1,000-row canary 为交付终点，不在该机器启动 full-lane 扩增。eligible pool 只用于报告可扩展性，不构成继续放量的授权。本轮允许 A800 作为权威 canary 验收环境，只要完整记录 GPU/Torch/CUDA/cuDNN/KernelGym 和 source-bound runtime fingerprint；不要求为了 H20 硬件一致性重跑。
+Shape、随机数生成分布、dtype 和 layout 已完成全量 review partition，并按随机数生成分布→dtype→layout 串行 fallback 合成为 31,648-row artifact。随机数生成分布最终覆盖 22,908 行，dtype 覆盖 7,249 行，layout 覆盖 7,682 行。Semantic/operator 仍停留在 parentless single-Tensor canary；source/mode coverage、structured semantic output 和训练 ablation 尚未完成。
 
-shape 扩展由当前会话继续负责。另一台 KernelGym 机器并行负责 random/value、coherent dtype、layout、semantic/operator 和 source/mode coverage。两边共享同一份 parent、manifest 和验证合同；runtime policy 不一致的结果只算 static candidate，不能直接合并为统一的 runtime-accepted partition。
-
-截至 2026-08-07，另一台机器已完成 random/value、parameter-free dtype、module-state coherent dtype、layout 和 parentless single-Tensor semantic/operator 的各 1k canary；这些结果都没有获得继续放量或训练授权。Source/mode coverage、structured semantic output、cross-lane merge 和训练 ablation 仍待后续。
+不同 GPU 或 runtime policy 的结果必须作为独立 evidence partition 管理，不能静默合并。只有 exact analyzer 校验过 source、launcher、validator、runtime fingerprint 和 row binding 的结果才能进入串行 review artifact。
 
 所有现有 v4 产物都处于 review 状态，`training_approved=false`。当前训练仍使用 40,307 条 v3 数据。最终数据集必须经过 cross-lane 去重、provenance/license 审计、统一 runtime evidence 检查和受控训练 ablation，不能由任一 lane 单独发布。
 
@@ -24,7 +22,7 @@ shape 扩展由当前会话继续负责。另一台 KernelGym 机器并行负责
 
 本计划把数据扩展分成两类 lineage：
 
-- mutation lanes：shape、random/value、dtype、layout。child 必须绑定 64,315-row canonical parent，且每个 child 只有一个 primary intervention。
+- mutation lanes：shape、随机数生成分布、dtype、layout。child 必须绑定 64,315-row canonical parent，且每个 child 只有一个 primary intervention。
 - standalone lanes：semantic/operator synthesis 和新增 source。它们使用 generator/source、provenance、license 和 decontamination root，不填写虚假的 parent UUID。mode-only variant 若由 canonical row 改写，仍按 mutation child 管理。
 
 ## 差距口径
@@ -48,7 +46,7 @@ tensor numel、所有 direct input 的 aggregate bytes、allocator peak、operat
 | 工作面 | Owner | 当前目标 | 禁止事项 |
 | --- | --- | --- | --- |
 | Shape | 当前会话 | 独立产出 shape partition 和统一交付 manifest | 另一台机器不生成、不验证、不调度 shape，也不等待 shape 进度 |
-| Random/value | 另一台 KernelGym 机器 | value-only 单轴 child；只生成 `uniform_01`、`signed_uniform`、`poisson_counts`、`multinomial_categories` | 不生成 `boundary_pm1`；不同时改 shape/dtype/layout；不把 Poisson、multinomial 当通用连续输入替换 |
+| 随机数生成分布 | 另一台 KernelGym 机器 | 只改变随机数生成分布的单轴 child；只生成 `uniform_01`、`signed_uniform`、`poisson_counts`、`multinomial_categories` | 不生成 `boundary_pm1`；不同时改 shape/dtype/layout；不把 Poisson、multinomial 当通用连续输入替换 |
 | Dtype | 另一台 KernelGym 机器 | parameter-free/proven-compatible input dtype，或 coherent precision sibling | 不只改 input factory 后让 FP16/BF16 撞 FP32 parameter、buffer 或 operand |
 | Layout | 另一台 KernelGym 机器 | 已覆盖 transposed stride、slice/storage offset、zero stride；memory format 后续 | 不和 value/dtype 先做组合；不只依赖源码形式，必须检查 runtime stride |
 | Semantic/operator | 另一台 KernelGym 机器 | 已完成 parentless single-Tensor 1k；后续补薄弱 family 和 heterogeneous graph cell | 不继续堆 shape-preserving pointwise 长链；不从 KernelBench 复制评测题；structured 本轮明确延期 |
@@ -59,9 +57,9 @@ tensor numel、所有 direct input 的 aggregate bytes、allocator peak、operat
 
 ## 另一台机器负责的构造合同
 
-### Random/value
+### 随机数生成分布
 
-random/value 只生成 value-only child，shape、dtype、layout、`Model.forward` 和 `get_init_inputs` 保持不变。每个 parent 用 stable hash 指定一个 eligible family，避免同一 parent 展开全部 family 形成 Cartesian amplification。本轮使用确定性 solver，不需要 LLM：
+随机数生成分布扩增只生成对应的单轴 child，shape、dtype、layout、`Model.forward` 和 `get_init_inputs` 保持不变。每个 parent 用 stable hash 指定一种 eligible 分布，避免同一 parent 展开全部分布形成 Cartesian amplification。本轮使用确定性 solver，不需要 LLM：
 
 - `uniform_01`：将原 `randn` draw 映射到 `[0, 1)`；
 - `signed_uniform`：将原 draw 映射到 `[-1, 1)`；
@@ -72,9 +70,9 @@ Poisson 和 multinomial 的结果仍编码在原浮点 dtype 中，并保持原 
 
 Poisson runtime evidence 必须从 parent 重算同一 rate mapping，报告固定区间的 rate histogram 和 sampled count histogram，并分别校验频次守恒；只报 min/max 不足以验收。Multinomial 必须按实际 runtime dtype 检查 category ID 的精确整数表示上限，并报告 last-dimension cardinality。
 
-2026-08-05 的 1k A800 canary 已完成：1,000 个 candidate 中 850 个 parent/child reference 双通过，792 个再通过 value/output liveness；accepted family 为 Multinomial 205、Poisson 209、signed Uniform 189、Uniform `[0,1)` 189，`boundary_pm1=0`。产物仍为 review-only，详见 `handoffs/data/synthesize/RANDOM_VALUE_CANARY.md`。
+全量构造已完整消费 31,648 个 shape-resample row：31,428 个 parent/child reference 双通过，31,039 个再通过输入值/输出 liveness，语义门禁最终保留 22,908 个随机数生成分布 child。产物仍为 review-only，详见 `handoffs/data/synthesize/random_distribution_augmentation.md`。
 
-旧 pilot 的 306 个 value intervention 中有 260 个 child pass，但其中 208 个同时改了 shape，且没有 paired parent runtime。该结果只能说明构造可执行，不能给出 value intervention 的独立通过率。新 canary 必须 paired 运行 parent/child，并把 evaluator failure、OOM、reference failure 和 intervention-induced failure 分开。
+旧 pilot 的 306 个 value intervention 中有 260 个 child pass，但其中 208 个同时改了 shape，且没有 paired parent runtime。该结果只能说明构造可执行，不能给出 value intervention 的独立通过率。后续批次必须 paired 运行 parent/child，并把 evaluator failure、OOM、reference failure 和 intervention-induced failure 分开。
 
 ### Dtype
 
@@ -117,9 +115,9 @@ source coverage 通过合规来源和受控生成扩展。Oubo 数据需先补 p
 
 ## 统一执行流程
 
-另一台机器上的每个新 non-shape 合同都按下列顺序运行，并先做 1,000-row canary；mutation lane 对应 1,000 个 parent/pair，standalone lane 对应 1,000 个 generator task。该流程不依赖 shape lane 的状态。
+每个新 non-shape 合同先做 1,000-row canary；mutation lane 对应 1,000 个 parent/pair，standalone lane 对应 1,000 个 generator task。Canary 完成人工 diff、失败偏差和 runtime evidence 复核后，才决定是否扩大。
 
-Random/value、dtype、layout 和 semantic/operator 现在已有 lane-local solver、validator、launcher 和 exact analyzer，并各完成 1k canary；这些工具只授权复现对应 review lane，不授权 full run。旧混合 shape/value generator、input-only dtype pilot、单一 layout pilot 和 pointwise-heavy semantic generator 仍是 legacy，不能代替新合同。Source/mode 尚未形成同等级正式 pipeline。Semantic task 没有 parent，使用 reference correctness、declared-op dependency/provenance 和 decontamination gate；mutation lanes 继续使用 paired parent/child gate。
+随机数生成分布、dtype 和 layout 已有 lane-local solver、validator、launcher、exact analyzer 和全量 review artifact。Semantic/operator 只有 canary，source/mode 尚未形成同等级正式 pipeline。Semantic task 没有 parent，使用 reference correctness、declared-op dependency/provenance 和 decontamination gate；mutation lanes 使用 paired parent/child gate。
 
 ```text
 immutable canonical parents or generator/provenance roots
@@ -130,13 +128,13 @@ immutable canonical parents or generator/provenance roots
   -> intervention-specific liveness
   -> lane bias and failure audit
   -> 1k lane-local canary handoff
-  -> any further scale-up requires separate authorization
+  -> explicit scale-up decision and full-lane validation
   -> cross-lane identity/provenance/evidence merge
   -> equal-budget training ablation
   -> mixture decision and explicit training approval
 ```
 
-canary 的 acceptance rate 用于估算后续运行成本和暴露构造问题，不设成训练价值代理。本机所有 non-shape 单次构造或验证不超过 5,000；本轮已完成的 random/value、dtype、layout、semantic/operator 均以 1,000-row 为交付上限，不因 eligible pool 大小自动放量。每轮至少人工复核不同 source、operator、target cell、成功与失败的真实 reference diff 和 raw runtime audit。
+Canary 的 acceptance rate 只用于估算运行成本和暴露构造问题，不作为训练价值代理。任何扩量都要重新执行 source-bound static、paired reference、intervention-specific liveness、exact merge 和人工抽检，不能只复制 canary 的通过率。
 
 生产数据路径不新增单元测试，继续依赖 `py_compile`、CLI/launcher syntax、真实 canary、deterministic shard merge、exact manifest checker 和人工样本复核。任何 source-bound generator/validator 改动都会使旧 manifest 或 runtime binding 的 source hash 失效，必须重建相应 evidence。
 
@@ -171,7 +169,7 @@ manifest 一行对应一行 parquet，顺序固定，并包含：
 
 | Lane | 必报分布 | 必报 failure attribution |
 | --- | --- | --- |
-| Random/value | family、factory、support、rate/count 分布、category cardinality、source/operator 条件分布；另报 multinomial last-dimension eligibility 和各 family 的 paired/liveness 拒绝率 | evaluator、domain、numerical、OOM、joint contamination |
+| 随机数生成分布 | 分布类型、factory、support、rate/count 分布、category cardinality、source/operator 条件分布；另报 multinomial last-dimension eligibility 和各分布的 paired/liveness 拒绝率 | evaluator、domain、numerical、OOM、joint contamination |
 | Dtype | target dtype、parameter/buffer/constant 一致性、cast/promotion、source/operator | dtype mismatch、unsupported op、tolerance、implicit FP32 fallback |
 | Layout | pattern、rank、stride、offset、contiguity、source/operator | intervention erased、unsupported stride、evaluator、reference |
 | Semantic/source | family、topology、op count、shape-changing/stateful/single-Tensor cells、lineage；structured 另报延期状态 | invalid graph、dead op、mode/state、provenance/license、evaluator |
@@ -211,7 +209,7 @@ materialize/merge 还依赖 decontamination baseline `Data/external/converted/ke
 | --- | --- |
 | B0 | 当前训练 baseline |
 | B1 | shape only |
-| B2 | random/value only |
+| B2 | 随机数生成分布 only |
 | B3 | coherent dtype only |
 | B4 | layout only |
 | B5 | semantic/operator only |
