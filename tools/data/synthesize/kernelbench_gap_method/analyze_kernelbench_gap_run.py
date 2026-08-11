@@ -472,7 +472,7 @@ def _verify_reference(
 
 
 def _failure_reason(record: Mapping[str, Any]) -> str:
-    reason = record.get("failure_signature") or record.get("reason") or record.get("error") or record.get("status")
+    reason = record.get("error") or record.get("reason") or record.get("status") or record.get("failure_signature")
     return _canonical_json(reason) if isinstance(reason, (Mapping, list)) else str(reason)
 
 
@@ -678,7 +678,22 @@ def _verify_liveness_launcher_evidence(
     ):
         if document.get("contract_version") != contract or document.get("shard_count") != shard_count:
             raise ValueError(f"liveness {label} contract/shard count mismatch")
-        if document.get("source_binding") != expected_sources:
+        observed_sources = document.get("source_binding")
+        if not isinstance(observed_sources, Mapping) or set(observed_sources) != set(expected_sources):
+            raise ValueError(f"liveness {label} source binding mismatch")
+        projected_sources: dict[str, dict[str, Any]] = {}
+        for name, value in observed_sources.items():
+            expected_fields = {"path", "sha256"}
+            if label == "launcher summary" and name == "shared_runtime_core_source":
+                expected_fields.add("contract_version")
+            if not isinstance(value, Mapping) or set(value) != expected_fields:
+                raise ValueError(f"liveness {label} source binding mismatch")
+            projected_sources[name] = {"path": value.get("path"), "sha256": value.get("sha256")}
+            if "contract_version" in expected_fields and value.get("contract_version") != raw_sources[name].get(
+                "contract_version"
+            ):
+                raise ValueError(f"liveness {label} runtime-core contract mismatch")
+        if projected_sources != expected_sources:
             raise ValueError(f"liveness {label} source binding mismatch")
     if scheduler.get("candidates") != {"path": str(candidates_path), "sha256": candidate_sha}:
         raise ValueError("liveness scheduler candidate binding mismatch")
@@ -1047,6 +1062,7 @@ def analyze(
         updated.update(
             {
                 "reference_runtime_status": "passed",
+                "operator_liveness_status": "passed",
                 "kernelbench_gap_liveness_status": "passed",
                 "runtime_status": ACCEPTED_RUNTIME_STATUS,
                 "governance_status": ACCEPTED_GOVERNANCE_STATUS,
