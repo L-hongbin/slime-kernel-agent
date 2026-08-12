@@ -2402,6 +2402,37 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
     return eval_datasets
 
 
+def _resolve_checkpoint_load_args(args) -> None:
+    """Apply checkpoint fallbacks without replacing an explicit rollout id."""
+    if args.megatron_to_hf_mode == "bridge":
+        load_is_megatron = (
+            args.load is not None
+            and os.path.exists(args.load)
+            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+        )
+        if not load_is_megatron:
+            if args.load is None:
+                args.load = args.ref_load or args.hf_checkpoint
+            if args.start_rollout_id is None:
+                args.start_rollout_id = 0
+        return
+
+    load_is_megatron = (
+        args.load is not None
+        and os.path.exists(args.load)
+        and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
+    )
+    if not load_is_megatron:
+        args.no_load_optim = True
+        args.no_load_rng = True
+        args.finetune = True
+        args.load = args.ref_load
+        if args.ref_ckpt_step is not None:
+            args.ckpt_step = args.ref_ckpt_step
+        if args.start_rollout_id is None:
+            args.start_rollout_id = 0
+
+
 def slime_validate_args(args):
     if getattr(args, "enable_fp32_lm_head", False):
         args.fp32_lm_head = True
@@ -2497,32 +2528,7 @@ def slime_validate_args(args):
         if args.opd_teacher_load is not None:
             raise ValueError("--opd-teacher-load is set but --use-opd is not enabled. Please add --use-opd flag.")
 
-    if args.megatron_to_hf_mode == "bridge":
-        if (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            # If is a Megatron checkpoint, won't use bridge to load hf weight.
-            pass
-        else:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            # If is a HF checkpoint, set start_rollout_id to 0 here.
-            args.start_rollout_id = 0
-    else:
-        if (
-            args.load is None
-            or not os.path.exists(args.load)
-            or not os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        ):
-            args.no_load_optim = True
-            args.no_load_rng = True
-            args.finetune = True
-            args.load = args.ref_load
-            if args.ref_ckpt_step is not None:
-                args.ckpt_step = args.ref_ckpt_step
-            args.start_rollout_id = 0
+    _resolve_checkpoint_load_args(args)
 
     if args.eval_interval is not None:
         assert args.eval_datasets, "Evaluation datasets must be configured when eval_interval is set."

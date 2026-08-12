@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from slime.utils.arguments import _resolve_checkpoint_load_args
+
 
 NUM_GPUS = 0
 
@@ -238,6 +240,28 @@ def test_default_args_disable_distributed_optimizer_for_muon(monkeypatch):
     assert args.overlap_param_gather is False
     assert args.overlap_param_gather_with_optimizer_step is False
     assert args.bf16 is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("megatron_to_hf_mode", ["raw", "bridge"])
+@pytest.mark.parametrize(("start_rollout_id", "expected"), [(100, 100), (None, 0)])
+def test_checkpoint_fallback_preserves_explicit_start_rollout_id(megatron_to_hf_mode, start_rollout_id, expected):
+    args = types.SimpleNamespace(
+        megatron_to_hf_mode=megatron_to_hf_mode,
+        load=None,
+        ref_load=None,
+        hf_checkpoint="/tmp/hf",
+        ref_ckpt_step=7,
+        ckpt_step=None,
+        no_load_optim=False,
+        no_load_rng=False,
+        finetune=False,
+        start_rollout_id=start_rollout_id,
+    )
+
+    _resolve_checkpoint_load_args(args)
+
+    assert args.start_rollout_id == expected
 
 
 if __name__ == "__main__":
