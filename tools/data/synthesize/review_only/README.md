@@ -2,6 +2,14 @@
 
 This directory contains read-only review tooling for the final shape → dtype additive artifact.  Layout is explicitly deferred and is not included in the additive data, H20 post-selection gate, deterministic sample, or Kimi packet.  The tooling does not run a model, invoke Kimi, alter selected data, or alter the frozen synthesis pipeline
 
+After the four dtype H20 shards have been copied back, audit their artifact lineage, source bindings, result payloads, and three-trial numerical evidence before selection:
+
+```bash
+python -m tools.data.synthesize.review_only.audit_dtype_runtime \
+  "$RUN/dtype" --repo-root "$PWD" --require-complete \
+  --output "$RUN/dtype/review_runtime_independent/audit.json"
+```
+
 Run only after `finalize_shape_dtype_expansion.py` has written `final_summary.json` and both H20 post-selection directories have been synchronized back to the artifact host.  `$RUN` must carry freezes produced from the same source revision; the output directory must not exist
 
 ```bash
