@@ -144,6 +144,7 @@ _EXPLICIT_VALUE_SCHEMAS = frozenset(
         "aten::native_batch_norm",
         "aten::native_group_norm",
         "aten::native_layer_norm",
+        "aten::nll_loss_forward",
         "aten::permute",
         "aten::relu",
         "aten::reshape",
