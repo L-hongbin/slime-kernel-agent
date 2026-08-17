@@ -322,7 +322,7 @@ python -m tools.data.synthesize.review_only.sample_serial_expanded_one_question_
   --fallback-fraction 0.20
 ```
 
-正式入口为 `tools/data/synthesize/review_only/sample_serial_expanded_one_question_per_parent.py`，覆盖加权 selector 位于同目录的 `sample_serial_expanded_one_question_per_parent_v2.py`。KernelBench 对比图由同目录的 `plot_serial_release_vs_kernelbench.py` 生成，完整测量值和输入 SHA 写入 `kernelbench_comparison.json` -->
+正式 selector 为 `tools/data/synthesize/review_only/sample_serial_expanded_one_question_per_parent.py`。KernelBench 对比图由 `plot_serial_release_vs_kernelbench.py` 生成，完整测量值和输入 SHA 写入 `kernelbench_comparison.json` -->
 
 <!-- ## 使用边界
 
