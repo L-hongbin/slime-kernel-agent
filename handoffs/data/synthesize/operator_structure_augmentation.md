@@ -256,7 +256,7 @@ KernelBench 的 `ndim` 通过实际执行 `get_inputs()` 取输入 tensor 的最
 
 核心代码:
 
-- `tools/data/synthesize/csp_dag_method/generate_csp_dag_canary.py`:operator schema、DAG 采样、shape CSP 与 lowering
+- `tools/data/synthesize/csp_dag_method/generate_csp_dag.py`:operator schema、DAG 采样、shape CSP 与 lowering
 - `tools/data/synthesize/csp_dag_method/build_csp_dag_5k.py`:直接生成 5，000 条并 strict near-dedup
 - `tools/data/synthesize/csp_dag_method/audit_csp_dag_near_duplicates.py`:source/semantic graph near-dedup
 - `tools/data/synthesize/csp_dag_method/audit_csp_dag_quality.py`:静态质量 gate
@@ -266,7 +266,6 @@ KernelBench 的 `ndim` 通过实际执行 `get_inputs()` 取输入 tensor 的最
 - `tools/data/synthesize/csp_dag_method/build_csp_dag_input_expansions.py`:shape/dtype 构造和 fail-closed selection
 - `tools/data/synthesize/csp_dag_method/finalize_shape_dtype_expansion.py`:shape/dtype lineage、layout deferral 与 additive 汇总
 - `review_runtime_independent/audit_dtype_v5_runtime.py`:dtype runtime 独立全量审计
-- `tools/data/synthesize/csp_dag_method/audit_layout_runtime_independent.py`:layout 重新启用时使用的静态与 runtime 审计器
 - `tools/data/synthesize/review_only/audit_csp_dag_final_v4.py`:shape+dtype 独立终审
 - `tools/data/synthesize/review_only/verify_kimi_k3_packet.py`:Kimi 28 条 response verify-only gate
 
