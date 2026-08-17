@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Validate dtype realization, coherent model state, and no-FP32 fallback.
+"""Validate dtype realization and coherent model state on logical DAG values.
 
 Each row is isolated in a subprocess under the 64-GiB allocator guard.  Three
 deterministic trials prove direct-input realization, construction RNG equality,
-the selected model-state coherence contract, cast-equivalent outputs, and a
-child dispatcher trace with no floating output outside the assigned dtype.
+the selected model-state coherence contract, cast-equivalent outputs, and that
+every generated ``Model.forward`` logical ``vN`` value is in the assigned
+dtype.  Dispatcher transitions are retained as diagnostics: an internal ATen
+FP32 temporary is permitted, while an internal complex result remains a
+conservative rejection.
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -43,6 +47,7 @@ from tools.data.cleaning.runtime_validation import (
     _snapshot_rng_states,
     _to_device,
 )
+from tools.data.synthesize.csp_dag_method.validate_csp_dag_repeatability import _repeatability_execution_context
 from tools.data.synthesize.serial_source_contract import resolve_lane_serial_source
 from tools.data.synthesize.validate_train_mode_contract import _cuda_memory_guard, _CudaMemoryGuardFailure
 
@@ -50,13 +55,16 @@ PARAMETER_FREE = "parameter_free"
 MODULE_STATE = "module_state"
 COHERENCE_CLASSES = frozenset({PARAMETER_FREE, MODULE_STATE})
 CONTRACT_VERSIONS = {
-    PARAMETER_FREE: "dtype_parameter_free_runtime_liveness_v2",
-    MODULE_STATE: "dtype_module_state_runtime_liveness_v1",
+    PARAMETER_FREE: "dtype_parameter_free_runtime_liveness_v6",
+    MODULE_STATE: "dtype_module_state_runtime_liveness_v5",
 }
 RUN_BINDING_VERSIONS = {
-    PARAMETER_FREE: "dtype_parameter_free_runtime_binding_v2",
-    MODULE_STATE: "dtype_module_state_runtime_binding_v1",
+    PARAMETER_FREE: "dtype_parameter_free_runtime_binding_v6",
+    MODULE_STATE: "dtype_module_state_runtime_binding_v5",
 }
+RESULT_BINDING_VERSION = "dtype_runtime_result_payload_binding_v1"
+FLOAT_COMPARATOR_CONTRACT = "dtype_cast_equivalent_torch_allclose_v1"
+EXACT_COMPARATOR_CONTRACT = "dtype_nonfloating_torch_equal_v1"
 RESULT_MARKER = "__DTYPE_LIVENESS_RESULT__="
 MAX_DEVICE_MEMORY_GIB = 64.0
 MAX_AUTHORIZED_CANDIDATES = 5_000
@@ -65,8 +73,46 @@ REQUIRED_LIVENESS_SEED = 17
 LOW_PRECISION_TOLERANCES = {"float16": 1e-2, "bfloat16": 2e-2}
 TARGET_DTYPES = frozenset({"float16", "bfloat16"})
 MAX_RECORDED_DISPATCH_TRANSITIONS = 256
+_LOGICAL_VALUE_RE = re.compile(r"v(?P<index>[0-9]+)\Z")
 _DRIVER_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 _ACTIVE_WORKER_PROCESS: subprocess.Popen[str] | None = None
+_UNSUPPORTED_RUNTIME_OPTIONAL_FIELDS = frozenset({"worker_stderr_tail"})
+_UNSUPPORTED_RUNTIME_FIELDS = frozenset(
+    {
+        "allowlist_sha256",
+        "assigned_dtype",
+        "binding_version",
+        "candidate_row_index",
+        "child_uuid",
+        "children_sha256",
+        "coherence_class",
+        "contract_version",
+        "duration_seconds",
+        "execution_context",
+        "launcher_source_sha256",
+        "manifest_sha256",
+        "memory_guard",
+        "parent_uuid",
+        "parents_sha256",
+        "passed",
+        "reason",
+        "result_binding_version",
+        "result_payload_sha256",
+        "runtime_dependencies",
+        "status",
+        "transformed_factory_count",
+        "validation_binding_sha256",
+        "validation_config",
+        "validator_source_sha256",
+    }
+)
+_RUNTIME_DEPENDENCY_PATHS = {
+    "runtime_validation": _REPO_ROOT / "tools/data/cleaning/runtime_validation.py",
+    "serial_source_contract": _REPO_ROOT / "tools/data/synthesize/serial_source_contract.py",
+    "repeatability_execution_context": _REPO_ROOT
+    / "tools/data/synthesize/csp_dag_method/validate_csp_dag_repeatability.py",
+    "train_mode_memory_guard": _REPO_ROOT / "tools/data/synthesize/validate_train_mode_contract.py",
+}
 
 
 def contract_version(coherence_class: str) -> str:
@@ -101,6 +147,66 @@ def _sha256_file(path: Path) -> str:
 
 def _canonical_sha256(value: Any) -> str:
     return _sha256_bytes(json.dumps(value, sort_keys=True, separators=(",", ":")).encode())
+
+
+def _payload_sha256(value: Mapping[str, Any], digest_field: str) -> str:
+    """Bind one finalized payload without recursively including its digest."""
+
+    return _canonical_sha256({key: item for key, item in value.items() if key != digest_field})
+
+
+def _comparison_payload_sha256(value: Mapping[str, Any]) -> str:
+    return _payload_sha256(value, "comparison_payload_sha256")
+
+
+def _trial_payload_sha256(value: Mapping[str, Any]) -> str:
+    return _payload_sha256(value, "trial_payload_sha256")
+
+
+def _result_payload_sha256(value: Mapping[str, Any]) -> str:
+    return _payload_sha256(value, "result_payload_sha256")
+
+
+def _validate_unsupported_runtime_schema(record: Mapping[str, Any]) -> None:
+    """Require one canonical top-level shape for a rejected runtime row."""
+
+    if record.get("status") != "unsupported":
+        return
+    actual = set(record)
+    missing = _UNSUPPORTED_RUNTIME_FIELDS - actual
+    unexpected = actual - _UNSUPPORTED_RUNTIME_FIELDS - _UNSUPPORTED_RUNTIME_OPTIONAL_FIELDS
+    reason = record.get("reason")
+    detail = reason.removeprefix("UnsupportedCase:").strip() if isinstance(reason, str) else ""
+    stderr = record.get("worker_stderr_tail")
+    if (
+        record.get("passed") is not False
+        or not isinstance(reason, str)
+        or not reason.startswith("UnsupportedCase:")
+        or not detail
+        or missing
+        or unexpected
+        or ("worker_stderr_tail" in record and (not isinstance(stderr, str) or not stderr.strip()))
+    ):
+        raise ValueError(
+            "unsupported runtime record schema mismatch:" f"missing={sorted(missing)}:unexpected={sorted(unexpected)}"
+        )
+
+
+def _runtime_dependencies() -> dict[str, dict[str, str]]:
+    """Return every checked-in helper directly used by this runtime validator.
+
+    This is evidence, not an advisory provenance list: the selector compares
+    every path/hash pair against its own current production copy before it
+    accepts a record.  Keep paths repository-relative so an H20 node and the
+    authoring node obtain the same binding.
+    """
+    return {
+        name: {
+            "path": str(path.relative_to(_REPO_ROOT)),
+            "sha256": _sha256_file(path),
+        }
+        for name, path in _RUNTIME_DEPENDENCY_PATHS.items()
+    }
 
 
 def _nested(value: Any, path: str, default: Any = None) -> Any:
@@ -528,6 +634,109 @@ def _run_arm(model: Any, inputs: Sequence[Any], rng_state: Mapping[str, Any]) ->
         del trial_model
 
 
+class _LogicalForwardCapture:
+    """Capture generated ``Model.forward`` local DAG values without rewriting it.
+
+    Generated CSP-DAG lowering names every logical result ``v0`` through
+    ``vN``.  Inspecting the exact outer forward frame at its return event keeps
+    the dtype assertion at the generated-program boundary.  It deliberately
+    does not ascribe ATen implementation temporaries to logical DAG values.
+    """
+
+    def __init__(self, model: Any, torch: Any) -> None:
+        forward = getattr(model.forward, "__func__", model.forward)
+        code = getattr(forward, "__code__", None)
+        if code is None:
+            raise UnsupportedCase("model_forward_is_not_python_traceable")
+        self._code = code
+        self._torch = torch
+        self._returns: list[dict[str, Any]] = []
+
+    def trace(self, frame: Any, event: str, arg: Any) -> Any:
+        del arg
+        if event == "return" and frame.f_code is self._code:
+            values: list[tuple[int, str, Any]] = []
+            for name, value in frame.f_locals.items():
+                matched = _LOGICAL_VALUE_RE.fullmatch(name)
+                if matched is not None and name == f"v{int(matched.group('index'))}":
+                    values.append((int(matched.group("index")), name, value))
+            self._returns.append({"values": tuple(sorted(values))})
+        return self.trace
+
+    def evidence(self, *, target_dtype: Any) -> dict[str, Any]:
+        if len(self._returns) != 1:
+            raise UnsupportedCase(f"logical_forward_return_count_mismatch:{len(self._returns)}")
+        values = self._returns[0]["values"]
+        if not values:
+            raise UnsupportedCase("logical_forward_values_not_observed")
+        indices = [index for index, _name, _value in values]
+        expected = list(range(len(indices)))
+        if indices != expected:
+            raise UnsupportedCase(f"logical_forward_value_indices_not_contiguous:{indices[:8]}:{indices[-8:]}")
+        floating_dtypes: collections.Counter[str] = collections.Counter()
+        nonfloating_dtypes: collections.Counter[str] = collections.Counter()
+        for _index, name, value in values:
+            if not isinstance(value, self._torch.Tensor):
+                raise UnsupportedCase(f"logical_forward_value_not_tensor:{name}:{type(value).__qualname__}")
+            if value.dtype.is_complex:
+                raise UnsupportedCase(f"logical_forward_complex_value:{name}:{value.dtype}")
+            if value.dtype.is_floating_point:
+                floating_dtypes[str(value.dtype)] += 1
+                if value.dtype != target_dtype:
+                    raise UnsupportedCase(
+                        f"logical_forward_float_value_not_target:{name}:{value.dtype}:{target_dtype}"
+                    )
+            else:
+                nonfloating_dtypes[str(value.dtype)] += 1
+        names = [name for _index, name, _value in values]
+        return {
+            "target_dtype": str(target_dtype),
+            "forward_return_count": 1,
+            "logical_value_count": len(values),
+            "logical_value_indices_sha256": _canonical_sha256(indices),
+            "floating_logical_value_count": sum(floating_dtypes.values()),
+            "nonfloating_logical_value_count": sum(nonfloating_dtypes.values()),
+            "floating_logical_dtypes": dict(sorted(floating_dtypes.items())),
+            "nonfloating_logical_dtypes": dict(sorted(nonfloating_dtypes.items())),
+            "logical_value_names_sha256": _canonical_sha256(names),
+        }
+
+
+def _assert_floating_tree_target_dtype(value: Any, *, target_dtype: Any, torch: Any, path: str) -> dict[str, Any]:
+    """Reject complex or non-target floating final outputs recursively."""
+
+    floating_dtypes: collections.Counter[str] = collections.Counter()
+    nonfloating_dtypes: collections.Counter[str] = collections.Counter()
+
+    def visit(item: Any, item_path: str) -> None:
+        if isinstance(item, torch.Tensor):
+            if item.dtype.is_complex:
+                raise UnsupportedCase(f"final_output_complex:{item_path}:{item.dtype}")
+            if item.dtype.is_floating_point:
+                floating_dtypes[str(item.dtype)] += 1
+                if item.dtype != target_dtype:
+                    raise UnsupportedCase(f"final_output_float_not_target:{item_path}:{item.dtype}:{target_dtype}")
+            else:
+                nonfloating_dtypes[str(item.dtype)] += 1
+            return
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                visit(nested, f"{item_path}.{key}")
+            return
+        if isinstance(item, (list, tuple)):
+            for index, nested in enumerate(item):
+                visit(nested, f"{item_path}[{index}]")
+
+    visit(value, path)
+    return {
+        "target_dtype": str(target_dtype),
+        "floating_final_output_count": sum(floating_dtypes.values()),
+        "nonfloating_final_output_count": sum(nonfloating_dtypes.values()),
+        "floating_final_output_dtypes": dict(sorted(floating_dtypes.items())),
+        "nonfloating_final_output_dtypes": dict(sorted(nonfloating_dtypes.items())),
+    }
+
+
 def _run_traced_arm(
     model: Any,
     inputs: Sequence[Any],
@@ -543,7 +752,8 @@ def _run_traced_arm(
         def __init__(self) -> None:
             super().__init__()
             self.transitions: collections.Counter[tuple[str, tuple[str, ...], tuple[str, ...]]] = collections.Counter()
-            self.fallbacks: collections.Counter[tuple[str, str]] = collections.Counter()
+            self.internal_non_target_floating_outputs: collections.Counter[tuple[str, str]] = collections.Counter()
+            self.complex_outputs: collections.Counter[tuple[str, str]] = collections.Counter()
             self.target_consuming_calls = 0
             self.total_calls = 0
 
@@ -562,17 +772,23 @@ def _run_traced_arm(
                 self.target_consuming_calls += 1
             for tensor in output_tensors:
                 if tensor.dtype.is_complex:
-                    self.fallbacks[(name, str(tensor.dtype))] += 1
+                    self.complex_outputs[(name, str(tensor.dtype))] += 1
                 elif tensor.dtype.is_floating_point and tensor.dtype != target_dtype:
-                    self.fallbacks[(name, str(tensor.dtype))] += 1
+                    self.internal_non_target_floating_outputs[(name, str(tensor.dtype))] += 1
             return output
 
     trial_model = copy.deepcopy(model)
     mode = DtypeTraceMode()
+    logical_capture = _LogicalForwardCapture(trial_model, torch)
+    prior_trace = sys.gettrace()
     try:
         _restore_rng_states(rng_state)
-        with torch.no_grad(), mode:
-            raw_output = _invoke_model(trial_model, inputs)
+        sys.settrace(logical_capture.trace)
+        try:
+            with torch.no_grad(), mode:
+                raw_output = _invoke_model(trial_model, inputs)
+        finally:
+            sys.settrace(prior_trace)
         if coherence_class == MODULE_STATE:
             _assert_model_state_dtype(trial_model, target_dtype, torch)
         else:
@@ -580,24 +796,41 @@ def _run_traced_arm(
         output = _snapshot_output(raw_output)
         if not _all_finite(output):
             raise UnsupportedCase("non_finite_traced_output")
+        logical_evidence = logical_capture.evidence(target_dtype=target_dtype)
+        final_output_evidence = _assert_floating_tree_target_dtype(
+            raw_output, target_dtype=target_dtype, torch=torch, path="output"
+        )
     finally:
+        # A forward exception must not leave a worker-wide trace installed.
+        sys.settrace(prior_trace)
         del trial_model
     if mode.target_consuming_calls <= 0:
         raise UnsupportedCase("dispatch_trace_did_not_consume_target_dtype")
-    if mode.fallbacks:
-        first = next(iter(sorted(mode.fallbacks.items())))
-        raise UnsupportedCase(f"dispatch_fp32_or_complex_fallback:{first[0][0]}:{first[0][1]}:{first[1]}")
+    if mode.complex_outputs:
+        first = next(iter(sorted(mode.complex_outputs.items())))
+        raise UnsupportedCase(f"dispatch_complex_output:{first[0][0]}:{first[0][1]}:{first[1]}")
     ordered = sorted(mode.transitions.items(), key=lambda item: (-item[1], item[0]))
+    ordered_internal_fp32 = sorted(
+        mode.internal_non_target_floating_outputs.items(), key=lambda item: (-item[1], item[0])
+    )
     return output, {
         "total_dispatch_calls": mode.total_calls,
         "target_consuming_calls": mode.target_consuming_calls,
-        "fp32_or_complex_fallback_calls": 0,
+        "internal_non_target_floating_output_calls": sum(mode.internal_non_target_floating_outputs.values()),
+        "internal_non_target_floating_output_transition_count": len(ordered_internal_fp32),
+        "internal_non_target_floating_output_transitions": [
+            {"operator": key[0], "output_dtype": key[1], "calls": count}
+            for key, count in ordered_internal_fp32[:MAX_RECORDED_DISPATCH_TRANSITIONS]
+        ],
+        "complex_output_calls": 0,
         "transition_count": len(ordered),
         "transitions_truncated": len(ordered) > MAX_RECORDED_DISPATCH_TRANSITIONS,
         "transitions": [
             {"operator": key[0], "input_dtypes": list(key[1]), "output_dtypes": list(key[2]), "calls": count}
             for key, count in ordered[:MAX_RECORDED_DISPATCH_TRANSITIONS]
         ],
+        "logical_forward": logical_evidence,
+        "final_output": final_output_evidence,
     }
 
 
@@ -624,47 +857,92 @@ def _compare_outputs(
                 raise UnsupportedCase(f"child_float_output_not_target:{path}:{child.dtype}:{target_dtype}")
             parent_float = parent.to(torch.float32)
             child_float = child.to(torch.float32)
-            difference = (parent_float - child_float).abs()
-            if not bool(
-                torch.allclose(
-                    parent_float,
-                    child_float,
-                    rtol=tolerance,
-                    atol=tolerance,
-                    equal_nan=False,
-                )
+            if not bool(torch.isfinite(parent_float).all().item()) or not bool(
+                torch.isfinite(child_float).all().item()
             ):
+                raise UnsupportedCase(f"non_finite_cast_equivalent_output:{path}")
+            difference = (parent_float - child_float).abs()
+            allowed = tolerance + tolerance * child_float.abs()
+            violating_elements = int((difference > allowed).sum().item())
+            allclose_passed = bool(
+                torch.allclose(parent_float, child_float, rtol=tolerance, atol=tolerance, equal_nan=False)
+            )
+            elementwise_passed = violating_elements == 0
+            if allclose_passed is not elementwise_passed:
+                raise RuntimeError(f"torch allclose disagrees with comparator witness:{path}")
+            maximum_absolute_difference = float(difference.max().item()) if child.numel() else 0.0
+            mean_absolute_difference = float(difference.mean().item()) if child.numel() else 0.0
+            maximum_tolerance_ratio = float((difference / allowed).max().item()) if child.numel() else 0.0
+            maximum_tolerance_excess = float((difference - allowed).max().item()) if child.numel() else 0.0
+            maximum_reference_absolute_value = float(child_float.abs().max().item()) if child.numel() else 0.0
+            maximum_allowed_absolute_difference = (
+                tolerance + tolerance * maximum_reference_absolute_value if child.numel() else 0.0
+            )
+            if not allclose_passed:
                 raise UnsupportedCase(
-                    f"cast_equivalent_output_mismatch:{path}:max_abs={float(difference.max().item())}"
+                    f"cast_equivalent_output_mismatch:{path}:max_abs={maximum_absolute_difference}:"
+                    f"max_ratio={maximum_tolerance_ratio}:violations={violating_elements}"
                 )
-            return [
-                {
-                    "path": path,
-                    "shape": list(child.shape),
-                    "parent_dtype": str(parent.dtype),
-                    "child_dtype": str(child.dtype),
-                    "elements": child.numel(),
-                    "maximum_absolute_difference": float(difference.max().item()) if child.numel() else 0.0,
-                    "mean_absolute_difference": float(difference.mean().item()) if child.numel() else 0.0,
-                    "rtol": tolerance,
-                    "atol": tolerance,
-                }
-            ]
-        if child.dtype != parent.dtype or not torch.equal(parent, child):
-            raise UnsupportedCase(f"non_float_output_mismatch:{path}:{parent.dtype}:{child.dtype}")
-        return [
-            {
+            record = {
                 "path": path,
                 "shape": list(child.shape),
                 "parent_dtype": str(parent.dtype),
                 "child_dtype": str(child.dtype),
                 "elements": child.numel(),
-                "maximum_absolute_difference": 0.0,
-                "mean_absolute_difference": 0.0,
+                "maximum_absolute_difference": maximum_absolute_difference,
+                "mean_absolute_difference": mean_absolute_difference,
+                "maximum_tolerance_ratio": maximum_tolerance_ratio,
+                "maximum_tolerance_excess": maximum_tolerance_excess,
+                "maximum_reference_absolute_value": maximum_reference_absolute_value,
+                "maximum_allowed_absolute_difference": maximum_allowed_absolute_difference,
+                "violating_elements": violating_elements,
+                "within_tolerance": True,
+                "allclose_passed": True,
+                "rtol": tolerance,
+                "atol": tolerance,
+                "comparator": {
+                    "contract": FLOAT_COMPARATOR_CONTRACT,
+                    "implementation": "torch.allclose",
+                    "rtol": tolerance,
+                    "atol": tolerance,
+                    "equal_nan": False,
+                    "relative_reference_operand": "child",
+                    "elementwise_bound": "abs(parent-child) <= atol + rtol * abs(child)",
+                },
+            }
+            record["comparison_payload_sha256"] = _comparison_payload_sha256(record)
+            return [record]
+        if child.dtype != parent.dtype or not torch.equal(parent, child):
+            raise UnsupportedCase(f"non_float_output_mismatch:{path}:{parent.dtype}:{child.dtype}")
+        record = {
+            "path": path,
+            "shape": list(child.shape),
+            "parent_dtype": str(parent.dtype),
+            "child_dtype": str(child.dtype),
+            "elements": child.numel(),
+            "maximum_absolute_difference": 0.0,
+            "mean_absolute_difference": 0.0,
+            "maximum_tolerance_ratio": 0.0,
+            "maximum_tolerance_excess": 0.0,
+            "maximum_reference_absolute_value": 0.0,
+            "maximum_allowed_absolute_difference": 0.0,
+            "violating_elements": 0,
+            "within_tolerance": True,
+            "allclose_passed": True,
+            "rtol": 0.0,
+            "atol": 0.0,
+            "comparator": {
+                "contract": EXACT_COMPARATOR_CONTRACT,
+                "implementation": "torch.equal",
                 "rtol": 0.0,
                 "atol": 0.0,
-            }
-        ]
+                "equal_nan": False,
+                "relative_reference_operand": None,
+                "elementwise_bound": "exact equality",
+            },
+        }
+        record["comparison_payload_sha256"] = _comparison_payload_sha256(record)
+        return [record]
     if isinstance(parent, Mapping) or isinstance(child, Mapping):
         if not isinstance(parent, Mapping) or not isinstance(child, Mapping) or list(parent) != list(child):
             raise UnsupportedCase(f"output_mapping_structure_mismatch:{path}")
@@ -829,18 +1107,18 @@ def _evaluate_without_guard(payload: Mapping[str, Any]) -> dict[str, Any]:
             realized_control = _run_arm(child_model, child_inputs, forward_rng)
             if not _outputs_allclose(realized_output, realized_control, rtol=0.0, atol=0.0):
                 raise UnsupportedCase("unchanged_child_control_is_not_exact")
-            trial_records.append(
-                {
-                    "trial": trial,
-                    "seed": trial_seed,
-                    "changed_dtype_tensors": changed_tensors,
-                    "inputs": input_records,
-                    "model_state": model_state,
-                    "cast_equivalent_outputs": output_records,
-                    "semantic_dispatch": semantic_trace,
-                    "realized_dispatch": realized_trace,
-                }
-            )
+            trial_record = {
+                "trial": trial,
+                "seed": trial_seed,
+                "changed_dtype_tensors": changed_tensors,
+                "inputs": input_records,
+                "model_state": model_state,
+                "cast_equivalent_outputs": output_records,
+                "semantic_dispatch": semantic_trace,
+                "realized_dispatch": realized_trace,
+            }
+            trial_record["trial_payload_sha256"] = _trial_payload_sha256(trial_record)
+            trial_records.append(trial_record)
             del (
                 parent_inputs,
                 child_inputs,
@@ -881,12 +1159,22 @@ def _evaluate(payload: Mapping[str, Any]) -> dict[str, Any]:
 
     device = torch.device(str(payload["device"]))
     torch.cuda.set_device(device)
-    with _cuda_memory_guard(torch=torch, device=device, max_device_memory_gib=MAX_DEVICE_MEMORY_GIB) as guard:
+    with _repeatability_execution_context(device) as execution_context:
+        if payload.get("execution_context") != execution_context:
+            raise RuntimeError(
+                f"execution context differs from launcher binding:{payload.get('execution_context')!r}:{execution_context!r}"
+            )
         try:
-            result = _evaluate_without_guard(payload)
-        except UnsupportedCase as exc:
-            result = {"status": "unsupported", "passed": False, "reason": _exception_detail(exc)}
-    result["memory_guard"] = guard
+            with _cuda_memory_guard(torch=torch, device=device, max_device_memory_gib=MAX_DEVICE_MEMORY_GIB) as guard:
+                try:
+                    result = _evaluate_without_guard(payload)
+                except UnsupportedCase as exc:
+                    result = {"status": "unsupported", "passed": False, "reason": _exception_detail(exc)}
+            result["memory_guard"] = guard
+        except _CudaMemoryGuardFailure as exc:
+            result = exc.result_record()
+            result["reason"] = exc.failure_reason
+        result["execution_context"] = execution_context
     return result
 
 
@@ -1120,29 +1408,39 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError("shard selection produced no dtype validation tasks")
     coherence_class = str(tasks[0]["coherence_class"])
     runtime_contract = contract_version(coherence_class)
-    evidence = {
-        "contract_version": runtime_contract,
-        "binding_version": binding_version(coherence_class),
-        "coherence_class": coherence_class,
-        "validator_source_sha256": _sha256_file(Path(__file__).resolve()),
-        "launcher_source_sha256": args.launcher_sha256,
-        "parents_sha256": _sha256_file(args.parents),
-        "children_sha256": _sha256_file(args.children),
-        "manifest_sha256": _sha256_file(args.manifest),
-        "allowlist_sha256": _sha256_file(args.child_uuid_file) if args.child_uuid_file else None,
-        "validation_config": {
-            "device": args.device,
-            "trials": args.trials,
-            "seed": args.seed,
-            "timeout_seconds": args.timeout_seconds,
-            "max_device_memory_gib": MAX_DEVICE_MEMORY_GIB,
-            "float16_rtol": LOW_PRECISION_TOLERANCES["float16"],
-            "float16_atol": LOW_PRECISION_TOLERANCES["float16"],
-            "bfloat16_rtol": LOW_PRECISION_TOLERANCES["bfloat16"],
-            "bfloat16_atol": LOW_PRECISION_TOLERANCES["bfloat16"],
-            "dispatch_fp32_fallback_allowed": False,
-        },
-    }
+    import torch
+
+    with _repeatability_execution_context(torch.device(args.device)) as execution_context:
+        evidence = {
+            "contract_version": runtime_contract,
+            "binding_version": binding_version(coherence_class),
+            "coherence_class": coherence_class,
+            "validator_source_sha256": _sha256_file(Path(__file__).resolve()),
+            "launcher_source_sha256": args.launcher_sha256,
+            "runtime_dependencies": _runtime_dependencies(),
+            "parents_sha256": _sha256_file(args.parents),
+            "children_sha256": _sha256_file(args.children),
+            "manifest_sha256": _sha256_file(args.manifest),
+            "allowlist_sha256": _sha256_file(args.child_uuid_file) if args.child_uuid_file else None,
+            "validation_config": {
+                "device": args.device,
+                "trials": args.trials,
+                "seed": args.seed,
+                "timeout_seconds": args.timeout_seconds,
+                "max_device_memory_gib": MAX_DEVICE_MEMORY_GIB,
+                "float16_rtol": LOW_PRECISION_TOLERANCES["float16"],
+                "float16_atol": LOW_PRECISION_TOLERANCES["float16"],
+                "bfloat16_rtol": LOW_PRECISION_TOLERANCES["bfloat16"],
+                "bfloat16_atol": LOW_PRECISION_TOLERANCES["bfloat16"],
+                "logical_forward_dtype_contract": "all_floating_vN_and_final_outputs_match_assigned_dtype_v1",
+                "internal_aten_non_target_floating_outputs": "diagnostic_only",
+                "internal_aten_complex_outputs": "reject",
+                "cast_equivalent_comparator_contract": FLOAT_COMPARATOR_CONTRACT,
+                "nonfloating_comparator_contract": EXACT_COMPARATOR_CONTRACT,
+                "execution_context": execution_context,
+            },
+            "execution_context": execution_context,
+        }
     binding_sha256 = _canonical_sha256(evidence)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     counts: collections.Counter[str] = collections.Counter()
@@ -1163,6 +1461,11 @@ def main(argv: Sequence[str] | None = None) -> None:
                 raise ValueError(f"invalid resume child at {args.output}:{line_number}:{uuid}")
             if record.get("validation_binding_sha256") != binding_sha256:
                 raise ValueError(f"resume binding mismatch at {args.output}:{line_number}")
+            if record.get("result_binding_version") != RESULT_BINDING_VERSION:
+                raise ValueError(f"resume result binding version mismatch at {args.output}:{line_number}")
+            if record.get("result_payload_sha256") != _result_payload_sha256(record):
+                raise ValueError(f"resume result payload mismatch at {args.output}:{line_number}")
+            _validate_unsupported_runtime_schema(record)
             if type(record.get("passed")) is not bool:
                 raise ValueError(f"resume passed field invalid at {args.output}:{line_number}")
             prior[str(uuid)] = record
@@ -1174,10 +1477,20 @@ def main(argv: Sequence[str] | None = None) -> None:
                 counts[str(prior[child_uuid]["status"])] += 1
                 continue
             result = _run_subprocess(
-                {**task, "device": args.device, "trials": args.trials, "seed": args.seed}, args.timeout_seconds
+                {
+                    **task,
+                    "device": args.device,
+                    "trials": args.trials,
+                    "seed": args.seed,
+                    "execution_context": evidence["execution_context"],
+                },
+                args.timeout_seconds,
             )
             result.update(evidence)
             result["validation_binding_sha256"] = binding_sha256
+            result["result_binding_version"] = RESULT_BINDING_VERSION
+            result["result_payload_sha256"] = _result_payload_sha256(result)
+            _validate_unsupported_runtime_schema(result)
             _append(handle, result)
             counts[str(result["status"])] += 1
             executed += 1
@@ -1206,6 +1519,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 "launcher_source_sha256": args.launcher_sha256,
                 "validator_source_sha256": evidence["validator_source_sha256"],
                 "validation_binding_sha256": binding_sha256,
+                "result_binding_version": RESULT_BINDING_VERSION,
             },
             sort_keys=True,
         )
