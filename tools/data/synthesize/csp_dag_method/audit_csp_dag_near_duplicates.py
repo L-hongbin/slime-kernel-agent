@@ -15,8 +15,9 @@ import dataclasses
 import hashlib
 import json
 import sys
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import networkx as nx
 import pyarrow as pa
@@ -29,8 +30,7 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.data.cleaning.ast_similarity import _significant_trees, ast_structure_similarity
 from tools.data.cleaning.similarity import python_token_set, token_jaccard
 from tools.data.synthesize.csp_dag_method import generate_csp_dag as generator
-from tools.data.synthesize.csp_dag_method import validate_csp_dag_canary as runtime_validator
-
+from tools.data.synthesize.csp_dag_method import validate_csp_dag as runtime_validator
 
 CONTRACT = "open_csp_dag_near_duplicate_audit_v2"
 SOURCE_TOKEN_THRESHOLD = 0.8
@@ -44,8 +44,7 @@ _VERIFIED_IDENTITY_VARIANTS = frozenset(
 )
 _RANK_SPECIALIZED_RULES = frozenset({"conv", "pool"})
 _DEFAULT_RUN = (
-    _REPO_ROOT
-    / "local_artifacts/data/synthesize/csp_dag_low_level_canary200/run.coverage_high_complexity.v2"
+    _REPO_ROOT / "local_artifacts/data/synthesize/csp_dag_low_level_canary200/run.coverage_high_complexity.v2"
 )
 
 
@@ -102,9 +101,7 @@ def _write_json(path: Path, value: Any) -> None:
 def _load_selected(run_dir: Path) -> list[Item]:
     rows = pq.read_table(run_dir / "selected.parquet").to_pylist()
     manifests = [
-        json.loads(line)
-        for line in (run_dir / "selected.manifest.jsonl").read_text().splitlines()
-        if line.strip()
+        json.loads(line) for line in (run_dir / "selected.manifest.jsonl").read_text().splitlines() if line.strip()
     ]
     if len(rows) != len(manifests):
         raise ValueError("selected parquet and manifest lengths differ")
@@ -160,11 +157,7 @@ def _counter_jaccard(left: Iterable[Any], right: Iterable[Any]) -> float:
     left_count, right_count = collections.Counter(left), collections.Counter(right)
     keys = left_count.keys() | right_count.keys()
     denominator = sum(max(left_count[key], right_count[key]) for key in keys)
-    return (
-        sum(min(left_count[key], right_count[key]) for key in keys) / denominator
-        if denominator
-        else 1.0
-    )
+    return sum(min(left_count[key], right_count[key]) for key in keys) / denominator if denominator else 1.0
 
 
 def _graph(item: Item, *, variant: bool) -> nx.DiGraph:
@@ -206,8 +199,7 @@ def _identity_normalized_graph(item: Item) -> nx.DiGraph:
     for node in nodes:
         original_index = int(node["index"])
         predecessors = tuple(
-            "input" if int(value) < 0 else representative[int(value)]
-            for value in node["predecessors"]
+            "input" if int(value) < 0 else representative[int(value)] for value in node["predecessors"]
         )
         key = (str(node["rule"]), str(node["variant"]))
         if key in _VERIFIED_IDENTITY_VARIANTS:
@@ -310,17 +302,14 @@ def _features(item: Item) -> dict[str, Any]:
     shape_csp = item.manifest["graph"]["shape_csp"]
     shape_contract = [f"ndim={typed['input_rank']}"]
     shape_contract.extend(
-        f"divisible:{axis}:{divisor}"
-        for axis, divisor in sorted(shape_csp.get("divisibility", {}).items())
+        f"divisible:{axis}:{divisor}" for axis, divisor in sorted(shape_csp.get("divisibility", {}).items())
     )
-    shape_contract.extend(
-        f"equality:{equality}" for equality in sorted(shape_csp.get("equalities", []))
-    )
+    shape_contract.extend(f"equality:{equality}" for equality in sorted(shape_csp.get("equalities", [])))
     return {
         "families": frozenset(item.manifest["actual_low_level_families"]),
         "node_count": len(nodes),
         "fine_nodes": sequence,
-        "sequence_bigrams": list(zip(sequence, sequence[1:])),
+        "sequence_bigrams": list(zip(sequence, sequence[1:], strict=False)),
         "operator_tokens": item.manifest["operator_signature"],
         "edge_labels": edge_labels,
         "edge_spans": edge_spans,
@@ -390,9 +379,7 @@ def _representative_key(item: Item) -> tuple[int, int, int, int, int, int]:
     """Prefer semantic breadth without retaining redundant identity padding."""
     nodes = item.manifest["graph"]["typed_graph"]["nodes"]
     semantic_nodes = [
-        node
-        for node in nodes
-        if (str(node["rule"]), str(node["variant"])) not in _VERIFIED_IDENTITY_VARIANTS
+        node for node in nodes if (str(node["rule"]), str(node["variant"])) not in _VERIFIED_IDENTITY_VARIANTS
     ]
     identity_count = len(nodes) - len(semantic_nodes)
     return (
@@ -440,18 +427,12 @@ def _audit(scope: str, items: Sequence[Item], output_dir: Path) -> dict[str, Any
     strict_edges = sorted(set(source_edges) | set(exact_semantic) | set(identity_normalized))
     strict_clusters, strict_retained = _cluster_summary(len(items), strict_edges)
     semantic_clusters, semantic_retained = _cluster_summary(len(items), exact_semantic)
-    normalized_clusters, normalized_retained = _cluster_summary(
-        len(items), identity_normalized
-    )
+    normalized_clusters, normalized_retained = _cluster_summary(len(items), identity_normalized)
     coarse_clusters, coarse_retained = _cluster_summary(len(items), exact_coarse)
 
     sensitivity = {}
     for threshold in STRUCTURAL_THRESHOLDS:
-        threshold_edges = [
-            (pair["left"], pair["right"])
-            for pair in structural
-            if pair["score"] >= threshold
-        ]
+        threshold_edges = [(pair["left"], pair["right"]) for pair in structural if pair["score"] >= threshold]
         clusters, retained = _cluster_summary(len(items), strict_edges + threshold_edges)
         sensitivity[str(threshold)] = {
             "approximate_pair_count": len(threshold_edges),
@@ -490,12 +471,8 @@ def _audit(scope: str, items: Sequence[Item], output_dir: Path) -> dict[str, Any
                     "cluster_index": index,
                     "positions": cluster,
                     "uuids": [items[position].uuid for position in cluster],
-                    "keeper_position": max(
-                        cluster, key=lambda position: _representative_key(items[position])
-                    ),
-                    "keeper_uuid": items[
-                        max(cluster, key=lambda position: _representative_key(items[position]))
-                    ].uuid,
+                    "keeper_position": max(cluster, key=lambda position: _representative_key(items[position])),
+                    "keeper_uuid": items[max(cluster, key=lambda position: _representative_key(items[position]))].uuid,
                 }
             )
             + "\n"
@@ -536,9 +513,7 @@ def _audit(scope: str, items: Sequence[Item], output_dir: Path) -> dict[str, Any
         },
         "identity_normalized_semantic_graph": {
             "definition": "exact directed functional-structure isomorphism after contracting verified value identities layout:transpose and layout:chunk_cat, preserving repeated argument slots, treating layout:binary_cat inputs as commutative, ignoring rank for dimension-agnostic operators, and retaining rank when Conv/Pool selects a rank-specific callable",
-            "verified_identity_variants": sorted(
-                f"{rule}:{variant}" for rule, variant in _VERIFIED_IDENTITY_VARIANTS
-            ),
+            "verified_identity_variants": sorted(f"{rule}:{variant}" for rule, variant in _VERIFIED_IDENTITY_VARIANTS),
             "rank_specialized_rules": sorted(_RANK_SPECIALIZED_RULES),
             "pair_count": len(identity_normalized),
             "cluster_count": len(normalized_clusters),
@@ -599,10 +574,7 @@ def _manual_review(
     seen: set[tuple[str, str]] = set()
     for summary in summaries:
         candidates = summary["approximate_graph_sensitivity"]["top_pairs"][:3]
-        pair_rows = [
-            json.loads(line)
-            for line in Path(summary["artifacts"]["pairs"]["path"]).read_text().splitlines()
-        ]
+        pair_rows = [json.loads(line) for line in Path(summary["artifacts"]["pairs"]["path"]).read_text().splitlines()]
         candidates = [row for row in pair_rows if row["kind"] != "approximate_graph"] + candidates
         for pair in candidates:
             left_uuid, right_uuid = pair["left_uuid"], pair["right_uuid"]
@@ -643,9 +615,7 @@ def _materialize_reselected(
     schema = pq.read_schema(run_dir / "selected.parquet")
     table = pa.Table.from_pylist([candidate.row for candidate in selected], schema=schema)
     pq.write_table(table, parquet_path, compression="zstd")
-    manifest_path.write_text(
-        "".join(_canonical_json(candidate.manifest) + "\n" for candidate in selected)
-    )
+    manifest_path.write_text("".join(_canonical_json(candidate.manifest) + "\n" for candidate in selected))
     runtime_records = [
         runtime_validator._validate_row(
             candidate.row,
@@ -655,14 +625,10 @@ def _materialize_reselected(
         for candidate in selected
     ]
     runtime_path = output_dir / "reselected200.cpu_validation.jsonl"
-    runtime_path.write_text(
-        "".join(_canonical_json(record) + "\n" for record in runtime_records)
-    )
+    runtime_path.write_text("".join(_canonical_json(record) + "\n" for record in runtime_records))
     runtime_passed = sum(record["passed"] for record in runtime_records)
     if runtime_passed != generator.ROWS:
-        raise AssertionError(
-            f"reselected CPU reference validation failed: {runtime_passed}/{generator.ROWS}"
-        )
+        raise AssertionError(f"reselected CPU reference validation failed: {runtime_passed}/{generator.ROWS}")
     items = _items_from_candidates(selected)
     audit = _audit("reselected200", items, output_dir)
     if audit["strict_recommended_union"]["effective_rows"] != generator.ROWS:
@@ -710,14 +676,10 @@ def main() -> None:
     pool_summary = _audit("candidate_pool", pool, output_dir)
     retained_uuids = {
         json.loads(line)["uuid"]
-        for line in Path(
-            pool_summary["artifacts"]["strict_retained_uuids"]["path"]
-        ).read_text().splitlines()
+        for line in Path(pool_summary["artifacts"]["strict_retained_uuids"]["path"]).read_text().splitlines()
         if line.strip()
     }
-    reselected = _materialize_reselected(
-        args.run_dir, output_dir, pool_candidates, retained_uuids
-    )
+    reselected = _materialize_reselected(args.run_dir, output_dir, pool_candidates, retained_uuids)
     review_path = _manual_review(
         output_dir,
         selected,

@@ -93,7 +93,6 @@ lowering 将 typed graph 写成完整 PyTorch 源码。有参数的 Conv、Linea
 <!-- 。固定变量名让源码、typed graph 与 runtime record 可以逐 node 绑定 -->
 
 数据使用 single-class lowering：每条程序的模块顶层恰好一个 class，名字必须是 `Model`，没有 helper class
-<!-- 。独立 AST gate 解析源码，要求顶层 `ClassDef` 名字列表为 `['Model']`，并禁止 `TensorBridge`/`form_bridge`。它分别扫描 raw 5，000、retained base 4，946、shape selected 4，946 和 dtype candidates 4，946，合计 19，838 行，全部通过。这是四份 parquet 的行数加总，不是 19，838 条互不重复的程序；raw 含后来被 near-dedup 删除的 54 条，shape/dtype 是同一批 root 的扩增副本 -->
 
 <!-- semantic multi-class 留作后续实现。helper class 必须承载至少一个 tracked typed DAG node，优先抽取 connected、single-exit 子图；helper 参数精确对应子图外部入边，内部 registered module 归 helper 所有，输出精确对应唯一出边。把 helper 内联后必须恢复同一 typed DAG、operator lowering 和边界关系，manifest 还要保存 helper node indices、boundary edges、module ownership 与 inlining hash。找不到合法子图时保留 single-class。实现完成后需通过静态 source binding、dispatcher liveness、input sensitivity、CPU/H20 和 shape→dtype lineage 验证 -->
 
@@ -260,7 +259,7 @@ KernelBench 的 `ndim` 通过实际执行 `get_inputs()` 取输入 tensor 的最
 - `tools/data/synthesize/csp_dag_method/build_csp_dag_5k.py`:直接生成 5，000 条并 strict near-dedup
 - `tools/data/synthesize/csp_dag_method/audit_csp_dag_near_duplicates.py`:source/semantic graph near-dedup
 - `tools/data/synthesize/csp_dag_method/audit_csp_dag_quality.py`:静态质量 gate
-- `tools/data/synthesize/csp_dag_method/validate_csp_dag_canary.py`:graph/source/runtime validator
+- `tools/data/synthesize/csp_dag_method/validate_csp_dag.py`:graph/source/runtime validator
 - `tools/data/synthesize/csp_dag_method/validate_csp_dag_repeatability.py`:CPU/GPU exact-byte repeatability
 - `tools/data/synthesize/csp_dag_method/audit_kernelbench_low_level_coverage_v2.py`:token-aware KernelBench 覆盖审计
 - `tools/data/synthesize/csp_dag_method/build_csp_dag_input_expansions.py`:shape/dtype 构造和 fail-closed selection
