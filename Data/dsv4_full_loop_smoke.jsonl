@@ -1,8 +1,0 @@
-{"input":[{"role":"user","content":"Reply with exactly one short sentence: ready."}],"label":"ready","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"What is 2 plus 2? Reply with the number only."}],"label":"4","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"Reply with one word meaning affirmative."}],"label":"yes","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"Name the color of a clear daytime sky in one word."}],"label":"blue","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"Write exactly three words about testing."}],"label":"testing is useful","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"Return the lowercase word done."}],"label":"done","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"What is 5 minus 3? Reply with the number only."}],"label":"2","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"Reply with a short sentence confirming the system is running."}],"label":"system is running","metadata":{"rm_type":"random"}}

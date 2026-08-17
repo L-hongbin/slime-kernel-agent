@@ -381,7 +381,7 @@ AND
 | `cross_source.audit.jsonl` | 204 | `011366416411560309d5455fab9895d7da458fceb9a86a2b625c790b7e7613ad` |
 | `review_pairs.md` | 12 | `5c724d70fb8b7e78b3ac2dcc5aef4b85945285e8062cb2f9c4c21cd62305dc5a` |
 | `cross_source_review.md` | 8 | `0fc9c5fb707ed19cca78000455ecb4781f0e73993f5f73b9475d62baec4b9cff` |
-| `summary.json` | — | `174486914b34947a6568e3b0be583382329398079ab5d4b8bee081997c1648aa` |
+| `summary.json` | — | `a27f01c398514f43ef6b37ef351fa3e1d0f3ace24954c1f95a84272299391c64` |
 
 `manifest.jsonl` 对每个 retained 样本 绑定上游数据部分、源 样本、源 parquet、源 manifest 样本、UUID、reference SHA、normalized-AST SHA 和统一 operator set。summary 还绑定合并器、统一 operator extractor、token similarity 与 AST similarity 实现的 SHA
 

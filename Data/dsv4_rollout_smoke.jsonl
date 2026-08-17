@@ -1,2 +1,0 @@
-{"input":[{"role":"user","content":"Reply with exactly one short sentence: ready."}],"label":"ready","metadata":{"rm_type":"random"}}
-{"input":[{"role":"user","content":"What is 2 plus 2? Reply with the number only."}],"label":"4","metadata":{"rm_type":"random"}}
