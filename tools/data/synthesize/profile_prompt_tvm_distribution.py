@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Profile the exact parquet inputs used by the distribution figures.
-
-The profiler never executes task source.  It streams reference text from the
-parquets, parses it with Python's AST, and publishes exact counts plus the
-input/report hashes needed to reproduce every plotted value.  KernelBench
-step620 correctness is the one exception: raw evaluation dumps are not part of
-the data handoff, so those integer counts remain pinned to two audited reports
-whose byte hashes are checked before publication.
-"""
+"""Profile static distributions from parquet reference code without executing it."""
 
 from __future__ import annotations
 
@@ -17,10 +9,7 @@ import collections
 import hashlib
 import json
 import math
-import os
-import re
 import sys
-import tempfile
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -33,16 +22,14 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.data.cleaning.complexity import extract_operator_signature
 
-PROFILE_SCHEMA_VERSION = "prompt-tvm-distribution-profile-v1"
-PROFILER_VERSION = "prompt-tvm-distribution-profiler-v1"
+PROFILE_SCHEMA_VERSION = "prompt-tvm-distribution-profile-v2"
+PROFILER_VERSION = "prompt-tvm-distribution-profiler-v3"
 REPO_ROOT = _REPO_ROOT
 DEFAULT_OUTPUT = REPO_ROOT / "Data/prompt_tvm_v4/analysis/distribution_profile.json"
 DEFAULT_TRAIN = REPO_ROOT / "Data/prompt_tvm_v3/drkernel_rl_thinking.parquet"
 DEFAULT_KERNELBENCH = tuple(
     REPO_ROOT / f"Data/kernelbench-level{level}-validation-tvm-v2/train.parquet" for level in (1, 2, 3)
 )
-SHA256_RE = re.compile(r"[0-9a-f]{64}")
-
 FACTORY_BASES = frozenset(
     {
         "arange",
@@ -55,10 +42,10 @@ FACTORY_BASES = frozenset(
         "randint",
         "randn",
         "randperm",
-        "uniform",
         "zeros",
     }
 )
+FACTORY_CALLEES = frozenset(f"torch.{base}" for base in FACTORY_BASES)
 ROW_PRESENCE_FACTORIES = ("randn", "rand", "randint")
 SHAPE_PERCENTILES = (50, 75, 90, 95, 99)
 SHAPE_TAIL_THRESHOLDS = (1_000_000, 10_000_000, 100_000_000)
@@ -116,33 +103,9 @@ CATEGORY_PATTERNS: dict[str, tuple[str, ...]] = {
     "fft_sparse": ("fft", "sparse"),
 }
 
-PINNED_CORRECTNESS = {
-    "L1": {
-        "generated": 800,
-        "compiled": 782,
-        "correct": 723,
-        "report": REPO_ROOT / "handoffs/deepseek-v4/iter620_kernelbench_question_audit_20260729.md",
-        "report_sha256": "d65a8f71c4c6f6d183473aa530f0d8e9d1eb50e96050a5501e8d9e3500d65af8",
-    },
-    "L2": {
-        "generated": 800,
-        "compiled": 666,
-        "correct": 549,
-        "report": REPO_ROOT / "handoffs/deepseek-v4/iter440_iter620_kernelbench_failure_attribution_20260729.md",
-        "report_sha256": "27908959de98ba8df361e3f5c00e79fd5ffd0de3ec3c9dc806f7a4c29e29fcf4",
-    },
-    "L3": {
-        "generated": 400,
-        "compiled": 273,
-        "correct": 40,
-        "report": REPO_ROOT / "handoffs/deepseek-v4/iter440_iter620_kernelbench_failure_attribution_20260729.md",
-        "report_sha256": "27908959de98ba8df361e3f5c00e79fd5ffd0de3ec3c9dc806f7a4c29e29fcf4",
-    },
-}
-
 
 class ProfileError(ValueError):
-    """An input or pinned provenance record is invalid."""
+    """An input record cannot be profiled."""
 
 
 def _sha256_file(path: Path) -> str:
@@ -221,66 +184,167 @@ def _module_environment(tree: ast.Module) -> dict[str, Any]:
     for statement in tree.body:
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
             continue
+        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+        names = [target.id for target in targets if isinstance(target, ast.Name)]
         try:
             value = _safe_value(statement.value, environment)
         except (ArithmeticError, OverflowError, ValueError):
+            for name in names:
+                environment.pop(name, None)
             continue
-        targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
-        for target in targets:
-            if isinstance(target, ast.Name):
-                environment[target.id] = value
+        for name in names:
+            environment[name] = value
     return environment
 
 
-def _resolved_sequence(node: ast.AST, environment: Mapping[str, Any]) -> tuple[int | float, ...] | None:
+def _factory_calls_with_environments(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_environment: Mapping[str, Any],
+) -> list[tuple[ast.Call, dict[str, Any]]]:
+    """Bind each call to the straight-line environment visible at that call."""
+    environment = dict(module_environment)
+    records: list[tuple[ast.Call, dict[str, Any]]] = []
+    for statement in function.body:
+        calls = sorted(
+            (node for node in ast.walk(statement) if isinstance(node, ast.Call)),
+            key=lambda node: (getattr(node, "lineno", -1), getattr(node, "col_offset", -1)),
+        )
+        records.extend((call, dict(environment)) for call in calls)
+
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+            value_node = statement.value
+        elif isinstance(statement, ast.AnnAssign):
+            targets = [statement.target]
+            value_node = statement.value
+        elif isinstance(statement, ast.AugAssign):
+            targets = [statement.target]
+            value_node = None
+        else:
+            continue
+        names = [target.id for target in targets if isinstance(target, ast.Name)]
+        try:
+            if value_node is None:
+                raise ValueError("assignment has no statically safe value")
+            value = _safe_value(value_node, environment)
+        except (ArithmeticError, OverflowError, ValueError):
+            for name in names:
+                environment.pop(name, None)
+            continue
+        for name in names:
+            environment[name] = value
+    return records
+
+
+def _resolved_sequence(
+    node: ast.AST,
+    environment: Mapping[str, Any],
+    *,
+    allow_scalar: bool,
+) -> tuple[int, ...] | None:
     try:
         value = _safe_value(node, environment)
     except (ArithmeticError, OverflowError, ValueError):
         return None
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, int) and not isinstance(value, bool) and allow_scalar:
         value = (value,)
     if not isinstance(value, tuple):
         return None
-    if any(not isinstance(item, (int, float)) for item in value):
+    dimensions = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            return None
+        dimensions.append(item)
+    return tuple(dimensions)
+
+
+def _keyword(call: ast.Call, name: str) -> ast.AST | None:
+    return next((keyword.value for keyword in call.keywords if keyword.arg == name), None)
+
+
+def _resolved_shape(
+    node: ast.AST | None,
+    environment: Mapping[str, Any],
+    *,
+    allow_scalar: bool = False,
+) -> tuple[int, ...] | None:
+    if node is None:
         return None
-    return tuple(value)
+    shape = _resolved_sequence(node, environment, allow_scalar=allow_scalar)
+    return shape if shape is not None and all(dimension >= 0 for dimension in shape) else None
 
 
-def _factory_shape(call: ast.Call, base: str, environment: Mapping[str, Any]) -> tuple[int | float, ...] | None:
-    if base in {"rand", "randn", "zeros", "ones", "empty", "full", "normal", "uniform"}:
-        arguments = call.args[:1] if base == "full" else call.args
-        if not arguments:
-            return None
-        if len(arguments) == 1:
-            argument = arguments[0]
-            return _resolved_sequence(argument.value if isinstance(argument, ast.Starred) else argument, environment)
-        dimensions: list[Any] = []
-        for argument in arguments:
-            if isinstance(argument, ast.Starred):
-                expanded = _resolved_sequence(argument.value, environment)
-                if expanded is None:
-                    return None
-                dimensions.extend(expanded)
-            else:
-                try:
-                    dimensions.append(_safe_value(argument, environment))
-                except (ArithmeticError, OverflowError, ValueError):
-                    return None
-        if any(not isinstance(value, (int, float)) for value in dimensions):
-            return None
-        return tuple(dimensions)
-    if base == "randint":
-        node = call.args[2] if len(call.args) >= 3 else call.args[1] if len(call.args) >= 2 else None
-        return _resolved_sequence(node, environment) if node is not None else None
-    if base in {"randperm", "arange", "linspace"}:
-        if not call.args:
-            return None
+def _shape_arguments(
+    arguments: Sequence[ast.AST],
+    environment: Mapping[str, Any],
+) -> tuple[int, ...] | None:
+    if len(arguments) == 1:
+        argument = arguments[0]
+        return _resolved_shape(
+            argument.value if isinstance(argument, ast.Starred) else argument,
+            environment,
+            allow_scalar=not isinstance(argument, ast.Starred),
+        )
+    dimensions: list[int] = []
+    for argument in arguments:
+        if isinstance(argument, ast.Starred):
+            expanded = _resolved_shape(argument.value, environment)
+            if expanded is None:
+                return None
+            dimensions.extend(expanded)
+            continue
         try:
-            first_argument = _safe_value(call.args[0], environment)
+            value = _safe_value(argument, environment)
         except (ArithmeticError, OverflowError, ValueError):
             return None
-        return (first_argument,) if isinstance(first_argument, (int, float)) else None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+        dimensions.append(value)
+    return tuple(dimensions) if dimensions else None
+
+
+def _factory_shape(call: ast.Call, base: str, environment: Mapping[str, Any]) -> tuple[int, ...] | None:
+    """Conservatively extract an explicit factory output shape."""
+
+    size = _keyword(call, "size")
+    if base in {"rand", "randn", "zeros", "ones", "empty"}:
+        return _resolved_shape(size, environment) if size is not None else _shape_arguments(call.args, environment)
+    if base == "full":
+        node = size if size is not None else (call.args[0] if call.args else None)
+        return _resolved_shape(node, environment)
+    if base == "normal":
+        node = size if size is not None else (call.args[2] if len(call.args) >= 3 else None)
+        return _resolved_shape(node, environment)
+    if base == "randint":
+        node = (
+            size
+            if size is not None
+            else (call.args[2] if len(call.args) >= 3 else call.args[1] if len(call.args) >= 2 else None)
+        )
+        return _resolved_shape(node, environment)
+    if base in {"randperm", "arange"}:
+        keyword_name = "n" if base == "randperm" else "end"
+        node = _keyword(call, keyword_name) or (call.args[0] if len(call.args) == 1 else None)
+        return _resolved_shape(node, environment, allow_scalar=True)
+    if base == "linspace":
+        node = _keyword(call, "steps") or (call.args[2] if len(call.args) >= 3 else None)
+        return _resolved_shape(node, environment, allow_scalar=True)
     return None
+
+
+def _exact_factory_observations(
+    function: ast.FunctionDef | ast.AsyncFunctionDef,
+    module_environment: Mapping[str, Any],
+) -> list[tuple[str, tuple[int, ...] | None, str | None]]:
+    observations = []
+    for call, environment in _factory_calls_with_environments(function, module_environment):
+        callee = _call_name(call.func)
+        if callee not in FACTORY_CALLEES:
+            continue
+        base = callee.removeprefix("torch.")
+        shape = _factory_shape(call, base, environment)
+        observations.append((base, shape, None if shape is not None else "unresolved"))
+    return observations
 
 
 def _classify_signature(signature: Sequence[str]) -> set[str]:
@@ -295,7 +359,7 @@ def _classify_signature(signature: Sequence[str]) -> set[str]:
     return categories
 
 
-def _nearest_observation(values: Sequence[int], percentile: int) -> int:
+def _nearest_observation(values: Sequence[int | float], percentile: int) -> int | float:
     if not values:
         raise ProfileError("cannot compute a percentile from no observations")
     ordered = sorted(values)
@@ -345,7 +409,9 @@ def profile_dataset(label: str, paths: Sequence[Path]) -> dict[str, Any]:
     factory_presence: collections.Counter[str] = collections.Counter()
     total_factory_occurrences = 0
     resolved_shape_occurrences = 0
+    unresolved_by_factory: collections.Counter[str] = collections.Counter()
     positive_numel: list[int] = []
+    positive_shapes: list[tuple[int, ...]] = []
     operator_histogram: collections.Counter[int] = collections.Counter()
     operator_families: collections.Counter[str] = collections.Counter()
 
@@ -369,37 +435,20 @@ def profile_dataset(label: str, paths: Sequence[Path]) -> dict[str, Any]:
         if get_inputs is None:
             missing_get_inputs += 1
             continue
-        calls = [node for node in ast.walk(get_inputs) if isinstance(node, ast.Call)]
-        bases = {_call_name(call.func).split(".")[-1].lower() for call in calls}
-        factory_presence.update(base for base in ROW_PRESENCE_FACTORIES if base in bases)
+        observations = _exact_factory_observations(get_inputs, _module_environment(tree))
+        present_bases = {base for base, _shape, _reason in observations}
+        factory_presence.update(base for base in ROW_PRESENCE_FACTORIES if base in present_bases)
 
-        environment = _module_environment(tree)
-        factory_calls = sorted(
-            (node for node in ast.walk(get_inputs) if isinstance(node, ast.Call)),
-            key=lambda node: (getattr(node, "lineno", -1), getattr(node, "col_offset", -1)),
-        )
-        positional_shape_factories = {
-            "rand",
-            "randn",
-            "zeros",
-            "ones",
-            "empty",
-            "full",
-            "normal",
-            "uniform",
-        }
-        for call in factory_calls:
-            base = _call_name(call.func).split(".")[-1].lower()
-            if base not in FACTORY_BASES or (base in positional_shape_factories and not call.args):
-                continue
+        for base, shape, _reason in observations:
             total_factory_occurrences += 1
-            shape = _factory_shape(call, base, environment)
-            if not shape or any(not isinstance(dimension, (int, float)) or dimension < 0 for dimension in shape):
+            if shape is None:
+                unresolved_by_factory[base] += 1
                 continue
             resolved_shape_occurrences += 1
             numel = math.prod(shape)
             if numel > 0:
                 positive_numel.append(numel)
+                positive_shapes.append(shape)
 
     if rows != sum(source["rows"] for source in sources):
         raise AssertionError(f"streamed {rows} rows but parquet metadata reports a different total")
@@ -415,6 +464,13 @@ def profile_dataset(label: str, paths: Sequence[Path]) -> dict[str, Any]:
             "percent": _percent(sum(value >= threshold for value in positive_numel), len(positive_numel)),
         }
         for threshold in SHAPE_TAIL_THRESHOLDS
+    }
+    rank_histogram = collections.Counter(len(shape) for shape in positive_shapes)
+    axis_ratios = sorted(max(shape) / min(shape) for shape in positive_shapes if shape and min(shape) > 0)
+    axis_ratio = {
+        "count": len(axis_ratios),
+        "p99": _nearest_observation(axis_ratios, 99) if axis_ratios else None,
+        "gt_1e3_percent": _percent(sum(value > 1_000 for value in axis_ratios), len(axis_ratios)),
     }
     op_bins = []
     for count in range(OP_TAIL_START):
@@ -464,10 +520,14 @@ def profile_dataset(label: str, paths: Sequence[Path]) -> dict[str, Any]:
             "total_factory_occurrences": total_factory_occurrences,
             "resolved_shape_occurrences": resolved_shape_occurrences,
             "positive_numel_occurrences": len(positive_numel),
+            "unresolved_shape_occurrences": total_factory_occurrences - resolved_shape_occurrences,
+            "unresolved_by_factory": dict(sorted(unresolved_by_factory.items())),
             "resolved_shape_percent": _percent(resolved_shape_occurrences, total_factory_occurrences),
             "percentile_method": "nearest observation at round((n - 1) * p)",
             "percentiles": numel_percentiles,
             "tails": tails,
+            "rank_histogram": {str(rank): count for rank, count in sorted(rank_histogram.items())},
+            "axis_ratio": axis_ratio,
         },
         "operator_count": {
             "unit": "task",
@@ -487,42 +547,6 @@ def profile_dataset(label: str, paths: Sequence[Path]) -> dict[str, Any]:
                 for name in (*CATEGORY_PATTERNS, "other_only")
             },
         },
-    }
-
-
-def pinned_correctness_profile() -> dict[str, Any]:
-    levels: dict[str, Any] = {}
-    for level, values in PINNED_CORRECTNESS.items():
-        report = Path(values["report"]).resolve()
-        if not report.is_file():
-            raise FileNotFoundError(f"pinned correctness report is missing: {report}")
-        observed_hash = _sha256_file(report)
-        expected_hash = values["report_sha256"]
-        if observed_hash != expected_hash:
-            raise ProfileError(
-                f"pinned correctness report hash changed for {level}: expected {expected_hash}, got {observed_hash}"
-            )
-        generated = int(values["generated"])
-        compiled = int(values["compiled"])
-        correct = int(values["correct"])
-        if not 0 <= correct <= compiled <= generated:
-            raise AssertionError(f"invalid pinned counts for {level}")
-        levels[level] = {
-            "generated": generated,
-            "compiled": compiled,
-            "correct": correct,
-            "compile_percent": _percent(compiled, generated),
-            "correct_percent": _percent(correct, generated),
-            "provenance": {
-                "path": _display_path(report),
-                "sha256": observed_hash,
-            },
-        }
-    return {
-        "source_kind": "pinned_audited_integer_counts",
-        "percentages_recomputed_from_counts": True,
-        "raw_evaluation_artifact_in_data_handoff": False,
-        "levels": levels,
     }
 
 
@@ -550,9 +574,11 @@ def build_profile(train_paths: Sequence[Path], kernelbench_paths: Sequence[Path]
             "resolved_tensor_numel": {
                 "unit": "tensor-factory occurrence",
                 "execution": "static AST evaluation only; task source is never executed",
-                "constant_scope": "safe module-level numeric assignments evaluated in source order",
-                "function_local_assignments_resolved": False,
-                "shape_source": "positional factory arguments only",
+                "constant_scope": "safe module-level final bindings plus straight-line get_inputs numeric bindings captured at each call",
+                "function_local_assignments_resolved": True,
+                "shape_source": "factory-specific positional or explicit size/steps/n keyword grammar",
+                "callee_policy": "exact torch factory names only; NumPy and leaf-name matches are excluded",
+                "unresolved_calls": "counted as factory occurrences and excluded from shape statistics",
                 "negative_dimensions_included": False,
                 "zero_numel_in_percentiles": False,
                 "percentile_method": "nearest observation at round((n - 1) * p)",
@@ -570,7 +596,6 @@ def build_profile(train_paths: Sequence[Path], kernelbench_paths: Sequence[Path]
                 "matching": "case-insensitive substring match over extracted operator tokens",
             },
         },
-        "panel_a_correctness": pinned_correctness_profile(),
         "datasets": {
             "active_train": train,
             "kernelbench": kernelbench,
@@ -583,20 +608,57 @@ def write_profile(profile: Mapping[str, Any], output: Path, *, overwrite: bool) 
     if destination.exists() and not overwrite:
         raise FileExistsError(f"output already exists; pass --overwrite: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+    destination.write_text(
+        json.dumps(profile, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
     )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
-            json.dump(profile, handle, indent=2, sort_keys=True, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, destination)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+
+
+def _self_check() -> None:
+    def observe(expression: str, environment: Mapping[str, Any] | None = None) -> tuple[int, ...] | None:
+        node = ast.parse(expression, mode="eval").body
+        assert isinstance(node, ast.Call)
+        callee = _call_name(node.func)
+        if callee not in FACTORY_CALLEES:
+            return None
+        return _factory_shape(node, callee.removeprefix("torch."), environment or {})
+
+    cases = {
+        "torch.rand(2, 3)": (2, 3),
+        "torch.rand(size=(2, 3))": (2, 3),
+        "torch.rand(*(2, 3))": (2, 3),
+        "torch.full((2, 3), 1.0)": (2, 3),
+        "torch.randint(10, (2, 3))": (2, 3),
+        "torch.randint(1, 10, (2, 3))": (2, 3),
+        "torch.arange(5)": (5,),
+        "np.random.rand(2, 3)": None,
+        "torch.rand(dynamic_shape)": None,
+    }
+    assert all(observe(expression) == expected for expression, expected in cases.items())
+
+    tree = ast.parse(
+        """import torch
+D = 4
+def get_inputs():
+    shape = (D, 2)
+    first = torch.rand(shape)
+    shape = (5, 3)
+    second = torch.rand(shape)
+    shape = dynamic_shape()
+    third = torch.rand(shape)
+    ignored = np.random.rand(7)
+    return [first, second, third, ignored]
+"""
+    )
+    function = _last_top_level_get_inputs(tree)
+    assert function is not None
+    observations = _exact_factory_observations(function, _module_environment(tree))
+    assert observations == [
+        ("rand", (4, 2), None),
+        ("rand", (5, 3), None),
+        ("rand", None, "unresolved"),
+    ]
+    print("prompt_tvm_distribution_profiler_self_check=passed")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -605,11 +667,15 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--kernelbench-parquet", type=Path, action="append", dest="kernelbench_paths")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--self-check", action="store_true")
     return parser.parse_args()
 
 
 def main() -> None:
     args = _parse_args()
+    if args.self_check:
+        _self_check()
+        return
     train_paths = tuple(args.train_paths) if args.train_paths else (DEFAULT_TRAIN,)
     kernelbench_paths = tuple(args.kernelbench_paths) if args.kernelbench_paths else DEFAULT_KERNELBENCH
     profile = build_profile(train_paths, kernelbench_paths)
