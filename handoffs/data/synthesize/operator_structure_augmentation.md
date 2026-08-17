@@ -261,7 +261,7 @@ KernelBench 的 `ndim` 通过实际执行 `get_inputs()` 取输入 tensor 的最
 - `tools/data/synthesize/csp_dag_method/audit_csp_dag_quality.py`:静态质量 gate
 - `tools/data/synthesize/csp_dag_method/validate_csp_dag.py`:graph/source/runtime validator
 - `tools/data/synthesize/csp_dag_method/validate_csp_dag_repeatability.py`:CPU/GPU exact-byte repeatability
-- `tools/data/synthesize/csp_dag_method/audit_kernelbench_low_level_coverage_v2.py`:token-aware KernelBench 覆盖审计
+- `tools/data/synthesize/csp_dag_method/compare_kernelbench_distribution.py`:token-aware KernelBench 覆盖与分布对比
 - `tools/data/synthesize/csp_dag_method/build_csp_dag_input_expansions.py`:shape/dtype 构造和 fail-closed selection
 - `tools/data/synthesize/csp_dag_method/csp_dag_finalization.py`:shape/dtype selection 与 post-selection 公共校验
 - `tools/data/synthesize/csp_dag_method/finalize_shape_dtype_expansion.py`:shape/dtype lineage、layout deferral 与 additive 汇总
@@ -348,7 +348,7 @@ layout 遗留问题证据:
 python -m tools.data.synthesize.csp_dag_method.build_csp_dag_5k
 python -m tools.data.synthesize.csp_dag_method.audit_csp_dag_quality --help
 python -m tools.data.synthesize.csp_dag_method.validate_csp_dag_repeatability --help
-python -m tools.data.synthesize.csp_dag_method.audit_kernelbench_low_level_coverage_v2
+python -m tools.data.synthesize.csp_dag_method.compare_kernelbench_distribution --help
 python -m tools.data.synthesize.csp_dag_method.build_csp_dag_input_expansions --help
 python -m tools.data.synthesize.csp_dag_method.finalize_shape_dtype_expansion --help
 python -m tools.data.synthesize.review_only.audit_csp_dag_final --help
