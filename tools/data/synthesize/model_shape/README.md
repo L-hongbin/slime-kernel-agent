@@ -5,7 +5,7 @@ expansion. It contains the static solver, the DSV4F fallback, target-GPU
 validation, final resampling, and distribution/semantic audits.
 
 The method, contracts, results, and known limitations are documented in
-[`handoffs/data/synthesize/SHAPE_EXPANSION.md`](../../../../handoffs/data/synthesize/SHAPE_EXPANSION.md).
+[`handoffs/data/synthesize/shape_expansion.md`](../../../../handoffs/data/synthesize/shape_expansion.md).
 
 ## Components
 
