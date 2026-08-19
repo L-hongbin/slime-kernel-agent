@@ -1,8 +1,8 @@
-# DeepSeek-V4-Flash 当前 Megatron 分片契约
+# DeepSeek-V4-Flash Megatron 分片与 CP2 契约
 
 ## 结论
 
-截至 2026-07-20，r21 正式训练使用 2 个节点、16 张 H20，拓扑固定为：
+r21 formal launcher 保留的训练拓扑使用 2 个节点、16 张 H20：
 
 ```text
 TP1 × PP1 × CP2 × DP8，叠加 EP8 × ETP1
@@ -15,9 +15,11 @@ world_size = TP × PP × CP × DP = 16
 - `CP2` 将每条序列连续切成两半；每个 rank 仍计算完整的 64 个 query heads。
 - `EP8` 将 256 个 routed experts 切成每 rank 32 个；同一 expert shard 在两台训练节点上各有一份副本。
 
-除 routed experts 外，embedding、全部 43 层 attention、compressor、mHC、router、shared expert、final norm 和 lm head 都不做模型权重分片。`TP=PP=1`，因此没有 TP collective，也没有 PP stage 或 PP P2P。旧文档中关于 PP2/PP3 层切分、跨 PP 传输 4 倍 hc-stream，以及“EP-only、每个 rank 重复计算完整序列”的描述均不再代表当前训练。
+除 routed experts 外，embedding、全部 43 层 attention、compressor、mHC、router、shared expert、final norm 和 lm head 都不做模型权重分片。`TP=PP=1`，因此没有 TP collective，也没有 PP stage 或 PP P2P。旧文档中关于 PP2/PP3 层切分、跨 PP 传输 4 倍 hc-stream，以及“EP-only、每个 rank 重复计算完整序列”的描述均不再代表该 launcher
 
-本文只约束 Megatron 训练侧。当前 rollout 是 3 个独立的 8-GPU DSpark/SGLang engine；SGLang 的 `tp_size=8, dp_size=8, enable_dp_attention=True` 不等于训练侧 TP8，不能直接套用本文的 Megatron rank 轴。
+本文只约束 Megatron 训练侧。formal launcher 配置 2 个独立的 8-GPU DSpark/SGLang engine；SGLang 的 `tp_size=8, dp_size=8, enable_dp_attention=True` 不等于训练侧 TP8，不能直接套用本文的 Megatron rank 轴
+
+DS-V4 正式训练当前仍按 `RUNTIME.md` 挂起；本文记录保留 launcher 的分片能力和恢复约束，不构成启动授权
 
 ## 1. 当前物理布局与 rank 组
 
@@ -108,7 +110,7 @@ cp_rank 0: [0, S/2)
 cp_rank 1: [S/2, S)
 ```
 
-padding 粒度会提升到 `lcm(data_pad_size, CP×128)`；CP2 下即 256 的倍数，保证本地长度 `S/2` 是 128 的倍数。正式 16k 上下文时，每个 rank 的常规本地长度是 8192。
+padding 粒度会提升到 `lcm(data_pad_size, CP×128)`；CP2 下即 256 的倍数，保证本地长度 `S/2` 是 128 的倍数。保留 launcher 的 12k 上下文取 `S=12288`，每个 rank 的常规本地长度是 6144
 
 每层 attention 的 CP 数据流如下：
 
@@ -122,9 +124,18 @@ attention 之外的 mHC、router、shared expert 和 lm head 都继续在本地�
 
 当前 CP 路径只支持 dense-over-compressed attention。`V4_SPARSE_ATTENTION=1` 在 `CP>1` 时会硬报错，因为 indexer top-k 尚未实现全局 compressed 轴语义，不能静默退化为 rank-local top-k。
 
-### 3.1 生产采用与验收边界
+`bshd`、micro-batch-size 1 和单条右 padding 文档使 CP2 不需要 THD packed-sequence、CuTe layout 或 ring-attention/LSE merge。128-token raw receptive field 由左 halo 覆盖，compressed receptive field 由全局 all-gather 覆盖，每个 rank 可以独立完成本地 query 的单次 softmax。12k、bf16 下 CSA 的全局 compressed 轴是 `[3072,512]`，HCA 是 `[96,512]`；collective 逐层执行和释放，不堆叠整网中间量
 
-2026-07-19 实际落地的生产拓扑是 **PP1×CP2×DP8×EP8**，不是早期设计稿中的 PP2×CP2×DP4。PP1 packed base 避开了当时不支持的 PP2→PP1 uint8 distributed-checkpoint 重分片，同时让两个 CP rank 都持有完整 43 层 pipeline，并保持 16-GPU 训练规模。iter59 迁移边界允许一次性的 PP-rank RNG 不连续；LoRA 与 Muon 状态均保留。
+实现必须同时维持以下 CP seam 不变量：
+
+- `q_pos0` 与 `raw_halo` 进入全部 forward/backward builder 及其 JIT cache key，防止 rank 变体误复用 kernel
+- contiguous offset 同时用于 token/logprob/loss slicing，不能只修改 `slice_with_cp`
+- MTP label shift 在 CP 边界做相邻 rank exchange，不能沿用 zigzag 的双 chunk 假设
+- raw KV projection 与 compressor 共享同一个带 autograd 的 halo exchange，确保两个 consumer 的边界梯度都回到所有者
+
+### 3.1 验收边界
+
+验收采用 **PP1×CP2×DP8×EP8**。PP1 packed base 避开了 PP2→PP1 uint8 distributed-checkpoint 重分片，同时让两个 CP rank 都持有完整 43 层 pipeline，并保持 16-GPU 训练规模。iter59 迁移边界允许一次性的 PP-rank RNG 不连续；LoRA 与 Muon 状态均保留
 
 正式配置的有界 canary 在 16k 上完成 rollout 60–64，退出码为 0；五步 train time 分别为 770.8、829.1、770.3、865.3、767.5 秒。iter64 在 node69 与 node64 原子提交：每份 checkpoint 都有 32 个 distcp shard、37 个文件、1,154,007,655 bytes，排序后的逐文件 manifest digest 同为 `6e7a4e124928696da13c3198482bd715b3d40d8578722c807ce38067d85d376e`。head-node dataset cursor 为 group/offset 2816、sample 45056、epoch 0；相对 iter59 的额外消耗来自 dynamic-filter refill。
 
@@ -216,8 +227,10 @@ PP、EP、world size 或节点集合变化都必须先生成/验证 topology-mat
 - 模型、EP dispatcher、checkpoint 分片：`custom_kernels/deepseek_v4/megatron/mcore_model.py`
 - CP halo / compressed collectives：`custom_kernels/deepseek_v4/megatron/cp_utils.py`、`attention.py`
 - 数据、logprob 与 loss 的 contiguous CP：`slime/backends/megatron_utils/cp_utils.py`
+- kernel position/cache-key parity：`custom_kernels/deepseek_v4/attention/test_correctness.py`
+- halo/compressed collectives 与 contiguous slicing：`tests/deepseek-v4/test_cp2_orchestration.py`、`tests/deepseek-v4/test_cp2_slime_plumbing.py`
 - LoRA target：`custom_kernels/deepseek_v4/megatron/lora.py`
 - 已完成的 CP2 canary：`local_artifacts/deepseek-v4/r2_logs/r21_pp1cp2_canary60_64_result_20260719.txt`
 - 正式 native resume 证据：`local_artifacts/deepseek-v4/r2_logs/r21_formal_launch_iter64_20260719.txt`
 
-2026-07-20 对 `/tmp/r21_formal.out` 的只读核对确认了 `world_size=16`、`PP1/EP8/TP1/CP2`、node64 ranks 0–7、node69 ranks 8–15；运行中的训练已经越过 canary，本文记录的是其稳定 topology 契约，不承担动态 step 状态记录。
+保留的 launcher、CP2 canary 和 native resume 证据共同确认 `world_size=16`、`PP1/EP8/TP1/CP2`、node64 ranks 0–7、node69 ranks 8–15；动态运行状态以 `RUNTIME.md` 和正式 launcher 为准

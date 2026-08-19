@@ -1,7 +1,7 @@
 """CPU unit tests for the CP2 (contiguous context-parallel) slime plumbing.
 
 Covers the slime-side pieces of the DeepSeek-V4-Flash contiguous-CP design
-(handoffs/deepseek-v4/cp2_design.md, findings B1/M3/M4):
+(handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md):
 
   (a) ``slice_with_cp`` contiguous mode == the manual contiguous block slice,
       including the pad_func-callable (routing-replay) path.

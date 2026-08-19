@@ -1,6 +1,7 @@
 """Context-parallel (CP2) orchestration for V4-Flash training.
 
-Stage-2 of the CP2 design (``handoffs/deepseek-v4/cp2_design.md``): the torch-level
+The CP2 contract lives in ``handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md``:
+this module provides the torch-level
 comm/orchestration around the already-CP-capable A1 attention kernel (which threads
 ``q_pos0`` / ``raw_halo`` -- see ``attention/kernel.py``).  bshd-contiguous CP2: each
 rank owns a CONTIGUOUS slice ``[r*l_local, (r+1)*l_local)`` of the sequence

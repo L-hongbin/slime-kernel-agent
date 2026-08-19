@@ -7,7 +7,7 @@ comm is exercised with a real gloo process group via ``torch.multiprocessing.spa
 These tests cover the torch-level ORCHESTRATION -- shapes, indices, autograd flow,
 and comm adjointness -- not the kernels themselves.
 
-Coverage (design ``cp2_design.md`` validation ladder + review additions):
+Coverage (``dsv4_megatron_sharding_contract.md`` CP2 invariants):
   (a) CpHaloExchange fwd/bwd incl. gradient accumulation back to the halo owner.
   (b) per-layer-type boundary drop counts (CSA m=4 -> 32, HCA m=128 -> 1).
   (c) compressed all-gather fwd <-> reduce-scatter bwd adjointness.
