@@ -10,7 +10,7 @@ subdirectories below.
 |---|---|
 | `launch_formal_managed.sh` → `run.deepseek_v4_flash.fp4.formal.rl.sh` | Formal DS-V4 lifecycle and configuration |
 | `formal_resume_preflight.py` | Formal checkpoint/resume validation |
-| `run.t1.deepseek_v4_flash.rl.sh` → `full_loop_smoke.sh` | Shared lower-level launch chain |
+| `run.t1.deepseek_v4_flash.rl.sh` → `_dsv4_launch_core.sh` | Shared lower-level launch chain |
 | `_dsv4_task_args.sh` | Shared task-argument assembly |
 | `train_smoke.sh` / `rollout_smoke.sh` | Isolated train and rollout bring-up |
 | `convert_torch_dist.sh` | HF-to-`torch_dist` conversion and chained verification |

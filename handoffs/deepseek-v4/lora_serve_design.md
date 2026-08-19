@@ -13,7 +13,7 @@
 
 ## 启用与拓扑约束
 
-正式入口 `scripts/dsv4/run.deepseek_v4_flash.fp4.formal.rl.sh` 经 `scripts/dsv4/run.t1.deepseek_v4_flash.rl.sh` 向 `scripts/dsv4/full_loop_smoke.sh` 传递以下配置
+正式入口 `scripts/dsv4/run.deepseek_v4_flash.fp4.formal.rl.sh` 经 `scripts/dsv4/run.t1.deepseek_v4_flash.rl.sh` 向 `scripts/dsv4/_dsv4_launch_core.sh` 传递以下配置
 
 | 配置 | 正式值或约束 | 作用 |
 |---|---|---|

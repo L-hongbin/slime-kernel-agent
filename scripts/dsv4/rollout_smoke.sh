@@ -224,7 +224,7 @@ SGLANG_ARGS=(
 )
 
 # NEXTN/EAGLE speculative decoding. Chain mode (eagle-topk=1) needs draft =
-# steps + 1. DELIBERATELY UNGATED for FP4+EAGLE (unlike full_loop_smoke.sh's
+# steps + 1. DELIBERATELY UNGATED for FP4+EAGLE (unlike _dsv4_launch_core.sh's
 # hard block): this rollout-only harness IS the investigation tool for the
 # known FP4+EAGLE NCCL deadlock (fp4_w4a16_design.md) — launching the wedging
 # combo on purpose is its job. Do not use this script for routine validation
@@ -266,7 +266,7 @@ fi
 if [[ "${V4_FP4_FROZEN_EXPERTS:-0}" == "1" ]]; then
   # Packed-MXFP4 W4A16 serving (official checkpoint): SM90 runners are a2a=none
   # only; runner must be explicit ('auto' falls into Fp8MoEMethod). Mirrors the
-  # full_loop_smoke.sh FP4 block; design handoffs/deepseek-v4/fp4_w4a16_design.md.
+  # _dsv4_launch_core.sh FP4 block; design handoffs/deepseek-v4/fp4_w4a16_design.md.
   if [[ "${USE_SGLANG_DEEPEP}" == "1" ]]; then
     echo "FATAL: V4_FP4_FROZEN_EXPERTS=1 requires USE_SGLANG_DEEPEP=0" >&2
     exit 1

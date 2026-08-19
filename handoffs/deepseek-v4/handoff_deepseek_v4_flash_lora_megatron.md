@@ -14,7 +14,7 @@ The R6 full loop runs **end-to-end** and both historical blockers are
    **Verified: attempt36_tempfix PASSED the full R6 gate** (finite loss 0.0743,
    grad_norm 0.344, routing-replay dump verified). The R6 smoke's post-hoc dump
    verifier also needed `--expected-samples` (it defaulted to R4's 2; R6 has 8)
-   — fixed in `scripts/dsv4/full_loop_smoke.sh` (both call sites) via `N_SAMPLES_PER_PROMPT`.
+   — fixed in `scripts/dsv4/_dsv4_launch_core.sh` (both call sites) via `N_SAMPLES_PER_PROMPT`.
 
 ## Root Cause of the First-Backward NaN: rollout-temperature 0
 
@@ -213,7 +213,7 @@ Validation already run for these fixes:
 - `python3 -m pytest -q tests/test_deepseekv4_megatron_to_hf.py`
 - Standalone Ray actor test: env_vars `PYTHONPATH=/root/Megatron-LM` →
   `megatron.training` imports; without it → `ModuleNotFoundError` (reproduced).
-- `bash -n scripts/dsv4/full_loop_smoke.sh`
+- `bash -n scripts/dsv4/_dsv4_launch_core.sh`
 - Codex (xhigh) reviewed the diagnosis and the fixes; it verified the PYTHONPATH
   fix and flagged the cleanup pkills as unsafe on the shared box (now defaulted off).
 
@@ -285,7 +285,7 @@ log-prob/train forward, never the SFT smoke; rollout worked every attempt):
    got 3-D not 4-D. Fixed in `model.py` (both forward paths now wire it;
    `test_v4_pp_shape_adapter.py` guards both).
 2. SGLang context vs response length rejection -> total-budget windows +
-   `--rollout-max-prompt-len` (`full_loop_smoke.sh`, `_dsv4_task_args.sh`).
+   `--rollout-max-prompt-len` (`_dsv4_launch_core.sh`, `_dsv4_task_args.sh`).
 3. V4 PP shape adapter hardcoded S from static `args.seq_length`, but slime uses
    `variable_seq_lengths` and pads each rollout to a per-step `max_seq_len` (~384)
    while RoPE used the real length -> RoPE shape clash. Fixed: `actor.py` stashes
@@ -547,7 +547,7 @@ Execution-ready (injection points located):
   adapter `--save`, with the model's `sharded_state_dict` filtered to adapter
   keys so Megatron's load tolerates the missing base keys. Muon optim state for
   the (tiny) trainable params saves/loads normally (`SAVE_OPTIM`/`LOAD_OPTIM`
-  already wired in `full_loop_smoke.sh`).
+  already wired in `_dsv4_launch_core.sh`).
 - **Validate**: adapter-only checkpoints are MB-scale so a save+resume smoke
   fits the tight disk. Confirm: (1) `--save` writes MB not 259GB; (2) resume
   restores adapters + Muon momentum and continues finite training.

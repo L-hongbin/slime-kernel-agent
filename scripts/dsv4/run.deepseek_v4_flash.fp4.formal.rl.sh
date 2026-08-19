@@ -79,7 +79,7 @@ export CP_SIZE=${CP_SIZE:-2}
 # path's shape set small enough for production kernel-cache reuse while still
 # avoiding rollout-wide 12k padding.
 readonly FORMAL_DATA_PAD_SIZE_MULTIPLIER=1024
-# PP1 ignores first/last-stage split flags in full_loop_smoke.sh.  Keep the
+# PP1 ignores first/last-stage split flags in _dsv4_launch_core.sh.  Keep the
 # banner truthful instead of advertising the retired 20/23 PP2 partition.
 export FIRST_LAYERS=${FIRST_LAYERS:-43}
 export LAST_LAYERS=${LAST_LAYERS:-0}

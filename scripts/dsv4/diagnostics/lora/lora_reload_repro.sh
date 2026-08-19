@@ -72,7 +72,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export NO_PROXY="127.0.0.1,localhost,0.0.0.0,::1"
 export no_proxy="${NO_PROXY}"
-# V4 engine env (mirrors full_loop_smoke.sh). LoRA needs wq_a/wkv unfused.
+# V4 engine env (mirrors _dsv4_launch_core.sh). LoRA needs wq_a/wkv unfused.
 export SGLANG_OPT_FUSE_WQA_WKV=0
 export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=${SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK:-false}
 export SGLANG_MEMORY_SAVER_CUDA_GRAPH=${SGLANG_MEMORY_SAVER_CUDA_GRAPH:-true}

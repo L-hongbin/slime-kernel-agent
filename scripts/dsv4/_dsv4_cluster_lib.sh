@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # Stable cluster infrastructure for the V4 full-loop launcher, extracted from
-# scripts/dsv4/full_loop_smoke.sh (2026-07-14 refactor). This file holds the
+# scripts/dsv4/_dsv4_launch_core.sh (2026-07-14 refactor). This file holds the
 # rarely-changing bring-up/cleanup machinery; all volatile config, derived
 # sizing, validation guards, arg assembly and orchestration stay in
-# full_loop_smoke.sh.
+# _dsv4_launch_core.sh.
 #
 # CONTRACT:
 #   * FUNCTIONS ONLY — sourcing this file must not execute anything.

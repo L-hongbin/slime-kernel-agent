@@ -378,7 +378,7 @@ def test_checkpoint_perf_reporting_is_best_effort_and_selective(monkeypatch):
 
 @pytest.mark.parametrize(
     "launcher",
-    ("scripts/dsv4/full_loop_smoke.sh", "scripts/dsv4/train_smoke.sh"),
+    ("scripts/dsv4/_dsv4_launch_core.sh", "scripts/dsv4/train_smoke.sh"),
 )
 def test_async_save_launchers_enable_the_persistent_worker(launcher):
     source = (REPO / launcher).read_text()

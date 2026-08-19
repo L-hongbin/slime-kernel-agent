@@ -71,7 +71,7 @@ case "${HEAD_PHYSICAL}" in
     ;;
 esac
 
-# full_loop_smoke.sh starts the Ray head in its own process namespace.  Mapping
+# _dsv4_launch_core.sh starts the Ray head in its own process namespace.  Mapping
 # HEAD_HOST is not enough: invoking a node69 arm from node64 would otherwise
 # silently start the head on node64 while advertising node69's address.
 LOCAL_IPV4S=$(hostname -I 2>/dev/null || true)
@@ -328,7 +328,7 @@ CRITICAL_CODE_FILES=(
   examples/kernel_agent/utils.py
   scripts/dsv4/_dsv4_cluster_lib.sh
   scripts/dsv4/_dsv4_task_args.sh
-  scripts/dsv4/full_loop_smoke.sh
+  scripts/dsv4/_dsv4_launch_core.sh
   scripts/dsv4/studies/entropy/prepare_entropy_fixed_rollout.py
   scripts/dsv4/studies/entropy/run_entropy_fixed_batch_arm.sh
   slime/backends/megatron_utils/actor.py
@@ -544,7 +544,7 @@ fi
 export REPO ARM HEAD_PHYSICAL HEAD_HOST HEAD_IP ROLLOUT_WORKER_HOSTS ROLLOUT_WORKER_IPS
 export ROLLOUT_PHYSICAL_HOSTS RUN_ID SCRATCH LOG
 # A non-empty whitespace value expands to an empty bash array in
-# full_loop_smoke.sh, giving this diagnostic exactly one actor node.
+# _dsv4_launch_core.sh, giving this diagnostic exactly one actor node.
 export TRAIN_WORKER_HOSTS=' '
 export TRAIN_WORKER_IPS=' '
 export ACTOR_PHYSICAL_HOSTS="${HEAD_PHYSICAL}"
@@ -597,7 +597,7 @@ export EXTERNAL_SGLANG_GUARD=0 CLEANUP_KILL_ORPHANS_ON_EXIT=0
 export RUN_LOCK="/tmp/slime_entropy_ab_${HEAD_PHYSICAL}.lock"
 [[ "${MODE}" == "--prepare-only" ]] && export PREPARE_ONLY=1
 
-# full_loop_smoke.sh owns LOG and truncates it at startup, so pass provenance
+# _dsv4_launch_core.sh owns LOG and truncates it at startup, so pass provenance
 # explicitly for that launcher to emit after opening the final log.
 export ENTROPY_AB_ARM="${ARM}"
 export ENTROPY_AB_SOURCE_DEBUG_DATA="${SOURCE_DEBUG_DATA}"
@@ -635,7 +635,7 @@ parallel=PP1/CP2/EP8 actor_nodes=1 batch=${GLOBAL_BATCH_SIZE} repeats=${NUM_ROLL
 save_model=0 wandb=0 log=${LOG}
 EOF
 
-exec bash "${REPO}/scripts/dsv4/full_loop_smoke.sh" \
+exec bash "${REPO}/scripts/dsv4/_dsv4_launch_core.sh" \
   --lora-dim 32 \
   --lora-alpha 32 \
   --lora-dropout 0.0 \

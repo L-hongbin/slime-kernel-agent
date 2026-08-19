@@ -1,7 +1,7 @@
 #!/bin/bash
 # Formal DeepSeek-V4-Flash LoRA RL training launcher.
 #
-# Reuses the validated R6 full-loop infrastructure (scripts/dsv4/full_loop_smoke.sh:
+# Reuses the validated R6 full-loop infrastructure (scripts/dsv4/_dsv4_launch_core.sh:
 # fratricide guard, ray bring-up, external-sglang guard, PP3/EP8 Megatron actor +
 # SGLang EP8/dp-attention rollout, Muon, torch_dist checkpoint, routing replay) via
 # TASK_MODE=rl, and layers on the RL task.
@@ -138,12 +138,12 @@ export LR="${LR:-1e-4}"
 # MAX_CONTEXT_LEN is the total prompt+response window. V4's SGLang strictly
 # rejects prompt+new_tokens > context (the qwen ref's SGLang silently clamps
 # instead), so response gets half the window and rollout_max_prompt_len is
-# pinned to the remainder in full_loop_smoke.sh.
+# pinned to the remainder in _dsv4_launch_core.sh.
 export MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-16384}"
 # Full-window responses (2026-07-11): drkernel's custom generate clamps
 # max_new_tokens to (ctx - prompt_len) per request, so response may equal ctx —
 # kills the 17% truncation at the old ctx/2 cap. Only the random-reward mode
-# needs response < ctx (unclamped path; full_loop_smoke guards it).
+# needs response < ctx (unclamped path; _dsv4_launch_core guards it).
 export MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}"
 export ROLLOUT_BATCH_SIZE="${ROLLOUT_BATCH_SIZE:-16}"
 export N_SAMPLES_PER_PROMPT="${N_SAMPLES_PER_PROMPT:-16}"
@@ -250,7 +250,7 @@ export USE_WANDB="${USE_WANDB:-1}"
 export WANDB_PROJECT="${WANDB_PROJECT:-slime}"
 export WANDB_GROUP="${WANDB_GROUP:-FAsync.${KERNEL_BACKEND}.DeepSeek-V4-Flash.CTX${MAX_CONTEXT_LEN}}"
 # Populate WANDB_API_KEY from the standard key file (as the qwen ref does) so
-# full_loop_smoke.sh can forward it into the Ray runtime env; else wandb logging
+# _dsv4_launch_core.sh can forward it into the Ray runtime env; else wandb logging
 # silently fails to authenticate on the actors.
 WANDB_KEY_FILE="${WANDB_KEY_FILE:-${HOME}/.config/wandb/slime.key}"
 if [[ "${USE_WANDB}" == "1" && -z "${WANDB_API_KEY:-}" && -f "${WANDB_KEY_FILE}" ]]; then
@@ -283,7 +283,7 @@ lora_defaults=r${T1_LORA_DIM}/alpha${T1_LORA_ALPHA}/rslora0/plusoff/shared1 \
 use_rollout_routing_replay=${USE_ROLLOUT_ROUTING_REPLAY} \
 checkpoint=save_optim${SAVE_OPTIM}/save_rng${SAVE_RNG}/load_optim${LOAD_OPTIM}/load_rng${LOAD_RNG}"
 
-exec "${SCRIPT_DIR}/full_loop_smoke.sh" \
+exec "${SCRIPT_DIR}/_dsv4_launch_core.sh" \
   --sequence-mis-config "${T1_SEQUENCE_MIS_CONFIG}" \
   --lora-dim "${T1_LORA_DIM}" \
   --lora-alpha "${T1_LORA_ALPHA}" \

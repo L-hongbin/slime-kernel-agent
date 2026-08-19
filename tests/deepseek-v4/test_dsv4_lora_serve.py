@@ -10,7 +10,7 @@ Covers (no GPU, no sglang server needed):
      server --lora-target-modules (after sglang normalization).
   5. sglang-side registration (import-light asserts) + the compressor wkv+gate
      fusion (normalize_wkv_gate) that the served fused wkv_gate module requires.
-  6. Launcher (full_loop_smoke.sh) LoRA env/arg wiring + safety gates.
+  6. Launcher (_dsv4_launch_core.sh) LoRA env/arg wiring + safety gates.
 
 Run: python -m pytest tests/deepseek-v4/test_dsv4_lora_serve.py -q
 """
@@ -643,7 +643,7 @@ def test_sglang_normalize_wkv_gate_fusion():
 
 
 def _full_loop_text():
-    return (REPO / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
+    return (REPO / "scripts" / "dsv4" / "_dsv4_launch_core.sh").read_text()
 
 
 def test_launcher_lora_args():

@@ -1,9 +1,8 @@
 #!/bin/bash
-# R6 full-loop smoke for DeepSeek-V4-Flash:
-# node64+node69 Megatron PP2/EP8 actor train, node62 SGLang TP4 rollout.
+# Shared DeepSeek-V4 full-loop launch core
 #
-# This runs one small rollout+SFT train iteration with rollout routing replay,
-# Megatron DeepEP, Megatron Muon, and a converted torch_dist checkpoint.
+# TASK_MODE=smoke_sft runs the small integration smoke; TASK_MODE=rl runs the
+# configured training recipe. Public wrappers own topology and experiment values.
 set -euo pipefail
 
 OVERLONG_PENALTY=0

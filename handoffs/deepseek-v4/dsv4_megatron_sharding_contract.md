@@ -221,7 +221,7 @@ PP、EP、world size 或节点集合变化都必须先生成/验证 topology-mat
 ## 9. 可复核依据
 
 - 拓扑与节点：`scripts/dsv4/run.deepseek_v4_flash.fp4.formal.rl.sh`
-- Megatron 参数：`scripts/dsv4/full_loop_smoke.sh`
+- Megatron 参数：`scripts/dsv4/_dsv4_launch_core.sh`
 - rank 顺序：`slime/backends/megatron_utils/initialize.py`
 - 物理 rank 排序：`slime/ray/placement_group.py`
 - 模型、EP dispatcher、checkpoint 分片：`custom_kernels/deepseek_v4/megatron/mcore_model.py`

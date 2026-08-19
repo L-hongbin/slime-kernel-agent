@@ -94,7 +94,7 @@ def test_ds_v4_decoder_defaults_to_official_mhc():
 
 
 def test_full_loop_exports_tilekernels_for_train_actors():
-    launcher_path = REPO_ROOT / "scripts" / "dsv4" / "full_loop_smoke.sh"
+    launcher_path = REPO_ROOT / "scripts" / "dsv4" / "_dsv4_launch_core.sh"
     source = launcher_path.read_text()
 
     assert "TILEKERNELS_DIR=${TILEKERNELS_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/TileKernels}" in source

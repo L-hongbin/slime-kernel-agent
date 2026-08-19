@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# V4 task-arg assembly, extracted from full_loop_smoke.sh so it can be unit-tested
+# V4 task-arg assembly, extracted from _dsv4_launch_core.sh so it can be unit-tested
 # in isolation (tests/deepseek-v4/test_dsv4_rl_task_args.py) without the cluster
 # bring-up. Sets the global array TASK_ARGS from the caller's environment.
 #

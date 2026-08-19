@@ -115,7 +115,7 @@ def test_train_smoke_gpu_idle_check_strips_nvidia_smi_units():
 
 
 def test_r6_full_loop_smoke_starts_from_rollout_zero_and_cleans_debug_dumps():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "_dsv4_launch_core.sh").read_text()
 
     assert "START_ROLLOUT_ID=${START_ROLLOUT_ID:-0}" in source
     assert "MOE_ROUTER_TOPK" not in source
@@ -126,7 +126,7 @@ def test_r6_full_loop_smoke_starts_from_rollout_zero_and_cleans_debug_dumps():
 
 
 def test_r6_full_loop_smoke_keeps_runtime_cache_off_root_disk():
-    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "full_loop_smoke.sh").read_text()
+    source = (Path(__file__).resolve().parents[1] / "scripts" / "dsv4" / "_dsv4_launch_core.sh").read_text()
 
     assert "readonly RUNTIME_CACHE_ROOT=/dev/shm/v4r6_full_loop_cache" in source
     assert "export TMPDIR=${TMPDIR:-${RUNTIME_CACHE_ROOT}/tmp}" in source

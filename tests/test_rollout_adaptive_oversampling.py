@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO))
 from slime.rollout.sglang_rollout import _get_over_sampling_fetch_size
 
 FORMAL_LAUNCHER = REPO / "scripts" / "dsv4" / "run.deepseek_v4_flash.fp4.formal.rl.sh"
-FULL_LOOP = REPO / "scripts" / "dsv4" / "full_loop_smoke.sh"
+FULL_LOOP = REPO / "scripts" / "dsv4" / "_dsv4_launch_core.sh"
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[2]
-R6 = REPO / "scripts" / "dsv4" / "full_loop_smoke.sh"
+R6 = REPO / "scripts" / "dsv4" / "_dsv4_launch_core.sh"
 # The task-arg assembly (loss type, rollout-temperature wiring, etc.) was
 # extracted into this sourceable helper so it can be unit-tested in isolation;
 # the r6_text fixture reads both so these assertions still cover it.

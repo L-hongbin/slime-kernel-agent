@@ -14,7 +14,7 @@ ACTCKPT_HARNESS = REPO / "scripts" / "dsv4" / "diagnostics" / "parity" / "test_a
 RUNTIME_SURFACES = [
     ATTENTION,
     REPO / "slime" / "backends" / "megatron_utils" / "actor.py",
-    REPO / "scripts" / "dsv4" / "full_loop_smoke.sh",
+    REPO / "scripts" / "dsv4" / "_dsv4_launch_core.sh",
     REPO / "scripts" / "dsv4" / "train_smoke.sh",
     ACTCKPT_HARNESS,
 ]

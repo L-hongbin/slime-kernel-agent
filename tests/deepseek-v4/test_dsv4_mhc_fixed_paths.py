@@ -20,7 +20,7 @@ def test_train_path_is_fixed_to_official_mhc():
 
 def test_train_mhc_always_uses_full_autograd():
     model = (REPO / "custom_kernels/deepseek_v4/megatron/mcore_model.py").read_text()
-    full_loop = (REPO / "scripts/dsv4/full_loop_smoke.sh").read_text()
+    full_loop = (REPO / "scripts/dsv4/_dsv4_launch_core.sh").read_text()
     train_smoke = (REPO / "scripts/dsv4/train_smoke.sh").read_text()
     removed_env = "V4_MHC_" "MIXING_ORACLE"
 
