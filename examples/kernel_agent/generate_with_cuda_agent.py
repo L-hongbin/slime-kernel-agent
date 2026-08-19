@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import hashlib
 import json
@@ -397,6 +398,77 @@ def _get_entry_point(sample: Sample) -> Any:
     return "Model"
 
 
+_PRECISION_ALIASES = {
+    "fp32": "fp32",
+    "float32": "fp32",
+    "torch.float32": "fp32",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "torch.float16": "fp16",
+    "torch.half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "torch.bfloat16": "bf16",
+}
+
+
+def _canonical_task_precision(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _PRECISION_ALIASES.get(str(value).strip().lower())
+
+
+def _reference_input_precision(reference_code: Any) -> str:
+    """Infer the effective input precision from ``get_inputs`` only.
+
+    Serial layout augmentation intentionally leaves ``augmentation.dtype_after``
+    empty on the layout child even when its parent was a dtype intervention.  The
+    rewritten reference remains authoritative, though: all floating factories in
+    ``get_inputs`` carry the selected ``torch.float16``/``torch.bfloat16`` dtype.
+    Restricting inference to that function avoids treating unrelated casts in the
+    model implementation as the task's input precision.
+    """
+
+    if not isinstance(reference_code, str) or not reference_code.strip():
+        return "fp32"
+    try:
+        tree = ast.parse(reference_code)
+    except (SyntaxError, ValueError, TypeError):
+        return "fp32"
+
+    detected: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "get_inputs":
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "torch":
+                precision = _canonical_task_precision(f"torch.{child.attr}")
+                if precision in {"fp16", "bf16"}:
+                    detected.add(precision)
+
+    # The augmentation contract uses one low-precision dtype for every floating
+    # input.  Ambiguous mixed-dtype references retain the historical fp32 policy
+    # instead of silently weakening the static precision check.
+    return next(iter(detected)) if len(detected) == 1 else "fp32"
+
+
+def _resolve_task_precision(sample: Sample, reference_code: Any) -> str:
+    """Resolve the precision KernelGym should enforce for this task."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    augmentation = metadata.get("augmentation")
+    if isinstance(augmentation, dict):
+        explicit = _canonical_task_precision(augmentation.get("dtype_after"))
+        if explicit is not None:
+            return explicit
+
+    explicit = _canonical_task_precision(metadata.get("precision"))
+    if explicit is not None:
+        return explicit
+    return _reference_input_precision(reference_code)
+
+
 def _reference_cache_uuid(ground_truth: Any, entry_point: Any) -> str | None:
     """Collision-resistant key for KernelGym's reference-timing cache.
 
@@ -467,6 +539,8 @@ async def cuda_kernel_env(
     turn_idx: int,
 ) -> dict[str, Any]:
     entry_point = _get_entry_point(sample)
+    ground_truth = _get_label_value(sample, "ground_truth")
+    precision = _resolve_task_precision(sample, ground_truth)
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
@@ -478,13 +552,13 @@ async def cuda_kernel_env(
             precheck_result.setdefault("decoy_kernel", None)
             return {"env_state": precheck_result, "reward_extra_info": precheck_result}
 
-    ground_truth = _get_label_value(sample, "ground_truth")
     payload = {
         "response": response,
         "ground_truth": ground_truth,
         "kernel_backend": kernel_backend,
         "reference_backend": reference_backend,
         "entry_point": entry_point,
+        "precision": precision,
         # Reference-timing cache key: a hash of the reference identity, NOT any
         # dataset-supplied id — a bare problem_id/name (or a non-unique explicit
         # uuid) would false-share a wrong cached baseline across datasets on a
