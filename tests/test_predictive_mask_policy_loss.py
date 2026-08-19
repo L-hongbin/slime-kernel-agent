@@ -225,6 +225,8 @@ def test_gradient_flows_only_through_sampled_current_log_prob_and_ratio_is_cappe
     out["pg_losses"].sum().backward()
 
     torch.testing.assert_close(sampled_current.grad, torch.tensor([-2.0 * 1.25], dtype=torch.float64))
+    torch.testing.assert_close(out["dppo_importance_ratio"], torch.tensor([math.exp(5.0)], dtype=torch.float64))
+    torch.testing.assert_close(out["dppo_importance_weight"], torch.tensor([1.25], dtype=torch.float64))
     assert sampled_behavior.grad is None
     assert behavior_support.grad is None
     assert current_support.grad is None

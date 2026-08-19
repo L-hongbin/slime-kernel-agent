@@ -31,6 +31,7 @@ def test_double_sided_gate_is_independent_of_advantage_sign():
 
     assert result["pg_lower_clipfrac"].tolist() == [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     assert result["pg_upper_clipfrac"].tolist() == [0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+    torch.testing.assert_close(result["dis_importance_ratio"], torch.tensor(ratios, dtype=torch.float64))
     assert result["dis_valid_token_frac"].tolist() == [0.0, 1.0, 1.0, 1.0, 0.0, 0.0]
     assert result["pg_losses"][0].item() == 0.0
     assert result["pg_losses"][4].item() == 0.0
@@ -63,6 +64,7 @@ def test_outside_tokens_stay_finite_even_for_extreme_log_ratios():
 
     assert result["pg_clipfrac"].tolist() == [1.0, 1.0]
     assert torch.isfinite(result["pg_losses"]).all()
+    assert torch.isfinite(result["dis_importance_ratio"]).all()
     assert result["pg_losses"].tolist() == [0.0, 0.0]
 
 

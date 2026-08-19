@@ -238,6 +238,11 @@ def compute_dis_policy_loss(
         above = log_ratio >= log_upper
         valid = ~(below | above)
 
+        # Keep the raw importance ratio observable independently of the DIS
+        # gate/weight.  Clamp only for finite diagnostics: the actual gate is
+        # still decided from the unclamped log-ratio above.
+        importance_ratio = log_ratio.clamp(min=-20.0, max=20.0).exp()
+
         # The ratio only contributes for valid tokens.  Clamping before exp
         # prevents an out-of-range token from producing inf that later meets a
         # zero mask; values inside the open interval remain exact.
@@ -253,6 +258,7 @@ def compute_dis_policy_loss(
         "pg_clipfrac": (~valid).to(loss_dtype),
         "pg_upper_clipfrac": above.to(loss_dtype),
         "pg_lower_clipfrac": below.to(loss_dtype),
+        "dis_importance_ratio": importance_ratio.to(loss_dtype),
         "dis_importance_weight": importance_weight.to(loss_dtype),
         "dis_valid_token_frac": valid.to(loss_dtype),
     }
@@ -548,8 +554,11 @@ def compute_dppo_predictive_topk_policy_loss(
         negative_advantage = detached_advantages < 0
         zero_advantage = detached_advantages == 0
 
+        # Keep the raw sampled-token ratio observable independently of the
+        # cap used by the predictive-DPPO loss.  Both tensors are detached and
+        # linearly reducible, so logging them cannot alter the objective.
         importance_ratio = (sampled_log_prob - sampled_old_log_prob).clamp(min=-20.0, max=20.0).exp()
-        importance_ratio = importance_ratio.clamp(max=float(ratio_clip_c))
+        importance_weight = importance_ratio.clamp(max=float(ratio_clip_c))
         valid_loss_mask = (~invalid_mask).to(calc_dtype)
 
         # Diagnostic sufficient statistics deliberately remain per-token and
@@ -567,8 +576,8 @@ def compute_dppo_predictive_topk_policy_loss(
             "negative_kept": negative_kept.to(calc_dtype),
         }
 
-        update_mass = detached_advantages.abs() * importance_ratio
-        signed_update = detached_advantages * importance_ratio
+        update_mass = detached_advantages.abs() * importance_weight
+        signed_update = detached_advantages * importance_weight
         kept_update_mass = update_mass * valid_loss_mask
         kept_signed_update = signed_update * valid_loss_mask
         sampled_logit_first_order_unmasked = signed_update * (1.0 - sampled_current_prob)
@@ -686,12 +695,14 @@ def compute_dppo_predictive_topk_policy_loss(
 
     # Do not use sampled_log_prob here: it is detached.  This explicit factor
     # is the sole autograd path by construction.
-    pg_losses = -detached_advantages * importance_ratio * valid_loss_mask * log_probs
+    pg_losses = -detached_advantages * importance_weight * valid_loss_mask * log_probs
     return {
         "pg_losses": pg_losses,
         "pg_clipfrac": invalid_mask.to(calc_dtype),
         "pg_upper_clipfrac": (invalid_mask & positive_advantage).to(calc_dtype),
         "pg_lower_clipfrac": (invalid_mask & negative_advantage).to(calc_dtype),
+        "dppo_importance_ratio": importance_ratio,
+        "dppo_importance_weight": importance_weight,
         "dppo_topk_kl": topk_kl,
         "dppo_predictive_dot": predictive_dot,
         "dppo_outside": outside.to(calc_dtype),

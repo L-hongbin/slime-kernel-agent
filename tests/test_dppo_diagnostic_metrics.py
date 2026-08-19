@@ -158,6 +158,10 @@ def test_predictive_diagnostics_use_pre_tis_reducer_and_emit_namespaced_joint_mo
 
     torch.testing.assert_close(metrics["dppo/adv_positive_token_frac"], torch.tensor(0.5, dtype=torch.float64))
     torch.testing.assert_close(metrics["dppo/adv_negative_token_frac"], torch.tensor(0.5, dtype=torch.float64))
+    # The ordinary metric formatter maps these to train/dppo_importance_* in
+    # both the text log and centralized W&B payload.
+    torch.testing.assert_close(metrics["dppo_importance_ratio"], torch.tensor(1.09375, dtype=torch.float64))
+    torch.testing.assert_close(metrics["dppo_importance_weight"], torch.tensor(1.09375, dtype=torch.float64))
     torch.testing.assert_close(metrics["dppo/upper_clip_joint_frac"], torch.tensor(0.25, dtype=torch.float64))
     torch.testing.assert_close(metrics["dppo/lower_clip_joint_frac"], torch.tensor(0.25, dtype=torch.float64))
     torch.testing.assert_close(
