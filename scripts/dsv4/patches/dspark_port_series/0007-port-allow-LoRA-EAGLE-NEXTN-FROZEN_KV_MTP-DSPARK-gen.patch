@@ -1,0 +1,78 @@
+From 8610d91835f1a096032f14f6c2d836d6cad562ed Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 09:26:32 +0900
+Subject: [PATCH 07/13] port: allow LoRA + EAGLE/NEXTN/FROZEN_KV_MTP/DSPARK
+ (generalize mtp_lora_phase1)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+server_args.check_lora_server_args: relax the speculative-decoding LoRA gate
+from ["NGRAM", None] to also allow EAGLE, NEXTN, FROZEN_KV_MTP and DSPARK.
+Generalizes the fork's mtp_lora_phase1 allowlist (EAGLE/NEXTN/FROZEN_KV_MTP) by
+adding DSPARK; DSPARK is a builtin SpeculativeAlgorithm (spec_info.py:36) that
+otherwise hits the raise. EAGLE3 / DFLASH / STANDALONE stay blocked.
+
+DSPARK+LoRA is target-verify-only (the adapter applies to the target/verify
+forward; the DSPARK draft runs base weights, so accept-rate — not correctness —
+degrades) and is PENDING FIRST GPU VALIDATION. This relaxation is inert unless a
+DSPARK+LoRA launch is attempted; env-off byte-identical for every currently-used
+config.
+
+SCOPE / DEPENDENCY: only the allowlist is ported here (task d). The rest of
+mtp_lora_phase1 — the per-runner `lora_enabled = enable_lora and not
+is_draft_worker` gate + the fail-closed draft-runner LoRA audits — is NOT
+ported. Without it, a DSPARK draft ModelRunner would init a LoRAManager under the
+shared server_args.enable_lora (and the ported idle-LoRA suite gates on
+server_args.enable_lora, not lora_enabled), so DSPARK+LoRA must not be run on GPU
+until that gate lands. Flagged for the follow-up Phase-6 port.
+---
+ python/sglang/srt/server_args.py | 31 ++++++++++++++++++++++++++++---
+ 1 file changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/python/sglang/srt/server_args.py b/python/sglang/srt/server_args.py
+index 2fd9010..81c4948 100644
+--- a/python/sglang/srt/server_args.py
++++ b/python/sglang/srt/server_args.py
+@@ -7069,10 +7069,35 @@ class ServerArgs:
+                     f"so --max-loaded-loras must be less than or equal to double --max-loras-per-batch: {max_loaded_loras_limit}"
+                 )
+ 
+-            # Validate compatibility with speculative decoding
+-            if self.speculative_algorithm not in ["NGRAM", None]:
++            # Validate compatibility with speculative decoding. Compared against
++            # the raw (post-CLI) algorithm name, consistent with the other
++            # `self.speculative_algorithm == "EAGLE"` checks in __post_init__.
++            # EAGLE/NEXTN, FROZEN_KV_MTP and DSPARK are allowed under the
++            # adapter-on-target-only design (vLLM PR #11966): the adapter applies
++            # to the target/verify forward only; the draft/MTP runner runs BASE
++            # weights, so correctness is owned by verify and only accept-rate (not
++            # correctness) degrades vs a LoRA-matched draft. EAGLE3 / DFLASH /
++            # STANDALONE remain blocked (unvalidated with LoRA).
++            #
++            # DSPARK+LoRA is TARGET-VERIFY-ONLY and PENDING FIRST GPU VALIDATION.
++            # It additionally REQUIRES the per-runner `lora_enabled` gate (the
++            # remainder of mtp_lora_phase1: lora_enabled = enable_lora and not
++            # is_draft_worker) so the DSPARK draft ModelRunner never inits a
++            # LoRAManager under the shared server_args. That gate is NOT in this
++            # commit, so this relaxation must stay unused on GPU until it lands.
++            if self.speculative_algorithm not in [
++                "NGRAM",
++                "EAGLE",
++                "NEXTN",
++                "FROZEN_KV_MTP",
++                "DSPARK",
++                None,
++            ]:
+                 raise ValueError(
+-                    "Currently LoRA is only compatible with NGRAM speculative decoding."
++                    "Currently LoRA is only compatible with NGRAM, EAGLE/NEXTN, "
++                    "FROZEN_KV_MTP, or DSPARK speculative decoding. Under neural-"
++                    "draft algorithms the LoRA adapter is applied to the target "
++                    "model only; draft models run base weights."
+                 )
+ 
+             # Parse lora_paths
+-- 
+2.43.0
+

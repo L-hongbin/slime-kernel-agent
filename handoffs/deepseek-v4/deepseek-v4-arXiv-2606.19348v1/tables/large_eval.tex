@@ -1,0 +1,55 @@
+\begin{table}[ht] 
+    \centering
+    \footnotesize
+    \setlength{\tabcolsep}{1.2pt}
+    \caption{
+        Comparison between \dsvivpm{} and closed/open source models.
+        "Max", "xHigh", and "High" denote reasoning effort. 
+        The best results are highlighted in bold; the second-best results are underlined.
+    }
+    \label{tab:large_eval} 
+    \resizebox{\textwidth}{!}{
+    \begin{tabular}{@{}c l | c c c | c c c  c @{}} 
+    \toprule
+
+    & \multirow{2}{*}{\centering \textbf{Benchmark {\tiny (Metric)}}} & \textbf{Opus-4.6} & \textbf{GPT-5.4} & \textbf{Gemini-3.1-Pro} & \textbf{K2.6} & \textbf{GLM-5.1} & \textbf{DS-V4-Pro} \\ 
+    & & \textbf{Max} & \textbf{xHigh} & \textbf{High} & \textbf{Thinking} & \textbf{Thinking} & \textbf{Max}  \\ 
+  
+    % ========================
+
+    \midrule
+
+    \multirow{11}{*}{\rotatebox{90}{Knowledge \& Reasoning}} 
+    
+    & MMLU-Pro {\tiny (EM)}               & \underline{89.1} & 87.5             & \textbf{91.0} & 87.1 & 86.0 & 87.5             \\ 
+    & SimpleQA-Verified {\tiny (Pass@1)}  & 46.2             & 45.3             & \textbf{75.6} & 36.9 & 38.1 & \underline{57.9} \\ 
+    & Chinese-SimpleQA {\tiny (Pass@1)}   & 76.4             & 76.8             & \textbf{85.9} & 75.9 & 75.0 & \underline{84.4} \\ 
+    & GPQA Diamond {\tiny (Pass@1)}       & 91.3             & \underline{93.0} & \textbf{94.3} & 90.5 & 86.2 & 90.1             \\ 
+    & HLE {\tiny (Pass@1)}                & \underline{40.0} & 39.8             & \textbf{44.4} & 36.4 & 34.7 & 37.7             \\ 
+    & LiveCodeBench {\tiny (Pass@1)}      & 88.8             & -                & \underline{91.7}& 89.6 & -    & \textbf{93.5}    \\ 
+    & Codeforces {\tiny (Rating)}         & -                & \underline{3168} & 3052          & -    & -    & \textbf{3206}    \\ 
+    & HMMT 2026 Feb {\tiny (Pass@1)}      & \underline{96.2}& \textbf{97.7}    & 94.7          & 92.7 & 89.4 & {95.2} \\ 
+    & IMOAnswerBench {\tiny (Pass@1)}     & 75.3             & \textbf{91.4}    & 81.0          & 86.0 & 83.8 & \underline{89.8} \\ 
+    & Apex {\tiny (Pass@1)}               & 34.5             & \underline{54.1} & \textbf{60.9} & 24.0 & 11.5 & 38.3 \\
+    & Apex Shortlist {\tiny (Pass@1)}     & 85.9 & 78.1   & \underline{89.1} & 75.5 & 72.4 & \textbf{90.2}             \\ 
+    \midrule
+
+     \multirow{2}{*}{\rotatebox{90}{Long}} 
+    & MRCR 1M {\tiny (MMR)}  & \textbf{92.9} & - & 76.3 & - & - & \underline{83.5}  \\ 
+    & CorpusQA 1M {\tiny (ACC)}  & \textbf{71.7} & - & 53.8 & - & - & \underline{62.0} & \\ 
+    \midrule
+    
+    \multirow{10}{*}{\rotatebox{90}{Agentic}} 
+    & Terminal Bench 2.0 {\tiny (Acc)}  & 65.4 & \textbf{75.1} & \underline{68.5} & 66.7 & 63.5 & 67.9 & \\ 
+    & SWE Verified {\tiny (Resolved)}  & \textbf{80.8} & - & \underline{80.6} & 80.2 & -  & \underline{80.6} & \\ 
+    & SWE Pro {\tiny (Resolved)}  & 57.3 & 57.7 & 54.2 & \textbf{58.6} & \underline{58.4} & 55.4 & \\ 
+    & SWE Multilingual {\tiny (Resolved)}  & \textbf{77.5} & - & - & \underline{76.7} & 73.3 & \underline{76.2} & \\  
+    & BrowseComp {\tiny (Pass@1)}  & \underline{83.7} & 82.7 & \textbf{85.9} & 83.2 & 79.3 & 83.4 & \\ 
+    & HLE w/ tools {\tiny (Pass@1)}  & \underline{53.1} & 52.0 & 51.6  & \textbf{54.0} & 50.4 & 48.2 & \\ 
+    & GDPval-AA {\tiny (Elo)} &\underline{1619}& \textbf{1674}&1314&1482&1535&1554 \\ 
+    & MCPAtlas Public{\tiny (Pass@1)} & \textbf{73.8} & 67.2 & 69.2 & 66.6  & 71.8 & \underline{73.6} \\ 
+    & Toolathlon {\tiny (Pass@1)}  & 47.2 & \textbf{54.6} & 48.8 & 50.0 & 40.7 & \underline{51.8} & \\
+      
+    \bottomrule
+    \end{tabular}} 
+\end{table}

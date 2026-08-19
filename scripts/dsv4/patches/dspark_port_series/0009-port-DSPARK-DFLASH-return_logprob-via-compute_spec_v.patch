@@ -1,0 +1,153 @@
+From 475502e4e33d92c0c0b972b9e86e5f920171f636 Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 14:22:45 +0900
+Subject: [PATCH 09/13] port: DSPARK/DFLASH return_logprob via
+ compute_spec_v2_logprobs
+
+RL rollouts need sampled-token logprobs (MIS/TIS); upstream hard-blocked
+them under DSPARK/DFLASH. The scheduler/result pipeline is already generic
+for spec-v2 logprobs; ngram_worker.py:457 is the chain-verifier precedent.
+
+- validate_dflash_request: drop the return_logprob rejection.
+- dspark_worker_v2/dflash_worker_v2: drop the raises; at accept-branch
+  convergence synthesize the chain accept_index (committed token j of
+  request i <- verify row i*W+j, -1 past commit_lens; padded rows unread
+  downstream) and call compute_spec_v2_logprobs(batch, logits_output,
+  out_tokens.reshape(-1), accept_index, W-1). W = verify_num_draft_tokens
+  (DSpark) / block_size (DFlash).
+- Convention: reported logprob = UN-renormalized log_softmax(logits/temp)
+  (matches non-spec sampler and trainer full-vocab recompute; the top-k/p
+  renorm in dflash_utils is acceptance-only). With active top-k/top-p
+  truncation the reported logprob deliberately differs from the truncated
+  sampling distribution.
+- GPU-VALIDATE: DSpark greedy spec-on-vs-off tolerance check, non-greedy
+  temp!=1/top_p<1, full-vocab recompute reference, folded-path
+  (epilogue.strided_logits) population on graph replay. DFLASH-proper
+  path shares the code, not yet validated.
+---
+ python/sglang/srt/speculative/dflash_utils.py |  3 --
+ .../srt/speculative/dflash_worker_v2.py       | 26 ++++++++++++++---
+ .../dspark_components/dspark_worker_v2.py     | 28 +++++++++++++++----
+ 3 files changed, 45 insertions(+), 12 deletions(-)
+
+diff --git a/python/sglang/srt/speculative/dflash_utils.py b/python/sglang/srt/speculative/dflash_utils.py
+index 1fb69ff..aa0e163 100644
+--- a/python/sglang/srt/speculative/dflash_utils.py
++++ b/python/sglang/srt/speculative/dflash_utils.py
+@@ -811,9 +811,6 @@ def build_dflash_verify_target_probs(
+ 
+ 
+ def validate_dflash_request(req: Req, enable_overlap: bool) -> Optional[str]:
+-    if req.return_logprob:
+-        return "DFLASH speculative decoding does not support return_logprob yet."
+-
+     if enable_overlap and req.return_hidden_states:
+         return "DFLASH speculative decoding does not support return_hidden_states yet."
+ 
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index f63de41..52fa2c6 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -18,6 +18,7 @@ from sglang.srt.server_args import ServerArgs
+ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+ from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
++from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+ from sglang.srt.speculative.dflash_utils import (
+     apply_dflash_verify_logits_adjustments,
+     can_dflash_use_fused_qkv_proj,
+@@ -1203,10 +1204,6 @@ class DFlashWorkerV2(BaseSpecWorker):
+         batch: ScheduleBatch,
+         on_publish=None,
+     ) -> GenerationBatchResult:
+-        if getattr(batch, "return_logprob", False):
+-            raise ValueError(
+-                "DFLASH speculative decoding does not support return_logprob yet."
+-            )
+         self._validate_phase1_sampling_support(batch)
+ 
+         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+@@ -1653,6 +1650,27 @@ class DFlashWorkerV2(BaseSpecWorker):
+             commit_lens=commit_lens,
+         )
+ 
++        if getattr(batch, "return_logprob", False) and not batch.forward_mode.is_idle():
++            # Same chain-verifier layout as DSpark (W = block_size); see
++            # dspark_worker_v2. NOTE: DSPARK path is GPU-validated; this
++            # DFLASH-proper path shares the code but is not yet validated.
++            _W = int(self.block_size)
++            _rows = (
++                torch.arange(bs, device=out_tokens.device, dtype=torch.long) * _W
++            ).unsqueeze(1)
++            _cols = torch.arange(
++                _W, device=out_tokens.device, dtype=torch.long
++            ).unsqueeze(0)
++            _accept_index = _rows + _cols
++            _accept_index[_cols >= commit_lens.long().unsqueeze(1)] = -1
++            compute_spec_v2_logprobs(
++                batch,
++                logits_output,
++                out_tokens.reshape(-1),
++                _accept_index,
++                _W - 1,
++            )
++
+         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
+         logits_output.hidden_states = None
+ 
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 78b0dad..2ad6a02 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -91,6 +91,7 @@ from sglang.srt.speculative.dspark_components.kernels.finalize_accept_lens impor
+     FinalizeAcceptLens,
+ )
+ from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
++from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+ from sglang.srt.speculative.spec_utils import draft_tp_context
+ from sglang.srt.utils import get_available_gpu_memory, is_cuda
+ 
+@@ -529,11 +530,6 @@ class DSparkWorkerV2(BaseSpecWorker):
+         batch: ScheduleBatch,
+         on_publish=None,
+     ) -> GenerationBatchResult:
+-        if getattr(batch, "return_logprob", False):
+-            raise ValueError(
+-                "DSpark speculative decoding does not support return_logprob yet."
+-            )
+-
+         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+             self._verify_planner.note_non_decode_step()
+             if self._sps_recorder is not None:
+@@ -873,6 +869,28 @@ class DSparkWorkerV2(BaseSpecWorker):
+                 verify_num_draft_tokens=self.verify_num_draft_tokens,
+                 gamma=self.gamma,
+             )
++        if getattr(batch, "return_logprob", False) and not batch.forward_mode.is_idle():
++            # Chain verifier: committed token j of request i was scored by
++            # verify row i*W + j. Synthesize the EAGLE-style accept_index
++            # (-1 past commit_lens; padded rows are never read downstream)
++            # and reuse the generic spec-v2 logprob path (ngram precedent).
++            _W = int(self.verify_num_draft_tokens)
++            _rows = (
++                torch.arange(bs, device=out_tokens.device, dtype=torch.long) * _W
++            ).unsqueeze(1)
++            _cols = torch.arange(
++                _W, device=out_tokens.device, dtype=torch.long
++            ).unsqueeze(0)
++            _accept_index = _rows + _cols
++            _accept_index[_cols >= commit_lens.long().unsqueeze(1)] = -1
++            compute_spec_v2_logprobs(
++                batch,
++                logits_output,
++                out_tokens.reshape(-1),
++                _accept_index,
++                _W - 1,
++            )
++
+         if on_publish is not None:
+             if confidence is not None:
+                 on_publish(
+-- 
+2.43.0
+

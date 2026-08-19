@@ -1,0 +1,228 @@
+\documentclass[11pt]{article}
+
+% Math/theorem packages, colors, and other paper macros first.
+\input{macros}
+
+% Hunyuan style file (page geometry, fonts, sections, abstract, natbib +
+% hyperref). Loaded AFTER macros so its guarded proof/theorem definitions
+% override amsthm cleanly, and so it owns hyperref/natbib.
+\usepackage{hunyuan}
+
+% Additional packages needed by this paper (not in JMLR macros)
+\usepackage[capitalize,noabbrev]{cleveref}
+\usepackage{tabularx}
+\usepackage[most]{tcolorbox}
+\usepackage{wrapfig}
+\usepackage{xspace}
+\usepackage{fancyhdr}
+\usepackage{xurl}
+
+% Caption: continuation lines flush to the left margin (no hanging indent
+% under the "Table N:" / "Figure N:" label). hunyuan.sty redefines
+% \@makecaption with a hanging list, so override it here (after hunyuan.sty).
+\makeatletter
+\long\def\@makecaption#1#2{%
+  \vskip 10pt
+  \setbox\@tempboxa\hbox{#1: #2}%
+  \ifdim \wd\@tempboxa >\hsize
+    \noindent #1: #2\par   % too long for one line: flush-left paragraph
+  \else
+    \hbox to\hsize{\hfil\box\@tempboxa\hfil}%  one line: centered
+  \fi}
+\makeatother
+
+% Color hyperlinks and citations in hunyuanblue (hunyuan.sty loads hyperref
+% with colorlinks=false by default).
+\hypersetup{
+  colorlinks=true,
+  linkcolor=hunyuanblue,
+  citecolor=hunyuanblue,
+  urlcolor=hunyuanblue,
+}
+
+% Keep JMLR's section sizing/spacing, but recolor headings in hunyuanblue.
+\makeatletter
+\def\section{\@startsiction{section}{1}{\z@}{-0.24in}{0.10in}
+             {\large\bf\raggedright\color{hunyuanblue}}}
+\def\subsection{\@startsection{subsection}{2}{\z@}{-0.20in}{0.08in}
+                {\normalsize\bf\raggedright\color{hunyuanblue}}}
+\makeatother
+
+% Ensure enough headroom for the fancyhdr logo under JMLR's top margin
+\setlength{\headheight}{14pt}
+
+% Global page style (empty header, page number centered in footer)
+\pagestyle{fancy}
+\fancyhf{}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+
+% Redefine plain style to match (used automatically on some pages)
+\fancypagestyle{plain}{%
+  \fancyhf{}%
+  \fancyfoot[C]{\thepage}%
+  \renewcommand{\headrulewidth}{0pt}%
+  \renewcommand{\footrulewidth}{0pt}%
+}
+
+% First page style (logo in header, like Hunyuan)
+% raisebox with [0pt][0pt] keeps the logo from pushing the body down;
+% the negative shift lowers it toward the title rule below.
+\fancypagestyle{firststyle}{%
+  \fancyhf{}%
+  \fancyhead[L]{\raisebox{-18.5mm}[0pt][0pt]{\includegraphics[height=12mm]{figs/hunyuan-logo.png}}}%
+  \fancyfoot[C]{\thepage}%
+  \renewcommand{\headrulewidth}{0pt}%
+  \renewcommand{\footrulewidth}{0pt}%
+}
+
+% Paper-specific commands
+\newcommand{\bmu}{\mu}                       % behaviour / rollout policy
+\newcommand{\tpi}{\pi}                        % training / target policy
+\newcommand{\Adv}{\hat{A}}                    % advantage estimate
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\KLtopk}{\KL^{\mathrm{TopK}}}     % Top-K KL divergence
+\newcommand{\Dtok}{D}                         % per-token divergence shorthand
+\newcommand{\Taylor}{\dot{D}}                 % directional derivative of the divergence along one step
+\newcommand{\Keep}{\mathcal{K}}               % top-K index set
+\newcommand{\method}{predictive divergence mask\xspace}
+\newcommand{\EE}{\mathbb{E}}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+\newcommand{\resizecell}[1]{%
+    \resizebox{\linewidth}{!}{$\displaystyle #1$}%
+}
+\newcommand{\obj}[1]{%
+  \resizebox{0.43\textwidth}{!}{$\displaystyle #1$}%
+}
+
+% Author comments
+\newcommand{\xiangxin}[1]{{{\textcolor{red}{[Xiangxin: #1]}}}}
+\newcommand{\qph}[1]{{{\textcolor{red}{[QPH: #1]}}}}
+\newcommand{\jr}[1]{{{\textcolor{red}{[Jiarui: #1]}}}}
+
+% Colors
+\definecolor{caseblue}{RGB}{42, 91, 160}
+\definecolor{casebg}{RGB}{246, 248, 252}
+\definecolor{caseborder}{RGB}{180, 195, 220}
+\definecolor{paperblue}{HTML}{1F77B4}
+\definecolor{paperred}{HTML}{D62728}
+\definecolor{deepred}{HTML}{B22222}
+\definecolor{softred}{HTML}{C44E52}
+
+\newtcolorbox[auto counter, number within=section]{compactcase}[2][]{
+  breakable,
+  enhanced,
+  colback=gray!2,
+  colframe=gray!30,
+  colbacktitle=gray!12,
+  coltitle=black, 1
+  fonttitle=\bfseries,
+  title={#2},
+  boxrule=0.45pt,
+  arc=1mm,
+  left=1.5mm,
+  right=1.5mm,
+  top=1mm,
+  bottom=1mm,
+  toptitle=0.7mm,
+  bottomtitle=0.7mm,
+  before skip=0.8em,
+  after skip=0.8em,
+  label={#1}
+}
+
+\definecolor{abstractbg}{HTML}{F0F7FC}
+
+% Block-style paragraphs: no first-line indent, with a small amount of
+% inter-paragraph spacing to separate paragraphs.
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0.6em}
+
+\begin{document}
+
+% Custom title with Seed-style rules
+\thispagestyle{firststyle}
+% The page geometry moved the top margin up 0.25cm (2.75->2.5cm) so body
+% pages have symmetric 2.5cm top/bottom margins. Push the title block back
+% down by 0.25cm here so page 1's title/logo keep their original position.
+\vspace*{0.25cm}
+{\color{hunyuanblue}\hrule height 0.6pt}
+\vskip 6mm
+\begin{center}
+{\LARGE\bfseries Predictive Divergence Masks for LLM RL\par}
+\end{center}
+\vskip 3mm
+{\color{hunyuanblue}\hrule height 0.6pt}
+\vskip 6mm
+\begin{center}
+\textbf{Xiangxin Zhou}$^{1,*}$ \quad
+\textbf{Jiarui Yao}$^{1,2,*}$ \quad
+\textbf{Penghui Qi}$^{3,*}$ \quad
+\textbf{Bowen Ping}$^{1}$ \\
+\textbf{Jiaqi Tang}$^{1}$ \quad
+\textbf{Haonan Wang}$^{1}$ \quad
+\textbf{Tianyu Pang}$^{1,\ddagger}$
+\\[8pt]
+$^1$Tencent Hunyuan \quad $^2$UIUC \quad $^3$NUS \\[6pt]
+{\small $^*$Equal contribution \quad
+$^\ddagger$Corresponding author}
+\end{center}
+\vskip 6mm
+
+% Abstract with light blue background (OpenSearch style)
+\begin{tcolorbox}[
+  colframe=abstractbg,
+  colback=abstractbg,
+  boxrule=0pt,
+  arc=2mm,
+  enhanced,
+  top=12pt,
+  bottom=12pt,
+  left=15pt,
+  right=15pt,
+  width=\textwidth,
+]
+\textbf{Abstract.}\quad
+Reinforcement learning for large language models (LLMs) typically relies on
+trust-region masks to stabilize off-policy updates.
+The dominant PPO-style approach uses the sampled-token importance ratio for two criteria: a \emph{proximity} criterion, which asks whether the policy has moved too far from the behavior policy, and a \emph{direction} criterion, which asks whether the update pushes it farther away.
+Recent work DPPO improves the proximity criterion by replacing PPO's ratio-based test with a probability divergence between the behavior and training policies.
+However, its direction criterion is still inherited from PPO.
+A token can be masked only when the sampled-token importance ratio moves away from one.
+We observe that this ratio-based direction criterion is a single-sample proxy that can disagree in sign with the change of the divergence that defines the proximity criterion. 
+We therefore propose the \emph{predictive divergence mask}, which asks whether
+the next policy-gradient step will increase or decrease the same divergence used
+by the trust region. For the discrete softmax policies used in LLM RL, 
+we derive this prediction in closed form. Because production rollout engines expose only a truncated (top-$K$) view of the vocabulary, we develop two lightweight top-$K$ estimators for this prediction.
+Detailed analysis shows the
+divergence-based direction is better aligned with the realized change of the divergence
+than the sampled ratio, and the resulting masks improve RL 
+training across model scales and precision settings.
+
+\vskip 8pt
+\textbf{Date:} July 7, 2026 
+\end{tcolorbox}
+
+\input{content/introduction}
+\input{content/background}
+\input{content/method}
+\input{content/experiments}
+\input{content/conclusion}
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Bibliography style (plainnat) is set by hunyuan.sty
+\bibliography{ref}
+
+\clearpage
+\appendix
+\input{content/related_work}
+\input{content/appendix/derivations}
+\input{content/appendix/experiments}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\end{document}

@@ -14,6 +14,20 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     assert quantization_config["activation_scheme"] == "dynamic"
     weight_block_size = quantization_config.get("weight_block_size", None)
 
+    if _has_deepseekv4_fp8_weight(converted_named_params):
+        quantize_named_params = []
+        for converted_name, param in converted_named_params:
+            if _is_deepseekv4_fp8_weight(converted_name):
+                if converted_name.endswith(".attn.wo_a.weight"):
+                    quantize_named_params.extend(
+                        _quantize_param(converted_name, param, weight_block_size, scale_suffix=".scale")
+                    )
+                else:
+                    quantize_named_params.extend(_quantize_param(converted_name, param, weight_block_size))
+            else:
+                quantize_named_params.append((converted_name, param))
+        return quantize_named_params
+
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, megatron_name)
 
@@ -91,7 +105,30 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     return converted_named_params
 
 
-def _quantize_param(name, weight, weight_block_size):
+def _has_deepseekv4_fp8_weight(converted_named_params):
+    return any(_is_deepseekv4_fp8_weight(name) for name, _ in converted_named_params)
+
+
+def _is_deepseekv4_fp8_weight(name):
+    if re.fullmatch(
+        r"layers\.\d+\.attn\.(wq_a|wq_b|wkv|wo_a|wo_b)\.weight",
+        name,
+    ):
+        return True
+    if re.fullmatch(
+        r"layers\.\d+\.attn\.indexer\.wq_b\.weight",
+        name,
+    ):
+        return True
+    if re.fullmatch(
+        r"layers\.\d+\.ffn\.(shared_experts\.(w1|w2|w3)|experts\.\d+\.w(1|2|3))\.weight",
+        name,
+    ):
+        return True
+    return False
+
+
+def _quantize_param(name, weight, weight_block_size, scale_suffix=None):
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
     FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
@@ -103,11 +140,11 @@ def _quantize_param(name, weight, weight_block_size):
             scale = transform_scale_ue8m0(scale, mn=qweight.shape[-2])
         else:
             qweight, scale = blockwise_cast_to_fp8_triton(weight, weight_block_size)
-        scale_name = name.replace(".weight", ".weight_scale_inv")
+        scale_name = name[: -len(".weight")] + (scale_suffix or ".weight_scale_inv")
     else:
         # per tensor quant
         scale = weight.abs().max().clamp(min=1e-12).to(torch.float32) / FP8_MAX
         qweight = (weight / scale).clamp(min=FP8_MIN, max=FP8_MAX).to(torch.float8_e4m3fn)
         scale = scale.view(1)
-        scale_name = name.replace(".weight", ".weight_scale")
+        scale_name = name[: -len(".weight")] + (scale_suffix or ".weight_scale")
     return [(name, qweight), (scale_name, scale)]

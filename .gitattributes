@@ -1,0 +1,2 @@
+# git artifacts: patch files legitimately carry trailing whitespace (diff context)
+scripts/dsv4/patches/** -whitespace

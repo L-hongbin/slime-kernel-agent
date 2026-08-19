@@ -17,6 +17,7 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+DEFAULT_ROUTER_REGISTRATION_TIMEOUT_SECS = 300.0
 
 
 def get_base_gpu_id(args, rank):
@@ -113,6 +114,15 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        # Name of the LoRA adapter this engine currently serves (alternating sync
+        # path). Set on a successful ``load_lora_adapter_from_tensors``; the rollout
+        # queries it each step so ``/generate`` ``lora_path`` tracks the live name.
+        self._active_lora_name: str | None = None
+        # lora_name -> on-disk temp adapter dir (disk-path transport). Kept alive
+        # while the adapter is loaded (so sglang's implicit reload can re-read it),
+        # deleted when the adapter is unloaded or its name is reused. See
+        # ``load_lora_adapter_from_tensors``.
+        self._lora_dirs: dict[str, str] = {}
 
     def init(
         self,
@@ -160,6 +170,17 @@ class SGLangEngine(RayActor):
         self.node_rank = server_args_dict["node_rank"]
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
+        logger.warning(
+            "SGLangEngine launch rank=%s worker_type=%s base_gpu_id=%s "
+            "tp_size=%s CUDA_VISIBLE_DEVICES=%s host=%s port=%s",
+            self.rank,
+            self.worker_type,
+            server_args_dict.get("base_gpu_id"),
+            server_args_dict.get("tp_size"),
+            os.environ.get("CUDA_VISIBLE_DEVICES"),
+            self.server_host,
+            self.server_port,
+        )
 
         if self.args.rollout_external:
             self._init_external(server_args_dict, external_engine_need_check_fields=external_engine_need_check_fields)
@@ -198,25 +219,48 @@ class SGLangEngine(RayActor):
             return
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
+            worker_url = f"http://{self.server_host}:{self.server_port}"
+            registration_timeout = float(
+                os.environ.get("SGLANG_ROUTER_REGISTRATION_TIMEOUT_SECS", DEFAULT_ROUTER_REGISTRATION_TIMEOUT_SECS)
+            )
             if parse(sglang_router.__version__) <= parse("0.2.1"):
-                assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url=http://{self.server_host}:{self.server_port}",
+                registration_url = f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}"
+                logger.info(
+                    "Register SGLang worker with router: url=%s worker_type=%s timeout=%.1fs",
+                    registration_url,
+                    self.worker_type,
+                    registration_timeout,
                 )
+                assert self.worker_type == "regular", "pd disaggregation is not supported in old router."
+                response = requests.post(registration_url, timeout=registration_timeout)
             else:
                 payload = {
-                    "url": f"http://{self.server_host}:{self.server_port}",
+                    "url": worker_url,
                     "worker_type": self.worker_type,
                 }
                 if self.worker_type == "prefill":
                     payload["bootstrap_port"] = server_args_dict["disaggregation_bootstrap_port"]
+                registration_url = f"http://{self.router_ip}:{self.router_port}/workers"
+                logger.info(
+                    "Register SGLang worker with router: url=%s payload=%s timeout=%.1fs",
+                    registration_url,
+                    payload,
+                    registration_timeout,
+                )
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    registration_url,
                     json=payload,
+                    timeout=registration_timeout,
                 )
             response.raise_for_status()
+            logger.info(
+                "Registered SGLang worker with router: worker_url=%s worker_type=%s status=%s",
+                worker_url,
+                self.worker_type,
+                response.status_code,
+            )
 
-    def _make_request(self, endpoint: str, payload: dict | None = None):
+    def _make_request(self, endpoint: str, payload: dict | None = None, timeout: float = 600.0):
         """Make a POST request to the specified endpoint with the given payload.
 
         Args:
@@ -230,7 +274,12 @@ class SGLangEngine(RayActor):
             return
 
         url = f"http://{self.server_host}:{self.server_port}/{endpoint}"
-        response = requests.post(url, json=payload or {})
+        # Never wait forever on an engine control endpoint: /unload_lora_adapter
+        # blocks in sglang's lora_registry.wait_for_unload until the adapter's
+        # request refs drain, which cannot happen while generation is paused —
+        # rank0 hung ~50 min here and collapsed the weight-sync gloo barrier
+        # (formal r7f/r7g, 2026-07-10; codex-diagnosed).
+        response = requests.post(url, json=payload or {}, timeout=timeout)
         try:
             response.raise_for_status()
         except requests.exceptions.HTTPError as e:
@@ -285,6 +334,157 @@ class SGLangEngine(RayActor):
             payload,
         )
 
+    def _lora_engine_is_single_node(self) -> bool:
+        """True when this rollout engine occupies a single node (all its LoRA
+        workers are co-located with this node-0 actor)."""
+        gpus_per_engine = self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine
+        return max(1, gpus_per_engine // self.args.num_gpus_per_node) == 1
+
+    def _write_lora_adapter_dir(self, lora_name: str, tensors: dict, config_dict: dict) -> str:
+        """Materialize a PEFT adapter (``adapter_model.safetensors`` +
+        ``adapter_config.json``) into a fresh temp dir on local tmpfs and return it.
+
+        sglang's disk loader reads ``target_modules``/``r``/``lora_alpha`` from the
+        config and globs ``*.safetensors``; both the disk and from-tensors paths run
+        the same ``_normalize_weights`` (incl. the V4 ``wkv_gate`` fusion), so the
+        served result is identical.
+        """
+        import json
+        import os
+        import tempfile
+
+        from safetensors.torch import save_file
+
+        root = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+        base = os.path.join(root, "slime_lora_adapters") if root else tempfile.gettempdir()
+        os.makedirs(base, exist_ok=True)
+        adapter_dir = tempfile.mkdtemp(prefix=f"{lora_name}_", dir=base)
+        # safetensors needs contiguous, non-aliased CPU tensors.
+        state = {name: t.detach().to("cpu").contiguous() for name, t in tensors.items()}
+        save_file(state, os.path.join(adapter_dir, "adapter_model.safetensors"))
+        with open(os.path.join(adapter_dir, "adapter_config.json"), "w") as f:
+            json.dump(config_dict, f)
+        return adapter_dir
+
+    def _discard_lora_dir(self, lora_name: str) -> None:
+        import shutil
+
+        adapter_dir = self._lora_dirs.pop(lora_name, None)
+        if adapter_dir is not None:
+            shutil.rmtree(adapter_dir, ignore_errors=True)
+
+    def load_lora_adapter_from_tensors(
+        self,
+        lora_name: str,
+        tensors: dict,
+        config_dict: dict,
+        weight_version: str | None = None,
+        load_format: str | None = None,
+    ):
+        """Hot-load a LoRA adapter (base + adapter served) via a DISK-PATH transport.
+
+        ``tensors`` is a PEFT-named ``{name: cpu_tensor}`` state dict (produced by
+        the LoRA-adapter weight-sync path). We do NOT ship it as one
+        ``MultiprocessingSerializer`` IPC handle: sglang broadcasts that single
+        serialized string to every co-located DP worker, and torch's ``file_system``
+        sharing reference-counts the backing ``/dev/shm`` file across the N
+        independent deserializers — the first workers to finish drop the refcount to
+        zero and remove the file before a slower rank opens it, crashing that
+        scheduler with ``unable to open shared memory object … No such file`` (which
+        cascades over gloo and kills the server; caught on the 8-GPU alternating
+        smoke at the 6th load). Instead we materialize the adapter to a temp dir on
+        local tmpfs and load it by path: every worker reads the SAME persistent file
+        we own (no refcount race). ``/load_lora_adapter`` is synchronous over all DP
+        replies, so by the time it returns every worker has read the weights into CPU
+        tensors; the dir is retained (not deleted here) so sglang's implicit reload
+        from ``lora_ref_cache`` can re-read it, and is freed on unload / name reuse.
+
+        Also records ``weight_version`` so the ``--ci-test`` version-equality check
+        passes even though a LoRA load does not touch the base weights.
+        """
+        if self.node_rank != 0:
+            return
+
+        # Local tmpfs is only visible to workers on THIS node. Multi-node engines
+        # place workers on other nodes that cannot read a node-0 path — fail loudly
+        # rather than silently serve a half-loaded adapter (multi-node needs a
+        # shared-FS materialization, not yet implemented).
+        if not self._lora_engine_is_single_node():
+            raise RuntimeError(
+                "LoRA disk-path adapter transport requires single-node rollout engines "
+                f"(this engine spans {max(1, (self.num_gpus_per_engine or self.args.rollout_num_gpus_per_engine) // self.args.num_gpus_per_node)} nodes); "
+                "multi-node LoRA serving needs a shared-filesystem adapter path (TODO)."
+            )
+
+        # Reusing an alternating name: its previous dir (from 2 syncs ago, long
+        # since fully read) is safe to drop now.
+        self._discard_lora_dir(lora_name)
+        adapter_dir = self._write_lora_adapter_dir(lora_name, tensors, config_dict)
+        try:
+            result = self._make_request(
+                "load_lora_adapter",
+                {"lora_name": lora_name, "lora_path": adapter_dir},
+            )
+        except Exception:
+            # The request raising (connection error / HTTP error) would leak the
+            # freshly written adapter dir on tmpfs (codex review 2026-07-09).
+            import shutil
+
+            shutil.rmtree(adapter_dir, ignore_errors=True)
+            raise
+        # sglang can return HTTP 200 with success=False; only record the live name /
+        # bump the version / retain the dir on an actual success (a premature bump
+        # would let --ci-test pass — or the rollout route lora_path — while the
+        # engine serves the old/missing adapter).
+        load_ok = result is None or result.get("success", True)
+        if load_ok:
+            self._lora_dirs[lora_name] = adapter_dir
+            self._active_lora_name = lora_name
+            if weight_version is not None:
+                self._make_request("update_weight_version", {"new_version": str(weight_version)})
+        else:
+            import shutil
+
+            shutil.rmtree(adapter_dir, ignore_errors=True)
+        return result
+
+    def unload_lora_adapter(self, lora_name: str, timeout: float = 120.0):
+        """Unload a previously loaded LoRA adapter by name (paired with the
+        alternating load in the per-iteration adapter sync).
+
+        Bounded + best-effort: sglang waits for the adapter's request refs to
+        drain before unloading, so this MUST be called with generation resumed
+        (the updater defers it until after continue_generation) and may still
+        time out if refs leaked — the caller retries at the next swap."""
+        if self.node_rank != 0:
+            return
+        try:
+            result = self._make_request("unload_lora_adapter", {"lora_name": lora_name}, timeout=timeout)
+        except requests.exceptions.Timeout:
+            logger.warning(
+                "unload_lora_adapter(%s) timed out after %ss; adapter left resident "
+                "(will be retried at the next swap)",
+                lora_name,
+                timeout,
+            )
+            return None
+        # The adapter is now unregistered; free its on-disk temp dir (no implicit
+        # reload can reference it anymore).
+        self._discard_lora_dir(lora_name)
+        # If we just unloaded the adapter the rollout believes is active, clear the
+        # cached name so a stale name is never reported by get_active_lora_name.
+        # (In the normal alternating swap we unload the OLD name while _active is
+        # the just-loaded NEW name, so this is a defensive no-op there.)
+        if lora_name == self._active_lora_name:
+            self._active_lora_name = None
+        return result
+
+    def get_active_lora_name(self) -> str | None:
+        """Name of the LoRA adapter this engine currently serves, or ``None`` before
+        any adapter has been loaded. Queried by the rollout each step so ``/generate``
+        ``lora_path`` tracks the live (alternating) adapter name."""
+        return self._active_lora_name
+
     def flush_cache(self):
         """Flush the cache of the server."""
         if self.node_rank != 0:
@@ -312,6 +512,13 @@ class SGLangEngine(RayActor):
         return f"http://{self.server_host}:{self.server_port}"
 
     def shutdown(self):
+        # Free any retained LoRA adapter temp dirs (disk-path transport).
+        import shutil
+
+        for adapter_dir in self._lora_dirs.values():
+            shutil.rmtree(adapter_dir, ignore_errors=True)
+        self._lora_dirs.clear()
+
         if self.args.rollout_external:
             return
 
@@ -561,7 +768,9 @@ def _compute_server_args(
     base = base_gpu_id if base_gpu_id is not None else get_base_gpu_id(args, rank)
     base = _to_local_gpu_id(base)
     kwargs = {
-        "model_path": args.hf_checkpoint,
+        # rollout may serve a different ckpt than the trainer (DSpark draft
+        # stages); weight-sync/tokenizer keep using args.hf_checkpoint.
+        "model_path": getattr(args, "rollout_model_path", None) or args.hf_checkpoint,
         "trust_remote_code": True,
         "random_seed": args.seed + rank,
         # memory

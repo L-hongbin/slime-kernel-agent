@@ -1,0 +1,110 @@
+From b74c776be5c8d7c2344a14624605b9dc957d4f2b Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 17:34:28 +0900
+Subject: [PATCH 12/13] port: idle-LoRA prep on bs==0 idle (dp-attn
+ gathered-MoE crash)
+
+Root cause of the flaky CUDA_ERROR_ILLEGAL_ADDRESS in the DSPARK full-loop RL
+smokes (dspark_full_loop_smoke13/14/15): an IDLE-mode eager forward on a
+dp-attention rank crashes in the MoE dp-sync path shortly after a LoRA adapter
+swap on rollout resume.
+
+Mechanism (GPU-repro'd + instrumented on node53):
+- A dp-attention rank with no local requests runs an eager IDLE forward with
+  batch_size == 0 (0 local tokens). _execute_idle gated the eager LoRA batch_info
+  refresh on `batch_size > 0`, so bs==0 idle skipped it and kept the PREVIOUS
+  forward's batch_info (observed: preexisting bi.bs=1/num_seg=1/max_len=6).
+- Under dp-attention the MoE FFN runs on the GATHERED global buffer, so the idle
+  rank still executes the shared-expert LoRA on gathered_rows > 0 (observed
+  gathered_rows=6, local_input_rows=0). The layer-level `input_.shape[0] > 0`
+  guard in lora/layers.py cannot skip it: it sees the gathered rows, not the
+  local 0.
+- The LoRA shrink kernel grids over batch_info.bs / seg_indptr (stale). When a
+  prior larger forward left a big segment layout and the current gathered idle
+  buffer is small (varied batch sizes on rollout resume + adapter-swap pool
+  churn), the kernel over-reads the buffer -> illegal address. It surfaces as a
+  sticky async fault at the next synchronizing op (dp-gather all_reduce or an
+  FP8/FP4 MoE GEMM), which is why the reported frame varies across smokes.
+
+Fix: run the eager idle LoRA prep on EVERY idle eager forward, including
+batch_size == 0. Preparing with all-None ids on bs==0 yields an EMPTY consistent
+batch_info (num_segments==0) so the LoRA kernels launch 0 programs (safe no-op)
+instead of reading stale state. Mirrors the decode cuda-graph runner's idle-LoRA
+refresh. use_cuda_graph=False keeps it on the eager batch_info (IDLE is a
+cuda-graph MODE, so forward-construction prep targets the static graph buffers).
+
+Validation (node53 csl_dspark_r1, production DSPARK+FP4+dp8 config, graphs ON):
+pre-fix a large-burst->tiny-idle shape-thrash repro crashed on the first swap
+step with the exact smoke path (_execute_idle -> _run_moe_ffn_dp_sync -> illegal
+memory access); post-fix the same driver ran 12+ (ongoing, 0 scheduler exceptions) swap steps clean.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ .../srt/model_executor/runner/eager_runner.py | 49 ++++++++++++-------
+ 1 file changed, 30 insertions(+), 19 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index 7b40de4..0068b99 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -391,27 +391,38 @@ class EagerRunner(BaseRunner):
+             if not model_runner.server_args.enable_pdmux:
+                 forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+             model_runner.attn_backend.init_forward_metadata(forward_batch)
+-            # PORT-GPU-VALIDATE (idle-LoRA suite): relocated from the removed
+-            # model_runner.forward_idle prep. Same stale-state hazard as the
+-            # attention metadata above, but for LoRA: padded IDLE batches run the
+-            # LoRA wrappers with dummy tokens, and without a prepare_lora_batch
+-            # the triton kernels consume the PREVIOUS batch's segment/permutation/
+-            # weight-index state -> cudaErrorIllegalAddress (repro: sustained
+-            # varied-bs decode with an active adapter on dp-attention; random rank
+-            # = whichever idled). Prepare with all-None ids: rank-0 no-op kernels.
+-            # use_cuda_graph=False: this is the EAGER idle path, so the prep must
+-            # write the eager batch_info (IDLE is a cuda-graph forward MODE, so the
+-            # heuristic would otherwise target the static graph buffers and leave
+-            # the eager state stale). Confirm on GPU this is still needed vs
+-            # upstream's native idle-LoRA handling.
+-            if model_runner.lora_enabled:
+-                if forward_batch.lora_ids is None:
+-                    forward_batch.lora_ids = [None] * forward_batch.batch_size
+-                model_runner.lora_manager.prepare_lora_batch(
+-                    forward_batch, use_cuda_graph=False
+-                )
+         else:
+             model_runner.attn_backend.forward_metadata = None
++        # PORT-GPU-VALIDATE (idle-LoRA suite): relocated from the removed
++        # model_runner.forward_idle prep. Same stale-state hazard as the attention
++        # metadata above, but for LoRA -- and it MUST run on EVERY idle eager
++        # forward, INCLUDING batch_size == 0 (unpadded idle). Under dp-attention the
++        # MoE FFN runs on the GATHERED global buffer, so a rank with 0 LOCAL tokens
++        # still executes the shared-expert LoRA on gathered_rows > 0. The layer-level
++        # `input_.shape[0] > 0` guard (lora/layers.py) cannot skip that call because
++        # it sees the gathered rows, not the local 0. If the eager batch_info was not
++        # (re)prepared for this idle pass it holds the PREVIOUS forward's
++        # segment/weight-index state; the LoRA shrink kernel grids over
++        # batch_info.bs / seg_indptr and over-reads the (smaller) gathered buffer ->
++        # cudaErrorIllegalAddress. It surfaces as a sticky async fault at the next
++        # synchronizing op (the dp-gather all_reduce or an FP8/FP4 MoE GEMM) and is
++        # driven by adapter swaps + varied batch sizes on rollout resume
++        # (dspark_full_loop_smoke13/14/15; GPU-repro'd on node53 with a large-burst
++        # -> tiny-idle shape thrash). The old code gated this prep on
++        # `batch_size > 0`, so the crashing bs == 0 idle rank kept stale state.
++        # Preparing with all-None ids on bs == 0 yields an EMPTY, consistent
++        # batch_info (num_segments == 0), so the LoRA kernels launch 0 programs
++        # (safe no-op) instead of reading stale state. use_cuda_graph=False: this is
++        # the EAGER idle path (IDLE is a cuda-graph forward MODE, so the
++        # forward-construction prep targeted the static graph buffers and left the
++        # eager state stale). Mirrors the decode cuda-graph runner's idle-LoRA
++        # refresh (decode_cuda_graph_runner.py).
++        if model_runner.lora_enabled:
++            if not forward_batch.lora_ids:
++                forward_batch.lora_ids = [None] * forward_batch.batch_size
++            model_runner.lora_manager.prepare_lora_batch(
++                forward_batch, use_cuda_graph=False
++            )
+ 
+         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
+         ctx = (
+-- 
+2.43.0
+

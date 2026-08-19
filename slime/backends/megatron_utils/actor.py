@@ -2,12 +2,17 @@ import logging
 import os
 import random
 from argparse import Namespace
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import ray
 import torch
 import torch.distributed as dist
+
+from .path_bootstrap import ensure_megatron_lm_on_sys_path
+
+ensure_megatron_lm_on_sys_path()
+
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig, AutoTokenizer
@@ -20,16 +25,32 @@ from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
-from slime.utils.routing_replay import RoutingReplay
+from slime.utils.routing_replay import RoutingReplay, record_rollout_routing_replay_for_layer
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
+from slime.utils.train_metric_utils import ENTROPY_COMMON_PROBE_MASK_KEY
 from slime.utils.types import RolloutBatch
 
 from ...utils.profile_utils import TrainProfiler
 from ...utils.tensor_backper import TensorBackuper
 from .checkpoint import load_checkpoint
 from .cp_utils import slice_log_prob_with_cp, slice_with_cp
-from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_data
+from .data import (
+    DataIterator,
+    compute_bshd_max_seq_lens,
+    get_data_iterator,
+    log_named_perf_timers,
+    log_perf_data,
+    log_rollout_data,
+    summarize_bshd_padding,
+)
 from .initialize import init, is_megatron_main_rank
+from .lora_old_actor import (
+    LoRAOldActorSnapshot,
+    enumerate_adapter_params,
+    maybe_refresh_lora_old_actor_snapshot,
+    resolve_batch_gen_version,
+    should_recompute_old_actor_log_probs,
+)
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
 from .update_weight.common import named_params_and_buffers
@@ -41,6 +62,145 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _slice_predictive_support_with_cp(
+    support: np.ndarray,
+    *,
+    total_length: int,
+    response_length: int,
+    qkv_format: str,
+    max_seq_len: int | None,
+    dtype: torch.dtype,
+    device,
+) -> torch.Tensor:
+    """Slice a compact [response, support] numpy matrix along response/CP."""
+    if not isinstance(support, np.ndarray):
+        raise TypeError(f"predictive support must be numpy.ndarray, got {type(support).__name__}")
+    support_tensor = torch.from_numpy(support)
+    support_tensor = slice_log_prob_with_cp(
+        support_tensor,
+        total_length,
+        response_length,
+        qkv_format,
+        max_seq_len,
+    )
+    return support_tensor.to(device=device, dtype=dtype)
+
+
+_PROTECTED_TRAIN_ENV_KEYS = {
+    "CUDA_VISIBLE_DEVICES",
+    "LOCAL_RANK",
+    "MASTER_ADDR",
+    "MASTER_PORT",
+    "RANK",
+    "WORLD_SIZE",
+}
+
+
+def _apply_train_env_vars(args: Namespace) -> None:
+    train_env_vars = getattr(args, "train_env_vars", {}) or {}
+    for key, value in train_env_vars.items():
+        if key in _PROTECTED_TRAIN_ENV_KEYS or value is None:
+            continue
+        os.environ[str(key)] = str(value)
+
+
+def _snapshot_entropy_common_probe_masks(rollout_data: RolloutBatch, *, enabled: bool) -> bool:
+    """Freeze the pre-postprocess response masks for exact entropy comparison.
+
+    This diagnostic is deliberately fail-closed: a fixed-batch arm must not
+    silently overwrite a stale snapshot or compare populations after one of
+    the per-sample fields has drifted out of alignment.  The snapshot is made
+    before ``DataIterator`` construction and before sequence-MIS can replace
+    rejected samples' masks.
+    """
+    if not enabled:
+        return False
+    if ENTROPY_COMMON_PROBE_MASK_KEY in rollout_data:
+        raise RuntimeError(
+            f"entropy common-probe snapshot already exists under {ENTROPY_COMMON_PROBE_MASK_KEY!r}; "
+            "refusing to overwrite a duplicate/stale probe population"
+        )
+
+    required_fields = ("loss_masks", "response_lengths", "total_lengths", "tokens")
+    missing = [key for key in required_fields if rollout_data.get(key) is None]
+    if missing:
+        raise RuntimeError(f"entropy common-probe snapshot is missing rollout fields: {missing}")
+
+    loss_masks = rollout_data["loss_masks"]
+    response_lengths = rollout_data["response_lengths"]
+    total_lengths = rollout_data["total_lengths"]
+    tokens = rollout_data["tokens"]
+    if not isinstance(loss_masks, (list, tuple)):
+        raise RuntimeError(
+            f"entropy common-probe loss_masks must be a per-sample list/tuple, got {type(loss_masks).__name__}"
+        )
+
+    sample_count = len(loss_masks)
+    field_lengths = {
+        "loss_masks": sample_count,
+        "response_lengths": len(response_lengths),
+        "total_lengths": len(total_lengths),
+        "tokens": len(tokens),
+    }
+    if len(set(field_lengths.values())) != 1:
+        raise RuntimeError(f"entropy common-probe rollout field length mismatch: {field_lengths}")
+    if sample_count == 0:
+        raise RuntimeError("entropy common-probe snapshot requires at least one sample")
+
+    frozen_masks: list[torch.Tensor] = []
+    for index, (loss_mask, response_length, total_length, token_ids) in enumerate(
+        zip(loss_masks, response_lengths, total_lengths, tokens, strict=True)
+    ):
+        if not isinstance(loss_mask, torch.Tensor) or loss_mask.ndim != 1:
+            shape = tuple(loss_mask.shape) if isinstance(loss_mask, torch.Tensor) else None
+            raise RuntimeError(
+                f"entropy common-probe loss_masks[{index}] must be a 1-D tensor, "
+                f"got type={type(loss_mask).__name__} shape={shape}"
+            )
+        response_length = int(response_length)
+        total_length = int(total_length)
+        if response_length < 0 or total_length <= 0 or response_length > total_length:
+            raise RuntimeError(
+                f"entropy common-probe invalid lengths at sample {index}: "
+                f"response_length={response_length}, total_length={total_length}"
+            )
+        if loss_mask.numel() != response_length:
+            raise RuntimeError(
+                f"entropy common-probe mask/response length mismatch at sample {index}: "
+                f"mask={loss_mask.numel()}, response_length={response_length}"
+            )
+        if not isinstance(token_ids, torch.Tensor) or token_ids.numel() != total_length:
+            token_count = token_ids.numel() if isinstance(token_ids, torch.Tensor) else None
+            raise RuntimeError(
+                f"entropy common-probe token/total length mismatch at sample {index}: "
+                f"tokens={token_count}, total_length={total_length}"
+            )
+        frozen_masks.append(loss_mask.detach().clone())
+
+    rollout_data[ENTROPY_COMMON_PROBE_MASK_KEY] = frozen_masks
+    return True
+
+
+@contextmanager
+def _cold_base_load_for_adapter_resume(args: Namespace, enabled: bool):
+    """Force the converted frozen-base load to be weights-only.
+
+    Stateful adapter resume is a two-source load: ``args.load`` points at the
+    converted base checkpoint, while ``args.lora_adapter_resume_load`` points at
+    the adapter+optimizer+RNG checkpoint.  The user's load flags belong to the
+    second source; applying them to the base first asks a model-only conversion
+    checkpoint for optimizer/RNG state and fails before the overlay is reached.
+    """
+    old = (args.no_load_optim, args.no_load_rng)
+    if enabled:
+        args.no_load_optim = True
+        args.no_load_rng = True
+    try:
+        yield
+    finally:
+        args.no_load_optim, args.no_load_rng = old
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -50,6 +210,7 @@ class MegatronTrainRayActor(TrainRayActor):
         with_ref: bool = False,
         with_opd_teacher: bool = False,
     ) -> int | None:
+        _apply_train_env_vars(args)
         if args.debug_rollout_only:
             self.args = args
             return 0
@@ -78,9 +239,42 @@ class MegatronTrainRayActor(TrainRayActor):
                 logger.info(f"Set torch_memory_saver.memory_margin_bytes to {x}")
                 torch_memory_saver.memory_margin_bytes = x
 
-        self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
-            args, role
-        )
+        # V4 LoRA adapter-only resume: base loaded cold from --load above; overlay
+        # saved adapters (+ Muon optim) from the adapter checkpoint and continue
+        # the rollout counter from its iteration.
+        from .adapter_ckpt import adapter_only_ckpt_enabled
+
+        adapter_resume_path = args.lora_adapter_resume_load
+        adapter_resume_active = bool(adapter_resume_path and adapter_only_ckpt_enabled(args) and role == "actor")
+        adapter_resume_load_optim = not args.no_load_optim
+        adapter_resume_load_rng = not args.no_load_rng
+        with _cold_base_load_for_adapter_resume(args, adapter_resume_active):
+            self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
+                args, role
+            )
+
+        if adapter_resume_active:
+            loaded_rollout_id = self.load_adapter_resume(
+                adapter_resume_path,
+                load_optim=adapter_resume_load_optim,
+                load_rng=adapter_resume_load_rng,
+            )
+
+        # Fixed-batch entropy A/B only: prove the freshly loaded actor is
+        # functionally the frozen base before any snapshot, publish, or optimizer
+        # update.  LinearAdapter contributes B(A(x)); exact-zero trainable B on
+        # every rank therefore makes the adapter delta identically zero even when
+        # random A initialization differs.  Keep the import behind the gate so
+        # ordinary training does not scan parameters or enter extra collectives.
+        if role == "actor" and getattr(args, "assert_zero_lora_out", False):
+            from .lora_zero_audit import assert_zero_lora_out
+
+            assert_zero_lora_out(
+                self.model,
+                process_group=get_gloo_group(),
+                should_print=is_megatron_main_rank(),
+                print_fn=lambda message: print(message, flush=True),
+            )
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -121,12 +315,43 @@ class MegatronTrainRayActor(TrainRayActor):
         if with_opd_teacher:
             self.load_other_checkpoint("teacher", args.opd_teacher_load)
 
+        # LoRA specialization of --keep-old-actor: when trainable adapter params
+        # exist, the "old actor" differs from the live model ONLY by the adapter, so
+        # we snapshot/swap just those (~90MB) instead of instantiating a second full
+        # model. Set for the actor role only; consumers use getattr for safety.
+        self.lora_old_actor = None
         if self.args.keep_old_actor:
-            # Load old_actor checkpoint
-            self.load_other_checkpoint("old_actor", args.load)
-            # Create rollout_actor as a copy of current actor
-            if args.update_weights_interval == 1:
-                self.weights_backuper.backup("rollout_actor")
+            if self._should_use_lora_old_actor():
+                # Snapshot contents refresh every training step but the published
+                # version tag only advances at an update boundary; with an interval
+                # above one the contents would drift ahead of the tag and the
+                # version assert could pass while scoring with the wrong weights.
+                assert getattr(self.args, "update_weights_interval", 1) == 1, (
+                    "--keep-old-actor (LoRA adapter snapshot) requires "
+                    "--update-weights-interval 1: the snapshot version tag is only "
+                    f"correct when every step publishes; got interval "
+                    f"{self.args.update_weights_interval}."
+                )
+                device = "cpu"
+                self.lora_old_actor = LoRAOldActorSnapshot(self.model, device=device)
+                logger.info(
+                    "LoRA old-actor (adapter-only --keep-old-actor): %d adapter tensors, %.1f MB on %s; "
+                    "NOT instantiating a second full model.",
+                    self.lora_old_actor.num_tensors,
+                    self.lora_old_actor.num_bytes / 1e6,
+                    device,
+                )
+            else:
+                if getattr(self.args, "debug_freeze_old_actor_snapshot", False):
+                    raise RuntimeError(
+                        "--debug-freeze-old-actor-snapshot requires the adapter-only LoRA old-actor path, "
+                        "but no trainable LoRA adapter parameters were found."
+                    )
+                # Upstream full-model path: a second model instance for scoring.
+                self.load_other_checkpoint("old_actor", args.load)
+                # Create rollout_actor as a copy of current actor
+                if args.update_weights_interval == 1:
+                    self.weights_backuper.backup("rollout_actor")
 
         if self.args.vocab_size is None:
             # Prefer HF config vocab_size (which may include model-native padding)
@@ -247,14 +472,78 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
 
         if self.args.qkv_format == "bshd":
-            # TODO: micro-batch wise dynamic, possibly move to @data.py:get_data_iterator
-            max_seq_len = max(rollout_data["total_lengths"])
-
-            # pad to reduce memory fragmentation and maybe make the computation faster
+            # Pad each scheduled microbatch only to its own real maximum. BSHD
+            # stacks the samples in an MBS, so all members of one MBS intentionally
+            # share a width. Under contiguous CP, the helper also enforces the B1
+            # invariant l_local=max_seq_len/cp_size is 128-aligned. PP>1 retains a
+            # safe rollout-wide fallback because its P2P shapes are fixed for one
+            # Megatron pipeline schedule; formal DS-V4 is PP1 and takes the dynamic
+            # path.
             pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            max_seq_len = (max_seq_len + pad_size - 1) // pad_size * pad_size
+            rollout_data["max_seq_lens"] = compute_bshd_max_seq_lens(
+                rollout_data["total_lengths"],
+                rollout_data["micro_batch_indices"],
+                pad_size=pad_size,
+                cp_size=mpu.get_context_parallel_world_size(),
+                cp_partition_mode=getattr(self.args, "cp_partition_mode", "zigzag"),
+                pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size(),
+            )
 
-            rollout_data["max_seq_lens"] = [max_seq_len] * len(rollout_data["tokens"])
+            # V4 PP needs the hidden-stream tensor shape to match this padded
+            # per-rollout length. PP1 does not consume this override; PP>1's
+            # fallback above makes every microbatch share the same maximum.
+            self.args._v4_pp_current_seq_len = max(rollout_data["max_seq_lens"])
+
+            # Log one line per DP shard (CP rank 0, last PP stage) so a GPU
+            # canary can positively prove which sequence widths were used.
+            # Including dp_rank prevents Ray log de-duplication from hiding
+            # distinct local histograms.
+            if (
+                mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.get_context_parallel_rank() == 0
+                and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
+            ):
+                padding_summary = summarize_bshd_padding(
+                    rollout_data["total_lengths"],
+                    rollout_data["max_seq_lens"],
+                )
+                microbatch_width_order = [
+                    max(rollout_data["max_seq_lens"][sample_index] for sample_index in microbatch)
+                    for microbatch in rollout_data["micro_batch_indices"]
+                ]
+                microbatch_width_orders_by_step = []
+                microbatch_cursor = 0
+                for step_num_microbatches in rollout_data["num_microbatches"]:
+                    step_end = microbatch_cursor + step_num_microbatches
+                    microbatch_width_orders_by_step.append(microbatch_width_order[microbatch_cursor:step_end])
+                    microbatch_cursor = step_end
+                microbatch_widths_descending = all(
+                    all(left >= right for left, right in zip(step_widths, step_widths[1:], strict=False))
+                    for step_widths in microbatch_width_orders_by_step
+                )
+                logger.info(
+                    "V4_ACTUAL_LENGTH_PADDING dp_rank=%s pad_multiplier=%s cp=%s pp=%s "
+                    "samples=%s unique_widths=%s width_hist=%s raw_slots=%s padded_slots=%s "
+                    "rollout_wide_slots=%s padding_overhead_pct=%.2f saved_vs_rollout_wide_pct=%.2f "
+                    "microbatch_width_order=%s microbatch_widths_descending=%s",
+                    mpu.get_data_parallel_rank(with_context_parallel=False),
+                    self.args.data_pad_size_multiplier,
+                    mpu.get_context_parallel_world_size(),
+                    mpu.get_pipeline_model_parallel_world_size(),
+                    padding_summary["samples"],
+                    padding_summary["unique_widths"],
+                    padding_summary["width_hist"],
+                    padding_summary["raw_slots"],
+                    padding_summary["padded_slots"],
+                    padding_summary["rollout_wide_slots"],
+                    padding_summary["padding_overhead_pct"],
+                    padding_summary["saved_vs_rollout_wide_pct"],
+                    ";".join(
+                        ",".join(str(width) for width in step_widths)
+                        for step_widths in microbatch_width_orders_by_step
+                    ),
+                    microbatch_widths_descending,
+                )
 
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
@@ -280,6 +569,33 @@ class MegatronTrainRayActor(TrainRayActor):
                     )
                 )
             ]
+        predictive_support_dtypes = {
+            "rollout_topk_token_ids": torch.long,
+            "rollout_topk_log_probs": torch.float32,
+            "rollout_topk_valid_mask": torch.bool,
+        }
+        for key, dtype in predictive_support_dtypes.items():
+            if key not in rollout_data:
+                continue
+            rollout_data[key] = [
+                _slice_predictive_support_with_cp(
+                    support,
+                    total_length=total_length,
+                    response_length=response_length,
+                    qkv_format=self.args.qkv_format,
+                    max_seq_len=(rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None),
+                    dtype=dtype,
+                    device=torch.cuda.current_device(),
+                )
+                for i, (support, total_length, response_length) in enumerate(
+                    zip(
+                        rollout_data[key],
+                        rollout_data["total_lengths"],
+                        rollout_data["response_lengths"],
+                        strict=True,
+                    )
+                )
+            ]
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]
@@ -291,6 +607,12 @@ class MegatronTrainRayActor(TrainRayActor):
             raise ValueError(f"Cannot switch to unknown model tag: {target_tag}")
         self.weights_backuper.restore(target_tag)
         self._active_model_tag = target_tag
+
+    def _should_use_lora_old_actor(self) -> bool:
+        """Take the adapter-only --keep-old-actor path iff trainable LoRA adapter
+        params exist. Non-LoRA models keep the upstream full-model old-actor
+        behavior."""
+        return len(enumerate_adapter_params(self.model)) > 0
 
     def fill_routing_replay(self, data_iterator, num_microbatches, rollout_data):
         if "rollout_routed_experts" not in rollout_data:
@@ -322,7 +644,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return torch.cat([experts, pad], dim=0)
 
         for _ in range(sum(num_microbatches)):
-            batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens"])
+            batch = data_iterator[0].get_next(["rollout_routed_experts", "tokens", "max_seq_lens"])
             rollout_routed_experts = batch["rollout_routed_experts"]
             tokens = batch["tokens"]
             assert len(rollout_routed_experts) == len(tokens)
@@ -333,12 +655,35 @@ class MegatronTrainRayActor(TrainRayActor):
             # TODO: fuse this padding with the following slice_with_cp to reduce memory copy.
             rollout_routed_experts = [pad_func(r, 1) for r in rollout_routed_experts]
             # TODO: maybe extract a common process function for here and get_batch?
-            rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
-            rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
-            pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
-            pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
-            if pad != 0:
-                rollout_routed_experts = pad_func(rollout_routed_experts, pad)
+            if self.args.qkv_format == "bshd":
+                # Match get_batch (data.py): every sample in this microbatch is
+                # padded to the same scheduled max_seq_len, so the router flattens
+                # a [B, max_seq_len] grid. Routing replay must use THIS
+                # microbatch's width, not the first/longest width in the rollout.
+                max_seq_lens = batch["max_seq_lens"]
+                assert max_seq_lens and all(width == max_seq_lens[0] for width in max_seq_lens), (
+                    "bshd samples in one microbatch must share max_seq_len, got " f"{max_seq_lens}"
+                )
+                max_seqlen = max_seq_lens[0]
+                # Mirror get_batch's invariant (data.py): no sample may exceed the
+                # scheduled max_seq_len, else slice_with_cp's bshd pad goes
+                # negative and silently TRUNCATES routing (corrupting the replay).
+                for r in rollout_routed_experts:
+                    assert r.shape[0] <= max_seqlen, (
+                        f"routing rows {r.shape[0]} > max_seqlen {max_seqlen}; "
+                        "rollout max_seq_lens is inconsistent with the token padding"
+                    )
+                rollout_routed_experts = [
+                    slice_with_cp(r, pad_func, self.args.qkv_format, max_seqlen) for r in rollout_routed_experts
+                ]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+            else:
+                rollout_routed_experts = [slice_with_cp(r, pad_func) for r in rollout_routed_experts]
+                rollout_routed_experts = torch.cat(rollout_routed_experts, dim=0)
+                pad_size = mpu.get_tensor_model_parallel_world_size() * self.args.data_pad_size_multiplier
+                pad = (pad_size - rollout_routed_experts.size(0) % pad_size) % pad_size
+                if pad != 0:
+                    rollout_routed_experts = pad_func(rollout_routed_experts, pad)
 
             if self.args.sequence_parallel:
                 seqlen = rollout_routed_experts.size(0)
@@ -348,7 +693,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
             routing_replay_offset = 0
             for vp_stage, model in enumerate(self.model):
-                config = model.module.config
+                model_module = model.module
+                config = model_module.config
                 num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
                 offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
                 for layer_id in range(offset, offset + num_layers_to_build):
@@ -361,9 +707,25 @@ class MegatronTrainRayActor(TrainRayActor):
                         if config.moe_layer_freq[layer_id] == 0:
                             continue
                     layer_routed_experts = rollout_routed_experts[:, layer_id]
-                    RoutingReplay.all_routing_replays[routing_replay_offset].record(layer_routed_experts)
-                    routing_replay_offset += 1
-            assert routing_replay_offset == len(RoutingReplay.all_routing_replays)
+                    routing_replay_offset = record_rollout_routing_replay_for_layer(
+                        model_module,
+                        layer_id,
+                        layer_routed_experts,
+                        routing_replay_offset,
+                    )
+            # The global registry can include routers from separately built
+            # ref/teacher models. They remain empty in this actor pass and must
+            # not make the active-model fill look incomplete.
+            registered_with_records = sum(
+                bool(replay.top_indices_list) for replay in RoutingReplay.all_routing_replays
+            )
+            if routing_replay_offset != registered_with_records:
+                raise AssertionError(
+                    "rollout routing replay did not fill all active-model replays: "
+                    f"recorded={routing_replay_offset}, "
+                    f"registered_with_records={registered_with_records}, "
+                    f"registered_total={len(RoutingReplay.all_routing_replays)}"
+                )
 
         del rollout_data["rollout_routed_experts"]
 
@@ -403,22 +765,65 @@ class MegatronTrainRayActor(TrainRayActor):
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
 
-        if self.args.async_save:
-            from megatron.training.async_utils import maybe_finalize_async_save
-
-            # Non-blocking poll: a finished background save gets its .metadata
-            # now instead of at the next save_model call. An un-finalized
-            # torch_dist checkpoint cannot be loaded, so without this poll a
-            # crash within the next save interval loses the checkpoint. Must
-            # run before sleep(): finalization is a collective and offload
-            # sleep destroys the process groups.
-            maybe_finalize_async_save(blocking=False)
+        # A normal resident actor is finalized explicitly by the driver, after
+        # its train refs have resolved.  Keeping that collective out of this
+        # method makes the save/train overlap boundary observable and prevents
+        # an implicit poll from racing a subsequently queued train call.  An
+        # offloaded actor is the exception: sleep() destroys its process groups,
+        # so any pending async checkpoint must be finalized first.
+        if self.args.offload_train and self.args.async_save:
+            self.finalize_async_save(rollout_id)
 
         if self.args.offload_train:
             del rollout_data
             self.sleep()
 
         return result
+
+    def finalize_async_save(
+        self,
+        iteration: int,
+        terminate: bool = False,
+        wake_if_offloaded: bool = False,
+    ) -> None:
+        """Finalize a pending async checkpoint on the Ray actor's main thread."""
+        if self.args.debug_rollout_only or not self.args.async_save:
+            return
+
+        from megatron.training.async_utils import maybe_finalize_async_save
+
+        woke_for_cleanup = bool(wake_if_offloaded and self.args.offload_train)
+        timer_name = (
+            "async_save_finalize" if getattr(self, "role", "actor") == "actor" else f"{self.role}_async_save_finalize"
+        )
+        if woke_for_cleanup:
+            self.wake_up()
+        try:
+            if dist.get_rank() == 0:
+                logger.info("V4_ASYNC_SAVE_FINALIZE_START iteration=%s", iteration)
+            with timer(timer_name):
+                # This is intentionally blocking. Ray invokes actor methods
+                # serially, so the collective cannot overlap this actor's train
+                # method. Include the global barrier so this measures complete
+                # worker shutdown rather than only the rank-local join.
+                finalize_kwargs = {"blocking": True}
+                if terminate:
+                    finalize_kwargs["terminate"] = True
+                maybe_finalize_async_save(**finalize_kwargs)
+                if terminate:
+                    dist.barrier()
+            if dist.get_rank() == 0 and terminate:
+                logger.info(
+                    "V4_ASYNC_SAVE_WORKERS_TERMINATED iteration=%s world_size=%s",
+                    iteration,
+                    dist.get_world_size(),
+                )
+            if dist.get_rank() == 0:
+                logger.info("V4_ASYNC_SAVE_FINALIZE_END iteration=%s", iteration)
+            log_named_perf_timers(iteration, self.args, timer_name)
+        finally:
+            if woke_for_cleanup:
+                self.sleep()
 
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch):
         """Train critic and return CPU values (used as old-values for the next actor train)."""
@@ -449,6 +854,43 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+        _snapshot_entropy_common_probe_masks(
+            rollout_data,
+            enabled=getattr(self.args, "entropy_common_probe", False),
+        )
+
+        # Diagnostic (env-gated, no-op unless enabled): after update_weights and
+        # before the first train forward/backward, scan live model params for
+        # NaN/Inf to tell param-corruption from a backward-compute NaN.
+        if os.environ.get("SLIME_DEBUG_CHECK_PARAMS", "0") == "1":
+            try:
+                bad = [
+                    (n, tuple(p.shape))
+                    for mdl in self.model
+                    for n, p in mdl.named_parameters()
+                    if not torch.isfinite(p.data).all()
+                ]
+                # Value checksum (not just finiteness): compare live full-loop vs
+                # debug-replay to detect params changed in place by update_weights.
+                csum = 0.0
+                for mdl in self.model:
+                    for _, p in mdl.named_parameters():
+                        csum += p.data.float().abs().sum().item()
+                print(
+                    f"[SLIME_DEBUG_CHECK_PARAMS] rollout_id={rollout_id} rank={dist.get_rank()} "
+                    f"pp={mpu.get_pipeline_model_parallel_rank()} nonfinite_params={len(bad)} "
+                    f"param_abs_sum={csum:.8e} first={bad[:5]}",
+                    flush=True,
+                )
+            except Exception as _e:  # never let the diagnostic break training
+                print(f"[SLIME_DEBUG_CHECK_PARAMS] error: {_e}", flush=True)
+        # Diagnostic (env-gated): autograd anomaly detection raises at the first
+        # backward op that produces NaN, with a traceback to the forward op that
+        # created it — pinpoints where the full-loop NaN originates.
+        if os.environ.get("SLIME_DEBUG_ANOMALY", "0") == "1":
+            torch.autograd.set_detect_anomaly(True, check_nan=True)
+            if dist.get_rank() == 0:
+                print("[SLIME_DEBUG_ANOMALY] autograd anomaly detection ON", flush=True)
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
@@ -484,7 +926,36 @@ class MegatronTrainRayActor(TrainRayActor):
                         )
                     )
 
-                self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
+                lora_old = getattr(self, "lora_old_actor", None)
+                if lora_old is not None:
+                    # LoRA old-actor: the live model already holds the current
+                    # adapter; the behavioral adapter is swapped in only around the
+                    # scoring forward (below). Seed the snapshot on the first step
+                    # (θ_0 == the just-pushed initial adapter). Live training normally
+                    # refreshes it after scoring; explicit fixed-debug replay keeps this
+                    # first snapshot instead so every repeat has the same behavior anchor.
+                    if lora_old.version is None:
+                        freeze_old_snapshot = bool(getattr(self.args, "debug_freeze_old_actor_snapshot", False))
+                        if freeze_old_snapshot and self.weight_updater.weight_version != 0:
+                            raise RuntimeError(
+                                "Fixed debug replay requires the initial LoRA old-actor snapshot to be v0, "
+                                f"but weight_updater is already v{self.weight_updater.weight_version}. "
+                                "The prepared dump is stamped gen_weight_version=0; refusing a mismatched anchor."
+                            )
+                        maybe_refresh_lora_old_actor_snapshot(
+                            lora_old,
+                            version=self.weight_updater.weight_version,
+                            freeze_after_seed=freeze_old_snapshot,
+                        )
+                        if freeze_old_snapshot and is_megatron_main_rank():
+                            logger.warning(
+                                "FIXED DEBUG REPLAY: seeded LoRA old-actor snapshot once at v%s; "
+                                "snapshot refresh is disabled, so every repeat scores against the initial "
+                                "behavior policy.",
+                                lora_old.version,
+                            )
+                else:
+                    self._switch_model("old_actor" if self.args.keep_old_actor else "actor")
                 can_reuse_log_probs_in_loss = (
                     len(num_microbatches) == 1
                     and self.args.loss_type == "policy_loss"
@@ -497,21 +968,63 @@ class MegatronTrainRayActor(TrainRayActor):
                     and not self.args.use_routing_replay
                     and self.args.advantage_estimator != "gspo"
                 )
-                if (
-                    not self.args.use_rollout_logprobs or self.args.get_mismatch_metrics
-                ) and not can_reuse_log_probs_in_loss:
+                if should_recompute_old_actor_log_probs(self.args) and not can_reuse_log_probs_in_loss:
+                    if (
+                        getattr(self.args, "debug_force_old_actor_logprob_recompute", False)
+                        and self.args.use_rollout_logprobs
+                        and is_megatron_main_rank()
+                    ):
+                        logger.warning(
+                            "FIXED DEBUG REPLAY: forcing frozen-old-actor log-prob recompute while "
+                            "policy loss keeps rollout_log_probs as its denominator."
+                        )
                     if self.args.use_routing_replay:
                         if self.args.use_rollout_routing_replay:
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                    rollout_data.update(
-                        self.compute_log_prob(
-                            data_iterator,
-                            num_microbatches,
-                            store_prefix="",
+                    if lora_old is not None:
+                        # Assert the batch's behavioral version matches the snapshot
+                        # (collective, so a lone stale DP rank fails loudly instead of
+                        # hanging the forward), then score under the old adapter and
+                        # restore the live adapter (score_with_snapshot's finally).
+                        expected_v = resolve_batch_gen_version(
+                            rollout_data.get("gen_weight_versions"),
+                            lora_old.version,
+                            gloo_group=get_gloo_group(),
                         )
-                    )
+                        with lora_old.score_with_snapshot(expected_version=expected_v):
+                            rollout_data.update(
+                                self.compute_log_prob(
+                                    data_iterator,
+                                    num_microbatches,
+                                    store_prefix="",
+                                )
+                            )
+                    else:
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="",
+                            )
+                        )
+                    if (
+                        lora_old is not None
+                        and getattr(self.args, "sequence_mis_ratio_source", "rollout") == "old_actor"
+                    ):
+                        # Same-stack MIS: also recompute under the CURRENT live
+                        # adapter (θ_k, already restored above) so the postprocess can
+                        # form a pure-drift ratio (cur/old, both megatron) instead of
+                        # the cross-engine megatron-vs-sglang pair. Validated
+                        # incompatible with routing replay, so this is a plain forward.
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="cur_",
+                            )
+                        )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
@@ -522,7 +1035,25 @@ class MegatronTrainRayActor(TrainRayActor):
                             from slime.backends.megatron_utils.data import tensors_to_gpu
 
                             rollout_data["values"] = tensors_to_gpu(values)
-                if self._active_model_tag != "actor":
+                if lora_old is not None:
+                    # The live adapter (θ_k) was already restored by
+                    # score_with_snapshot. In live training, refresh the behavioral
+                    # snapshot BEFORE the gradient step, tagged with the version it was
+                    # pushed to the engines as — it is exactly the next batch's policy.
+                    # Fixed debug replay deliberately leaves the initial snapshot intact.
+                    refreshed = maybe_refresh_lora_old_actor_snapshot(
+                        lora_old,
+                        version=self.weight_updater.weight_version,
+                        freeze_after_seed=bool(getattr(self.args, "debug_freeze_old_actor_snapshot", False)),
+                    )
+                    if not refreshed and is_megatron_main_rank():
+                        logger.info(
+                            "FIXED DEBUG REPLAY: keeping LoRA old-actor snapshot frozen at v%s "
+                            "after rollout_id=%s.",
+                            lora_old.version,
+                            rollout_id,
+                        )
+                elif self._active_model_tag != "actor":
                     self._switch_model("actor")
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
@@ -557,6 +1088,14 @@ class MegatronTrainRayActor(TrainRayActor):
         train_dump_utils.save_debug_train_data(self.args, rollout_id=rollout_id, rollout_data=rollout_data)
 
         if self.args.use_routing_replay:
+            # Codex-review invariant: verify every recorded routing entry was
+            # consumed by the train forward and by exactly the decoder layers
+            # that activation checkpointing replays in backward (uniform=all,
+            # block=first K local layers, off=none).
+            RoutingReplay.check_fully_consumed(
+                context=f"rollout {rollout_id} post-train",
+                model_modules=self.model,
+            )
             RoutingReplay.clear_all()
 
         # update the cpu actor weight to the latest model
@@ -575,32 +1114,54 @@ class MegatronTrainRayActor(TrainRayActor):
 
         log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
 
-    @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:
         if self.args.debug_rollout_only:
             return
 
-        # torch dist may trigger nccl communication during saving.
+        # Offloaded groups wake in a separate all-actor phase owned by
+        # RayTrainGroup, so one rank's wake failure cannot let healthy ranks
+        # enter checkpoint collectives alone.
+
+        timer_name = "save_model" if self.role == "actor" else f"{self.role}_save_model"
+        with timer(timer_name):
+            if self.args.async_save:
+                from megatron.training.async_utils import maybe_finalize_async_save
+
+                maybe_finalize_async_save(blocking=True)
+
+            save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+
+        # Report schedule/D2H time at the checkpoint's own rollout. This helper
+        # is best-effort and cannot interrupt checkpoint lifecycle control.
+        log_named_perf_timers(rollout_id, self.args, timer_name)
+
+        if force_sync and self.args.async_save:
+            self.finalize_async_save(rollout_id, terminate=True)
+
+        if self.args.offload_train:
+            # A non-final save launched a new background request above. It must
+            # be joined before sleep() destroys process groups.
+            if self.args.async_save and not force_sync:
+                self.finalize_async_save(rollout_id)
+
+    def prepare_save_model(self) -> None:
+        """Wake an offloaded actor before the group enters checkpoint collectives."""
         if self.args.offload_train:
             self.wake_up()
 
-        if self.args.async_save:
-            from megatron.training.async_utils import maybe_finalize_async_save
+    def finish_save_model(self, rollout_id: int) -> None:
+        """Run rank-local save postprocessing after checkpoint ownership transfers."""
+        try:
+            if self.args.save_hf is not None and self.role == "actor":
+                from slime.backends.megatron_utils.model import save_hf_model
 
-            maybe_finalize_async_save(blocking=True)
-
-        save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
-
-        if force_sync and self.args.async_save:
-            maybe_finalize_async_save(blocking=True)
-
-        if self.args.save_hf is not None and self.role == "actor":
-            from slime.backends.megatron_utils.model import save_hf_model
-
-            save_hf_model(self.args, rollout_id, self.model)
-
-        if self.args.offload_train:
-            self.sleep()
+                save_hf_model(self.args, rollout_id, self.model)
+        finally:
+            # All checkpoint collectives completed before rank-local HF work.
+            # Keep every offloaded actor in the same asleep state even when one
+            # rank's HF export fails, so driver cleanup can wake the full group.
+            if self.args.offload_train:
+                self.sleep()
 
     @timer
     def update_weights(self) -> None:
@@ -647,7 +1208,10 @@ class MegatronTrainRayActor(TrainRayActor):
                         f"Weight version mismatch! Engine: {engine_version}, Updater: {self.weight_updater.weight_version}"
                     )
 
-            if getattr(self.args, "keep_old_actor", False):
+            if getattr(self.args, "keep_old_actor", False) and getattr(self, "lora_old_actor", None) is None:
+                # Full-model queue (upstream). The LoRA old-actor path keeps its own
+                # adapter-only snapshot, refreshed in train_actor before the gradient
+                # step, so it does not participate in this weights_backuper queue.
                 if self.args.update_weights_interval == 1:
                     logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
                     # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
@@ -692,3 +1256,54 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.weights_backuper.backup(model_tag)
         self._active_model_tag = model_tag
+
+    def load_adapter_resume(self, path: str, load_optim: bool = True, load_rng: bool = True) -> int:
+        """Resume V4 LoRA training from an adapter-only checkpoint.
+
+        The frozen base was already loaded cold from ``--load`` (torch_dist) in
+        ``initialize_model_and_optimizer``; this overlays the saved adapter
+        weights, optional Muon optimizer state, and optional RNG state from an
+        adapter-only ``--save`` dir. Returns the checkpoint's iteration so the
+        rollout counter continues instead of restarting at 0. The model
+        sharded_state_dict is filtered to adapter keys so Megatron's load only
+        requests the (present) adapter tensors, not the absent base.
+        """
+        from .adapter_ckpt import (
+            adapter_only_model_load,
+            validate_adapter_checkpoint_components,
+            validate_adapter_scaling_marker,
+            validate_loaded_lora_optimizer_state,
+            validate_lora_optimizer_state,
+        )
+
+        # Fail loud if the checkpoint's recorded LoRA scaling (alpha/r vs rsLoRA's
+        # alpha/sqrt(r), dim, alpha) differs from what the CLI args rebuilt at model
+        # build — a silent mismatch rescales every adapter delta on resume.
+        validate_adapter_scaling_marker(path, self.model, rslora=self.args.lora_rslora)
+        if load_optim:
+            # The same identity gate used before save also protects load: never
+            # map checkpoint state onto an optimizer that owns frozen base params
+            # or omits a live LoRA matrix.
+            validate_lora_optimizer_state(self.model, self.optimizer)
+        component_marker = validate_adapter_checkpoint_components(path, load_optimizer=load_optim, load_rng=load_rng)
+
+        old = (self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune)
+        self.args.load = path
+        self.args.no_load_optim = not load_optim
+        self.args.no_load_rng = not load_rng
+        self.args.finetune = False  # a real resume: keep the checkpoint iteration
+        try:
+            with adapter_only_model_load(self.model):
+                iteration, _ = load_checkpoint(
+                    self.model,
+                    self.optimizer if load_optim else None,
+                    self.opt_param_scheduler if load_optim else None,
+                    checkpointing_context={},
+                    skip_load_to_model_and_opt=False,
+                )
+        finally:
+            self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune = old
+        if load_optim:
+            validate_loaded_lora_optimizer_state(self.model, self.optimizer, component_marker)
+        logger.info("V4 LoRA adapter resume: loaded adapters from %s at iteration %d", path, iteration)
+        return iteration

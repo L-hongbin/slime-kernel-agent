@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -15,6 +16,41 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _FILTER_CONFIG_LOGGED = False
+
+
+def _low_variance_audit_record(args, samples: list[Sample], filter_rewards: list[float]) -> dict[str, Any]:
+    """Build one structured record that joins filtered sample IDs to rewards."""
+
+    def metadata_for(sample: Sample) -> dict[str, Any]:
+        return sample.metadata if isinstance(sample.metadata, dict) else {}
+
+    def stable_id(sample: Sample) -> str | int | None:
+        metadata = metadata_for(sample)
+        for key in ("uuid", "uid", "id", "index", "source_row"):
+            value = metadata.get(key)
+            if value is not None:
+                return value if isinstance(value, (str, int)) else str(value)
+        return sample.index
+
+    first = samples[0]
+    first_metadata = metadata_for(first)
+    return {
+        "rollout_step": first_metadata.get("start_rollout_id"),
+        "prompt_group_index": first.group_index,
+        "samples": [
+            {
+                "id": stable_id(sample),
+                "sample_index": sample.index,
+                "group_id": sample.group_id,
+                # filter_reward is the pre-overlong-penalty task reward used
+                # for the variance decision; reward is the effective reward
+                # that would otherwise reach advantage computation.
+                "filter_reward": float(filter_reward),
+                "reward": float(sample.get_reward_value(args)),
+            }
+            for sample, filter_reward in zip(samples, filter_rewards, strict=True)
+        ],
+    }
 
 
 def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> DynamicFilterOutput:
@@ -74,15 +110,30 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         )
 
     if reject_low_variance_groups:
-        rewards = [sample.get_reward_value(args) for sample in valid_samples]
+        # Variance is judged on the PRE-PENALTY task reward when the overlong
+        # penalty recorded one (metadata["task_reward"]): lengthy all-fail
+        # groups must be dropped exactly as without the penalty; the penalty
+        # only shapes advantages of groups that survive (user directive
+        # 2026-07-18).
+        rewards = [
+            (
+                sample.metadata.get("task_reward")
+                if isinstance(sample.metadata, dict) and "task_reward" in sample.metadata
+                else sample.get_reward_value(args)
+            )
+            for sample in valid_samples
+        ]
         reward_std = torch.tensor(rewards, dtype=torch.float64).std(unbiased=False).item()
         if reward_std < reward_std_threshold:
+            audit_record = _low_variance_audit_record(args, valid_samples, rewards)
             logger.info(
-                "[kernel_agent][filter] drop group: reward_std=%.6g threshold=%.6g valid_group_size=%s rewards=%s",
+                "[kernel_agent][filter] drop group: reward_std=%.6g threshold=%.6g "
+                "valid_group_size=%s rewards=%s audit=%s",
                 reward_std,
                 reward_std_threshold,
                 len(valid_samples),
                 rewards,
+                json.dumps(audit_record, ensure_ascii=False, sort_keys=True, default=str),
             )
             return DynamicFilterOutput(
                 keep=False,
@@ -176,6 +227,8 @@ def _gather_sequence_mis_chunk(
     advantages: list[torch.Tensor] | None,
     total_lengths: list[int],
     response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
     start: int,
     end: int,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[bool]]:
@@ -183,9 +236,20 @@ def _gather_sequence_mis_chunk(
     masks = []
     advantage_protected_flags = []
     for i in range(start, end):
-        full_train_log_prob = all_gather_with_cp(train_log_probs[i], int(total_lengths[i]), int(response_lengths[i]))
+        max_seq_len = None if max_seq_lens is None else int(max_seq_lens[i])
+        full_train_log_prob = all_gather_with_cp(
+            train_log_probs[i],
+            int(total_lengths[i]),
+            int(response_lengths[i]),
+            qkv_format=qkv_format,
+            max_seq_len=max_seq_len,
+        )
         full_rollout_log_prob = all_gather_with_cp(
-            rollout_log_probs[i], int(total_lengths[i]), int(response_lengths[i])
+            rollout_log_probs[i],
+            int(total_lengths[i]),
+            int(response_lengths[i]),
+            qkv_format=qkv_format,
+            max_seq_len=max_seq_len,
         )
 
         if full_train_log_prob.shape != full_rollout_log_prob.shape:
@@ -248,6 +312,8 @@ def _loop_sequence_mis(
     advantages: list[torch.Tensor] | None,
     total_lengths: list[int],
     response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
     stats: dict[str, float],
 ) -> None:
     temp_turns: list[tuple[int, torch.Tensor, torch.Tensor, bool, bool]] = []
@@ -256,11 +322,20 @@ def _loop_sequence_mis(
 
     with torch.no_grad():
         for i in range(len(train_log_probs)):
+            max_seq_len = None if max_seq_lens is None else int(max_seq_lens[i])
             full_train_log_prob = all_gather_with_cp(
-                train_log_probs[i], int(total_lengths[i]), int(response_lengths[i])
+                train_log_probs[i],
+                int(total_lengths[i]),
+                int(response_lengths[i]),
+                qkv_format=qkv_format,
+                max_seq_len=max_seq_len,
             )
             full_rollout_log_prob = all_gather_with_cp(
-                rollout_log_probs[i], int(total_lengths[i]), int(response_lengths[i])
+                rollout_log_probs[i],
+                int(total_lengths[i]),
+                int(response_lengths[i]),
+                qkv_format=qkv_format,
+                max_seq_len=max_seq_len,
             )
 
             if full_train_log_prob.shape != full_rollout_log_prob.shape:
@@ -373,6 +448,8 @@ def _batch_sequence_mis(
     advantages: list[torch.Tensor] | None,
     total_lengths: list[int],
     response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
     stats: dict[str, float],
 ) -> None:
     with torch.no_grad():
@@ -385,6 +462,8 @@ def _batch_sequence_mis(
                 advantages,
                 total_lengths,
                 response_lengths,
+                qkv_format,
+                max_seq_lens,
                 start,
                 end,
             )
@@ -458,6 +537,15 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
     log-probs recomputed by Megatron and the rollout log-probs from SGLang, then
     masks whole response sequences whose importance ratio is outside the configured
     bounds. Samples stay in the batch; only their ``loss_masks`` are zeroed.
+
+    ``ratio_source`` (from ``--sequence-mis-config``) selects the ratio pair:
+      - ``"rollout"`` (default): ``log_probs`` (megatron recompute) vs
+        ``rollout_log_probs`` (sglang) — the train/infer cross-engine pair.
+      - ``"old_actor"``: ``cur_log_probs`` (current-actor recompute) vs ``log_probs``
+        (behavioral old-actor recompute) — a SAME-STACK drift ratio (both megatron),
+        so cross-engine numerics don't drive rejection. Requires ``--keep-old-actor``
+        and the train actor to have populated ``cur_log_probs`` (incompatible with
+        routing replay; enforced in ``slime_validate_args``).
     """
 
     if "log_probs" not in rollout_data:
@@ -502,11 +590,36 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
         max_turns = None
     group_size = _get_sequence_mis_group_size(args, aggregation)
 
-    train_log_probs = rollout_data["log_probs"]
-    rollout_log_probs = rollout_data["rollout_log_probs"]
+    ratio_source = getattr(args, "sequence_mis_ratio_source", "rollout")
+    if ratio_source == "old_actor":
+        if "cur_log_probs" not in rollout_data:
+            raise ValueError(
+                "[kernel_agent][sequence_mis] ratio_source='old_actor' requires "
+                "rollout_data['cur_log_probs'] (the current-actor recompute). It is populated by "
+                "the train actor only when --keep-old-actor takes the LoRA old-actor path."
+            )
+        # Same-stack drift ratio: current (numerator) vs old-actor (denominator), both megatron.
+        train_log_probs = rollout_data["cur_log_probs"]
+        rollout_log_probs = rollout_data["log_probs"]
+    else:
+        train_log_probs = rollout_data["log_probs"]
+        rollout_log_probs = rollout_data["rollout_log_probs"]
     loss_masks = rollout_data["loss_masks"]
     total_lengths = rollout_data["total_lengths"]
     response_lengths = rollout_data["response_lengths"]
+    qkv_format = getattr(args, "qkv_format", "thd")
+    max_seq_lens = rollout_data.get("max_seq_lens")
+    if qkv_format == "bshd":
+        if max_seq_lens is None:
+            raise ValueError(
+                "[kernel_agent][sequence_mis] qkv_format='bshd' requires "
+                "rollout_data['max_seq_lens'] so CP gather uses the forward layout."
+            )
+        if len(max_seq_lens) != len(response_lengths):
+            raise ValueError(
+                "[kernel_agent][sequence_mis] max_seq_lens length mismatch: "
+                f"max_seq_lens={len(max_seq_lens)}, response_lengths={len(response_lengths)}."
+            )
     use_advantage = bool(getattr(args, "sequence_mis_use_advantage", False))
     advantages = rollout_data.get("advantages") if use_advantage else None
     if use_advantage:
@@ -519,11 +632,18 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
                 f"advantages={len(advantages)}, loss_masks={len(loss_masks)}."
             )
 
-    if not (len(train_log_probs) == len(rollout_log_probs) == len(loss_masks) == len(response_lengths)):
+    if not (
+        len(train_log_probs)
+        == len(rollout_log_probs)
+        == len(loss_masks)
+        == len(total_lengths)
+        == len(response_lengths)
+    ):
         raise ValueError(
             "[kernel_agent][sequence_mis] rollout_data length mismatch: "
             f"log_probs={len(train_log_probs)}, rollout_log_probs={len(rollout_log_probs)}, "
-            f"loss_masks={len(loss_masks)}, response_lengths={len(response_lengths)}."
+            f"loss_masks={len(loss_masks)}, total_lengths={len(total_lengths)}, "
+            f"response_lengths={len(response_lengths)}."
         )
 
     if max_turns is not None and len(train_log_probs) % max_turns != 0:
@@ -572,6 +692,8 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
             advantages=advantages,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
+            qkv_format=qkv_format,
+            max_seq_lens=max_seq_lens,
             stats=stats,
         )
     elif mode == "batch":
@@ -589,6 +711,8 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
             advantages=advantages,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
+            qkv_format=qkv_format,
+            max_seq_lens=max_seq_lens,
             stats=stats,
         )
     else:

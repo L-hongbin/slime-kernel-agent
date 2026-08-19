@@ -1,0 +1,566 @@
+Subject: [BACKPORT->v0.5.13@28b095c] DSV4 non-paged indexer for large prefill chunks (upstream #29619 + #30140), OPT-IN (rev2)
+
+Upstream: a6ee64d23 "[DeepSeek-V4] Add an opt-in non-paged indexer for
+long-context prefill (#29619)" + 583e19d22 "Enable non-paged indexer by
+default for large prefill chunks (#30140)" (cherry-pick #30436).
+
+KEPT OPT-IN on our pin: SGLANG_OPT_DSV4_NONPAGED_INDEXER defaults to False
+here even though upstream #30140 defaulted it to True. Production flips it
+only after GPU validation. The #30140 large-chunk threshold
+(SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS=8192, per-rank local query
+rows) is included.
+
+rev2 (post-review): the pin DOES have prefill CUDA graphs
+(init_forward_metadata_prefill already takes use_prefill_cuda_graph and
+builds graph compressor plans), so this revision (a) patches
+deepseek_v4_backend.py to propagate use_prefill_cuda_graph through
+init_forward_metadata_indexer into PagedIndexerMetadata (upstream's own
+backend hunk, re-anchored), and (b) restores both upstream graph-context
+guards using their PIN-equivalent homes:
+  compilation.piecewise_context_manager.is_in_piecewise_cuda_graph
+  model_executor.breakable_cuda_graph.context.is_in_breakable_cuda_graph
+These are required, not optional: piecewise graph warmup runs a real bs=1
+EXTEND batch BEFORE stream capture, so is_current_stream_capturing() alone
+would not reject it. As upstream, the normal-decode / target-verify /
+raw-decode / CP-resplit callers of init_forward_metadata_indexer keep the
+default (False); they are rejected by the ForwardMode.EXTEND and cp_size==1
+eligibility checks.
+
+Adaptations vs upstream commits:
+- forward_batch._original_forward_mode accessed via getattr: on the pin it is
+  a setattr-only attribute (set when a decode batch is rewritten to EXTEND
+  under DP max-len padding — exactly our dp-attention LoRA config), not a
+  dataclass field; direct attribute access would raise.
+- DeepSeekV4(Indexer)Pool.get_index_k_scale_buffer signature fixed to the
+  gather-based accessor API. At the pin this method was dead code whose call
+  into dsa/index_buf_accessor.GetKAndS no longer matched the accessor
+  signature; no other DSV4 caller exists (verified on pin + node70 snapshot).
+- Upstream's CPU unit test test/registered/unit/layers/
+  test_dsv4_nonpaged_indexer.py not included (asserts upstream defaults /
+  v0.5.15-only constructs); its eligibility matrix is preserved in code.
+- environ insertions placed after SGLANG_TOPK_TRANSFORM_512_TORCH; this was
+  verified order-independent from the compress-state bf16 backport that was
+  later removed after upstream absorbed that capability.
+
+Gate-off residual (be precise): with the env OFF, two things change on the
+paged path: (a) each forward_c4_indexer call now runs the cheap fail-closed
+eligibility prelude (_get_nonpaged_indexer_plan's query-token threshold
+compare, plus the env check in _can_use_nonpaged_indexer if the threshold
+passes) before falling through to the paged path; (b) the paged
+token_to_kv_pool.get_index_k_with_scale_buffer() fetch (which can block in
+wait_layer_transfer()) moves from the prepare functions to immediately
+before the paged mqa-logits call — a scheduling-order change mirroring
+upstream. No numerical difference found by static reasoning (CPU-only
+review; not GPU-verified), but not "execution-identical".
+
+Env gates: SGLANG_OPT_DSV4_NONPAGED_INDEXER=0 (default) / 1 (opt-in);
+SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS=8192.
+
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -765,6 +765,12 @@ class Envs:
+     SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
+     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
++    # NOTE(backport): upstream #30140 flipped this default to True; kept
++    # opt-in (False) on the v0.5.13 pin until GPU-validated in production.
++    SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(False)
++    # Per-rank local query rows (after DP-attention sharding when enabled),
++    # not request ISL.
++    SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS = EnvInt(8192)
+     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(False)
+ 
+     # SWA radix cache
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -476,11 +476,17 @@ class DeepseekV4AttnBackend(
+         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
+         return pin_tensor.to(self.device, non_blocking=True)
+ 
+-    def init_forward_metadata_indexer(self, core_attn_metadata: DSV4AttnMetadata):
++    def init_forward_metadata_indexer(
++        self,
++        core_attn_metadata: DSV4AttnMetadata,
++        *,
++        use_prefill_cuda_graph: bool = False,
++    ):
+         return PagedIndexerMetadata(
+             page_size=self.page_size,
+             page_table=core_attn_metadata.page_table,
+             c4_seq_lens=core_attn_metadata.c4_topk_lengths_raw,
++            use_prefill_cuda_graph=use_prefill_cuda_graph,
+         )
+ 
+     def init_forward_metadata_decode(
+@@ -562,7 +568,10 @@ class DeepseekV4AttnBackend(
+             is_prefill=True,
+         )
+         indexer_metadata = (
+-            self.init_forward_metadata_indexer(core_attn_metadata)
++            self.init_forward_metadata_indexer(
++                core_attn_metadata,
++                use_prefill_cuda_graph=use_prefill_cuda_graph,
++            )
+             if need_compress
+             else None
+         )
+diff --git a/python/sglang/srt/layers/attention/dsv4/indexer.py b/python/sglang/srt/layers/attention/dsv4/indexer.py
+--- a/python/sglang/srt/layers/attention/dsv4/indexer.py
++++ b/python/sglang/srt/layers/attention/dsv4/indexer.py
+@@ -14,13 +14,24 @@ from sglang.jit_kernel.dsv4 import (
+     topk_transform_512,
+     topk_transform_512_v2,
+ )
++from sglang.srt.compilation.piecewise_context_manager import (
++    is_in_piecewise_cuda_graph,
++)
+ from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+ from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.dsv4.compressor import Compressor
+-from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
++from sglang.srt.layers.attention.dsv4.metadata import (
++    NonPagedIndexerPlan,
++    PagedIndexerMetadata,
++)
++from sglang.srt.layers.dp_attention import get_attention_cp_size
+ from sglang.srt.layers.linear import ReplicatedLinear
++from sglang.srt.model_executor.breakable_cuda_graph.context import (
++    is_in_breakable_cuda_graph,
++)
++from sglang.srt.model_executor.forward_batch_info import ForwardMode
+ from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
+-from sglang.srt.utils import add_prefix, is_hip
++from sglang.srt.utils import add_prefix, is_cuda, is_hip
+ from sglang.srt.utils.common import is_sm120_supported
+ 
+ if TYPE_CHECKING:
+@@ -360,10 +371,9 @@ class C4IndexerBackendMixin:
+         c4_indexer: C4Indexer,
+         positions: torch.Tensor,
+         forward_batch: ForwardBatch,
+-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+         q_lora_ready: Optional[torch.cuda.Event] = None,
+-    ) -> Tuple[IndexerQuery, torch.Tensor, torch.Tensor]:
++    ) -> Tuple[IndexerQuery, torch.Tensor]:
+         if TYPE_CHECKING:
+             assert isinstance(self, CompressorBackendMixin)
+ 
+@@ -382,9 +392,6 @@ class C4IndexerBackendMixin:
+             layer_id=c4_indexer.layer_id,
+             compressor=c4_indexer.compressor,
+         )
+-        c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
+-            layer_id=c4_indexer.layer_id,
+-        )
+ 
+         # The weight projection is small and fast; compute it on its own
+         # stream, then have the Q stream wait on it before launching the big
+@@ -401,7 +408,7 @@ class C4IndexerBackendMixin:
+             q, weights = c4_indexer.compute_q(q_lora, positions, weights)
+ 
+         current_stream.wait_stream(stream_q)
+-        return q, weights, c4_indexer_kv_cache
++        return q, weights
+ 
+     def _forward_prepare_normal(
+         self,
+@@ -410,9 +417,8 @@ class C4IndexerBackendMixin:
+         c4_indexer: C4Indexer,
+         positions: torch.Tensor,
+         forward_batch: ForwardBatch,
+-        token_to_kv_pool: DeepSeekV4TokenToKVPool,
+         skip_compressor: bool = False,
+-    ) -> Tuple[IndexerQuery, torch.Tensor, torch.Tensor]:
++    ) -> Tuple[IndexerQuery, torch.Tensor]:
+         if TYPE_CHECKING:
+             assert isinstance(self, CompressorBackendMixin)
+ 
+@@ -425,10 +431,172 @@ class C4IndexerBackendMixin:
+                 layer_id=c4_indexer.layer_id,
+                 compressor=c4_indexer.compressor,
+             )
+-        c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
++        return q, weights
++
++    def _can_use_nonpaged_indexer(
++        self,
++        *,
++        c4_indexer: C4Indexer,
++        forward_batch: ForwardBatch,
++        indexer_metadata: PagedIndexerMetadata,
++    ) -> bool:
++        if not envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER.get():
++            return False
++        # This path calls CUDA DeepGEMM and assumes the CUDA FP8+FP32 packed
++        # indexer cache layout. Explicitly reject HIP, NPU, and other devices.
++        if not is_cuda() or is_hip():
++            return False
++        # The gather plan is built from eager, child-local ForwardBatch metadata.
++        # Rewritten, TBO-split, and graph-backed batches must use the paged path.
++        # NOTE(backport): _original_forward_mode is not a dataclass field on the
++        # v0.5.13 pin; it is set via setattr only when a decode batch is
++        # rewritten to EXTEND under DP max-len padding, hence getattr here.
++        if (
++            forward_batch.forward_mode != ForwardMode.EXTEND
++            or getattr(forward_batch, "_original_forward_mode", None) is not None
++            or forward_batch.tbo_parent_token_range is not None
++            or forward_batch.batch_size != 1
++            or indexer_metadata.use_prefill_cuda_graph
++        ):
++            return False
++        if (
++            c4_indexer.use_fp4_indexer
++            or envs.SGLANG_OPT_USE_TILELANG_INDEXER.get()
++            or envs.SGLANG_OPT_USE_AITER_INDEXER.get()
++            or envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
++        ):
++            return False
++        # NOTE(backport): upstream (v0.5.15) rejects the runner-refactor
++        # is_in_tc_piecewise_cuda_graph()/is_in_breakable_cuda_graph(); the pin
++        # equivalents are compilation.piecewise_context_manager.
++        # is_in_piecewise_cuda_graph and model_executor.breakable_cuda_graph.
++        # context.is_in_breakable_cuda_graph. These are required: piecewise
++        # graph warmup runs a real bs=1 EXTEND batch BEFORE stream capture
++        # (piecewise_cuda_graph_runner), so is_current_stream_capturing()
++        # alone would not reject it.
++        if (
++            get_attention_cp_size() != 1
++            or self.hisparse_coordinator is not None
++            or is_in_piecewise_cuda_graph()
++            or is_in_breakable_cuda_graph()
++        ):
++            return False
++        return not torch.cuda.is_current_stream_capturing()
++
++    def _get_nonpaged_indexer_plan(
++        self,
++        *,
++        c4_indexer: C4Indexer,
++        forward_batch: ForwardBatch,
++        indexer_metadata: PagedIndexerMetadata,
++        page_table: torch.Tensor,
++        c4_seq_lens: torch.Tensor,
++        query_rows: int,
++    ) -> Optional[NonPagedIndexerPlan]:
++        if query_rows < envs.SGLANG_OPT_DSV4_NONPAGED_INDEXER_MIN_QUERY_TOKENS.get():
++            return None
++        if not self._can_use_nonpaged_indexer(
++            c4_indexer=c4_indexer,
++            forward_batch=forward_batch,
++            indexer_metadata=indexer_metadata,
++        ):
++            return None
++        if indexer_metadata.nonpaged_plan is not None:
++            return indexer_metadata.nonpaged_plan
++
++        if (
++            forward_batch.seq_lens is None
++            or forward_batch.seq_lens_cpu is None
++            or forward_batch.extend_seq_lens_cpu is None
++            or forward_batch.extend_seq_lens is None
++            or forward_batch.extend_start_loc is None
++            or forward_batch.extend_num_tokens is None
++        ):
++            return None
++
++        def to_cpu_int_list(values) -> Optional[List[int]]:
++            if isinstance(values, torch.Tensor):
++                if values.device.type != "cpu":
++                    return None
++                values = values.tolist()
++            return [int(value) for value in values]
++
++        extend_lens_cpu = to_cpu_int_list(forward_batch.extend_seq_lens_cpu)
++        seq_lens_cpu = to_cpu_int_list(forward_batch.seq_lens_cpu)
++        if (
++            extend_lens_cpu is None
++            or seq_lens_cpu is None
++            or len(extend_lens_cpu) != 1
++            or len(seq_lens_cpu) != 1
++            or extend_lens_cpu[0] <= 0
++        ):
++            return None
++
++        actual_queries = extend_lens_cpu[0]
++        if (
++            actual_queries != query_rows
++            or int(forward_batch.extend_num_tokens) != query_rows
++            or forward_batch.seq_lens.numel() != 1
++            or forward_batch.extend_seq_lens.numel() != 1
++            or forward_batch.extend_start_loc.numel() != 1
++            or page_table.dim() != 2
++            or page_table.shape[0] < query_rows
++            or c4_seq_lens.numel() < query_rows
++        ):
++            return None
++
++        final_c4_len = seq_lens_cpu[0] // 4
++        if final_c4_len <= 0:
++            return None
++
++        request_page_table = page_table[:1].contiguous()
++        ke = c4_seq_lens[:query_rows].reshape(-1).to(torch.int32).contiguous()
++        gather_seq_lens = ke[-1:]
++        ks = torch.zeros_like(ke)
++        c4_page_size = indexer_metadata.c4_page_size
++        max_seqlen_k = (final_c4_len + c4_page_size - 1) // c4_page_size * c4_page_size
++        plan = NonPagedIndexerPlan(
++            page_table=request_page_table,
++            gather_seq_lens=gather_seq_lens,
++            ks=ks,
++            ke=ke,
++            seq_len_sum=final_c4_len,
++            max_seq_len=final_c4_len,
++            max_seqlen_k=max_seqlen_k,
++            query_rows=query_rows,
++        )
++        indexer_metadata.nonpaged_plan = plan
++        return plan
++
++    @staticmethod
++    def _forward_nonpaged_indexer(
++        *,
++        q_indexer: torch.Tensor,
++        weights: torch.Tensor,
++        c4_indexer: C4Indexer,
++        token_to_kv_pool: DeepSeekV4TokenToKVPool,
++        plan: NonPagedIndexerPlan,
++    ) -> torch.Tensor:
++        import deep_gemm
++
++        k_u8, scale_u8 = token_to_kv_pool.get_index_k_scale_buffer(
+             layer_id=c4_indexer.layer_id,
++            seq_len_tensor=plan.gather_seq_lens,
++            page_indices=plan.page_table,
++            seq_len_sum=plan.seq_len_sum,
++            max_seq_len=plan.max_seq_len,
++        )
++        k_fp8 = k_u8.view(FP8_DTYPE)
++        k_scale = scale_u8.view(torch.float32).squeeze(-1)
++        return deep_gemm.fp8_mqa_logits(
++            q_indexer[: plan.query_rows],
++            (k_fp8, k_scale),
++            weights[: plan.query_rows],
++            plan.ks,
++            plan.ke,
++            clean_logits=False,
++            max_seqlen_k=plan.max_seqlen_k,
+         )
+-        return q, weights, c4_indexer_kv_cache
+ 
+     def forward_c4_indexer(
+         self,
+@@ -465,35 +633,27 @@ class C4IndexerBackendMixin:
+             positions = positions[:num_queries]
+ 
+         if enable_multi_stream:
+-            q_indexer, weights, c4_indexer_kv_cache = (
+-                self._forward_prepare_multi_stream(
+-                    x=x,
+-                    q_lora=q_lora,
+-                    c4_indexer=c4_indexer,
+-                    positions=positions,
+-                    forward_batch=forward_batch,
+-                    token_to_kv_pool=token_to_kv_pool,
+-                    alt_streams=alt_streams,
+-                    q_lora_ready=q_lora_ready,
+-                )
++            q_indexer, weights = self._forward_prepare_multi_stream(
++                x=x,
++                q_lora=q_lora,
++                c4_indexer=c4_indexer,
++                positions=positions,
++                forward_batch=forward_batch,
++                alt_streams=alt_streams,
++                q_lora_ready=q_lora_ready,
+             )
+         else:
+             assert q_lora_ready is None
+-            q_indexer, weights, c4_indexer_kv_cache = self._forward_prepare_normal(
++            q_indexer, weights = self._forward_prepare_normal(
+                 x=x,
+                 q_lora=q_lora,
+                 c4_indexer=c4_indexer,
+                 positions=positions,
+                 forward_batch=forward_batch,
+-                token_to_kv_pool=token_to_kv_pool,
+                 skip_compressor=skip_compressor,
+             )
+ 
+-        assert len(c4_indexer_kv_cache.shape) == 2
+-        block_kv = 64
+-        num_heads_kv = 1
+         use_fp4_indexer = c4_indexer.use_fp4_indexer
+-        head_dim_with_sf = 68 if use_fp4_indexer else 132
+ 
+         if use_fp4_indexer:
+             q_fp4, q_sf = q_indexer
+@@ -504,9 +664,6 @@ class C4IndexerBackendMixin:
+             assert len(q_indexer.shape) == 3
+             q = q_indexer.unsqueeze(1)
+ 
+-        c4_indexer_kv_cache = c4_indexer_kv_cache.view(
+-            c4_indexer_kv_cache.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+-        )
+         assert len(weights.shape) == 3
+         weights = weights.squeeze(2)
+         if use_fp4_indexer:
+@@ -550,16 +707,42 @@ class C4IndexerBackendMixin:
+         _use_aiter = envs.SGLANG_OPT_USE_AITER_INDEXER.get() and not use_fp4_indexer
+         if _c4sl.dim() == 1 and not _use_tilelang and not _use_aiter:
+             _c4sl = _c4sl.unsqueeze(-1)
+-        logits = fn(
+-            q,
+-            c4_indexer_kv_cache,
+-            weights,
+-            _c4sl,
+-            page_table,
+-            indexer_metadata.deep_gemm_metadata,
+-            indexer_metadata.max_c4_seq_len,
+-            False,
++        nonpaged_plan = self._get_nonpaged_indexer_plan(
++            c4_indexer=c4_indexer,
++            forward_batch=forward_batch,
++            indexer_metadata=indexer_metadata,
++            page_table=page_table,
++            c4_seq_lens=c4_seq_lens,
++            query_rows=query_rows,
+         )
++        if nonpaged_plan is not None:
++            assert isinstance(q_indexer, torch.Tensor)
++            logits = self._forward_nonpaged_indexer(
++                q_indexer=q_indexer,
++                weights=weights,
++                c4_indexer=c4_indexer,
++                token_to_kv_pool=token_to_kv_pool,
++                plan=nonpaged_plan,
++            )
++        else:
++            c4_indexer_kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(
++                layer_id=c4_indexer.layer_id,
++            )
++            assert c4_indexer_kv_cache.dim() == 2
++            head_dim_with_sf = 68 if use_fp4_indexer else 132
++            c4_indexer_kv_cache = c4_indexer_kv_cache.view(
++                c4_indexer_kv_cache.shape[0], 64, 1, head_dim_with_sf
++            )
++            logits = fn(
++                q,
++                c4_indexer_kv_cache,
++                weights,
++                _c4sl,
++                page_table,
++                indexer_metadata.deep_gemm_metadata,
++                indexer_metadata.max_c4_seq_len,
++                False,
++            )
+ 
+         assert indexer_metadata.page_table is core_metadata.page_table
+         if self.debug_use_external_c4_sparse_indices:
+diff --git a/python/sglang/srt/layers/attention/dsv4/metadata.py b/python/sglang/srt/layers/attention/dsv4/metadata.py
+--- a/python/sglang/srt/layers/attention/dsv4/metadata.py
++++ b/python/sglang/srt/layers/attention/dsv4/metadata.py
+@@ -95,13 +95,29 @@ def copy_metadata(
+     ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
+ 
+ 
++@dataclass
++class NonPagedIndexerPlan:
++    page_table: torch.Tensor
++    gather_seq_lens: torch.Tensor
++    ks: torch.Tensor
++    ke: torch.Tensor
++    seq_len_sum: int
++    max_seq_len: int
++    max_seqlen_k: int
++    query_rows: int
++
++
+ @dataclass
+ class PagedIndexerMetadata:
+     page_size: int
+     page_table: torch.Tensor
+     c4_seq_lens: torch.Tensor
++    use_prefill_cuda_graph: bool = False
+     deep_gemm_metadata: Any = field(init=False, repr=False)
+     topk_metadata: torch.Tensor = field(init=False, repr=False)
++    nonpaged_plan: Optional[NonPagedIndexerPlan] = field(
++        init=False, repr=False, default=None
++    )
+ 
+     def __post_init__(self):
+         if (
+@@ -156,18 +172,19 @@ class PagedIndexerMetadata:
+     def copy_(self, other: "PagedIndexerMetadata"):
+         if is_hip():
+             copy_fields = ["page_table", "c4_seq_lens"]
+-            assign_fields = ["deep_gemm_metadata"]
++            assign_fields = ["deep_gemm_metadata", "nonpaged_plan"]
+         else:
+             copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+-            assign_fields = []
++            assign_fields = ["nonpaged_plan"]
+         copy_fields += ["topk_metadata"]
+         copy_metadata(
+             src=other,
+             dst=self,
+-            check_eq_fields=["page_size"],
++            check_eq_fields=["page_size", "use_prefill_cuda_graph"],
+             copy_fields=copy_fields,
+             assign_fields=assign_fields,
+         )
++        self.nonpaged_plan = None
+ 
+ 
+ def maybe_copy_inplace(dst, *, src) -> None:
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -316,12 +316,19 @@ class DeepSeekV4IndexerPool(KVCache):
+     def get_index_k_scale_buffer(
+         self,
+         layer_id: int,
+-        seq_len: int,
++        seq_len_tensor: torch.Tensor,
+         page_indices: torch.Tensor,
++        seq_len_sum: int,
++        max_seq_len: int,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         buf = self.index_k_with_scale_buffer[layer_id]
+         return index_buf_accessor.GetKAndS.execute(
+-            self, buf, seq_len=seq_len, page_indices=page_indices
++            self,
++            buf,
++            page_indices=page_indices,
++            seq_len_tensor=seq_len_tensor,
++            seq_len_sum=seq_len_sum,
++            max_seq_len=max_seq_len,
+         )
+ 
+     def set_index_k_scale_buffer(
+@@ -717,14 +724,20 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+     def get_index_k_scale_buffer(
+         self,
+         layer_id: int,
+-        seq_len: int,
++        seq_len_tensor: torch.Tensor,
+         page_indices: torch.Tensor,
++        seq_len_sum: int,
++        max_seq_len: int,
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+         self.wait_layer_transfer(layer_id)
+         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
+         return self.c4_indexer_kv_pool.get_index_k_scale_buffer(
+-            compress_layer_id, seq_len, page_indices
++            compress_layer_id,
++            seq_len_tensor,
++            page_indices,
++            seq_len_sum,
++            max_seq_len,
+         )
+ 
+     def set_index_k_scale_buffer(

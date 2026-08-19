@@ -30,7 +30,12 @@ def load_arguments_module(monkeypatch):
     monkeypatch.setitem(sys.modules, "transformers", transformers_mod)
 
     module_path = Path(__file__).resolve().parents[1] / "slime" / "backends" / "megatron_utils" / "arguments.py"
-    module_name = "test_megatron_argument_validation_module"
+    # Load under the real package namespace so the module's relative imports
+    # (e.g. ``from .path_bootstrap import ...``) resolve; the megatron stubs
+    # above still take precedence via sys.modules.
+    import slime.backends.megatron_utils  # noqa: F401  (ensure parent package exists)
+
+    module_name = "slime.backends.megatron_utils._arguments_under_test"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
@@ -82,6 +87,28 @@ def make_allgather_cp_args(**overrides):
     return types.SimpleNamespace(**values)
 
 
+def make_default_megatron_args(**overrides):
+    values = dict(
+        optimizer="adam",
+        use_distributed_optimizer=False,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
+        fp16=False,
+        seq_length=None,
+        max_position_embeddings=None,
+        dist_ckpt_save_pre_mcore_014=False,
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=None,
+        tokenizer_model=None,
+        tokenizer_type=None,
+        hf_checkpoint="/tmp/hf",
+    )
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
 @pytest.mark.unit
 def test_hf_validate_all_moe_skips_dense_intermediate_size(monkeypatch):
     module = load_arguments_module(monkeypatch)
@@ -105,6 +132,49 @@ def test_hf_validate_checks_dense_intermediate_size_when_moe_has_dense_layers(mo
 
     with pytest.raises(AssertionError, match="intermediate_size"):
         module._hf_validate_args(args, make_qwen3_6_hf_config())
+
+
+@pytest.mark.unit
+def test_router_topk_comes_from_checkpoint(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=2)
+    hf_config = types.SimpleNamespace(model_type="deepseek_v4", num_experts_per_tok=6)
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 6
+
+
+@pytest.mark.unit
+def test_router_topk_rejects_explicit_checkpoint_conflict(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(model_type="deepseek_v4", num_experts_per_tok=6)
+
+    with pytest.raises(ValueError, match="conflicts with checkpoint metadata"):
+        module._bind_checkpoint_moe_router_topk(args, hf_config, explicit_moe_router_topk=True)
+
+
+@pytest.mark.unit
+def test_non_ds_v4_router_topk_also_comes_from_checkpoint(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(text_config=types.SimpleNamespace(model_type="qwen3_moe", num_experts_per_tok=6))
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 6
+
+
+@pytest.mark.unit
+def test_router_topk_ignores_checkpoint_without_topk_metadata(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(moe_router_topk=8)
+    hf_config = types.SimpleNamespace(model_type="dense")
+
+    module._bind_checkpoint_moe_router_topk(args, hf_config)
+
+    assert args.moe_router_topk == 8
 
 
 @pytest.mark.unit
@@ -137,6 +207,37 @@ def test_allgather_cp_ignores_cp_size_one(monkeypatch):
     args = make_allgather_cp_args(context_parallel_size=1)
 
     module._validate_allgather_cp_supported(args)
+
+
+@pytest.mark.unit
+def test_default_args_keep_distributed_optimizer_for_adam(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_default_megatron_args(optimizer="adam")
+
+    module._set_default_megatron_args(args)
+
+    assert args.use_distributed_optimizer is True
+    assert args.bf16 is True
+
+
+@pytest.mark.unit
+def test_default_args_disable_distributed_optimizer_for_muon(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = make_default_megatron_args(
+        optimizer="muon",
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=True,
+        overlap_param_gather=True,
+        overlap_param_gather_with_optimizer_step=True,
+    )
+
+    module._set_default_megatron_args(args)
+
+    assert args.use_distributed_optimizer is False
+    assert args.overlap_grad_reduce is False
+    assert args.overlap_param_gather is False
+    assert args.overlap_param_gather_with_optimizer_step is False
+    assert args.bf16 is True
 
 
 if __name__ == "__main__":

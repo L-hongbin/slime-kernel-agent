@@ -1,6 +1,9 @@
+import os
+
 CUDA_AGENT_CONFIGS = {
     "max_feedback_chars": 0,
     "log_multi_turn_sample_rate": 0.01,
+    "log_multi_turn_full_text": False,
     "log_slowest_step_window": 10,
     "log_slowest_min_delta_seconds": 5.0,
     "slowest_tracker_timeout": 2.0,
@@ -18,11 +21,16 @@ CUDA_AGENT_CONFIGS = {
         "kernel_eval_client_timeout": 2400,
         "kernel_eval_poll_interval": 1.0,
         "kernel_eval_heartbeat_interval": 60.0,
-        "kernel_eval_worker_max_concurrency": 32,
-        "kernel_eval_rate_limit": 32,
+        # Eval jobs can lower these independently when sharing the KernelGym
+        # backend pool with training. Training keeps the historical default 32.
+        "kernel_eval_worker_max_concurrency": int(os.environ.get("KERNEL_EVAL_WORKER_MAX_CONCURRENCY", "32")),
+        "kernel_eval_rate_limit": int(os.environ.get("KERNEL_EVAL_RATE_LIMIT", "32")),
+        "kernel_eval_priority": os.environ.get("KERNEL_EVAL_PRIORITY", "normal"),
         "kernel_eval_acquire_timeout": 2400,
         "num_correct_trials": 5,
-        "num_perf_trials": 100,
+        # 2026-07-11 (user direction): 30 warmup + 50 timed trials (was 3+100).
+        "num_perf_trials": 50,
+        "num_warmup": 30,
         "verbose_errors": True,
         "enable_profiling": True,
         "detect_decoy_kernel": True,

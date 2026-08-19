@@ -1,0 +1,120 @@
+diff --git a/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh b/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
+--- a/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
++++ b/python/sglang/jit_kernel/csrc/deepseek_v4/c_plan.cuh
+@@ -463,6 +463,7 @@ inline PrefillPlan plan_compress_prefill(
+     const int32_t compress_ratio,
+     const int32_t swa_page_size,
+     const int32_t ring_size,
++    const int32_t verify_width,
+     const bool use_cuda_graph) {
+   auto B = SymbolicSize{"batch_size"};
+   auto N = SymbolicSize{"num_q_tokens"};
+@@ -508,12 +509,15 @@ inline PrefillPlan plan_compress_prefill(
+   RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+   // `swa_page_size` >= `ring_size` >= `compress_ratio`
+   RuntimeCheck(swa_page_size % ring_size == 0 && ring_size % compress_ratio == 0);
++  RuntimeCheck(0 <= verify_width && verify_width <= ring_size - compress_ratio);
+ 
+   const auto device = device_.unwrap();
+   const auto stream = LaunchKernel::resolve_device(device);
+ 
+   constexpr int32_t kMaxMTPDraftTokens = 4;
+-  const auto mtp_pad = std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
++  const auto mtp_pad = verify_width > 0
++                           ? verify_width
++                           : std::min(ring_size - compress_ratio, kMaxMTPDraftTokens);
+ 
+   if (cpu_or_gpu.unwrap().device_type == kDLGPU) {
+     // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
+@@ -574,7 +578,9 @@ inline PrefillPlan plan_compress_prefill(
+     const int32_t extend_len = ext_ptr[i];
+     const int32_t prefix_len = seq_len - extend_len;
+     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
+-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
++    const int32_t default_first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
++    const int32_t first_w_pos =
++        verify_width > 0 ? std::min(default_first_w_pos, seq_len - verify_width) : default_first_w_pos;
+     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+     const auto should_write = [=](int32_t position) {
+       if (position >= first_w_pos) return true;
+diff --git a/python/sglang/jit_kernel/dsv4/compress.py b/python/sglang/jit_kernel/dsv4/compress.py
+--- a/python/sglang/jit_kernel/dsv4/compress.py
++++ b/python/sglang/jit_kernel/dsv4/compress.py
+@@ -208,6 +208,7 @@ class CompressorPrefillPlan(NamedTuple):
+         ring_size: int,
+         num_q_tokens: int,
+         use_cuda_graph: bool = False,
++        verify_width: int = 0,
+     ) -> CompressorPrefillPlan:
+         is_gpu_input = seq_lens.device.type == "cuda"
+         pin_buffer = torch.empty(
+@@ -227,6 +228,7 @@ class CompressorPrefillPlan(NamedTuple):
+             int(compress_ratio),
+             int(swa_page_size),
+             int(ring_size),
++            int(verify_width),
+             bool(use_cuda_graph),
+         )
+         return CompressorPrefillPlan(
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -812,6 +812,7 @@ class DeepseekV4AttnBackend(AttentionBackend):
+         use_prefill_cuda_graph: bool = False,
+         online_c128_state_slot_offset: int = 0,
+         dspark_block_size: Optional[int] = None,
++        verify_width: int = 0,
+     ) -> DSV4Metadata:
+         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
+             num_tokens=num_tokens,
+@@ -863,6 +864,7 @@ class DeepseekV4AttnBackend(AttentionBackend):
+                         use_prefill_cuda_graph=True,
+                         num_q_tokens=out_cache_loc.shape[0],
+                         online_state_slot_offset=online_c128_state_slot_offset,
++                        verify_width=verify_width,
+                     )
+                 return create_paged_compressor_data(
+                     compress_ratio=compress_ratio,
+@@ -876,6 +878,7 @@ class DeepseekV4AttnBackend(AttentionBackend):
+                     extend_lens_cpu=extend_seq_lens_cpu,
+                     use_prefill_cuda_graph=use_graph_plan,
+                     online_state_slot_offset=online_c128_state_slot_offset,
++                    verify_width=verify_width,
+                 )
+ 
+         c4_compress_metadata = create(compress_ratio=4)
+@@ -1008,6 +1011,7 @@ class DeepseekV4AttnBackend(AttentionBackend):
+             need_compress=True,
+             use_prefill_cuda_graph=use_prefill_cuda_graph,
+             online_c128_state_slot_offset=online_c128_state_slot_offset,
++            verify_width=self.speculative_num_draft_tokens,
+         )
+ 
+     def init_forward_metadata_dspark_draft_block(
+@@ -1105,6 +1109,7 @@ class DeepseekV4AttnBackend(AttentionBackend):
+             use_prefill_cuda_graph=True,
+             num_q_tokens=num_q_tokens,
+             online_state_slot_offset=online_c128_state_slot_offset,
++            verify_width=self.speculative_num_draft_tokens,
+         )
+         c128_compress_metadata = raw_metadata.c128_compress_metadata
+         if c128_compress_metadata is None:
+diff --git a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+--- a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
++++ b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+@@ -741,6 +741,7 @@ def create_paged_compressor_data(
+     use_prefill_cuda_graph: bool = False,
+     num_q_tokens: Optional[int] = None,
+     online_state_slot_offset: int = 0,
++    verify_width: int = 0,
+ ) -> CompressMetadata:
+     """Build the paged compress metadata (= the plan).
+ 
+@@ -792,6 +793,7 @@ def create_paged_compressor_data(
+             ring_size=ring_size,
+             num_q_tokens=num_q_tokens,
+             use_cuda_graph=use_prefill_cuda_graph,
++            verify_width=verify_width,
+         )
+     else:
+         return CompressorDecodePlan.generate(

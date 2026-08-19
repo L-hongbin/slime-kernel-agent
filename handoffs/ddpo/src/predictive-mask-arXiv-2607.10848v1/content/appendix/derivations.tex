@@ -1,0 +1,311 @@
+\clearpage
+\section{Derivation of the Directional Derivative}
+\label{app:derivations}
+
+This appendix proves Proposition~\ref{prop:dir-deriv}.
+The derivation is written for a generic softmax support.
+It applies to the full vocabulary, and also to the reduced support used by the
+top-$K$ construction when the tail is represented as an aggregate bucket.
+
+\subsection{Softmax sensitivity}
+
+We first record the first-order sensitivity of a softmax policy to a logit
+perturbation, which underlies the entire derivation.
+
+\begin{lemma}[Softmax logit sensitivity]
+\label{lem:softmax-sensitivity}
+Let $\tpi_i=e^{z_i}/\sum_j e^{z_j}$ be a softmax distribution with logits $z_i$, and let
+$\tpi_{\eta}$ denote the distribution obtained by perturbing the logits along a fixed
+direction $\bm v=(v_i)$, that is, $z_i(\eta)=z_i+\eta\,v_i$. Then
+\begin{equation}
+\label{eq:app-logderiv}
+\frac{d}{d\eta}\log\tpi_{\eta,i}\Big|_{\eta=0}
+= v_i - \sum_j \tpi_j v_j.
+\end{equation}
+\end{lemma}
+
+\begin{proof}
+By definition,
+\begin{equation}
+\log\tpi_{\eta,i}
+= z_i+\eta v_i-\log\sum_j \exp(z_j+\eta v_j).
+\end{equation}
+Differentiating with respect to $\eta$ gives
+\begin{equation}
+\frac{d}{d\eta}\log\tpi_{\eta,i}
+= v_i -
+\frac{\sum_j v_j\exp(z_j+\eta v_j)}
+{\sum_j \exp(z_j+\eta v_j)}.
+\end{equation}
+At $\eta=0$, the fraction is $\sum_j\tpi_j v_j$.
+Thus,
+\begin{equation}
+\frac{d}{d\eta}\log\tpi_{\eta,i}\Big|_{\eta=0}
+= v_i-\sum_j\tpi_j v_j .
+\end{equation}
+\end{proof}
+
+
+\subsection{Directional derivative of the divergence}
+
+\begin{proof}[Proof of Proposition~\ref{prop:dir-deriv}]
+The proposition uses the unit logit direction induced by a policy-gradient step.
+For the per-token surrogate $r\,\Adv$, the logit gradient is $\Adv\,r\,\nabla_z\log\tpi_k$, where
+\begin{equation}
+\nabla_{z_i}\log\tpi_k=\1[i=k]-\tpi_i .
+\end{equation}
+The scalar $r$ is positive, so the sign of the realized step is determined by
+$\Adv$.
+We therefore compute the derivative along the unit direction
+\begin{equation}
+\label{eq:app-v}
+v_i = \1[i=k]-\tpi_i .
+\end{equation}
+Its average under the current policy is
+\begin{equation}
+\sum_j \tpi_j v_j
+= \sum_j \tpi_j\big(\1[j=k]-\tpi_j\big)
+= \tpi_k - \sum_j \tpi_j^2 .
+\end{equation}
+
+Now write the forward KL as
+\begin{equation}
+\KL(\bmu\|\tpi_\eta)
+=
+\sum_i \bmu_i\log\bmu_i
+-
+\sum_i \bmu_i\log\tpi_{\eta,i} .
+\end{equation}
+The first term is independent of $\eta$.
+Applying Lemma~\ref{lem:softmax-sensitivity} to the second term gives
+\begin{align}
+\Taylor
+&= -\sum_i \bmu_i\,
+\frac{d}{d\eta}\log\tpi_{\eta,i}\Big|_{\eta=0}
+\nonumber\\
+&= -\sum_i \bmu_i\Big(v_i-\sum_j\tpi_j v_j\Big)
+\nonumber\\
+&= -\sum_i \bmu_i v_i
++ \Big(\sum_i\bmu_i\Big)\Big(\sum_j\tpi_j v_j\Big)
+\nonumber\\
+&= -\sum_i \bmu_i v_i + \sum_j\tpi_j v_j,
+\label{eq:app-step}
+\end{align}
+where the last equality uses $\sum_i\bmu_i=1$.
+
+The two terms in Eq.~(\ref{eq:app-step}) are
+\begin{equation}
+\sum_i \bmu_i v_i
+= \sum_i \bmu_i\big(\1[i=k]-\tpi_i\big)
+= \bmu_k-\sum_i\bmu_i\tpi_i,
+\end{equation}
+and
+\begin{equation}
+\sum_j\tpi_j v_j
+= \tpi_k-\sum_j\tpi_j^2 .
+\end{equation}
+Substituting them into Eq.~(\ref{eq:app-step}) yields
+\begin{align}
+\Taylor
+&= -\Big(\bmu_k-\sum_i\bmu_i\tpi_i\Big)
++ \Big(\tpi_k-\sum_j\tpi_j^2\Big)
+\nonumber\\
+&= (\tpi_k-\bmu_k)
++ \sum_i\tpi_i(\bmu_i-\tpi_i),
+\label{eq:app-result}
+\end{align}
+which is Eq.~(\ref{eq:taylor-coeff}).
+This completes the proof.
+\end{proof}
+
+\section{Equivalence under Binary-KL Approximation}
+\label{app:binary-kl-equivalence}
+
+DPPO also considers a binary KL approximation that collapses the vocabulary into
+the sampled token and its complement. In this special case, the predictive
+direction with the aggregated-tail estimator reduces exactly to the ratio-based
+direction criterion.
+
+Let the binary support contain the sampled token $k$ and a tail bucket. The two
+policies are
+\begin{equation}
+\bmu^{\mathrm{bin}}=(\bmu_k, 1-\bmu_k),
+\qquad
+\tpi^{\mathrm{bin}}=(\tpi_k, 1-\tpi_k).
+\end{equation}
+The binary KL proximity criterion is
+\begin{equation}
+\KL\big(\bmu^{\mathrm{bin}}\|\tpi^{\mathrm{bin}}\big)
+=
+\bmu_k\log\frac{\bmu_k}{\tpi_k}
++
+(1-\bmu_k)\log\frac{1-\bmu_k}{1-\tpi_k}.
+\end{equation}
+Applying Eq.~(\ref{eq:taylor-coeff}) to this two-atom support gives
+\begin{align}
+\Taylor^{\mathrm{bin}}
+&= (\tpi_k-\bmu_k)
++ \tpi_k(\bmu_k-\tpi_k)
++ (1-\tpi_k)\big((1-\bmu_k)-(1-\tpi_k)\big)
+\nonumber\\
+&= (\tpi_k-\bmu_k)
+- \tpi_k(\tpi_k-\bmu_k)
++ (1-\tpi_k)(\tpi_k-\bmu_k)
+\nonumber\\
+&= 2(1-\tpi_k)(\tpi_k-\bmu_k).
+\label{eq:binary-kl-taylor}
+\end{align}
+For nondegenerate softmax probabilities, $0<\tpi_k<1$ and $\bmu_k>0$.
+Therefore
+\begin{equation}
+\sign\big(\Taylor^{\mathrm{bin}}\big)
+=
+\sign(\tpi_k-\bmu_k)
+=
+\sign(r-1),
+\end{equation}
+where $r=\tpi_k/\bmu_k$.
+It follows that
+\begin{equation}
+\sign\big(\Adv\,\Taylor^{\mathrm{bin}}\big)
+=
+\sign\big(\Adv\,(r-1)\big).
+\end{equation}
+
+Thus, if the proximity criterion is also the same binary KL, the predictive mask
+with the aggregated-tail estimator is identical to DPPO-Binary-KL. This is a
+degenerate case in which the binary approximation removes the distributional
+degrees of freedom that the divergence-based direction criterion is designed to
+use. The top-$K$ KL setting retains additional tokens, so the global correction
+can differ from the sampled-token ratio direction.
+
+
+\section{Predictive Divergence Masks under TV Divergence}
+\label{app:topk-tv-predictive}
+
+The paper focuses on top-$K$ forward KL because it matches the primary baseline
+DPPO-TopK-KL.
+DPPO can also use total variation as the proximity criterion.
+This section derives the corresponding divergence-based direction criterion for TV using the same
+first-order principle as in the KL case.
+For a generic support, define
+\begin{equation}
+D_{\mathrm{TV}}(\bmu,\tpi)
+=
+\frac12\sum_i|\bmu_i-\tpi_i|.
+\end{equation}
+The divergence is not differentiable when a probability gap is exactly zero.
+We use the usual subgradient convention $\sign(0)=0$.
+On any fixed support, Lemma~\ref{lem:softmax-sensitivity} gives the
+directional derivative of TV along the unit policy-gradient direction:
+\begin{equation}
+\label{eq:tv-generic-deriv}
+\Taylor_{\mathrm{TV}}
+=
+-\frac12\sum_i s_i\,\tpi_i\Big(v_i-\sum_j\tpi_jv_j\Big),
+\quad\text{where}\quad
+s_i=\sign(\bmu_i-\tpi_i).
+\end{equation}
+The only difference from the KL case is the factor
+$s_i=\sign(\bmu_i-\tpi_i)$, which comes from differentiating the absolute value
+in TV.
+
+\noindent\textbf{Aggregated-tail estimator.}
+Under the top-$K$ aggregated-tail construction, the support contains the retained
+tokens $\Keep$ and one tail bucket.
+This treats the unseen tail as a single coordinate when computing both the TV
+proximity and the softmax coupling term.
+The top-$K$ TV proximity criterion is as follows:
+\begin{equation}
+D_{\mathrm{TV}}^{\mathrm{TopK}}(\bmu,\tpi)
+=
+\frac12\sum_{i\in\Keep}|\bmu_i-\tpi_i|
++
+\frac12|\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}}|.
+\end{equation}
+For the tail bucket, define
+\begin{equation}
+ s_{\mathrm{tail}}
+ =\sign(\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}}).
+\end{equation}
+On this reduced support,
+\begin{equation}
+ c_{\mathrm{agg}}
+ =\sum_j\tpi_jv_j
+ =\tpi_k-
+ \sum_{i\in\Keep}\tpi_i^2
+ -\tpi_{\mathrm{tail}}^2 .
+\end{equation}
+Substituting into Eq.~(\ref{eq:tv-generic-deriv}) gives
+\begin{equation}
+\label{eq:tv-agg-tail}
+\Taylor_{\mathrm{TV}}^{\mathrm{agg}}
+=
+-\frac12
+\left[
+\sum_{i\in\Keep}
+ s_i\tpi_i\big(\1[i=k]-\tpi_i-c_{\mathrm{agg}}\big)
++
+ s_{\mathrm{tail}}\tpi_{\mathrm{tail}}
+ \big(-\tpi_{\mathrm{tail}}-c_{\mathrm{agg}}\big)
+\right].
+\end{equation}
+
+\noindent\textbf{Uniform-tail estimator.}
+Under the top-$K$ uniform-tail construction, the residual mass is spread over the
+$n-m$ unseen tokens, where $m=|\Keep|$ and $n$ is the vocabulary size.
+This keeps the observed head terms unchanged but models the unseen tail as many
+small coordinates rather than one aggregate coordinate:
+\begin{equation}
+\tpi_j\approx\frac{\tpi_{\mathrm{tail}}}{n-m},
+\qquad
+\bmu_j\approx\frac{\bmu_{\mathrm{tail}}}{n-m},
+\qquad j\notin\Keep.
+\end{equation}
+The softmax coupling term becomes
+\begin{equation}
+ c_{\mathrm{uni}}
+ =\tpi_k-
+ \sum_{i\in\Keep}\tpi_i^2
+ -\frac{\tpi_{\mathrm{tail}}^2}{n-m}.
+\end{equation}
+The tail contribution in Eq.~(\ref{eq:tv-generic-deriv}) then sums to
+\begin{equation}
+ s_{\mathrm{tail}}
+ \left(
+ -\frac{\tpi_{\mathrm{tail}}^2}{n-m}
+ -c_{\mathrm{uni}}\tpi_{\mathrm{tail}}
+ \right).
+\end{equation}
+Thus
+\begin{equation}
+\label{eq:tv-uni-tail}
+\Taylor_{\mathrm{TV}}^{\mathrm{uni}}
+=
+-\frac12
+\left[
+\sum_{i\in\Keep}
+ s_i\tpi_i\big(\1[i=k]-\tpi_i-c_{\mathrm{uni}}\big)
++
+ s_{\mathrm{tail}}
+ \left(
+ -\frac{\tpi_{\mathrm{tail}}^2}{n-m}
+ -c_{\mathrm{uni}}\tpi_{\mathrm{tail}}
+ \right)
+\right].
+\end{equation}
+
+The masking rule is unchanged.
+Only the proximity measure and the divergence-based direction coefficient are replaced
+by their TV counterparts.
+With either estimator, the corresponding predictive TV mask is as follows:
+\begin{equation}
+M_t^{\mathrm{pred}} =
+\begin{cases}
+0, & \sign\big(\Adv_t\,\Taylor_{\mathrm{TV},t}\big)>0
+\ \text{ and }\ D_{\mathrm{TV},t}^{\mathrm{TopK}}>\delta,\\[2pt]
+1, & \text{otherwise.}
+\end{cases}
+\end{equation}
+Since the paper focuses on DPPO-TopK-KL, this TV form is included as the
+corresponding extension for a TV proximity criterion.

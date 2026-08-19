@@ -1,0 +1,242 @@
+\section{Methodology}
+\label{sec:method}
+
+The divergence mask of Eq.~(\ref{eq:dppo}) upgrades the trust-region
+\emph{proximity} criterion from a sampled-ratio proxy to a distributional
+divergence, but leaves the
+\emph{direction} criterion $\sign(\Adv_t(r_t-1))$ untouched. This section makes the
+direction criterion consistent with the divergence-based proximity criterion. The
+principle is to ask whether the next gradient step would actually increase the
+divergence (\S\ref{sec:method-principle}).
+We answer it with the divergence's own directional derivative, which we derive in
+closed form (\S\ref{sec:method-derivation})
+and then recover from the truncated top-$K$ statistics a rollout reports
+(\S\ref{sec:method-estimators}). The result is a drop-in replacement for the direction
+criterion, together with an analysis of when it agrees with the ratio-based one and when
+it does not (\S\ref{sec:method-mask}).
+
+\subsection{From ``will the ratio move away from one?'' to ``will the divergence grow?''}
+\label{sec:method-principle}
+
+The direction criterion determines whether keeping a token update would drive
+the policy \emph{further} outside the trust region.
+Under a ratio-based trust region, this question is about $|r_t-1|$.
+The criterion $\sign(\Adv_t(r_t-1))$ answers it exactly because it is computed from the same ratio that defines the trust region.
+Its sign therefore reports whether the update increases $|r_t-1|$.
+Under a divergence-based trust region, the proximity criterion is instead defined by $\Dtok_t$, which aggregates the gap between the two policies over the entire vocabulary, while $\sign(\Adv_t(r_t-1))$ still looks only at the single sampled token. 
+Its sign can therefore disagree with the sign of the actual change in $\Dtok_t$, 
+so the ratio-based direction criterion no longer reliably indicates whether the update drives the policy further outside the trust region.
+
+We therefore define the direction criterion directly in terms of $\Dtok_t$.
+It asks whether the next gradient step increases $\Dtok_t$.
+Let $\tpi_\eta$ denote the training policy after moving its logits along the
+surrogate gradient by an effective step $\eta\ge0$.
+Expanding the divergence along this step,
+\begin{equation}
+\label{eq:taylor-def}
+\Dtok_t(\tpi_\eta) \;=\; \Dtok_t \;+\; \eta\cdot \frac{d}{d\eta}\Dtok_t(\tpi_\eta)\Big|_{\eta=0} \;+\; O(\eta^2),
+\end{equation}
+the sign of the first-order term determines the local trend of $\Dtok_t$.
+A positive sign means the update increases $\Dtok_t$, and a negative sign means
+it decreases $\Dtok_t$.
+A token already outside the trust region should therefore be blocked when this
+term is positive, since the update would push $\Dtok_t$ still higher, and kept
+when it is negative, since the update would pull $\Dtok_t$ back down.
+We replace the ratio-based direction criterion with the sign of this first-order
+change, the divergence's own response to the update rather than a single-sample
+proxy for it.
+
+\subsection{The directional derivative of the divergence}
+\label{sec:method-derivation}
+
+We work at a single token and drop the index $t$ for brevity. Let
+$\tpi_i = e^{z_i}/\sum_j e^{z_j}$ be the training policy over the vocabulary,
+with logits $z_i$, and let $k$ be the sampled action (the token $y_t$ of the
+underlying step). The per-token surrogate
+objective $r\,\Adv$ has gradient $\Adv\,r\,\nabla_z\log\tpi_k$ with respect to the
+logits, where $\nabla_{z_i}\log\tpi_k=\1[i=k]-\tpi_i$. A single gradient step therefore moves the
+logits along the direction $\1[i=k]-\tpi_i$, scaled by $\Adv\,r$.
+Since $r>0$, the \emph{sign} of the step is $\sign(\Adv)$.
+We compute the directional derivative for a
+unit step in $\bm{v}_i=\1[i=k]-\tpi_i$ and recombine the advantage sign afterwards.
+
+\begin{proposition}[Directional derivative of $\KL(\bmu\,\|\,\tpi)$ along a policy-gradient step]
+\label{prop:dir-deriv}
+Let $\tpi_\eta$ be the softmax policy whose logits are $z_i+\eta\,(\1[i=k]-\tpi_i)$.
+Then
+\begin{equation}
+\label{eq:taylor-coeff}
+\Taylor \;\equiv\; \frac{d}{d\eta}\,\KL(\bmu\,\|\,\tpi_\eta)\Big|_{\eta=0}
+\;=\; (\tpi_k-\bmu_k) \;+\; \sum_i \tpi_i\,(\bmu_i-\tpi_i).
+\end{equation}
+\end{proposition}
+
+We denote this directional derivative $\Taylor$ throughout and defer its derivation to
+Appendix~\ref{app:derivations}.
+
+\noindent\textbf{What the ratio-based direction criterion misses.}
+The coefficient $\Taylor$ decomposes into two terms with distinct scope,
+\begin{equation}
+\label{eq:decomp}
+\Taylor \;=\; \underbrace{(\tpi_k-\bmu_k)}_{\text{local: sampled token } k}
+\;+\; \underbrace{\sum_i \tpi_i(\bmu_i-\tpi_i)}_{\text{global: normalization coupling}},
+\end{equation}
+and the split is exactly the boundary between what a single sample observes and what
+it cannot. The local term is the probability gap at the sampled token. Since
+$r-1=(\tpi_k-\bmu_k)/\bmu_k$ with $\bmu_k>0$,
+\begin{equation}
+\label{eq:local-is-ratio}
+\sign(\tpi_k-\bmu_k)=\sign(r-1),
+\end{equation}
+so the ratio-based direction criterion is precisely the sign of the local term.
+The decomposition shows exactly what this criterion misses.
+Changing the sampled probability necessarily changes the rest of the distribution
+through the softmax normalizer, creating the global term $\E_{i\sim\tpi}[\bmu_i-\tpi_i]$ that no
+single sampled ratio can reveal.
+The ratio-based direction criterion is therefore equivalent to using only the
+local term and ignoring this coupling.
+The divergence-based criterion keeps both terms, which is why its sign can track
+the true change in $\Dtok_t$ where the ratio sign cannot.
+
+\begin{remark}[Step-size independence]
+\label{rem:step-size}
+The actual logit step scales the unit direction $\bm v$ by $\eta\,\Adv\,r$,
+where $\eta>0$ is the effective step size and $r>0$ is the importance ratio.
+Thus the first-order change of the divergence has sign
+$\sign(\Adv\cdot\Taylor)$.
+The mask only needs this sign.
+It does not need to estimate $\eta$ or the magnitude of $r$.
+By contrast, predicting the post-update value $\Dtok_t(\tpi_\eta)$ would require
+those quantities and the higher-order $O(\eta^2)$ terms.
+The sign prediction is reliable when the first-order term dominates the
+higher-order remainder.
+\end{remark}
+
+\subsection{Estimating the directional derivative under a truncated vocabulary}
+\label{sec:method-estimators}
+
+Computing $\Taylor$ exactly would require the full vocabulary distribution, whereas a
+production rollout stores only the top-$K$ probabilities and the leftover tail mass.
+The shortfall is minor, because the sampled token and the retained top-$K$ entries are
+observed directly and the only missing ingredient is the contribution of the unseen
+tail. Estimating $\Taylor$ therefore reduces to modeling that tail, and we
+consider two estimators that differ only in how they do so.
+
+\noindent\textbf{Aggregated-tail estimator.}
+The simplest choice mirrors the bucketing already used by the top-$K$ divergence in
+Eq.~(\ref{eq:topk-kl}) and collapses the entire tail into one aggregated token of mass
+$\tpi_{\mathrm{tail}}$ (resp.\ $\bmu_{\mathrm{tail}}$). The coefficient
+becomes
+\begin{equation}
+\label{eq:agg-tail}
+\Taylor^{\mathrm{agg}}=(\tpi_k-\bmu_k)
++\sum_{i\in\Keep}\tpi_i(\bmu_i-\tpi_i)
++\tpi_{\mathrm{tail}}\big(\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}}\big).
+\end{equation}
+This single-bucket approximation can overestimate the tail contribution by
+concentrating all residual mass on one aggregate token.
+
+\noindent\textbf{Uniform-tail estimator.}
+A more faithful model spreads the residual mass evenly over the $n-m$ unseen
+tokens, taking $\tpi_j\approx\tpi_{\mathrm{tail}}/(n-m)$ and
+$\bmu_j\approx\bmu_{\mathrm{tail}}/(n-m)$
+for $j\notin\Keep$ (with $m=|\Keep|$ and $n$ the vocabulary size). Substituting into
+the tail sums gives
+\begin{equation}
+\label{eq:uni-tail}
+\Taylor^{\mathrm{uni}}=(\tpi_k-\bmu_k)
++\sum_{i\in\Keep}\tpi_i(\bmu_i-\tpi_i)
++\frac{\tpi_{\mathrm{tail}}\big(\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}}\big)}{n-m},
+\end{equation}
+the same tail term as Eq.~(\ref{eq:agg-tail}) but suppressed by $1/(n-m)$. Since the
+vocabulary is large this term is negligible, in contrast to the exaggerated estimate of
+the single-bucket model.
+
+\noindent\textbf{The gap between the two estimators.}
+Since the two estimators share all retained-token terms and differ only in their
+tail contribution, their difference is
+\begin{equation}
+\label{eq:tail-gap}
+\Taylor^{\mathrm{agg}}-\Taylor^{\mathrm{uni}}
+=\Big(1-\tfrac{1}{n-m}\Big)\,\tpi_{\mathrm{tail}}\,(\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}})
+\;\approx\; \tpi_{\mathrm{tail}}\,(\bmu_{\mathrm{tail}}-\tpi_{\mathrm{tail}}),
+\end{equation}
+where the approximation uses $n-m\gg1$.
+In LLMs, the vocabulary size $n$ is typically on the order of $10^5$, while
+$m=|\Keep|$ is typically at most $20$.
+Thus the gap is small whenever the retained top-$K$ tokens capture most of the
+probability mass.
+In this regime, the aggregated-tail and uniform-tail masks should behave nearly
+identically.
+
+Both estimators are computationally lightweight. Each reads only the top-$K$
+probabilities and tail masses already returned by the rollout, requiring no
+additional forward or backward pass and no finite-difference evaluation.
+Appendix~\ref{app:binary-kl-equivalence} shows that, under DPPO's binary KL
+approximation, the aggregated-tail divergence-based direction criterion reduces exactly to the
+ratio-based direction criterion.
+Appendix~\ref{app:topk-tv-predictive} gives the analogous divergence-based direction criterion
+when the proximity criterion is top-$K$ TV.
+
+\subsection{Policy optimization with the predictive divergence mask}
+\label{sec:method-mask}
+
+Replacing the ratio-based direction criterion in Eq.~(\ref{eq:dppo}) with the
+divergence-based direction criterion built from the directional derivative $\Taylor_t$ gives
+the \emph{predictive divergence mask}:
+\begin{equation}
+\label{eq:predictive-mask}
+M_t^{\mathrm{pred}} =
+\begin{cases}
+0, & \sign\big(\Adv_t\cdot\Taylor_t\big)>0 \;\text{ and }\; \Dtok_t>\delta,\\[2pt]
+1, & \text{otherwise,}
+\end{cases}
+\end{equation}
+where $\Dtok_t=\KLtopk(\bmu\,\|\,\tpi)$ and $\Taylor_t$ is the directional derivative of
+Eq.~(\ref{eq:taylor-coeff}) (estimated by either the aggregated-tail or uniform-tail form). The mask reuses only
+quantities already on hand during training, namely $\Adv_t$, the top-$K$ probabilities,
+and the divergence, and introduces no new hyperparameter beyond the existing
+threshold $\delta$. The resulting objective is the masked policy gradient
+\begin{equation}
+\label{eq:predictive-obj}
+\nabla_\theta L^{\mathrm{pred}}(\tpi)
+= \E_{y\sim\bmu}\!\left[\sum_{t=1}^{|y|}
+M_t^{\mathrm{pred}}\; r_t\,\Adv_t\;\nabla_\theta\log\tpi(y_t\mid s_t)\right],
+\end{equation}
+which is identical to the DPPO-TopK-KL update of Eq.~(\ref{eq:dppo}) except that its direction criterion follows the divergence's first-order change instead of the sampled ratio.
+
+\begin{remark}[Local nature of the prediction]
+The predictive mask is a token-level first-order approximation.
+It estimates whether one token's gradient contribution would locally increase or
+decrease that token's divergence.
+The actual parameter update aggregates gradients from all tokens in the batch, so
+the realized divergence change at one token can also be affected by other tokens'
+updates.
+Thus the predicted sign should be viewed as a local estimate of the divergence
+trend, not an exact prediction of the post-update divergence.
+\end{remark}
+
+\noindent\textbf{Agreement and disagreement of the two criteria.}
+The decomposition in Eq.~(\ref{eq:decomp}) can also be read as centering the
+sampled-token gap by the policy-weighted average gap:
+\[
+\Taylor
+=
+(\tpi_k-\bmu_k)-\E_{i\sim\tpi}[\tpi_i-\bmu_i].
+\]
+Thus the global term changes the mask decision only if this centering crosses
+zero.
+Equivalently, disagreement occurs only when the current-policy average gap lies
+farther from zero in the same direction as the sampled-token gap:
+\begin{equation}
+\label{eq:recovery}
+0<\tpi_k-\bmu_k<\E_{i\sim\tpi}[\tpi_i-\bmu_i]
+\quad\text{or}\quad
+0>\tpi_k-\bmu_k>\E_{i\sim\tpi}[\tpi_i-\bmu_i].
+\end{equation}
+Together with the proximity condition $\Dtok_t>\delta$, these are precisely the
+tokens on which the predictive mask differs from the ratio-based mask.
+They are also the cases where a single-sample ratio is least informative: the
+sampled-token gap points in one direction, but the distribution-wide correction
+reverses the predicted change in divergence.
+Otherwise, the centered gap keeps the local sign, and the two masks agree.

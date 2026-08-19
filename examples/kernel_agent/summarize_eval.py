@@ -70,6 +70,17 @@ def _metadata(sample: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
+def _partition_by_metadata(samples: list[dict], key: str) -> dict[str, list[dict]]:
+    """Partition samples by one metadata value using stable string labels."""
+
+    groups: dict[str, list[dict]] = {}
+    for sample in samples:
+        value = _metadata(sample).get(key)
+        label = "<missing>" if value is None else str(value)
+        groups.setdefault(label, []).append(sample)
+    return groups
+
+
 def _env_extra_info(sample: dict) -> dict | None:
     meta = _metadata(sample)
     env_extra_info = meta.get("env_extra_info")
@@ -178,6 +189,7 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
     overall = _empty_counts(fast_thresholds)
     by_turn = {turn_count: _empty_counts(fast_thresholds) for turn_count in range(1, max_turns + 1)}
     by_turn_present = {turn_count: 0 for turn_count in range(1, max_turns + 1)}
+    best_by_turn = {turn_count: _empty_counts(fast_thresholds) for turn_count in range(1, max_turns + 1)}
     missing = 0
 
     for trajectory_samples in trajectories.values():
@@ -205,6 +217,8 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             if this_turn:
                 by_turn_present[turn_count] += 1
                 _add_best_counts(counts, this_turn, fast_thresholds)
+            cumulative = [metrics for turn_idx, metrics in turn_metrics if turn_idx < turn_count]
+            _add_best_counts(best_by_turn[turn_count], cumulative, fast_thresholds)
         # Overall "best" stays cumulative over the whole trajectory (all turns).
         _add_best_counts(overall, [metrics for _, metrics in turn_metrics], fast_thresholds)
 
@@ -249,6 +263,24 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             turn_out[f"Fast@{t:g}"] = prate(counts["fast"][t])
             turn_out[f"fast@{t:g}_count"] = counts["fast"][t]
         out["per_turn"][turn_count] = turn_out
+
+    # Cumulative best after at most k turns. Keep this alongside the single-turn
+    # table: the former answers "did any attempt up through k work?", while the
+    # latter makes regressions or gains in the feedback turns visible.
+    out["best_by_turn"] = {}
+    for turn_count, counts in best_by_turn.items():
+        turn_out = {
+            "compile_count": counts["compiled"],
+            "Compile": rate(counts["compiled"]),
+            "correct_count": counts["correct"],
+            "Correct": rate(counts["correct"]),
+        }
+        if counts["speedup"]:
+            turn_out["SpeedupMean"] = sum(counts["speedup"]) / len(counts["speedup"])
+        for t in fast_thresholds:
+            turn_out[f"Fast@{t:g}"] = rate(counts["fast"][t])
+            turn_out[f"fast@{t:g}_count"] = counts["fast"][t]
+        out["best_by_turn"][turn_count] = turn_out
     return out
 
 
@@ -423,6 +455,11 @@ def main():
     ap.add_argument("path", help="EVAL_DIR (…/dumps/rollout_data) or an eval_*.pt file")
     ap.add_argument("--fast", type=float, nargs="+", default=list(FAST_DEFAULT))
     ap.add_argument("--max-turns", type=int, default=None, help="Maximum turns for the per-turn table columns.")
+    ap.add_argument(
+        "--group-by-metadata",
+        default=None,
+        help="Print one independent summary per value of this sample.metadata key.",
+    )
     args = ap.parse_args()
 
     dumps = _find_dumps(args.path)
@@ -435,18 +472,24 @@ def main():
         samples.extend(obj.get("samples", []) if isinstance(obj, dict) else obj)
 
     fast_thresholds = tuple(args.fast)
-    base = summarize(samples, fast_thresholds)
-    group = None
-    if not _is_single_turn(samples, max_turns=args.max_turns):
-        group = _summarize_group_best(samples, fast_thresholds, max_turns=args.max_turns)
-        if group is None:
-            print(
-                "note: multi-turn dump but no group_id found; per-turn/best columns unavailable.",
-                file=sys.stderr,
-            )
+    partitions = _partition_by_metadata(samples, args.group_by_metadata) if args.group_by_metadata else {"": samples}
+    for idx, (label, partition) in enumerate(sorted(partitions.items())):
+        if idx:
+            print()
+        if args.group_by_metadata:
+            print(f"=== {args.group_by_metadata}={label} ===")
+        base = summarize(partition, fast_thresholds)
+        group = None
+        if not _is_single_turn(partition, max_turns=args.max_turns):
+            group = _summarize_group_best(partition, fast_thresholds, max_turns=args.max_turns)
+            if group is None:
+                print(
+                    "note: multi-turn dump but no group_id found; per-turn/best columns unavailable.",
+                    file=sys.stderr,
+                )
 
-    _print_debug_header(dumps, samples, base, group, args)
-    _print_oneline_table(group, base, fast_thresholds)
+        _print_debug_header(dumps, partition, base, group, args)
+        _print_oneline_table(group, base, fast_thresholds)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ from copy import deepcopy
 
 import wandb
 
+from .secret_redaction import redact_secrets_for_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -152,7 +154,7 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    return redact_secrets_for_logging(deepcopy(args.__dict__))
 
 
 def _prefix_config_keys(config, prefix):
@@ -223,6 +225,9 @@ def init_wandb_secondary(args, role=None):
 def _init_wandb_common():
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("dppo/*", step_metric="train/step")
+    wandb.define_metric("entropy/*", step_metric="train/step")
+    wandb.define_metric("entropy/rollout*", step_metric="rollout/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")

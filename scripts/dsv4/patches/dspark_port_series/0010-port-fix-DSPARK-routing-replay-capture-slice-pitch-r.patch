@@ -1,0 +1,131 @@
+From f6a01045752667fb0c0a0c6979a02055f62fee0f Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 16:37:25 +0900
+Subject: [PATCH 10/13] port: fix DSPARK routing-replay capture (slice pitch +
+ result passthrough)
+
+Two independent defects zeroed every response token's captured routing
+under DSPARK (trainer replay then consumed expert-0 rows: train logprob
+-3.8/-6.5 vs rollout -0.24; capture-content probes showed 98-99% zero rows).
+
+1) dp-attention capture slice pitch under spec-verify graphs:
+   get_dp_local_slice_cpu uses cuda_graph_batch as the per-rank row pitch
+   of the gathered capture buffer. model_runner passed runner.bs (REQUEST
+   batch), but target-verify graphs lay out bs * num_tokens_per_bs
+   token-rows per rank (num_tokens_per_bs = draft width W). Every dp rank
+   except 0 sliced unwritten buffer (upstream's own 'FIXME: spec decoding
+   num_verify_tokens not accounted for'). Pass bs * num_tokens_per_bs
+   (x1 for plain decode, unchanged).
+
+2) DSpark/DFlash verify-result rebuild dropped capture outputs:
+   _forward_decode constructs a fresh GenerationBatchResult after verify;
+   the inner target forward's deferred routed_experts_output /
+   indexer_topk_output were never carried over, so the accepted-row filter
+   never ran and host-cache verify rows stayed zero. Thread both fields
+   through TargetVerifyResult (both executor return sites) and both
+   workers' GenerationBatchResult.
+
+Fixed-data evidence: 32/32 samples healthy (response rows 7.6% zeros ==
+prompt-row natural rate); filter sees stride=6 slices at 93% nonzero.
+---
+ python/sglang/srt/model_executor/model_runner.py     | 12 +++++++++++-
+ python/sglang/srt/speculative/dflash_worker_v2.py    |  2 ++
+ .../srt/speculative/dspark_components/dspark_info.py |  6 ++++++
+ .../dspark_components/dspark_target_verify.py        |  4 ++++
+ .../dspark_components/dspark_worker_v2.py            |  2 ++
+ 5 files changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 2a55d67..cb1bbc8 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3026,10 +3026,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             not self.is_draft_worker
+             and (experts_capturer := get_global_experts_capturer()) is not None
+         ):
++            # Graph-replay row pitch: the buffer lays out per-dp-rank blocks of
++            # bs * num_tokens_per_bs TOKEN-ROWS (num_tokens_per_bs = draft width
++            # W under spec target-verify, 1 for plain decode). runner.bs alone
++            # is the REQUEST batch — using it as the pitch made every dp rank
++            # except 0 slice unwritten buffer under DSPARK (zero routing rows;
++            # upstream's own "FIXME: spec not accounted for").
++            _runner = self.decode_cuda_graph_runner
++            _graph_rows = None
++            if _runner is not None and getattr(_runner, "bs", None) is not None:
++                _graph_rows = _runner.bs * getattr(_runner, "num_tokens_per_bs", 1)
+             output.routed_experts_output = experts_capturer.on_forward_end(
+                 forward_batch=forward_batch,
+                 can_run_graph=output.can_run_graph,
+-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
++                cuda_graph_batch=_graph_rows,
+                 no_copy_to_cpu=no_copy_to_cpu,
+             )
+ 
+diff --git a/python/sglang/srt/speculative/dflash_worker_v2.py b/python/sglang/srt/speculative/dflash_worker_v2.py
+index 52fa2c6..d808741 100644
+--- a/python/sglang/srt/speculative/dflash_worker_v2.py
++++ b/python/sglang/srt/speculative/dflash_worker_v2.py
+@@ -1681,6 +1681,8 @@ class DFlashWorkerV2(BaseSpecWorker):
+ 
+         return GenerationBatchResult(
+             logits_output=logits_output,
++            routed_experts_output=getattr(target_out, "routed_experts_output", None),
++            indexer_topk_output=getattr(target_out, "indexer_topk_output", None),
+             next_token_ids=out_tokens.reshape(-1),
+             accept_lens=commit_lens,
+             can_run_cuda_graph=can_run_cuda_graph,
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_info.py b/python/sglang/srt/speculative/dspark_components/dspark_info.py
+index 8a4a77a..181279b 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_info.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_info.py
+@@ -19,6 +19,12 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
+ class TargetVerifyResult(msgspec.Struct, frozen=True):
+     logits_output: object
+     can_run_cuda_graph: bool
++    # Deferred state-capturer outputs from the inner target forward. DSpark
++    # rebuilds GenerationBatchResult after verify; without carrying these the
++    # routed-experts / indexer captures are silently dropped for every verify
++    # step (trainer routing replay then reads all-zero rows).
++    routed_experts_output: object = None
++    indexer_topk_output: object = None
+ 
+ 
+ class DraftBlockResult(msgspec.Struct, frozen=True):
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_target_verify.py b/python/sglang/srt/speculative/dspark_components/dspark_target_verify.py
+index d967f1d..4fdadba 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_target_verify.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_target_verify.py
+@@ -102,6 +102,8 @@ class TargetVerifyExecutor:
+         return TargetVerifyResult(
+             logits_output=logits_output,
+             can_run_cuda_graph=can_run_cuda_graph,
++            routed_experts_output=getattr(target_out, "routed_experts_output", None),
++            indexer_topk_output=getattr(target_out, "indexer_topk_output", None),
+         )
+ 
+     def commit_hidden(
+@@ -185,6 +187,8 @@ class TargetVerifyExecutor:
+         return TargetVerifyResult(
+             logits_output=logits_output,
+             can_run_cuda_graph=can_run_cuda_graph,
++            routed_experts_output=getattr(target_out, "routed_experts_output", None),
++            indexer_topk_output=getattr(target_out, "indexer_topk_output", None),
+         )
+ 
+     def run_compact(
+diff --git a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+index 2ad6a02..916b596 100644
+--- a/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
++++ b/python/sglang/srt/speculative/dspark_components/dspark_worker_v2.py
+@@ -1030,6 +1030,8 @@ class DSparkWorkerV2(BaseSpecWorker):
+         )
+         return GenerationBatchResult(
+             logits_output=logits_output,
++            routed_experts_output=target_verify.routed_experts_output,
++            indexer_topk_output=target_verify.indexer_topk_output,
+             next_token_ids=out_tokens.reshape(-1),
+             accept_lens=commit_lens,
+             block_accept_lens=commit_lens + cap_trim_lens,
+-- 
+2.43.0
+

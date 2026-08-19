@@ -1,0 +1,54 @@
+\begin{table}[!h]
+    \centering
+    \footnotesize
+    \caption{
+        Comparison among \dsviiiII{}-Base, \dsvivf{}-Base, and \dsvivp{}-Base.
+        All models are evaluated in our internal framework and share the same evaluation setting.
+        Scores with a gap not exceeding 0.3 are considered to be at the same level.
+        The highest score in each row is in \textbf{bold font}, and the second is \underline{underlined}. 
+    }
+    \setlength{\tabcolsep}{4pt}
+    \begin{tabular}{@{}c l c | c c c@{}}
+    \toprule
+    & \multirow{2}{*}{\centering \textbf{Benchmark {\tiny (Metric)}}} & \multirow{2}{*}{\textbf{\# Shots}} & \textbf{\dsviiiII{}} & \textbf{\dsvivf{}} & \textbf{\dsvivp{}} \\
+    & & & \textbf{Base} & \textbf{Base} & \textbf{Base} \\
+    \midrule
+    & Architecture & - & MoE & MoE & MoE \\
+    & \# Activated Params & - & 37B & \dsvivfap{} & \dsvivpap{} \\
+    & \# Total Params & - & 671B & \dsvivftp{} & \dsvivptp{} \\
+    \midrule
+    \multirow{12}{*}{World Knowl.}
+    & AGIEval {\tiny (EM)} & 0-shot & 80.1  & \underline{82.6} & \textbf{83.1} \\
+    & MMLU {\tiny (EM)} & 5-shot & 87.8 & \underline{88.7} & \textbf{90.1} \\
+    & MMLU-Redux {\tiny (EM)} & 5-shot & 87.5 & \underline{89.4} & \textbf{90.8} \\
+    & MMLU-Pro {\tiny (EM)} & 5-shot & 65.5 & \underline{68.3} & \textbf{73.5} \\
+    & MMMLU {\tiny (EM)} & 5-shot & 87.9 & \underline{88.8} & \textbf{90.3} \\
+    & C-Eval {\tiny (EM)} & 5-shot & 90.4 & \underline{92.1} & \textbf{93.1} \\
+    & CMMLU {\tiny (EM)} & 5-shot & 88.9 & \underline{90.4} & \textbf{90.8} \\
+    & MultiLoKo {\tiny (EM)} & 5-shot & 38.7 & \underline{42.2} & \textbf{51.1} \\
+    & Simple-QA verified {\tiny (EM)} & 25-shot & 28.3 & \underline{30.1} & \textbf{55.2} \\
+    & SuperGPQA {\tiny (EM)} & 5-shot & 45.0 & \underline{46.5} & \textbf{53.9} \\
+    & FACTS Parametric {\tiny (EM)} & 25-shot & 27.1 & \underline{33.9} & \textbf{62.6} \\
+    & TriviaQA {\tiny (EM)} & 5-shot & \underline{83.3} & 82.8 & \textbf{85.6} \\
+    \midrule
+    \multirow{5}{*}{Lang. \& Reas.}
+    & BBH {\tiny (EM)} & 3-shot & \textbf{87.6} & \underline{86.9} & \textbf{87.5} \\
+    & DROP {\tiny (F1)} & 1-shot & \underline{88.2} & \textbf{88.6} & \textbf{88.7} \\
+    & HellaSwag {\tiny (EM)} & 0-shot & \underline{86.4} & 85.7 & \textbf{88.0} \\
+    & WinoGrande {\tiny (EM)} & 0-shot & 78.9 & \underline{79.5} & \textbf{81.5} \\
+    & CLUEWSC {\tiny (EM)} & 5-shot & \underline{83.5} & 82.2 & \textbf{85.2} \\
+    \midrule
+    \multirow{6}{*}{Code \& Math}
+    & BigCodeBench {\tiny (Pass@1)} & 3-shot & \textbf{63.9} & 56.8 & \underline{59.2} \\
+    & HumanEval {\tiny (Pass@1)} & 0-shot & 62.8 & \underline{69.5} & \textbf{76.8} \\
+    & GSM8K {\tiny (EM)} & 8-shot & \underline{91.1} & 90.8 & \textbf{92.6} \\
+    & MATH {\tiny (EM)} & 4-shot & \underline{60.5} & 57.4 & \textbf{64.5} \\
+    & MGSM {\tiny (EM)} & 8-shot & 81.3 & \textbf{85.7} & \underline{84.4} \\
+    & CMath {\tiny (EM)} & 3-shot & \underline{92.6} & \textbf{93.6} & 90.9 \\
+    \midrule
+    \multirow{1}{*}{Long Context}
+    & LongBench-V2 {\tiny (EM)} & 1-shot & 40.2 & \underline{44.7} & \textbf{51.5} \\
+    \bottomrule
+    \end{tabular}
+    \label{tab:base}
+\end{table}

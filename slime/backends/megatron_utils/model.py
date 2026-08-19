@@ -15,6 +15,7 @@ from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -29,6 +30,13 @@ except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
 from slime.utils.memory_utils import clear_memory
+from slime.utils.train_metric_utils import (
+    ENTROPY_COMMON_PROBE_MASK_KEY,
+    add_derived_dppo_metrics,
+    add_derived_entropy_metrics,
+    add_entropy_common_probe_metric,
+    format_train_metric_key,
+)
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .cp_utils import reduce_train_step_metrics
@@ -57,6 +65,71 @@ def _should_update_microbatch_pbar(model) -> bool:
     if mpu.get_virtual_pipeline_model_parallel_world_size() is not None and vp_stage is not None:
         return mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage)
     return mpu.is_pipeline_last_stage(ignore_virtual=True)
+
+
+def _v4_current_pp_seq_length(args: Namespace) -> int:
+    """The sequence length the CURRENT forward pass actually communicates.
+
+    slime pads each rollout's tokens to a per-step ``max_seq_len`` (actor.py, the
+    padded max over ``total_lengths``), stored on ``args._v4_pp_current_seq_len``.
+    That value — not the static ``args.seq_length`` — is what ``get_batch``
+    produces and what RoPE/position_ids use, so it is the length PP must
+    communicate. Falls back to ``args.seq_length`` when unset (e.g. before the
+    first rollout, or non-rollout forwards)."""
+    override = getattr(args, "_v4_pp_current_seq_len", None)
+    if override:
+        return int(override)
+    return int(args.seq_length)
+
+
+def _v4_pp_sequence_length(args: Namespace) -> int:
+    """Sequence length that V4 PP stages communicate for the current batch.
+
+    In slime's ``bshd`` path, ``get_batch`` pads token/loss-mask tensors to the
+    per-step ``max_seq_len``.  PP hidden-state communication must use the same
+    padded sequence length; otherwise non-first stages recompute RoPE for the
+    padded input ids but receive a shorter hidden stream (the RL log-prob forward
+    crashed here: q S=128 from a stale args.seq_length vs cos/sin S=384 from the
+    real rollout data).
+    """
+    seq_length = _v4_current_pp_seq_length(args)
+    if getattr(args, "qkv_format", None) == "bshd":
+        tp_size = int(getattr(args, "tensor_model_parallel_size", 1) or 1)
+        pad_multiplier = int(getattr(args, "data_pad_size_multiplier", 1) or 1)
+        pad_size = max(1, tp_size * pad_multiplier)
+        seq_length = ((seq_length + pad_size - 1) // pad_size) * pad_size
+    return seq_length
+
+
+def _v4_pp_adjust_tensor_shapes_fn(args: Namespace, model: Sequence[DDP]):
+    """Return Megatron PP tensor-shape adapter for V4's 4D hc stream, if needed.
+
+    Megatron's non-interleaved PP schedule defaults to communicating [S, B, H].
+    V4 stages pass the hyper-connection stream [B, S, hc_mult, H], so PP>1 needs
+    explicit recv/send shapes. Interleaved PP still has no adjust hook upstream.
+    """
+    if getattr(args, "pipeline_model_parallel_size", 1) <= 1:
+        return None
+    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
+        raise ValueError("V4LanguageModel does not support virtual pipeline parallelism yet")
+
+    hf_config = None
+    for module in unwrap_model(model):
+        hf_config = getattr(module, "hf_config", None)
+        if hf_config is not None and hasattr(hf_config, "hc_mult"):
+            break
+    if hf_config is None or not hasattr(hf_config, "hc_mult"):
+        return None
+
+    hc_mult = int(hf_config.hc_mult)
+    hidden_size = int(hf_config.hidden_size)
+    pp_seq_length = _v4_pp_sequence_length(args)
+
+    def adjust_tensor_shapes(_recv_shapes, _send_shapes):
+        shape = (args.micro_batch_size, pp_seq_length, hc_mult, hidden_size)
+        return [shape], [shape]
+
+    return adjust_tensor_shapes
 
 
 def _wrap_forward_step_with_microbatch_pbar(forward_step_func, pbar):
@@ -157,7 +230,12 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    args.train_iters = _estimate_train_iters(
+        args.num_rollout,
+        args.rollout_batch_size,
+        args.n_samples_per_prompt,
+        args.global_batch_size,
+    )
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters * args.global_batch_size
@@ -189,6 +267,119 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     )
 
     return opt_param_scheduler
+
+
+def _estimate_train_iters(
+    num_rollout: int,
+    rollout_batch_size: int,
+    n_samples_per_prompt: int,
+    global_batch_size: int,
+) -> int:
+    total_samples = num_rollout * rollout_batch_size * n_samples_per_prompt
+    if total_samples <= 0:
+        return 0
+    return max(1, math.ceil(total_samples / global_batch_size))
+
+
+_LORA_B_PARAM_SUFFIX = ".linear_out.weight"
+
+
+def _v4_lora_plus_config_overrides(config: OptimizerConfig, model: Sequence[DDP], lam: float):
+    """Megatron ``config_overrides`` implementing LoRA+ (eta_B = lambda * eta_A).
+
+    Builds on the standard overrides (bias/1D weight-decay skip — preserved so the
+    non-LoRA behavior is unchanged) and adds a ``ParamKey`` matching the LoRA B
+    matrices (``*.linear_out.weight``; only megatron-bridge ``LinearAdapter``
+    modules own a ``linear_out`` child, and only adapter params are trainable, so
+    the glob cannot catch base weights). The override sets:
+
+    * ``max_lr`` / ``min_lr`` scaled by lambda — these are the per-group knobs
+      ``OptimizerParamScheduler.get_lr`` actually honors (it IGNORES ``lr_mult``;
+      the scheduler multiplies nothing), so the B group tracks every decay style
+      at exactly lambda x the A group (min_lr scaled too, keeping the ratio exact
+      through cosine/linear floors; during a warmup ramp the ratio approaches
+      lambda as lr leaves ``init_lr``).
+    * ``lr_mult = lambda`` — NOT for the scheduler (ignored there) but because it
+      is part of Megatron's param-group identity tuple
+      (``param_group_identifier_keys = (wd_mult, lr_mult, is_expert_parallel,
+      is_decoupled_lr)`` — note ``max_lr`` is NOT in it). Without a distinct
+      ``lr_mult`` the A and B groups would collide into ONE identifier on
+      optimizer-state save/resume (``_filter_and_reorder_param_groups`` keys a
+      dict on the tuple), silently cross-mapping Muon momentum between groups.
+      With it, resume round-trips, and resuming with a DIFFERENT lambda (or
+      toggling LoRA+ across a resume) fails loud with a missing-group ValueError
+      instead of silently keeping the old ratio.
+
+    Raises if no trainable LoRA B param exists (lambda set on a non-LoRA run is a
+    config error, not a no-op).
+    """
+    from megatron.core.optimizer import get_standard_config_overrides
+    from megatron.core.optimizer.optimizer_config import ParamKey
+
+    n_b = 0
+    for chunk in model:
+        for name, param in chunk.named_parameters():
+            if param.requires_grad and name.endswith(_LORA_B_PARAM_SUFFIX):
+                n_b += 1
+    if n_b == 0:
+        raise RuntimeError(
+            f"--lora-plus-lambda={lam} is set but the model has no trainable LoRA "
+            f"B params (*{_LORA_B_PARAM_SUFFIX}); LoRA+ requires --lora-dim > 0."
+        )
+
+    overrides = get_standard_config_overrides(config)
+    overrides[ParamKey(name=f"*{_LORA_B_PARAM_SUFFIX}")] = {
+        "max_lr": lam * config.lr,
+        "min_lr": lam * (config.min_lr or 0.0),
+        "lr_mult": float(lam),
+    }
+    return overrides
+
+
+def _log_v4_lora_plus_groups(optimizer: MegatronOptimizer, model: Sequence[DDP], lam: float) -> None:
+    """Verify + log the LoRA+ split once at init (after the scheduler's step(0)).
+
+    Fails loud if the optimizer does not contain exactly the expected B group:
+    the B (lr_mult == lambda) group's param shapes must equal the model's
+    trainable ``linear_out`` shapes (shape multiset survives the fp32
+    master-param clone inside Float16OptimizerWithFloat16Params, unlike ids),
+    and its lr must be exactly lambda x the default group's lr.
+    """
+    expected_b_shapes = sorted(
+        tuple(p.shape)
+        for chunk in model
+        for name, p in chunk.named_parameters()
+        if p.requires_grad and name.endswith(_LORA_B_PARAM_SUFFIX)
+    )
+    b_groups = [g for g in optimizer.param_groups if g.get("lr_mult") == lam and g["params"]]
+    a_groups = [g for g in optimizer.param_groups if g.get("lr_mult", 1.0) == 1.0 and g["params"]]
+    if len(b_groups) != 1 or not a_groups:
+        raise RuntimeError(
+            f"LoRA+ group split failed: found {len(b_groups)} B group(s) with "
+            f"lr_mult=={lam} and {len(a_groups)} default group(s) "
+            f"(param_groups={[(g.get('lr_mult'), len(g['params'])) for g in optimizer.param_groups]})"
+        )
+    b_group = b_groups[0]
+    got_b_shapes = sorted(tuple(p.shape) for p in b_group["params"])
+    if got_b_shapes != expected_b_shapes:
+        raise RuntimeError(
+            f"LoRA+ B group does not contain exactly the LoRA linear_out params: "
+            f"expected {len(expected_b_shapes)} tensors, got {len(got_b_shapes)}"
+        )
+    eta_a = a_groups[0]["lr"]
+    eta_b = b_group["lr"]
+    if eta_b != lam * eta_a:
+        raise RuntimeError(f"LoRA+ effective LRs wrong at init: eta_A={eta_a} eta_B={eta_b} lambda={lam}")
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        logger.info(
+            "[lora+] optimizer param groups split: eta_A=%.3e (%d tensors), eta_B=%.3e "
+            "(%d tensors), lambda=%g (--lora-plus-lambda)",
+            eta_a,
+            sum(len(g["params"]) for g in a_groups),
+            eta_b,
+            len(b_group["params"]),
+            lam,
+        )
 
 
 def setup_model_and_optimizer(
@@ -225,12 +416,37 @@ def setup_model_and_optimizer(
     config = OptimizerConfig(**kwargs)
     config.timers = None
 
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
+    # LoRA+ (--lora-plus-lambda, default unset/1.0 = OFF): separate param group
+    # for the LoRA B matrices with eta_B = lambda * eta_A. When off,
+    # config_overrides stays None and the optimizer construction below is
+    # byte-identical to the pre-LoRA+ behavior (None triggers megatron's own
+    # get_standard_config_overrides fallback inside _get_param_groups).
+    from slime.utils.lora_utils import lora_plus_lambda
+
+    lora_plus_lam = lora_plus_lambda(args)
+    config_overrides = (
+        _v4_lora_plus_config_overrides(config, model, lora_plus_lam) if lora_plus_lam is not None else None
     )
+
+    if "muon" in config.optimizer:
+        optimizer = get_megatron_muon_optimizer(
+            config=config,
+            model_chunks=model,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+            layer_wise_distributed_optimizer="dist" in config.optimizer,
+        )
+    else:
+        optimizer = get_megatron_optimizer(
+            config=config,
+            model_chunks=model,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
     opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    if lora_plus_lam is not None:
+        # scheduler __init__ ran step(0), so per-group lrs are live — verify + log.
+        _log_v4_lora_plus_groups(optimizer, model, lora_plus_lam)
     return model, optimizer, opt_param_scheduler
 
 
@@ -369,6 +585,16 @@ def forward_only(
         custom_before_log_prob_hook(args, model, store_prefix)
 
     forward_backward_func = get_forward_backward_func()
+    # V4's PP hidden stream is 4D [B, S, hc_mult, H]; PP>1 needs the same
+    # recv/send shape adapter here as the training forward (build_train_step),
+    # otherwise stage 1's log-prob forward allocates a 3D recv buffer and the mHC
+    # kernel fails with "not enough values to unpack (expected 4, got 3)". Returns
+    # None for PP<=1 / non-V4 models, so this is a no-op elsewhere.
+    adjust_tensor_shapes_fn = _v4_pp_adjust_tensor_shapes_fn(args, model)
+    # When the V4 adapter is active it fixes the PP tensor shape, so Megatron's
+    # own get_tensor_shapes must be told the same (current-rollout) seq length,
+    # not the static args.seq_length. No-op for non-V4 / PP<=1 (adapter is None).
+    log_prob_seq_length = _v4_current_pp_seq_length(args) if adjust_tensor_shapes_fn is not None else args.seq_length
     # Don't care about timing during evaluation
     config.timers = None
     forward_data_store = []
@@ -388,9 +614,10 @@ def forward_only(
             data_iterator=data_iterator,
             model=model,
             num_microbatches=num_microbatches[step_id],
-            seq_length=args.seq_length,
+            seq_length=log_prob_seq_length,
             micro_batch_size=args.micro_batch_size,
             forward_only=True,
+            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
         )
     microbatch_pbar.close()
 
@@ -431,7 +658,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
-) -> tuple[dict[str, float], float]:
+) -> tuple[dict[str, float], float, dict[str, float]]:
     """Execute a single pipeline-parallel training step.
 
     Runs forward/backward over ``num_microbatches``, applies optimizer step and
@@ -455,8 +682,9 @@ def train_one_step(
             equals the per-step sample count, so behavior is unchanged.
 
     Returns:
-        tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
-        and gradient norm for logging.
+        tuple[dict[str, float], float, dict[str, float]]: Reduced loss
+        dictionary (last stage only), gradient norm, and optional gradient
+        diagnostic metrics for logging.
     """
     args = get_args()
 
@@ -497,12 +725,16 @@ def train_one_step(
                 "total_lengths",
                 "response_lengths",
                 "loss_masks",
+                ENTROPY_COMMON_PROBE_MASK_KEY,
                 "log_probs",
                 "ref_log_probs",
                 "values",
                 "advantages",
                 "returns",
                 "rollout_log_probs",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
+                "rollout_topk_valid_mask",
                 "max_seq_lens",
                 "teacher_log_probs",
                 "group_mask_sums",
@@ -552,15 +784,20 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    adjust_tensor_shapes_fn = _v4_pp_adjust_tensor_shapes_fn(args, model)
+    # See forward_only: when the V4 adapter fixes the PP shape, Megatron's
+    # get_tensor_shapes must use the same current-rollout seq length.
+    train_seq_length = _v4_current_pp_seq_length(args) if adjust_tensor_shapes_fn is not None else args.seq_length
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
         data_iterator=data_iterator,
         model=model,
         num_microbatches=num_microbatches,
-        seq_length=args.seq_length,
+        seq_length=train_seq_length,
         micro_batch_size=args.micro_batch_size,
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
+        adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
     )
 
     valid_step = True
@@ -791,14 +1028,19 @@ def train(
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
             role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
+            add_entropy_common_probe_metric(
+                loss_dict,
+                required=getattr(args, "entropy_common_probe", False),
+            )
+            add_derived_dppo_metrics(loss_dict)
+            add_derived_entropy_metrics(loss_dict)
             log_dict = {
-                f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
+                format_train_metric_key(key, role_tag): val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
-
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
 
@@ -868,19 +1110,84 @@ def save(
         optimizer (MegatronOptimizer): Optimizer instance.
         opt_param_scheduler (OptimizerParamScheduler): LR/WD scheduler.
     """
+    from .adapter_ckpt import (
+        adapter_checkpoint_staging,
+        adapter_only_ckpt_enabled,
+        adapter_only_model_save,
+        finalize_adapter_checkpoint,
+        register_adapter_async_finalize,
+        validate_lora_optimizer_state,
+    )
+
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
+
+    def _do_save(*, non_persistent_ckpt=False):
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+            non_persistent_ckpt=non_persistent_ckpt,
+        )
+
+    if adapter_only_ckpt_enabled(args):
+        # LoRA-only save: filter the model state dict to adapter params (frozen
+        # base reloads cold from --load on resume). Always logs full-vs-kept byte
+        # sizes so the adapter-only shrink is visible.
+        optimizer_stats = None
+        if not args.no_save_optim:
+            optimizer_stats = validate_lora_optimizer_state(model, optimizer)
+        if not args.save:
+            raise RuntimeError("adapter-only checkpointing requires args.save")
+        final_save_dir = args.save
+        saved_optimizer = not args.no_save_optim
+        saved_rng = not args.no_save_rng
+        # Upstream Megatron writes latest_checkpointed_iteration.txt before our
+        # node-local files can be unioned. Route the save to a hidden
+        # non-persistent-global root, replicate and validate there, atomically
+        # promote the iteration on each node, and publish final latest markers
+        # only after every node has committed.  With --async-save, the post-write
+        # work is registered on Megatron's AsyncRequest and therefore runs only
+        # after all distcp writer processes have completed.
+        with adapter_checkpoint_staging(args, iteration) as staging_dir:
+
+            def _finalize_adapter_save():
+                finalize_adapter_checkpoint(
+                    final_save_dir,
+                    staging_dir,
+                    iteration,
+                    model,
+                    optimizer_stats=optimizer_stats,
+                    saved_optimizer=saved_optimizer,
+                    saved_rng=saved_rng,
+                    max_node_bytes=args.lora_checkpoint_max_node_bytes,
+                    rslora=args.lora_rslora,
+                )
+
+            with adapter_only_model_save(model):
+                if args.async_save:
+                    with register_adapter_async_finalize(_finalize_adapter_save):
+                        _do_save(non_persistent_ckpt=True)
+                else:
+                    _do_save(non_persistent_ckpt=True)
+        if args.async_save:
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                logger.info(
+                    "adapter checkpoint SCHEDULED: iteration=%s staging_dir=%s",
+                    iteration,
+                    staging_dir,
+                )
+        else:
+            _finalize_adapter_save()
+    else:
+        _do_save()
+
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
@@ -975,4 +1282,36 @@ def initialize_model_and_optimizer(
             optimizer.reload_model_params()
     clear_memory()
 
+    _maybe_verify_v4_frozen_experts_fp4(model)
+
     return model, optimizer, opt_param_scheduler, iteration
+
+
+def _maybe_verify_v4_frozen_experts_fp4(model):
+    """Packed-MXFP4 frozen experts (V4_FP4_FROZEN_EXPERTS=1): the OFFICIAL
+    checkpoint's packed expert bytes were loaded VERBATIM into uint8 buffers by
+    the torch_dist load (no post-load quantization step exists in this mode).
+    Verify the buffers were actually populated — a checkpoint-family mixup leaves
+    the zero-init scales in place, which would silently make every expert a
+    near-no-op. The packed buffers never enter adapter saves, so full
+    saves/ref/teacher loads remain forbidden."""
+    import os
+
+    if os.environ.get("V4_FP4_FROZEN_EXPERTS", "0") != "1":
+        return
+    n = 0
+    for chunk in model:
+        for module in chunk.modules():
+            if hasattr(module, "verify_fp4_loaded") and getattr(module, "_experts_fp4", False):
+                module.verify_fp4_loaded()
+                n += 1
+    if n == 0:
+        raise RuntimeError(
+            "V4_FP4_FROZEN_EXPERTS=1 but no packed-MXFP4 V4GroupedExperts modules "
+            "were found — the model was built without the flag (it is read at "
+            "module construction) or this is not a V4 model"
+        )
+    import torch
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[V4_FP4_FROZEN_EXPERTS] rank={rank} verified {n} packed-MXFP4 expert modules", flush=True)

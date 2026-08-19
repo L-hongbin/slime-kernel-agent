@@ -1,8 +1,14 @@
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from slime.utils import logging_utils
+
+NUM_GPUS = 0
 
 
 class _RemoteMethod:
@@ -157,9 +163,94 @@ def test_centralized_log_is_forwarded_to_tracking_actor(monkeypatch, reset_track
 
     args = _args()
     logging_utils.init_tracking(args, primary=True)
-    logging_utils.log(args, {"train/loss": 1.5, "train/step": 7}, step_key="train/step")
+    logging_utils.log(
+        args,
+        {"train/loss": 1.5, "train/pg_loss": 1.5, "train/step": 7},
+        step_key="train/step",
+    )
 
-    assert fake_wandb.logged == [{"train/loss": 1.5, "train/step": 7}]
+    assert fake_wandb.logged == [{"train/pg_loss": 1.5, "train/step": 7}]
+
+
+@pytest.mark.unit
+def test_redundant_tracking_metrics_are_filtered_without_mutating_payload(monkeypatch, reset_tracking_globals):
+    fake_wandb = _FakeWandb()
+    monkeypatch.setattr(logging_utils, "wandb", fake_wandb)
+
+    redundant = {key: float(index) for index, key in enumerate(logging_utils._REDUNDANT_WANDB_METRICS)}
+    metrics = {
+        **redundant,
+        "rollout/truncated": 0.25,
+        "rollout/response_len/mean": 1024.0,
+        "rollout/kernel/turn0/compilation": 0.8,
+        "rollout/kernel/turn0/speedup": 1.2,
+        "train/pg_loss": -0.1,
+        "rollout/step": 3,
+    }
+    original = metrics.copy()
+
+    logging_utils.log(_args(wandb_centralized=False), metrics, step_key="rollout/step")
+
+    assert metrics == original
+    assert fake_wandb.logged == [
+        {
+            "rollout/truncated": 0.25,
+            "rollout/response_len/mean": 1024.0,
+            "rollout/kernel/turn0/compilation": 0.8,
+            "rollout/kernel/turn0/speedup": 1.2,
+            "train/pg_loss": -0.1,
+            "rollout/step": 3,
+        }
+    ]
+
+
+@pytest.mark.unit
+def test_redundant_wandb_filter_does_not_change_tensorboard_payload(monkeypatch, reset_tracking_globals):
+    tensorboard_logs = []
+
+    class _FakeTensorboardAdapter:
+        def __init__(self, args):
+            pass
+
+        def log(self, data, step):
+            tensorboard_logs.append((data, step))
+
+    monkeypatch.setattr(logging_utils, "_TensorboardAdapter", _FakeTensorboardAdapter)
+    metrics = {"train/loss": 1.5, "train/pg_loss": 1.5, "train/step": 7}
+
+    logging_utils.log(
+        _args(use_wandb=False, use_tensorboard=True, wandb_centralized=False),
+        metrics,
+        step_key="train/step",
+    )
+
+    assert tensorboard_logs == [({"train/loss": 1.5, "train/pg_loss": 1.5}, 7)]
+
+
+@pytest.mark.unit
+def test_redundant_tracking_metric_inventory_is_exact():
+    assert logging_utils._REDUNDANT_WANDB_METRICS == {
+        "lora/lora_adapter/bytes",
+        "lora/lora_adapter/num_tensors",
+        "lora/lora_adapter/rank",
+        "perf/effective_tokens_per_gpu_per_sec",
+        "perf/longest_effective_sample_tokens_per_sec",
+        "rollout/coverage/num_coverage/max",
+        "rollout/coverage/num_coverage/min",
+        "rollout/coverage/time_coverage/max",
+        "rollout/coverage/time_coverage/min",
+        "rollout/env_extra_info/compilation/mean",
+        "rollout/env_extra_info/speedup/mean",
+        "rollout/env_extra_info/speedup/min",
+        "rollout/kernel/time/env_time/sum",
+        "rollout/kernel/time/model_time/sum",
+        "rollout/kl",
+        "rollout/response_lengths",
+        "rollout/returns",
+        "rollout/truncated_ratio",
+        "rollout/turn_indices",
+        "train/loss",
+    }
 
 
 @pytest.mark.unit
@@ -204,3 +295,7 @@ def test_centralized_tracking_requires_explicit_flag(monkeypatch, reset_tracking
 
     assert len(init_primary_calls) == 1
     assert logging_utils._TRACKING_ACTOR is None
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

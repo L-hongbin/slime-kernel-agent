@@ -112,6 +112,34 @@ def add_sglang_arguments(parser):
     ServerArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
 
+    # SGLang renamed data_parallel_size/pipeline_parallel_size/
+    # expert_parallel_size to dp_size/pp_size/ep_size.  Keep the historical
+    # slime CLI accepted when the newer ServerArgs is installed; the explicit
+    # option, when present, writes the new destination.
+    for legacy_name, current_name in (
+        ("data_parallel_size", "dp_size"),
+        ("pipeline_parallel_size", "pp_size"),
+        ("expert_parallel_size", "ep_size"),
+    ):
+        legacy_dest = f"sglang_{legacy_name}"
+        current_dest = f"sglang_{current_name}"
+        action_dests = {action.dest for action in parser._actions}
+        legacy_option = f"--sglang-{legacy_name.replace('_', '-')}"
+        option_strings = {option for action in parser._actions for option in action.option_strings}
+        if legacy_dest not in action_dests and current_dest in action_dests and legacy_option not in option_strings:
+            parser.add_argument(
+                legacy_option,
+                dest=current_dest,
+                type=int,
+                default=argparse.SUPPRESS,
+            )
+
+    # The training image can carry an older SGLang than the rollout image.
+    # Keep this DSpark option parseable on the head; rollout actors running the
+    # newer ServerArgs will forward it to their local engine.
+    if not any(action.dest == "sglang_speculative_dspark_block_size" for action in parser._actions):
+        parser.add_argument("--sglang-speculative-dspark-block-size", type=int, default=None)
+
     # PD disaggregation / multi-group config
     parser.add_argument(
         "--prefill-num-servers",
@@ -137,9 +165,9 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    args.sglang_dp_size = getattr(args, "sglang_data_parallel_size", getattr(args, "sglang_dp_size", 1))
+    args.sglang_pp_size = getattr(args, "sglang_pipeline_parallel_size", getattr(args, "sglang_pp_size", 1))
+    args.sglang_ep_size = getattr(args, "sglang_expert_parallel_size", getattr(args, "sglang_ep_size", 1))
 
     # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:

@@ -695,6 +695,39 @@ def _set_multi_turn_rewards(args, output_samples: list[Sample], finish_reason: s
         )
 
 
+def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
+    """DAPO-style soft overlong penalty: linear ramp over the last
+    ``overlong_buffer_len`` response tokens, capped at ``-factor`` at
+    ``rollout_max_response_len``. Applied to per-turn ``sample.reward`` AFTER
+    coverage-RS and BEFORE multi-turn accumulation, so TRLOO trains on the
+    penalized reward. The PRE-penalty reward is recorded in
+    ``metadata["task_reward"]``: the group low-variance filter judges on it, so
+    lengthy-but-task-uniform (e.g. all-fail) groups are discarded exactly as
+    without the penalty — the penalty only shapes advantages of groups that
+    survive the filter (user directive 2026-07-18)."""
+    if not getattr(args, "overlong_penalty", False):
+        return
+    buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
+    factor = float(getattr(args, "overlong_penalty_factor", 1.0))
+    cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
+    if buffer_len <= 0 or factor <= 0 or cap <= 0:
+        return
+
+    threshold = cap - buffer_len
+    for sample in output_samples:
+        if sample.remove_sample:
+            continue
+        resp_len = int(getattr(sample, "response_length", 0) or 0)
+        exceed = resp_len - threshold
+        if exceed <= 0:
+            continue
+        penalty = factor * min(1.0, exceed / buffer_len)
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["task_reward"] = float(sample.reward)
+        sample.reward = float(sample.reward) - penalty
+        sample.metadata["overlong_penalty"] = penalty
+
+
 def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
     if not getattr(args, "use_coverage_rs", False):
         return
@@ -810,6 +843,7 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
         return output_samples
 
     _apply_coverage_rs(args, output_samples)
+    _apply_overlong_penalty(args, output_samples)
 
     finalize_mode = getattr(args, "finalize_mode", "positive")
     if finalize_mode == "none":

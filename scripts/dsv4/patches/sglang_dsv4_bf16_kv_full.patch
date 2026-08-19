@@ -1,0 +1,945 @@
+diff --git a/python/sglang/srt/layers/attention/deepseek_v4_backend.py b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+index f57486e..5da02dc 100644
+--- a/python/sglang/srt/layers/attention/deepseek_v4_backend.py
++++ b/python/sglang/srt/layers/attention/deepseek_v4_backend.py
+@@ -1257,6 +1257,13 @@ class DeepseekV4AttnBackend(
+             if forward_batch.forward_mode.is_extend_without_speculative() and (
+                 q.shape[0] > _LARGE_INDEXER_QUERY_THRESHOLD
+                 or envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.get()
++                # NOTE (Tier 1, bf16 dense prefill): bf16 KV is NO LONGER forced
++                # onto flash_mla_sparse_fwd here. The earlier force existed because
++                # the fp8 compiled decode kernel below rejects bf16 keys — but bf16
++                # now routes through flash_mla_with_kvcache_sm120 (the sm120 Triton
++                # kernel, IS_BF16 branch), the SAME kernel bf16 DECODE uses, so the
++                # dense fall-through below is consistent with decode. Sparse stays
++                # reachable via SGLANG_OPT_FLASHMLA_SPARSE_PREFILL=1 (diagnostic).
+             ):
+                 return self._forward_prefill_sparse(
+                     q=q,
+@@ -1268,7 +1275,14 @@ class DeepseekV4AttnBackend(
+                     attn_sink=attn_sink,
+                 )
+ 
+-            if _is_sm120:
++            # bf16 KV (--kv-cache-dtype bf16): the compiled flash_mla_with_kvcache
++            # rejects bf16 keys, so route through flash_mla_with_kvcache_sm120 (the
++            # sm120 Triton kernel, IS_BF16 branch) which reads the bf16 swa+extra
++            # caches DIRECTLY (no dequant). This serves BOTH decode AND — since the
++            # Tier 1 change above — the dense (non-forced) prefill/extend path, so
++            # bf16 prefill and decode use the identical kernel (self-consistent).
++            # Derived from pool dtype so fp8 keeps the compiled kernel below.
++            if _is_sm120 or token_to_kv_pool.swa_kv_pool.is_bf16_kv:
+                 from sglang.srt.layers.attention.flash_mla_sm120 import (
+                     flash_mla_with_kvcache_sm120,
+                 )
+diff --git a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+index fdbe68c..07d3c15 100644
+--- a/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
++++ b/python/sglang/srt/layers/attention/dsv4/compressor_v2.py
+@@ -485,7 +485,16 @@ class CompressorBackendMixin:
+         kv_score_input = compressor.compute_kv_score(x, forward_batch)
+ 
+         state_pool = compressor.get_state_pool(self)
+-        if _is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get():
++        # bf16 KV (--kv-cache-dtype bf16): the CUDA all-in-one path
++        # (compress_norm_rope_store) fuses an fp8-packing store that hardcodes
++        # the 576-byte page stride and rejects a bf16 buffer. Route bf16 to the
++        # split path (portable compress_forward + Triton norm+rope +
++        # set_extra_key_buffer_fused, which stores the dtype-honest bf16 latent
++        # via the SetKAndS path). fp8 keeps the fused all-in-one kernel.
++        route_split = (_is_hip and not envs.SGLANG_OPT_USE_JIT_NORM.get()) or (
++            token_to_kv_pool.swa_kv_pool.is_bf16_kv
++        )
++        if route_split:
+             self._forward_unified_hip(
+                 token_to_kv_pool=token_to_kv_pool,
+                 kv_score_input=kv_score_input,
+diff --git a/python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py b/python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py
+index 110b7e2..6aa31c5 100644
+--- a/python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py
++++ b/python/sglang/srt/layers/attention/dsv4/dequant_k_cache.py
+@@ -43,6 +43,14 @@ def dequantize_k_cache_paged(
+     assert quant_k_cache.is_contiguous()
+     assert page_table_1_flattened.dtype in (torch.int32, torch.int64)
+ 
++    if quant_k_cache.dtype == torch.bfloat16:
++        # Dtype-honest bf16 KV pool (--kv-cache-dtype bf16): the stored value IS
++        # the latent (448 nope + 64 rope contiguous bf16, no fp8 quant, no
++        # scales). "Dequant" is a paged gather into the (N,1,512) output.
++        return _gather_bf16_k_cache_paged(
++            quant_k_cache, page_table_1_flattened, page_size, out
++        )
++
+     # The buffer's dtype is whatever the pool exposes (often bf16); the
+     # underlying storage is uint8. Reinterpret to byte-space first.
+     quant_k_cache_u8 = quant_k_cache.view(torch.uint8)
+@@ -85,6 +93,70 @@ def dequantize_k_cache_paged(
+     return out
+ 
+ 
++def _gather_bf16_k_cache_paged(
++    k_cache_bf16: torch.Tensor,
++    page_table_1_flattened: torch.Tensor,
++    page_size: int,
++    out: Optional[torch.Tensor] = None,
++) -> torch.Tensor:
++    """bf16 counterpart of :func:`dequantize_k_cache_paged`. The bf16 KV pool
++    stores 512 contiguous bf16 elems/token (nope 448 + rope 64) with no scales,
++    so this is a paged gather (no fp8 dequant). ``k_cache_bf16`` has shape
++    (num_pages, page_size * 512) bfloat16."""
++    assert k_cache_bf16.dtype == torch.bfloat16
++    assert k_cache_bf16.is_contiguous()
++    latent = DIM_NOPE + DIM_ROPE  # 512
++    num_pages, numel_per_page = k_cache_bf16.shape
++    assert numel_per_page % latent == 0, (
++        f"bf16 page ({numel_per_page}) must be a multiple of the per-token "
++        f"latent ({latent})"
++    )
++    num_tokens = page_table_1_flattened.shape[0]
++    if out is None:
++        out = torch.empty(
++            (num_tokens, 1, latent), dtype=torch.bfloat16, device=k_cache_bf16.device
++        )
++    else:
++        assert out.shape == (num_tokens, 1, latent)
++        assert out.dtype == torch.bfloat16
++
++    _gather_bf16_k_cache_paged_kernel[(num_tokens,)](
++        out,
++        k_cache_bf16.reshape(-1),
++        page_table_1_flattened,
++        out.stride(0),
++        NUMEL_PER_PAGE=numel_per_page,
++        PAGE_SIZE=page_size,
++        LATENT=latent,
++        BLOCK=512,
++    )
++    return out
++
++
++@triton.jit
++def _gather_bf16_k_cache_paged_kernel(
++    output_ptr,
++    buf_ptr,
++    page_table_ptr,
++    output_stride_0,
++    NUMEL_PER_PAGE: tl.constexpr,
++    PAGE_SIZE: tl.constexpr,
++    LATENT: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    loc = tl.load(page_table_ptr + token_id).to(tl.int64)
++    page_idx = loc // PAGE_SIZE
++    in_page = loc % PAGE_SIZE
++    token_base = page_idx * NUMEL_PER_PAGE + in_page * LATENT
++    out_base = token_id * output_stride_0
++
++    offs = tl.arange(0, BLOCK)
++    mask = offs < LATENT
++    vals = tl.load(buf_ptr + token_base + offs, mask=mask, other=0.0)
++    tl.store(output_ptr + out_base + offs, vals, mask=mask)
++
++
+ @triton.jit
+ def _dequantize_k_cache_paged_kernel(
+     output_ptr,
+diff --git a/python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py b/python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py
+index d9fdbf1..800e44e 100644
+--- a/python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py
++++ b/python/sglang/srt/layers/attention/dsv4/index_buf_accessor.py
+@@ -31,17 +31,49 @@ class NopeFp8RopeBf16Pack:
+         )
+ 
+ 
++@dataclass
++class NopeBf16RopeBf16Pack:
++    """Dtype-honest bf16 KV pack: nope and rope stored as native bf16 with no
++    fp8 quantization and no UE8M0 scales. Used only when the DSV4 KV pool is
++    allocated with dtype=bfloat16 (``--kv-cache-dtype bf16``); the fp8 default
++    keeps ``NopeFp8RopeBf16Pack`` byte-for-byte."""
++
++    k_nope_bf16: torch.Tensor
++    k_rope_bf16: torch.Tensor
++
++    def __post_init__(self):
++        assert self.k_nope_bf16.shape[-1] == 448
++        assert self.k_rope_bf16.shape[-1] == 64
++
++    def slice_pack(self, _slice: Any) -> NopeBf16RopeBf16Pack:
++        return NopeBf16RopeBf16Pack(
++            k_nope_bf16=self.k_nope_bf16[_slice],
++            k_rope_bf16=self.k_rope_bf16[_slice],
++        )
++
++
+ class SetKAndS:
+     @classmethod
+-    def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
++    def execute(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
++        # bf16 pool: dtype-honest store (no fp8 quant / no scales). Dispatched by
++        # pack type so the fp8 path is untouched.
++        if isinstance(nope_fp8_rope_bf16_pack, NopeBf16RopeBf16Pack):
++            _set_k_bf16_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
++            return
+         cls.triton(pool, buf, loc, nope_fp8_rope_bf16_pack)
+ 
+     @classmethod
+-    def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
++    def torch(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
++        if isinstance(nope_fp8_rope_bf16_pack, NopeBf16RopeBf16Pack):
++            _set_k_bf16_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
++            return
+         _set_k_and_s_torch(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+ 
+     @classmethod
+-    def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack):
++    def triton(cls, pool, buf, loc, nope_fp8_rope_bf16_pack):
++        if isinstance(nope_fp8_rope_bf16_pack, NopeBf16RopeBf16Pack):
++            _set_k_bf16_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
++            return
+         _set_k_and_s_triton(buf, loc, nope_fp8_rope_bf16_pack, pool.page_size)
+ 
+ 
+@@ -255,3 +287,124 @@ def _set_k_and_s_torch(
+         buf_fp8[nope_offset[i] : nope_offset[i] + nope_dim] = k_nope[i]
+         buf_bf16[rope_offset[i] : rope_offset[i] + rope_dim] = k_rope[i]
+         buf_scale[s_offset[i] : s_offset[i] + scale_dim] = scale_k_nope[i]
++
++
++# ---------------------------------------------------------------------------
++# bf16 KV store (dtype-honest, no fp8 quant / no scales). Mirrors the fp8
++# _set_k_and_s_* path but for a single-dtype bf16 buffer: per token the layout
++# is [nope(448) | rope(64)] contiguous bf16 (512 elems = 1024 B/token), page
++# stride = page_size * 512 bf16 elems, no separate scale region.
++# ---------------------------------------------------------------------------
++def _set_k_bf16_triton(
++    buf: torch.Tensor,
++    loc: torch.Tensor,
++    pack: NopeBf16RopeBf16Pack,
++    page_size: int,
++):
++    num_pages, numel_per_page = buf.shape
++    (num_tokens_to_write,) = loc.shape
++
++    k_nope, k_rope = pack.k_nope_bf16, pack.k_rope_bf16
++    n_nope, nope_dim = k_nope.shape
++    n_rope, rope_dim = k_rope.shape
++    assert num_tokens_to_write == n_nope == n_rope
++
++    assert buf.dtype == torch.bfloat16
++    assert loc.dtype in [torch.int64, torch.int32], f"{loc.dtype=}"
++    assert k_nope.dtype == torch.bfloat16
++    assert k_rope.dtype == torch.bfloat16
++    assert buf.is_contiguous()
++    assert loc.is_contiguous()
++    assert k_nope.is_contiguous()
++    assert k_rope.is_contiguous()
++
++    token_stride = nope_dim + rope_dim
++    assert numel_per_page % token_stride == 0, (
++        f"bf16 page ({numel_per_page}) must be a multiple of the per-token "
++        f"stride ({token_stride})"
++    )
++
++    _set_k_bf16_kernel[(num_tokens_to_write,)](
++        buf,
++        loc,
++        k_nope,
++        k_rope,
++        k_nope.stride(0),
++        k_rope.stride(0),
++        PAGE_SIZE=page_size,
++        NUMEL_PER_PAGE=numel_per_page,
++        NOPE_DIM=nope_dim,
++        ROPE_DIM=rope_dim,
++        TOKEN_STRIDE=token_stride,
++        BLOCK_NOPE=512,
++        BLOCK_ROPE=64,
++    )
++
++
++@triton.jit
++def _set_k_bf16_kernel(
++    buf_ptr,
++    loc_ptr,
++    k_nope_ptr,
++    k_rope_ptr,
++    k_nope_ptr_stride_0,
++    k_rope_ptr_stride_0,
++    PAGE_SIZE: tl.constexpr,
++    NUMEL_PER_PAGE: tl.constexpr,
++    NOPE_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++    TOKEN_STRIDE: tl.constexpr,
++    BLOCK_NOPE: tl.constexpr,
++    BLOCK_ROPE: tl.constexpr,
++):
++    token_id = tl.program_id(0)
++    loc = tl.load(loc_ptr + token_id)
++
++    loc_page_index = loc // PAGE_SIZE
++    loc_token_offset_in_page = loc % PAGE_SIZE
++    token_base = loc_page_index * NUMEL_PER_PAGE + loc_token_offset_in_page * TOKEN_STRIDE
++
++    nope_range = tl.arange(0, BLOCK_NOPE)
++    nope_mask = nope_range < NOPE_DIM
++    k_nope = tl.load(
++        k_nope_ptr + token_id * k_nope_ptr_stride_0 + nope_range,
++        mask=nope_mask,
++        other=0.0,
++    )
++    tl.store(buf_ptr + token_base + nope_range, k_nope, mask=nope_mask)
++
++    rope_range = tl.arange(0, BLOCK_ROPE)
++    rope_mask = rope_range < ROPE_DIM
++    k_rope = tl.load(
++        k_rope_ptr + token_id * k_rope_ptr_stride_0 + rope_range,
++        mask=rope_mask,
++        other=0.0,
++    )
++    tl.store(buf_ptr + token_base + NOPE_DIM + rope_range, k_rope, mask=rope_mask)
++
++
++def _set_k_bf16_torch(
++    buf: torch.Tensor,
++    loc: torch.Tensor,
++    pack: NopeBf16RopeBf16Pack,
++    page_size: int,
++):
++    """Reference implementation of the bf16 store (used to validate the Triton
++    kernel and as a CPU/fallback path)."""
++    num_pages, numel_per_page = buf.shape
++    k_nope, k_rope = pack.k_nope_bf16, pack.k_rope_bf16
++    _, nope_dim = k_nope.shape
++    _, rope_dim = k_rope.shape
++    token_stride = nope_dim + rope_dim
++    assert buf.dtype == torch.bfloat16
++    assert buf.is_contiguous()
++
++    flat = buf.view(-1)
++    loc_page_index = loc // page_size
++    loc_token_offset_in_page = loc % page_size
++    token_base = loc_page_index * numel_per_page + loc_token_offset_in_page * token_stride
++
++    nope_idx = token_base[:, None] + torch.arange(nope_dim, device=buf.device)
++    flat[nope_idx.reshape(-1)] = k_nope.reshape(-1).to(buf.dtype)
++    rope_idx = token_base[:, None] + nope_dim + torch.arange(rope_dim, device=buf.device)
++    flat[rope_idx.reshape(-1)] = k_rope.reshape(-1).to(buf.dtype)
+diff --git a/python/sglang/srt/layers/attention/dsv4/quant_k_cache.py b/python/sglang/srt/layers/attention/dsv4/quant_k_cache.py
+index 6370bcb..9a6c903 100644
+--- a/python/sglang/srt/layers/attention/dsv4/quant_k_cache.py
++++ b/python/sglang/srt/layers/attention/dsv4/quant_k_cache.py
+@@ -2,7 +2,10 @@ import torch
+ import triton
+ import triton.language as tl
+ 
+-from sglang.srt.layers.attention.dsv4.index_buf_accessor import NopeFp8RopeBf16Pack
++from sglang.srt.layers.attention.dsv4.index_buf_accessor import (
++    NopeBf16RopeBf16Pack,
++    NopeFp8RopeBf16Pack,
++)
+ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+ 
+ fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+@@ -118,3 +121,21 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
+         k_rope_bf16=k_rope_bf16,
+         scale_k_nope_ue8m0=scale_k_nope_ue8m0,
+     )
++
++
++def pack_nope_bf16_rope_bf16(k: torch.Tensor) -> NopeBf16RopeBf16Pack:
++    """bf16 analogue of ``quant_to_nope_fp8_rope_bf16_pack_triton``: no fp8
++    quantization, no UE8M0 scales — just split the [N, 512] latent into its
++    nope (448) and rope (64) halves as native bf16. Used when the DSV4 KV pool
++    is bf16 (``--kv-cache-dtype bf16``). Accepts fp32 or bf16 input: the
++    compressor computes the compressed latent in fp32 (the fp8 path likewise
++    stores ``kv_to_store.bfloat16()``), so cast to bf16 here."""
++    k_bf16 = k.to(torch.bfloat16)
++    num_tokens, hidden_dim = k_bf16.shape
++    assert hidden_dim == 512, f"{hidden_dim=}"
++    dim_nope = 448
++    k_bf16 = k_bf16.contiguous()
++    return NopeBf16RopeBf16Pack(
++        k_nope_bf16=k_bf16[:, :dim_nope].contiguous(),
++        k_rope_bf16=k_bf16[:, dim_nope:].contiguous(),
++    )
+diff --git a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+index 77a5a13..33471a5 100644
+--- a/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
++++ b/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py
+@@ -74,6 +74,11 @@ class DeepSeekV4SingleKVPool(KVCache):
+         self.quantize_block_size = 64
+         self.rope_storage_dtype = torch.bfloat16
+         self.k_with_scale_buffer_dtype = torch.int8
++        # Dtype-honest bf16 KV opt-in (``--kv-cache-dtype bf16``). Derived purely
++        # from the pool dtype so the fp8 packed layout stays the default and is
++        # byte-identical; no extra operator env. store_dtype is set by
++        # KVCache.__init__ (bf16 dtype -> bf16 store, fp8 -> uint8).
++        self.is_bf16_kv = self.dtype == torch.bfloat16
+         self._create_buffers()
+ 
+     def _create_buffers(self):
+@@ -91,6 +96,11 @@ class DeepSeekV4SingleKVPool(KVCache):
+                 ]
+ 
+     def get_bytes_per_token(self) -> int:
++        if self.is_bf16_kv:
++            # bf16 store: value is in store_dtype (bfloat16) ELEMENTS/token, i.e.
++            # nope(448) + rope(64) = 512 contiguous bf16 elems (= 1024 bytes), no
++            # fp8 block scales and no pad byte.
++            return self.qk_nope_head_dim + self.qk_rope_head_dim
+         dim_per_token = (
+             self.qk_nope_head_dim
+             + self.qk_rope_head_dim * self.rope_storage_dtype.itemsize
+@@ -102,6 +112,25 @@ class DeepSeekV4SingleKVPool(KVCache):
+     def create_buffer(self, *, num_pages: int):
+         bytes_per_token = self.get_bytes_per_token()
+         self.kv_cache_total_dim = bytes_per_token
++
++        if self.is_bf16_kv:
++            # Single-dtype bf16: no scale region, so no 576-byte fp8 alignment.
++            # kv_cache_total_dim / bytes_per_page_padded are in bf16-ELEMENT units.
++            # Per-token stride = 512 elems (1024 B); a page is exactly page_size
++            # tokens (inherently a multiple of the token stride -> aligned).
++            self.bytes_per_page_padded = self.page_size * bytes_per_token
++            assert bytes_per_token == self.qk_nope_head_dim + self.qk_rope_head_dim, (
++                "bf16 DSV4 KV layout: qk_nope_head_dim + qk_rope_head_dim bf16 "
++                f"elems/token, got {bytes_per_token}"
++            )
++            assert self.store_dtype == torch.bfloat16
++            return torch.zeros(
++                num_pages,
++                self.bytes_per_page_padded,
++                dtype=self.store_dtype,
++                device=self.device,
++            )
++
+         bytes_per_page_non_padded = self.page_size * bytes_per_token
+         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
+ 
+@@ -137,6 +166,23 @@ class DeepSeekV4SingleKVPool(KVCache):
+         loc: torch.Tensor,
+         cache_k: torch.Tensor,
+     ) -> None:
++        if self.is_bf16_kv:
++            # No bf16 fused CUDA store kernel exists; derive the non-fused bf16
++            # store from the pool dtype so operators need not disable
++            # SGLANG_OPT_USE_FUSED_STORE_CACHE by hand. The fp8 default keeps the
++            # fused path below byte-/perf-identical.
++            from sglang.srt.layers.attention.dsv4.quant_k_cache import (
++                pack_nope_bf16_rope_bf16,
++            )
++
++            pack = pack_nope_bf16_rope_bf16(cache_k)
++            dsv4_index_buf_accessor.SetKAndS.execute(
++                pool=self,
++                buf=self.kv_buffer[layer_id],
++                loc=loc,
++                nope_fp8_rope_bf16_pack=pack,
++            )
++            return
+         return fused_store_cache(
+             input=cache_k,
+             cache=self.kv_buffer[layer_id],
+@@ -418,6 +464,13 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+             f"{c4_state_pool_size=} {c128_state_pool_size=}"
+         )
+ 
++        if dtype == torch.bfloat16:
++            logger.info(
++                "DeepSeekV4TokenToKVPool: bf16 KV cache ACTIVE (--kv-cache-dtype "
++                "bf16). Dtype-honest bf16 layout (1024 B/token vs 584 B fp8, "
++                "~1.75x); fused CUDA store auto-bypassed for bf16 pools."
++            )
++
+         self.max_num_reqs = max_num_reqs
+         self.c4_size = c4_size
+         self.c4_logical_size = c4_logical_size
+@@ -784,6 +837,11 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
+         freqs_cis: torch.Tensor,
+         positions: torch.Tensor,
+     ) -> None:
++        assert not self.swa_kv_pool.is_bf16_kv, (
++            "fused_k_norm_rope_flashmla (W4) has no bf16 store variant; it is "
++            "unused on the CUDA path. A bf16 KV pool must store via the SetKAndS "
++            "path (set_swa_key_buffer_radix / _fused)."
++        )
+         fused_k_norm_rope_flashmla(
+             kv=kv,
+             kv_weight=kv_weight,
+diff --git a/python/sglang/srt/models/deepseek_v4.py b/python/sglang/srt/models/deepseek_v4.py
+index e693c15..ac7d783 100644
+--- a/python/sglang/srt/models/deepseek_v4.py
++++ b/python/sglang/srt/models/deepseek_v4.py
+@@ -549,6 +549,27 @@ class MQALayer(nn.Module):
+         token_to_kv_pool = get_token_to_kv_pool()
+         if TYPE_CHECKING:
+             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
++        if token_to_kv_pool.swa_kv_pool.is_bf16_kv:
++            # bf16 KV (--kv-cache-dtype bf16): there is no fused norm+rope+store
++            # CUDA kernel (W4) for bf16. Apply norm+RoPE in place (identical to
++            # the DSA prefill-CP path _compute_kv_bf16), then store the
++            # dtype-honest bf16 latent through the SetKAndS path
++            # (set_swa_key_buffer_radix_fused -> set_key_buffer_fused bf16
++            # branch). fp8 keeps the fully-fused W4 kernel below, byte-identical.
++            kv = kv.contiguous()
++            fused_norm_rope_inplace(
++                kv,
++                self.kv_norm.weight.data,
++                self.eps,
++                self.freqs_cis,
++                positions,
++            )
++            token_to_kv_pool.set_swa_key_buffer_radix_fused(
++                layer_id=self.layer_id,
++                swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
++                cache_k=kv,
++            )
++            return
+         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+             layer_id=self.layer_id,
+             swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+diff --git a/python/sglang/srt/layers/attention/flash_mla_sm120.py b/python/sglang/srt/layers/attention/flash_mla_sm120.py
+index 8d49d2a..77da973 100644
+--- a/python/sglang/srt/layers/attention/flash_mla_sm120.py
++++ b/python/sglang/srt/layers/attention/flash_mla_sm120.py
+@@ -1,210 +1,38 @@
+-"""SM120 FlashMLA sparse decode implementation.
+-
+-On SM120 (Blackwell Desktop / RTX PRO 6000) the flash_mla CUDA kernel
+-is not available, so this module provides alternative implementations:
+-
+-- A fused Triton kernel (default, ``SGLANG_SM120_TRITON_FLASHMLA=1``)
+-- A pure-PyTorch fallback (``SGLANG_SM120_TRITON_FLASHMLA=0``)
+-
+-The FP8 KV cache uses a page-internal layout where NOPE+ROPE data has
+-stride (nope_dim + rope_dim*2) per token, and scales are stored in a
+-separate region at the end of each page.
++"""SM120 / bf16-KV FlashMLA sparse decode dispatch.
++
++On SM120 (Blackwell Desktop / RTX PRO 6000) and for the dtype-honest bf16 KV
++pool (``--kv-cache-dtype bf16``), the packed-fp8 flash_mla CUDA kernel is
++unavailable, so sparse MLA decode is served by the fused Triton kernel in
++``flash_mla_sm120_triton.py`` (the ``IS_BF16`` gather branch handles the bf16
++pool; the fp8 branch handles the packed-fp8 pool on SM120).
++
++There is NO pure-torch decode fallback in the serving path — it was removed by
++production decision. The torch reference implementation survives only as the
++bit-compare oracle in ``tests/deepseek-v4/test_dsv4_bf16_kv_pool.py``; no torch
++decode code is reachable from serving.
+ """
+ 
+ import logging
+ import os
+ 
+-import torch
+-
+ logger = logging.getLogger(__name__)
+ 
+-# Page layout constants for DSv4-Flash (MODEL1):
+-#   nope_dim = 448, rope_dim = 64, quantize_block_size = 64
+-#   nope_rope_stride = 448 + 64*2 = 576 bytes per token
+-#   scale_stride = ceil(448/64) + 1 = 8 bytes per token (7 scales + 1 pad)
+-#   bytes_per_token = 448 + 128 + 8 = 584
+-#   page_bytes = ceil_div(page_size * 584, 576) * 576
+-
+-_NOPE_DIM = 448
+-_ROPE_DIM = 64
+-_NOPE_ROPE_STRIDE = _NOPE_DIM + _ROPE_DIM * 2  # 576
+-_TILE_SIZE = 64
+-_NUM_TILES = _NOPE_DIM // _TILE_SIZE  # 7
+-_SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
+-_D = _NOPE_DIM + _ROPE_DIM  # 512
+-
+ 
+-def _gather_and_dequant(k_cache, indices, page_size):
+-    """Gather KV entries from the paged buffer using correct page-internal addressing.
+-
+-    Args:
+-        k_cache: (num_pages, page_size, 1, bytes_per_token) float8_e4m3fn
+-                 Non-contiguous view of the raw page buffer.
+-        indices: (...) int32/int64, token-level indices. -1 = invalid.
+-        page_size: tokens per page (256)
++def flash_mla_with_kvcache_sm120(**kwargs):
++    """SM120 / bf16-KV sparse MLA decode entry point — Triton-only.
+ 
+-    Returns:
+-        kv: (..., _D) bfloat16, dequantized KV vectors
++    Routes to the fused Triton sparse-decode kernel. If the Triton backend is
++    explicitly disabled (``SGLANG_SM120_TRITON_FLASHMLA=0``), raise rather than
++    silently degrade: the pure-torch decode fallback no longer exists here.
+     """
+-    idx_shape = indices.shape
+-    flat_idx = indices.reshape(-1)  # (N,)
+-    N = flat_idx.shape[0]
+-    device = k_cache.device
+-
+-    # Page-level addressing
+-    page_bytes = k_cache.stride(0)  # actual byte stride between pages
+-    pages = flat_idx // page_size
+-    offsets = flat_idx % page_size
+-
+-    # Clamp invalid indices
+-    safe_pages = pages.clamp(min=0)
+-    safe_offsets = offsets.clamp(min=0)
+-
+-    # Access raw buffer as uint8 — use as_strided to get full page view
+-    num_pages = k_cache.shape[0]
+-    raw_pages = k_cache.as_strided(
+-        (num_pages, page_bytes),
+-        (page_bytes, 1),
+-    ).view(
+-        torch.uint8
+-    )  # (num_pages, page_bytes) uint8
+-    # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
+-
+-    # Compute byte offsets within each page
+-    # NOPE: page[safe_page, safe_offset * 576 + 0:448]
+-    # ROPE: page[safe_page, safe_offset * 576 + 448:576]
+-    # SCALES: page[safe_page, page_size * 576 + safe_offset * 8 + 0:7]
+-
+-    nope_base = safe_offsets * _NOPE_ROPE_STRIDE  # (N,)
+-    nope_offsets = nope_base.unsqueeze(-1) + torch.arange(
+-        _NOPE_DIM, device=device, dtype=torch.long
+-    )  # (N, 448)
+-
+-    rope_base = nope_base + _NOPE_DIM  # (N,)
+-    rope_offsets = rope_base.unsqueeze(-1) + torch.arange(
+-        _ROPE_DIM * 2, device=device, dtype=torch.long
+-    )  # (N, 128)
+-
+-    scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
+-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
+-    scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
+-        _NUM_TILES, device=device, dtype=torch.long
+-    )  # (N, 7)
+-
+-    # Gather bytes per page — use advanced indexing
+-    # raw_pages[safe_pages, nope_offsets] → (N, 448)
+-    page_idx_nope = safe_pages.unsqueeze(-1).expand_as(nope_offsets)
+-    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, 448) uint8
+-
+-    page_idx_rope = safe_pages.unsqueeze(-1).expand_as(rope_offsets)
+-    rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
+-
+-    page_idx_scale = safe_pages.unsqueeze(-1).expand_as(scale_offsets)
+-    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
+-
+-    # Reinterpret dtypes
+-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
+-    rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
+-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
+-
+-    # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
+-    result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
+-    result[:, :_NOPE_DIM] = (
+-        (
+-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
+-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
+-        )
+-        .view(N, _NOPE_DIM)
+-        .to(torch.bfloat16)
+-    )
+-    result[:, _NOPE_DIM:] = rope_bf16
+-
+-    return result.reshape(*idx_shape, _D)
+-
+-
+-def _sm120_sparse_decode_fwd(
+-    q,
+-    k_cache,
+-    indices,
+-    topk_length,
+-    attn_sink,
+-    head_dim_v,
+-    softmax_scale,
+-    extra_k_cache=None,
+-    extra_indices=None,
+-    extra_topk_length=None,
+-):
+-    B, s_q, H_q, D_qk = q.shape
+-    num_pages, page_size, H_k, bpt = k_cache.shape
+-    topk = indices.shape[-1]
+-
+-    invalid_mask = indices < 0
+-    safe_indices = indices.clamp(min=0)
+-
+-    if topk_length is not None:
+-        topk_range = torch.arange(topk, device=topk_length.device).view(1, 1, topk)
+-        invalid_mask = invalid_mask | (topk_range >= topk_length.view(B, 1, 1))
+-
+-    # Gather and dequantize using page-aware addressing
+-    gathered_kv = _gather_and_dequant(k_cache, safe_indices, page_size)
+-
+-    if extra_k_cache is not None and extra_indices is not None:
+-        extra_topk = extra_indices.shape[-1]
+-        extra_page_size = extra_k_cache.shape[1]
+-        extra_invalid = extra_indices < 0
+-        extra_safe = extra_indices.clamp(min=0)
+-        if extra_topk_length is not None:
+-            extra_range = torch.arange(
+-                extra_topk, device=extra_topk_length.device
+-            ).view(1, 1, extra_topk)
+-            extra_invalid = extra_invalid | (
+-                extra_range >= extra_topk_length.view(B, 1, 1)
+-            )
+-        extra_kv = _gather_and_dequant(extra_k_cache, extra_safe, extra_page_size)
+-        gathered_kv = torch.cat([gathered_kv, extra_kv], dim=2)
+-        invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
+-
+-    gathered_kv[invalid_mask] = 0.0
+-
+-    q_f = q.float()
+-    kv_f = gathered_kv.float()
+-    kv_d = kv_f.shape[-1]
+-    if D_qk != kv_d:
+-        q_f = q_f[..., :kv_d]
+-
+-    scores = torch.einsum("bshd,bstd->bsht", q_f, kv_f) * softmax_scale
+-    scores.masked_fill_(invalid_mask.unsqueeze(2).expand_as(scores), float("-inf"))
+-
+-    lse = torch.logsumexp(scores, dim=-1)
+-
+-    if attn_sink is not None:
+-        lse_for_out = torch.logsumexp(
+-            torch.stack([lse, attn_sink.view(1, 1, H_q).expand_as(lse)], dim=0), dim=0
++    if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") != "1":
++        raise RuntimeError(
++            "SM120/bf16-KV sparse MLA decode requires the Triton kernel "
++            "(SGLANG_SM120_TRITON_FLASHMLA=1). The pure-torch decode fallback "
++            "has been removed from the serving path; it survives only as the "
++            "bit-compare reference in tests/deepseek-v4/test_dsv4_bf16_kv_pool.py."
+         )
+-    else:
+-        lse_for_out = lse.clone()
+-
+-    lonely = lse == float("-inf")
+-    lse_for_out[lonely] = float("inf")
+-    weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
+-    out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
+-    out[lonely.unsqueeze(-1).expand_as(out)] = 0.0
+ 
+-    return out.to(torch.bfloat16), lse.permute(0, 2, 1)
+-
+-
+-# Default SM120 FlashMLA backend: "triton" (optimized) or "torch" (pure-PyTorch fallback).
+-# Controlled by SGLANG_SM120_TRITON_FLASHMLA env var (1=triton, 0=torch).
+-_sm120_default_backend = (
+-    "triton" if os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1" else "torch"
+-)
+-
+-
+-def flash_mla_with_kvcache_sm120(**kwargs):
+-    """SM120 FlashMLA sparse decode entry point.
+-
+-    Dispatches to the Triton kernel (default) or PyTorch fallback.
+-    """
+     q = kwargs["q"]
+     k_cache = kwargs["k_cache"]
+     indices = kwargs["indices"]
+@@ -218,26 +46,11 @@ def flash_mla_with_kvcache_sm120(**kwargs):
+     extra_indices = kwargs.get("extra_indices_in_kvcache")
+     extra_topk_length = kwargs.get("extra_topk_length")
+ 
+-    if _sm120_default_backend == "triton":
+-        from sglang.srt.layers.attention.flash_mla_sm120_triton import (
+-            flash_mla_sparse_decode_triton,
+-        )
+-
+-        out, lse = flash_mla_sparse_decode_triton(
+-            q,
+-            k_cache,
+-            indices,
+-            topk_length,
+-            attn_sink,
+-            head_dim_v,
+-            softmax_scale,
+-            extra_k_cache,
+-            extra_indices,
+-            extra_topk_length,
+-        )
+-        return (out, lse)
++    from sglang.srt.layers.attention.flash_mla_sm120_triton import (
++        flash_mla_sparse_decode_triton,
++    )
+ 
+-    out, lse = _sm120_sparse_decode_fwd(
++    out, lse = flash_mla_sparse_decode_triton(
+         q,
+         k_cache,
+         indices,
+diff --git a/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py b/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
+index 20ffb4d..f6ee4d8 100644
+--- a/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
++++ b/python/sglang/srt/layers/attention/flash_mla_sm120_triton.py
+@@ -79,6 +79,7 @@ def _tiled_sparse_decode_kernel(
+     NOPE_PAD: tl.constexpr,  # 512 (padded from 448)
+     ROPE_DIM: tl.constexpr,  # 64
+     NOPE_DIM_RT: tl.int32,  # 448 (runtime, for masking)
++    IS_BF16: tl.constexpr,  # bf16 KV pool: dtype-honest [nope|rope] bf16, no fp8/scales
+     BLOCK_T: tl.constexpr,  # tokens per tile (16 or 32)
+ ):
+     """Tiled sparse decode: vectorized gather + QK + softmax + V accumulation.
+@@ -134,37 +135,62 @@ def _tiled_sparse_decode_kernel(
+         safe_indices = tl.where(idx_valid, raw_indices, tl.zeros_like(raw_indices))
+         page_ids = (safe_indices // page_size).to(tl.int64)
+         page_offs_t = (safe_indices % page_size).to(tl.int64)
+-        token_data_bases = page_ids * page_bytes + page_offs_t * 576  # [BLOCK_T] int64
+-
+-        # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
+-        nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
+         nope_2d_mask = idx_valid[:, None] & nope_mask[None, :]
+-        kv_nope_fp8 = tl.load(
+-            cache_fp8_ptr + nope_addrs,
+-            mask=nope_2d_mask,
+-            other=0.0,
+-        )
+-
+-        # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
+-        scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
+-        scale_addrs = scale_bases[:, None] + group_ids[None, :]
+-        scale_raw = tl.load(
+-            cache_uint8_ptr + scale_addrs,
+-            mask=nope_2d_mask,
+-            other=127,
+-        )
+-        scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
+-        kv_nope = tl.where(nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0)
+-
+-        # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
+-        rope_byte_bases = token_data_bases + 448
+-        rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)
+-        rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
+-        kv_rope = tl.load(
+-            cache_bf16_ptr + rope_addrs,
+-            mask=idx_valid[:, None],
+-            other=0.0,
+-        ).to(tl.float32)
++        if IS_BF16:
++            # ---- bf16 pool: [nope(448) | rope(64)] contiguous bf16, no scales ----
++            # page_bytes carries the page stride in bf16 ELEMENTS; per-token
++            # stride = NOPE_DIM_RT + ROPE_DIM (=512) bf16 elems.
++            token_bases = (
++                page_ids * page_bytes + page_offs_t * (NOPE_DIM_RT + ROPE_DIM)
++            )  # [BLOCK_T] int64, bf16 elems
++            nope_addrs = token_bases[:, None] + nope_offs[None, :].to(tl.int64)
++            kv_nope_bf16 = tl.load(
++                cache_bf16_ptr + nope_addrs,
++                mask=nope_2d_mask,
++                other=0.0,
++            )
++            kv_nope = tl.where(nope_2d_mask, kv_nope_bf16.to(tl.float32), 0.0)
++            rope_addrs = (
++                token_bases[:, None] + NOPE_DIM_RT + rope_offs[None, :].to(tl.int64)
++            )
++            kv_rope = tl.load(
++                cache_bf16_ptr + rope_addrs,
++                mask=idx_valid[:, None],
++                other=0.0,
++            ).to(tl.float32)
++        else:
++            token_data_bases = page_ids * page_bytes + page_offs_t * 576  # [BLOCK_T] int64
++
++            # ---- Vectorized NOPE FP8 gather: [BLOCK_T, NOPE_PAD] ----
++            nope_addrs = token_data_bases[:, None] + nope_offs[None, :].to(tl.int64)
++            kv_nope_fp8 = tl.load(
++                cache_fp8_ptr + nope_addrs,
++                mask=nope_2d_mask,
++                other=0.0,
++            )
++
++            # ---- Vectorized scale gather + dequant: [BLOCK_T, NOPE_PAD] ----
++            scale_bases = page_ids * page_bytes + scale_section_off + page_offs_t * 8
++            scale_addrs = scale_bases[:, None] + group_ids[None, :]
++            scale_raw = tl.load(
++                cache_uint8_ptr + scale_addrs,
++                mask=nope_2d_mask,
++                other=127,
++            )
++            scale_f32 = tl.math.exp2(scale_raw.to(tl.float32) - 127.0)
++            kv_nope = tl.where(
++                nope_2d_mask, kv_nope_fp8.to(tl.float32) * scale_f32, 0.0
++            )
++
++            # ---- Vectorized ROPE BF16 gather: [BLOCK_T, ROPE_DIM] ----
++            rope_byte_bases = token_data_bases + 448
++            rope_elem_bases = (rope_byte_bases // 2).to(tl.int64)
++            rope_addrs = rope_elem_bases[:, None] + rope_offs[None, :].to(tl.int64)
++            kv_rope = tl.load(
++                cache_bf16_ptr + rope_addrs,
++                mask=idx_valid[:, None],
++                other=0.0,
++            ).to(tl.float32)
+ 
+         # ---- Vectorized QK scores: [BLOCK_T] ----
+         # scores[t] = dot(q_nope, kv_nope[t]) + dot(q_rope, kv_rope[t])
+@@ -216,7 +242,12 @@ def _run_triton_sparse_decode(
+     B, _, H, D = q.shape
+     num_pages = k_cache.shape[0]
+     page_size = k_cache.shape[1]
+-    page_bytes = k_cache.stride(0)  # elements = bytes for float8
++    # For fp8/uint8 caches stride(0) is in bytes (1 byte/elem); for the
++    # dtype-honest bf16 pool it is in bf16 ELEMENTS (page_size * 512). The
++    # kernel's IS_BF16 branch consumes page_bytes in the matching unit, so no
++    # rescale is needed here — the dtype of k_cache carries the unit.
++    is_bf16 = k_cache.dtype == torch.bfloat16
++    page_bytes = k_cache.stride(0)
+ 
+     # Flatten indices to [B, topk]
+     flat_indices = indices.reshape(B, -1).contiguous()
+@@ -232,12 +263,16 @@ def _run_triton_sparse_decode(
+     raw_fp8 = raw_uint8.view(torch.float8_e4m3fn)
+     raw_bf16 = raw_uint8.view(torch.bfloat16)
+ 
+-    # Squeeze Q: [B, H, D]
++    # Squeeze Q: [B, H, D]. Q may be D_qk-wide (576 = 512 latent + 64 rope);
++    # the kernel only consumes q[0:512] via nope(448)+rope(64) offsets.
+     q3 = q.squeeze(1)
+     if not q3.is_contiguous():
+         q3 = q3.contiguous()
+ 
+-    out = torch.zeros(B, H, D, dtype=torch.bfloat16, device=q.device)
++    # Output width is the kernel's fixed latent size (_D = nope 448 + rope 64 =
++    # 512), NOT q's D_qk. Sizing by q.shape[-1] would leave a 64-wide zero tail
++    # for 576-wide queries and diverge from the torch reference (head_dim_v).
++    out = torch.zeros(B, H, _D, dtype=torch.bfloat16, device=q.device)
+     lse = torch.full((B, H), float("-inf"), dtype=torch.float32, device=q.device)
+ 
+     # Round topk for autotune key stability
+@@ -273,6 +308,7 @@ def _run_triton_sparse_decode(
+         NOPE_PAD=512,
+         ROPE_DIM=_ROPE_DIM,
+         NOPE_DIM_RT=_NOPE_DIM,
++        IS_BF16=is_bf16,
+     )
+ 
+     # Return [B, 1, H, D] and [B, 1, H]
+diff --git a/python/sglang/srt/model_executor/pool_configurator.py b/python/sglang/srt/model_executor/pool_configurator.py
+index 5803e0b..e4aacc7 100644
+--- a/python/sglang/srt/model_executor/pool_configurator.py
++++ b/python/sglang/srt/model_executor/pool_configurator.py
+@@ -318,6 +318,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+         cfg = mr.model_config
+         self.qk_nope_head_dim = cfg.qk_nope_head_dim
+         self.qk_rope_head_dim = cfg.qk_rope_head_dim
++        self.kv_cache_dtype = mr.kv_cache_dtype
+         self.indexer_head_dim = cfg.index_head_dim
+         # PP-local slice; matches DeepSeekV4TokenToKVPool's stage_ratios.
+         self.compression_ratios = cfg.compress_ratios[mr.start_layer : mr.end_layer]
+@@ -370,7 +371,14 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
+             logger.info("DSV4 compressed attention: online c128 enabled (ring_size=1)")
+ 
+     def _get_bytes_per_full_token(self) -> float:
+-        kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
++        if self.kv_cache_dtype == torch.bfloat16:
++            # bf16 KV (--kv-cache-dtype bfloat16): pools store [nope|rope] as
++            # contiguous bf16 (512 elems = 1024 B/token), no fp8 scale bytes.
++            # Sizing MUST match DeepSeekV4TokenToKVPool or the pool allocation
++            # overshoots available_bytes by ~1.75x and OOMs at engine init.
++            kv_bytes = (self.qk_nope_head_dim + self.qk_rope_head_dim) * 2
++        else:
++            kv_bytes = self.qk_nope_head_dim + self.qk_rope_head_dim * 2 + 8
+ 
+         quant_block_size = 128
+         indexer_bytes = (

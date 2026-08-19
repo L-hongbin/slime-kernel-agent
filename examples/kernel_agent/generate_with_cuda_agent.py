@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import hashlib
 import json
@@ -9,13 +10,21 @@ import time
 from copy import deepcopy
 from typing import Any
 
+import numpy as np
+
 try:
     import ray
 except ImportError:
     ray = None
 
-from slime.rollout.sglang_rollout import GenerateState
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    _decode_routed_experts,
+    _empty_predictive_support,
+    _extract_predictive_support,
+)
 from slime.utils.http_utils import post
+from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
 from slime.utils.types import Sample
 
 try:
@@ -389,6 +398,77 @@ def _get_entry_point(sample: Sample) -> Any:
     return "Model"
 
 
+_PRECISION_ALIASES = {
+    "fp32": "fp32",
+    "float32": "fp32",
+    "torch.float32": "fp32",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "half": "fp16",
+    "torch.float16": "fp16",
+    "torch.half": "fp16",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "torch.bfloat16": "bf16",
+}
+
+
+def _canonical_task_precision(value: Any) -> str | None:
+    if value is None:
+        return None
+    return _PRECISION_ALIASES.get(str(value).strip().lower())
+
+
+def _reference_input_precision(reference_code: Any) -> str:
+    """Infer the effective input precision from ``get_inputs`` only.
+
+    Serial layout augmentation intentionally leaves ``augmentation.dtype_after``
+    empty on the layout child even when its parent was a dtype intervention.  The
+    rewritten reference remains authoritative, though: all floating factories in
+    ``get_inputs`` carry the selected ``torch.float16``/``torch.bfloat16`` dtype.
+    Restricting inference to that function avoids treating unrelated casts in the
+    model implementation as the task's input precision.
+    """
+
+    if not isinstance(reference_code, str) or not reference_code.strip():
+        return "fp32"
+    try:
+        tree = ast.parse(reference_code)
+    except (SyntaxError, ValueError, TypeError):
+        return "fp32"
+
+    detected: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "get_inputs":
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id == "torch":
+                precision = _canonical_task_precision(f"torch.{child.attr}")
+                if precision in {"fp16", "bf16"}:
+                    detected.add(precision)
+
+    # The augmentation contract uses one low-precision dtype for every floating
+    # input.  Ambiguous mixed-dtype references retain the historical fp32 policy
+    # instead of silently weakening the static precision check.
+    return next(iter(detected)) if len(detected) == 1 else "fp32"
+
+
+def _resolve_task_precision(sample: Sample, reference_code: Any) -> str:
+    """Resolve the precision KernelGym should enforce for this task."""
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    augmentation = metadata.get("augmentation")
+    if isinstance(augmentation, dict):
+        explicit = _canonical_task_precision(augmentation.get("dtype_after"))
+        if explicit is not None:
+            return explicit
+
+    explicit = _canonical_task_precision(metadata.get("precision"))
+    if explicit is not None:
+        return explicit
+    return _reference_input_precision(reference_code)
+
+
 def _reference_cache_uuid(ground_truth: Any, entry_point: Any) -> str | None:
     """Collision-resistant key for KernelGym's reference-timing cache.
 
@@ -459,6 +539,8 @@ async def cuda_kernel_env(
     turn_idx: int,
 ) -> dict[str, Any]:
     entry_point = _get_entry_point(sample)
+    ground_truth = _get_label_value(sample, "ground_truth")
+    precision = _resolve_task_precision(sample, ground_truth)
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
@@ -470,13 +552,13 @@ async def cuda_kernel_env(
             precheck_result.setdefault("decoy_kernel", None)
             return {"env_state": precheck_result, "reward_extra_info": precheck_result}
 
-    ground_truth = _get_label_value(sample, "ground_truth")
     payload = {
         "response": response,
         "ground_truth": ground_truth,
         "kernel_backend": kernel_backend,
         "reference_backend": reference_backend,
         "entry_point": entry_point,
+        "precision": precision,
         # Reference-timing cache key: a hash of the reference identity, NOT any
         # dataset-supplied id — a bare problem_id/name (or a non-unique explicit
         # uuid) would false-share a wrong cached baseline across datasets on a
@@ -508,12 +590,23 @@ def _sample_for_turn(
     env_result: dict[str, Any],
     args: Any = None,
     meta_info: dict[str, Any] | None = None,
+    predictive_support: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> Sample:
     turn_sample = deepcopy(base_sample)
     turn_sample.tokens = prompt_ids + response_ids
     turn_sample.response = response
     turn_sample.response_length = len(response_ids)
     turn_sample.rollout_log_probs = log_probs
+    if predictive_support is None:
+        turn_sample.rollout_topk_token_ids = None
+        turn_sample.rollout_topk_log_probs = None
+        turn_sample.rollout_topk_valid_mask = None
+    else:
+        (
+            turn_sample.rollout_topk_token_ids,
+            turn_sample.rollout_topk_log_probs,
+            turn_sample.rollout_topk_valid_mask,
+        ) = predictive_support
     turn_sample.reward = reward
     turn_sample.status = status
     turn_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
@@ -535,6 +628,18 @@ def _sample_for_turn(
         if getattr(args, "sglang_speculative_algorithm", None):
             turn_sample.spec_info.add(meta_info=meta_info)
         turn_sample.prefix_cache_info.add(meta_info=meta_info)
+        # V4 MoE routing replay: decode this call's routed-expert indices into the
+        # turn sample (mirrors the default rollout, sglang_rollout.py; row count
+        # must be len(tokens)-1 per the upstream shape contract, THUDM/slime
+        # 1b73ddc1). fill_routing_replay requires this on EVERY sample when
+        # --use-rollout-routing-replay is set.
+        if getattr(args, "use_rollout_routing_replay", False) and "routed_experts" in meta_info:
+            turn_sample.rollout_routed_experts = _decode_routed_experts(
+                meta_info,
+                token_count=len(turn_sample.tokens) - 1,
+                num_layers=args.num_layers,
+                expected_topk=getattr(args, "moe_router_topk", None),
+            )
     return turn_sample
 
 
@@ -545,6 +650,7 @@ def _pad_turn_samples(
     max_turns: int,
     pad_token_id: int | None,
     pad_token: str | None,
+    predictive_top_k: int = 0,
 ) -> list[Sample]:
     if pad_token_id is None or pad_token is None:
         raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
@@ -564,8 +670,27 @@ def _pad_turn_samples(
         fake_sample.response = pad_token
         fake_sample.response_length = 1
         fake_sample.rollout_log_probs = [0.0]
+        if predictive_top_k:
+            (
+                fake_sample.rollout_topk_token_ids,
+                fake_sample.rollout_topk_log_probs,
+                fake_sample.rollout_topk_valid_mask,
+            ) = _empty_predictive_support(1, predictive_top_k)
+        else:
+            fake_sample.rollout_topk_token_ids = None
+            fake_sample.rollout_topk_log_probs = None
+            fake_sample.rollout_topk_valid_mask = None
         fake_sample.reward = 0.0
         fake_sample.status = Sample.Status.COMPLETED
+        # V4 routing replay: a pad turn has len(tokens)-1 == 0 replayable tokens,
+        # so it carries an EMPTY (0, num_layers, topk) routed array — shape taken
+        # from any real turn — satisfying fill_routing_replay's per-sample
+        # invariant without influencing training (loss_mask 0, remove_sample).
+        for real in output_samples:
+            routed = getattr(real, "rollout_routed_experts", None)
+            if routed is not None:
+                fake_sample.rollout_routed_experts = routed[:0]
+                break
         fake_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
         fake_sample.loss_mask = [0]
         fake_sample.remove_sample = True
@@ -628,6 +753,17 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
     aborted.response = ""
     aborted.response_length = 1
     aborted.rollout_log_probs = [0.0]
+    predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
+    if predictive_top_k:
+        (
+            aborted.rollout_topk_token_ids,
+            aborted.rollout_topk_log_probs,
+            aborted.rollout_topk_valid_mask,
+        ) = _empty_predictive_support(1, predictive_top_k)
+    else:
+        aborted.rollout_topk_token_ids = None
+        aborted.rollout_topk_log_probs = None
+        aborted.rollout_topk_valid_mask = None
     aborted.reward = 0.0
     aborted.status = Sample.Status.ABORTED
     aborted.group_id = sample.group_id if sample.group_id is not None else sample.index
@@ -652,6 +788,7 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
             max_turns=max_turns,
             pad_token_id=pad_token_id,
             pad_token=pad_token,
+            predictive_top_k=predictive_top_k,
         )
     return postprocess_turn_samples(args, output_samples, finish_reason="aborted")
 
@@ -739,6 +876,26 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
+        if predictive_top_k < 0:
+            raise ValueError(f"dppo_predictive_top_k must be non-negative, got {predictive_top_k}")
+        if predictive_top_k:
+            payload["top_logprobs_num"] = predictive_top_k
+        # V4 MoE routing replay: ask the engine for the per-token routed-expert
+        # indices so the train side can replay rollout routing (same request the
+        # default slime rollout makes, sglang_rollout.py). Each turn is a
+        # standalone Sample (tokens = this call's prompt+response), so the
+        # per-call payload aligns with the turn sample 1:1.
+        if getattr(args, "use_rollout_routing_replay", False):
+            payload["return_routed_experts"] = True
+        # Route to the currently-served (alternating) LoRA adapter, mirroring the
+        # default slime rollout (sglang_rollout.py generate). Without this the
+        # USE_LORA_WEIGHT_SYNC path would serve the base model on this custom
+        # rollout. The active name is refreshed onto the shared GenerateState by
+        # the RolloutManager each step; None -> base-only (unset lora_path).
+        lora_path = _rollout_lora_path(args, state.active_lora_name)
+        if lora_path is not None:
+            payload["lora_path"] = lora_path
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
         output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
@@ -756,6 +913,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                     max_turns=max_turns,
                     pad_token_id=pad_token_id,
                     pad_token=pad_token,
+                    predictive_top_k=predictive_top_k,
                 )
             output_samples = postprocess_turn_samples(
                 args,
@@ -766,11 +924,27 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                 return output_samples
             return output_samples[-1] if output_samples else sample
 
-        token_logprobs = output["meta_info"].get("output_token_logprobs", [])
-        response_ids = [item[1] for item in token_logprobs]
-        log_probs = [item[0] for item in token_logprobs]
+        predictive_support = None
+        if predictive_top_k:
+            (
+                response_ids,
+                log_probs,
+                support_token_ids,
+                support_log_probs,
+                support_valid_mask,
+            ) = _extract_predictive_support(output["meta_info"], predictive_top_k)
+            predictive_support = (support_token_ids, support_log_probs, support_valid_mask)
+        else:
+            token_logprobs = output["meta_info"].get("output_token_logprobs", [])
+            response_ids = [item[1] for item in token_logprobs]
+            log_probs = [item[0] for item in token_logprobs]
         response = output["text"]
         if not response_ids:
+            if predictive_top_k and response:
+                raise ValueError(
+                    "SGLang returned non-empty response text without output_token_logprobs "
+                    "while predictive-mask support is enabled"
+                )
             response_ids = state.tokenizer(response, add_special_tokens=False)["input_ids"]
             log_probs = [0.0] * len(response_ids)
 
@@ -796,6 +970,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             env_result=env_result,
             args=args,
             meta_info=output["meta_info"],
+            predictive_support=predictive_support,
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time
@@ -857,6 +1032,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             max_turns=max_turns,
             pad_token_id=pad_token_id,
             pad_token=pad_token,
+            predictive_top_k=int(getattr(args, "dppo_predictive_top_k", 0) or 0),
         )
     output_samples = postprocess_turn_samples(
         args,
