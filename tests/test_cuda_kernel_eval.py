@@ -6,17 +6,17 @@ from types import SimpleNamespace
 import pytest
 
 from examples.kernel_agent import generate_with_cuda_agent
+from examples.kernel_agent import utils as kernel_agent_utils
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.utils import (
+    PRECHECK_ERROR,
     extract_cuda_agent_kernel_code,
     normalize_env_feedback,
     parse_cuda_agent_response,
-    precheck_cuda_agent_response,
-    precheck_tvm_ffi_response,
+    precheck_response,
     split_think_response,
 )
 from slime.utils.types import Sample
-
 
 VALID_CUDA_AGENT_RESPONSE = """
 ### CUDA_KERNELS
@@ -305,7 +305,7 @@ def _skip_unselected_compiled_case(request, case, compiled_key):
 
 
 def _format_feedback_for_test(env_result):
-    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_templates=None))
+    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_template=None))
     return generate_with_cuda_agent._apply_feedback_template(env_result, template)
 
 
@@ -313,12 +313,16 @@ def _format_feedback_for_test(env_result):
 @pytest.mark.parametrize("case", KERNEL_EVAL_CASES)
 def test_precheck_accepts_cuda_agent_responses_from_compiled_feedback_cases(request, case):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
-    assert precheck_cuda_agent_response(VALID_CUDA_AGENT_RESPONSE, "Model") is None
+    precheck_passed, precheck_state = precheck_response(VALID_CUDA_AGENT_RESPONSE, "Model", "cuda_agent")
+    assert precheck_passed is True
+    assert precheck_state is None
 
 
 @pytest.mark.unit
 def test_precheck_accepts_tvm_ffi_responses():
-    assert precheck_tvm_ffi_response(VALID_TVM_FFI_RESPONSE, "Model") is None
+    precheck_passed, precheck_state = precheck_response(VALID_TVM_FFI_RESPONSE, "Model", "tvm_ffi")
+    assert precheck_passed is True
+    assert precheck_state is None
 
 
 @pytest.mark.unit
@@ -327,7 +331,8 @@ def test_precheck_rejects_tvm_ffi_missing_export():
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward, copy_forward);",
         "TVM_FFI_DLL_EXPORT_TYPED_FUNC(copy_forward_exported, copy_forward);",
     )
-    result = precheck_tvm_ffi_response(response, "Model")
+    precheck_passed, result = precheck_response(response, "Model", "tvm_ffi")
+    assert precheck_passed is False
     assert result is not None
     assert "TVM-FFI model calls are not exported: copy_forward" in result["error_message"]
 
@@ -386,15 +391,28 @@ class ModelNew(nn.Module):
 @pytest.mark.parametrize("case", KERNEL_EVAL_CASES)
 def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, monkeypatch, caplog, case):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_sample_rate", 1.0)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
 
     captured_payload = {}
 
     async def fake_run_kernel_eval(args, sample, payload, config):
         captured_payload.update(payload)
-        env_state = normalize_env_feedback(case["env_state"])
-        return {"env_state": env_state, "reward_extra_info": env_state}
+        raw_env_state = dict(case["env_state"])
+        raw_env_state["metadata"] = {
+            **case["env_state"].get("metadata", {}),
+            "kg_kernel_backend_compile_s": 1.0,
+            "kg_kernel_perf_warmup_s": 0.5,
+            "kg_kernel_perf_measure_wall_s": 1.5,
+            "kg_kernel_perf_profile_s": 3.0,
+            "kg_kernel_perf_mean_ms": 10.0,
+            "kg_kernel_perf_std_ms": 2.5,
+            "kg_reference_perf_warmup_s": 1.0,
+            "kg_reference_perf_measure_wall_s": 3.0,
+            "kg_reference_perf_mean_ms": 20.0,
+            "kg_reference_perf_std_ms": 4.0,
+        }
+        return {"env_state": raw_env_state}
 
     monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
 
@@ -404,13 +422,13 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         metadata={
             "uuid": case["uuid"],
             "source_row": case["source_row"],
-            "log_multi_turn": True,
+            "log_rollout_info": True,
         },
     )
 
     env_result = asyncio.run(
         generate_with_cuda_agent.cuda_kernel_env(
-            SimpleNamespace(kernel_backend="cuda_agent", do_precheck=False),
+            SimpleNamespace(kernel_backend="cuda_agent", reference_backend="torch", do_precheck=False),
             sample,
             VALID_CUDA_AGENT_RESPONSE,
             turn_idx=0,
@@ -440,12 +458,18 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         assert "Compilation failed. Compiler output:" in env_state["error_message"]
         assert "nvcc fatal: syntax error" in env_state["error_message"]
         assert "compile_only" not in env_state["metadata"]
+        assert "device" not in env_state["metadata"]
         assert "entry_point" not in env_state["metadata"]
         assert "required_resource" not in env_state["metadata"]
         assert "task_id" not in env_state["metadata"]
         assert "inline_gpu_execute_completed" not in env_state["metadata"]
         assert "inline_compile_worker_id" not in env_state["metadata"]
         assert "inline_compile_worker_device" not in env_state["metadata"]
+        assert "correctness_tf32_state_before" not in env_state["metadata"]
+        assert "correctness_tf32_state_forced" not in env_state["metadata"]
+        assert "correctness_atol" not in env_state["metadata"]
+        assert "correctness_rtol" not in env_state["metadata"]
+        assert "runtime_error" not in env_state["metadata"]
         assert env_state["metadata"]["refer_entry_point"] == "Model"
         assert env_state["metadata"]["kernel_entry_point"] == "ModelNew"
         assert "error" not in env_state["metadata"]["compile_artifact"]
@@ -455,10 +479,16 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         assert "compiled" not in env_state["metadata"]["compile_artifact"]
         assert "source_mode" not in env_state["metadata"]["compile_artifact"]
         assert "entry_point" not in env_state["metadata"]["compile_artifact"]
+        assert "module_name" not in env_state["metadata"]["compile_artifact"]
+        assert "profiling_hints" not in env_state["metadata"]["compile_artifact"]
+        assert "artifact_node_id" not in env_state["metadata"]["compile_artifact"]
+        assert "artifact_hostname" not in env_state["metadata"]["compile_artifact"]
+        assert "target_gpu_worker_id" not in env_state["metadata"]["compile_artifact"]
+        assert "target_gpu_selection_strategy" not in env_state["metadata"]["compile_artifact"]
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
     response_with_think = f"<think>\ntry a simple copy kernel\n</think>\n{VALID_CUDA_AGENT_RESPONSE}"
-    generate_with_cuda_agent._log_multiturn_messages(
+    generate_with_cuda_agent._log_rollout_info(
         sample,
         messages=[
             {"role": "user", "content": sample.prompt},
@@ -468,6 +498,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         turn_logs=[
             {
                 "turn_idx": 0,
+                "task_id": case["env_state"]["task_id"],
                 "model_time": 0.25,
                 "env_time": 0.75,
                 "prompt_tokens": 16,
@@ -475,21 +506,29 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
                 "finish_type": "stop",
                 "prompt": sample.prompt,
                 "response": response_with_think,
-                "env_state": env_state,
                 "env_result": env_result,
                 "format_feedback": format_feedback,
             }
         ],
         finish_reason="max_turns",
+        should_log=True,
         is_slowest=True,
         total_request_time=1.0,
     )
 
-    assert "[cuda_agent][multi_turn][slowest]" in caplog.text
+    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
     assert "total_request_time=1.000s" in caplog.text
     assert f"compiled={case['feedback_compiled']}" in caplog.text
     expected_reward = 1.2456140350877192 if case["feedback_compiled"] else 0.0
     assert f"reward={expected_reward}" in caplog.text
+    assert "precheck=passed" in caplog.text
+    assert f"task_id={case['env_state']['task_id']}" in caplog.text
+    assert "reward=" in caplog.text
+    assert "detail_env_time=" in caplog.text
+    assert "compile_time" in caplog.text
+    assert "perf_cv=" in caplog.text
+    assert "kernel_perf_cv" in caplog.text
+    assert "refer_perf_cv" in caplog.text
     assert case["uuid"] in caplog.text
     assert "format_feedback" in caplog.text
     assert format_feedback in caplog.text
@@ -508,7 +547,7 @@ def test_cuda_kernel_env_defaults_missing_entry_point_to_model(monkeypatch):
 
     async def fake_run_kernel_eval(args, sample, payload, config):
         captured_payload.update(payload)
-        env_state = normalize_env_feedback({"compiled": True, "correctness": True, "speedup": 1.0})
+        env_state = {"compiled": True, "correctness": True, "speedup": 1.0, "metadata": {}}
         return {"env_state": env_state, "reward_extra_info": env_state}
 
     monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
@@ -623,7 +662,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "kernel_eval_heartbeat_interval", 5.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "num_correct_trials", 1)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "num_perf_trials", 1)
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_sample_rate", 1.0)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
 
     sample = Sample(
@@ -632,7 +671,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
         metadata={
             "uuid": case["uuid"],
             "source_row": "integration",
-            "log_multi_turn": True,
+            "log_rollout_info": True,
         },
     )
 
@@ -649,7 +688,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
     print(f"\n[cuda_agent][test][format_feedback][{case['uuid']}]\n{format_feedback}")
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
-    generate_with_cuda_agent._log_multiturn_messages(
+    generate_with_cuda_agent._log_rollout_info(
         sample,
         messages=[
             {"role": "user", "content": sample.prompt},
@@ -666,18 +705,205 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
                 "finish_type": "stop",
                 "prompt": sample.prompt,
                 "response": case["response"],
-                "env_state": env_state,
+                "env_result": env_result,
                 "format_feedback": format_feedback,
             }
         ],
         finish_reason="max_turns",
+        should_log=True,
         is_slowest=True,
         total_request_time=float(env_state.get("processing_time") or 0.0),
     )
 
     assert env_state["status"] in {"completed", "failed", "timeout", "cancelled"}
     assert env_state.get("compiled") is case["expected_compiled"]
-    assert "[cuda_agent][multi_turn][slowest]" in caplog.text
+    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
     assert case["uuid"] in caplog.text
     assert "format_feedback" in caplog.text
     assert "Server feedback (status/metrics/errors):" in caplog.text
+
+
+def test_extract_detail_env_time_from_raw_env_state():
+    raw_env_state = {
+        "metadata": {
+            "kg_kernel_backend_compile_s": 1.5,
+            "kg_kernel_perf_warmup_s": 0.25,
+            "kg_kernel_perf_measure_wall_s": 2.75,
+            "kg_kernel_perf_profile_s": 0.5,
+            "kg_reference_perf_warmup_s": 0.1,
+            "kg_reference_perf_measure_wall_s": 0.9,
+        }
+    }
+
+    detail_env_time = kernel_agent_utils._extract_detail_env_time(raw_env_state)
+
+    assert detail_env_time == {
+        "compile_time": 1.5,
+        "kernel_runtime": 3.0,
+        "profile_time": 0.5,
+        "refer_runtime": 1.0,
+    }
+
+
+def test_cuda_kernel_env_returns_detail_env_time(monkeypatch):
+    async def fake_run_kernel_eval(args, sample, payload, config):
+        return {
+            "env_state": {
+                "status": "completed",
+                "compiled": True,
+                "correctness": True,
+                "speedup": 1.0,
+                "decoy_kernel": False,
+                "metadata": {
+                    "kg_kernel_backend_compile_s": 4.0,
+                    "kg_kernel_perf_warmup_s": 0.5,
+                    "kg_kernel_perf_measure_wall_s": 1.5,
+                    "kg_kernel_perf_profile_s": 2.0,
+                    "kg_kernel_perf_mean_ms": 10.0,
+                    "kg_kernel_perf_std_ms": 2.5,
+                    "kg_reference_perf_warmup_s": 0.25,
+                    "kg_reference_perf_measure_wall_s": 0.75,
+                    "kg_reference_perf_mean_ms": 20.0,
+                    "kg_reference_perf_std_ms": 4.0,
+                },
+            }
+        }
+
+    monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
+    monkeypatch.setattr(generate_with_cuda_agent, "next_kernel_task_id", lambda: "parallel_task_detail_time")
+
+    args = SimpleNamespace(
+        kernel_backend="cuda",
+        reference_backend="torch",
+        enable_response_precheck=False,
+    )
+    sample = Sample(
+        prompt="prompt", label={"ground_truth": REFERENCE_IDENTITY_CODE, "entry_point": "Model"}, metadata={}
+    )
+
+    env_result = asyncio.run(generate_with_cuda_agent.cuda_kernel_env(args, sample, VALID_CUDA_AGENT_RESPONSE, 0))
+
+    env_extra_info = env_result["env_extra_info"]
+    assert env_extra_info["detail_env_time"] == {
+        "compile_time": 4.0,
+        "kernel_runtime": 2.0,
+        "profile_time": 2.0,
+        "refer_runtime": 1.0,
+    }
+    assert env_extra_info["kernel_perf_cv"] == pytest.approx(0.25)
+    assert env_extra_info["refer_perf_cv"] == pytest.approx(0.2)
+
+
+def test_cuda_kernel_env_env_precheck_error_overrides_default_passed(monkeypatch):
+    async def fake_run_kernel_eval(args, sample, payload, config):
+        return {
+            "env_state": {
+                "status": "failed",
+                "compiled": False,
+                "correctness": False,
+                "speedup": 0.0,
+                "decoy_kernel": False,
+                "error_message": "Precheck failed: static check failed: framework_compute",
+                "metadata": {"compilation_error": "Precheck failed: static check failed: framework_compute"},
+            }
+        }
+
+    monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
+    monkeypatch.setattr(generate_with_cuda_agent, "next_kernel_task_id", lambda: "parallel_task_env_precheck")
+    monkeypatch.setattr(generate_with_cuda_agent, "precheck_response", lambda *args, **kwargs: (True, None))
+
+    args = SimpleNamespace(
+        kernel_backend="cuda",
+        reference_backend="torch",
+        do_precheck=True,
+    )
+    sample = Sample(
+        prompt="prompt", label={"ground_truth": REFERENCE_IDENTITY_CODE, "entry_point": "Model"}, metadata={}
+    )
+
+    env_result = asyncio.run(generate_with_cuda_agent.cuda_kernel_env(args, sample, VALID_CUDA_AGENT_RESPONSE, 0))
+
+    assert env_result["env_state"]["error"] == PRECHECK_ERROR
+    assert env_result["env_state"]["precheck"] == "failed"
+    assert env_result["env_extra_info"]["precheck"] == "failed"
+
+
+def test_normalize_env_feedback_extra_info_defaults_missing_decoy_kernel():
+    _env_state, env_extra_info = normalize_env_feedback(
+        {
+            "status": "failed",
+            "compiled": False,
+            "correctness": False,
+            "speedup": 0.0,
+            "metadata": {},
+        }
+    )
+
+    assert env_extra_info["decoy_kernel"] is False
+
+
+def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
+    from slime.ray.rollout import _compute_kernel_agent_metrics
+
+    samples = [
+        Sample(
+            prompt="prompt",
+            metadata={
+                "env_time": 1.0,
+                "env_extra_info": {
+                    "correctness": True,
+                    "compilation": True,
+                    "speedup": 1.0,
+                    "decoy_kernel": False,
+                    "precheck": "passed",
+                    "detail_env_time": {
+                        "compile_time": 1.0,
+                        "kernel_runtime": 10.0,
+                        "profile_time": 100.0,
+                        "refer_runtime": 1000.0,
+                    },
+                },
+            },
+        ),
+        Sample(
+            prompt="prompt",
+            metadata={
+                "env_time": 3.0,
+                "env_extra_info": {
+                    "correctness": True,
+                    "compilation": True,
+                    "speedup": 1.0,
+                    "decoy_kernel": False,
+                    "precheck": "passed",
+                    "detail_env_time": {
+                        "compile_time": 3.0,
+                        "kernel_runtime": 30.0,
+                        "profile_time": 300.0,
+                        "refer_runtime": 3000.0,
+                    },
+                },
+            },
+        ),
+        Sample(
+            prompt="prompt",
+            metadata={
+                "conditional_truncation_masked": True,
+                "env_extra_info": {
+                    "correctness": False,
+                    "compilation": True,
+                    "speedup": 0.0,
+                    "decoy_kernel": False,
+                    "precheck": "passed",
+                },
+            },
+        ),
+    ]
+
+    metrics = _compute_kernel_agent_metrics(samples)
+
+    assert metrics["kernel/time/detail_env_time/compile_time/count"] == 2
+    assert metrics["kernel/time/detail_env_time/compile_time/p50"] == pytest.approx(2.0)
+    assert metrics["kernel/time/detail_env_time/kernel_runtime/mean"] == pytest.approx(20.0)
+    assert metrics["kernel/time/detail_env_time/profile_time/sum"] == pytest.approx(400.0)
+    assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)
+    assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)

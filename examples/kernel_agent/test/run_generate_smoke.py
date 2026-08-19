@@ -24,7 +24,6 @@ from slime.utils.data import read_file
 from slime.utils.http_utils import init_http_client
 from slime.utils.types import Sample
 
-
 DEFAULT_SAMPLE_PATH = "/nfs/FM/lihongbin/datasets/CUDA_RL/SFT/prompt_v4/parallel_drkernel_minimax_results_sft.parquet"
 
 
@@ -185,8 +184,9 @@ class FakeTokenizer:
 class FakeGenerateState:
     def __init__(self, args):
         self.tokenizer = FakeTokenizer()
-        self.multi_turn_templates = None
+        self.multi_turn_template = None
         self.apply_chat_template_kwargs = {}
+        self.active_lora_name = None
 
     def _is_qwen3_5_model(self):
         return False
@@ -221,7 +221,7 @@ def _build_sample(args) -> Sample:
         return Sample(
             prompt=args.prompt,
             label={"entry_point": "Model", "ground_truth": REFERENCE_IDENTITY_CODE},
-            metadata={"uuid": args.uuid, "source_row": "generate_smoke", "log_multi_turn": True},
+            metadata={"uuid": args.uuid, "source_row": "generate_smoke", "log_rollout_info": True},
         )
 
     row = _read_data_row(args.sample_path, args.sample_index)
@@ -246,7 +246,7 @@ def _build_sample(args) -> Sample:
             "uuid": str(_get_row_value(row, args.uuid_key) or args.uuid),
             "source_row": args.sample_index,
             "sample_path": args.sample_path,
-            "log_multi_turn": True,
+            "log_rollout_info": True,
         }
     )
     print(
@@ -314,7 +314,7 @@ def _install_fake_generate_state() -> None:
 
 
 def _install_fake_model(response: str) -> None:
-    async def fake_post(url, payload):
+    async def fake_post(url, payload, max_retries=None):
         token_ids = list(range(1, len(response.split()) + 1))
         return {
             "text": response,
@@ -329,8 +329,8 @@ def _install_fake_model(response: str) -> None:
 
 def _install_fake_env(compiled: bool) -> None:
     async def fake_run_kernel_eval(args, sample, payload, config):
-        env_state = generate_with_cuda_agent.normalize_env_feedback(_mock_env_state(compiled))
-        return {"env_state": env_state, "reward_extra_info": env_state}
+        env_state, _env_extra_info = generate_with_cuda_agent.normalize_env_feedback(_mock_env_state(compiled))
+        return {"env_state": env_state}
 
     generate_with_cuda_agent.run_kernel_eval = fake_run_kernel_eval
 
@@ -417,7 +417,7 @@ async def _run(args) -> None:
     )
     _init_ray_for_kernel_env(args)
     CUDA_AGENT_CONFIGS["max_feedback_chars"] = args.max_feedback_chars
-    CUDA_AGENT_CONFIGS["log_multi_turn_sample_rate"] = 1.0
+    CUDA_AGENT_CONFIGS["log_rollout_info_rate"] = 1.0
     CUDA_AGENT_CONFIGS["do_precheck"] = args.do_precheck
     CUDA_AGENT_CONFIGS["finalize_mode"] = None if args.finalize_mode == "none" else args.finalize_mode
 
@@ -483,7 +483,8 @@ async def _run(args) -> None:
 
         if use_real_model:
             init_http_client(rollout_args)
-        output_samples = await generate_with_cuda_agent.generate(rollout_args, sample, sampling_params)
+        output = await generate_with_cuda_agent.generate(rollout_args, sample, sampling_params)
+        output_samples = output if isinstance(output, list) else [output]
         state = generate_with_cuda_agent.GenerateState(rollout_args)
         tool_response_template = generate_with_cuda_agent._get_tool_response_template(state)
         print(f"\n[cuda_agent][generate_smoke] output_samples={len(output_samples)}")

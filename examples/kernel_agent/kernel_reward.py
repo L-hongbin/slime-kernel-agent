@@ -1,3 +1,4 @@
+import random
 from typing import Any
 
 import torch
@@ -13,12 +14,70 @@ def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> floa
     return calculate_reward_speedup(env_state, config)["reward"]
 
 
+def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
+    """Apply the MicroCoder-GRPO Conditional Truncation Mask (CTM).
+
+    Implements CTM from Breaking Training Bottlenecks: Effective and Stable
+    Reinforcement Learning for Coding Models (arXiv:2603.07777). Eligible
+    responses reach the maximum length, are non-incorrect (correct or
+    incomplete), and do not repeat the preceding 128-token window at the tail;
+    their post-processed advantages are randomly zeroed with probability rho.
+    The paper compares rho=0.1, 0.2, and 0.3; slime defaults to rho=0.1. This
+    hook runs after group reward normalization so masked samples do not alter
+    other samples' advantages.
+    """
+    if sample.remove_sample:
+        return advantage
+    if sample.loss_mask is not None and sum(sample.loss_mask) == 0:
+        return advantage
+
+    # Paper CTM eligibility: max length, non-incorrect (correct or truncated),
+    # no repeated tail, then Bernoulli masking.
+    max_response_len = int(getattr(args, "rollout_max_response_len", getattr(args, "max_new_tokens", 0)) or 0)
+    response_length = int(sample.response_length or 0)
+    if max_response_len <= 0 or response_length != max_response_len:
+        return advantage
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    env_extra_info = metadata.get("env_extra_info")
+    if isinstance(env_extra_info, dict):
+        if bool(env_extra_info.get("decoy_kernel")):
+            return advantage
+        is_mask_candidate = env_extra_info.get("correctness") is True or sample.status == sample.Status.TRUNCATED
+    else:
+        is_mask_candidate = sample.status == sample.Status.TRUNCATED
+    if not is_mask_candidate:
+        return advantage
+
+    repeat_window = int(getattr(args, "conditional_truncation_repeat_window", 128))
+    response_tokens = sample.tokens[-response_length:] if response_length > 0 else []
+    has_repeated_tail = (
+        repeat_window > 0
+        and len(response_tokens) >= 2 * repeat_window
+        and response_tokens[-repeat_window:] == response_tokens[-2 * repeat_window : -repeat_window]
+    )
+    if has_repeated_tail:
+        return advantage
+
+    mask_prob = float(getattr(args, "conditional_truncation_mask_prob", 0.1))
+    sample.metadata = dict(sample.metadata or {})
+    sample.metadata["conditional_truncation_masking_eligible"] = True
+    if random.random() >= mask_prob:
+        return advantage
+
+    sample.metadata["conditional_truncation_masked"] = True
+    sample.metadata["conditional_truncation_mask_prob"] = mask_prob
+    sample.metadata["conditional_truncation_repeat_window"] = repeat_window
+    return 0.0
+
+
 def reward_post_process_by_group(args, samples):
     if args.advantage_estimator == "trloo":
         raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     else:
         raw_rewards = [sample.get_reward_value(args) for sample in samples]
     rewards = [None] * len(raw_rewards)
+    use_conditional_truncation_mask = getattr(args, "use_conditional_truncation_mask", False)
 
     idx_to_group_index: dict[int, object] = {}
     reward_groups: dict[object, list[float]] = {}
@@ -40,7 +99,7 @@ def reward_post_process_by_group(args, samples):
         group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
         group_stats[group_index] = {
             "mean": group_rewards.mean().item(),
-            "std": group_rewards.std().item(),
+            "std": group_rewards.std().item() if len(group_reward_values) > 1 else 0.0,
             "size": len(group_reward_values),
         }
 
@@ -66,6 +125,8 @@ def reward_post_process_by_group(args, samples):
             else:
                 reward = reward * group_len / (group_len - 1)
 
+        if use_conditional_truncation_mask:
+            reward = _apply_conditional_truncation_mask(args, samples[idx], reward)
         rewards[idx] = reward
 
     return raw_rewards, rewards

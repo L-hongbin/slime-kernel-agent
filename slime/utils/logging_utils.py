@@ -69,6 +69,11 @@ class _CentralTrackingActor:
             _TensorboardAdapter(self.args).log(data=metrics_except_step, step=metrics[step_key])
 
     def finish(self):
+        if self.args.use_tensorboard:
+            try:
+                _TensorboardAdapter(self.args).finish()
+            except Exception:
+                logging.getLogger(__name__).exception("Failed to finish tensorboard writer")
         if self.args.use_wandb:
             try:
                 if wandb.run is not None:
@@ -129,6 +134,12 @@ def finish_tracking(args):
             _TRACKING_ACTOR = None
             _OWNS_TRACKING_ACTOR = False
         return
+
+    if args.use_tensorboard:
+        try:
+            _TensorboardAdapter(args).finish()
+        except Exception:
+            logging.getLogger(__name__).exception("Failed to finish tensorboard writer")
 
     if not args.use_wandb:
         return

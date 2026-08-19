@@ -1,6 +1,7 @@
 # Adapt from https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/models/utils.py
 # and https://github.com/OpenRLHF/OpenRLHF/blob/10c733694ed9fbb78a0a2ff6a05efc7401584d46/openrlhf/trainer/ppo_utils/experience_maker.py
 
+import math
 from argparse import Namespace
 
 import torch
@@ -167,6 +168,375 @@ def compute_policy_loss(
     return pg_losses, clipfrac
 
 
+def compute_policy_loss_output(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+) -> dict[str, torch.Tensor]:
+    """Return ordinary PPO loss plus the richer metric mapping used by newer modes.
+
+    ``compute_policy_loss`` retains slime's established two-tensor return
+    protocol; this adapter supplies the mapping protocol used by the newer
+    policy-loss implementations.
+    """
+    pg_losses, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, eps_clip, eps_clip_high, eps_clip_c)
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": pg_clipfrac,
+        **compute_ppo_clip_diagnostics(ppo_kl, advantages, eps_clip, eps_clip_high, eps_clip_c),
+    }
+
+
+def compute_up_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+):
+    """Compute UP asymmetric policy loss.
+
+    Implements UP: Unbounded Positive Asymmetric Optimization for Breaking
+    the Exploration-Stability Dilemma (arXiv:2607.06987). Positive advantages
+    use an unclipped REINFORCE-style log-prob objective. Non-positive
+    advantages keep the standard PPO/DAPO clipped objective as the
+    trust-region safeguard. Reported epsilon settings: UP-DAPO uses
+    eps_clip=0.2 and no positive upper clip; UP-GRPO uses eps_clip=0.2 and
+    no positive upper clip; UP-GSPO uses eps_clip=3e-4 and no positive upper
+    clip.
+    """
+    ppo_output = compute_policy_loss_output(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, eps_clip_c)
+    positive_advantage_mask = advantages > 0
+    positive_pg_losses = -advantages * log_probs
+    pg_losses = torch.where(positive_advantage_mask, positive_pg_losses, ppo_output["pg_losses"])
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": torch.where(positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_clipfrac"]),
+        "pg_upper_clipfrac": torch.where(
+            positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_upper_clipfrac"]
+        ),
+        "pg_lower_clipfrac": torch.where(
+            positive_advantage_mask, torch.zeros_like(advantages), ppo_output["pg_lower_clipfrac"]
+        ),
+    }
+
+
+def compute_aspo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+):
+    """Compute ASPO loss with asymmetric positive-token IS weights.
+
+    Implements ASPO from When Importance Sampling Misallocates Credit:
+    Asymmetric Ratios for Outcome-Supervised RL (arXiv:2510.06062). Negative
+    advantages keep the standard PPO/GRPO active-region gradient. Positive
+    advantages use reciprocal ratio weights, hard-mask high-ratio over-updates,
+    and optionally soft dual-clip the reciprocal weight. Reported experiments
+    use eps_clip=0.2 for GRPO/ASPO clipping; explicit KL uses k3 with
+    coefficient 0.001. The paper ablates dual clipping but does not publish a
+    separate numeric reciprocal dual-clip threshold.
+    """
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    positive_advantage_mask = advantages > 0
+
+    negative_output = compute_policy_loss_output(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, None)
+
+    invalid_positive_mask = positive_advantage_mask & (ratio > 1 + eps_clip_high)
+    positive_valid_mask = 1.0 - invalid_positive_mask.detach().float()
+    reciprocal_ratio = (1.0 / ratio).detach()
+    if eps_clip_c is not None:
+        assert (
+            eps_clip_c > 1.0
+        ), f"The upper bound of ASPO reciprocal dual-clip should be greater than 1.0, but get the value: {eps_clip_c}."
+        reciprocal_ratio = reciprocal_ratio.clamp(max=eps_clip_c)
+    positive_pg_losses = -advantages * reciprocal_ratio * positive_valid_mask * log_probs
+
+    pg_losses = torch.where(positive_advantage_mask, positive_pg_losses, negative_output["pg_losses"])
+    upper_clipfrac = torch.where(
+        positive_advantage_mask, invalid_positive_mask.float(), negative_output["pg_upper_clipfrac"]
+    )
+    lower_clipfrac = torch.where(
+        positive_advantage_mask, torch.zeros_like(advantages), negative_output["pg_lower_clipfrac"]
+    )
+    clipfrac = torch.maximum(upper_clipfrac, lower_clipfrac)
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_ripo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    ripo_delta: float,
+    ripo_delta_high: float,
+    ripo_ratio_min: float | None = 0.5,
+    ripo_ratio_max: float | None = 10.0,
+):
+    """Compute RIPO/RIC policy loss.
+
+    Implements Riemannian Isometric Policy Optimization from Beyond Euclidean
+    Clipping: Overcoming Exploration Collapse in LLM RL via Riemannian
+    Isometric Policy Optimization (arXiv:2607.10169). RIPO replaces fixed PPO
+    clipping with token-wise Riemannian Isometric Clip boundaries
+    eps_i,t=sqrt(delta/pi_old(token)). Reported experiments use delta=0.05
+    by default and outer ratio clipping bounds [0.5, 10].
+    """
+    assert ripo_delta > 0.0, f"ripo_delta must be positive, got {ripo_delta}."
+    assert ripo_delta_high > 0.0, f"ripo_delta_high must be positive, got {ripo_delta_high}."
+
+    log_ratio = torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0)
+    ratio = torch.exp(log_ratio)
+    old_prob = old_log_probs.float().exp().detach().clamp_min(1e-12).to(ratio.dtype)
+
+    eps_low = torch.sqrt(ratio.new_tensor(ripo_delta) / old_prob)
+    eps_high = torch.sqrt(ratio.new_tensor(ripo_delta_high) / old_prob)
+    clip_lower = 1.0 - eps_low
+    clip_upper = 1.0 + eps_high
+
+    if ripo_ratio_min is not None:
+        clip_lower = torch.clamp(clip_lower, min=ripo_ratio_min)
+    if ripo_ratio_max is not None:
+        clip_upper = torch.clamp(clip_upper, max=ripo_ratio_max)
+
+    clipped_ratio = torch.minimum(torch.maximum(ratio, clip_lower), clip_upper)
+    pg_losses1 = -advantages * ratio
+    pg_losses2 = -advantages * clipped_ratio
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+
+    clipfrac = (pg_losses2 > pg_losses1).float()
+    upper_clipfrac = clipfrac * (ratio > clip_upper).float()
+    lower_clipfrac = clipfrac * (ratio < clip_lower).float()
+
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+        "ripo_eps_low": eps_low,
+        "ripo_eps_high": eps_high,
+        "ripo_clip_lower": clip_lower,
+        "ripo_clip_upper": clip_upper,
+    }
+
+
+def compute_cppo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    delta: float,
+    prefix_delta: float,
+    weight_floor: float,
+    eps_clip_c: float | None = None,
+):
+    """Compute CPPO policy loss in Binary-TV mode for one complete response.
+
+    Implements Cumulative Prefix-divergence Policy Optimization from Beyond Uniform
+    Token-Level Trust Region in LLM Reinforcement Learning
+    (arXiv:2606.10968). The sampled-token Binary-TV divergence is weighted by
+    response position and admitted only when both its token threshold and the
+    preceding prefix budget allow it. This implementation follows the official
+    UniRL cppo.py Binary-TV mode. The prefix floor is calibrated per sequence
+    as clamp(P90(D), prefix_delta, 2*prefix_delta), matching the official UniRL
+    implementation. Reported experiments use weight_floor=0.8, delta=0.15
+    (0.2 for the 30B MoE), and prefix_delta=0.02 for Base models.
+    """
+    if log_probs.ndim != 1 or old_log_probs.ndim != 1 or advantages.ndim != 1:
+        raise ValueError("CPPO expects one-dimensional tensors for one complete response.")
+    if not (log_probs.shape == old_log_probs.shape == advantages.shape):
+        raise ValueError(
+            "CPPO tensor shapes must match, got "
+            f"log_probs={log_probs.shape}, old_log_probs={old_log_probs.shape}, advantages={advantages.shape}."
+        )
+    if not math.isfinite(delta) or delta <= 0.0:
+        raise ValueError(f"CPPO delta must be finite and positive, got {delta}.")
+    if not math.isfinite(prefix_delta) or prefix_delta <= 0.0:
+        raise ValueError(f"CPPO prefix_delta must be finite and positive, got {prefix_delta}.")
+    if not math.isfinite(weight_floor) or not 0.0 < weight_floor <= 1.0:
+        raise ValueError(f"CPPO weight_floor must be finite and in (0, 1], got {weight_floor}.")
+
+    response_length = log_probs.numel()
+    old_prob = old_log_probs.float().exp().detach()
+    divergence = (log_probs.float().exp().detach() - old_prob).abs()
+
+    if response_length <= 1:
+        position_weight = torch.ones_like(log_probs)
+    else:
+        positions = torch.arange(response_length, dtype=divergence.dtype, device=log_probs.device)
+        position_weight = 1.0 - (1.0 - weight_floor) * positions / (response_length - 1)
+
+    weighted_divergence = position_weight * divergence
+    prefix_divergence = torch.cat([weighted_divergence.new_zeros(1), weighted_divergence.cumsum(dim=0)[:-1]], dim=0)
+    prefix_weight = torch.cat([position_weight.new_zeros(1), position_weight.cumsum(dim=0)[:-1]], dim=0)
+    sequence_prefix_delta = torch.quantile(divergence, 0.9).clamp(prefix_delta, 2.0 * prefix_delta)
+    effective_threshold = torch.minimum(
+        weighted_divergence.new_full(weighted_divergence.shape, delta),
+        delta + sequence_prefix_delta * prefix_weight - prefix_divergence,
+    )
+
+    ratio_clip_c = 20.0 if eps_clip_c is None else eps_clip_c
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    ratio = torch.clamp(ratio, max=ratio_clip_c).detach()
+
+    outward_update = advantages * (ratio.detach() - 1.0) > 0.0
+    invalid_mask = outward_update & (weighted_divergence > effective_threshold)
+    valid_mask = (~invalid_mask).to(log_probs.dtype)
+
+    pg_losses = -advantages * ratio * valid_mask * log_probs
+
+    positive_advantage_mask = advantages > 0
+    token_threshold_violation = outward_update & (weighted_divergence > delta)
+    prefix_threshold_violation = invalid_mask & ~token_threshold_violation
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": invalid_mask.float(),
+        "pg_upper_clipfrac": (positive_advantage_mask & invalid_mask).float(),
+        "pg_lower_clipfrac": (~positive_advantage_mask & invalid_mask).float(),
+        "cppo_token_clipfrac": token_threshold_violation.float(),
+        "cppo_prefix_clipfrac": prefix_threshold_violation.float(),
+        "cppo_divergence": divergence,
+        "cppo_weighted_divergence": weighted_divergence,
+        "cppo_effective_threshold": effective_threshold,
+        "cppo_prefix_delta": torch.full_like(divergence, sequence_prefix_delta),
+    }
+
+
+def compute_cispo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+):
+    """Compute CISPO policy loss with a detached clipped importance ratio."""
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    clipped_ratio = torch.clamp(ratio, min=1 - eps_clip, max=1 + eps_clip_high)
+    clipped_ratio_sg = clipped_ratio.detach()
+
+    pg_losses = -clipped_ratio_sg * advantages * log_probs
+    upper_clipfrac = (ratio > 1 + eps_clip_high).float()
+    lower_clipfrac = (ratio < 1 - eps_clip).float()
+    clipfrac = torch.maximum(upper_clipfrac, lower_clipfrac)
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_dppo_binary_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    loss_mode: str,
+    eps_clip_c: float | None = None,
+):
+    """Compute DPPO Binary-TV/KL policy loss.
+
+    Implements Divergence Proximal Policy Optimization from Rethinking the
+    Trust Region in LLM Reinforcement Learning (arXiv:2602.04879). Binary
+    variants split the vocabulary into the sampled token and all other tokens,
+    then mask updates that cross the divergence threshold in the
+    advantage-driven direction. Reported scaling experiments use delta=0.2 for
+    Binary-TV (0.15 for the MoE Base with LoRA experiment) and delta=0.05 for
+    Binary-KL.
+    """
+    prob = log_probs.exp()
+    old_prob = old_log_probs.exp()
+
+    if loss_mode == "dppo_binary_tv":
+        invalid_positive_mask = (prob - old_prob) > eps_clip_high
+        invalid_negative_mask = (prob - old_prob) < -eps_clip
+    elif loss_mode == "dppo_binary_kl":
+        prob_for_other = torch.clamp(1.0 - prob, min=1e-8)
+        old_prob_for_other = torch.clamp(1.0 - old_prob, min=1e-8)
+        binary_kl = old_prob * (old_log_probs - log_probs) + old_prob_for_other * torch.log(
+            old_prob_for_other / prob_for_other
+        )
+        invalid_positive_mask = (binary_kl > eps_clip_high) & (prob > old_prob)
+        invalid_negative_mask = (binary_kl > eps_clip) & (prob < old_prob)
+    else:
+        raise ValueError(f"Unsupported DPPO loss mode: {loss_mode}")
+
+    positive_advantage_mask = advantages > 0
+    invalid_mask = torch.where(positive_advantage_mask, invalid_positive_mask, invalid_negative_mask)
+    valid_mask = 1.0 - invalid_mask.detach().float()
+
+    ratio_clip_c = 20.0 if eps_clip_c is None else eps_clip_c
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    ratio = torch.clamp(ratio, max=ratio_clip_c).detach()
+
+    pg_losses = -advantages * ratio * valid_mask * log_probs
+    upper_clipfrac = (positive_advantage_mask & invalid_positive_mask).float()
+    lower_clipfrac = (~positive_advantage_mask & invalid_negative_mask).float()
+    clipfrac = invalid_mask.float()
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": clipfrac,
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
+def compute_drpo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+):
+    """Compute DRPO smooth Binary-TV regularized policy loss.
+
+    Implements Divergence Regularized Policy Optimization from Rethinking the
+    Divergence Regularization in LLM RL (arXiv:2606.09821). DRPO keeps DPPO's
+    sampled-token Binary-TV trust region but replaces its hard update mask with
+    an advantage-weighted quadratic regularizer. Reported experiments use a
+    symmetric regularization threshold delta=12.5 and ablate delta=2.5.
+    """
+    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
+    old_prob = old_log_probs.float().exp().detach()
+
+    positive_advantage_mask = advantages > 0
+    eps = torch.where(
+        positive_advantage_mask,
+        torch.full_like(advantages, eps_clip_high),
+        torch.full_like(advantages, eps_clip),
+    )
+    eps = torch.clamp(eps, min=1e-8)
+
+    quadratic_penalty = advantages.abs() * old_prob * (ratio - 1.0).pow(2) / (2.0 * eps)
+    pg_losses = -advantages * ratio + quadratic_penalty
+
+    prob = log_probs.float().exp()
+    invalid_positive_mask = (prob - old_prob) > eps_clip_high
+    invalid_negative_mask = (prob - old_prob) < -eps_clip
+    invalid_mask = torch.where(positive_advantage_mask, invalid_positive_mask, invalid_negative_mask)
+
+    upper_clipfrac = (positive_advantage_mask & invalid_positive_mask).float()
+    lower_clipfrac = (~positive_advantage_mask & invalid_negative_mask).float()
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": invalid_mask.float(),
+        "pg_upper_clipfrac": upper_clipfrac,
+        "pg_lower_clipfrac": lower_clipfrac,
+    }
+
+
 def compute_dis_policy_loss(
     log_probs: torch.Tensor,
     rollout_log_probs: torch.Tensor,
@@ -290,58 +660,6 @@ def compute_ppo_clip_diagnostics(
     if eps_clip_c is not None:
         diagnostics["pg_dual_clipfrac"] = (negative_advantage & (ratio > eps_clip_c)).float()
     return diagnostics
-
-
-def compute_dppo_binary_policy_loss(
-    log_probs: torch.Tensor,
-    old_log_probs: torch.Tensor,
-    advantages: torch.Tensor,
-    eps_clip: float,
-    eps_clip_high: float,
-    loss_mode: str,
-    eps_clip_c: float | None = None,
-):
-    """Compute DPPO binary-TV/KL policy loss against the configured old policy anchor.
-
-    Binary variants split the vocabulary into the sampled token and all other
-    tokens, then mask token updates that move outside the divergence threshold
-    in the advantage-driven direction.
-    """
-    prob = log_probs.exp()
-    old_prob = old_log_probs.exp()
-
-    if loss_mode == "dppo_binary_tv":
-        invalid_positive_mask = (prob - old_prob) > eps_clip_high
-        invalid_negative_mask = (prob - old_prob) < -eps_clip
-    elif loss_mode == "dppo_binary_kl":
-        prob_for_other = torch.clamp(1.0 - prob, min=1e-8)
-        old_prob_for_other = torch.clamp(1.0 - old_prob, min=1e-8)
-        binary_kl = old_prob * (old_log_probs - log_probs) + old_prob_for_other * torch.log(
-            old_prob_for_other / prob_for_other
-        )
-        invalid_positive_mask = (binary_kl > eps_clip_high) & (prob > old_prob)
-        invalid_negative_mask = (binary_kl > eps_clip) & (prob < old_prob)
-    else:
-        raise ValueError(f"Unsupported DPPO loss mode: {loss_mode}")
-
-    positive_advantage_mask = advantages > 0
-    invalid_mask = torch.where(positive_advantage_mask, invalid_positive_mask, invalid_negative_mask)
-    valid_mask = 1.0 - invalid_mask.detach().float()
-
-    ratio_clip_c = 20.0 if eps_clip_c is None else eps_clip_c
-    ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
-    ratio = torch.clamp(ratio, max=ratio_clip_c).detach()
-
-    pg_losses = -advantages * ratio * valid_mask * log_probs
-    upper_clipfrac = (positive_advantage_mask & invalid_positive_mask).float()
-    lower_clipfrac = (~positive_advantage_mask & invalid_negative_mask).float()
-    clipfrac = invalid_mask.float()
-    return {
-        "pg_losses": pg_losses,
-        "pg_clipfrac": clipfrac,
-        "pg_upper_clipfrac": upper_clipfrac,
-        "pg_lower_clipfrac": lower_clipfrac,
-    }
 
 
 def compute_dppo_predictive_topk_policy_loss(

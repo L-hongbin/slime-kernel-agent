@@ -151,13 +151,15 @@ def _parse_sequence_mis_args(args) -> None:
         args.sequence_mis_ratio_source = ratio_source
 
     aggregation = getattr(args, "sequence_mis_aggregation", "geometric")
-    if aggregation not in {"kl", "geometric", "turns_geometric"}:
+    if aggregation not in {"kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"}:
         raise ValueError(
-            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'turns_geometric'], "
+            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop'], "
             f"got {aggregation!r}."
         )
-    if aggregation == "turns_geometric" and args.max_turns is None:
-        raise ValueError("--max-turns must be set when --sequence-mis-config aggregation=turns_geometric.")
+    if aggregation in {"turns_geometric", "turns_mirrorpop"} and args.max_turns is None:
+        raise ValueError(
+            "--max-turns must be set when --sequence-mis-config aggregation=turns_geometric or turns_mirrorpop."
+        )
     token_veto_threshold = getattr(args, "sequence_mis_token_veto_threshold", None)
     if token_veto_threshold is not None and token_veto_threshold <= 0:
         raise ValueError(
@@ -567,6 +569,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--log-probs-chunk-size", type=int, default=-1, help="Chunk size to compute log probs to save memory"
             )
             parser.add_argument(
+                "--enable-fp32-lm-head",
+                action="store_true",
+                default=False,
+                help=(
+                    "Request fp32 lm-head logits. Megatron actor logits are cast to fp32 while preserving the "
+                    "original output-layer parameter and TP gradient path; SGLang rollout engines are also asked "
+                    "to enable fp32 lm head when supported."
+                ),
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",
@@ -869,6 +881,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time) -> bool. "
                     "The return value indicates whether to skip the default logging. "
                 ),
+            )
+            parser.add_argument(
+                "--log-response-diversity",
+                action="store_true",
+                default=False,
+                help="Whether to log response diversity as unique 4-grams / total 4-grams during rollout.",
             )
             parser.add_argument(
                 "--custom-eval-rollout-log-function-path",
@@ -1281,16 +1299,23 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--policy-loss-mode",
                 type=str,
                 default="ppo",
-                choices=["ppo", "dis", "dppo_binary_tv", "dppo_binary_kl", "dppo_topk_kl_predictive"],
+                choices=[
+                    "ppo",
+                    "dis",
+                    "up",
+                    "aspo",
+                    "ripo",
+                    "dppo_binary_tv",
+                    "dppo_binary_kl",
+                    "dppo_topk_kl_predictive",
+                    "cppo",
+                    "cispo",
+                    "drpo",
+                ],
                 help=(
-                    "Policy surrogate: 'ppo' = ratio-clipped PPO (default); "
-                    "'dis' = Direct Double-Sided Importance Sampling against rollout "
-                    "log-probs, masking ratios outside (1-eps-clip, 1+eps-clip-high); "
-                    "'dppo_binary_tv'/'dppo_binary_kl' = Stable-RL DPPO divergence "
-                    "trust region (eps-clip/eps-clip-high become the TV/binary-KL "
-                    "thresholds); 'dppo_topk_kl_predictive' = predictive divergence "
-                    "mask with a rollout Top-K forward-KL support (arXiv:2607.10848; "
-                    "eps-clip is delta). eps-clip-c caps the detached IS ratio."
+                    "Policy-loss trust region: PPO/DIS, UP/ASPO/RIPO, binary or predictive DPPO, "
+                    "CPPO, CISPO, and DRPO. DPPO modes use eps-clip/eps-clip-high as divergence "
+                    "thresholds; dppo_topk_kl_predictive uses rollout Top-K support."
                 ),
             )
             parser.add_argument(
@@ -1316,12 +1341,64 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="aggregated",
                 help="Tail approximation for the predictive Top-K KL directional derivative.",
             )
-            parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+            parser.add_argument(
+                "--ripo-delta",
+                type=float,
+                default=0.05,
+                help="RIPO/RIC trust-region radius delta. Paper arXiv:2607.10169 uses 0.05 by default.",
+            )
+            parser.add_argument(
+                "--ripo-delta-high",
+                type=float,
+                default=None,
+                help="Optional RIPO upper-bound delta, analogous to --eps-clip-high. Defaults to --ripo-delta.",
+            )
+            parser.add_argument(
+                "--ripo-ratio-min",
+                type=float,
+                default=0.5,
+                help="Outer lower bound for RIPO importance-ratio clipping. Paper uses 0.5.",
+            )
+            parser.add_argument(
+                "--ripo-ratio-max",
+                type=float,
+                default=10.0,
+                help="Outer upper bound for RIPO importance-ratio clipping. Paper uses 10.",
+            )
+            parser.add_argument(
+                "--cppo-prefix-delta",
+                type=float,
+                default=0.02,
+                help=(
+                    "CPPO dynamic prefix-budget floor delta_b_min. Each sequence uses "
+                    "clamp(P90(D), delta_b_min, 2*delta_b_min), matching the official UniRL implementation. "
+                    "The paper uses 0.015 for the post-trained model and 0.02 for Base models."
+                ),
+            )
+            parser.add_argument(
+                "--cppo-weight-floor",
+                type=float,
+                default=0.8,
+                help=(
+                    "CPPO final-token position weight w_min; weights decay linearly from 1. "
+                    "CPPO (arXiv:2606.10968) uses 0.8."
+                ),
+            )
+            parser.add_argument(
+                "--eps-clip-high",
+                type=float,
+                default=None,
+                help="PPO clip upper offset; the final ratio upper bound is 1 + eps_clip_high.",
+            )
             parser.add_argument(
                 "--eps-clip-c",
                 type=float,
                 default=None,
-                help="lower bound of the value for Dual-clip PPO from https://arxiv.org/pdf/1912.09729",
+                help=(
+                    "Dual-clip threshold. For PPO it is the lower bound from https://arxiv.org/pdf/1912.09729; "
+                    "for ASPO it is the optional upper bound for soft dual-clipping positive reciprocal weights; "
+                    "for DPPO/CPPO it is the detached importance-ratio upper bound."
+                ),
             )
             parser.add_argument("--value-clip", type=float, default=0.2, help="the clip for value loss")
             parser.add_argument(
@@ -1958,6 +2035,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=1.0,
                 help="Maximum reward subtraction applied by --overlong-penalty.",
             )
+            parser.add_argument(
+                "--use-conditional-truncation-mask",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable Conditional Truncation Masking from MicroCoder-GRPO (arXiv:2603.07777), which "
+                    "probabilistically zeros post-processed advantages for eligible max-length responses."
+                ),
+            )
+            parser.add_argument(
+                "--conditional-truncation-mask-prob",
+                type=float,
+                default=0.1,
+                help=("CTM masking probability rho. The paper compares 0.1, 0.2, and 0.3; slime defaults to 0.1."),
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):
@@ -2311,6 +2403,14 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if getattr(args, "enable_fp32_lm_head", False):
+        args.fp32_lm_head = True
+    if getattr(args, "fp32_lm_head", False):
+        args.enable_fp32_lm_head = True
+        if not getattr(args, "sglang_enable_fp32_lm_head", False):
+            logger.info("fp32 LM head is set; enabling fp32 LM head for rollout engines.")
+        args.sglang_enable_fp32_lm_head = True
+
     _parse_sequence_mis_args(args)
     _validate_lora_args(args)
     # rollout_temperature <= 0 (greedy) breaks the train-side log-prob path,
@@ -2324,12 +2424,29 @@ def slime_validate_args(args):
             "so 0 (greedy) produces a NaN loss. Use --rollout-temperature 1 for on-policy RL; "
             "temperature 0 is only allowed with --debug-rollout-only."
         )
-    if getattr(args, "sequence_mis_aggregation", None) == "turns_geometric" and not getattr(
+    if getattr(args, "sequence_mis_aggregation", None) in {"turns_geometric", "turns_mirrorpop"} and not getattr(
         args, "enable_turns_dp_partitions", False
     ):
-        raise ValueError("--enable-turns-dp-partitions must be set when Sequence MIS aggregation is turns_geometric.")
+        raise ValueError(
+            "--enable-turns-dp-partitions must be set when Sequence MIS aggregation is "
+            "turns_geometric or turns_mirrorpop."
+        )
     _validate_sequence_mis_ratio_source(args)
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    conditional_truncation_mask_prob = getattr(args, "conditional_truncation_mask_prob", 0.1)
+    assert 0.0 <= conditional_truncation_mask_prob <= 1.0, "conditional_truncation_mask_prob must be in [0, 1]."
+    if getattr(args, "use_conditional_truncation_mask", False):
+        reward_post_process_path = getattr(args, "custom_reward_post_process_path", None)
+        expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+        if reward_post_process_path != expected_path:
+            logger.warning(
+                "--use-conditional-truncation-mask is applied by %s, but "
+                "--custom-reward-post-process-path is %r. CTM will not be applied unless the configured hook "
+                "implements equivalent post-normalization masking.",
+                expected_path,
+                reward_post_process_path,
+            )
 
     if args.use_slime_router:
         logger.warning(
@@ -2445,6 +2562,71 @@ def slime_validate_args(args):
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
+
+    policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
+    use_dppo_binary = policy_loss_mode in ["dppo_binary_tv", "dppo_binary_kl"]
+    if policy_loss_mode == "cppo":
+        if not math.isfinite(args.eps_clip) or args.eps_clip <= 0.0:
+            raise ValueError(f"--eps-clip must be finite and positive for CPPO, got {args.eps_clip}.")
+        if not math.isfinite(args.cppo_prefix_delta) or args.cppo_prefix_delta <= 0.0:
+            raise ValueError(f"--cppo-prefix-delta must be finite and positive, got {args.cppo_prefix_delta}.")
+        if not math.isfinite(args.cppo_weight_floor) or not 0.0 < args.cppo_weight_floor <= 1.0:
+            raise ValueError(f"--cppo-weight-floor must be finite and in (0, 1], got {args.cppo_weight_floor}.")
+        if args.eps_clip_high is not None and args.eps_clip_high != args.eps_clip:
+            logger.warning(
+                "CPPO uses --eps-clip as its symmetric TV-divergence threshold; --eps-clip-high=%s is ignored.",
+                args.eps_clip_high,
+            )
+        if args.eps_clip_c is not None and (not math.isfinite(args.eps_clip_c) or args.eps_clip_c <= 1.0):
+            raise ValueError(
+                "--eps-clip-c must be finite and greater than 1 for CPPO's detached ratio upper bound, "
+                f"got {args.eps_clip_c}."
+            )
+    if policy_loss_mode == "ripo":
+        if not math.isfinite(args.ripo_delta) or args.ripo_delta <= 0.0:
+            raise ValueError(f"--ripo-delta must be a finite positive number, got {args.ripo_delta}.")
+        if args.ripo_delta_high is not None and (
+            not math.isfinite(args.ripo_delta_high) or args.ripo_delta_high <= 0.0
+        ):
+            raise ValueError(
+                f"--ripo-delta-high must be a finite positive number when set, got {args.ripo_delta_high}."
+            )
+        if not math.isfinite(args.ripo_ratio_min) or not 0.0 <= args.ripo_ratio_min <= 1.0:
+            raise ValueError(f"--ripo-ratio-min must be finite and in [0, 1], got {args.ripo_ratio_min}.")
+        if not math.isfinite(args.ripo_ratio_max) or args.ripo_ratio_max < 1.0:
+            raise ValueError(f"--ripo-ratio-max must be finite and >= 1, got {args.ripo_ratio_max}.")
+        if args.ripo_ratio_min > args.ripo_ratio_max:
+            raise ValueError(
+                "--ripo-ratio-min must not exceed --ripo-ratio-max, got "
+                f"{args.ripo_ratio_min} > {args.ripo_ratio_max}."
+            )
+    assert not (
+        (use_dppo_binary or policy_loss_mode in {"cppo", "drpo"}) and args.use_tis
+    ), "DPPO binary loss, CPPO, DRPO, and TIS apply policy-loss corrections; disable use_tis."
+    if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl", "cppo", "drpo"} and not args.use_rollout_logprobs:
+        if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}:
+            loss_name = "DPPO binary loss"
+        elif policy_loss_mode == "cppo":
+            loss_name = "CPPO"
+        else:
+            loss_name = policy_loss_mode.upper()
+        paper_context = (
+            " This is the decoupled-objective ablation, not the rollout behavior-policy anchor used in "
+            "the DPPO paper (https://arxiv.org/abs/2602.04879)."
+            if policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}
+            else (
+                " CPPO (https://arxiv.org/abs/2606.10968) defines its divergence against the rollout "
+                "behavior policy."
+                if policy_loss_mode == "cppo"
+                else ""
+            )
+        )
+        logger.warning(
+            "%s is using actor-recomputed old log_probs.%s Add --use-rollout-logprobs to use the rollout "
+            "behavior-policy anchor and skip the actor old-logprob forward pass.",
+            loss_name,
+            paper_context,
+        )
 
     if args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip

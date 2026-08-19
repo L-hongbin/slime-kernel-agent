@@ -1,0 +1,204 @@
+To optimize a given PyTorch model by replacing operators with custom CUDA kernels, follow these detailed instructions. Your goal is to achieve performance improvements while ensuring correctness. Name your optimized output architecture `ModelNew`. Generate real code, NOT pseudocode, ensure it compiles and is fully functional, and present it in codeblocks using exactly this section structure and nothing else:
+
+### Output Format
+
+Return exactly the following three codeblocks and nothing else:
+
+#### CUDA_KERNELS
+```cpp
+<CUDA .cu source: kernels, device helpers, and C ABI launcher functions>
+```
+
+#### APPLY_BINDINGS
+```cpp
+<C++/TVM-FFI source that exports launcher wrappers with TVM_FFI_DLL_EXPORT_TYPED_FUNC>
+```
+
+#### MODEL_NEW
+```python
+<Python ModelNew implementation using tvm_ffi_extension>
+```
+
+### Steps to Create Custom CUDA Kernels
+
+#### 1. Identify Operators to Replace
+
+- Analyze the original `Model.forward` and identify operators that can benefit from custom CUDA implementations.
+- Prefer replacing compute-heavy or memory-bandwidth-heavy operations with custom CUDA kernels.
+- Consider operator fusion opportunities to combine adjacent operations into a single kernel, especially elementwise chains, reductions followed by elementwise operations, normalization patterns, and activation chains.
+- Preserve PyTorch semantics: shapes, dtypes, devices, broadcasting, reductions, scalar constants, and edge cases.
+- Preserve the original `Model.__init__` and `forward` signatures.
+- Preserve state_dict compatibility by keeping parameter and buffer names, shapes, and dtypes compatible with the original model.
+
+#### 2. Plan the TVM-FFI Extension Interface
+
+- Split the answer into `CUDA_KERNELS`, `APPLY_BINDINGS`, and `MODEL_NEW`.
+- In `CUDA_KERNELS`, expose C ABI launcher functions that use raw pointers, integer sizes/strides, scalar parameters, and an opaque `void*` stream handle.
+- In `APPLY_BINDINGS`, write TVM-FFI wrapper functions that receive `tvm::ffi::Tensor`, validate inputs, get the current CUDA stream, and call the CUDA launcher.
+- In `MODEL_NEW`, allocate output tensors in Python and pass them to `tvm_ffi_extension` functions.
+- Make sure every Python-callable wrapper is exported with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function_name);`.
+- Make sure exported names in `APPLY_BINDINGS` exactly match calls in `MODEL_NEW`.
+
+#### 3. Implement the CUDA Kernels
+
+- Write real CUDA C++ code using `__global__` kernels for the core computation.
+- This section must be pure CUDA/C++; do not call PyTorch, ATen, TVM, TVM-FFI, or Python APIs here.
+- You may use cuBLAS for GEMM and cuDNN for convolution when appropriate.
+- Cast the opaque stream handle to `cudaStream_t` inside launcher functions.
+- Use correct indexing and explicit bounds checks.
+- Use grid-stride loops or correct multidimensional indexing so every valid output element is computed.
+- Use shared memory, tiling, vectorized memory access, or warp-level reductions only when they fit the operation.
+- Handle non-divisible sizes, partial blocks, reductions, broadcasting, and scalar constants correctly.
+- Avoid data races. Use atomics only when necessary and safe.
+
+Example CUDA launcher shape:
+
+```cpp
+__global__ void my_kernel(const float* input, float* output, int64_t n) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = blockDim.x * gridDim.x;
+    for (int64_t i = idx; i < n; i += stride) {
+        output[i] = input[i];
+    }
+}
+
+extern "C" void my_kernel_launcher(float* output, const float* input, int64_t n, void* stream_handle) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_handle);
+    int threads = 256;
+    int blocks = static_cast<int>((n + threads - 1) / threads);
+    my_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+}
+```
+
+#### 4. Write TVM-FFI Bindings
+
+- Use TVM-FFI bindings only.
+- Include:
+  `#include <tvm/ffi/tvm_ffi.h>`
+  `#include <tvm/ffi/extra/c_env_api.h>`
+- TVM-FFI receives tensors as `tvm::ffi::Tensor`.
+- Validate op-specific invariants with `TVM_FFI_ICHECK`: device, dtype, ndim, shapes, and contiguity when required.
+- Get the current CUDA stream from the TVM-FFI environment:
+  `void* stream_handle = TVMFFIEnvGetStream(input.device().device_type, input.device().device_id);`
+- Pass raw tensor pointers and metadata into CUDA launcher functions.
+- Do not invoke PyTorch or ATen compute operators here.
+- Do not allocate output tensors in C++ bindings unless unavoidable; prefer preallocated output tensors from Python.
+
+Minimal TVM-FFI wrapper pattern:
+
+```cpp
+#include <tvm/ffi/tvm_ffi.h>
+#include <tvm/ffi/extra/c_env_api.h>
+
+extern "C" void my_kernel_launcher(float* out, const float* in, int64_t n, void* stream_handle);
+
+void my_kernel_forward(tvm::ffi::Tensor input, tvm::ffi::Tensor output) {
+    TVM_FFI_ICHECK(input.device().device_type == kDLCUDA) << "input must be CUDA";
+    TVM_FFI_ICHECK(output.device().device_type == kDLCUDA) << "output must be CUDA";
+    void* stream_handle = TVMFFIEnvGetStream(input.device().device_type, input.device().device_id);
+    my_kernel_launcher(
+        static_cast<float*>(output.data_ptr()),
+        static_cast<const float*>(input.data_ptr()),
+        input.shape()[0],
+        stream_handle);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(my_kernel_forward, my_kernel_forward);
+```
+
+#### 5. Integrate the Kernels into `ModelNew`
+
+- Define `class ModelNew(nn.Module)` matching the original `Model.__init__` and `forward` signatures.
+- Preserve parameter and buffer attribute names, shapes, and dtypes so the original `state_dict` still loads.
+- Do not invent new trainable parameters.
+- Do not rename parameters or buffers.
+- Do not create attribute names containing `.`.
+- If the original model uses submodules such as `self.conv`, `self.linear`, or normalization modules, instantiate compatible submodules in `ModelNew` and pass their `.weight`, `.bias`, or buffers into `tvm_ffi_extension` calls when needed.
+- Import the compiled extension as `tvm_ffi_extension`.
+- Allocate output tensors with `torch.empty` or `torch.empty_like` in Python, then pass them into the TVM-FFI wrapper.
+- If your CUDA kernel assumes contiguous tensors, call `.contiguous()` before passing inputs to the extension.
+- Do not bypass core computation with PyTorch operators such as `torch.matmul`, `torch.sum`, `torch.exp`, `torch.softmax`, `F.conv2d`, `F.softmax`, or similar.
+- Tensor allocation and metadata access are allowed, such as `torch.empty`, `torch.empty_like`, `.shape`, `.device`, `.dtype`, and `.contiguous()`.
+
+Example `MODEL_NEW` pattern:
+
+```python
+import torch
+import torch.nn as nn
+import tvm_ffi_extension
+
+class ModelNew(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+
+    def forward(self, x):
+        out = torch.empty_like(x)
+        tvm_ffi_extension.my_kernel_forward(x.contiguous(), out)
+        return out
+```
+
+#### 6. Static Correctness Checklist
+
+- CUDA launcher declarations match definitions and binding calls exactly.
+- TVM-FFI exported function names match Python calls.
+- All code blocks are complete and syntactically valid.
+- Required headers are included in the correct section.
+- No PyTorch, ATen, TVM, or Python APIs are called inside `CUDA_KERNELS`.
+- Output shapes match the original model exactly.
+- Broadcasting, reductions, and scalar constants match PyTorch behavior.
+- Non-power-of-two sizes and partial blocks are handled.
+- Floating-point results should match the PyTorch reference within normal tolerance.
+- `MODEL_NEW` should return the same kind of object as the original `forward`.
+- The final answer contains no tests, benchmark code, or explanatory prose outside the three required sections.
+
+### Additional Best Practices
+
+- **Optimize Memory Usage**: Minimize data transfers between host and device, reduce intermediate allocations, and use shared memory only when it meaningfully reduces global memory access.
+- **Operator Fusion**: Fuse adjacent operations when doing so reduces memory traffic or kernel launch overhead without making correctness fragile.
+- **TVM-FFI Interface Design**: Keep TVM-FFI bindings thin. Derive output shapes in Python, allocate outputs in `MODEL_NEW`, and let bindings only validate tensors and marshal raw pointers into CUDA launchers.
+- **Stream Handling**: Pass an opaque `void*` stream handle from TVM-FFI into CUDA launchers, and keep `cudaStream_t` usage inside `CUDA_KERNELS`.
+- **Atomic Operations**: When using atomic operations like `atomicMax` with floating-point numbers, ensure correct usage with appropriate data types and minimize contention.
+- **Performance Optimization**: Maximize parallel execution, optimize memory access patterns, prefer coalesced loads/stores, and use robust launch configurations that cover all elements.
+- **Namespace Usage**: Avoid adding class declarations or function definitions directly to reserved namespaces like `cuda`. Use nested namespaces within non-reserved namespaces to organize code.
+- **Numerical Precision**: Be aware of floating-point arithmetic issues, such as non-associativity, and use appropriate precision levels for calculations.
+- **Compatibility**: Preserve the original module signatures and state_dict layout, and keep dtype, device, shape, broadcasting, and reduction semantics aligned with PyTorch.
+
+By following these instructions, you can effectively replace PyTorch operators with custom CUDA kernels exposed through TVM-FFI, ensuring both performance improvements and correctness.
+
+### Instruction for Replacing PyTorch Operators with Custom CUDA Kernels
+
+Your task is to optimize the given PyTorch model by replacing selected operators with custom CUDA kernels exposed through TVM-FFI. Follow the requirements below to ensure a valid implementation.
+
+#### Step 1: Select Replacement Targets
+
+- Choose operators that are computationally intensive, memory-bandwidth intensive, or frequently used in the forward pass.
+- Fuse operations when doing so reduces memory traffic or kernel launch overhead.
+- Preserve output shapes, return types, dtype behavior, and all visible model semantics.
+
+#### Step 2: Produce the Required TVM-FFI Sections
+
+- `CUDA_KERNELS` must contain CUDA kernels, device helpers, and C ABI launcher functions.
+- `APPLY_BINDINGS` must contain TVM-FFI wrappers and `TVM_FFI_DLL_EXPORT_TYPED_FUNC` exports.
+- `MODEL_NEW` must contain the Python `ModelNew` implementation using `tvm_ffi_extension`.
+- The final answer must contain exactly these three sections and no other prose.
+
+#### Step 3: Maintain Model Compatibility
+
+- `ModelNew.__init__` and `ModelNew.forward` must match the original model signatures.
+- Parameter and buffer names, shapes, and dtypes must remain compatible with the original `state_dict`.
+- Submodules needed for state compatibility should be recreated with compatible names and attributes.
+- `MODEL_NEW` should return the same kind of object as the original `forward`.
+
+#### Constraints
+
+- The optimized model must maintain the same accuracy and visible behavior as the original model.
+- The custom CUDA kernels should improve performance by reducing runtime, memory traffic, or kernel launch overhead.
+- The final answer must contain exactly the three required sections: `CUDA_KERNELS`, `APPLY_BINDINGS`, and `MODEL_NEW`.
+- Do not include tests, benchmark code, or explanatory prose outside the three required sections.
+- Do not call PyTorch, ATen, TVM, TVM-FFI, or Python APIs inside `CUDA_KERNELS`.
+
+Here is the original PyTorch problem:
+
+```python
+{{ problem }}
+```

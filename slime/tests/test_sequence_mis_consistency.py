@@ -126,7 +126,11 @@ def _actual_masks_from_sequence_mis(
 def assert_sequence_mis_loop_matches_batch(aggregation: str, *, token_veto_threshold: float | None = None) -> None:
     sequence_mis = _import_targets()
     train_log_probs, rollout_log_probs, loss_masks, _advantages = _build_inputs()
-    lower, upper = (-0.1, 0.1) if aggregation == "kl" else (0.9, 1.1)
+    lower, upper = (
+        (0.0, 0.1)
+        if aggregation in {"mirrorpop", "turns_mirrorpop"}
+        else ((-0.1, 0.1) if aggregation == "kl" else (0.9, 1.1))
+    )
 
     expected = _actual_masks_from_sequence_mis(
         sequence_mis,
@@ -160,7 +164,7 @@ def assert_sequence_mis_loop_matches_batch(aggregation: str, *, token_veto_thres
 
 
 def test_sequence_mis_loop_matches_batch() -> None:
-    for aggregation in ("kl", "geometric", "turns_geometric"):
+    for aggregation in ("kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"):
         assert_sequence_mis_loop_matches_batch(aggregation)
         assert_sequence_mis_loop_matches_batch(aggregation, token_veto_threshold=1e-4)
 
@@ -189,6 +193,34 @@ def test_sequence_mis_token_veto_without_aggregation() -> None:
                 f"token-veto-only mismatch at sample {i}: "
                 f"actual={actual_mask.tolist()} expected={expected_mask.tolist()}"
             )
+
+
+def test_sequence_mis_writes_seq_mis_metrics() -> None:
+    sequence_mis = _import_targets()
+    train_log_probs, rollout_log_probs, loss_masks, _advantages = _build_inputs()
+    args = Namespace(
+        sequence_mis_aggregation="mirrorpop",
+        sequence_mis_lower=0.0,
+        sequence_mis_upper=0.1,
+        sequence_mis_token_veto_threshold=1e-4,
+        sequence_mis_mode="batch",
+        sequence_mis_batch_size=8,
+        n_samples_per_prompt=2,
+        max_turns=3,
+        sequence_mis_use_advantage=False,
+    )
+    rollout_data = {
+        "log_probs": [item.clone() for item in train_log_probs],
+        "rollout_log_probs": [item.clone() for item in rollout_log_probs],
+        "loss_masks": [item.clone() for item in loss_masks],
+        "total_lengths": [len(item) for item in loss_masks],
+        "response_lengths": [len(item) for item in loss_masks],
+    }
+
+    sequence_mis(args, rollout_id=0, rollout_data=rollout_data)
+
+    if rollout_data["seq_mis/reject_rate"] != (3.0, 5.0):
+        raise AssertionError(f"unexpected reject_rate contribution: {rollout_data['seq_mis/reject_rate']}")
 
 
 def test_sequence_mis_use_advantage_protects_positive_advantage() -> None:
@@ -315,7 +347,11 @@ def _run_sequence_mis_once(
     rollout_log_probs: list[torch.Tensor],
     loss_masks: list[torch.Tensor],
 ) -> list[torch.Tensor]:
-    lower, upper = (-0.1, 0.1) if aggregation == "kl" else (0.9, 1.1)
+    lower, upper = (
+        (0.0, 0.1)
+        if aggregation in {"mirrorpop", "turns_mirrorpop"}
+        else ((-0.1, 0.1) if aggregation == "kl" else (0.9, 1.1))
+    )
     args = Namespace(
         sequence_mis_aggregation=aggregation,
         sequence_mis_lower=lower,
@@ -380,7 +416,7 @@ def benchmark_loop_vs_batch() -> None:
     train_log_probs, rollout_log_probs, loss_masks = _build_benchmark_inputs(device=device)
     print(f"\nloop vs batch sequence_mis benchmark ({device.type.upper()}, CP gather patched to no-op)")
     print("aggregation        loop_ms    batch_ms   speedup")
-    for aggregation in ("kl", "geometric", "turns_geometric"):
+    for aggregation in ("kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"):
         loop_masks = _run_sequence_mis_once(
             sequence_mis,
             aggregation=aggregation,
@@ -429,10 +465,11 @@ def benchmark_loop_vs_batch() -> None:
 def main() -> None:
     test_sequence_mis_loop_matches_batch()
     test_sequence_mis_token_veto_without_aggregation()
+    test_sequence_mis_writes_seq_mis_metrics()
     test_sequence_mis_use_advantage_protects_positive_advantage()
     test_sequence_mis_reports_mismatch_stats()
     print(
-        "sequence_mis loop/batch modes match for kl, geometric, turns_geometric, "
+        "sequence_mis loop/batch modes match for kl, geometric, mirrorpop, turns_geometric, turns_mirrorpop, "
         "batch mode supports token-veto-only mode, use_advantage protects positive advantages, "
         "and mismatch/effective-batch stats are reported consistently."
     )

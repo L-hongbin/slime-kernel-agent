@@ -1,0 +1,48 @@
+Use this feedback to revise your previous CUDA + TVM-FFI implementation:
+
+{{ feedback }}
+
+First identify the exact failure mode from the feedback. Do not make unrelated rewrites.
+
+Revise based on the exact failure mode above:
+
+- **Compilation error** (`compiled: false`): Fix the specific C++ or CUDA compile error shown in `error_message`. Common TVM-FFI fixes:
+  - Use `input.dtype().code == kDLFloat && input.dtype().bits == 32` for float32 checks (never `.type_code`, `kTVMFloat`, or `kTVMFFIFloat`).
+  - Use `input.ndim()` and `input.shape()[i]`; `ndim` is a method, not a member.
+  - Ensure `TVMFFIEnvGetStream(input.device().device_type, input.device().device_id)` is called correctly.
+
+- **Runtime error / Crash** (`compiled: true, correctness: false` or segfault): Fix execution logic.
+  - Relax or remove brittle `TVM_FFI_ICHECK` assertions that compare exact shapes/sizes between tensors and computed scalars.
+  - Ensure `MODEL_NEW` preallocates outputs with the exact shape the launcher expects.
+  - Ensure the CUDA kernel matches PyTorch semantics (padding, reductions, broadcasting, edge cases).
+  - **PyTorch module compatibility**: Do not assume submodule parameters exist. For example, `nn.InstanceNorm2d(affine=False)` has `weight=None` and `bias=None`. Use conditional logic or `getattr(module, 'weight', None)` instead of unconditionally accessing `.weight` and `.bias`.
+  - Check for out-of-bounds shared memory access and invalid `blockDim.x` assumptions.
+
+- **Performance** (`speedup < 1`): Optimize the CUDA kernel without changing the TVM-FFI interface.
+  - For simple memory-bound elementwise ops (e.g., activations), PyTorch is already highly optimized. Only replace if you can match its performance without breaking correctness. A simple branchless grid-stride loop is often safer and faster than a buggy vectorized kernel.
+  - Eliminate warp divergence (e.g., branchless math with `fmaxf`/`fminf`).
+  - Use vectorized memory access (`float4`) only when you are certain it preserves exact semantics for all elements including tail handling.
+  - Tune block/grid sizes and minimize global memory traffic.
+  - For GEMM/conv, use cuBLAS/cuDNN rather than naive custom kernels.
+
+- **Correct and faster than baseline** (`compiled: true, correctness: true, speedup > 1`): Push the CUDA kernel further toward the performance limit while preserving correctness and the TVM-FFI interface.
+  - Keep PyTorch semantics exactly unchanged.
+  - Aggressively explore performance improvements including algorithm changes, kernel fusion, reduced global memory traffic, improved occupancy, shared memory tiling, warp-level primitives, vectorized memory access, specialized fast paths, launch configuration tuning, and cuBLAS/cuDNN where appropriate.
+  - Any specialization must be justified by guarantees from the feedback, model code, or launcher-visible tensor metadata, and must include correct fallback or tail handling for all valid inputs.
+
+Return a full improved implementation with exactly these three codeblocks and nothing else:
+
+#### CUDA_KERNELS
+```cpp
+<CUDA .cu source>
+```
+
+#### APPLY_BINDINGS
+```cpp
+<TVM-FFI C++ source>
+```
+
+#### MODEL_NEW
+```python
+<Python ModelNew implementation>
+```

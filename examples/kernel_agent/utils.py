@@ -27,6 +27,7 @@ CUDA_SECTIONS = ("CUDA_KERNELS", "APPLY_BINDINGS", "MODEL_NEW")
 
 METADATA_POP_KEYS = (
     "compile_only",
+    "device",
     "required_resource",
     "task_id",
     "inline_gpu_execute_completed",
@@ -50,6 +51,11 @@ METADATA_POP_KEYS = (
     "reference_task_id",
     "split_compile_and_execute",
     "cpu_worker_run_s",
+    "correctness_tf32_state_before",
+    "correctness_tf32_state_forced",
+    "correctness_atol",
+    "correctness_rtol",
+    "runtime_error",
 )
 
 COMPILE_ARTIFACT_POP_KEYS = (
@@ -64,6 +70,13 @@ COMPILE_ARTIFACT_POP_KEYS = (
     "compile_artifact_cache_hit",
     "compile_artifact_cache_dir",
     "compile_cache_hit",
+    "module_name",
+    "profiling_hints",
+    "artifact_node_id",
+    "artifact_hostname",
+    "target_gpu_worker_id",
+    "target_gpu_selection_strategy",
+    "device",
 )
 
 
@@ -99,10 +112,107 @@ def _extract_env_precheck_error_message(env_state: dict[str, Any]) -> str | None
     return None
 
 
-def normalize_env_feedback(env_state: dict[str, Any]) -> dict[str, Any]:
+def _as_float_or_none(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _get_env_metadata(env_state: dict[str, Any]) -> dict[str, Any]:
+    metadata = env_state.get("metadata") if isinstance(env_state, dict) else None
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _coefficient_of_variation(metadata: dict[str, Any], mean_key: str, std_key: str) -> float | None:
+    mean = _as_float_or_none(metadata.get(mean_key))
+    std = _as_float_or_none(metadata.get(std_key))
+    if mean is None or std is None or mean == 0.0:
+        return None
+    return std / mean
+
+
+def _extract_detail_env_time(env_state: dict[str, Any]) -> dict[str, float]:
+    metadata = _get_env_metadata(env_state)
+
+    detail_env_time: dict[str, float] = {}
+    compile_time = _as_float_or_none(metadata.get("kg_kernel_backend_compile_s"))
+    if compile_time is not None:
+        detail_env_time["compile_time"] = compile_time
+
+    warmup_time = _as_float_or_none(metadata.get("kg_kernel_perf_warmup_s"))
+    measure_time = _as_float_or_none(metadata.get("kg_kernel_perf_measure_wall_s"))
+    if warmup_time is not None or measure_time is not None:
+        detail_env_time["kernel_runtime"] = (warmup_time or 0.0) + (measure_time or 0.0)
+
+    profile_time = _as_float_or_none(metadata.get("kg_kernel_perf_profile_s"))
+    if profile_time is not None:
+        detail_env_time["profile_time"] = profile_time
+
+    reference_warmup_time = _as_float_or_none(metadata.get("kg_reference_perf_warmup_s"))
+    reference_measure_time = _as_float_or_none(metadata.get("kg_reference_perf_measure_wall_s"))
+    if reference_warmup_time is not None or reference_measure_time is not None:
+        detail_env_time["refer_runtime"] = (reference_warmup_time or 0.0) + (reference_measure_time or 0.0)
+
+    return detail_env_time
+
+
+def _require_env_value(mapping: dict[str, Any], key: str, path: str) -> Any:
+    if key not in mapping:
+        raise KeyError(f"{path} missing required field for env_extra_info: {key}")
+    return mapping[key]
+
+
+def _extract_env_extra_info(env_state: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(env_state, dict):
+        raise TypeError("env_state must be a dict for env_extra_info extraction.")
+
+    metadata = _require_env_value(env_state, "metadata", "env_state")
+    if not isinstance(metadata, dict):
+        raise TypeError("env_state.metadata must be a dict for env_extra_info extraction.")
+
+    num_custom_kernels = metadata.get("num_custom_kernels", 0)
+    num_total_kernels = metadata.get("num_total_kernels", 0)
+    custom_kernel_time = metadata.get(
+        "custom_kernel_cuda_time_in_profiling_us",
+        metadata.get("custom_kernel_time_in_profiling_us", 0),
+    )
+    total_kernel_time = metadata.get("total_kernel_run_time_in_profiling_us", 0)
+    num_coverage = 0.0
+    if float(num_total_kernels) > 0:
+        num_coverage = float(num_custom_kernels) / float(num_total_kernels)
+    time_coverage = 0.0
+    if float(total_kernel_time) > 0:
+        time_coverage = float(custom_kernel_time) / float(total_kernel_time)
+
+    detail_env_time = _extract_detail_env_time(env_state)
+    kernel_perf_cv = _coefficient_of_variation(metadata, "kg_kernel_perf_mean_ms", "kg_kernel_perf_std_ms")
+    refer_perf_cv = _coefficient_of_variation(metadata, "kg_reference_perf_mean_ms", "kg_reference_perf_std_ms")
+
+    env_extra_info = {
+        "time_coverage": float(f"{time_coverage:.2f}"),
+        "num_coverage": float(f"{num_coverage:.2f}"),
+        "correctness": _require_env_value(env_state, "correctness", "env_state"),
+        "compilation": _require_env_value(env_state, "compiled", "env_state"),
+        "speedup": _require_env_value(env_state, "speedup", "env_state"),
+        "decoy_kernel": bool(env_state.get("decoy_kernel", False)),
+        "precheck": env_state.get("precheck"),
+        "detail_env_time": detail_env_time,
+    }
+    if isinstance(kernel_perf_cv, (int, float)) and not isinstance(kernel_perf_cv, bool):
+        env_extra_info["kernel_perf_cv"] = float(kernel_perf_cv)
+    if isinstance(refer_perf_cv, (int, float)) and not isinstance(refer_perf_cv, bool):
+        env_extra_info["refer_perf_cv"] = float(refer_perf_cv)
+    return env_extra_info
+
+
+def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     env_state = dict(env_state or {})
-    env_state.pop("error_code", None)
     env_state.setdefault("decoy_kernel", False)
+    env_state.setdefault("precheck", "passed")
+
+    metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
+    runtime_error = metadata.get("runtime_error")
+    metadata_error = metadata.get("error")
     error_message = env_state.get("error_message") or env_state.get("error")
     env_precheck_error_message = _extract_env_precheck_error_message(env_state)
 
@@ -164,10 +274,26 @@ def normalize_env_feedback(env_state: dict[str, Any]) -> dict[str, Any]:
                 "error_message": error_message or "Task failed: Kernel evaluation error.",
             }
         )
-    else:
-        pass
-    # Remove or mask fields that are not essential for reward computation and may contain large or sensitive information.
-    for key in ("submitted_at", "completed_at"):
+    if runtime_error:
+        runtime_error = str(runtime_error)
+        current_error_message = str(env_state.get("error_message") or "")
+        if runtime_error not in current_error_message:
+            env_state["error_message"] = "\n".join(
+                part for part in (current_error_message, "other error message:", runtime_error) if part
+            )
+    if metadata_error:
+        metadata_error = str(metadata_error)
+        current_error_message = str(env_state.get("error_message") or "")
+        if metadata_error not in current_error_message:
+            env_state["error_message"] = "\n".join(
+                part for part in (current_error_message, "other error message:", metadata_error) if part
+            )
+    return env_state
+
+
+def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
+    env_state = dict(env_state or {})
+    for key in ("submitted_at", "completed_at", "error_code"):
         env_state.pop(key, None)
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
@@ -194,6 +320,12 @@ def normalize_env_feedback(env_state: dict[str, Any]) -> dict[str, Any]:
             metadata["compile_artifact"] = compile_artifact
         env_state["metadata"] = metadata
     return env_state
+
+
+def normalize_env_feedback(env_state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    normalized_env_state = _normalize_env_feedback_fields(env_state)
+    env_extra_info = _extract_env_extra_info(normalized_env_state)
+    return _strip_env_feedback_fields(normalized_env_state), env_extra_info
 
 
 def split_think_response(response: str) -> tuple[str | None, str]:
@@ -605,66 +737,42 @@ def extract_cuda_agent_kernel_code(response: str) -> str:
     return "\n\n".join(ordered_sections) if ordered_sections else response
 
 
-def precheck_cuda_agent_response(response: str, entry_point: str) -> dict[str, Any] | None:
-    cuda_sources, model_new_code = parse_cuda_agent_response(response)
-    error_message, error, precheck = precheck_cuda_agent_code(
-        model_new_code,
-        cuda_sources,
-        entry_point=entry_point,
-    )
-    if precheck == "passed":
-        return None
-
-    return {
-        "status": "failed",
-        "precheck": precheck,
-        "success": False,
-        "correctness": None,
-        "compiled": None,
-        "speedup": None,
-        "error": error,
-        "error_message": error_message,
-        "metadata": {
-            "kernel_eval_failure": True,
-        },
-    }
-
-
-def precheck_tvm_ffi_response(response: str, entry_point: str) -> dict[str, Any] | None:
-    cuda_sources, model_new_code = parse_cuda_agent_response(response)
-    error_message, error, precheck = precheck_cuda_tvm_code(
-        model_new_code,
-        cuda_sources,
-        entry_point=entry_point,
-    )
-    if precheck == "passed":
-        return None
-
-    return {
-        "status": "failed",
-        "precheck": precheck,
-        "success": False,
-        "correctness": None,
-        "compiled": None,
-        "speedup": None,
-        "error": error,
-        "error_message": error_message,
-        "metadata": {
-            "kernel_eval_failure": True,
-        },
-    }
-
-
 def precheck_response(
     response: str,
     entry_point: str,
     backend: str,
-) -> dict[str, Any] | None:
+) -> tuple[bool, dict[str, Any] | None]:
     if backend == "cuda_agent":
-        return precheck_cuda_agent_response(response, entry_point)
-    if backend == "tvm_ffi":
-        return precheck_tvm_ffi_response(response, entry_point)
-    return None
+        precheck_func = precheck_cuda_agent_code
+    elif backend == "tvm_ffi":
+        precheck_func = precheck_cuda_tvm_code
+    else:
+        return True, None
+
+    cuda_sources, model_new_code = parse_cuda_agent_response(response)
+    error_message, error, precheck = precheck_func(
+        model_new_code,
+        cuda_sources,
+        entry_point=entry_point,
+    )
+    if precheck == "passed":
+        return True, None
+    else:
+        precheck_state = {
+            "status": "failed",
+            "precheck": precheck,
+            "success": False,
+            "correctness": None,
+            "compiled": None,
+            "speedup": None,
+            "decoy_kernel": False,
+            "error": error,
+            "error_message": error_message,
+            "metadata": {
+                "kernel_eval_failure": True,
+            },
+        }
+        return False, precheck_state
 
 
 def _mark_remove_sample(sample: Sample, reason: str) -> None:

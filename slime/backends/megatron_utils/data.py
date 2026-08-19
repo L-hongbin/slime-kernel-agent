@@ -460,6 +460,9 @@ def log_rollout_data(
                 "micro_batch_indices",
             ]:
                 continue
+            if isinstance(val, tuple) and len(val) == 2 and all(isinstance(item, (int, float)) for item in val):
+                log_dict[key] = val
+                continue
             # Emit (sum, count) so gather_log_data can do a weighted average across
             # DP ranks. This stops the legacy "every rank has the same N samples"
             # assumption from biasing means once uneven-DP partitioning lands.

@@ -15,6 +15,12 @@ import pybase64
 import sglang_router
 import yaml
 from packaging.version import parse
+
+try:
+    from jinja2 import Template, TemplateError
+except ImportError:
+    Template = None
+    TemplateError = Exception
 from tqdm import tqdm
 
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
@@ -279,6 +285,55 @@ def _decode_routed_experts(
     return raw.reshape(token_count, num_layers, actual_topk)
 
 
+class PromptTemplate:
+    FORMAT_SUFFIXES = {".yaml", ".yml"}
+    JINJA_SUFFIXES = {".jinja", ".j2"}
+
+    def __init__(self, template: str, render_mode: str, source: str | None = None) -> None:
+        self.template = template
+        self.render_mode = render_mode
+        self.source = source
+
+    @classmethod
+    def from_path(cls, config_path: str | None, *, prompt_name: str = "tool_response") -> "PromptTemplate | None":
+        if config_path is None:
+            return None
+
+        config_file = Path(config_path)
+        suffix = config_file.suffix.lower()
+        if suffix in cls.JINJA_SUFFIXES:
+            return cls(config_file.read_text(encoding="utf-8"), "jinja", str(config_file))
+        if suffix not in cls.FORMAT_SUFFIXES:
+            raise ValueError(
+                f"Unsupported multi_turn_prompt_config_path suffix: {config_file.suffix}. "
+                "Expected .yaml/.yml or .jinja/.j2."
+            )
+
+        with config_file.open(encoding="utf-8") as f:
+            prompt_cfg = yaml.safe_load(f) or {}
+
+        for item in prompt_cfg.get("per_turn_prompts", []) or []:
+            if str(item.get("name")) == prompt_name and item.get("template"):
+                return cls(str(item["template"]), "format", str(config_file))
+        return None
+
+    def format(self, feedback: str, feedback_dict: dict[str, Any]) -> str:
+        if self.render_mode == "format":
+            return self.template.format(feedback=feedback, feedback_dict=feedback_dict)
+        if self.render_mode == "jinja":
+            if Template is None:
+                raise RuntimeError("Jinja multi-turn prompt template requires jinja2 to be installed.")
+            try:
+                return Template(self.template).render(feedback=feedback, feedback_dict=feedback_dict)
+            except TemplateError:
+                raise
+            except Exception as exc:
+                raise TemplateError(
+                    f"failed to render Jinja multi-turn prompt template: {type(exc).__name__}: {exc}"
+                ) from exc
+        raise ValueError(f"Unknown multi-turn prompt render mode: {self.render_mode}")
+
+
 def get_model_url(args: Namespace, model_name: str, endpoint: str = "/generate") -> str:
     """Return the router URL for a named model.
 
@@ -313,9 +368,7 @@ class GenerateState(metaclass=SingletonMeta):
         self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
         logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)
         self._warn_history_thinking_template()
-        self.multi_turn_templates = self._load_multi_turn_templates(
-            getattr(args, "multi_turn_prompt_config_path", None)
-        )
+        self.multi_turn_template = PromptTemplate.from_path(getattr(args, "multi_turn_prompt_config_path", None))
 
         self.semaphore = asyncio.Semaphore(get_sglang_client_concurrency(args))
         self.sampling_params: dict[str, Any] = dict(
@@ -345,26 +398,6 @@ class GenerateState(metaclass=SingletonMeta):
         self.active_lora_name: str | None = None
 
         self.reset()
-
-    @staticmethod
-    def _load_multi_turn_templates(config_path: str | None) -> dict[str, str] | None:
-        if config_path is None:
-            return None
-
-        with open(config_path, encoding="utf-8") as f:
-            prompt_cfg = yaml.safe_load(f) or {}
-
-        templates = {}
-        for item in prompt_cfg.get("per_turn_prompts", []) or []:
-            name = item.get("name")
-            template = item.get("template")
-            if name and template:
-                templates[str(name)] = str(template)
-        if not templates:
-            return None
-
-        logger.info("Loaded multi_turn_templates from %s: %s", config_path, templates)
-        return templates
 
     def _warn_history_thinking_template(self) -> None:
         if not bool(getattr(self.args, "preserve_history_thinking", False)):

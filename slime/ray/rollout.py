@@ -4,6 +4,7 @@ import logging
 import multiprocessing
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -638,9 +639,27 @@ class RolloutManager:
                 logger.warning(f"CI Fault Injection failed: {e}")
 
     def dispose(self):
+        self._stop_rollout_background_workers()
         for monitor in self._health_monitors:
             monitor.stop()
         logging_utils.finish_tracking(self.args)
+
+    def _stop_rollout_background_workers(self) -> None:
+        stopped_modules: set[str] = set()
+        for fn in (self.generate_rollout, self.eval_generate_rollout):
+            module_name = getattr(fn, "__module__", None)
+            if not module_name or module_name in stopped_modules:
+                continue
+            module = sys.modules.get(module_name)
+            stop_fn = getattr(module, "_stop_global_worker", None) if module is not None else None
+            if not callable(stop_fn):
+                continue
+            logger.info("Stopping rollout background worker from %s", module_name)
+            try:
+                stop_fn()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to stop rollout background worker from %s", module_name)
+            stopped_modules.add(module_name)
 
     @property
     def server(self) -> RolloutServer | None:
@@ -1670,9 +1689,64 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
     log_dict |= _compute_reward_cat_metrics(args, samples)
+    if getattr(args, "log_response_diversity", False):
+        log_dict |= _compute_response_diversity(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _iter_response_diversity_groups(args, samples):
+    if any(sample.group_id is not None or sample.group_index is not None for sample in samples):
+        groups = {}
+        for sample in samples:
+            if sample.group_id is not None:
+                group_key = sample.group_id
+            elif sample.group_index is not None:
+                group_key = sample.group_index
+            else:
+                group_key = sample.index
+            groups.setdefault(group_key, []).append(sample)
+        return groups.values()
+
+    group_size = max(int(getattr(args, "n_samples_per_prompt", 1) or 1), 1)
+    return (samples[i : i + group_size] for i in range(0, len(samples), group_size))
+
+
+def _compute_response_diversity(args, samples) -> dict[str, float]:
+    token_bits = 32
+    max_token = (1 << token_bits) - 1
+    tail_mask = (1 << (token_bits * 3)) - 1
+    diversities = []
+
+    for group in _iter_response_diversity_groups(args, samples):
+        total = 0
+        unique = set()
+        for sample in group:
+            response_length = int(sample.response_length or 0)
+            if response_length < 4:
+                continue
+            tokens = sample.tokens[-response_length:]
+            if len(tokens) < 4:
+                continue
+            total += len(tokens) - 3
+
+            a, b, c, d = tokens[0], tokens[1], tokens[2], tokens[3]
+            if (a | b | c | d) > max_token:
+                raise ValueError(f"token id exceeds response diversity token_bits={token_bits}")
+            key = (((a << token_bits) | b) << token_bits | c) << token_bits | d
+            unique.add(key)
+
+            for token in tokens[4:]:
+                if token > max_token:
+                    raise ValueError(f"token id {token} exceeds response diversity token_bits={token_bits}")
+                key = ((key & tail_mask) << token_bits) | token
+                unique.add(key)
+
+        if total > 0:
+            diversities.append(len(unique) / total)
+
+    return {"response_diversity": float(np.mean(diversities).item()) if diversities else 0.0}
 
 
 FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0, 3.0)
@@ -1800,29 +1874,78 @@ def _compute_kernel_agent_metrics(samples):
     bool_keys = {"correctness", "compilation", "decoy_kernel"}
     coverage_keys = {"time_coverage", "num_coverage"}
     values_by_key = {}
-    time_values = {"model_time": [], "env_time": []}
+    time_values = {
+        "model_time": [],
+        "env_time": [],
+        "detail_env_time/compile_time": [],
+        "detail_env_time/kernel_runtime": [],
+        "detail_env_time/profile_time": [],
+        "detail_env_time/refer_runtime": [],
+    }
     total_count = len(samples)
     coverage_rs_masked_count = 0
+    conditional_truncation_masked_count = 0
     correct_count = 0
     coverage_rs_correct_masked_count = 0
     precheck_count = 0
     precheck_passed_count = 0
+    env_status_count = 0
+    env_timeout_count = 0
+    kernel_eval_client_timeout_count = 0
+    non_pad_count = 0
+    generate_guard_timeout_count = 0
 
     for sample in samples:
         metadata = sample.metadata or {}
         is_coverage_rs_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
+        is_conditional_truncation_masked = bool(metadata.get("conditional_truncation_masked"))
         if is_coverage_rs_masked:
             coverage_rs_masked_count += 1
+        if is_conditional_truncation_masked:
+            conditional_truncation_masked_count += 1
 
-        for key in time_values:
-            value = metadata.get(key)
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                continue
-            time_values[key].append(float(value))
+        if not metadata.get("is_pad_turn"):
+            non_pad_count += 1
+            if sample.status == Sample.Status.ABORTED and metadata.get("abort_reason") == "wall_clock_timeout":
+                generate_guard_timeout_count += 1
+
+        model_time = metadata.get("model_time")
+        if not isinstance(model_time, bool) and isinstance(model_time, (int, float)):
+            time_values["model_time"].append(float(model_time))
 
         env_extra_info = metadata.get("env_extra_info")
         if not isinstance(env_extra_info, dict):
             continue
+
+        env_time = metadata.get("env_time")
+        if (
+            env_extra_info.get("precheck") != "failed"
+            and not isinstance(env_time, bool)
+            and isinstance(env_time, (int, float))
+        ):
+            time_values["env_time"].append(float(env_time))
+
+            detail_env_time = env_extra_info.get("detail_env_time")
+            if isinstance(detail_env_time, dict):
+                for key in ("compile_time", "kernel_runtime", "profile_time", "refer_runtime"):
+                    value = detail_env_time.get(key)
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    time_values[f"detail_env_time/{key}"].append(float(value))
+
+        env_result = metadata.get("env_result")
+        env_state = env_result.get("env_state") if isinstance(env_result, dict) else None
+        if not isinstance(env_state, dict):
+            env_state = {}
+
+        status = env_state.get("status")
+        if status is not None:
+            env_status_count += 1
+            if status == "timeout":
+                env_timeout_count += 1
+                error_message = str(env_state.get("error_message") or env_state.get("error") or "")
+                if "client-side" in error_message:
+                    kernel_eval_client_timeout_count += 1
 
         precheck = env_extra_info.get("precheck")
         if precheck in ("passed", "failed"):
@@ -1858,15 +1981,31 @@ def _compute_kernel_agent_metrics(samples):
             for stat_key in ("min", "max", "mean"):
                 log_dict[f"{prefix}/{key}/{stat_key}"] = stats[stat_key]
     if total_count > 0:
-        log_dict["coverage/coverage_rs_masked_fraction"] = coverage_rs_masked_count / total_count
+        log_dict["sample_mask/coverage_rs_masked_fraction"] = coverage_rs_masked_count / total_count
+        log_dict["sample_mask/conditional_truncation_masked_fraction"] = (
+            conditional_truncation_masked_count / total_count
+        )
     if correct_count > 0:
-        log_dict["coverage/coverage_rs_correct_masked_fraction"] = coverage_rs_correct_masked_count / correct_count
+        log_dict["sample_mask/coverage_rs_correct_masked_fraction"] = coverage_rs_correct_masked_count / correct_count
     if precheck_count > 0:
         log_dict["kernel/precheck_pass_rate"] = precheck_passed_count / precheck_count
+    if env_status_count > 0:
+        log_dict["kernel/eval_timeout_count"] = env_timeout_count
+        log_dict["kernel/eval_timeout_ratio"] = env_timeout_count / env_status_count
+        log_dict["kernel/eval_client_timeout_count"] = kernel_eval_client_timeout_count
+        log_dict["kernel/eval_client_timeout_ratio"] = kernel_eval_client_timeout_count / env_status_count
+    if non_pad_count > 0:
+        log_dict["kernel/generate_guard_timeout_count"] = generate_guard_timeout_count
+        log_dict["kernel/generate_guard_timeout_ratio"] = generate_guard_timeout_count / non_pad_count
     for key, values in time_values.items():
         if values:
             log_dict[f"kernel/time/{key}/mean"] = np.mean(values).item()
             log_dict[f"kernel/time/{key}/sum"] = np.sum(values).item()
+            log_dict[f"kernel/time/{key}/count"] = len(values)
+            log_dict[f"kernel/time/{key}/p50"] = np.percentile(values, 50).item()
+            log_dict[f"kernel/time/{key}/p90"] = np.percentile(values, 90).item()
+            log_dict[f"kernel/time/{key}/p95"] = np.percentile(values, 95).item()
+            log_dict[f"kernel/time/{key}/max"] = np.max(values).item()
     return log_dict
 
 

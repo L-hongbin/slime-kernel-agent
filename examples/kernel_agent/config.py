@@ -1,9 +1,48 @@
 import os
 
+log_rollout_info = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_INFO", 1)))
+log_rollout_info_rate = float(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_INFO_RATE", 0.01))
+# When True, [rollout_info] logs only stats (summary + per-turn metrics) and skips the
+# verbose text: prompt, response_think, response_content, format_feedback, and [messages].
+log_rollout_stats_only = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY", 0)))
+kernel_eval_heartbeat_interval = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL", 60.0))
+kernel_eval_task_timeout = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_TASK_TIMEOUT", 300.0))
+num_correct_trials = int(os.environ.get("CUDA_AGENT_NUM_CORRECT_TRIALS", 5))
+num_perf_trials = int(os.environ.get("CUDA_AGENT_NUM_PERF_TRIALS", 50))
+# Warmup iterations before timed trials, and number of high/low trials trimmed
+# from each end before the mean is computed. Both reference and kernel are timed
+# under these identical settings (KernelGYM defaults: num_warmup=3, trim=0).
+num_warmup = int(os.environ.get("CUDA_AGENT_NUM_WARMUP", 30))
+perf_trim_count = int(os.environ.get("CUDA_AGENT_PERF_TRIM_COUNT", 0))
+# Reuse a cached reference runtime (keyed by uuid) instead of re-timing the
+# reference every turn. Gives a stable speedup denominator across turns/samples
+# of the same problem. Requires uuid in the payload; only applied when present.
+use_reference_cache = bool(int(os.environ.get("CUDA_AGENT_USE_REFERENCE_CACHE", 1)))
+# Adaptive kernel-perf trials: run at least perf_min_trials, then continue only
+# while timing CV > perf_cv_threshold, up to num_perf_trials. Default OFF (opt-in);
+# enable with CUDA_AGENT_ADAPTIVE_PERF_TRIALS=1.
+adaptive_perf_trials = bool(int(os.environ.get("CUDA_AGENT_ADAPTIVE_PERF_TRIALS", 0)))
+perf_min_trials = int(os.environ.get("CUDA_AGENT_PERF_MIN_TRIALS", 20))
+perf_cv_threshold = float(os.environ.get("CUDA_AGENT_PERF_CV_THRESHOLD", 0.05))
+# Reference perf trials; None -> reuse num_perf_trials on the server.
+refer_num_perf_trials = (
+    int(os.environ["CUDA_AGENT_REFER_NUM_PERF_TRIALS"]) if os.environ.get("CUDA_AGENT_REFER_NUM_PERF_TRIALS") else None
+)
+# Correctness-stage timeout overrides; None -> use the server's config/formula.
+# correctness_timeout: explicit budget in seconds. enabled: per-request on/off.
+correctness_timeout = (
+    float(os.environ["CUDA_AGENT_CORRECTNESS_TIMEOUT"]) if os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT") else None
+)
+_cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
+correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
+
 CUDA_AGENT_CONFIGS = {
     "max_feedback_chars": 0,
     "log_multi_turn_sample_rate": 0.01,
     "log_multi_turn_full_text": False,
+    "log_rollout_info": log_rollout_info,
+    "log_rollout_info_rate": log_rollout_info_rate,
+    "log_rollout_stats_only": log_rollout_stats_only,
     "log_slowest_step_window": 10,
     "log_slowest_min_delta_seconds": 5.0,
     "slowest_tracker_timeout": 2.0,
@@ -17,20 +56,28 @@ CUDA_AGENT_CONFIGS = {
     "env": {
         "kernel_eval_function_path": None,
         "kernel_eval_max_retries": 3,
-        "kernel_eval_task_timeout": 300,
+        "kernel_eval_task_timeout": kernel_eval_task_timeout,
         "kernel_eval_client_timeout": 2400,
         "kernel_eval_poll_interval": 1.0,
-        "kernel_eval_heartbeat_interval": 60.0,
+        "kernel_eval_heartbeat_interval": kernel_eval_heartbeat_interval,
         # Eval jobs can lower these independently when sharing the KernelGym
         # backend pool with training. Training keeps the historical default 32.
         "kernel_eval_worker_max_concurrency": int(os.environ.get("KERNEL_EVAL_WORKER_MAX_CONCURRENCY", "32")),
         "kernel_eval_rate_limit": int(os.environ.get("KERNEL_EVAL_RATE_LIMIT", "32")),
         "kernel_eval_priority": os.environ.get("KERNEL_EVAL_PRIORITY", "normal"),
         "kernel_eval_acquire_timeout": 2400,
-        "num_correct_trials": 5,
+        "num_correct_trials": num_correct_trials,
         # 2026-07-11 (user direction): 30 warmup + 50 timed trials (was 3+100).
-        "num_perf_trials": 50,
-        "num_warmup": 30,
+        "num_perf_trials": num_perf_trials,
+        "num_warmup": num_warmup,
+        "perf_trim_count": perf_trim_count,
+        "use_reference_cache": use_reference_cache,
+        "adaptive_perf_trials": adaptive_perf_trials,
+        "perf_min_trials": perf_min_trials,
+        "perf_cv_threshold": perf_cv_threshold,
+        "refer_num_perf_trials": refer_num_perf_trials,
+        "correctness_timeout": correctness_timeout,
+        "correctness_timeout_enabled": correctness_timeout_enabled,
         "verbose_errors": True,
         "enable_profiling": True,
         "detect_decoy_kernel": True,

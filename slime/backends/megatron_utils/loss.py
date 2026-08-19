@@ -14,14 +14,19 @@ from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_aspo_policy_loss,
+    compute_cispo_policy_loss,
+    compute_cppo_policy_loss,
     compute_dis_policy_loss,
     compute_dppo_binary_policy_loss,
     compute_dppo_predictive_topk_policy_loss,
+    compute_drpo_policy_loss,
     compute_gspo_kl,
     compute_opsm_mask,
-    compute_policy_loss,
-    compute_ppo_clip_diagnostics,
+    compute_policy_loss_output,
+    compute_ripo_policy_loss,
     compute_sequence_log_ratio,
+    compute_up_policy_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
@@ -1456,15 +1461,18 @@ def policy_loss_function(
     policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
     dis_ratio_level = getattr(args, "dis_ratio_level", "token")
 
-    # Pre-gather log probs if needed by OPSM, GSPO, or sequence-level DIS.
+    # Pre-gather log probs if needed by OPSM, GSPO, response-level CPPO,
+    # or sequence-level DIS.
     need_full_log_probs = (
         args.use_opsm
         or args.advantage_estimator == "gspo"
+        or policy_loss_mode == "cppo"
         or (policy_loss_mode == "dis" and dis_ratio_level == "sequence")
     )
 
     full_log_probs = None
     full_old_log_probs = None
+    full_advantages = None
     if need_full_log_probs:
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
@@ -1478,6 +1486,13 @@ def policy_loss_function(
                 old_log_probs, total_lengths, response_lengths, strict=False
             )
         ]
+        if policy_loss_mode == "cppo":
+            full_advantages = [
+                all_gather_with_cp(advantage, total_length, response_length)
+                for advantage, total_length, response_length in zip(
+                    batch["advantages"], total_lengths, response_lengths, strict=False
+                )
+            ]
 
     dis_log_ratio = None
     if policy_loss_mode == "dis" and dis_ratio_level == "sequence":
@@ -1513,12 +1528,10 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    # DPPO diagnostics describe the policy/mask before any optional TIS/RS
-    # rejection changes the loss mask.  Preserve this reducer now; using the
+    # Policy diagnostics describe the policy/mask before any optional TIS/RS
+    # rejection changes the loss mask. Preserve this reducer now; using the
     # rebuilt post-TIS reducer below would silently exclude rejected tokens.
     sum_of_sample_mean_for_dppo_metrics = sum_of_sample_mean
-    dppo_extra_metrics = {}
-    ppo_clip_diagnostics = {}
     _dppo = None
     if policy_loss_mode == "dis":
         _dppo = compute_dis_policy_loss(
@@ -1529,9 +1542,7 @@ def policy_loss_function(
             eps_clip_high=args.eps_clip_high,
             log_ratio=dis_log_ratio,
         )
-        pg_loss = _dppo["pg_losses"]
-        pg_clipfrac = _dppo["pg_clipfrac"]
-        dppo_extra_metrics = {key: value for key, value in _dppo.items() if key not in {"pg_losses", "pg_clipfrac"}}
+        policy_loss_output = _dppo
     elif policy_loss_mode.startswith("dppo"):
         assert args.advantage_estimator != "gspo", (
             "DPPO ignores GSPO's sequence-level ppo_kl and would silently run "
@@ -1591,27 +1602,80 @@ def policy_loss_function(
                 loss_mode=policy_loss_mode,
                 eps_clip_c=args.eps_clip_c,
             )
-        pg_loss = _dppo["pg_losses"]
-        pg_clipfrac = _dppo["pg_clipfrac"]
-        dppo_extra_metrics = {key: value for key, value in _dppo.items() if key not in {"pg_losses", "pg_clipfrac"}}
+        policy_loss_output = _dppo
+    elif policy_loss_mode == "drpo":
+        policy_loss_output = compute_drpo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
+        )
+    elif policy_loss_mode == "cppo":
+        per_sample_outputs = [
+            compute_cppo_policy_loss(
+                full_log_prob,
+                full_old_log_prob,
+                full_advantage,
+                args.eps_clip,
+                args.cppo_prefix_delta,
+                args.cppo_weight_floor,
+                args.eps_clip_c,
+            )
+            for full_log_prob, full_old_log_prob, full_advantage in zip(
+                full_log_probs, full_old_log_probs, full_advantages, strict=False
+            )
+        ]
+        policy_loss_output = {
+            key: torch.cat(
+                [
+                    slice_log_prob_with_cp(
+                        item[key],
+                        total_length,
+                        response_length,
+                        args.qkv_format,
+                        max_seq_len,
+                    )
+                    for item, total_length, response_length, max_seq_len in zip(
+                        per_sample_outputs,
+                        total_lengths,
+                        response_lengths,
+                        max_seq_lens if max_seq_lens is not None else [None] * len(total_lengths),
+                        strict=False,
+                    )
+                ],
+                dim=0,
+            )
+            for key in per_sample_outputs[0]
+        }
+    elif policy_loss_mode == "up":
+        policy_loss_output = compute_up_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif policy_loss_mode == "aspo":
+        policy_loss_output = compute_aspo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
+        )
+    elif policy_loss_mode == "ripo":
+        ripo_delta_high = args.ripo_delta_high if args.ripo_delta_high is not None else args.ripo_delta
+        policy_loss_output = compute_ripo_policy_loss(
+            log_probs,
+            old_log_probs,
+            advantages,
+            args.ripo_delta,
+            ripo_delta_high,
+            args.ripo_ratio_min,
+            args.ripo_ratio_max,
+        )
+    elif policy_loss_mode == "cispo":
+        policy_loss_output = compute_cispo_policy_loss(
+            log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
+        )
     else:
-        # ``eps_clip_c`` is ordinary PPO's dual-clip bound for negative
-        # advantages.  The CLI has exposed it for years; omitting it here made
-        # the configured value observational only while DPPO did receive it.
-        pg_loss, pg_clipfrac = compute_policy_loss(
-            ppo_kl,
-            advantages,
-            args.eps_clip,
-            args.eps_clip_high,
-            args.eps_clip_c,
+        policy_loss_output = compute_policy_loss_output(
+            ppo_kl, advantages, args.eps_clip, args.eps_clip_high, args.eps_clip_c
         )
-        ppo_clip_diagnostics = compute_ppo_clip_diagnostics(
-            ppo_kl,
-            advantages,
-            args.eps_clip,
-            args.eps_clip_high,
-            args.eps_clip_c,
-        )
+
+    pg_loss = policy_loss_output["pg_losses"]
+    policy_loss_metrics = {key: value for key, value in policy_loss_output.items() if key != "pg_losses"}
+    pg_clipfrac = policy_loss_metrics["pg_clipfrac"]
+    dppo_extra_metrics = policy_loss_metrics if _dppo is not None else {}
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1708,7 +1772,7 @@ def policy_loss_function(
     ratio_ge_1 = log_probs.detach() >= old_log_probs.detach()
     positive_advantage = detached_advantages > 0
     negative_advantage = detached_advantages < 0
-    clip_diagnostics = dppo_extra_metrics if _dppo is not None else ppo_clip_diagnostics
+    clip_diagnostics = policy_loss_metrics
     entropy_groups = {
         "adv_positive_ratio_ge_1": positive_advantage & ratio_ge_1,
         "adv_positive_ratio_lt_1": positive_advantage & ~ratio_ge_1,
@@ -1798,9 +1862,9 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
     }
     reported_loss.update(entropy_common_probe_stats)
-    for _k, _v in ppo_clip_diagnostics.items():
-        reported_loss[_k] = sum_of_sample_mean(_v).clone().detach()
-    for _k, _v in dppo_extra_metrics.items():
+    for _k, _v in policy_loss_metrics.items():
+        if _k == "pg_clipfrac":
+            continue
         reported_loss[_k] = sum_of_sample_mean_for_dppo_metrics(_v).clone().detach()
     for _k, _v in entropy_group_metrics.items():
         reported_loss[_k] = sum_of_sample_mean_for_dppo_metrics(_v).clone().detach()

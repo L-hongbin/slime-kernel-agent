@@ -57,8 +57,18 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def _fp32_lm_head_requested(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "fp32_lm_head", False) or getattr(args, "enable_fp32_lm_head", False))
+
+
+def _enable_actor_fp32_lm_head(model: GPTModel) -> GPTModel:
+    """Compatibility wrapper for the main-branch helper name."""
+    enable_fp32_lm_head(model)
+    return model
+
+
 def _maybe_enable_fp32_lm_head(model: GPTModel, args: argparse.Namespace, role: str, post_process: bool) -> None:
-    if post_process and role != "critic" and getattr(args, "fp32_lm_head", False):
+    if post_process and role != "critic" and _fp32_lm_head_requested(args):
         enable_fp32_lm_head(model)
 
 
@@ -125,7 +135,7 @@ def _get_model_provider_func(
 
             return _critic_provide
 
-        if getattr(args, "fp32_lm_head", False):
+        if _fp32_lm_head_requested(args):
 
             def _actor_provide(pre_process=True, post_process=True, vp_stage=None):
                 model = provider.provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
@@ -252,7 +262,6 @@ def _get_model_provider_func(
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
         _maybe_enable_fp32_lm_head(model, args, role, post_process)
-
         return model
 
     return model_provider
