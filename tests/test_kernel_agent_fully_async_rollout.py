@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
+import sys
 import threading
 import time
 from argparse import Namespace
@@ -10,12 +12,28 @@ from pathlib import Path
 import httpx
 import pytest
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+repo_root_path = str(REPO_ROOT)
+if repo_root_path in sys.path:
+    sys.path.remove(repo_root_path)
+sys.path.insert(0, repo_root_path)
+repo_examples_path = str(REPO_ROOT / "examples")
+if (examples_package := sys.modules.get("examples")) is not None and hasattr(examples_package, "__path__"):
+    # Megatron also ships a top-level ``examples`` package. If it was imported
+    # first in a combined test process, include this repo's package path before
+    # resolving ``examples.kernel_agent``.
+    examples_package.__path__ = [
+        repo_examples_path,
+        *(path for path in examples_package.__path__ if path != repo_examples_path),
+    ]
+
 from examples.kernel_agent import fully_async_rollout
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
 
 pytestmark = pytest.mark.unit
+NUM_GPUS = 0
 
 
 def _make_rollout_args(**overrides):
@@ -143,6 +161,45 @@ def test_kernel_agent_worker_does_not_exceed_group_concurrency(monkeypatch):
     assert max_in_flight <= 2
 
 
+def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch):
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    for gid in range(5):
+        sample = Sample(index=gid, group_index=gid, prompt=f"prompt-{gid}")
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = float(gid)
+        sample.response = f"response-{gid}"
+        worker.output_queue.put((gid, [sample]))
+
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    args = Namespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=2,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+    )
+
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=7, data_buffer=None))
+
+    assert [group[0].index for group in output.samples] == [0, 1]
+    assert worker.queue_size() == 3
+    assert [gid for gid, _ in worker.get_completed_groups()] == [2, 3, 4]
+
+
+def test_kernel_agent_completed_group_drain_honors_limit():
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    for gid in range(4):
+        worker.output_queue.put((gid, [Sample(index=gid)]))
+
+    assert [gid for gid, _ in worker.get_completed_groups(limit=2)] == [0, 1]
+    assert [gid for gid, _ in worker.get_completed_groups()] == [2, 3]
+
+
 def test_kernel_agent_worker_cancels_inflight_tasks_on_stop(monkeypatch):
     class FakeGenerateState:
         def __init__(self, args):
@@ -244,7 +301,7 @@ def test_kernel_agent_http_client_does_not_cancel_slow_posts():
 
 
 def test_full_async_kernel_agent_script_guards_critical_config():
-    script = Path("examples/kernel_agent/run.t1.qwen3.6.27B.full-async.sh").read_text()
+    script = (REPO_ROOT / "examples/kernel_agent/run.t1.qwen3.6.27B.fasync.sh").read_text()
 
     # Router retries/circuit-breaker must stay enabled (matches reference runs).
     assert "--router-disable-retries" not in script
@@ -264,10 +321,14 @@ def test_full_async_kernel_agent_script_guards_critical_config():
 
 
 def test_cuda_agent_sglang_post_is_fail_fast_by_default():
-    source = Path("examples/kernel_agent/generate_with_cuda_agent.py").read_text()
+    source = (REPO_ROOT / "examples/kernel_agent/generate_with_cuda_agent.py").read_text()
 
     assert (
         'KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))'
         in source
     )
     assert "post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)" in source
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

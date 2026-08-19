@@ -264,5 +264,47 @@ def test_checkpoint_fallback_preserves_explicit_start_rollout_id(megatron_to_hf_
     assert args.start_rollout_id == expected
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    ("model_tag", "expected_load_step"),
+    [("ref", 12), ("teacher", 34), ("rollout_actor", 77)],
+)
+def test_load_other_checkpoint_restores_ckpt_step(monkeypatch, model_tag, expected_load_step):
+    from slime.backends.megatron_utils import actor as actor_module
+
+    actor = types.SimpleNamespace(
+        args=types.SimpleNamespace(
+            load="original-load",
+            no_load_optim=False,
+            no_load_rng=False,
+            finetune=False,
+            ckpt_step=77,
+            ref_ckpt_step=12,
+            opd_teacher_ckpt_step=34,
+        ),
+        model=object(),
+        weights_backuper=types.SimpleNamespace(backup=lambda tag: None),
+        _active_model_tag="actor",
+    )
+    seen = {}
+
+    def fake_load_checkpoint(*args, **kwargs):
+        seen["load"] = actor.args.load
+        seen["ckpt_step"] = actor.args.ckpt_step
+        return 0, 0
+
+    monkeypatch.setattr(actor_module, "load_checkpoint", fake_load_checkpoint)
+
+    actor_module.MegatronTrainRayActor.load_other_checkpoint(actor, model_tag, "/tmp/other-checkpoint")
+
+    assert seen == {"load": "/tmp/other-checkpoint", "ckpt_step": expected_load_step}
+    assert actor.args.load == "original-load"
+    assert actor.args.no_load_optim is False
+    assert actor.args.no_load_rng is False
+    assert actor.args.finetune is False
+    assert actor.args.ckpt_step == 77
+    assert actor._active_model_tag == model_tag
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

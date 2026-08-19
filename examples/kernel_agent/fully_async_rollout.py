@@ -132,7 +132,10 @@ class KernelAgentAsyncRolloutWorker:
         self.data_buffer = data_buffer
         self.concurrency = concurrency
         self.running = True
-        self.output_queue: queue.Queue[tuple[int, RolloutTaskResult]] = queue.Queue(maxsize=1000)
+        # The done callback runs on the event-loop thread, so put() must never
+        # block. Backpressure is enforced in _loop before new prompts are read.
+        self.output_queue: queue.Queue[tuple[int, RolloutTaskResult]] = queue.Queue()
+        self.poll_interval = 1.0
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
         self.active_count = 0
@@ -157,9 +160,10 @@ class KernelAgentAsyncRolloutWorker:
             if self.worker_thread.is_alive():
                 logger.warning("kernel-agent fully-async: worker thread did not stop within timeout")
 
-    def get_completed_groups(self) -> list[tuple[int, RolloutTaskResult]]:
+    def get_completed_groups(self, limit: int | None = None) -> list[tuple[int, RolloutTaskResult]]:
+        """Pop at most ``limit`` completed prompt groups, or all when unset."""
         completed: list[tuple[int, RolloutTaskResult]] = []
-        while True:
+        while limit is None or len(completed) < limit:
             try:
                 completed.append(self.output_queue.get_nowait())
             except queue.Empty:
@@ -198,7 +202,11 @@ class KernelAgentAsyncRolloutWorker:
                     active_tasks -= done
                     self.active_count = len(active_tasks)
 
-                while len(active_tasks) < self.concurrency and self.running:
+                while (
+                    len(active_tasks) < self.concurrency
+                    and self.output_queue.qsize() < self.concurrency
+                    and self.running
+                ):
                     groups = self.data_buffer.get_samples(1)
                     if not groups:
                         break
@@ -220,10 +228,10 @@ class KernelAgentAsyncRolloutWorker:
                         self.active_count = len(active_tasks)
 
                 self.active_count = len(active_tasks)
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.poll_interval)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("kernel-agent fully-async loop iteration error: %s", exc)
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.poll_interval)
 
         if active_tasks:
             logger.info("kernel-agent fully-async: waiting for %d in-flight tasks to drain", len(active_tasks))
@@ -313,7 +321,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
 
     while len(collected) < target:
         drained = 0
-        for gid, task_group in worker.get_completed_groups():
+        # A dynamically filtered task may contribute nothing, so this loop can
+        # drain again on the next iteration. It must never pop more accepted
+        # prompt groups than the current rollout can consume: surplus completed
+        # work stays warm for the next rollout.
+        for gid, task_group in worker.get_completed_groups(limit=target - len(collected)):
             drained += 1
             groups = _as_sample_groups(task_group)
             if not groups:
@@ -363,9 +375,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
 
     collect_time = time.time() - started
     data = [
-        group
-        for _gid, groups in sorted(collected.items(), key=lambda item: _sort_key(item[1]))[:target]
-        for group in groups
+        group for _gid, groups in sorted(collected.items(), key=lambda item: _sort_key(item[1])) for group in groups
     ]
     sample = data[-1][0]
     logger.info(
