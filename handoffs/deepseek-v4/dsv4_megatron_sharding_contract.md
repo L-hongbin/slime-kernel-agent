@@ -85,21 +85,11 @@ V4 使用单 KV head 的 MQA：`num_key_value_heads=1`，再将 KV 广播给 64 
 
 `o_a_proj` 不是普通 dense linear。它将权重解释为 `[8,1024,4096]` 的分组块对角 BMM；通用 LoRA 会把它误当成一个 `[8192,4096]` dense matrix，改变数学语义，所以当前显式排除 `*.self_attn.o_a_proj`。
 
-### 2.2 Routed expert 的本地存储
+### 2.2 Routed expert placement
 
-每个 rank 的逻辑 expert 权重为：
+256 个 routed experts 沿 global expert axis 做 EP8，每个 rank 持有连续 32 个 experts。Checkpoint 的 packed tensor shape、scale、临时解包和 W4A16 forward/backward 统一由 `fp4_w4a16_design.md` 维护
 
-- `gate_up_proj [32,4096,4096]`
-- `down_proj [32,4096,2048]`
-
-r21 直接驻留 official checkpoint 的 packed-MXFP4 字节，不创建对应的 bf16 trainable Parameter：
-
-- `gate_up_proj_fp4 [32,4096,2048]`，scale `[32,4096,128]`
-- `down_proj_fp4 [32,4096,1024]`，scale `[32,4096,64]`
-
-dispatch 后按本地 expert 临时解包为 bf16 做 W4A16 计算；固定为一次只保留一个
-expert 的临时权重，不再提供大块 grouped transient 开关。自定义 expert 路径保留
-DS-V4 的 `clamp + SwiGLU`，不能换成缺少 clamp 的 stock `GroupedMLP` 激活。
+本文件只维护分片边界：converter、`sharded_state_dict`、token dispatcher 和 combine 必须使用同一 global-to-local expert range；CP/DP replica 通过 expert-DP `replica_id` 区分，不能重复声明 main shard
 
 ## 3. CP2 连续序列分片契约
 

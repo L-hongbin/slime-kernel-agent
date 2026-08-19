@@ -15,6 +15,7 @@
 | 责任 | 唯一维护入口 |
 |---|---|
 | 自定义模型与 kernel 边界 | `handoffs/deepseek-v4/dsv4_kernel_inventory.md` |
+| Packed-MXFP4 storage、转换与 W4A16 compute | `handoffs/deepseek-v4/fp4_w4a16_design.md` |
 | Megatron 分片、CP/EP 与 checkpoint contract | `handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md` |
 | LoRA training、old actor、TIS/MIS、rsLoRA 与 LoRA+ | `handoffs/deepseek-v4/lora_training_features.md` |
 | LoRA adapter serving 与 CUDA Graph contract | `handoffs/deepseek-v4/lora_serve_design.md` |

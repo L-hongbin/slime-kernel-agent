@@ -80,7 +80,7 @@ kernel/serve 与 routing-replay 数据面；node70 仍不参与 kernel-on。
 
 **结论：健康 bwd/fwd ≈ 2.0–2.5×；且这些核 fwd 效率 ≥ bwd 效率。** 据此：A1 延迟比正常但 fwd<bwd 效率倒挂（前向欠优化）；B1 的 7–30× 与 B2 的 ~5× 都明显超标，反向有真实浪费。`bwd/fwd 基线脚本：scratchpad/bwdfwd.py`。
 
-**fp8**：sglang 这三个算子前向**全部 bf16**（FA4 attention 显式 `NotImplementedError` 拒绝 descale；`compress_forward` 无 fp8 入参；mhc 断言 bf16+fp32，`FP8` 常量未用）。V4 的 fp8/fp4 只在 **MoE experts（block-fp8，复用 Megatron TE）** 和 **indexer（fp4，已丢弃）**——**三个核都不需要 fp8 前向**。
+**精度边界**：sglang 这三个算子前向全部使用 bf16 activation 与 fp32 accumulation（FA4 attention 显式拒绝 descale，`compress_forward` 无 fp8 入参，mHC 断言 bf16+fp32）。Routed-expert 的 packed-MXFP4 storage 与 W4A16 compute 由 `fp4_w4a16_design.md` 维护，不属于这三个 kernel
 
 ## V4-Flash 固定维度（决定核 shape）
 
@@ -129,7 +129,6 @@ kernel/serve 与 routing-replay 数据面；node70 仍不参与 kernel-on。
 | Unweighted RMSNorm | 66 | trivial |
 | HashRouter `tid2eid` 查表 | 1040 | 冻结 gather，trivial |
 | TopKRouter（sqrtsoftplus + e_score_correction_bias） | 1019 | 复用 Megatron router，加 sqrtsoftplus |
-| Experts（256，grouped） | 978 | Megatron GroupedGEMM MoE，FP8，**冻结** —— 复用 |
 | Attention sink | 721 | 折进 A1 |
 | **Indexer top-k** | 448 | **32k 丢弃**（dense-over-compressed）—— 不实现 |
 
@@ -219,7 +218,7 @@ kernel/serve 与 routing-replay 数据面；node70 仍不参与 kernel-on。
 - **frozen-param 的效率优化(LoRA 专属)**:base frozen 时,这些核**自身参数梯度不需要**,只要输入梯度。
   - **B1 已做**:LoRA 下 `fn/base/scale` frozen → `needs_input_grad` gating **跳过 d_fn 那个重 GEMM**,只算 d_x。
   - **A1 / B2 是机会点(非阻塞)**:A1 的 `dsink`(sinks frozen)、B2 的 `dpos_bias`/`dweight`(frozen)目前仍算,LoRA 下可按 `needs_input_grad` 跳过省算力——**待做的小优化**。
-- **dtype 对齐**:核是 **bf16**(fp32 累加),匹配 **bf16 LoRA adapter + bf16 激活**;FP8 只在 base 的 TE 线性 / MoE experts,**不在我们的核里**(与 fp8 结论一致)。无冲突。
+- **dtype 对齐**:核是 **bf16**(fp32 累加),匹配 **bf16 LoRA adapter + bf16 激活**;frozen base linear 与 routed-expert 的存储/compute precision 在核外,由模型与 `fp4_w4a16_design.md` 维护。
 - **正好覆盖计划的 LoRA 目标**:handoff 计划把 LoRA 挂在 MLA 注意力线性(q_a/q_b、kv 压缩、o_proj)。A1 的反向 `dq/dk` 喂 q_b/kv adapter,`o_proj` 的梯度从层后流入——**A1 完整支撑这套目标**。
 
 **集成时要验证的点**:① autograd.Function 的输入梯度流要与 `megatron.bridge.peft.LoRA` 包裹 + **EP/PP 切分**(V4 注意力 EP 复制、无纯 TP)下的 adapter 形状对得上;② 给 A1/B2 补 `needs_input_grad` gating(frozen 时跳参数梯度);③ RoPE/grouped-o_proj 在核外,梯度经 autograd 串起(已是)。
@@ -229,9 +228,6 @@ kernel/serve 与 routing-replay 数据面；node70 仍不参与 kernel-on。
 2. **B1**：若不想依赖 sglang，可自己写**非 warp 专门化**的融合 Sinkhorn+collapse（避开死锁根源）；否则 `hyper_connection_sglang` 已够。
 3. **接入 Megatron Phase-1 parity spike**：把三个核接进 mcore 的 V4 模型，逐层对齐 HF。
 
-## FP8 MoE expert compute (deep_gemm grouped fp8)
-- Historical benchmark sources and results were retired from the working tree; recover them with
-  `git show 851199b:custom_kernels/deepseek_v4/megatron/bench_fp8_moe.py` and
-  `git show 851199b:custom_kernels/deepseek_v4/megatron/FP8_MOE_RESULTS.md` if needed. The
-  production path now uses frozen FP4 experts.
-- fp8 grouped fwd ~2x, fwd+bwd ~1.7x faster than the per-expert bf16 loop; matches sglang serving numerics. (2026-07-05)
+## Routed expert compute
+
+正式路径使用 frozen packed-MXFP4 experts 与 W4A16 compute，存储、转换和验证契约见 `handoffs/deepseek-v4/fp4_w4a16_design.md`。本文只维护 attention、mHC 与 compressor kernel 的选型和性能边界
