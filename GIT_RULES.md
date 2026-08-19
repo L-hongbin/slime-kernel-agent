@@ -13,6 +13,12 @@
 3. Do not keep compatibility shims unless an active caller requires them
 4. Keep implementations simple and remove redundant validation or defensive branches that do not protect a demonstrated contract
 
+## Simplicity and canonical ownership
+
+1. Each workflow, document, and evidence set has exactly one canonical owner; extend it instead of creating parallel versions, and store details once — other places keep only the conclusion plus a link
+2. Delete obsolete code and documents instead of labeling them legacy, deprecated, v2, or backup; Git history already preserves the past
+3. Split documents that are reviewed or reverted independently, even when they share a topic
+
 ## Data workflow checks
 
 1. Do not put code related to offline data processing — including its checks — under `tests/`; `tests/` is for slime tests
@@ -20,4 +26,6 @@
 
 ## Before committing
 
-1. Use `--amend` when review feedback applies to the latest unpushed commit rather than adding a corrective follow-up commit
+1. Group the entire dirty worktree (including untracked files) into commits upfront; define each commit as one independently revertible responsibility instead of choosing boundaries file-by-file or by a broad label like train, eval, or docs
+2. Before a commit adding 3+ documents or 500+ documentation lines, do a semantic-duplication review and resolve it first
+3. Use `--amend` on the latest unpushed commit for review feedback instead of adding fix-up commits
