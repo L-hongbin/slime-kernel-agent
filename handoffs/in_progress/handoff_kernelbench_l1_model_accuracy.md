@@ -12,10 +12,12 @@
 | **Step-3.7-Flash**(198B MoE VLM,language-only) | base(未训练) | tvm_ffi / 32768 / **3(best)** / 8 / high + MTP | **31.25%** | **18.88%** | **5.12%** | **4.12%** |
 | **gpt-oss-120b**(117B MoE,base 未训练,mxfp4) | base @H20(TP8) | tvm_ffi / 32768 / **3(best)** / 8 | **53.87%** | **42.88%** | **14.12%** | **8.00%** |
 | **DeepSeek-V4-Flash**(MoE,fp8) | base @H20(TP4+MTP+marlin) | tvm_ffi / 32768 / **3(best)** / 8 | **86.00%** | **65.12%** | **29.12%** | **14.25%** |
+| **DeepSeek-V4-Flash**(r21 rsLoRA,predictive-DPPO) | step720(iter719 adapter) @H20 | tvm_ffi / 12288 / **1** / 8 | **97.88%** | **90.25%** | **21.38%** | **18.38%** |
 
-> **不可直接横比**:Qwen iter_39 是 **单轮**(max-turns=1);Step-3.7-Flash 与 gpt-oss-120b 是 **3 轮取最好**。turns/ctx 不同,只看绝对水平。
+> **不可直接横比**:Qwen iter_39 与 DeepSeek r21 rsLoRA 曲线是 **单轮**(max-turns=1);Step-3.7-Flash、gpt-oss-120b 与 DeepSeek base 是 **3 轮取最好**。turns/ctx 不同,只看绝对水平。
 > **gpt-oss / DeepSeek 均为 H20 干净口径**:两者在 A800 都跑不动(mxfp4 / `deepseek_v4` 均需 sm90,见各自明细);DeepSeek 靠 `--moe-runner-backend marlin` 跑通。
 > **复核**:gpt-oss 与 DeepSeek 的 H20 结果经 codex(gpt-5.5,xhigh)对抗式复核,均判 **TRUSTWORTHY**(从 `eval_0.pt` dump 逐 trajectory 重算 = summary;无 correct-but-not-compiled、无空 kernel 误判、无 reference 抄答、decoy 正确剔除)。
+> **step720 边界**:表中保留原始 800 条 dump 口径；其中 1 条 formal precheck 通过后遇到 KernelGym 基础设施断连，因此四项指标各有最多 +0.125 pct-pt 的未知宽度。
 
 ---
 
@@ -148,3 +150,7 @@ sglang 的 `deepseek_v4` 是 **Hopper(sm90)专用**:MoE top-k 簇 kernel(`topk_v
 - **H20 覆盖**:`AMPERE_TOPK_FALLBACK=0`(非 Ampere)、TP=4(fp8 ~37GB/卡)。
 
 <!-- 名词:trajectory = 一个 (题, sample) 的完整多轮轨迹;turn = agent 的一轮生成+评测。 -->
+
+DeepSeek-V4-Flash r21 rsLoRA 的 step0–720 单轮完整曲线、bootstrap 诊断、逐点证据和
+H20/H200 平台边界统一维护在
+`handoffs/deepseek-v4/kernelbench_l1_lora_curve_20260724.md`。
