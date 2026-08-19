@@ -381,7 +381,7 @@ TILEKERNELS_DIR=${TILEKERNELS_DIR:-/nfs/FM/chenshuailin/projects/kernel_agents/T
 export PYTHONPATH="${REPO}:/root/Megatron-LM:${TILEKERNELS_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 # rsLoRA (default OFF): adapter forward scale alpha/sqrt(r) instead of alpha/r.
 # At r=16/alpha=32 that is a 4x stronger multiplier — co-adjust LR (see
-# handoffs/deepseek-v4/lora_rslora_loraplus.md). Serving follows automatically
+# handoffs/deepseek-v4/lora_training_features.md). Serving follows automatically
 # (the sync exports the effective lora_alpha = alpha*sqrt(r)).
 # LoRA+ (default OFF = unset/empty/1.0): eta_B = lambda * eta_A via a separate
 # optimizer param group for the LoRA B (linear_out) matrices.

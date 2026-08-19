@@ -157,7 +157,7 @@ export USE_ROLLOUT_ROUTING_REPLAY="${USE_ROLLOUT_ROUTING_REPLAY:-1}"
 # ratios truly behavioral (previously ratio==1 -> effectively REINFORCE) and
 # TIS = exp(megatron_V - sglang_V) corrects the pure same-version cross-
 # engine mismatch in-loss. Validated V1-V3 (tests/deepseek-v4/
-# test_dsv4_lora_old_actor.py; handoffs/deepseek-v4/lora_old_actor_tis.md).
+# test_dsv4_lora_old_actor.py; handoffs/deepseek-v4/lora_training_features.md).
 # Rollback: USE_KEEP_OLD_ACTOR=0 USE_TIS=0.
 export USE_KEEP_OLD_ACTOR="${USE_KEEP_OLD_ACTOR:-1}"
 export USE_TIS="${USE_TIS:-1}"
@@ -224,7 +224,7 @@ readonly T1_LORA_DROPOUT=0.0
 # NEVER flip it across a resume (the adapter ckpt records the scaling and the
 # resume fails loud on mismatch). Serving equivalence is automatic (the sync
 # ships lora_alpha = alpha*sqrt(r) = 128 so sglang's lora_alpha/r == the trainer
-# scale exactly). See handoffs/deepseek-v4/lora_rslora_loraplus.md.
+# scale exactly). See handoffs/deepseek-v4/lora_training_features.md.
 # LoRA+ (default OFF = unset/empty/1.0): eta_B = lambda * eta_A via a separate
 # Muon param group for the LoRA B (linear_out) matrices. Start with 4-8.
 # Shared-expert LoRA (FFN-direction capacity, +~12.7M params at r16): frozen fp8

@@ -120,7 +120,7 @@ build_dsv4_task_args() {
     # adapter-only path (a ~90MB snapshot swap, NOT a 2nd full model) so the PPO
     # ratio uses the policy that actually sampled the batch (real clipping) and
     # TIS = exp(megatron_old_V - sglang_V) is the pure train/infer mismatch.
-    # See handoffs/deepseek-v4/lora_old_actor_tis.md for the launcher recipe.
+    # See handoffs/deepseek-v4/lora_training_features.md for the launcher recipe.
     if [[ "${USE_KEEP_OLD_ACTOR:-0}" == "1" ]]; then
       rl_args+=(--keep-old-actor)
     fi
