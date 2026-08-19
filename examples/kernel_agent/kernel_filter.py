@@ -1,3 +1,4 @@
+import json
 import logging
 from typing import Any
 
@@ -15,6 +16,41 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _FILTER_CONFIG_LOGGED = False
+
+
+def _low_variance_audit_record(args, samples: list[Sample], filter_rewards: list[float]) -> dict[str, Any]:
+    """Build one structured record that joins filtered sample IDs to rewards."""
+
+    def metadata_for(sample: Sample) -> dict[str, Any]:
+        return sample.metadata if isinstance(sample.metadata, dict) else {}
+
+    def stable_id(sample: Sample) -> str | int | None:
+        metadata = metadata_for(sample)
+        for key in ("uuid", "uid", "id", "index", "source_row"):
+            value = metadata.get(key)
+            if value is not None:
+                return value if isinstance(value, (str, int)) else str(value)
+        return sample.index
+
+    first = samples[0]
+    first_metadata = metadata_for(first)
+    return {
+        "rollout_step": first_metadata.get("start_rollout_id"),
+        "prompt_group_index": first.group_index,
+        "samples": [
+            {
+                "id": stable_id(sample),
+                "sample_index": sample.index,
+                "group_id": sample.group_id,
+                # filter_reward is the pre-overlong-penalty task reward used
+                # for the variance decision; reward is the effective reward
+                # that would otherwise reach advantage computation.
+                "filter_reward": float(filter_reward),
+                "reward": float(sample.get_reward_value(args)),
+            }
+            for sample, filter_reward in zip(samples, filter_rewards, strict=True)
+        ],
+    }
 
 
 def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> DynamicFilterOutput:
@@ -89,12 +125,15 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         ]
         reward_std = torch.tensor(rewards, dtype=torch.float64).std(unbiased=False).item()
         if reward_std < reward_std_threshold:
+            audit_record = _low_variance_audit_record(args, valid_samples, rewards)
             logger.info(
-                "[kernel_agent][filter] drop group: reward_std=%.6g threshold=%.6g valid_group_size=%s rewards=%s",
+                "[kernel_agent][filter] drop group: reward_std=%.6g threshold=%.6g "
+                "valid_group_size=%s rewards=%s audit=%s",
                 reward_std,
                 reward_std_threshold,
                 len(valid_samples),
                 rewards,
+                json.dumps(audit_record, ensure_ascii=False, sort_keys=True, default=str),
             )
             return DynamicFilterOutput(
                 keep=False,
