@@ -1,4 +1,4 @@
-{# DeepSeek-V4-Flash chat template (kernel-agent eval).
+{# DeepSeek-V4-Flash pre-0731 chat template (kernel-agent eval).
    V4-Flash ships NO HF jinja chat_template (it expects formatting via the bundled
    encoding/encoding_dsv4.py). slime calls tokenizer.apply_chat_template, so this
    template reproduces encode_messages() output BYTE-EXACT for plain chat:
@@ -10,7 +10,8 @@
    skip_special_tokens=False response unchanged. No-op concern for other models:
    this file is only loaded for the V4-Flash checkpoint.
    Installed (auto-loaded) at: <ckpt>/chat_template.jinja. Validated byte-exact vs
-   encoding_dsv4.encode_messages for thinking/chat x {1,sys+1,2-turn,3-turn}.
+   encoding_dsv4.encode_messages for thinking/chat x {1,sys+1,2-turn,3-turn},
+   including the old model's reasoning_effort=max prefix.
    INVARIANTS (hold in the kernel-agent loop; outside them this is NOT a general
    encode_messages replacement): messages strictly alternate user/assistant and
    always end with a user turn before a generation prompt. A thinking-mode response
@@ -18,6 +19,13 @@
    non-fatal degraded context). #}
 {{- '<｜begin▁of▁sentence｜>' -}}
 {%- set et = enable_thinking if enable_thinking is defined else true -%}
+{%- set re = reasoning_effort if reasoning_effort is defined else none -%}
+{%- if re not in [none, 'high', 'max'] -%}
+  {{- raise_exception('Invalid reasoning effort: ' ~ re) -}}
+{%- endif -%}
+{%- if et and re == 'max' -%}
+  {{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+{%- endif -%}
 {%- for m in messages -%}
   {%- if m['role'] == 'system' -%}
     {{- m['content'] -}}
