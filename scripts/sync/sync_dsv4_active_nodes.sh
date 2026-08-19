@@ -70,9 +70,9 @@ fi
 [[ -x "${sync_script}" ]] || { echo "sync_v4: sync helper is not executable: ${sync_script}" >&2; exit 2; }
 [[ -r "${fingerprint_script}" ]] || { echo "sync_v4: fingerprint helper is not readable: ${fingerprint_script}" >&2; exit 2; }
 
-allowed_targets=(node69_slime node53_dspark node70_dspark)
+allowed_targets=(node69_slime node53_dspark node70_dspark node64_dspark)
 if [[ ${#targets[@]} == 0 ]]; then
-  targets=("${allowed_targets[@]}")
+  targets=(node69_slime node53_dspark node70_dspark)
 fi
 
 is_allowed_target() {
@@ -165,17 +165,33 @@ echo "sync_v4: targets=${targets[*]}"
 
 run_target() {
   local target=$1
+  # node64_dspark is a container on the source host and sees the same node-local
+  # checkout paths. Copying a tree onto itself is both unnecessary and unsafe
+  # with the tar fallback. Real sync and check modes still run the remote-view
+  # fingerprint/provenance checks below so a mount mismatch fails closed.
+  local shared_source_tree=0
+  if [[ "${source_host}" == "node64" && "${target}" == "node64_dspark" ]]; then
+    shared_source_tree=1
+  fi
   if [[ "${mode}" == dry-run ]]; then
-    RSYNC_PROJECT_DRY_RUN=1 "${sync_script}" "${target}" "${repo_root}"
-    RSYNC_PROJECT_DRY_RUN=1 RSYNC_PROJECT_SOURCE_DIR="${tilekernels_dir}" \
-      "${sync_script}" "${target}" "${tilekernels_dir}"
+    if [[ "${shared_source_tree}" == 1 ]]; then
+      echo "sync_v4: ${target} shares node64 source paths; dry-run skips self-copy"
+    else
+      RSYNC_PROJECT_DRY_RUN=1 "${sync_script}" "${target}" "${repo_root}"
+      RSYNC_PROJECT_DRY_RUN=1 RSYNC_PROJECT_SOURCE_DIR="${tilekernels_dir}" \
+        "${sync_script}" "${target}" "${tilekernels_dir}"
+    fi
     return
   fi
 
   if [[ "${mode}" == sync ]]; then
-    "${sync_script}" "${target}" "${repo_root}"
-    RSYNC_PROJECT_SOURCE_DIR="${tilekernels_dir}" \
-      "${sync_script}" "${target}" "${tilekernels_dir}"
+    if [[ "${shared_source_tree}" == 1 ]]; then
+      echo "sync_v4: ${target} shares node64 source paths; skipping self-copy"
+    else
+      "${sync_script}" "${target}" "${repo_root}"
+      RSYNC_PROJECT_SOURCE_DIR="${tilekernels_dir}" \
+        "${sync_script}" "${target}" "${tilekernels_dir}"
+    fi
   fi
 
   local remote_fingerprint remote_helper_q remote_repo_q remote_digest_q

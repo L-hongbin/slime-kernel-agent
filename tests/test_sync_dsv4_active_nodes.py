@@ -90,6 +90,17 @@ fi
 exit 0
 """,
     )
+    _write_executable(
+        fake_bin / "hostname",
+        r"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ -n "${FAKE_SOURCE_HOST:-}" ]]; then
+  printf '%s\n' "${FAKE_SOURCE_HOST}"
+else
+  exec /bin/hostname "$@"
+fi
+""",
+    )
     return fake_bin, call_log
 
 
@@ -216,6 +227,29 @@ def test_active_sync_dry_run_is_concurrent_whitelisted_and_fail_closed(tmp_path:
         "node53_dspark",
         "node70_dspark",
     }
+
+
+def test_node64_dspark_dry_run_is_allowed_but_never_self_copies(tmp_path: Path, fake_transport) -> None:
+    fake_bin, call_log = fake_transport
+    root = _fixture_repo(tmp_path)
+    script = root / "scripts/sync/sync_dsv4_active_nodes.sh"
+    env = {
+        **_env(fake_bin, call_log),
+        "FAKE_SOURCE_HOST": "node64",
+        "SYNC_V4_EXPECTED_SOURCE_HOST": "node64",
+        "SYNC_V4_TILEKERNELS_DIR": str(tmp_path / "TileKernels"),
+    }
+
+    result = subprocess.run(
+        [str(script), "--dry-run", "--target", "node64_dspark"],
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "node64_dspark shares node64 source paths; dry-run skips self-copy" in result.stdout
+    assert not call_log.exists()
 
 
 def test_check_compares_streamed_deterministic_fingerprints(tmp_path: Path, fake_transport) -> None:
