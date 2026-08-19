@@ -1,200 +1,115 @@
-# DeepSeek-V4-Flash train↔rollout mismatch: audit, fixes, and precision memo
+# DeepSeek-V4 train↔rollout probability parity contract
 
-> **UPDATE (2026-07, round 2 — measured, supersedes the original claims below):**
-> The full algorithmic audit is now **exhausted and clean**. Every component — router, RoPE,
-> mHC, SwiGLU clamp, C4 indexer, **CSA compressor, attention sinks, conjugate output-RoPE** —
-> either matches or is fixed. Two original claims are now **refuted by measurement**:
-> 1. **The C4 indexer (sparse vs dense) is NOT the dominant long-context mismatch.** Measured
->    directly: dense-train vs sparse-rollout = 0.0404, sparse-train vs sparse-rollout = 0.0411 at
->    ctx-8192 (indexer active) → the indexer term is **≤0.0007** (within kernel-vs-reference noise).
->    A train-side sparse CSA path was built (env `V4_SPARSE_ATTENTION`) and showed **no improvement**.
->    Forcing sglang dense (original fix #1) is therefore **moot** — it removes ≤0.0007.
-> 2. **The ~0.037 gap is the NON-indexer term** (measured at ctx-2048, where the indexer is a
->    provable no-op). It is *most likely* fp8-decode(rollout)-vs-bf16-prefill(train) **precision**,
->    but this is **inferred, not isolated** — the clean test (serve sglang bf16, compare bf16-train
->    vs bf16-rollout) has NOT been run. Direct kernel check: sglang's bf16 sparse flash-MLA matches a
->    reference to 0.0037, and the train A1 is also bf16 → the bf16 attention *kernels agree*; the gap
->    is the rollout's **fp8 KV-cache decode** path, not the kernel algorithm.
->
-> **Net:** only ONE real algorithmic fix existed (the shared-expert clamp, done). The residual
-> ~0.037 is a precision/kernel-alignment floor, closable only by unifying on bit-identical fp8
-> kernels (DeepSeek's approach) or absorbed by TIS/MIS. See §Precision + the round-2 detail at end.
+本文定义同一策略在 SGLang rollout 与 Megatron trainer 之间的概率一致性口径、已验证事实和诊断门禁。Policy loss、old actor 与 TIS 的训练语义见 `handoffs/deepseek-v4/lora_training_features.md`；predictive mask 对 entropy 的影响见 `handoffs/deepseek-v4/predictive_entropy_collapse_20260721.md`
 
-**Reader takeaway (original):** the train (Megatron/tilelang) and rollout (sglang) forwards diverge for
-two *real algorithmic* reasons and several *negligible numeric* reasons. Fix the two real ones;
-the rest are recorded as a memo so no one re-opens them. `train_rollout_logprob_abs_diff` is the
-metric; its floor is set by the items below, **not** by fp8-vs-bf16 precision (see §Precision).
+## 结论
 
-Distinguish two axes throughout:
-- **Same math** — the two sides implement the same algorithm.
-- **Same numerics** — the two sides produce the same bits (precision/kernel/accumulation).
+- train↔rollout mismatch 必须先拆成观测接口、SGLang 内部一致性、跨引擎数值路径和策略版本漂移四层
+- DSPARK verifier-window 修复后的一个 H200 artifact 证明 SGLang generation 与同引擎 full-prefix scorer 可以逐 bit 一致
+- 在同一 artifact 上固定 rollout expert ID 后，Megatron 与 SGLang 仍有 `0.043693` sampled-token mean absolute log-prob gap 和 `0.019976` full-vocabulary TV
+- routing replay 只固定 expert ID，不固定 gate weight、router 输入、expert arithmetic、attention 或 collective
+- 旧 EAGLE、bf16 KV 和已删除 FP8 alignment flag 的测量不能作为当前 FP4/DSPARK recipe 的预期 floor
+- online sampled-token 指标混合了策略漂移与跨引擎数值差异；完整 paired-logit probe 才能判定纯 parity
 
-## Fix list (do these)
+## 四层因果分解
 
-| # | Mismatch | Side to change | Fix | Impact |
-|---|---|---|---|---|
-| 1 | **C4 lightning-indexer: rollout SPARSE (top-512), train DENSE** | **sglang → dense** | force `index_topk` ≥ `max_context/compress_ratio` so the top-k selects all compressed positions | **large at ctx>2048**, zero at ctx≤2048 |
-| 2 | **Shared expert missing SwiGLU clamp** | **train → add clamp** | clamp `gate≤limit`, `up∈[-limit,limit]` (`swiglu_limit=10.0`) in `V4SharedExpertMLP`, in bf16 | moderate (every token where shared gate/up exceed ±10) |
-
-Decision (owner): align **both sides on DENSE** attention (patch sglang to drop the indexer),
-rather than porting the sparse indexer into train. Rationale: train already drops the indexer;
-dense is the simpler common denominator and is exact.
-
-## Real mismatch 1 — C4 lightning indexer (sparse vs dense)
-
-| | Train (Megatron) | Rollout (sglang) |
-|---|---|---|
-| C4 compressed KV | yes (compress_ratio=4) | yes |
-| indexer top-k | **DROPPED** — attends all valid compressed positions (dense) | **top-512** selected by lightning indexer (`index_topk=512`) |
-| evidence | `attention/reference.py` "Lightning Indexer + top-k DROPPED"; `compressor.py:11-16` | `deepseek_v4.py:416` builds `C4Indexer` when `compress_ratio==4`; `sparse_prefill_utils.py:297` `topk_len=min((pos+1)//COMPRESS_RATIO, TOP_K)` |
-
-**Why it hid until now:** at ctx ≤ 2048 there are ≤ 512 compressed positions, so `min(pos//4, 512)`
-= all → the indexer is a no-op and both sides are dense. At 16k there are ~4096 compressed
-positions and rollout attends to only 512 of them → genuinely different attention. This is the
-dominant long-context divergence and is invisible in the ctx-2048 debug runs.
-
-**Model-design note (important):** CSA (Compressed Sparse Attention) is V4-Flash's **native**
-attention on `compress_ratio==4` layers (paper §Hybrid Attention; lightning-indexer top-k is the
-mechanism, and the model is *trained* sparse — paper "backward propagation for sparse attention").
-So **the rollout (sglang sparse) is correct; the train (dense, indexer dropped) is the deviation.**
-Forcing sglang dense is OFF-DESIGN (attends positions the model learned to ignore → quality risk);
-chosen deliberately here for train/rollout consistency. The *correct* alternative is to implement
-CSA sparse in train.
-
-**Fix (sglang → dense) — requires BACKEND surgery, not an `index_topk` override.** A naive override
-of `get_dsa_index_topk` / `C4Indexer.index_topk` is a **no-op**: the DSV4 backend reads
-`hf_text_config.index_topk` directly (`deepseek_v4_backend.py:454`) and `init_flashmla_related`
-asserts `c4_sparse_topk ∈ {512,1024}` (`:308`), then `c4_sparse_topk_lengths = clamp(lengths,
-max=c4_sparse_topk)` + sizes `c4_sparse_page_indices` to that width — the clamp IS the sparsity, and
-the flashMLA kernel is tuned for 512/1024. Real dense mode (env `V4_DENSE_ATTENTION=1`): set
-`c4_sparse_topk` to the batch's full compressed length, relax the assert, fill
-`c4_sparse_page_indices` with all causal compressed positions (bypass the indexer top-k), and route
-through a dense-capable kernel path; cover prefill AND decode; bound buffers by seq_len. Default
-(env unset) stays byte-identical sparse.
-
-## Real mismatch 2 — shared expert SwiGLU clamp
-
-| | Train | Rollout |
-|---|---|---|
-| routed experts | clamp `gate≤limit`, `up∈[-limit,limit]` then `act(gate)*up` (`_apply_gate`) | same (`silu_and_mul_masked_post_quant.cuh:51-73`) — **MATCH** |
-| shared expert | `act_fn(gate_proj(x))*up_proj(x)` — **NO clamp** | clamps with `swiglu_limit=10.0` (`deepseek_v2.py:675`) |
-
-**Fix (train → add clamp):** apply the same clamp in `V4SharedExpertMLP.forward`, in bf16
-(sglang clamps in bf16 by design). Thread `swiglu_limit` from config (checkpoint has `10.0`).
-
-**Clamp backward = STE.** `torch.clamp` has zero gradient outside `[min,max]`, so on outlier
-activations (|gate/up| > 10) the gradient flowing back *through* the frozen expert to the LoRA
-is killed. The DeepSeek-V4 paper does not specify the swiglu-limit clamp's backward (it uses
-QK-Clip nowhere and FP4-QAT elsewhere), so we use the **straight-through estimator**: forward
-clamps, backward is identity (`_clamp(x)=x+(x.clamp()-x).detach()`, `_CLAMP_STE`, default on;
-`V4_CLAMP_STE=0` reverts). Applied to **both** the routed `_apply_gate` and the shared `_act`.
-
-## Structural asymmetry — weight sync (audit confounder, not a forward bug)
-
-The LoRA-only weight sync (`update_weight_from_distributed.py`) **skips experts**
-(`:279 if ".experts." in name: continue`) and merges LoRA attention as **bf16**
-(`_merge_lora_weight → base_weight.dtype`, train is `--bf16`). Consequence:
-
-| rollout state | attention | experts |
-|---|---|---|
-| **real loop** (after a weight sync) | bf16 (synced from train) | original fp8 (never synced) |
-| **`--debug-rollout-only`** (no sync) | fp8 (initial load) | fp8 (initial load) |
-
-The A–I debug comparisons used no-sync data (full fp8), which is **not** what the real loop sees.
-The real-loop optimum is therefore **fp8-experts (ue8m0) + bf16-attention** — mirroring what the sync
-makes sglang serve — and the 16k formal run (that config) measured `logprob_diff` 0.022.
-**Action:** always verify precision choices against a sync'd/real-loop rollout, not `--debug-rollout-only`.
-
-## Negligible / env-gated mismatches (MEMO — do not re-open without evidence)
-
-| item | same math? | same numerics? | detail | why negligible |
-|---|---|---|---|---|
-| mHC prenorm | yes | no (env-gated) | train FP32 `_HC(... .float())`; sglang `tf32_hc_prenorm_gemm` (TF32) **iff** `SGLANG_OPT_DEEPGEMM_HC_PRENORM=True` (default True; `server_args.py:2122` can disable). Else branch `hc_pre_torch_impl` is fp32. | **MEASURED 2026-07:** TF32-vs-FP32 rel-err = **1.79e-4/site** → ~1.7e-3 random-walk over 43×2 sites (coherent worst 1.5e-2). Input `x_flat` is bf16 on both sides (bf16⊂TF32 → exact); only `hc_fn` rounds; mix is a *detached* Sinkhorn oracle (no grad compound). 45× below the per-layer bf16 residual rounding. Negligible vs 0.037. |
-| weighted RMSNorm | yes | no | train keeps weighted RMSNorm bf16 (`mcore_model.py:997-1011`, quantified+accepted); sglang default `cast_x_before_out_mul=False` (`layernorm.py`) casts differently | eps matches (1e-6); dtype-order only |
-| router `+1e-20` renorm guard | yes | ~ | train adds `1e-20` to the weight-sum denominator; sglang does not | scores positive for sigmoid/sqrtsoftplus → denominator ≫ 1e-20 |
-| fp8 gemm accumulation | n/a | no | non-bit-identical deep_gemm invocation vs sglang | see §Precision |
-
-### Round 3 (2026-07) — the memo items above NOW FIXED (train→rollout alignment)
-
-User directive: fix all remaining mismatches even negligible, primarily changing TRAIN to match
-ROLLOUT. Done + Codex-reviewed (94 tests pass):
-
-| item | fix | side | verdict |
+| 层 | 比较对象 | 主要问题 | 必须先满足的门禁 |
 |---|---|---|---|
-| **weighted RMSNorm cast** | `V4RMSNorm.forward` now `(self.weight * hidden_states).to(input_dtype)` (fp32-mul-then-cast), matching sglang `cast_x_before_out_mul=False`. Env `V4_RMSNORM_HF=1` reverts to HF order. Measured order-diff 4.15e-3 (~1 bf16 ulp). | **train** | Codex CORRECT |
-| **router +1e-20 + score dtype** | removed `+1e-20` renorm guard AND now `score_fn(logits.float())` — sglang scores in fp32 (`gating_output.float()`), which also aligns the top-k SELECTION, not just weights. | **train** | Codex-corrected (was RISKY: dtype) |
-| **mHC prenorm TF32** | run script forces sglang FP32: `SGLANG_OPT_USE_TILELANG_MHC_PRE=false` + `SGLANG_OPT_DEEPGEMM_HC_PRENORM=False` (BOTH needed — DEEPGEMM alone lands on another TileLang kernel, not fp32; Codex-caught). Gated by `V4_ALIGN_MHC_FP32=1`. Changes ROLLOUT to fp32 (keeps correct precision, does NOT degrade train to TF32). | rollout | Codex-corrected (was WRONG: single-flag no-op) |
-| indexer sparse | DEFERRED — needs A1 tilelang kernel port; measured effect ≤0.0007. `V4_SPARSE_ATTENTION=1` reference path exists. | — | negligible, not worth kernel port |
+| 观测接口 | generation hook 与 API 返回值 | API 是否记录了实际采样分布 | sampled token 与 logprob 长度、token ID、精度一致 |
+| SGLang 内部 | generation-time logits 与同引擎 full-prefix scorer | verifier state、prefix、kernel path 是否一致 | 完整词表逐行对齐，最好逐 bit 相同 |
+| 跨引擎 | SGLang 与 Megatron 的同权重、同 prefix forward | kernel、dtype、routing、collective 是否一致 | 相同 checkpoint、adapter、tokens、expert IDs 与 runtime fingerprint |
+| 策略版本 | current trainer 与 rollout behavior policy | optimizer step 或 async lag 造成的真实 policy drift | old-actor version tag 或冻结 replay |
 
-## Confirmed MATCH (same math AND acceptable numerics)
+上层没有关闭时，不得把观测到的差异归因给下层。例如 SGLang 自身 generation/scorer 不一致时，Megatron 对 stored rollout logprob 的差异不是纯跨引擎残差；current trainer 对 rollout 的差异也不是同版本数值误差
 
-Router gating-weight order (sqrtsoftplus + `e_score_correction_bias` for indices only + gather +
-renorm + `routed_scaling_factor`); RoPE (theta, `compress_rope_theta`, YaRN, partial-rotary,
-interleaved rotation, `is_neox_style=False`); attention `softmax_scale = head_dim**-0.5`; mHC
-algorithm; logits (fp32, no softcap; temperature=1 so `logits/T` is a no-op); tokenization/chat
-template (`add_generation_prompt`, `add_special_tokens=False`, BOS from template).
+## 度量
 
-## Precision floor (memo — why fp8 does NOT help here)
+对 rollout 返回 token `x_t` 定义
 
-Measured on identical data (ctx-2048, step-0), train vs a **known full-fp8** rollout:
+```text
+delta_logp = log p_train(x_t | h_t) - log p_rollout(x_t | h_t)
+delta_p    =     p_train(x_t | h_t) -     p_rollout(x_t | h_t)
+ratio      = exp(delta_logp)
+```
 
-| train forward | logprob_diff |
+paired full-vocabulary 诊断至少报告以下统计
+
+| 度量 | 作用 |
 |---|---|
-| bf16 | **0.034** |
-| unified fp8, non-bit-identical kernels | **0.058** (worse) |
+| mean `delta_logp` | sampled-token 系统方向 |
+| mean absolute `delta_logp` | sampled-token 差异量级 |
+| mean/absolute `delta_p` | 原始概率尺度的差异 |
+| `H(rollout)-H(train)` | 分布平坦度方向 |
+| total variation | 完整分布差异，不依赖 sampled token |
+| top-1 ID agreement | 决策边界稳定性 |
+| position/length buckets | 判断误差是否随 decode 深度增长 |
 
-Isolation proved our fp8 *components* match sglang (MoE 0.0046, attn-proj 0.0051), yet the full
-fp8 forward is *worse* than bf16: two independent fp8 quantizations (our deep_gemm kernels vs
-sglang's) don't cancel and compound over 43 layers. DeepSeek-V4 (arXiv 2606.19348) resolves this
-with **unified FP8 QAT + bitwise batch-invariant deterministic kernels** — "bitwise alignment
-among pre-training, post-training, and inference pipelines." We lack bit-identical kernels, so
-**bf16 train is the best practical choice** unless we invest in kernel alignment. Field-standard
-alternatives: FP16 train (reported ~7.7× smaller diff than bf16) or TIS/MIS correction (Miles MoE
-recipe: token TIS [0.5,1.5] + geometric MIS [0.99,1.001] + batch-norm — ours `[0.999,1.001]` is too
-tight, no token-TIS/batch-norm, hence ~90% MIS reject).
+online 指标的解释必须区分来源
 
-<!-- Also fixed en route (kept, env-gated off): ue8m0 weight/activation scale SPLIT
-(_V4_FP8_WEIGHT_UE8M0=True matches ckpt; _V4_FP8_ACT_UE8M0 auto False on H20/Hopper; the old
-single flag gave 88%-wrong expert weights). mega_moe is Blackwell-only (DEEPGEMM_BLACKWELL=False
-on H20) — H20 uses m_grouped_fp8_gemm_nt_contiguous, same as train. -->
+- `train/train_rollout_logprob_abs_diff` 比较当前 trainer forward 与 batch 中的 rollout logprob，包含真实策略更新带来的漂移
+- `tis_abs = |exp(megatron_old_logprob-sglang_rollout_logprob)-1|` 只有在 old actor 与 `gen_weight_version` 匹配时才表示同版本 cross-engine mismatch
+- PPO/DIS/predictive ratio 使用哪个 denominator 由 policy-loss 配置决定，不能把 objective ratio 直接当 parity metric
 
-## Verification (after fixes) — original plan, now OBE
+## 已验证事实
 
-1. ~~Fresh rollout with dense sglang at 16k~~ — moot; indexer term measured ≤0.0007 (see round 2).
-2. Shared-clamp fix verified (94→93 tests pass; the 1 fail is a pre-existing WS-kernel small-N flake).
-3. ctx-2048 unchanged (indexer was already a no-op there) — confirmed.
+### SGLang 内部一致性
 
-## Round 2 (2026-07) — measured audit closure
+DSPARK target verifier 曾遗漏完整 verify window 的状态重写，使 generation-time probability 与同引擎 full-prefix scorer 不一致。`scripts/dsv4/patches/dspark_port_series/0014-*` 修复后，记录的 H200 artifact 在 384 个位置、49,643,520 个 logits 上逐 bit 相同；API sampled logprob 只剩一个浮点舍入量级的单点差异
 
-**Newly audited components (were NOT in the original 9-item audit) — all MATCH:**
+这项证据证明该 runtime 与 artifact 的 SGLang 内部层已关闭，不证明所有未来 runtime 自动满足，也不证明 Megatron 与 SGLang 相同。每次 runtime 或 speculative patch 变化后都必须重跑内部自检
 
-| component | train | rollout (sglang) | verdict |
-|---|---|---|---|
-| CSA compressor | softmax-pool + `position_bias` + `kv_norm` (B2 kernel) | `compress_forward` online softmax-pool + `ape` | same math; kernel-precision only |
-| attention sinks | `self.sinks`, mapped `←attn.attn_sink` (`deepseekv4.py:35`), loaded nonzero (mean 0.498) | `self.attn_sink` loaded | loaded + match |
-| conjugate output-RoPE | `apply_rotary(out, cos, -sin)` (`attention.py:148`) | `fused_rope_inplace(o[...,-rope:], inverse=True)` (`deepseek_v4.py:980`) | match |
+### 跨引擎 residual
 
-**Empirical mismatch decomposition (measured, step-0):**
+在通过内部自检的 H200 artifact 上，Megatron 使用相同 checkpoint、prefix，并 replay rollout expert IDs，paired full-vocabulary 结果为
 
-| what | measurement | meaning |
-|---|---|---|
-| indexer term | dense-train 0.0404 vs sparse-train 0.0411 @ ctx-8192 (both vs sparse rollout) | **≤0.0007** (sparse gave no gain) |
-| bf16-indexer vs fp8-rollout selection overlap | 98.9% (real L12 weights, ctx>2048) | replay unnecessary |
-| non-indexer term | 0.037 @ ctx-2048 (indexer no-op) | the real gap |
-| bf16 sparse flash-MLA kernel vs reference | 0.0037 | attention *algorithm* aligned |
+| 度量 | 值 |
+|---|---:|
+| sampled-token mean `delta_logp` | `+0.004859` |
+| sampled-token mean absolute `delta_logp` | `0.043693` |
+| sampled-token mean absolute `delta_p` | `0.010473` |
+| mean `H(rollout)-H(train)` | `-0.002505` |
+| mean total variation | `0.019976` |
+| top-1 ID agreement | `97.40%` |
 
-**Train-side sparse CSA** (built, env `V4_SPARSE_ATTENTION=1`, torch-reference path; A1 kernel port
-NOT done): indexer weights load cleanly (`compressor.indexer.*` ↔ ckpt `attn.indexer.*`, CSA layers
-only). Kept for reference; **not worth the A1 kernel port** — the indexer isn't the mismatch.
-sglang exposes `enable_return_indexer_topk` if exact-selection replay is ever wanted (~5.6 GB/batch;
-not built — 98.9% overlap makes it a predicted null).
+该结果证明 same-expert-ID residual 存在，但不能确定其他 checkpoint、batch、并行拓扑或 runtime 的稳定方向。旧 H0 的 signed `-0.037949` 与 absolute `0.115774` 包含当时 SGLang 内部不一致，不能与上表做 paired 前后比较
 
-**The one unrun test that would settle "precision vs path":** serve sglang in bf16 (dequant the fp8
-ckpt), regen rollout, compare bf16-train vs bf16-rollout. →0 confirms fp8 precision is the whole
-gap; ≈0.037 means it's path/kernel/structural and the precision story is wrong.
+## Routing replay 边界
 
-**Why "use sglang's kernels in train" doesn't work:** they're inference-only (`sparse_decode_fwd`,
-no backward) and serving-context-bound (`ForwardBatch`, paged KV, `PagedIndexerMetadata`). The A1
-custom kernel is mandatory (non-standard MLA head_dim=512 + CSA + sinks; flash-attn can't express it;
-training needs a backward). The gap is that A1 and sglang's flash-MLA are *independently written* —
-closable only by unifying on one bit-identical kernel (DeepSeek's design) or TIS/MIS.
+rollout 保存 learned-MoE 层每个 token 的 top-6 expert ID，Megatron forward 使用这些 ID 选取自己计算的 router scores
+
+- 已固定：每层执行的 expert ID 集合
+- 未固定：六个 expert 的 gate weight
+- 未固定：进入 router 的 hidden state
+- 未固定：W4A16 expert 内部 arithmetic 与 combine reduction
+- 未固定：attention、shared expert、mHC、lm head 与 collective
+
+因此，routing replay 能消除离散 expert-set 分叉，但不能把整个 MoE 层变成相同函数。下一层分解应先比较 IDs-only replay 与 IDs+gate-weight replay，再检查 expert 输入、单 expert 输出和 combine 前后结果
+
+## 已排除的解法
+
+- 将 trainer 的逐 expert BF16 `F.linear` 换成 grouped BF16 GEMM 没有改善 TV
+- 强行启用当前 W4A16 路径不执行的旧 shared-expert/attention FP8 alignment flag 会新增数值路径，不能作为修复
+- 历史 dense-vs-sparse indexer 实验测得影响远小于主 residual，不能解释当前差异
+- bf16 KV 属于另一套容量与 kernel contract；当前 DSpark launch core 对 bf16 KV fail closed，不能借用旧 bf16-KV 数字描述正式 FP8-KV 路径
+
+## 诊断与验收流程
+
+1. 固定 checkpoint、adapter、tokenizer、chat template、prompt、response token、sampling 参数和 runtime fingerprint
+2. 在 SGLang 同时保存 generation logits、full-prefix scorer logits、sampled token 和 routed expert IDs
+3. 先要求 SGLang 内部 paired logits 逐 bit 相同；失败时停止跨引擎归因
+4. 用 `train_rollout_full_vocab_probe.py` 在 Megatron 重建相同 prefix，并 replay rollout expert IDs
+5. 保存完整词表 logits，报告 sampled signed/absolute gap、raw probability、entropy、TV、top-1 与位置分桶
+6. 若 residual 仍存在，按 gate weight、expert arithmetic、attention/shared path、collective 的顺序做单变量分解
+7. 只有同一 checkpoint、batch 与 runtime 的 paired A/B 才能量化修复效果
+
+诊断只读 checkpoint，不得写 optimizer 或训练状态。生成 artifact 必须记录输入 SHA256、模型与 adapter identity、patch-series fingerprint、精度、并行拓扑和 expert-replay 设置
+
+## 实现与证据入口
+
+- `scripts/dsv4/diagnostics/mismatch/dspark_full_vocab_probe.py`：SGLang generation/scorer 内部自检
+- `scripts/dsv4/diagnostics/mismatch/train_rollout_full_vocab_probe.py`：Megatron/SGLang paired full-vocabulary 比较
+- `scripts/dsv4/patches/dspark_port_series/0014-*`：DSPARK verifier-window 修复
+- `slime/utils/routing_replay.py`：expert-ID replay
+- `slime/backends/megatron_utils/loss.py`：online sampled-token mismatch 指标
+- `local_artifacts/deepseek-v4/r2_logs/train_rollout_full_vocab_h200_20260723.txt`：当前 paired H200 evidence
+- `local_artifacts/deepseek-v4/r2_logs/tim_h200_dspark_root_fix_20260722.txt`：SGLang 内部 closure evidence
