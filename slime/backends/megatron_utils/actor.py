@@ -507,10 +507,25 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["total_lengths"],
                     rollout_data["max_seq_lens"],
                 )
+                microbatch_width_order = [
+                    max(rollout_data["max_seq_lens"][sample_index] for sample_index in microbatch)
+                    for microbatch in rollout_data["micro_batch_indices"]
+                ]
+                microbatch_width_orders_by_step = []
+                microbatch_cursor = 0
+                for step_num_microbatches in rollout_data["num_microbatches"]:
+                    step_end = microbatch_cursor + step_num_microbatches
+                    microbatch_width_orders_by_step.append(microbatch_width_order[microbatch_cursor:step_end])
+                    microbatch_cursor = step_end
+                microbatch_widths_descending = all(
+                    all(left >= right for left, right in zip(step_widths, step_widths[1:], strict=False))
+                    for step_widths in microbatch_width_orders_by_step
+                )
                 logger.info(
                     "V4_ACTUAL_LENGTH_PADDING dp_rank=%s pad_multiplier=%s cp=%s pp=%s "
                     "samples=%s unique_widths=%s width_hist=%s raw_slots=%s padded_slots=%s "
-                    "rollout_wide_slots=%s padding_overhead_pct=%.2f saved_vs_rollout_wide_pct=%.2f",
+                    "rollout_wide_slots=%s padding_overhead_pct=%.2f saved_vs_rollout_wide_pct=%.2f "
+                    "microbatch_width_order=%s microbatch_widths_descending=%s",
                     mpu.get_data_parallel_rank(with_context_parallel=False),
                     self.args.data_pad_size_multiplier,
                     mpu.get_context_parallel_world_size(),
@@ -523,6 +538,11 @@ class MegatronTrainRayActor(TrainRayActor):
                     padding_summary["rollout_wide_slots"],
                     padding_summary["padding_overhead_pct"],
                     padding_summary["saved_vs_rollout_wide_pct"],
+                    ";".join(
+                        ",".join(str(width) for width in step_widths)
+                        for step_widths in microbatch_width_orders_by_step
+                    ),
+                    microbatch_widths_descending,
                 )
 
         for key in ["rollout_log_probs", "teacher_log_probs"]:

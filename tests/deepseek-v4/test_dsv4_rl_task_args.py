@@ -216,6 +216,26 @@ def test_dynamic_batch_uses_explicit_slime_token_limits():
     assert args[args.index("--log-probs-max-tokens-per-gpu") + 1] == "8192"
 
 
+def test_padded_length_descending_train_order_is_explicit_and_validated():
+    default_args = _task_args(TASK_MODE="rl", REWARD_MODE="random")
+    assert "--sort-train-microbatches-by-padded-length-desc" not in default_args
+
+    descending_args = _task_args(
+        TASK_MODE="rl",
+        REWARD_MODE="random",
+        SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC="1",
+    )
+    assert "--sort-train-microbatches-by-padded-length-desc" in descending_args
+
+    invalid = _task_args_result(
+        TASK_MODE="rl",
+        REWARD_MODE="random",
+        SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC="yes",
+    )
+    assert invalid.returncode == 2
+    assert "SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC must be 0 or 1" in invalid.stderr
+
+
 def test_overlong_penalty_is_explicit_drkernel_cli():
     args = _task_args(
         TASK_MODE="rl",

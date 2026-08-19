@@ -20,12 +20,14 @@ def make_args(
     use_dynamic_batch_size=False,
     max_tokens_per_gpu=None,
     balance_data=False,
+    sort_train_microbatches_by_padded_length_desc=False,
 ):
     return SimpleNamespace(
         micro_batch_size=micro_batch_size,
         use_dynamic_batch_size=use_dynamic_batch_size,
         max_tokens_per_gpu=max_tokens_per_gpu,
         balance_data=balance_data,
+        sort_train_microbatches_by_padded_length_desc=sort_train_microbatches_by_padded_length_desc,
     )
 
 
@@ -81,6 +83,10 @@ def assert_invariants(
             bin_total = sum(total_lengths[partition[i]] for i in mbs)
             if bin_total > max_per_bin:
                 assert len(mbs) == 1, f"rank {r}: mbs sum {bin_total} > {max_per_bin} but contains {len(mbs)} samples"
+
+
+def microbatch_max_lengths(partition, micro_batch_indices, total_lengths):
+    return [max(total_lengths[partition[i]] for i in microbatch) for microbatch in micro_batch_indices]
 
 
 @pytest.mark.unit
@@ -285,6 +291,89 @@ def test_rejects_when_fewer_groups_than_gbs():
     tp = make_tp(dp_size=1)
     with pytest.raises(AssertionError, match="num_groups"):
         build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, group_indices=[0, 0, 1, 1, 2, 2])
+
+
+@pytest.mark.unit
+def test_static_microbatches_can_run_largest_padded_width_first_without_changing_assignment():
+    total_lengths = [1, 100, 2, 900, 3, 700, 4, 800]
+    group_indices = list(range(8))
+    args = make_args(
+        micro_batch_size=2,
+        sort_train_microbatches_by_padded_length_desc=True,
+    )
+    tp = make_tp(dp_size=2)
+
+    partitions, mbi, nmb, _ = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=8, group_indices=group_indices
+    )
+
+    assert nmb == [2]
+    for rank in range(2):
+        widths = microbatch_max_lengths(partitions[rank], mbi[rank], total_lengths)
+        assert widths == sorted(widths, reverse=True)
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=2,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+    )
+
+
+@pytest.mark.unit
+def test_turn_aware_balancing_can_run_single_turn_trajectories_largest_first():
+    total_lengths = [100, 7000, 1500, 4096, 9000, 2500, 12000, 5120]
+    group_indices = list(range(8))
+    args = make_args(
+        micro_batch_size=1,
+        balance_data=True,
+        sort_train_microbatches_by_padded_length_desc=True,
+    )
+    tp = make_tp(dp_size=2)
+
+    partitions, mbi, nmb, _ = build_dp_schedule(
+        args,
+        tp,
+        total_lengths,
+        global_batch_size=8,
+        group_indices=group_indices,
+        pack_group_atomic=True,
+        group_sample_sort_keys=[0] * 8,
+    )
+
+    assert nmb == [4]
+    for rank in range(2):
+        widths = microbatch_max_lengths(partitions[rank], mbi[rank], total_lengths)
+        assert widths == sorted(widths, reverse=True)
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=2,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+    )
+
+
+@pytest.mark.unit
+def test_turn_aware_descending_order_rejects_multi_turn_trajectories():
+    args = make_args(
+        micro_batch_size=1,
+        sort_train_microbatches_by_padded_length_desc=True,
+    )
+    tp = make_tp(dp_size=1)
+
+    with pytest.raises(ValueError, match="requires one training sample per trajectory"):
+        build_dp_schedule(
+            args,
+            tp,
+            [200, 100],
+            global_batch_size=1,
+            group_indices=[7, 7],
+            pack_group_atomic=True,
+            group_sample_sort_keys=[0, 1],
+        )
 
 
 if __name__ == "__main__":

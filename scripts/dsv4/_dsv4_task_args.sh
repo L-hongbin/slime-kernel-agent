@@ -7,7 +7,8 @@
 #   METADATA_KEY, MAX_CONTEXT_LEN, MAX_RESPONSE_LEN, ROLLOUT_TEMPERATURE,
 #   ROLLOUT_TOP_P, ADVANTAGE_ESTIMATOR, EPS_CLIP, EPS_CLIP_HIGH, ENTROPY_COEF,
 #   REPO, KERNEL_ENV_URL, KERNEL_BACKEND, USE_WANDB, WANDB_PROJECT, WANDB_GROUP,
-#   DEBUG_DIR, USE_ROLLOUT_ROUTING_REPLAY, and LOAD_FORGE_ROLLOUT_DATA.
+#   DEBUG_DIR, USE_ROLLOUT_ROUTING_REPLAY, LOAD_FORGE_ROLLOUT_DATA, and
+#   SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC.
 # Output: the TASK_ARGS array (declared by the caller / this function).
 
 build_dsv4_task_args() {
@@ -92,6 +93,14 @@ build_dsv4_task_args() {
       # the peak that OOM'd the 16k train backward (v9, stage-2, 114MB short).
       --log-probs-chunk-size "${LOG_PROBS_CHUNK_SIZE:-10000}"
     )
+    case "${SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC:-0}" in
+      1) rl_args+=(--sort-train-microbatches-by-padded-length-desc) ;;
+      0) ;;
+      *)
+        echo "FATAL: SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC must be 0 or 1, got '${SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC}'." >&2
+        return 2
+        ;;
+    esac
     # Token-capped microbatching (default OFF). The caller passes the same
     # explicit values used by slime's --max-tokens-per-gpu interfaces. PP2@16k
     # r16/r16b/r16c all OOM'd ~3GB short in the stage0

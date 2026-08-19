@@ -1109,6 +1109,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "and turn_indices before partitioning; with --balance-data, balancing is done at trajectory granularity."
                 ),
             )
+            parser.add_argument(
+                "--sort-train-microbatches-by-padded-length-desc",
+                action="store_true",
+                default=False,
+                help=(
+                    "Within each training step and DP rank, execute already-assigned microbatches from "
+                    "largest to smallest padded sequence width. This does not change DP balancing or "
+                    "the theoretical peak of the longest microbatch; it can reduce allocator growth and "
+                    "fragmentation by establishing the largest allocation first. With turn-aware DP "
+                    "partitions, this currently requires one training sample per trajectory."
+                ),
+            )
 
             parser.add_argument(
                 "--use-dynamic-batch-size",

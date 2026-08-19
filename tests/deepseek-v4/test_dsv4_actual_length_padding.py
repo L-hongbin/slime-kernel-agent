@@ -173,6 +173,8 @@ def test_actor_wires_dynamic_widths_from_the_real_microbatch_schedule():
     assert 'rollout_data["micro_batch_indices"]' in actor_source
     assert "pipeline_model_parallel_size=mpu.get_pipeline_model_parallel_world_size()" in actor_source
     assert "V4_ACTUAL_LENGTH_PADDING" in actor_source
+    assert "microbatch_width_order" in actor_source
+    assert "microbatch_widths_descending" in actor_source
 
 
 if __name__ == "__main__":
