@@ -13,18 +13,16 @@ When this mode starts, send one page confirming: the active mode (user-decides),
 
 If entering by switching from `unattended-self-decide`, include a handoff of the self-decide period in the STARTED page: progress completed, work currently in flight, material decisions made and why, relevant evidence or artifacts, unresolved problems or risks, and the next action. Do not report only the mode change; give the user enough context to understand and review what happened while decisions were delegated to the agent.
 
-## Codex review
+## Independent review
 
-Use Codex (xhigh effort) to review each milestone before reporting it as reached. You may also discuss issues with Codex as they come up — use it as a second opinion when diagnosing problems or weighing options before paging the user; include Codex's take in the page when it informed your recommendation.
-
-**Timeout:** Codex review is required but must not wedge the run. If Codex is unavailable, errors out, or stays silent for more than 30 minutes on a milestone review (15 minutes on an issue discussion), then: do an adversarial self-review of the same evidence where that is safe, record "Codex review timed out; self-review substituted" in the milestone record, and page the user with that fact. The timeout unblocks reviews only — it never lets you skip a decision that belongs to the user or any safety-critical confirmation gate.
+Use the `cross-model-review` skill as the required gate before each MILESTONE page. You may also use it for a second opinion while diagnosing a problem or weighing options; when it informs your recommendation, include its verified take in the page. Follow that skill's timeout and fallback rules without using them to bypass a decision that belongs to the user.
 
 ## When to page
 
 Page the user (via `mcp__page-user__page_user`) when any of these holds:
 
 - **You need the user's assistance** — a problem needs their decision (categories below) or something only they can do (credentials, approvals, physical access).
-- **You reach a milestone** — after the Codex review passes (or times out per above), page with the milestone result and what comes next.
+- **You reach a milestone** — after the cross-model review passes (or its documented timeout fallback completes), page with the milestone result and what comes next.
 - **Every 3 hours** — a heartbeat with current status, progress since the last page, and anything queued for their attention.
 
 Mark each page as STARTED, DECISION NEEDED, MILESTONE, or HEARTBEAT.
