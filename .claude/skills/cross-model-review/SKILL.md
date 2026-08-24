@@ -13,6 +13,8 @@ Try reviewers in this order, moving to the next when the command, model, or serv
 2. `agentp --print --model kimi-k3-high --workspace <repo-root> <prompt>`
 3. `kimi --model kimi-code/k3 --prompt <prompt>` with `thinking.effort = "high"` in `~/.kimi-code/config.toml`
 
+Treat repeated reconnects, stream termination, TLS/proxy failures, rate or resource exhaustion, and a stalled call as reviewer failure. Do not repeatedly retry or resume a failed candidate during the same review; continue with the next viable model while the overall timeout remains.
+
 - Milestone timeout: 30 minutes
 - Issue-discussion timeout: 30 minutes
 
@@ -24,4 +26,4 @@ Use the configured model to review each milestone before reporting it as reached
 
 The reviewer may inspect the repository, run focused tests, make small targeted changes, or add test files. It must not make broad changes or start long-running, expensive, or externally mutating work.
 
-If the reviewer is unavailable, errors out, or exceeds the applicable timeout, do an adversarial self-review where safe and record `Cross-model review timed out; self-review substituted.` This fallback never bypasses a user-owned decision or safety-critical confirmation.
+Only after every viable candidate has failed, become unavailable, or exhausted the shared timeout, do an adversarial self-review where safe and record `Cross-model review timed out; self-review substituted.` This fallback never bypasses a user-owned decision or safety-critical confirmation.
