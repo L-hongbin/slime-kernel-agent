@@ -109,11 +109,11 @@ class ServerGroup:
         """Node-0 engines only (for multi-node serving)."""
         return self.all_engines[:: self.nodes_per_engine]
 
-    def start_engines(self, port_cursors: dict[int, int] | None = None) -> tuple[list, dict[int, int]]:
+    def start_engines(self, port_cursors: dict[str, int] | None = None) -> tuple[list, dict[str, int]]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
-        of Ray ObjectRefs and *port_cursors* maps node index → next free port.
+        of Ray ObjectRefs and *port_cursors* maps host IP → next free port.
         The caller should ``ray.get()`` on the handles to block until the
         engines are healthy, and pass *port_cursors* to the next server group
         so that different groups on the same node don't race for ports.
@@ -314,7 +314,7 @@ class RolloutServer:
 
         # Start all groups concurrently.
         all_handles = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
         for g in self.server_groups:
             handles, port_cursors = g.start_engines(port_cursors)
             all_handles.extend(handles)
@@ -1273,70 +1273,63 @@ def _allocate_rollout_engine_addr_and_ports_normal(
     # 3. dist_init_addr port
     # 4. other ports for dp_attention, which is of size 4 + dp_size
     _gpus_per_engine = num_gpus_per_engine or args.rollout_num_gpus_per_engine
-    num_engines_per_node = max(1, args.num_gpus_per_node // _gpus_per_engine)
     addr_and_ports: dict[int, dict] = {}
 
     # Track per-node port cursors so that different server groups (called
     # sequentially) never race for the same ports on a given node.
-    node_port_cursor: dict[int, int] = {}
+    node_port_cursor: dict[str, int] = {}
+    engines_by_rank = dict(rollout_engines)
 
-    visited_nodes = set()
-    for rank, engine in rollout_engines:
-        local_rank = rank - rank_offset
-        node_index = local_rank // num_engines_per_node
-        if node_index in visited_nodes:
-            continue
-        visited_nodes.add(node_index)
-        # TODO: currently when restarting engines, we will set port for all engines on this node starting with this rank.
-        # e.g. for 8 gpus, if we are restarting engine on gpu 3, we will set port for engine 3,4,5,6,7 on this node.
-        num_engines_on_this_node = num_engines_per_node - (local_rank % num_engines_per_node)
+    # Placement groups may intentionally spread fewer-than-node-sized engines
+    # across hosts (for example one TP4 engine on each 8-GPU node).  Rank
+    # arithmetic cannot recover that physical placement.  Query every actor and
+    # allocate its server/NCCL ports on the actor's actual host.
+    hosts_by_rank = {
+        rank: ray.get(engine._get_current_node_ip_and_free_port.remote())[0] for rank, engine in rollout_engines
+    }
 
-        def get_addr_and_ports(engine, node_idx):
-            # use small ports to prevent ephemeral port between 32768 and 65536.
-            # also, ray uses port 10002-19999, thus we avoid near-10002 to avoid racing condition
-            start_port = node_port_cursor.get(node_idx, base_port)
+    def get_port(rank: int, consecutive: int = 1) -> int:
+        host = hosts_by_rank[rank]
+        start_port = node_port_cursor.get(host, base_port)
+        returned_host, selected_port = ray.get(
+            engines_by_rank[rank]._get_current_node_ip_and_free_port.remote(
+                start_port=start_port,
+                consecutive=consecutive,
+            )
+        )
+        if returned_host != host:
+            raise RuntimeError(f"Rollout engine {rank} moved nodes during port allocation: {host} -> {returned_host}")
+        node_port_cursor[host] = selected_port + consecutive
+        return selected_port
 
-            def port(consecutive=1):
-                nonlocal start_port
-                _, port = ray.get(
-                    engine._get_current_node_ip_and_free_port.remote(
-                        start_port=start_port,
-                        consecutive=consecutive,
-                    )
-                )
-                start_port = port + consecutive
-                node_port_cursor[node_idx] = start_port
-                return port
+    ranks = sorted(engines_by_rank)
+    for rank in ranks:
+        addr_and_ports[rank] = {
+            "host": hosts_by_rank[rank],
+            "port": get_port(rank),
+            "nccl_port": get_port(rank),
+        }
+        if worker_type == "prefill":
+            addr_and_ports[rank]["disaggregation_bootstrap_port"] = get_port(rank)
 
-            def addr():
-                addr, _ = ray.get(engine._get_current_node_ip_and_free_port.remote())
-                return addr
-
-            return addr, port
-
-        get_addr, get_port = get_addr_and_ports(engine, node_index)
-
-        for i in range(num_engines_on_this_node):
-            current_rank = rank + i
-            addr_and_ports.setdefault(current_rank, {})
-            addr_and_ports[current_rank]["host"] = get_addr()
-            addr_and_ports[current_rank]["port"] = get_port()
-            addr_and_ports[current_rank]["nccl_port"] = get_port()
-
-            if worker_type == "prefill":
-                addr_and_ports[current_rank]["disaggregation_bootstrap_port"] = get_port()
-
-        if _gpus_per_engine > args.num_gpus_per_node:
-            num_node_per_engine = _gpus_per_engine // args.num_gpus_per_node
-            if local_rank % num_node_per_engine == 0:
-                # this is the first node in the engine, we need to allocate the dist_init_addr port
-                dist_init_addr = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-                for i in range(num_node_per_engine):
-                    addr_and_ports.setdefault(rank + i, {})
-                    addr_and_ports[rank + i]["dist_init_addr"] = dist_init_addr
-        else:
-            for i in range(num_engines_on_this_node):
-                addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
+    if _gpus_per_engine > args.num_gpus_per_node:
+        num_nodes_per_engine = _gpus_per_engine // args.num_gpus_per_node
+        if len(ranks) % num_nodes_per_engine != 0:
+            raise ValueError(
+                f"Rollout engine ranks ({len(ranks)}) are not divisible by nodes per engine "
+                f"({num_nodes_per_engine})."
+            )
+        for group_start in range(0, len(ranks), num_nodes_per_engine):
+            group_ranks = ranks[group_start : group_start + num_nodes_per_engine]
+            root_rank = group_ranks[0]
+            dist_init_addr = f"{hosts_by_rank[root_rank]}:{get_port(root_rank, 30 + args.sglang_dp_size)}"
+            for rank in group_ranks:
+                addr_and_ports[rank]["dist_init_addr"] = dist_init_addr
+    else:
+        for rank in ranks:
+            addr_and_ports[rank][
+                "dist_init_addr"
+            ] = f"{hosts_by_rank[rank]}:{get_port(rank, 30 + args.sglang_dp_size)}"
 
     for i, _ in rollout_engines:
         for key in ["port", "nccl_port", "dist_init_addr"]:
@@ -1451,7 +1444,7 @@ def start_rollout_servers(args, pg) -> dict[str, RolloutServer]:
             args.sglang_router_port = router_port
 
         server_groups: list[ServerGroup] = []
-        port_cursors: dict[int, int] = {}
+        port_cursors: dict[str, int] = {}
 
         has_epd = model_cfg.has_encoder_disaggregation
 

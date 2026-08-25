@@ -3,6 +3,11 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+
+NUM_GPUS = 0
+
 
 def test_train_actor_uses_full_gpu_when_not_colocated():
     from slime.ray.placement_group import _num_gpus_per_train_actor
@@ -57,6 +62,161 @@ def test_role_placement_resources_create_separate_actor_and_rollout_pgs(monkeypa
     assert pgs["actor"][0] == "actor_pg"
     assert pgs["rollout"][0] == "rollout_pg"
     assert pgs["critic"] is None
+
+
+def test_rollout_port_allocation_uses_each_engine_actual_host(monkeypatch):
+    """Two TP4 engines spread across 8-GPU nodes must not share rank-derived host data."""
+
+    from slime.ray import rollout as rollout_module
+
+    class RemoteNodeProbe:
+        def __init__(self, host):
+            self.host = host
+            self.calls = []
+
+        def remote(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.host, kwargs.get("start_port", 19999)
+
+    class Engine:
+        def __init__(self, host):
+            self._get_current_node_ip_and_free_port = RemoteNodeProbe(host)
+
+    engines = [(0, Engine("10.0.0.70")), (1, Engine("10.0.0.69"))]
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=4,
+        num_gpus_per_node=8,
+        sglang_dp_size=1,
+    )
+    monkeypatch.setattr(rollout_module.ray, "get", lambda value: value)
+
+    allocated, cursors = rollout_module._allocate_rollout_engine_addr_and_ports_normal(
+        args=args,
+        rollout_engines=engines,
+        num_gpus_per_engine=4,
+    )
+
+    assert allocated == {
+        0: {
+            "host": "10.0.0.70",
+            "port": 15000,
+            "nccl_port": 15001,
+            "dist_init_addr": "10.0.0.70:15002",
+        },
+        1: {
+            "host": "10.0.0.69",
+            "port": 15000,
+            "nccl_port": 15001,
+            "dist_init_addr": "10.0.0.69:15002",
+        },
+    }
+    assert cursors == {"10.0.0.70": 15033, "10.0.0.69": 15033}
+
+
+def test_rollout_port_allocation_keeps_same_host_engines_disjoint(monkeypatch):
+    from slime.ray import rollout as rollout_module
+
+    class RemoteNodeProbe:
+        def __init__(self, host):
+            self.host = host
+
+        def remote(self, **kwargs):
+            return self.host, kwargs.get("start_port", 19999)
+
+    class Engine:
+        def __init__(self, host):
+            self._get_current_node_ip_and_free_port = RemoteNodeProbe(host)
+
+    engines = [(0, Engine("10.0.0.70")), (1, Engine("10.0.0.70"))]
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=4,
+        num_gpus_per_node=8,
+        sglang_dp_size=1,
+    )
+    monkeypatch.setattr(rollout_module.ray, "get", lambda value: value)
+
+    allocated, cursors = rollout_module._allocate_rollout_engine_addr_and_ports_normal(
+        args=args,
+        rollout_engines=engines,
+        num_gpus_per_engine=4,
+    )
+
+    assert allocated[0] == {
+        "host": "10.0.0.70",
+        "port": 15000,
+        "nccl_port": 15001,
+        "dist_init_addr": "10.0.0.70:15004",
+    }
+    assert allocated[1] == {
+        "host": "10.0.0.70",
+        "port": 15002,
+        "nccl_port": 15003,
+        "dist_init_addr": "10.0.0.70:15035",
+    }
+    assert cursors == {"10.0.0.70": 15066}
+
+
+def test_rollout_port_allocation_shares_root_dist_init_for_multinode_engine(monkeypatch):
+    from slime.ray import rollout as rollout_module
+
+    class RemoteNodeProbe:
+        def __init__(self, host):
+            self.host = host
+
+        def remote(self, **kwargs):
+            return self.host, kwargs.get("start_port", 19999)
+
+    class Engine:
+        def __init__(self, host):
+            self._get_current_node_ip_and_free_port = RemoteNodeProbe(host)
+
+    engines = [(0, Engine("10.0.0.70")), (1, Engine("10.0.0.69"))]
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=16,
+        num_gpus_per_node=8,
+        sglang_dp_size=1,
+    )
+    monkeypatch.setattr(rollout_module.ray, "get", lambda value: value)
+
+    allocated, cursors = rollout_module._allocate_rollout_engine_addr_and_ports_normal(
+        args=args,
+        rollout_engines=engines,
+        num_gpus_per_engine=16,
+    )
+
+    assert allocated[0]["dist_init_addr"] == "10.0.0.70:15002"
+    assert allocated[1]["dist_init_addr"] == "10.0.0.70:15002"
+    assert allocated[0]["host"] == "10.0.0.70"
+    assert allocated[1]["host"] == "10.0.0.69"
+    assert cursors == {"10.0.0.70": 15033, "10.0.0.69": 15002}
+
+
+def test_rollout_port_allocation_fails_if_actor_moves_hosts(monkeypatch):
+    from slime.ray import rollout as rollout_module
+
+    class MovingRemoteNodeProbe:
+        def __init__(self):
+            self.calls = 0
+
+        def remote(self, **kwargs):
+            self.calls += 1
+            host = "10.0.0.70" if self.calls == 1 else "10.0.0.69"
+            return host, kwargs.get("start_port", 19999)
+
+    engine = SimpleNamespace(_get_current_node_ip_and_free_port=MovingRemoteNodeProbe())
+    args = SimpleNamespace(
+        rollout_num_gpus_per_engine=4,
+        num_gpus_per_node=8,
+        sglang_dp_size=1,
+    )
+    monkeypatch.setattr(rollout_module.ray, "get", lambda value: value)
+
+    with pytest.raises(RuntimeError, match="moved nodes during port allocation"):
+        rollout_module._allocate_rollout_engine_addr_and_ports_normal(
+            args=args,
+            rollout_engines=[(0, engine)],
+            num_gpus_per_engine=4,
+        )
 
 
 def test_rollout_actor_disables_sglang_tp_memory_imbalance_guard():
@@ -194,3 +354,7 @@ def test_sglang_engine_registers_router_with_timeout(monkeypatch):
             },
         )
     ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
