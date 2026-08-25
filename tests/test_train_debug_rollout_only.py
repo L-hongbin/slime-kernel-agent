@@ -1,4 +1,10 @@
+import importlib
 from argparse import Namespace
+
+import pytest
+
+
+NUM_GPUS = 0
 
 
 class _RemoteMethod:
@@ -47,6 +53,7 @@ class _FakeActorModel:
 
 def _args(**overrides):
     values = dict(
+        colocate=False,
         debug_rollout_only=True,
         debug_train_only=False,
         num_rollout=2,
@@ -58,8 +65,9 @@ def _args(**overrides):
     return Namespace(**values)
 
 
-def test_debug_rollout_only_skips_training_model_allocation(monkeypatch):
-    import train as train_module
+@pytest.mark.parametrize("driver_module_name", ["train", "train_async"])
+def test_debug_rollout_only_skips_training_model_allocation(monkeypatch, driver_module_name):
+    train_module = importlib.import_module(driver_module_name)
 
     manager = _FakeRolloutManager()
 
@@ -85,8 +93,9 @@ def test_debug_rollout_only_skips_training_model_allocation(monkeypatch):
     ]
 
 
-def test_debug_rollout_only_preserves_eval_cadence(monkeypatch):
-    import train as train_module
+@pytest.mark.parametrize("driver_module_name", ["train", "train_async"])
+def test_debug_rollout_only_preserves_eval_cadence(monkeypatch, driver_module_name):
+    train_module = importlib.import_module(driver_module_name)
 
     manager = _FakeRolloutManager()
 
@@ -161,3 +170,7 @@ def test_debug_train_only_skips_rollout_metrics_router(monkeypatch):
         ("clear_memory", None),
         ("update_weights", None),
     ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

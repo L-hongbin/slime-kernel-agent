@@ -25,6 +25,25 @@ def train(args):
         router_addr = ray.get(rollout_manager.get_metrics_router_addr.remote())
         update_tracking_open_metrics(args, router_addr)
 
+    if args.debug_rollout_only:
+        # Match the synchronous driver contract: rollout-only debugging owns
+        # no actor placement bundles and must return before Megatron allocation.
+        if args.num_rollout == 0 and args.eval_interval is not None:
+            ray.get(rollout_manager.eval.remote(rollout_id=0))
+
+        for rollout_id in range(args.start_rollout_id, args.num_rollout):
+            if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+                ray.get(rollout_manager.eval.remote(rollout_id))
+
+            ray.get(rollout_manager.generate.remote(rollout_id))
+
+            if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
+                ray.get(rollout_manager.eval.remote(rollout_id))
+
+        ray.get(rollout_manager.dispose.remote())
+        finish_tracking(args)
+        return
+
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
     checkpoint_finalizer = AsyncCheckpointFinalizer(
