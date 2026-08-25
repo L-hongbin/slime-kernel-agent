@@ -1,9 +1,22 @@
 import asyncio
 import logging
 import os
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+NUM_GPUS = 0
+
+# tests/conftest.py adds Megatron-LM to sys.path; that checkout also owns an
+# ``examples`` package. Keep this repository first so the kernel-agent tests do
+# not accidentally import Megatron-LM's unrelated package.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+repo_root_path = str(REPO_ROOT)
+if repo_root_path in sys.path:
+    sys.path.remove(repo_root_path)
+sys.path.insert(0, repo_root_path)
 
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent import utils as kernel_agent_utils
@@ -621,6 +634,46 @@ def test_multiturn_log_can_omit_full_prompt_and_response(monkeypatch, caplog):
 
 
 @pytest.mark.unit
+def test_rollout_stats_only_omits_slowest_sample_body(monkeypatch, caplog):
+    sentinel = "very-long-response-body-must-not-be-logged"
+    sample = Sample(prompt="long prompt", metadata={"uuid": "slowest-stats-only"})
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
+
+    caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
+    generate_with_cuda_agent._log_rollout_info(
+        sample,
+        messages=[
+            {"role": "user", "content": sample.prompt},
+            {"role": "assistant", "content": sentinel},
+        ],
+        turn_logs=[
+            {
+                "turn_idx": 0,
+                "task_id": "slowest-task",
+                "model_time": 12.5,
+                "env_time": 3.5,
+                "prompt_tokens": 128,
+                "response_tokens": 16384,
+                "finish_type": "length",
+                "prompt": sample.prompt,
+                "response": sentinel,
+                "env_result": {"env_state": {"status": "completed"}},
+                "format_feedback": sentinel,
+            }
+        ],
+        finish_reason="max_turns",
+        is_slowest=True,
+        total_request_time=16.0,
+    )
+
+    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
+    assert "response_tokens=16384" in caplog.text
+    assert sentinel not in caplog.text
+    assert "response_content" not in caplog.text
+    assert "messages:" not in caplog.text
+
+
+@pytest.mark.unit
 def test_cuda_agent_sampling_params_reserve_context_for_eagle():
     args = SimpleNamespace(
         rollout_max_context_len=16384,
@@ -907,3 +960,7 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
     assert metrics["kernel/time/detail_env_time/profile_time/sum"] == pytest.approx(400.0)
     assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)
     assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

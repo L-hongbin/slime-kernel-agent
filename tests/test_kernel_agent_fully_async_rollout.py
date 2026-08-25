@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 import sys
 import threading
@@ -161,19 +162,20 @@ def test_kernel_agent_worker_does_not_exceed_group_concurrency(monkeypatch):
     assert max_in_flight <= 2
 
 
-def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch):
+def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch, caplog):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker
     )
     worker.output_queue = queue.Queue()
     for gid in range(5):
-        sample = Sample(index=gid, group_index=gid, prompt=f"prompt-{gid}")
+        sample = Sample(index=gid, group_index=gid, prompt=f"secret-prompt-{gid}")
         sample.status = Sample.Status.COMPLETED
         sample.reward = float(gid)
-        sample.response = f"response-{gid}"
+        sample.response = f"secret-response-{gid}"
         worker.output_queue.put((gid, [sample]))
 
     monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    monkeypatch.setitem(fully_async_rollout.CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
     args = Namespace(
         rollout_global_dataset=True,
         rollout_batch_size=2,
@@ -181,11 +183,46 @@ def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch
         use_multi_turn=False,
     )
 
+    caplog.set_level(logging.INFO, logger=fully_async_rollout.logger.name)
     output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=7, data_buffer=None))
 
     assert [group[0].index for group in output.samples] == [0, 1]
     assert worker.queue_size() == 3
     assert [gid for gid, _ in worker.get_completed_groups()] == [2, 3, 4]
+    assert "kernel-agent fully-async rollout 7: done" in caplog.text
+    assert "accepted_groups=2" in caplog.text
+    assert "secret-prompt" not in caplog.text
+    assert "secret-response" not in caplog.text
+
+
+def test_kernel_agent_rollout_logs_sample_bodies_when_stats_only_is_disabled(monkeypatch, caplog):
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    for gid in range(2):
+        sample = Sample(index=gid, group_index=gid, prompt=f"visible-prompt-{gid}")
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = float(gid)
+        sample.response = f"visible-response-{gid}"
+        worker.output_queue.put((gid, [sample]))
+
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    monkeypatch.setitem(fully_async_rollout.CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
+    args = Namespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=2,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+    )
+
+    caplog.set_level(logging.INFO, logger=fully_async_rollout.logger.name)
+    asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=8, data_buffer=None))
+
+    assert "First kernel-agent fully-async rollout sample" in caplog.text
+    assert "visible-prompt-0visible-response-0" in caplog.text
+    assert "kernel-agent fully-async rollout 8: done" in caplog.text
+    assert "visible-prompt-1visible-response-1" in caplog.text
 
 
 def test_kernel_agent_completed_group_drain_honors_limit():

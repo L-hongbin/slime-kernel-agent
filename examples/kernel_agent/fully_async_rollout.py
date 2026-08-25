@@ -17,6 +17,7 @@ from collections import Counter
 from collections.abc import Iterable
 from typing import Any
 
+from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
@@ -312,7 +313,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     started = time.time()
     last_log = started
     log_every = 30.0
-    do_print = True
+    log_sample_bodies = not bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", False))
+    do_print = log_sample_bodies
     drop_reason_counts: Counter[str] = Counter()
 
     def _record_dynamic_filter_drop(reason: str | None, count: int = 1) -> None:
@@ -377,16 +379,25 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     data = [
         group for _gid, groups in sorted(collected.items(), key=lambda item: _sort_key(item[1])) for group in groups
     ]
-    sample = data[-1][0]
-    logger.info(
-        "kernel-agent fully-async rollout %d: done in %.1fs, queue_left=%d, %s, label: %s, reward: %s",
-        rollout_id,
-        collect_time,
-        worker.queue_size(),
-        [str(sample.prompt) + sample.response],
-        str(sample.label)[:100],
-        sample.reward,
-    )
+    if log_sample_bodies:
+        sample = data[-1][0]
+        logger.info(
+            "kernel-agent fully-async rollout %d: done in %.1fs, queue_left=%d, %s, label: %s, reward: %s",
+            rollout_id,
+            collect_time,
+            worker.queue_size(),
+            [str(sample.prompt) + sample.response],
+            str(sample.label)[:100],
+            sample.reward,
+        )
+    else:
+        logger.info(
+            "kernel-agent fully-async rollout %d: done in %.1fs, queue_left=%d, accepted_groups=%d",
+            rollout_id,
+            collect_time,
+            worker.queue_size(),
+            len(data),
+        )
     metrics = metric_gatherer.collect()
     metrics["fully_async_collect_time"] = collect_time
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
