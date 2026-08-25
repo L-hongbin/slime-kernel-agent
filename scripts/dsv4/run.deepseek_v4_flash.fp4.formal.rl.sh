@@ -207,7 +207,7 @@ native_minimum_iteration=0
 # This lineage contains the native iter724 model/optimizer/RNG checkpoint and
 # the exact iter724 cursor for the original prompt dataset. The scratch path
 # retains its historical identifier because it names an existing checkpoint.
-readonly DSV4_FORMAL_SCRATCH=/nfs/FM/csl_v4r21_fp4_pp1cp2_14k_step724_originaldata_20260731
+readonly DSV4_FORMAL_SCRATCH=/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/csl_v4r21_fp4_pp1cp2_14k_step724_originaldata_20260731
 readonly DSV4_FORMAL_PROMPT_DATA=/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/Data/prompt_tvm_v3/drkernel_rl_thinking.parquet
 readonly DSV4_FORMAL_PROMPT_SHA256=9e9ffca46022e74c0616f5e272871e76dfd000b6e7937b01685cd0bb11d521e5
 readonly DSV4_FORMAL_PROMPT_ROWS=40307

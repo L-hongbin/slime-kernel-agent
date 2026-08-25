@@ -264,7 +264,7 @@ if [[ ! "${RUN_TAG}" =~ ^[A-Za-z0-9._-]+$ ]]; then
   exit 2
 fi
 RUN_ID=entropy_ab_${ARM}_${HEAD_PHYSICAL}_${RUN_TAG}
-SCRATCH=/nfs/FM/csl_v4_entropy_ab_${ARM}_${HEAD_PHYSICAL}_${RUN_TAG}
+SCRATCH=/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/csl_v4_entropy_ab_${ARM}_${HEAD_PHYSICAL}_${RUN_TAG}
 LOG=/tmp/${RUN_ID}.out
 HF_CKPT=/nfs/FM/chenshuailin/checkpoints/deepseek-ai/DeepSeek-V4-Flash
 LOAD=/nfs/FM/chenshuailin/checkpoints/deepseek-ai/DeepSeek-V4-Flash-FP4-r21-pp1-ep8-torch_dist

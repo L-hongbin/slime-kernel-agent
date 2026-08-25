@@ -9,7 +9,7 @@ set -euo pipefail
 REPO=${REPO:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora}
 HF_CKPT=${HF_CKPT:-/nfs/FM/chenshuailin/checkpoints/sgl-project/DeepSeek-V4-Flash-FP8}
 PROMPT_DATA=${PROMPT_DATA:-${REPO}/Data/dsv4_rollout_smoke.jsonl}
-SCRATCH=${SCRATCH:-/nfs/FM/csl_v4r4_rollout_smoke_node62}
+SCRATCH=${SCRATCH:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/csl_v4r4_rollout_smoke_node62}
 DEBUG_DIR=${DEBUG_DIR:-${SCRATCH}/debug}
 RUN_ID=${RUN_ID:-$(date +%Y%m%d_%H%M%S)}
 LOG=${LOG:-${REPO}/local_artifacts/deepseek-v4/r2_logs/r4_node62_rollout_smoke_${RUN_ID}.log}

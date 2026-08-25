@@ -67,8 +67,8 @@ case "${PROFILE}" in
     CONTAINER_DISK_ROOT=/nfs/FM
     HOST_REPO="${DISK_ROOT}/chenshuailin/projects/kernel_agents/slime-v4flash-lora-eval-20260729"
     CONTAINER_REPO="${CONTAINER_DISK_ROOT}/chenshuailin/projects/kernel_agents/slime-v4flash-lora-eval-20260729"
-    HOST_RUN_ROOT="${DISK_ROOT}/${RUN_NAME}"
-    CONTAINER_RUN_ROOT="${CONTAINER_DISK_ROOT}/${RUN_NAME}"
+    HOST_RUN_ROOT="${DISK_ROOT}/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/${RUN_NAME}"
+    CONTAINER_RUN_ROOT="${CONTAINER_DISK_ROOT}/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/${RUN_NAME}"
     HOST_EVAL_ROOT="${HOST_RUN_ROOT}/h20_eval_20260729"
     CONTAINER_EVAL_ROOT="${CONTAINER_RUN_ROOT}/h20_eval_20260729"
     HOST_ADAPTER_ROOT="${HOST_RUN_ROOT}/eval_adapters"

@@ -9,7 +9,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/eval.deepseek-v4-flash.sh"
 
-ADAPTER_ROOT="${ADAPTER_ROOT:-/nfs/FM/csl_v4r21_fp4_pp1cp2_12k_dppo_predictive_resume40_20260722/eval_adapters}"
+ADAPTER_ROOT="${ADAPTER_ROOT:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/csl_v4r21_fp4_pp1cp2_12k_dppo_predictive_resume40_20260722/eval_adapters}"
 EXP_ROOT="${EXP_ROOT:-${REPO_ROOT}/experiments/Eval.KernelBenchL1.DeepSeekV4FlashLoRA.12k.turn1.n8}"
 RAY_WORKER_HOST="${RAY_WORKER_HOST-node53_dspark}"
 RAY_WORKER_IP="${RAY_WORKER_IP-10.11.2.153}"
