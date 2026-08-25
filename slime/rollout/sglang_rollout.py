@@ -106,7 +106,10 @@ def _extract_predictive_support(
     SGLang returns ``output_top_logprobs`` independently from the sampled-token
     logprob and does not promise that the sample is in top-k.  We therefore use
     the top-k order as the first K slots, overwrite its entry with the sampled
-    logprob when present, or append the sampled token in slot K otherwise.
+    logprob when present, or append the sampled token in slot K otherwise.  At
+    non-unit temperature these values must already be log-probabilities from
+    SGLang's temperature-scaled sampling distribution; do not re-temperature a
+    sparse Top-K result because its missing tail prevents exact normalization.
     """
     if top_k <= 0:
         raise ValueError(f"top_k must be positive, got {top_k}")

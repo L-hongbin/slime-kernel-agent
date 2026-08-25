@@ -1,5 +1,6 @@
 """Launch-time distribution-consistency guards for predictive Top-K DPPO."""
 
+import logging
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -42,7 +43,6 @@ def test_paper_configuration_is_accepted():
         ({"use_rollout_logprobs": False}, "use-rollout-logprobs"),
         ({"use_tis": True}, "incompatible"),
         ({"eps_clip_high": 0.2}, "same positive value"),
-        ({"rollout_temperature": 0.8}, "temperature 1"),
         ({"rollout_top_p": 0.95}, "top-p 1"),
         ({"rollout_top_k": 50}, "top-k -1"),
         ({"allgather_cp": True}, "allgather-cp"),
@@ -51,6 +51,14 @@ def test_paper_configuration_is_accepted():
 def test_mismatched_distributions_fail_loud(override, message):
     with pytest.raises(ValueError, match=message):
         _validate_dppo_predictive_args(_args(**override))
+
+
+def test_non_unit_temperature_warns_but_is_accepted(caplog):
+    with caplog.at_level(logging.WARNING, logger="slime.utils.arguments"):
+        _validate_dppo_predictive_args(_args(rollout_temperature=1.4))
+
+    assert "--rollout-temperature=1.4 instead of 1" in caplog.text
+    assert "same temperature-scaled distribution" in caplog.text
 
 
 def test_non_predictive_modes_remain_unconstrained():

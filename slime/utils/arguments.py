@@ -69,9 +69,11 @@ def _validate_dppo_predictive_args(args) -> None:
             "--eps-clip and --eps-clip-high to the same positive value."
         )
     if getattr(args, "rollout_temperature", 1.0) != 1.0:
-        raise ValueError(
-            "dppo_topk_kl_predictive currently requires --rollout-temperature 1: SGLang's "
-            "returned Top-K log-probs are not temperature-scaled in the pinned runtime."
+        logger.warning(
+            "dppo_topk_kl_predictive is running with --rollout-temperature=%s instead of 1. "
+            "The rollout sampled-token/Top-K log-probs and train-side current-policy "
+            "probabilities must all come from the same temperature-scaled distribution.",
+            args.rollout_temperature,
         )
     if getattr(args, "rollout_top_p", 1.0) != 1.0 or getattr(args, "rollout_top_k", -1) != -1:
         raise ValueError(

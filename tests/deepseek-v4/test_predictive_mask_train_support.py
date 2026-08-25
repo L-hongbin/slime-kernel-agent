@@ -84,12 +84,13 @@ def test_cp2_bshd_support_embedding_round_trips_local_order(monkeypatch, cp_rank
         cp_utils.set_cp_partition_mode(old_mode)
 
 
-def test_current_support_log_probs_use_response_predictor_rows(monkeypatch):
+@pytest.mark.parametrize("temperature", [1.0, 1.4])
+def test_current_support_log_probs_use_response_predictor_rows(monkeypatch, temperature):
     _patch_parallel(monkeypatch)
     args = Namespace(
         qkv_format="thd",
         allgather_cp=False,
-        rollout_temperature=1.0,
+        rollout_temperature=temperature,
         log_probs_chunk_size=2,
         vocab_size=5,
     )
@@ -115,7 +116,7 @@ def test_current_support_log_probs_use_response_predictor_rows(monkeypatch):
         response_lengths=[2],
         max_seq_lens=None,
     )[0]
-    expected = torch.log_softmax(logits[0, 1:3], dim=-1).gather(1, ids)
+    expected = torch.log_softmax(logits[0, 1:3] / temperature, dim=-1).gather(1, ids)
     torch.testing.assert_close(actual, expected)
 
 
