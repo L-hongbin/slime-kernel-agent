@@ -14,6 +14,10 @@ cpu_window=1
 check_kernelgym_health=1
 kernelgym_url="${KERNELGYM_URL:-http://127.0.0.1:20211}"
 kernelgym_health_script=""
+kernelgym_health_attempts="${KERNELGYM_HEALTH_ATTEMPTS:-3}"
+kernelgym_health_interval="${KERNELGYM_HEALTH_INTERVAL:-2}"
+kernelgym_health_backoff="${KERNELGYM_HEALTH_BACKOFF:-1}"
+kernelgym_health_max_interval="${KERNELGYM_HEALTH_MAX_INTERVAL:-60}"
 python_bin="${PYTHON_BIN:-python3}"
 
 usage() {
@@ -29,6 +33,10 @@ Options:
   --cpu-window SECONDS         Sampling window for CPU idle percent.
   --kernelgym-url URL          KernelGym base URL for /health preflight.
   --kernelgym-health-script P  Path to scripts/check_kernelgym_health.py.
+  --kernelgym-health-attempts N  Number of KernelGym attempts; 0 retries forever.
+  --kernelgym-health-interval S  Initial seconds between attempts.
+  --kernelgym-health-backoff F   Retry interval multiplier (>=1).
+  --kernelgym-health-max-interval S  Maximum seconds between attempts.
   --python-bin PATH            Python interpreter used for KernelGym health.
   --skip-cpu-health            Only check CPU count, not current load/idle.
   --skip-gpu-occupancy         Check GPU count, but allow existing GPU processes.
@@ -68,6 +76,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --kernelgym-health-script)
             kernelgym_health_script="$2"
+            shift 2
+            ;;
+        --kernelgym-health-attempts)
+            kernelgym_health_attempts="$2"
+            shift 2
+            ;;
+        --kernelgym-health-interval)
+            kernelgym_health_interval="$2"
+            shift 2
+            ;;
+        --kernelgym-health-backoff)
+            kernelgym_health_backoff="$2"
+            shift 2
+            ;;
+        --kernelgym-health-max-interval)
+            kernelgym_health_max_interval="$2"
             shift 2
             ;;
         --python-bin)
@@ -230,15 +254,25 @@ check_kernelgym() {
     fi
 
     echo "resource-check: ${label}: checking KernelGym health at ${kernelgym_url}"
-    if ! "${python_bin}" "${health_script}" --url "${kernelgym_url}"; then
+    if ! "${python_bin}" "${health_script}" \
+        --url "${kernelgym_url}" \
+        --attempts "${kernelgym_health_attempts}" \
+        --interval "${kernelgym_health_interval}" \
+        --backoff-factor "${kernelgym_health_backoff}" \
+        --max-interval "${kernelgym_health_max_interval}"; then
         fail "${label}: KernelGym health check failed"
     fi
 }
 
 echo "resource-check: checking ${label}"
-check_kernelgym
 check_cpu
 check_gpu
+
+if [[ "${status}" -ne 0 ]]; then
+    exit "${status}"
+fi
+
+check_kernelgym
 
 if [[ "${status}" -ne 0 ]]; then
     exit "${status}"
