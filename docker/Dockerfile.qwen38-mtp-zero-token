@@ -6,4 +6,14 @@ RUN python3 /tmp/patch_megatron_mtp_zero_token.py \
     && python3 /tmp/patch_megatron_mtp_zero_token.py --check \
     && rm /tmp/patch_megatron_mtp_zero_token.py
 
+# Audited FLA 0.4.1/0.4.2 Qwen helper layouts specialize and autotune on an
+# unused NB token-count bucket. Dynamic THD training then recompiles identical
+# gated RMSNorm and short-convolution kernels for nearly every microbatch
+# length.
+COPY scripts/patch_fla_varlen_autotune_nb.py /tmp/patch_fla_varlen_autotune_nb.py
+RUN python3 /tmp/patch_fla_varlen_autotune_nb.py \
+    && python3 /tmp/patch_fla_varlen_autotune_nb.py --check \
+    && rm /tmp/patch_fla_varlen_autotune_nb.py
+
 LABEL org.opencontainers.image.megatron.patch.mtp-zero-token="clamp-denominator-v1"
+LABEL org.opencontainers.image.fla.patch.varlen-autotune-nb="remove-unused-specialization-v1"
