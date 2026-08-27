@@ -732,6 +732,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
+            # Extra kwargs forwarded to AutoTokenizer.from_pretrained when loading the rollout
+            # tokenizer, e.g. '{"fix_mistral_regex": true}' for Mistral-lineage tokenizers
+            # (stepfun Step-3.x) that otherwise drop whitespace under transformers v5.
+            parser.add_argument("--tokenizer-load-kwargs", type=json.loads, default="{}")
             parser.add_argument("--input-key", type=str, default="input", help="JSON dataset key")
             parser.add_argument("--label-key", type=str, default=None, help="JSON dataset key")
             parser.add_argument(
@@ -1359,6 +1363,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--wandb-centralized",
+                action="store_true",
+                default=False,
+                help=(
+                    "Route W&B and TensorBoard logging through a single Ray actor on the driver node. "
+                    "This avoids multiple Ray actors writing to the same W&B run."
+                ),
+            )
+            parser.add_argument(
                 "--log-multi-turn",
                 action="store_true",
                 default=False,
@@ -1572,6 +1585,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action=argparse.BooleanOptionalAction,
                 default=True,
                 help="Whether the kernel agent should run client-side precheck before env execution.",
+            )
+            parser.add_argument(
+                "--use-reference-cache",
+                action="store_true",
+                default=False,
+                help=(
+                    "Ask KernelGym to reuse cached reference timing (KernelGym /evaluate "
+                    "use_reference_cache). The cache key is derived from the reference identity "
+                    "(entry_point + ground_truth hash), so a reference is timed once instead of "
+                    "on every kernel attempt. Only safe for fixed-input references."
+                ),
             )
             parser.add_argument(
                 "--finalize-mode",

@@ -155,7 +155,9 @@ class GenerateState(metaclass=SingletonMeta):
     def __init__(self, args: Namespace) -> None:
         # persistent state for the generation process
         self.args = args
-        self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
+        self.tokenizer = load_tokenizer(
+            args.hf_checkpoint, trust_remote_code=True, **getattr(args, "tokenizer_load_kwargs", {})
+        )
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
         self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
         logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)

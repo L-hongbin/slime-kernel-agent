@@ -439,7 +439,9 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     env_state = env_result["env_state"]
     format_feedback = _format_feedback_for_test(env_result)
     print(f"\n[cuda_agent][test][format_feedback][{case['uuid']}]\n{format_feedback}")
-    assert captured_payload["uuid"] == case["uuid"]
+    # uuid is the reference-cache key: a hash of (entry_point, ground_truth),
+    # not the dataset's metadata uuid.
+    assert captured_payload["uuid"] == generate_with_cuda_agent._reference_cache_uuid("class Model: pass", "Model")
     assert captured_payload["reference_code"] == "class Model: pass"
     assert captured_payload["kernel_code"] == extract_cuda_agent_kernel_code(VALID_CUDA_AGENT_RESPONSE)
     assert captured_payload["backend"] == "cuda"
@@ -532,6 +534,8 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     assert "perf_cv=" in caplog.text
     assert "kernel_perf_cv" in caplog.text
     assert "refer_perf_cv" in caplog.text
+    expected_reward = 1.2456 if case["feedback_compiled"] else 0.0
+    assert f"reward={expected_reward}" in caplog.text
     assert case["uuid"] in caplog.text
     assert "format_feedback" in caplog.text
     assert format_feedback in caplog.text
@@ -545,11 +549,108 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
 
 
 @pytest.mark.unit
+def test_cuda_kernel_env_defaults_missing_entry_point_to_model(monkeypatch):
+    captured_payload = {}
+
+    async def fake_run_kernel_eval(args, sample, payload, config):
+        captured_payload.update(payload)
+        return {
+            "env_state": {
+                "compiled": True,
+                "correctness": True,
+                "speedup": 1.0,
+                "metadata": {},
+            }
+        }
+
+    monkeypatch.setattr(generate_with_cuda_agent, "run_kernel_eval", fake_run_kernel_eval)
+
+    sample = Sample(
+        prompt="Write a CUDA implementation.",
+        label={"ground_truth": "class Model: pass"},
+        metadata={"problem_id": 1},
+    )
+
+    asyncio.run(
+        generate_with_cuda_agent.cuda_kernel_env(
+            SimpleNamespace(kernel_backend="cuda", reference_backend="torch"),
+            sample,
+            VALID_CUDA_AGENT_RESPONSE,
+            turn_idx=0,
+        )
+    )
+
+    assert captured_payload["entry_point"] == "Model"
+    assert captured_payload["uuid"] == generate_with_cuda_agent._reference_cache_uuid("class Model: pass", "Model")
+
+
+@pytest.mark.unit
 def test_split_think_response_handles_generation_prompt_prefilled_think():
     response = "reasoning from model\n</think>\n### CUDA_KERNELS\n```cpp\ncode\n```"
     response_think, response_content = split_think_response(response)
     assert response_think == "reasoning from model"
     assert response_content.startswith("### CUDA_KERNELS")
+
+
+@pytest.mark.unit
+def test_multiturn_log_can_omit_full_prompt_and_response(monkeypatch, caplog):
+    monkeypatch.setenv("CUDA_AGENT_LOG_MULTI_TURN_TEXT", "0")
+    sample = Sample(
+        prompt="Write a CUDA implementation.",
+        metadata={"uuid": "log-trim"},
+    )
+
+    caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
+    generate_with_cuda_agent._log_rollout_info(
+        sample,
+        messages=[
+            {"role": "user", "content": sample.prompt},
+            {"role": "assistant", "content": VALID_CUDA_AGENT_RESPONSE},
+        ],
+        turn_logs=[
+            {
+                "turn_idx": 0,
+                "model_time": 0.25,
+                "env_time": 0.75,
+                "prompt_tokens": 16,
+                "response_tokens": 32,
+                "finish_type": "stop",
+                "prompt": sample.prompt,
+                "response": VALID_CUDA_AGENT_RESPONSE,
+                "env_state": {"status": "completed", "compiled": True},
+                "env_result": {"env_state": {"status": "completed", "compiled": True}},
+            }
+        ],
+        finish_reason="max_turns",
+        is_slowest=True,
+        total_request_time=1.0,
+    )
+
+    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
+    assert "sample=log-trim" in caplog.text
+    assert "### CUDA_KERNELS" not in caplog.text
+    assert "response_content" not in caplog.text
+    assert "messages:" not in caplog.text
+
+
+@pytest.mark.unit
+def test_cuda_agent_sampling_params_reserve_context_for_eagle():
+    args = SimpleNamespace(
+        rollout_max_context_len=16384,
+        sglang_speculative_algorithm="EAGLE",
+        sglang_speculative_num_draft_tokens=4,
+    )
+    sampling_params = {"max_new_tokens": 16384, "temperature": 1.0}
+
+    adjusted = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        args,
+        sampling_params,
+        prompt_token_count=10000,
+    )
+
+    assert adjusted["max_new_tokens"] == 6380
+    assert adjusted["temperature"] == 1.0
+    assert sampling_params["max_new_tokens"] == 16384
 
 
 @pytest.mark.integration
@@ -589,7 +690,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
 
     env_result = asyncio.run(
         generate_with_cuda_agent.cuda_kernel_env(
-            SimpleNamespace(),
+            SimpleNamespace(kernel_backend="cuda_agent", do_precheck=False),
             sample,
             case["response"],
             turn_idx=0,

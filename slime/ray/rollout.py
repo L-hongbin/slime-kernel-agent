@@ -1305,6 +1305,9 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
+    if args.wandb_always_use_train_step:
+        log_dict["train/step"] = step
+        log_dict["rollout/step"] = step
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
@@ -1325,6 +1328,8 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     logger.info(f"perf {rollout_id}: {log_dict}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
+    if args.wandb_always_use_train_step:
+        log_dict["train/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
 
 
@@ -1335,7 +1340,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_kernel_agent_metrics(samples)
     if getattr(args, "use_multi_turn", False):
-        log_dict |= _compute_kernel_multi_turn_metrics(samples)
+        log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)
@@ -1403,7 +1408,7 @@ def _compute_response_diversity(args, samples) -> dict[str, float]:
 FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0, 3.0)
 
 
-def _compute_kernel_multi_turn_metrics(samples):
+def _compute_kernel_multi_turn_metrics(args, samples):
     values_by_turn = {}
     sample_trajectory = {}
     for sample in samples:
@@ -1458,19 +1463,28 @@ def _compute_kernel_multi_turn_metrics(samples):
         for threshold, values in turn_values["fast"].items():
             if values:
                 log_dict[f"{prefix}/fast@{threshold:g}"] = np.mean(values).item()
-    log_dict |= _compute_kernel_trajectory_metrics(sample_trajectory)
+    log_dict |= _compute_kernel_trajectory_metrics(args, sample_trajectory)
     return log_dict
 
 
-def _compute_kernel_trajectory_metrics(sample_trajectory):
+def _compute_kernel_trajectory_metrics(args, sample_trajectory):
+    # Cross-turn trajectory metrics (best_by_turn_N, first-vs-last correctness,
+    # improvement counts) only mean something with more than one turn. In single-turn
+    # training every series is degenerate -- first == last, improved == regressed == 0,
+    # and best_by_turn_2/3 just duplicate best_by_turn_1 -- so skip the whole block
+    # instead of polluting W&B with redundant keys.
+    max_turns = int(getattr(args, "max_turns", 1) or 1)
+    if max_turns <= 1:
+        return {}
+
     first_turn_correct = []
     last_turn_correct = []
     improved_samples = 0
     regressed_samples = 0
+    # One best_by_turn_{k} cutoff per configured turn, k = 1..max_turns, so the set of
+    # logged keys tracks the actual turn budget instead of a hardcoded 1/2/3.
     best_by_turn = {
-        1: {"correctness": [], "compilation": [], "speedup": []},
-        2: {"correctness": [], "compilation": [], "speedup": []},
-        3: {"correctness": [], "compilation": [], "speedup": []},
+        turn_count: {"correctness": [], "compilation": [], "speedup": []} for turn_count in range(1, max_turns + 1)
     }
 
     for trajectory in sample_trajectory.values():

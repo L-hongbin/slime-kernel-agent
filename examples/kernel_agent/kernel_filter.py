@@ -222,6 +222,33 @@ def _gather_sequence_mis_chunk(
     return log_ratios, masks, advantage_protected_flags
 
 
+# Per-token |train_log_prob - rollout_log_prob| exceedance buckets. These measure
+# the raw train/rollout logits mismatch magnitude independent of the MIS bounds, so
+# they stay comparable when the bounds or aggregation change (e.g. the fp32-lm_head
+# experiment that aims to shrink this distribution).
+_MISMATCH_EXCEED_THRESHOLDS = (0.02, 0.05)
+
+
+def _accumulate_mismatch_stats(stats: dict[str, float], log_ratios: torch.Tensor, mask: torch.Tensor) -> None:
+    """Accumulate raw per-token log-prob mismatch magnitude over valid tokens.
+
+    ``log_ratios`` is already zeroed outside ``mask`` by every caller, so padded /
+    un-masked positions contribute 0 to the sum and never trip the exceedance
+    counts (all thresholds are > 0). Works for both 1-D (loop) and 2-D padded
+    (batch) tensors.
+    """
+
+    valid_count = float(mask.sum().item())
+    if valid_count == 0:
+        return
+    abs_log_ratios = log_ratios.abs()
+    stats["abs_log_ratio_sum"] += float(abs_log_ratios.sum().item())
+    stats["valid_tokens"] += valid_count
+    stats["abs_log_ratio_max"] = max(stats["abs_log_ratio_max"], float(abs_log_ratios.max().item()))
+    for threshold in _MISMATCH_EXCEED_THRESHOLDS:
+        stats[f"tok_exceed_{threshold}"] += float((abs_log_ratios > threshold).sum().item())
+
+
 def _loop_sequence_mis(
     *,
     aggregation: str | None,
@@ -258,6 +285,7 @@ def _loop_sequence_mis(
                 full_rollout_log_prob=full_rollout_log_prob,
                 loss_mask=loss_masks[i],
             )
+            _accumulate_mismatch_stats(stats, log_ratios, mask)
             valid_token_count = torch.clamp_min(mask.sum(), 1)
             is_token_veto = bool(
                 log_veto_threshold is not None and ((log_ratios < log_veto_threshold) & mask.bool()).any().item()
@@ -394,6 +422,7 @@ def _batch_sequence_mis(
             )
             log_ratios_padded = pad_sequence(log_ratios, batch_first=True, padding_value=0)
             masks_padded = pad_sequence(masks, batch_first=True, padding_value=0)
+            _accumulate_mismatch_stats(stats, log_ratios_padded, masks_padded)
             valid_token_counts = torch.clamp_min(masks_padded.sum(dim=1), 1)
             is_token_veto = torch.zeros(len(log_ratios), dtype=torch.bool, device=masks_padded.device)
             if log_veto_threshold is not None:
@@ -459,7 +488,7 @@ def _batch_sequence_mis(
                 loss_masks[start + offset] = torch.zeros_like(loss_masks[start + offset])
 
 
-def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
+def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[str, float]:
     """Apply sequence-level mask importance sampling before dynamic micro-batching.
 
     This hook is intended for ``--rollout-data-postprocess-path``. It uses the actor
@@ -474,7 +503,7 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
             "on this rank.",
             rollout_id,
         )
-        return
+        return {}
     if "rollout_log_probs" not in rollout_data:
         raise ValueError(
             "sequence_mis requires rollout_data['rollout_log_probs']. "
@@ -561,7 +590,12 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
         "min_ratio": float("inf"),
         "max_ratio": 0.0,
         "advantage_protected": 0.0,
+        "abs_log_ratio_sum": 0.0,
+        "valid_tokens": 0.0,
+        "abs_log_ratio_max": 0.0,
     }
+    for threshold in _MISMATCH_EXCEED_THRESHOLDS:
+        stats[f"tok_exceed_{threshold}"] = 0.0
     mode = getattr(args, "sequence_mis_mode", "batch") or "batch"
     if mode == "loop":
         _loop_sequence_mis(
@@ -606,16 +640,57 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> None:
     rollout_data["seq_mis/reject_rate"] = (rejected, valid_sequences)
     rollout_data["seq_mis/advantage_protected_rate"] = (stats["advantage_protected"], valid_sequences)
     rollout_data["seq_mis/ratio_mean"] = (stats["ratio_sum"], valid_sequences)
+
+    # Post-MIS effective batch: sequences/tokens that still carry a non-zero
+    # loss mask. ``effective_tokens == 0`` is exactly the silent no-op train step
+    # (whole batch rejected -> loss/grad all zero), so surface it explicitly.
+    valid_tokens = stats["valid_tokens"]
+    reject_rate = rejected / max(valid_sequences, 1)
+    effective_sequences = int(valid_sequences - rejected)
+    effective_tokens = sum(float(m.sum().item()) for m in loss_masks)
+    mean_abs_log_ratio = stats["abs_log_ratio_sum"] / max(valid_tokens, 1.0)
+    exceed_fracs = {
+        threshold: stats[f"tok_exceed_{threshold}"] / max(valid_tokens, 1.0)
+        for threshold in _MISMATCH_EXCEED_THRESHOLDS
+    }
+
     logger.info(
         "[kernel_agent][sequence_mis] rollout_id=%s mode=%s rejected=%s/%s reject_rate=%.6f "
-        "advantage_protected=%s ratio_mean=%.6g ratio_min=%.6g ratio_max=%.6g",
+        "advantage_protected=%s ratio_mean=%.6g ratio_min=%.6g ratio_max=%.6g "
+        "effective_sequences=%s effective_tokens=%s valid_tokens=%s "
+        "mismatch_mean_abs_log_ratio=%.6g mismatch_max_abs_log_ratio=%.6g mismatch_exceed_frac=%s",
         rollout_id,
         mode,
         int(stats["rejected"]),
         int(stats["valid_sequences"]),
-        stats["rejected"] / max(stats["valid_sequences"], 1),
+        reject_rate,
         int(stats["advantage_protected"]),
         mean_ratio,
         0.0 if stats["min_ratio"] == float("inf") else stats["min_ratio"],
         stats["max_ratio"],
+        effective_sequences,
+        int(effective_tokens),
+        int(valid_tokens),
+        mean_abs_log_ratio,
+        stats["abs_log_ratio_max"],
+        {f"|lr|>{threshold}": round(frac, 6) for threshold, frac in exceed_fracs.items()},
     )
+
+    # Surface aggregate mismatch/rejection signals to the metric logger so the
+    # fp32-lm_head experiment is comparable across runs. ``log_rollout_data``
+    # treats 0-d tensors as per-(DP rank) scalars (count=1) and gathers them as a
+    # mean across DP ranks, which is the right aggregation for these rates.
+    if loss_masks:
+        metric_device = loss_masks[0].device
+        wandb_metrics = {
+            "mis_reject_rate": reject_rate,
+            "mis_effective_token_frac": effective_tokens / max(valid_tokens, 1.0),
+            "mis_mean_abs_log_ratio": mean_abs_log_ratio,
+            "mis_max_abs_log_ratio": stats["abs_log_ratio_max"],
+        }
+        for threshold, frac in exceed_fracs.items():
+            wandb_metrics[f"mis_tok_frac_abs_log_ratio_gt_{threshold}"] = frac
+        for name, value in wandb_metrics.items():
+            rollout_data[name] = torch.tensor(float(value), device=metric_device)
+
+    return stats

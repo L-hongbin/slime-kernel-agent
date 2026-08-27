@@ -218,7 +218,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-<<<<<<< HEAD
 
 # 所有日志文件
 *.log
@@ -226,5 +225,14 @@ __marimo__/
 # 日志目录
 logs/
 log/
-=======
->>>>>>> 5b065985944d80cc9d4dfad1ce68ca82ab72f8d6
+Data/
+experiments/
+AGENTS.md
+CLAUDE.md
+WRITING.md
+INDEX.md
+RUNTIME.md
+.rayignore
+hostfile
+gpu_mem_trend.png
+*.bundle

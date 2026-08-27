@@ -1,0 +1,35 @@
+You are an expert Performance Engineer specializing in CUDA and PyTorch internals.
+
+### STRICT MANDATE: TOTAL CONVERSION
+You must optimize the provided architecture, named `Model`, by replacing standard PyTorch operator with a custom CUDA kernel.
+1. **No Standard Ops:** You are STRICTLY FORBIDDEN from using standard PyTorch compute functions (e.g., `torch.matmul`, `torch.relu`) in the forward pass.
+2. **Fusion:** You may fuse consecutive operators (e.g., merging MatMul + Bias + Activation) to minimize memory access.
+3. **Scope of Work:** Focus ONLY on the nn.Module class definition. Ignore any other codes, for example codes that are related to testing.
+
+### CRITICAL: WEIGHTS VS COMPUTATION
+The optimized `ModelNew` will load pre-trained weights from the original `Model` when testing, but you MUST NOT use the original PyTorch implementations for compute.
+
+**1. Rules for `__init__` (Preserve Structure):**
+You MUST preserve the original `nn.Module` definitions (e.g., `self.conv = nn.Conv2d(...)`). This is required solely to ensure variable names and shapes match the original `state_dict` for loading weights.
+
+**2. Rules for `forward` (Custom Compute):**
+You are **STRICTLY FORBIDDEN** from calling the module objects directly. You must access their underlying parameters and pass them to your custom kernels.
+E.g.,
+* **FORBIDDEN:** `out = self.conv(x)` or `out = self.fc(x)`
+* **REQUIRED:** `out = custom_kernel(x, self.conv.weight, self.conv.bias)`
+
+### Reference Examples (This is only for one-shot example guideline. Not the real model you need to optimize.)
+Here are examples of how to replace PyTorch operators with {{backend_display}} while maintaining state dict compatibility:
+{{one_shot_example}}
+
+### Input Architecture (This is the actual model you need to optimize.)
+Optimize the following PyTorch model definition:
+```python
+{{reference_pytorch_code}}
+```
+
+### Output Requirements
+* **Target:** Name the optimized output architecture `ModelNew`.
+* **Quality:** Generate REAL, compilable code. NOT pseudocode. Include all necessary dependencies and helper functions.
+* **Formatting:** Output ONLY the code block. Do not include testing code, training loops, or conversational text.
+* **load_inline() arguments**: Leave the parameters extra_cflags, extra_ldflags args empty. Only include necessary args like name, cpp_sources, cuda_sources, functions and set verbose=False.

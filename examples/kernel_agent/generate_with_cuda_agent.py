@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
+import re
 import time
 from copy import deepcopy
 from typing import Any
@@ -51,6 +53,14 @@ KERNEL_AGENT_GENERATE_GUARD_SEC = int(os.environ.get("KERNEL_AGENT_GENERATE_GUAR
 )
 LOG_FIRST_ROLLOUT = bool(int(os.environ.get("CUDA_AGENT_LOG_FIRST_ROLLOUT", "0")))
 _LOGGED_FIRST_ROLLOUT = False
+KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))
+
+
+def _log_multiturn_full_text_enabled() -> bool:
+    value = os.environ.get("CUDA_AGENT_LOG_MULTI_TURN_TEXT")
+    if value is not None:
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(CUDA_AGENT_CONFIGS.get("log_multi_turn_full_text", True))
 
 
 if ray is not None:
@@ -293,6 +303,8 @@ def _log_rollout_info(
         _format_log_value(total_detail_env_time, log_max_chars),
         _format_log_value(mean_perf_cv, log_max_chars),
     )
+    if not _log_multiturn_full_text_enabled():
+        return
 
     for item in turn_logs:
         env_result = item.get("env_result") if isinstance(item.get("env_result"), dict) else {}
@@ -310,7 +322,8 @@ def _log_rollout_info(
             if (value := _as_float_or_none(env_extra_info.get(key))) is not None
         }
         logger.info(
-            "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s response_tokens=%s "
+            "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s "
+            "response_tokens=%s "
             "finish_type=%s status=%s error=%s precheck=%s speedup=%s correctness=%s compiled=%s "
             "reward=%s detail_env_time=%s perf_cv=%s",
             prefix,
@@ -319,6 +332,7 @@ def _log_rollout_info(
             float(item.get("model_time", 0.0)),
             float(item.get("env_time", 0.0)),
             item.get("prompt_tokens"),
+            item.get("max_new_tokens"),
             item.get("response_tokens"),
             item.get("finish_type"),
             env_state.get("status"),
@@ -382,6 +396,29 @@ def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
     return False
 
 
+def _sampling_params_for_prompt_context(
+    args,
+    sampling_params: dict[str, Any],
+    prompt_token_count: int,
+) -> dict[str, Any]:
+    turn_sampling_params = sampling_params.copy()
+    max_context_len = getattr(args, "rollout_max_context_len", None)
+    if max_context_len is None:
+        return turn_sampling_params
+
+    draft_token_reserve = 0
+    if getattr(args, "sglang_speculative_algorithm", None):
+        draft_token_reserve = max(0, int(getattr(args, "sglang_speculative_num_draft_tokens", 0) or 0))
+    remaining_context = int(max_context_len) - int(prompt_token_count) - draft_token_reserve
+    configured_max_new_tokens = turn_sampling_params.get("max_new_tokens")
+    if configured_max_new_tokens is None:
+        max_new_tokens = remaining_context
+    else:
+        max_new_tokens = min(int(configured_max_new_tokens), remaining_context)
+    turn_sampling_params["max_new_tokens"] = max(0, max_new_tokens)
+    return turn_sampling_params
+
+
 def _get_label_value(sample: Sample, key: str) -> Any:
     if isinstance(sample.label, dict):
         value = sample.label.get(key)
@@ -392,11 +429,34 @@ def _get_label_value(sample: Sample, key: str) -> Any:
     return None
 
 
-def _get_entry_point(sample: Sample) -> str:
+def _get_entry_point(sample: Sample) -> Any:
     entry_point = _get_label_value(sample, "entry_point")
     if entry_point is not None:
-        return str(entry_point)
+        return entry_point
     return "Model"
+
+
+def _reference_cache_uuid(ground_truth: Any, entry_point: Any) -> str | None:
+    """Collision-resistant key for KernelGym's reference-timing cache.
+
+    Derived purely from the reference identity (reference code + entry point) and
+    NOT from any dataset-supplied id: same reference -> same key, different
+    reference -> different key (modulo the negligible 64-bit truncation collision),
+    so it cannot false-share a cached baseline across datasets on a shared
+    KernelGym the way a bare per-problem id like "1" would. Returns None when
+    there is no reference to hash, which leaves the cache disabled.
+
+    Safety note: the cached baseline is only valid because KernelBench references
+    use fixed-shape get_inputs(); a dataset with randomized reference inputs must
+    NOT enable use_reference_cache.
+    """
+    if not ground_truth:
+        return None
+    if not isinstance(ground_truth, str):
+        ground_truth = str(ground_truth)
+    # 64 bits (16 hex) — collision-safe for realistic problem counts (~1e3-1e4).
+    digest = hashlib.sha256(f"{entry_point}\n{ground_truth}".encode()).hexdigest()[:16]
+    return f"ref_{digest}"
 
 
 def _kernel_eval_config_value(args, config: dict[str, Any], name: str, default: Any = None) -> Any:
@@ -413,8 +473,6 @@ async def cuda_kernel_env(
     turn_idx: int,
 ) -> dict[str, Any]:
     entry_point = _get_entry_point(sample)
-    if entry_point is None:
-        raise ValueError("CUDA kernel env requires sample.label['entry_point'].")
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
@@ -436,14 +494,16 @@ async def cuda_kernel_env(
         sample.metadata = metadata
 
         env_config = CUDA_AGENT_CONFIGS["env"]
+        reference_code = _get_label_value(sample, "ground_truth")
+        uuid = _reference_cache_uuid(reference_code, entry_point)
         payload = {
             "task_id": task_id,
-            "reference_code": _get_label_value(sample, "ground_truth"),
+            "reference_code": reference_code,
             "kernel_code": extract_cuda_agent_kernel_code(response),
             "backend": kernel_backend,
             "reference_backend": reference_backend,
             "entry_point": entry_point,
-            "uuid": (sample.metadata or {}).get("uuid"),
+            "uuid": uuid,
             "num_correct_trials": env_config.get("num_correct_trials"),
             "num_perf_trials": env_config.get("num_perf_trials"),
             "num_warmup": env_config.get("num_warmup"),
@@ -495,6 +555,8 @@ def _sample_for_turn(
     status: Sample.Status,
     turn_idx: int,
     env_result: dict[str, Any],
+    args: Any = None,
+    meta_info: dict[str, Any] | None = None,
 ) -> Sample:
     turn_sample = deepcopy(base_sample)
     turn_sample.tokens = prompt_ids + response_ids
@@ -513,6 +575,15 @@ def _sample_for_turn(
             "env_extra_info": env_result["env_extra_info"],
         }
     )
+    # Populate speculative-decoding / prefix-cache stats from the engine meta_info
+    # so rollout/spec_accept_rate and rollout/prefix_cache_hit_rate are not silently 0.
+    # Only the stat sub-updates are applied here (not the full update_from_meta_info)
+    # so the turn's own status logic above is preserved. .add() accumulates across
+    # turns, matching partial-rollout semantics.
+    if meta_info is not None:
+        if getattr(args, "sglang_speculative_algorithm", None):
+            turn_sample.spec_info.add(meta_info=meta_info)
+        turn_sample.prefix_cache_info.add(meta_info=meta_info)
     return turn_sample
 
 
@@ -677,7 +748,6 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     """
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
     messages = _as_messages(sample.prompt)
     max_turns = getattr(args, "max_turns", None)
     if max_turns is None:
@@ -717,14 +787,26 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             finish_reason = "prompt_truncated"
             logger.warning("CUDA agent prompt exceeds context length at turn %s: %s", turn_idx, len(prompt_ids))
             break
+        turn_sampling_params = _sampling_params_for_prompt_context(args, sampling_params, len(prompt_ids))
+        if int(turn_sampling_params.get("max_new_tokens", 0) or 0) <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            finish_reason = "response_budget_exhausted"
+            logger.warning(
+                "CUDA agent response budget exhausted at turn %s: prompt_tokens=%s max_context_len=%s",
+                turn_idx,
+                len(prompt_ids),
+                max_context_len,
+            )
+            break
 
         payload = {
             "input_ids": prompt_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
-        output = await post(url, payload)
+        output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
         model_time = time.monotonic() - model_started_at
         finish_type = output["meta_info"]["finish_reason"]["type"]
         if finish_type == "abort":
@@ -784,6 +866,8 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             status=status,
             turn_idx=turn_idx,
             env_result=env_result,
+            args=args,
+            meta_info=output["meta_info"],
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time
@@ -795,6 +879,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "model_time": model_time,
             "env_time": env_time,
             "prompt_tokens": len(prompt_ids),
+            "max_new_tokens": turn_sampling_params.get("max_new_tokens"),
             "response_tokens": len(response_ids),
             "finish_type": finish_type,
             "prompt": prompt_text,
@@ -810,7 +895,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         messages.append(
             {
                 "role": "assistant",
-                "content": response,
+                "content": _sanitize_assistant_history_content(response),
             }
         )
 

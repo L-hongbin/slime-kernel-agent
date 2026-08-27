@@ -43,6 +43,9 @@ def install_stubs(*, with_sglang_router: bool = False, with_transformers: bool =
             {"from_pretrained": staticmethod(lambda *args, **kwargs: (_ for _ in ()).throw(OSError()))},
         )
         mod.PreTrainedTokenizerBase = type("PreTrainedTokenizerBase", (), {})
+        mod.PreTrainedTokenizerFast = type(
+            "PreTrainedTokenizerFast", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: object())}
+        )
         mod.ProcessorMixin = type("ProcessorMixin", (), {})
         sys.modules["transformers"] = mod
 

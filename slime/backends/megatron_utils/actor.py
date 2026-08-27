@@ -403,6 +403,17 @@ class MegatronTrainRayActor(TrainRayActor):
             self.train_actor(rollout_id, rollout_data, external_data=external_data)
             result = None
 
+        if self.args.async_save:
+            from megatron.training.async_utils import maybe_finalize_async_save
+
+            # Non-blocking poll: a finished background save gets its .metadata
+            # now instead of at the next save_model call. An un-finalized
+            # torch_dist checkpoint cannot be loaded, so without this poll a
+            # crash within the next save interval loses the checkpoint. Must
+            # run before sleep(): finalization is a collective and offload
+            # sleep destroys the process groups.
+            maybe_finalize_async_save(blocking=False)
+
         if self.args.offload_train:
             del rollout_data
             self.sleep()
