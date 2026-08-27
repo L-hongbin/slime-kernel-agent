@@ -214,7 +214,7 @@ CUSTOM_ARGS=(
    --custom-reward-post-process-path examples.kernel_agent.reward_post_process_by_group
    --dynamic-sampling-filter-path examples.kernel_agent.filter_cuda_kernel_group
    --rollout-data-postprocess-path examples.kernel_agent.sequence_mis
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/initial_prompt/multi_turn_cuda_kernel.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/cuda_kernel.yaml"
 
    # TIS-related args, recommended to enable when using TIS
    # --custom-config-path examples/train_infer_mismatch_helper/mis.yaml

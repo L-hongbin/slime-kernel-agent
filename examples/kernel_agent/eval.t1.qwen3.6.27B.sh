@@ -2,7 +2,7 @@
 #
 # Single-node eval-only of a trained kernel-agent checkpoint, FAITHFUL to
 # training: same generate fn (generate_with_cuda_agent.generate), tvm_ffi
-# backend, multi_turn_cuda_kernel prompt. examples/kernel_agent/summarize_eval.py
+# backend, response_prompt/cuda_kernel prompt. examples/kernel_agent/summarize_eval.py
 # turns the dumped env_result.env_state into Compile / Correct / Fast@1.0 /
 # Fast@1.2 (in_all). NOTE: the sibling summarize_kernelgym_eval.py does NOT read
 # this dump schema (it expects metadata.kernelgym); use summarize_eval.py.
@@ -110,7 +110,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/cuda_kernel.yaml"
 )
 
 KERNEL_AGENT_ARGS=(

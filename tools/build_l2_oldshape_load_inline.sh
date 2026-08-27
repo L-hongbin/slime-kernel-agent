@@ -15,7 +15,7 @@ python3 tools/convert_prompt_with_template.py \
   --raw-data "$OUT/raw.parquet" \
   --target-data "$OUT/train.parquet" \
   --problem-field ground_truth \
-  --template-path examples/kernel_agent/prompt_config/musa_coder.jinja \
+  --template-path examples/kernel_agent/prompt_config/initial_prompt/musa_coder.jinja \
   --template-var "backend_display=pybind load_inline" \
   --template-var-file one_shot_example=Data/kernelbench-level1-validation-musa-coder-load-inline/one_shot_example_load_inline.txt
 echo "L2 oldshape dataset OK -> $OUT/train.parquet"

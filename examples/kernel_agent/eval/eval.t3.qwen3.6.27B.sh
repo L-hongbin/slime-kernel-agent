@@ -18,7 +18,7 @@ MASTER_ADDR="${MASTER_ADDR:-192.168.112.x}"
 KERNEL_BACKEND="tvm_ffi"
 REFERENCE_BACKEND="torch"
 
-TURN_PROMPT_PATH="${TURN_PROMPT_PATH:-"${SCRIPT_DIR}/prompt_config/multi_turn_tvm_ffi_short.yaml"}"
+TURN_PROMPT_PATH="${TURN_PROMPT_PATH:-"${SCRIPT_DIR}/prompt_config/response_prompt/tvm_ffi_short.yaml"}"
 EVAL_DATA="${EVAL_DATA:-"/ms/FM/lihongbin/dataset/CUDA_RL/Eval_data/tvm_v2/kernelbench-level1-validation/train.parquet"}"
 if [[ ! -f "${EVAL_DATA}" ]]; then
    echo "EVAL_DATA does not exist: ${EVAL_DATA}" >&2

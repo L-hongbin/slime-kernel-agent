@@ -1,0 +1,72 @@
+Use the following environment feedback to revise your previous CUDA + TVM-FFI implementation:
+
+{{ feedback }}
+
+Treat the complete feedback above as the source of truth. First identify the exact failure mode internally, then make the smallest relevant changes. Do not make unrelated rewrites.
+
+### Correctness-First Priority
+
+- If compilation, runtime execution, or correctness has not fully passed, fix that problem first. Do not optimize performance before correctness is stable.
+- If correctness has passed, preserve the working output semantics, dtype behavior, state-dict compatibility, bounds checks, and TVM-FFI integration. Prefer safe local optimizations over a full rewrite.
+
+### Failure-Guided Revision
+
+- **Extraction or output-format failure:** Return one complete implementation with exactly the required three sections. Close all code fences and string literals. Do not return patches, partial files, tests, or explanatory prose.
+
+- **Compilation error:** Fix the specific Python, C++, CUDA, linker, or TVM-FFI error reported in `error_message` or compilation details.
+  - For float32 checks, use `input.dtype().code == kDLFloat && input.dtype().bits == 32`; do not use `.type_code`, `kTVMFloat`, or `kTVMFFIFloat`.
+  - Use `input.ndim()` and `input.shape()[i]`; `ndim` is a method.
+  - Call `TVMFFIEnvGetStream(input.device().device_type, input.device().device_id)` correctly.
+  - Keep CUDA runtime headers and `cudaStream_t` in `CUDA_KERNELS`, not in the host binding source.
+  - Ensure launcher declarations, definitions, binding calls, exports, and Python extension calls match exactly.
+
+- **Runtime error, crash, or timeout:** Fix execution safety and interface consistency using the reported runtime detail.
+  - Ensure `MODEL_NEW` preallocates every output/workspace with the shape, dtype, device, and layout expected by the launcher.
+  - Verify pointer types, argument order, sizes, strides, launch dimensions, shared-memory sizes, and current-stream usage.
+  - Audit all global/shared-memory indexing and bounds checks. Do not assume a fixed `blockDim.x` unless it is enforced by the launcher.
+  - Fix incorrect or over-specific `TVM_FFI_ICHECK` assertions, but retain valid device, dtype, ndim, shape, and contiguity checks.
+  - Do not initialize CUDA globally at import time, spawn/fork subprocesses, add dynamic module-scope side effects, or call `torch.cuda.synchronize()` in `ModelNew.forward`.
+
+- **Correctness error:** Use the reported shape, dtype, numerical-error, or failing-input details to localize the mismatch.
+  - Match output shape, axis order, broadcasting, padding, reduction dimensions, scalar constants, return structure, and edge-case behavior exactly.
+  - Match the reference output dtype. Do not assume FP32; preserve the FP16/BF16 path and use suitable accumulation precision when needed.
+  - Check reduction initialization, partial blocks, tail elements, clamp/activation boundaries, NaN/Inf behavior, and non-contiguous inputs.
+  - Do not assume optional module parameters exist. For example, normalization modules may have `weight=None` or `bias=None`; handle parameters and buffers consistently with the original module.
+  - Do not fix correctness by reintroducing standard PyTorch/ATen compute.
+
+- **Disallowed PyTorch/ATen compute:** Remove the reported fallback and implement that computation through the submitted CUDA + TVM-FFI path.
+  - Do not use `torch.*` or `torch.nn.functional` compute functions, Tensor compute methods, Tensor arithmetic operators, or retained `nn.Module` calls for target computation.
+  - PyTorch remains allowed only for tensor allocation, metadata access, required `.contiguous()` conversion, parameter/buffer access, output-container construction, and `tvm_ffi_extension` calls.
+  - Do not use PyTorch to precompute, finish, repair, or post-process extension results.
+
+### Performance Revision
+
+Apply this section only after correctness and legality pass.
+
+- Preserve the working correctness path and optimize the measured bottleneck rather than rewriting unrelated code.
+- If profiling or NCU metrics are present, treat them as empirical evidence:
+  - For a memory-bound kernel, inspect memory traffic, coalescing, L2/DRAM throughput, intermediate tensors, and kernel-launch count.
+  - For a compute-bound kernel, inspect SM utilization, occupancy, instruction mix, register pressure, and stall reasons.
+  - If profiling metrics are absent, do not invent profiler results or claim a bottleneck as measured fact.
+- Fuse adjacent operations when it reduces memory traffic, intermediate allocations, or launch overhead without excessive synchronization, register pressure, shared-memory use, recomputation, or fragile indexing.
+- Prefer coalesced access, fewer global-memory passes, minimal host-side logic, and robust launch configurations.
+- Use vectorized access only when alignment, layout, and tail handling are valid for every tested input.
+- Prefer warp- or block-level reductions over unnecessary global atomics, while handling partial warps and non-power-of-two dimensions correctly.
+- Change the TVM-FFI interface only when the optimization requires it; if changed, update launchers, bindings, exports, allocations, and Python calls consistently.
+
+Return a full improved implementation, not a patch, with exactly these three code blocks and nothing else:
+
+#### CUDA_KERNELS
+```cpp
+<complete CUDA .cu source>
+```
+
+#### APPLY_BINDINGS
+```cpp
+<complete TVM-FFI C++ binding source>
+```
+
+#### MODEL_NEW
+```python
+<complete Python ModelNew implementation using tvm_ffi_extension>
+```

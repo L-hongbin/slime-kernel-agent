@@ -142,7 +142,7 @@ RolloutManager 内部指标(口径与 summarize 略不同,供参考):综合分 `
 sglang 的 `deepseek_v4` 是 **Hopper(sm90)专用**:MoE top-k 簇 kernel(`topk_v2.cuh` 的 `__cluster_dims__`)+ DeepGEMM HC-prenorm GEMM(`tf32_hc_prenorm_gemm`,V4 hash-compress 层)都要 sm90,在 A800(sm80)上 cuda graph 捕获即崩。(topk 可用 `AMPERE_TOPK_FALLBACK=1` 走非簇回退,但 DeepGEMM 那道墙绕不过。)
 
 ### 配置要点
-- **chat template**:V4 不带 jinja chat_template,手写模板与官方 `encode_messages` **逐字节一致**,需装到 `<ckpt>/chat_template.jinja`(AutoTokenizer 自动加载);仓库副本 `examples/kernel_agent/prompt_config/deepseek_v4_chat_template.jinja`,单测 `test/test_deepseek_v4_chat_template.py`(过 codex review;本次 eval 经 codex 复核确认字节匹配)。
+- **chat template**: V4 默认不带 jinja chat template，运行前需由 checkpoint 在 `<ckpt>/chat_template.jinja` 提供（AutoTokenizer 自动加载）；仓库不再维护模板副本。
 - **MTP 投机**:`USE_MTP_SPEC=1`(默认开,EAGLE 3/1/4,draft 从主 ckpt 自动加载、无需 draft path);lossless,只提速。
 - **thinking = ON**:`enable_thinking=true` → 模板 emit `<think>`(`chat_template.jinja:20,34`);DeepSeek 无 low/med/high 分级,只 on/off,本结果是 thinking-on。与 gpt-oss 的 medium effort **不在同一轴,不可直接横比 effort**。
 - **H20 覆盖**:`AMPERE_TOPK_FALLBACK=0`(非 Ampere)、TP=4(fp8 ~37GB/卡)。

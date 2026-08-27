@@ -85,7 +85,7 @@ case "${DATASET}" in
       exit 1
       ;;
 esac
-TURN_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/response_prompt/gepa_kimi.jinja"
+TURN_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_gepa_kimi_v1.jinja"
 
 case "${LOSS_MODE}" in
     cispo)
@@ -469,4 +469,3 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${MISC_ARGS[@]} \
    ${KERNEL_AGENT_ARGS[@]} \
    ${CUSTOM_ARGS[@]}
-

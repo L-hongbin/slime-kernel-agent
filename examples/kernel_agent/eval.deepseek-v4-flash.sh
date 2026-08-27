@@ -26,12 +26,10 @@ if [[ ! -f "${HF_MODEL_PATH}/config.json" ]]; then
    exit 1
 fi
 
-# DeepSeek-V4 ships no jinja chat_template; install the repo's byte-exact one so a
-# default run reproduces the eval (AutoTokenizer auto-loads <ckpt>/chat_template.jinja).
-DSV4_CHAT_TEMPLATE="${SCRIPT_DIR}/prompt_config/deepseek_v4_chat_template.jinja"
-if [[ ! -s "${HF_MODEL_PATH}/chat_template.jinja" && -f "${DSV4_CHAT_TEMPLATE}" ]]; then
-   cp "${DSV4_CHAT_TEMPLATE}" "${HF_MODEL_PATH}/chat_template.jinja"
-   echo "installed chat_template.jinja -> ${HF_MODEL_PATH}/chat_template.jinja"
+# DeepSeek-V4 checkpoints must provide the tokenizer chat template themselves.
+if [[ ! -s "${HF_MODEL_PATH}/chat_template.jinja" ]]; then
+   echo "HF_MODEL_PATH does not provide chat_template.jinja: ${HF_MODEL_PATH}/chat_template.jinja" >&2
+   exit 1
 fi
 
 EVAL_DATA="${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}"
@@ -160,7 +158,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_tvm_ffi_short.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/tvm_ffi_short.yaml"
 )
 
 KERNEL_AGENT_ARGS=(

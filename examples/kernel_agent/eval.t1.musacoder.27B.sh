@@ -128,7 +128,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/multi_turn_cuda_kernel.yaml"
+   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/cuda_kernel.yaml"
 )
 
 KERNEL_AGENT_ARGS=(

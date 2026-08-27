@@ -1803,7 +1803,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             "--multi-turn-prompt-config-path",
             type=str,
             default=None,
-            help="Path to the YAML config for multi-turn prompt templates.",
+            help="Path to a YAML or Jinja config for multi-turn prompt templates.",
         )
         reset_arg(parser, "--padded-vocab-size", type=int, default=None)
 

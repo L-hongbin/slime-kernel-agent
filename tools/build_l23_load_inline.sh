@@ -10,7 +10,7 @@ for lvl in 2 3; do
     --raw-data "Data/kernelbench-level${lvl}-validation/train.parquet" \
     --target-data "$out/train.parquet" \
     --problem-field ground_truth \
-    --template-path examples/kernel_agent/prompt_config/musa_coder.jinja \
+    --template-path examples/kernel_agent/prompt_config/initial_prompt/musa_coder.jinja \
     --template-var "backend_display=pybind load_inline" \
     --template-var-file one_shot_example=Data/kernelbench-level1-validation-musa-coder-load-inline/one_shot_example_load_inline.txt
   echo "level${lvl} converted OK -> $out/train.parquet"

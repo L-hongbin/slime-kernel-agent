@@ -1,0 +1,206 @@
+Optimize the provided PyTorch `Model` with custom CUDA kernels exposed through TVM-FFI. Preserve correctness first, then improve performance. Name the optimized architecture `ModelNew` and generate complete, compilable code rather than pseudocode.
+
+### Strict Native-Compute Requirements
+
+1. **Total conversion:** Replace every value-producing computation in the original `Model.forward` with the submitted CUDA implementation. Partial conversion is not allowed. Calling one custom kernel does not permit the remaining computation to fall back to PyTorch.
+
+2. **Preserved modules are weights only:** Preserve the original modules, parameters, and buffers in `ModelNew.__init__` when required for `state_dict` compatibility, but never invoke retained modules such as `self.conv(x)`, `self.linear(x)`, or `self.norm(x)` in `ModelNew.forward`. Pass their weights, biases, and buffers to `tvm_ffi_extension` instead.
+
+3. **No standard PyTorch/ATen compute:** Do not use standard PyTorch compute functions, `torch.nn.functional` compute functions, Tensor compute methods, Tensor arithmetic operators, or direct `nn.Module` calls to perform the target computation.
+
+   Forbidden examples:
+
+   ```python
+   y = torch.matmul(x, weight)
+   y = torch.sum(x, dim=-1)
+   y = torch.exp(x)
+   y = F.conv2d(x, weight, bias)
+   y = x + bias
+   y = x.mean(dim=-1)
+   y = self.conv(x)
+   ```
+
+   PyTorch is allowed only for integration utilities such as:
+
+   - tensor allocation: `torch.empty`, `torch.empty_like`, `torch.zeros`, `torch.zeros_like`;
+   - metadata access: `shape`, `stride`, `dtype`, `device`;
+   - required `.contiguous()` conversion;
+   - parameter and buffer access;
+   - output-container construction;
+   - calls to `tvm_ffi_extension`.
+
+4. **No bypasses:** Do not use PyTorch to precompute, finish, repair, or post-process mathematical results from the extension. Do not return cached/reference outputs or constants instead of computing the result. Do not modify benchmark, profiler, synchronization, or global PyTorch behavior.
+
+5. **Dtype and numerical behavior:** Match the reference output shape, dtype, device, values, broadcasting, reduction, and return structure. Do not assume every tensor is FP32. FP16/BF16 kernels may accumulate internally in FP32 when appropriate, but the returned dtype must match the reference.
+
+6. **Single consistent submission:** Follow the requirements below without adding alternate implementations, duplicated instructions, tests, benchmark code, or explanatory prose.
+
+### Output Format
+
+Return exactly these three sections and code blocks, and nothing else:
+
+#### CUDA_KERNELS
+```cpp
+<complete CUDA .cu source: kernels, device helpers, and C ABI launchers>
+```
+
+#### APPLY_BINDINGS
+```cpp
+<complete C++ TVM-FFI binding source>
+```
+
+#### MODEL_NEW
+```python
+<complete Python ModelNew implementation using tvm_ffi_extension>
+```
+
+### Model Compatibility
+
+- Preserve the original `Model.__init__` and `Model.forward` signatures.
+- Preserve parameter and buffer names, shapes, and dtypes so the original `state_dict` loads into `ModelNew`.
+- Do not rename or invent trainable parameters or buffers.
+- Recreate original submodules only when needed for state compatibility; access their parameters and buffers without calling the modules in `forward`.
+- Return the same Python object structure as the original `forward`.
+
+### CUDA_KERNELS
+
+- Write real CUDA C++ kernels for all target computation.
+- Do not call PyTorch, ATen, TVM, TVM-FFI, or Python APIs in this section.
+- Expose C ABI launcher functions using raw pointers, integer sizes/strides, scalar parameters, and an opaque `void*` stream handle.
+- Cast the stream handle to `cudaStream_t` inside the launcher and launch work on that stream.
+- Use correct indexing and bounds checks. Handle non-divisible sizes, partial blocks, broadcasting, reductions, scalar constants, and non-power-of-two dimensions.
+- Avoid out-of-bounds accesses and data races. Use atomics only when necessary and valid for the dtype.
+- Use shared memory, tiling, vectorized access, or warp primitives when beneficial and correct.
+
+Example launcher shape:
+
+```cpp
+#include <cuda_runtime.h>
+#include <cstdint>
+
+__global__ void example_kernel(const float* input, float* output, int64_t n) {
+    int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    int64_t step = static_cast<int64_t>(blockDim.x) * gridDim.x;
+    for (int64_t i = idx; i < n; i += step) {
+        output[i] = input[i];
+    }
+}
+
+extern "C" void example_launcher(
+    float* output, const float* input, int64_t n, void* stream_handle) {
+    cudaStream_t stream = static_cast<cudaStream_t>(stream_handle);
+    int threads = 256;
+    int blocks = static_cast<int>((n + threads - 1) / threads);
+    example_kernel<<<blocks, threads, 0, stream>>>(input, output, n);
+}
+```
+
+### APPLY_BINDINGS
+
+- Use TVM-FFI only; do not use pybind11.
+- Include `#include <tvm/ffi/tvm_ffi.h>` and `#include <tvm/ffi/extra/c_env_api.h>`.
+- Receive tensors as `tvm::ffi::Tensor` and validate device, dtype, ndim, shape, and contiguity assumptions with `TVM_FFI_ICHECK`.
+- Obtain the current stream with `TVMFFIEnvGetStream`.
+- Pass raw pointers, metadata, scalars, and the opaque stream to C ABI launchers.
+- Keep bindings thin and do not perform computation through PyTorch, ATen, or TVM operators.
+- Prefer outputs/workspaces allocated in `MODEL_NEW`.
+- Export every Python-callable wrapper with `TVM_FFI_DLL_EXPORT_TYPED_FUNC(exported_name, function_name);`.
+- Exported names must exactly match the functions called by `MODEL_NEW`.
+- Keep CUDA runtime headers and `cudaStream_t` out of the host binding source; use `void*` across the binding boundary.
+
+Example binding shape:
+
+```cpp
+#include <tvm/ffi/tvm_ffi.h>
+#include <tvm/ffi/extra/c_env_api.h>
+
+extern "C" void example_launcher(
+    float* output,
+    const float* input,
+    int64_t n,
+    void* stream_handle);
+
+void example_forward(
+    tvm::ffi::Tensor input,
+    tvm::ffi::Tensor output) {
+    TVM_FFI_ICHECK(input.device().device_type == kDLCUDA)
+        << "input must be CUDA";
+    TVM_FFI_ICHECK(output.device().device_type == kDLCUDA)
+        << "output must be CUDA";
+    TVM_FFI_ICHECK(input.ndim() == 1)
+        << "input must be 1D";
+    TVM_FFI_ICHECK(output.ndim() == 1)
+        << "output must be 1D";
+    TVM_FFI_ICHECK(input.shape()[0] == output.shape()[0])
+        << "shape mismatch";
+
+    void* stream_handle = TVMFFIEnvGetStream(
+        input.device().device_type,
+        input.device().device_id);
+
+    example_launcher(
+        static_cast<float*>(output.data_ptr()),
+        static_cast<const float*>(input.data_ptr()),
+        input.shape()[0],
+        stream_handle);
+}
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    example_forward,
+    example_forward);
+```
+
+### MODEL_NEW
+
+- Import the extension as `tvm_ffi_extension`.
+- Define `class ModelNew(nn.Module)` with signatures compatible with `Model`.
+- Allocate outputs/workspaces using the allowed PyTorch integration utilities and pass them to extension functions.
+- Route every original computation through `tvm_ffi_extension`; no PyTorch/ATen compute fallback may remain.
+- If a kernel requires contiguous input, call `.contiguous()` before the extension and validate that assumption in the binding.
+- Do not call `torch.cuda.synchronize()` in `forward`.
+
+Example pattern:
+
+```python
+import torch
+import torch.nn as nn
+import tvm_ffi_extension
+
+
+class ModelNew(nn.Module):
+    def __init__(self, ...):
+        super().__init__()
+
+    def forward(self, x):
+        x = x.contiguous()
+        output = torch.empty_like(x)
+        tvm_ffi_extension.example_forward(x, output)
+        return output
+```
+
+### Additional Best Practices
+
+- **Fusion:** Fuse adjacent operations when it reduces global-memory traffic, intermediate allocations, or kernel-launch overhead. Good candidates include elementwise chains, bias-plus-activation, reduction followed by elementwise work, normalization, and activation chains. Keep operations separate when fusion would require excessive synchronization, registers, shared memory, recomputation, or fragile indexing.
+- **Memory access:** Prefer coalesced loads and stores, minimize redundant global-memory passes, and use shared memory only when it provides meaningful reuse.
+- **Data movement:** Avoid host-device transfers and unnecessary intermediate allocations. Keep computation and temporary data on the current CUDA device.
+- **Launch configuration:** Use robust block/grid configurations that cover all elements and balance occupancy, register pressure, and shared-memory usage.
+- **Reductions:** Prefer warp- or block-level reductions over unnecessary global atomics, while correctly handling partial warps and non-power-of-two dimensions.
+- **Atomic operations:** Use atomics only when necessary, minimize contention, and ensure the selected operation is valid for the target dtype.
+- **Vectorization:** Use vectorized access only when pointer alignment, tensor layout, and tail handling are valid.
+- **Numerical precision:** Preserve reference semantics and use suitable accumulation precision for reductions, normalization, and low-precision inputs.
+- **TVM-FFI interface:** Keep bindings thin, preallocate outputs in `MODEL_NEW`, and minimize Python-side allocations and layout conversions.
+- **Namespace usage:** Do not add declarations directly to reserved namespaces such as `cuda`. Use a project-specific namespace for helper types and functions when needed.
+
+### Final Checklist
+
+- All three code blocks are complete and syntactically valid.
+- Launcher declarations, definitions, binding calls, exports, and Python calls match exactly.
+- Output shape, dtype, device, values, and return structure match the reference.
+- Every original computation is implemented through CUDA; no standard PyTorch/ATen compute fallback or direct retained-module call remains.
+- No tests, benchmarks, alternate answers, or prose appear outside the three required sections.
+
+### Original PyTorch Problem
+
+```python
+{{ problem }}
+```
