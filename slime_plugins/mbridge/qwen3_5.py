@@ -5,6 +5,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
 from mbridge.core import register_model
 from mbridge.models import Qwen2MoEBridge
+from slime.backends.megatron_utils.megatron_to_hf.qwen3_5 import (
+    deinterleave_gdn_tp_sections,
+    interleave_gdn_tp_sections,
+)
 
 
 @register_model(["qwen3_5", "qwen3_5_moe"])
@@ -38,6 +42,21 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
             "model.language_model.layers.{layer_number}.self_attn.k_proj.bias",
             "model.language_model.layers.{layer_number}.self_attn.v_proj.bias",
         ],
+        # Native TP/CP-sharded GDN.
+        "self_attention.in_proj.layer_norm_weight": [
+            "model.language_model.layers.{layer_number}.input_layernorm.weight"
+        ],
+        "self_attention.in_proj.weight": [
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_z.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_b.weight",
+            "model.language_model.layers.{layer_number}.linear_attn.in_proj_a.weight",
+        ],
+        "self_attention.conv1d.weight": ["model.language_model.layers.{layer_number}.linear_attn.conv1d.weight"],
+        "self_attention.out_norm.weight": ["model.language_model.layers.{layer_number}.linear_attn.norm.weight"],
+        "self_attention.out_proj.weight": ["model.language_model.layers.{layer_number}.linear_attn.out_proj.weight"],
+        "self_attention.A_log": ["model.language_model.layers.{layer_number}.linear_attn.A_log"],
+        "self_attention.dt_bias": ["model.language_model.layers.{layer_number}.linear_attn.dt_bias"],
     } | {
         f"self_attention.{weight_name}": ["model.language_model.layers.{layer_number}." + weight_name]
         for weight_name in [
@@ -249,6 +268,27 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
     def _weight_to_mcore_format(
         self, mcore_weights_name: str, hf_weights: list[torch.Tensor]
     ) -> tuple[list[str], list[torch.Tensor]]:
+        if "self_attention.in_proj.weight" in mcore_weights_name:
+            assert len(hf_weights) == 4
+            qkv, z, b, a = hf_weights
+            text_config = self._get_text_config()
+            qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+            value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+            q, k, v = qkv.split((qk_dim, qk_dim, value_dim), dim=0)
+            return interleave_gdn_tp_sections([q, k, v, z, b, a], self.mpu.tp_size)
+
+        if "self_attention.conv1d.weight" in mcore_weights_name:
+            assert len(hf_weights) == 1
+            text_config = self._get_text_config()
+            qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+            value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+            q, k, v = hf_weights[0].split((qk_dim, qk_dim, value_dim), dim=0)
+            return interleave_gdn_tp_sections([q, k, v], self.mpu.tp_size)
+
+        if "self_attention.out_norm.weight" in mcore_weights_name:
+            assert len(hf_weights) == 1
+            return hf_weights[0] - 1
+
         if "self_attention.linear_qkv." in mcore_weights_name and "layer_norm" not in mcore_weights_name:
             # merge qkv
             assert len(hf_weights) == 3
@@ -308,6 +348,35 @@ class Qwen3_5Bridge(Qwen2MoEBridge):
     def _weight_to_hf_format(
         self, mcore_weights_name: str, mcore_weights: torch.Tensor
     ) -> tuple[list[str], list[torch.Tensor]]:
+        if "self_attention.in_proj.weight" in mcore_weights_name:
+            text_config = self._get_text_config()
+            qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+            value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+            num_value_heads = text_config.linear_num_value_heads
+            q, k, v, z, b, a = deinterleave_gdn_tp_sections(
+                mcore_weights,
+                (qk_dim, qk_dim, value_dim, value_dim, num_value_heads, num_value_heads),
+                self.mpu.tp_size,
+            )
+            return (
+                self._weight_name_mapping_mcore_to_hf(mcore_weights_name),
+                [torch.cat((q, k, v), dim=0), z, b, a],
+            )
+
+        if "self_attention.conv1d.weight" in mcore_weights_name:
+            text_config = self._get_text_config()
+            qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+            value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+            q, k, v = deinterleave_gdn_tp_sections(
+                mcore_weights,
+                (qk_dim, qk_dim, value_dim),
+                self.mpu.tp_size,
+            )
+            return self._weight_name_mapping_mcore_to_hf(mcore_weights_name), [torch.cat((q, k, v), dim=0)]
+
+        if "self_attention.out_norm.weight" in mcore_weights_name:
+            return self._weight_name_mapping_mcore_to_hf(mcore_weights_name), [mcore_weights + 1]
+
         return super()._weight_to_hf_format(mcore_weights_name, mcore_weights)
 
     def _build_config(self):

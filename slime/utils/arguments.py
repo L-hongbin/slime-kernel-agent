@@ -266,6 +266,29 @@ def reset_arg(parser, name, **kwargs):
         parser.add_argument(name, **kwargs)
 
 
+def add_qwen_gdn_arguments(parser):
+    """Register Qwen GDN options shared by training and conversion tools."""
+    parser.add_argument(
+        "--qwen-gdn-backend",
+        type=str,
+        choices=["fla", "flashqla"],
+        default="fla",
+        help="GDN implementation backend for Qwen linear-attention layers.",
+    )
+    parser.add_argument(
+        "--qwen-gdn-implementation",
+        type=str,
+        choices=["replicated", "distributed"],
+        default="replicated",
+        help=(
+            "Qwen GDN rank layout. 'replicated' keeps the HuggingFace-compatible "
+            "all-gather path; 'distributed' uses TP-sharded projections and CP "
+            "sequence-to-head all-to-all while retaining --qwen-gdn-backend."
+        ),
+    )
+    return parser
+
+
 def get_slime_extra_args_provider(add_custom_arguments=None):
     def add_slime_arguments(parser):
         # Ray
@@ -377,13 +400,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "local position axis). No-op at --context-parallel-size 1."
                 ),
             )
-            parser.add_argument(
-                "--qwen-gdn-backend",
-                type=str,
-                choices=["fla", "flashqla"],
-                default="fla",
-                help="GDN implementation backend for Qwen linear-attention layers.",
-            )
+            add_qwen_gdn_arguments(parser)
             parser.add_argument(
                 "--fp32-lm-head",
                 action="store_true",

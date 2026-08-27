@@ -1,6 +1,57 @@
 import re
+from functools import lru_cache
 
 import torch
+from transformers import AutoConfig
+
+
+@lru_cache(maxsize=8)
+def _load_qwen_gdn_dimensions(hf_checkpoint: str) -> tuple[int, int, int]:
+    hf_config = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+    text_config = getattr(hf_config, "text_config", hf_config)
+    qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+    value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+    return qk_dim, value_dim, text_config.linear_num_value_heads
+
+
+def interleave_gdn_tp_sections(sections: list[torch.Tensor], tp_size: int) -> torch.Tensor:
+    """Pack global GDN sections into the rank-major layout of fused native ``in_proj``."""
+    if not sections:
+        raise ValueError("GDN section list must not be empty.")
+    if tp_size < 1:
+        raise ValueError(f"tp_size must be positive, got {tp_size}.")
+    if any(section.shape[0] % tp_size != 0 for section in sections):
+        raise ValueError(
+            f"Every GDN section must be divisible by tp_size={tp_size}, "
+            f"got {[section.shape[0] for section in sections]}."
+        )
+
+    per_section_shards = [section.chunk(tp_size, dim=0) for section in sections]
+    rank_shards = [
+        torch.cat([section_shards[rank] for section_shards in per_section_shards], dim=0) for rank in range(tp_size)
+    ]
+    return torch.cat(rank_shards, dim=0)
+
+
+def deinterleave_gdn_tp_sections(
+    tensor: torch.Tensor, section_sizes: tuple[int, ...], tp_size: int
+) -> list[torch.Tensor]:
+    """Unpack gathered rank-major native GDN weights into global logical sections."""
+    if any(section % tp_size != 0 for section in section_sizes):
+        raise ValueError(f"Every GDN section must be divisible by tp_size={tp_size}, got {section_sizes}.")
+    if tensor.shape[0] != sum(section_sizes):
+        raise ValueError(f"GDN tensor first dimension {tensor.shape[0]} does not match sections {section_sizes}.")
+
+    local_sizes = tuple(section // tp_size for section in section_sizes)
+    rank_size = sum(local_sizes)
+    rank_shards = tensor.split(rank_size, dim=0)
+    if len(rank_shards) != tp_size:
+        raise ValueError(f"Expected {tp_size} GDN rank shards, got {len(rank_shards)}.")
+    split_rank_shards = [rank_shard.split(local_sizes, dim=0) for rank_shard in rank_shards]
+    return [
+        torch.cat([rank_sections[section_idx] for rank_sections in split_rank_shards], dim=0)
+        for section_idx in range(len(section_sizes))
+    ]
 
 
 def _convert_mtp_layer(args, name, param, layer_idx):
@@ -57,17 +108,49 @@ def convert_qwen3_5_to_hf(args, name, param):
     if name == "module.module.decoder.final_layernorm.weight":
         return [("model.language_model.norm.weight", param)]
 
-    try:
-        head_dim = args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
-    except AttributeError:
-        head_dim = args.hidden_size // args.num_attention_heads
-    value_num_per_group = args.num_attention_heads // args.num_query_groups
-
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
     match = re.match(decoder_layers_pattern, name)
     if match:
         layer_idx, rest = match.groups()
         prefix = f"model.language_model.layers.{layer_idx}"
+
+        # Native distributed GDN.  TP all-gather returns the fused projection
+        # and convolution in rank-major section order, so restore the logical
+        # Q/K/V/Z/B/A order before emitting HuggingFace tensors.
+        if rest == "self_attention.in_proj.weight":
+            qk_dim, value_dim, num_value_heads = _load_qwen_gdn_dimensions(args.hf_checkpoint)
+            q, k, v, z, b, a = deinterleave_gdn_tp_sections(
+                param,
+                (qk_dim, qk_dim, value_dim, value_dim, num_value_heads, num_value_heads),
+                args.tensor_model_parallel_size,
+            )
+            return [
+                (f"{prefix}.linear_attn.in_proj_qkv.weight", torch.cat((q, k, v), dim=0)),
+                (f"{prefix}.linear_attn.in_proj_z.weight", z),
+                (f"{prefix}.linear_attn.in_proj_b.weight", b),
+                (f"{prefix}.linear_attn.in_proj_a.weight", a),
+            ]
+        elif rest == "self_attention.conv1d.weight":
+            qk_dim, value_dim, _ = _load_qwen_gdn_dimensions(args.hf_checkpoint)
+            q, k, v = deinterleave_gdn_tp_sections(
+                param,
+                (qk_dim, qk_dim, value_dim),
+                args.tensor_model_parallel_size,
+            )
+            return [(f"{prefix}.linear_attn.conv1d.weight", torch.cat((q, k, v), dim=0))]
+        elif rest == "self_attention.in_proj.layer_norm_weight":
+            # Qwen3.5 HuggingFace RMSNorm also stores zero-centered gamma and
+            # adds one in forward, so the native TE value is exported as-is.
+            return [(f"{prefix}.input_layernorm.weight", param)]
+        elif rest == "self_attention.out_proj.weight":
+            return [(f"{prefix}.linear_attn.out_proj.weight", param)]
+        elif rest == "self_attention.out_norm.weight":
+            # Native GDN uses zero-centered RMSNorm gamma.
+            return [(f"{prefix}.linear_attn.norm.weight", param + 1)]
+        elif rest == "self_attention.A_log":
+            return [(f"{prefix}.linear_attn.A_log", param)]
+        elif rest == "self_attention.dt_bias":
+            return [(f"{prefix}.linear_attn.dt_bias", param)]
 
         # experts (grouped gemm - fused format)
         if rest == "mlp.experts.linear_fc1":
@@ -112,6 +195,10 @@ def convert_qwen3_5_to_hf(args, name, param):
         if rest == "self_attention.linear_proj.weight":
             return [(f"{prefix}.self_attn.o_proj.weight", param)]
         elif rest == "self_attention.linear_qkv.weight":
+            head_dim = (
+                args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
+            )
+            value_num_per_group = args.num_attention_heads // args.num_query_groups
             param = param.view(args.num_query_groups, -1, head_dim, args.hidden_size)
             q_param, k_param, v_param = torch.split(
                 param, split_size_or_sections=[2 * value_num_per_group, 1, 1], dim=1
@@ -129,6 +216,10 @@ def convert_qwen3_5_to_hf(args, name, param):
                 (f"{prefix}.self_attn.v_proj.weight", v_param),
             ]
         elif rest == "self_attention.linear_qkv.bias":
+            head_dim = (
+                args.kv_channels if args.kv_channels is not None else args.hidden_size // args.num_attention_heads
+            )
+            value_num_per_group = args.num_attention_heads // args.num_query_groups
             param = param.view(args.num_query_groups, -1)
             q_bias, k_bias, v_bias = torch.split(
                 param,

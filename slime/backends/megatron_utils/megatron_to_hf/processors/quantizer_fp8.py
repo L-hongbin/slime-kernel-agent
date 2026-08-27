@@ -76,6 +76,20 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
 
             return quantize_named_params
 
+    # The native distributed GDN fuses qkv/z/b/a into one Megatron parameter,
+    # but the Qwen FP8 checkpoint quantizes only the matrix-heavy qkv and z
+    # projections.  in_proj_b and in_proj_a are explicitly excluded by the HF
+    # quantization manifest and must stay BF16.  Treat the converted HF names
+    # individually instead of quantizing every output of the fused parameter.
+    if rest == "self_attention.in_proj.weight":
+        quantize_named_params = []
+        for converted_name, param in converted_named_params:
+            if converted_name.endswith((".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_z.weight")):
+                quantize_named_params.extend(_quantize_param(converted_name, param, weight_block_size))
+            else:
+                quantize_named_params.append((converted_name, param))
+        return quantize_named_params
+
     if rest in [
         "self_attention.linear_proj.weight",
         "self_attention.linear_qkv.weight",
@@ -94,6 +108,8 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
         "self_attention.linear_attn.in_proj_qkv.weight",
         "self_attention.linear_attn.in_proj_z.weight",
         "self_attention.linear_attn.out_proj.weight",
+        # native distributed GDN
+        "self_attention.out_proj.weight",
     ]:
         quantize_named_params = []
         for converted_name, param in converted_named_params:
