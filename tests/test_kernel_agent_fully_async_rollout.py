@@ -28,7 +28,7 @@ if (examples_package := sys.modules.get("examples")) is not None and hasattr(exa
         *(path for path in examples_package.__path__ if path != repo_examples_path),
     ]
 
-from examples.kernel_agent import fully_async_rollout
+from examples.kernel_agent import fully_async_rollout, generate_with_cuda_agent
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
@@ -46,6 +46,10 @@ def _make_rollout_args(**overrides):
         sglang_max_running_requests=32,
         n_samples_per_prompt=16,
         use_distributed_post=False,
+        wandb_always_use_train_step=False,
+        rollout_batch_size=16,
+        global_batch_size=256,
+        gen_weight_version=7,
     )
     values.update(overrides)
     return Namespace(**values)
@@ -148,6 +152,7 @@ def test_kernel_agent_worker_does_not_exceed_group_concurrency(monkeypatch):
         FakeDataBuffer(),
         concurrency=2,
     )
+    worker.set_generation_context(rollout_id=3)
     worker.start()
     try:
         deadline = time.monotonic() + 5.0
@@ -160,6 +165,104 @@ def test_kernel_agent_worker_does_not_exceed_group_concurrency(monkeypatch):
 
     assert len(completed) >= 4
     assert max_in_flight <= 2
+    assert all(
+        sample.metadata["rollout_step"] == 3 and sample.metadata["gen_weight_version"] == 7
+        for _gid, group in completed
+        for sample in group
+    )
+
+
+def test_kernel_agent_worker_prefers_engine_generation_weight_version(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
+    class FakeDataBuffer:
+        def __init__(self):
+            self.groups = [[Sample(index=0, group_index=0)]]
+
+        def get_samples(self, count):
+            out = self.groups[:count]
+            self.groups = self.groups[count:]
+            return out
+
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation):
+        sample = group[0]
+        # Simulate a request submitted under the v7 snapshot but admitted by
+        # SGLang only after a pause/update/continue advanced the engine to v8.
+        sample.weight_versions.append("8")
+        sample.status = Sample.Status.COMPLETED
+        sample.reward = 0.0
+        return group
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+    monkeypatch.setattr(fully_async_rollout, "generate_and_rm_group", fake_generate_and_rm_group)
+
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(gen_weight_version=7),
+        FakeDataBuffer(),
+        concurrency=1,
+    )
+    worker.poll_interval = 0.01
+    worker.set_generation_context(rollout_id=4)
+    worker.start()
+    try:
+        deadline = time.monotonic() + 2.0
+        completed = []
+        while time.monotonic() < deadline and not completed:
+            completed = worker.get_completed_groups()
+            time.sleep(0.01)
+    finally:
+        worker.stop()
+
+    assert len(completed) == 1
+    sample = completed[0][1][0]
+    assert sample.metadata["rollout_step"] == 4
+    assert sample.metadata["gen_weight_version"] == 8
+
+
+def test_kernel_agent_worker_restamps_a_fresh_retry_after_abort():
+    args = _make_rollout_args(gen_weight_version=7)
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.args = args
+    worker._generation_context_lock = threading.Lock()
+    worker._rollout_step = None
+    worker._gen_weight_version = None
+    sample = Sample(index=1, metadata={"rollout_step": 3, "gen_weight_version": 6})
+
+    worker.set_generation_context(rollout_id=4)
+    worker._stamp_group_for_submission([sample])
+    assert sample.metadata["rollout_step"] == 4
+    assert sample.metadata["gen_weight_version"] == 7
+
+    # The aborted input is regenerated from its prompt, rather than resumed.
+    # Its next attempt must describe the new generation policy, not retain v7.
+    args.gen_weight_version = 8
+    worker.set_generation_context(rollout_id=5)
+    worker._stamp_group_for_submission([sample])
+    assert sample.metadata["rollout_step"] == 5
+    assert sample.metadata["gen_weight_version"] == 8
+
+
+def test_kernel_agent_turn_preserves_engine_weight_version():
+    base_sample = Sample(index=1, metadata={"rollout_step": 5, "gen_weight_version": 7})
+    turn_sample = generate_with_cuda_agent._sample_for_turn(
+        base_sample,
+        prompt_ids=[1, 2],
+        response="ok",
+        response_ids=[3],
+        log_probs=[-0.1],
+        reward=0.0,
+        status=Sample.Status.COMPLETED,
+        turn_idx=0,
+        env_result={"env_extra_info": {}},
+        args=Namespace(sglang_speculative_algorithm=None, use_rollout_routing_replay=False),
+        meta_info={"weight_version": "8"},
+    )
+
+    assert turn_sample.weight_versions == ["8"]
 
 
 def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch, caplog):
@@ -174,7 +277,7 @@ def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch
         sample.response = f"secret-response-{gid}"
         worker.output_queue.put((gid, [sample]))
 
-    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
     monkeypatch.setitem(fully_async_rollout.CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
     args = Namespace(
         rollout_global_dataset=True,
@@ -207,7 +310,7 @@ def test_kernel_agent_rollout_logs_sample_bodies_when_stats_only_is_disabled(mon
         sample.response = f"visible-response-{gid}"
         worker.output_queue.put((gid, [sample]))
 
-    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
     monkeypatch.setitem(fully_async_rollout.CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
     args = Namespace(
         rollout_global_dataset=True,
@@ -270,6 +373,7 @@ def test_kernel_agent_worker_cancels_inflight_tasks_on_stop(monkeypatch):
         FakeDataBuffer(),
         concurrency=1,
     )
+    worker.set_generation_context(rollout_id=0)
     worker.start()
     try:
         assert started.wait(timeout=2.0)

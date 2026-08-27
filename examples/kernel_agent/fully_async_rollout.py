@@ -23,6 +23,7 @@ from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_fil
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_sglang_client_concurrency
+from slime.utils.metric_utils import compute_rollout_step
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
@@ -94,10 +95,14 @@ def _get_group_concurrency(args, client_concurrency: int) -> int:
     return max(1, client_concurrency // n_samples_per_prompt)
 
 
-def _get_global_worker(args, data_buffer) -> KernelAgentAsyncRolloutWorker:
+def _get_global_worker(args, data_buffer, rollout_id: int) -> KernelAgentAsyncRolloutWorker:
     global _global_worker
     with _worker_lock:
-        if _global_worker is None or not _global_worker.worker_thread.is_alive():
+        if (
+            _global_worker is None
+            or _global_worker.worker_thread is None
+            or not _global_worker.worker_thread.is_alive()
+        ):
             logger.info("starting kernel-agent fully-async rollout worker")
             client_concurrency = get_sglang_client_concurrency(args)
             group_concurrency = _get_group_concurrency(args, client_concurrency)
@@ -112,7 +117,11 @@ def _get_global_worker(args, data_buffer) -> KernelAgentAsyncRolloutWorker:
                 data_buffer,
                 concurrency=group_concurrency,
             )
+            # Install the first context before the thread can consume a prompt.
+            _global_worker.set_generation_context(rollout_id)
             _global_worker.start()
+        else:
+            _global_worker.set_generation_context(rollout_id)
         return _global_worker
 
 
@@ -144,6 +153,64 @@ class KernelAgentAsyncRolloutWorker:
         self.completed_count = 0
         self.aborted_count = 0
         self.exception_count = 0
+        # The collector thread advances this context at each rollout boundary,
+        # while the background event loop snapshots it for each fresh request.
+        # Keep rollout_step and generation weight version as an atomic pair.
+        self._generation_context_lock = threading.Lock()
+        self._rollout_step: int | None = None
+        self._gen_weight_version: int | None = None
+
+    def set_generation_context(self, rollout_id: int) -> None:
+        rollout_step = compute_rollout_step(self.args, rollout_id)
+        gen_weight_version = getattr(self.args, "gen_weight_version", None)
+        with self._generation_context_lock:
+            self._rollout_step = rollout_step
+            self._gen_weight_version = gen_weight_version
+
+    def _stamp_group_for_submission(self, group: RolloutGroup) -> None:
+        with self._generation_context_lock:
+            rollout_step = self._rollout_step
+            gen_weight_version = self._gen_weight_version
+        if rollout_step is None:
+            raise RuntimeError("kernel-agent fully-async generation context was not initialized")
+
+        for sample in group:
+            metadata = dict(sample.metadata or {})
+            metadata["rollout_step"] = rollout_step
+            if gen_weight_version is None:
+                metadata.pop("gen_weight_version", None)
+            else:
+                # An aborted fully-async request is regenerated from scratch,
+                # so a requeued prompt must be restamped for the new attempt.
+                metadata["gen_weight_version"] = gen_weight_version
+            sample.metadata = metadata
+
+    @staticmethod
+    def _reconcile_engine_weight_versions(task_group: RolloutTaskResult) -> None:
+        """Prefer the engine-reported version over the submission snapshot.
+
+        Weight updates pause the engines, but the persistent worker can already
+        have a request waiting when generation resumes. SGLang's response-side
+        weight_version is therefore the authoritative version for completed
+        output; the submission stamp remains a fallback for custom generators
+        that do not preserve that field.
+        """
+        for sample in _iter_samples(task_group):
+            if not sample.weight_versions:
+                continue
+            try:
+                versions = {int(version) for version in sample.weight_versions}
+            except (TypeError, ValueError):
+                continue
+            if len(versions) != 1:
+                logger.warning(
+                    "kernel-agent fully-async sample %s spans engine weight versions %s; " "keeping submission stamp",
+                    sample.index,
+                    sorted(versions),
+                )
+                continue
+            sample.metadata = dict(sample.metadata or {})
+            sample.metadata["gen_weight_version"] = versions.pop()
 
     def start(self) -> None:
         if self.worker_thread is None or not self.worker_thread.is_alive():
@@ -214,6 +281,7 @@ class KernelAgentAsyncRolloutWorker:
                     for group in groups:
                         gid = gid_counter
                         gid_counter += 1
+                        self._stamp_group_for_submission(group)
                         original_group = copy.deepcopy(group)
                         task = asyncio.create_task(
                             generate_and_rm_group(
@@ -279,6 +347,7 @@ class KernelAgentAsyncRolloutWorker:
                 except Exception:  # noqa: BLE001
                     logger.exception("kernel-agent fully-async: failed to requeue aborted input group")
                 return
+            self._reconcile_engine_weight_versions(result)
             self.output_queue.put((gid, result))
             self.completed_count += 1
 
@@ -300,7 +369,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         assert int(max_turns) >= 1, "--max-turns must be >= 1"
     filter_by_last_turn = use_multi_turn and getattr(args, "filter_by_last_turn", False)
 
-    worker = _get_global_worker(args, data_buffer)
+    worker = _get_global_worker(args, data_buffer, rollout_id)
     target = args.rollout_batch_size
     logger.info(
         "kernel-agent fully-async rollout %d: target=%d queue_warm=%d",

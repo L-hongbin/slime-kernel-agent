@@ -748,6 +748,12 @@ def _sample_for_turn(
         if getattr(args, "sglang_speculative_algorithm", None):
             turn_sample.spec_info.add(meta_info=meta_info)
         turn_sample.prefix_cache_info.add(meta_info=meta_info)
+        # Preserve SGLang's response-side version so the persistent fully-async
+        # worker can stamp the policy that actually generated this turn. This
+        # can differ from its submission snapshot when a request waited across
+        # a pause -> weight update -> continue boundary.
+        if "weight_version" in meta_info:
+            turn_sample.weight_versions.append(meta_info["weight_version"])
         # V4 MoE routing replay: decode this call's routed-expert indices into the
         # turn sample (mirrors the default rollout, sglang_rollout.py; row count
         # must be len(tokens)-1 per the upstream shape contract, THUDM/slime
