@@ -961,5 +961,57 @@ def test_kernel_agent_metrics_keep_selected_detail_env_time_and_omit_compile_tim
     assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)
 
 
+def test_single_turn_kernel_metrics_include_turn_zero_correctness():
+    from slime.ray.rollout import compute_metrics_from_samples
+
+    samples = [
+        Sample(
+            index=0,
+            response="correct",
+            response_length=1,
+            status=Sample.Status.COMPLETED,
+            metadata={
+                "turn_idx": 0,
+                "env_extra_info": {
+                    "correctness": True,
+                    "compilation": True,
+                    "speedup": 1.5,
+                    "decoy_kernel": False,
+                },
+            },
+        ),
+        Sample(
+            index=1,
+            response="decoy",
+            response_length=1,
+            status=Sample.Status.COMPLETED,
+            metadata={
+                "turn_idx": 0,
+                "env_extra_info": {
+                    "correctness": True,
+                    "compilation": True,
+                    "speedup": 1.0,
+                    "decoy_kernel": True,
+                },
+            },
+        ),
+    ]
+    args = SimpleNamespace(
+        use_multi_turn=False,
+        max_turns=1,
+        advantage_estimator="ppo",
+        sglang_speculative_algorithm=None,
+        log_reward_category=None,
+    )
+
+    metrics = compute_metrics_from_samples(args, samples)
+
+    assert metrics["kernel/turn0/correctness"] == pytest.approx(0.5)
+    assert metrics["kernel/turn0/compilation"] == 1.0
+    assert metrics["kernel/turn0/speedup"] == pytest.approx(1.25)
+    assert metrics["kernel/turn0/fast@1"] == pytest.approx(0.5)
+    assert not any(key.startswith("kernel/trajectory/") for key in metrics)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

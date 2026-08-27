@@ -1676,7 +1676,13 @@ def compute_metrics_from_samples(args, samples):
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_kernel_agent_metrics(samples)
-    if getattr(args, "use_multi_turn", False):
+    # Kernel-agent samples keep a turn index even in true single-turn mode.  Emit
+    # per-turn metrics whenever that provenance is present; only the trajectory
+    # metrics inside _compute_kernel_multi_turn_metrics require max_turns > 1.
+    has_turn_metadata = any(
+        isinstance(getattr(sample, "metadata", None), dict) and "turn_idx" in sample.metadata for sample in samples
+    )
+    if getattr(args, "use_multi_turn", False) or has_turn_metadata:
         log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
