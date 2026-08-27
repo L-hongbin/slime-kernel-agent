@@ -895,7 +895,7 @@ def test_normalize_env_feedback_extra_info_defaults_missing_decoy_kernel():
     assert env_extra_info["decoy_kernel"] is False
 
 
-def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
+def test_kernel_agent_metrics_keep_selected_detail_env_time_and_omit_compile_time():
     from slime.ray.rollout import _compute_kernel_agent_metrics
 
     samples = [
@@ -954,8 +954,7 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
 
     metrics = _compute_kernel_agent_metrics(samples)
 
-    assert metrics["kernel/time/detail_env_time/compile_time/count"] == 2
-    assert metrics["kernel/time/detail_env_time/compile_time/p50"] == pytest.approx(2.0)
+    assert not any(key.startswith("kernel/time/detail_env_time/compile_time/") for key in metrics)
     assert metrics["kernel/time/detail_env_time/kernel_runtime/mean"] == pytest.approx(20.0)
     assert metrics["kernel/time/detail_env_time/profile_time/sum"] == pytest.approx(400.0)
     assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)

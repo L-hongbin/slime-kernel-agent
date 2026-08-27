@@ -35,6 +35,14 @@ correctness_timeout = (
 )
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
+# Optional reward for a candidate that compiled, completed its forward pass,
+# and reached KernelGym's shape/value comparison but produced a wrong output.
+# Default off so other launchers keep their historical reward policy; the
+# Qwen3.8 production launcher opts into the reviewed 0.25 policy explicitly.
+output_mismatch_partial_reward = float(os.environ.get("CUDA_AGENT_OUTPUT_MISMATCH_PARTIAL_REWARD", 0.0))
+performance_reward_requires_correctness = bool(
+    int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
+)
 
 CUDA_AGENT_CONFIGS = {
     "max_feedback_chars": 0,
@@ -87,7 +95,7 @@ CUDA_AGENT_CONFIGS = {
     "reward": {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
-        "speedup_reward_upper_bound": 3.0,
+        "speedup_reward_upper_bound": 2.0,
         "speedup_reward_lower_bound": 0.0,
         "penalty_score": 0,
         "compilation_fail_penalty": 0,
@@ -97,5 +105,7 @@ CUDA_AGENT_CONFIGS = {
         "coverage_reward_enable": True,
         "coverage_reward_type": "time_coverage",
         "coverage_reward_weight": 0.5,
+        "output_mismatch_partial_reward": output_mismatch_partial_reward,
+        "performance_reward_requires_correctness": performance_reward_requires_correctness,
     },
 }

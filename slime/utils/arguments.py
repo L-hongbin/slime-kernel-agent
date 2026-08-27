@@ -2038,6 +2038,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Maximum reward subtraction applied by --overlong-penalty.",
             )
             parser.add_argument(
+                "--overlong-use-effective-response-cap",
+                action="store_true",
+                default=False,
+                help=(
+                    "Compute the overlong window from min(response cap, context cap - prompt length). "
+                    "Opt in when the serving response limit is clamped by the remaining context."
+                ),
+            )
+            parser.add_argument(
                 "--use-conditional-truncation-mask",
                 action="store_true",
                 default=False,

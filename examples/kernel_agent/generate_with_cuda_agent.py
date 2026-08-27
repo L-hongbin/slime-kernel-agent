@@ -31,7 +31,7 @@ from slime.utils.types import Sample
 try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from .kernel_reward import calculate_reward
+    from .kernel_reward import calculate_reward, calculate_reward_speedup
     from .utils import (
         _extract_env_extra_info,
         normalize_env_feedback,
@@ -42,7 +42,7 @@ try:
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from kernel_reward import calculate_reward
+    from kernel_reward import calculate_reward, calculate_reward_speedup
 
     from utils import (
         _extract_env_extra_info,
@@ -366,7 +366,7 @@ def _log_rollout_info(
             "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s "
             "response_tokens=%s "
             "finish_type=%s status=%s error=%s precheck=%s speedup=%s correctness=%s compiled=%s "
-            "reward=%s detail_env_time=%s perf_cv=%s",
+            "partial_credit=%s partial_reason=%s reward=%s detail_env_time=%s perf_cv=%s",
             prefix,
             item.get("turn_idx"),
             item.get("task_id"),
@@ -382,6 +382,8 @@ def _log_rollout_info(
             env_state.get("speedup"),
             env_state.get("correctness"),
             env_state.get("compiled"),
+            env_extra_info.get("partial_credit_output_mismatch"),
+            env_extra_info.get("partial_credit_output_mismatch_reason"),
             reward,
             _format_log_value(detail_env_time, log_max_chars),
             _format_log_value(perf_cv, log_max_chars),
@@ -1202,7 +1204,25 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
     def get_reward(sample: Sample):
         if sample.reward is not None:
             return sample.reward
-        return calculate_reward(sample.metadata.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
+        metadata = dict(sample.metadata or {})
+        env_result = metadata.get("env_result") if isinstance(metadata.get("env_result"), dict) else {}
+        env_state = env_result.get("env_state") if isinstance(env_result.get("env_state"), dict) else {}
+        reward_details = calculate_reward_speedup(env_state, CUDA_AGENT_CONFIGS["reward"])
+
+        partial_applied = bool(reward_details["partial_credit_output_mismatch"])
+        partial_reason = str(reward_details["partial_credit_output_mismatch_reason"])
+        metadata.update(
+            {
+                "partial_credit_output_mismatch": partial_applied,
+                "partial_credit_output_mismatch_reason": partial_reason,
+            }
+        )
+        env_extra_info = metadata.get("env_extra_info")
+        if isinstance(env_extra_info, dict):
+            env_extra_info["partial_credit_output_mismatch"] = partial_applied
+            env_extra_info["partial_credit_output_mismatch_reason"] = partial_reason
+        sample.metadata = metadata
+        return float(reward_details["reward"])
 
     if isinstance(samples, list):
         return [get_reward(sample) for sample in samples]

@@ -79,6 +79,21 @@ COMPILE_ARTIFACT_POP_KEYS = (
     "device",
 )
 
+INCORRECT_BACKEND_PROBE_KEEP_KEYS = (
+    "backend",
+    "attempted",
+    "num_forwards",
+    "valid",
+    "custom_kernel_observed",
+    "decoy_detected",
+    "skip_reason",
+    "error",
+    "num_total_kernels",
+    "num_matched_custom_kernels",
+    "matched_kernel_names",
+    "missing_kernel_names",
+)
+
 
 def _format_compilation_error_message(env_state: dict[str, Any]) -> str:
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
@@ -187,6 +202,7 @@ def _extract_env_extra_info(env_state: dict[str, Any]) -> dict[str, Any]:
     detail_env_time = _extract_detail_env_time(env_state)
     kernel_perf_cv = _coefficient_of_variation(metadata, "kg_kernel_perf_mean_ms", "kg_kernel_perf_std_ms")
     refer_perf_cv = _coefficient_of_variation(metadata, "kg_reference_perf_mean_ms", "kg_reference_perf_std_ms")
+    incorrect_backend_probe = metadata.get("incorrect_backend_usage_probe")
 
     env_extra_info = {
         "time_coverage": float(f"{time_coverage:.2f}"),
@@ -195,9 +211,29 @@ def _extract_env_extra_info(env_state: dict[str, Any]) -> dict[str, Any]:
         "compilation": _require_env_value(env_state, "compiled", "env_state"),
         "speedup": _require_env_value(env_state, "speedup", "env_state"),
         "decoy_kernel": bool(env_state.get("decoy_kernel", False)),
+        "correctness_candidate_forward_completed": bool(
+            metadata.get("correctness_candidate_forward_completed", False)
+        ),
+        "correctness_output_mismatch": bool(metadata.get("correctness_output_mismatch", False)),
         "precheck": env_state.get("precheck"),
         "detail_env_time": detail_env_time,
     }
+    decoy_reason = metadata.get("decoy_reason") or metadata.get("policy_violation_reason")
+    if isinstance(decoy_reason, str) and decoy_reason:
+        env_extra_info["decoy_reason"] = decoy_reason
+    if isinstance(incorrect_backend_probe, dict):
+        for source_key, target_key in (
+            ("attempted", "incorrect_backend_probe_attempted"),
+            ("valid", "incorrect_backend_probe_valid"),
+            ("custom_kernel_observed", "incorrect_backend_probe_custom_kernel_observed"),
+            ("decoy_detected", "incorrect_backend_probe_decoy_detected"),
+        ):
+            value = incorrect_backend_probe.get(source_key)
+            if isinstance(value, bool):
+                env_extra_info[target_key] = value
+        skip_reason = incorrect_backend_probe.get("skip_reason")
+        if isinstance(skip_reason, str) and skip_reason:
+            env_extra_info["incorrect_backend_probe_skip_reason"] = skip_reason
     if isinstance(kernel_perf_cv, (int, float)) and not isinstance(kernel_perf_cv, bool):
         env_extra_info["kernel_perf_cv"] = float(kernel_perf_cv)
     if isinstance(refer_perf_cv, (int, float)) and not isinstance(refer_perf_cv, bool):
@@ -298,11 +334,18 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
+        runtime_error = metadata.get("runtime_error")
         if "device_info" in metadata:
             for key in ("gpu_name", "hardware"):
                 metadata.pop(key, None)
         for key in METADATA_POP_KEYS:
             metadata.pop(key, None)
+        if runtime_error:
+            # Preserve only a bounded correctness-stage summary after removing
+            # KernelGym's raw runtime field. The Qwen mismatch reward consumes
+            # this guard after normalization; multi-turn feedback does not need
+            # an unbounded duplicate of the error payload.
+            metadata["correctness_runtime_error"] = str(runtime_error)[:512]
         for key in list(metadata):
             if key.startswith(("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_")):
                 metadata.pop(key, None)
@@ -310,6 +353,13 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
                 metadata.pop(key, None)
         if "entry_point" in metadata:
             metadata["refer_entry_point"] = metadata.pop("entry_point")
+        incorrect_backend_probe = metadata.get("incorrect_backend_usage_probe")
+        if isinstance(incorrect_backend_probe, dict):
+            metadata["incorrect_backend_usage_probe"] = {
+                key: incorrect_backend_probe[key]
+                for key in INCORRECT_BACKEND_PROBE_KEEP_KEYS
+                if key in incorrect_backend_probe
+            }
         compile_artifact = metadata.get("compile_artifact")
         if isinstance(compile_artifact, dict):
             compile_artifact = dict(compile_artifact)
@@ -805,10 +855,12 @@ def _set_multi_turn_rewards(args, output_samples: list[Sample], finish_reason: s
 
 def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
     """DAPO-style soft overlong penalty: linear ramp over the last
-    ``overlong_buffer_len`` response tokens, capped at ``-factor`` at
-    ``rollout_max_response_len``. Applied to per-turn ``sample.reward`` AFTER
-    coverage-RS and BEFORE multi-turn accumulation, so TRLOO trains on the
-    penalized reward. The PRE-penalty reward is recorded in
+    ``overlong_buffer_len`` tokens of each sample's effective response budget,
+    capped at ``-factor`` at that budget. The effective budget is the smaller
+    of ``rollout_max_response_len`` and ``rollout_max_context_len-prompt_len``;
+    this matters when context and response are both configured to 24K. Applied
+    to per-turn ``sample.reward`` before multi-turn accumulation, so TRLOO
+    trains on the penalized reward. The PRE-penalty reward is recorded in
     ``metadata["task_reward"]``: the group low-variance filter judges on it, so
     lengthy-but-task-uniform (e.g. all-fail) groups are discarded exactly as
     without the penalty — the penalty only shapes advantages of groups that
@@ -817,23 +869,31 @@ def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
         return
     buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
     factor = float(getattr(args, "overlong_penalty_factor", 1.0))
-    cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
-    if buffer_len <= 0 or factor <= 0 or cap <= 0:
+    response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
+    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0)
+    if buffer_len <= 0 or factor <= 0 or response_cap <= 0:
         return
 
-    threshold = cap - buffer_len
     for sample in output_samples:
         if sample.remove_sample:
             continue
-        resp_len = int(getattr(sample, "response_length", 0) or 0)
-        exceed = resp_len - threshold
-        if exceed <= 0:
-            continue
-        penalty = factor * min(1.0, exceed / buffer_len)
         sample.metadata = dict(sample.metadata or {})
-        sample.metadata["task_reward"] = float(sample.reward)
-        sample.reward = float(sample.reward) - penalty
+        task_reward = float(sample.reward)
+        sample.metadata["task_reward"] = task_reward
+        resp_len = int(getattr(sample, "response_length", 0) or 0)
+        tokens = getattr(sample, "tokens", None)
+        prompt_len = max(0, len(tokens) - resp_len) if isinstance(tokens, (list, tuple)) else 0
+        effective_cap = response_cap
+        if getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
+            effective_cap = min(effective_cap, max(1, context_cap - prompt_len))
+        effective_buffer_len = min(buffer_len, effective_cap)
+        threshold = effective_cap - effective_buffer_len
+        exceed = resp_len - threshold
+        penalty = factor * min(1.0, max(0, exceed) / effective_buffer_len)
+        sample.reward = task_reward - penalty
         sample.metadata["overlong_penalty"] = penalty
+        sample.metadata["overlong_prompt_len"] = prompt_len
+        sample.metadata["overlong_effective_response_cap"] = effective_cap
 
 
 def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
