@@ -1,0 +1,45 @@
+From 8f650a1894b08763f635146c7a38a007f4a5e069 Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 18:07:03 +0900
+Subject: [PATCH 13/13] port: scope idle-LoRA prep to the triton backend (codex
+ final review)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Mirror decode_cuda_graph_runner's triton-only guard: csgmv/chunked prep
+raises on IDLE forward mode (generate_sequence_lengths), so csgmv is
+idle-unsafe under dp-attention either way — with the guard it keeps the
+(pre-existing) stale-state hazard instead of a new hard raise. All
+validated launchers run --lora-backend triton; the b74c776 fix claim is
+scoped to that backend.
+---
+ .../sglang/srt/model_executor/runner/eager_runner.py | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index 0068b99..bd60262 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -416,8 +416,16 @@ class EagerRunner(BaseRunner):
+         # the EAGER idle path (IDLE is a cuda-graph forward MODE, so the
+         # forward-construction prep targeted the static graph buffers and left the
+         # eager state stale). Mirrors the decode cuda-graph runner's idle-LoRA
+-        # refresh (decode_cuda_graph_runner.py).
+-        if model_runner.lora_enabled:
++        # refresh (decode_cuda_graph_runner.py) INCLUDING its triton-only guard:
++        # the chunked/csgmv backend's prep raises on IDLE forward mode
++        # (generate_sequence_lengths: "Unsupported forward mode"), so csgmv is
++        # idle-unsafe EITHER WAY under dp-attention — skipping leaves the stale
++        # state this fix removes, preparing raises. Only the triton backend is
++        # validated for LoRA + dp-attention idle forwards.
++        if (
++            model_runner.lora_enabled
++            and getattr(model_runner.lora_manager.lora_backend, "name", "") == "triton"
++        ):
+             if not forward_batch.lora_ids:
+                 forward_batch.lora_ids = [None] * forward_batch.batch_size
+             model_runner.lora_manager.prepare_lora_batch(
+-- 
+2.43.0
+

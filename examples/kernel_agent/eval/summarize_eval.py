@@ -24,7 +24,7 @@ If the dump does not contain Best* metrics, this script warns and falls back to
 group_id-based trajectory aggregation. If there is no group_id, Best* metrics are
 not computed.
 
-Usage: python3 examples/kernel_agent/summarize_eval.py <EVAL_DIR | dump.pt> [--fast 1.0 1.2] [--max-turns N]
+Usage: python3 examples/kernel_agent/eval/summarize_eval.py <EVAL_DIR | dump.pt> [--fast 1.0 1.2] [--max-turns N]
 """
 
 import argparse
@@ -68,6 +68,25 @@ def _env_state(sample: dict):
 def _metadata(sample: dict) -> dict:
     meta = sample.get("metadata") or {}
     return meta if isinstance(meta, dict) else {}
+
+
+def _is_truncated(sample: dict) -> bool:
+    """Return whether a dumped sample ended because generation was truncated."""
+    status = sample.get("status")
+    if hasattr(status, "value"):
+        status = status.value
+    return str(status).strip().lower() in {"truncated", "status.truncated", "sample.status.truncated"}
+
+
+def _partition_by_metadata(samples: list[dict], key: str) -> dict[str, list[dict]]:
+    """Partition samples by one metadata value using stable string labels."""
+
+    groups: dict[str, list[dict]] = {}
+    for sample in samples:
+        value = _metadata(sample).get(key)
+        label = "<missing>" if value is None else str(value)
+        groups.setdefault(label, []).append(sample)
+    return groups
 
 
 def _env_extra_info(sample: dict) -> dict | None:
@@ -254,6 +273,9 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             turn_out[f"Fast@{t:g}"] = prate(counts["fast"][t])
             turn_out[f"fast@{t:g}_count"] = counts["fast"][t]
         out["per_turn"][turn_count] = turn_out
+    # Cumulative best after at most k turns. Keep this alongside the single-turn
+    # table: the former answers "did any attempt up through k work?", while the
+    # latter makes regressions or gains in the feedback turns visible.
     out["best_by_turn"] = {}
     for turn_count, counts in best_by_turn.items():
         turn_out = {
@@ -289,6 +311,7 @@ def _add_best_counts(counts, metrics_list, fast_thresholds):
 def summarize(samples, fast_thresholds):
     total = len(samples)
     compiled = correct = missing = 0
+    truncated = sum(_is_truncated(sample) for sample in samples)
     fast = {t: 0 for t in fast_thresholds}
     for s in samples:
         es = _env_state(s)
@@ -316,6 +339,8 @@ def summarize(samples, fast_thresholds):
         "Compile": rate(compiled),
         "correct_count": correct,
         "Correct": rate(correct),
+        "truncated_count": truncated,
+        "TruncatedRatio": rate(truncated),
     }
     for t in fast_thresholds:
         out[f"Fast@{t:g}"] = rate(fast[t])
@@ -363,6 +388,10 @@ def _detected_turns(samples) -> int:
 def _print_debug_header(dumps, samples, base, group, args):
     print(f"dumps: {len(dumps)} -> {dumps}")
     print(f"samples: {base['total']}  (missing env_result: {base['missing_env_result']})")
+    print(
+        f"truncated: {base['truncated_count']}/{base['total']} "
+        f"({base['TruncatedRatio'] * 100:.2f}%)"
+    )
     configured = "auto" if args.max_turns is None else str(args.max_turns)
     print(f"turns: configured max-turns={configured}, detected={_detected_turns(samples)}")
     if group is not None:
@@ -442,6 +471,11 @@ def main():
     ap.add_argument("path", help="EVAL_DIR (…/dumps/rollout_data) or an eval_*.pt file")
     ap.add_argument("--fast", type=float, nargs="+", default=list(FAST_DEFAULT))
     ap.add_argument("--max-turns", type=int, default=None, help="Maximum turns for the per-turn table columns.")
+    ap.add_argument(
+        "--group-by-metadata",
+        default=None,
+        help="Print one independent summary per value of this sample.metadata key.",
+    )
     args = ap.parse_args()
 
     dumps = _find_dumps(args.path)
@@ -454,18 +488,24 @@ def main():
         samples.extend(obj.get("samples", []) if isinstance(obj, dict) else obj)
 
     fast_thresholds = tuple(args.fast)
-    base = summarize(samples, fast_thresholds)
-    group = None
-    if not _is_single_turn(samples, max_turns=args.max_turns):
-        group = _summarize_group_best(samples, fast_thresholds, max_turns=args.max_turns)
-        if group is None:
-            print(
-                "note: multi-turn dump but no group_id found; per-turn/best columns unavailable.",
-                file=sys.stderr,
-            )
+    partitions = _partition_by_metadata(samples, args.group_by_metadata) if args.group_by_metadata else {"": samples}
+    for idx, (label, partition) in enumerate(sorted(partitions.items())):
+        if idx:
+            print()
+        if args.group_by_metadata:
+            print(f"=== {args.group_by_metadata}={label} ===")
+        base = summarize(partition, fast_thresholds)
+        group = None
+        if not _is_single_turn(partition, max_turns=args.max_turns):
+            group = _summarize_group_best(partition, fast_thresholds, max_turns=args.max_turns)
+            if group is None:
+                print(
+                    "note: multi-turn dump but no group_id found; per-turn/best columns unavailable.",
+                    file=sys.stderr,
+                )
 
-    _print_debug_header(dumps, samples, base, group, args)
-    _print_oneline_table(group, base, fast_thresholds)
+        _print_debug_header(dumps, partition, base, group, args)
+        _print_oneline_table(group, base, fast_thresholds)
 
 
 if __name__ == "__main__":

@@ -13,18 +13,16 @@ Zero interruption means the user is never interrupted for a decision — it does
 
 When this mode starts, send one page confirming: the active mode (self-decide), the heartbeat cadence (every 3 hours), and the immediate next objective. This confirms the run actually entered the intended unattended mode. Mark it STARTED.
 
-## Codex review
+## Independent review
 
-Use Codex (xhigh effort) to review each milestone before reporting it as reached. You may also discuss issues with Codex as they come up — treat it as a second opinion inside the decision procedure below; note in the decision page when Codex agreed, disagreed, or changed your choice.
-
-**Timeout:** Codex review is required but must not wedge the run. If Codex is unavailable, errors out, or stays silent for more than 30 minutes on a milestone review (15 minutes on an issue discussion), then: do an adversarial self-review of the same evidence where that is safe, record "Codex review timed out; self-review substituted" in the milestone record, and page the user with that fact. The timeout unblocks reviews only — it never authorizes skipping safety-critical checks or the destructive-action boundary below.
+Use the `cross-model-review` skill as the required gate before each MILESTONE page. You may also use it as a second opinion inside the decision procedure below; note in the DECIDED page when its verified findings agreed with, disagreed with, or changed your choice. Follow that skill's timeout and fallback rules without using them to bypass safety-critical checks or the destructive-action boundary below.
 
 ## When to page
 
 You never wait on the user. Page (via `mcp__page-user__page_user`) when any of these holds:
 
 - **You make a significant decision** — one involving ambiguity where the choice changes the outcome, a risky or irreversible action, a scope change, evidence that contradicts stated assumptions, or a repeated failure whose candidate fixes have materially different trade-offs. Concretely in this project, significant includes: changing training hyperparameters, sampling config, loss scaling, or optimizer behavior; switching checkpoint source, precision mode, or kernel path; relaxing or skipping a validation gate; changing cleanup behavior; or spending another expensive full-loop run after repeated failures. Decide it yourself first, execute, and send the DECIDED page immediately as its own message: what was decided, the problem and key evidence, the reasoning and the strongest rejected alternative, and the impact on plan or risk. Minor operational choices (retry counts, log verbosity, poll cadence, which node hosts a smoke test) batch into the next heartbeat.
-- **You reach a milestone** — after the Codex review passes (or times out per above), page with the milestone result, decisions made along the way, and what comes next.
+- **You reach a milestone** — after the cross-model review passes (or its documented timeout fallback completes), page with the milestone result, decisions made along the way, and what comes next.
 - **Every 3 hours** — a heartbeat with current status, progress since the last page, and batched minor decisions.
 
 Mark each page as STARTED, DECIDED, MILESTONE, or HEARTBEAT. No page is a question; if the user disagrees with a decision, they will reply and you adjust then.

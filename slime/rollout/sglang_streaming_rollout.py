@@ -32,6 +32,7 @@ from typing import Any
 from slime.observability.trace_utils import build_sglang_meta_trace_attrs, trace_span
 from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids
 from slime.utils import http_utils
+from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.types import Sample
 
@@ -75,6 +76,13 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     }
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
+
+    # Route to the currently-served (alternating) LoRA adapter, mirroring the
+    # non-streaming generate(); the active name is refreshed onto the shared
+    # GenerateState by the RolloutManager each step. None -> base-only serving.
+    lora_path = _rollout_lora_path(args, state.active_lora_name)
+    if lora_path is not None:
+        payload["lora_path"] = lora_path
 
     images = sample.multimodal_inputs.get("images") if sample.multimodal_inputs else None
     if images:

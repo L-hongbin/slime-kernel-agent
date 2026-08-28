@@ -186,6 +186,7 @@ class FakeGenerateState:
         self.tokenizer = FakeTokenizer()
         self.multi_turn_template = None
         self.apply_chat_template_kwargs = {}
+        self.active_lora_name = None
 
     def _is_qwen3_5_model(self):
         return False
@@ -313,7 +314,7 @@ def _install_fake_generate_state() -> None:
 
 
 def _install_fake_model(response: str) -> None:
-    async def fake_post(url, payload):
+    async def fake_post(url, payload, max_retries=None):
         token_ids = list(range(1, len(response.split()) + 1))
         return {
             "text": response,
@@ -449,7 +450,7 @@ async def _run(args) -> None:
             sglang_server_concurrency=args.sglang_server_concurrency,
             rollout_num_gpus=args.rollout_num_gpus,
             rollout_num_gpus_per_engine=args.rollout_num_gpus_per_engine,
-            rollout_temperature=0.0,
+            rollout_temperature=args.rollout_temperature,
             rollout_top_p=1.0,
             rollout_top_k=-1,
             rollout_max_response_len=args.max_new_tokens,
@@ -478,11 +479,17 @@ async def _run(args) -> None:
             coverage_rs_threshold=args.coverage_rs_threshold,
             coverage_rs_factor=args.coverage_rs_factor,
         )
-        sampling_params = {"max_new_tokens": args.max_new_tokens, "temperature": 0.0}
+        sampling_params = {
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.rollout_temperature,
+            "top_p": 1.0,
+            "top_k": -1,
+        }
 
         if use_real_model:
             init_http_client(rollout_args)
-        output_samples = await generate_with_cuda_agent.generate(rollout_args, sample, sampling_params)
+        output = await generate_with_cuda_agent.generate(rollout_args, sample, sampling_params)
+        output_samples = output if isinstance(output, list) else [output]
         state = generate_with_cuda_agent.GenerateState(rollout_args)
         tool_response_template = generate_with_cuda_agent._get_tool_response_template(state)
         print(f"\n[cuda_agent][generate_smoke] output_samples={len(output_samples)}")
@@ -545,6 +552,7 @@ def parse_args():
     parser.add_argument("--compiled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-turns", type=int, default=2)
     parser.add_argument("--max-new-tokens", type=int, default=256)
+    parser.add_argument("--rollout-temperature", type=float, default=0.0)
     parser.add_argument("--max-feedback-chars", type=int, default=0)
     parser.add_argument(
         "--multi-turn-prompt-config-path",

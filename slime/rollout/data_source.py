@@ -139,11 +139,21 @@ class RolloutDataSource(DataSource):
         if not self.args.rollout_global_dataset:
             return
 
-        if self.args.load is None:
+        explicit_load_root = getattr(self.args, "rollout_dataset_load", None)
+        load_root = explicit_load_root
+        if load_root is None:
+            load_root = self.args.load
+
+        if load_root is None:
             return
 
-        path = os.path.join(self.args.load, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = os.path.join(load_root, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
         if not os.path.exists(path):
+            if explicit_load_root is not None:
+                raise FileNotFoundError(
+                    "explicit rollout dataset checkpoint does not exist: "
+                    f"{path}. Refusing to reset the prompt cursor silently."
+                )
             logger.info(f"Checkpoint {path} does not exist.")
             return
 

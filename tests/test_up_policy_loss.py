@@ -1,6 +1,9 @@
+import pytest
 import torch
 
-from slime.utils.ppo_utils import compute_policy_loss, compute_up_policy_loss
+from slime.utils.ppo_utils import compute_policy_loss_output, compute_up_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_up_uses_unclipped_logprob_loss_for_positive_advantages():
@@ -35,7 +38,7 @@ def test_up_keeps_ppo_clipped_objective_for_non_positive_advantages():
         eps_clip_high=0.28,
         eps_clip_c=2.0,
     )
-    ppo_output = compute_policy_loss(
+    ppo_output = compute_policy_loss_output(
         old_log_probs - log_probs,
         advantages,
         eps_clip=0.2,
@@ -45,3 +48,7 @@ def test_up_keeps_ppo_clipped_objective_for_non_positive_advantages():
 
     for key in ["pg_losses", "pg_clipfrac", "pg_upper_clipfrac", "pg_lower_clipfrac"]:
         torch.testing.assert_close(up_output[key], ppo_output[key])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

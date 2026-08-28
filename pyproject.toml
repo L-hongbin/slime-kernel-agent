@@ -37,6 +37,13 @@ ignore = [
     "E501", # Line too long # TODO handle it later
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# TileLang kernel DSL + bench/parity scripts: F821 is the DSL's injected kernel
+# variables (T.Kernel block/thread bindings); B023/E731/E741 etc. are bench-loop
+# closure patterns in measurement scripts. Do not "fix" validated kernel code to
+# satisfy lint.
+"custom_kernels/deepseek_v4/**" = ["F821", "B023", "B905", "B007", "E731", "E741", "F841"]
+
 [tool.pytest.ini_options]
 # durations=0 will display all tests execution time, sorted in ascending order starting from from the slowest one.
 # -vv will also display tests with duration = 0.00s

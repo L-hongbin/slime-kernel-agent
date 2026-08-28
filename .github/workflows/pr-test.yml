@@ -723,6 +723,30 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_kernel_agent_fully_async_rollout.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_kernel_agent_partial_reward.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_kernelgym_health_backoff.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_megatron_mtp_zero_token_patch.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_fla_varlen_autotune_patch.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_rolling_checkpoint_archiver.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_rollout_sample_hooks.py"
             },
             {

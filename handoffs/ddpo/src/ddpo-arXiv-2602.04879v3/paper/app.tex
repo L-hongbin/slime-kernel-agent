@@ -1,0 +1,589 @@
+\section{Trust Region in LLMs}
+\label{app:llm_tr_proof}
+
+\subsection{Proof of Performance Difference Identity}
+
+\begin{proof}[Proof of \Cref{lem:llm_identity}]  
+We begin by expressing the difference in expected returns by its definition:  
+\begin{align*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) 
+&= \mathbb{E}_{y \sim \trainerpi}[R(y)] - \mathbb{E}_{y \sim \rolloutpi}[R(y)] \\
+&= \sum_{y} \big( \trainerpi(y|x) - \rolloutpi(y|x) \big) R(y).
+\end{align*}  
+The core of the proof is to establish an identity for the difference in the probabilities of generating a sequence $y$, $\trainerpi(y|x) - \rolloutpi(y|x)$. We use the following telescoping sum identity, which can be verified by expanding the terms:  
+\begin{align*}  
+\trainerpi(y|x) - \rolloutpi(y|x) &= \sum_{t=1}^{T} \left( \prod_{k=1}^{t-1} \rolloutpi(y_k|s_k) \right) \Big( \trainerpi(y_t|s_t) - \rolloutpi(y_t|s_t) \Big) \left( \prod_{j=t+1}^{T} \trainerpi(y_j|s_j) \right).
+\end{align*}  
+Substituting this identity into the expression for the performance difference yields:  
+\begin{align*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) &= \sum_{y} R(y) \sum_{t=1}^{T}  \left( \prod_{k=1}^{t-1} \rolloutpi(y_k|s_k) \right) \Big( \trainerpi(y_t|s_t) - \rolloutpi(y_t|s_t) \Big) \left( \prod_{j=t+1}^{T} \trainerpi(y_j|s_j) \right) \\  
+&= \sum_{y} \rolloutpi(y|x) R(y) \sum_{t=1}^{T} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \left( \prod_{j=t+1}^{T} \frac{\trainerpi(y_j|s_j)}{\rolloutpi(y_j|s_j)} \right) \\ 
+&= \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{T} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \left( \prod_{j=t+1}^{T} \frac{\trainerpi(y_j|s_j)}{\rolloutpi(y_j|s_j)} \right)  \right] \\
+% \end{align*}  
+% This expression is exact. To derive the final form as stated in the theorem, we add and subtract a term inside the expectation, which corresponds to setting the future policy ratio term, $\frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})}$, to 1.  
+% \begin{align*}  
+% \mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) 
+&= \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \right] \\  
+& \quad - \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \left( 1 -  \prod_{j=t+1}^{T} \frac{\trainerpi(y_j|s_j)}{\rolloutpi(y_j|s_j)}   \right) \right].  
+\end{align*}  
+By identifying the terms with the definitions in the theorem statement, we arrive at:  
+\begin{equation*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) = L_{\rolloutpi}'(\trainerpi) - \Delta(\rolloutpi, \trainerpi),  
+\end{equation*}  
+where  
+\begin{align*}  
+L_{\rolloutpi}'(\trainerpi) &= \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \right], \\  
+\Delta(\rolloutpi, \trainerpi) &= \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \left( 1 - \prod_{j=t+1}^{T} \frac{\trainerpi(y_j|s_j)}{\rolloutpi(y_j|s_j)} \right) \right].  
+\end{align*}  
+This completes the proof.  
+\end{proof}
+
+
+\subsection{Proof of Policy Improvement Bound: Max-Divergence Part}
+
+\begin{lemma}[Bound on Sequence-Level TV Divergence]  
+\label{lem:sequence_tv_bound}  
+Let $\rolloutpi$ and $\trainerpi$ be two policies that generate sequences of length $N$. Let ${\rolloutpi}_N(\cdot|s_1)$ and ${\trainerpi}_N(\cdot|s_1)$ denote the distributions over sequences $y=(y_1, \dots, y_N)$. The total variation (TV) divergence between these sequence distributions is bounded by the sum of the expected single-step TV divergences:  
+\begin{equation*}  
+D_{\mathrm{TV}}\big({\rolloutpi}_N(\cdot|s_1)  \|  {\trainerpi}_N(\cdot|s_1)\big) \le \sum_{t=1}^{N} \mathbb{E}_{s_t \sim \rolloutpi} \left[ D_{\mathrm{TV}}\big(\rolloutpi(\cdot|s_t) \| \trainerpi(\cdot|s_t)\big) \right],  
+\end{equation*}  
+where the expectation is over the state distribution induced by policy $\rolloutpi$.  
+\end{lemma}  
+  
+\begin{proof}  
+Let $P(y) = {\rolloutpi}_N(y|s_1)$ and $Q(y) = {\trainerpi}_N(y|s_1)$.  
+\begin{equation*}  
+    2 D_{\mathrm{TV}}(P \|  Q) = \sum_{y} |P(y) - Q(y)| = \sum_{y} \left| \prod_{t=1}^N \rolloutpi(y_t|s_t) - \prod_{t=1}^N \trainerpi(y_t|s_t) \right|.  
+\end{equation*}  
+We use the algebraic identity $a_1\dots a_N - b_1\dots b_N = \sum_{t=1}^N \left(\prod_{k=1}^{t-1} a_k\right) (a_t - b_t) \left(\prod_{j=t+1}^N b_j\right)$. Applying this to the policy probabilities and then using the triangle inequality, we get:  
+\begin{align*}  
+    2 D_{\mathrm{TV}}(P \|  Q) &\le \sum_{y} \sum_{t=1}^N \left(\prod_{k=1}^{t-1} \rolloutpi(y_k|s_k)\right) |\rolloutpi(y_t|s_t) - \trainerpi(y_t|s_t)| \left(\prod_{j=t+1}^N \trainerpi(y_j|s_j)\right) \\  
+    &= \sum_{t=1}^N \sum_{y} \left(\prod_{k=1}^{t-1} \rolloutpi(y_k|s_k)\right) |\rolloutpi(y_t|s_t) - \trainerpi(y_t|s_t)| \left(\prod_{j=t+1}^N \trainerpi(y_j|s_j)\right).  
+\end{align*}  
+For each term in the outer sum over $t$, we can sum over the variables $y_j$ for $j>t$. Since $\sum_{y_j} \trainerpi(y_j|s_j) = 1$ for all $s_j$, the product of terms for $j>t$ sums to 1 when we integrate out $y_{t+1}, \dots, y_N$. This leaves:  
+\begin{align*}  
+    2 D_{\mathrm{TV}}(P \|  Q) &\le \sum_{t=1}^N \sum_{y_1, \dots, y_t} \left(\prod_{k=1}^{t-1} \rolloutpi(y_k|s_k)\right) |\rolloutpi(y_t|s_t) - \trainerpi(y_t|s_t)| \\  
+    &= \sum_{t=1}^N \sum_{y_1, \dots, y_{t-1}} \left(\prod_{k=1}^{t-1} \rolloutpi(y_k|s_k)\right) \sum_{y_t} |\rolloutpi(y_t|s_t) - \trainerpi(y_t|s_t)|.  
+\end{align*}  
+The inner sum is $2 D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t))$. The outer sum over $y_1, \dots, y_{t-1}$ defines an expectation over states $s_t$ under policy $\rolloutpi$. Thus, we have:  
+\begin{equation*}  
+    2 D_{\mathrm{TV}}(P \|  Q) \le \sum_{t=1}^N \mathbb{E}_{s_t \sim \rolloutpi} \left[ 2 D_{\mathrm{TV}}\big(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)\big) \right].  
+\end{equation*}  
+Dividing by 2 yields the desired result.  
+\end{proof}
+
+
+\begin{proof}[Proof of the max-divergence bound in \Cref{thm:llm_tr_bound}]
+From Lemma \ref{lem:llm_identity}, we start with the exact performance difference identity:  
+\begin{equation*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) = L_{\rolloutpi}'(\trainerpi) - \Delta(\rolloutpi, \trainerpi).  
+\end{equation*}  
+For brevity, we define $y_{\leq t} = \{x, y_1, \dots, y_t \}$ and $y_{>t} = \{y_{t+1}, y_{t+2}, \dots \}$, then we can rewrite $\Delta(\rolloutpi, \trainerpi)$ as:
+\begin{equation*}
+\Delta(\rolloutpi, \trainerpi) = \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \left( 1 - \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})}  \right) \right].  
+\end{equation*}
+Our goal is to find an upper bound for the error term $\Delta(\rolloutpi, \trainerpi)$. We begin by bounding the reward by its maximum absolute value, $\xi = \max_{y} |R(y)|$.  
+\begin{align}  
+\label{eq:delta_bound_intermediate}
+\begin{split}
+\Delta(\rolloutpi, \trainerpi) &\le \xi \cdot \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{T} \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \cdot \left| 1 - \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})} \right| \right] \\  
+&= \xi \cdot \sum_{t=1}^{T} \mathbb{E}_{y_{\le t} \sim \rolloutpi} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \cdot \mathbb{E}_{y_{>t} \sim \rolloutpi(\cdot|s_{t+1})} \left[ \left| 1 - \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})} \right| \right] \right].  
+\end{split}
+\end{align}  
+The inner expectation is exactly twice the TV divergence between the distributions over future trajectories:  
+\begin{equation*}  
+\mathbb{E}_{y_{>t} \sim \rolloutpi(\cdot|s_{t+1})} \left[ \left| 1 - \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})} \right| \right] = 2 D_{\mathrm{TV}}\big({\rolloutpi}_{>t}(\cdot|s_{t+1}) \|  {\trainerpi}_{>t}(\cdot|s_{t+1})\big).  
+\end{equation*}  
+Using \Cref{lem:sequence_tv_bound} on this sequence-level TV divergence (for a sequence of length $T-t$), we get:  
+\begin{equation*}  
+D_{\mathrm{TV}}\big({\rolloutpi}_{>t}(\cdot|s_{t+1}) \|  {\trainerpi}_{>t}(\cdot|s_{t+1})\big) \le \sum_{k=t+1}^{T} \mathbb{E}_{s_k \sim \rolloutpi(\cdot|s_{t+1})} \left[ D_{\mathrm{TV}}\big(\rolloutpi(\cdot|s_k) \|  \trainerpi(\cdot|s_k)\big) \right].  
+\end{equation*}  
+We bound each term in the sum by the maximum single-step TV divergence, $D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) = \max_{s} D_{\mathrm{TV}}(\rolloutpi(\cdot|s) \|  \trainerpi(\cdot|s))$, which gives:  
+\begin{equation*}  
+D_{\mathrm{TV}}\big({\rolloutpi}_{>t}(\cdot|s_{t+1}) \|  {\trainerpi}_{>t}(\cdot|s_{t+1})\big) \le \sum_{k=t+1}^{T} D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) = (T-t) D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi).  
+\end{equation*}  
+Substituting this back into the bound for $\Delta(\rolloutpi, \trainerpi)$:  
+\begin{align}
+\label{eq:delta_bound_final}
+\begin{split}
+\Delta(\rolloutpi, \trainerpi) &\le \xi \cdot \sum_{t=1}^{T} \mathbb{E}_{y_{\le t} \sim \rolloutpi} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \cdot 2(T-t) D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) \right] \\  
+&= 2\xi \cdot D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) \sum_{t=1}^{T} (T-t) \mathbb{E}_{s_t \sim \rolloutpi} \left[ \sum_{y_t} \rolloutpi(y_t|s_t) \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \right] \\
+&= 2\xi \cdot D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) \sum_{t=1}^{T} (T-t) \mathbb{E}_{s_t \sim \rolloutpi} \left[ 2 D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)) \right] \\
+&\le 2\xi \cdot D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) \sum_{t=1}^{T} (T-t) \cdot \mathbb{E}_{s_t \sim \rolloutpi} \left[ 2 D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi) \right] \\  
+&= 4\xi \cdot {D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi)}^2 \sum_{t=1}^{T} (T-t) \\
+&= 2\xi T(T-1) \cdot {D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi)}^2.  
+\end{split}
+\end{align}  
+Substituting this into the performance difference identity gives the max-divergence bound in \Cref{eq:llm-tv-bound}:
+\begin{equation*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) \ge L_{\rolloutpi}'(\trainerpi) - 2\xi T(T-1) \cdot {D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi)}^2.  
+\end{equation*}  
+This completes the proof.  
+\end{proof}
+
+\subsection{Proof of Policy Improvement Bound: Average-Divergence Part}
+\label{app:tighter_bound}  
+  
+We now prove the linear average-divergence bound in \Cref{eq:llm-tv-linear-bound}, which is the second part of \Cref{thm:llm_tr_bound}. Compared with the quadratic max-divergence bound in \Cref{eq:llm-tv-bound}, this form avoids a $T^2$ dependence and is therefore more suitable for long LLM responses. The key step is to use the fact that total variation is always bounded by one, i.e., $D_{\mathrm{TV}}(P \|  Q) \le 1$, instead of upper-bounding the future-trajectory divergence by $(T-t)D_{\mathrm{TV}}^{\max}(\rolloutpi\|\trainerpi)$.
+  
+We begin from the intermediate step in \Cref{eq:delta_bound_intermediate}:  
+\begin{equation*}  
+\Delta(\rolloutpi, \trainerpi) \le \xi \cdot \sum_{t=1}^{T} \mathbb{E}_{y_{\le t} \sim \rolloutpi} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \cdot \mathbb{E}_{y_{>t} \sim \rolloutpi(\cdot|s_{t+1})} \left[ \left| 1 - \frac{\trainerpi(y_{>t}|s_{t+1})}{\rolloutpi(y_{>t}|s_{t+1})} \right| \right] \right].  
+\end{equation*}  
+The inner expectation is exactly twice the TV divergence between the future trajectory distributions, $2 D_{\mathrm{TV}}\big({\rolloutpi}_{>t}(\cdot|s_{t+1}) \|  {\trainerpi}_{>t}(\cdot|s_{t+1})\big)$. Instead of bounding this term with $2 (T-t) D_{\mathrm{TV}}^{\max}(\rolloutpi \|  \trainerpi)$, we now apply the simple upper bound of 2:  
+\begin{align}  
+\Delta(\rolloutpi, \trainerpi) &\le \xi \cdot \sum_{t=1}^{T} \mathbb{E}_{y_{\le t} \sim \rolloutpi} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \cdot 2 D_{\mathrm{TV}}\big({\rolloutpi}_{>t}(\cdot|s_{t+1}) \|  {\trainerpi}_{>t}(\cdot|s_{t+1})\big) \right] \nonumber \\  
+&\le 2\xi \cdot \sum_{t=1}^{T} \mathbb{E}_{y_{\le t} \sim \rolloutpi} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \right] \label{eq:tighter_bound_step1} \\  
+&= 2\xi \cdot \sum_{t=1}^{T} \mathbb{E}_{s_t \sim \rho_t^{\rolloutpi}} \mathbb{E}_{y_t \sim \rolloutpi(\cdot|s_t)} \left[ \left| \frac{\trainerpi(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right| \right] \nonumber \\  
+&= 2\xi \cdot \sum_{t=1}^{T} \mathbb{E}_{s_t \sim \rho_t^{\rolloutpi}} \left[ 2 D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)) \right] \nonumber \\  
+&= 4\xi \cdot \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|} D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)) \right]. \label{eq:tighter_bound_final}  
+\end{align}  
+Substituting \Cref{eq:tighter_bound_final} into the performance difference identity proves the average-divergence part of \Cref{thm:llm_tr_bound}:
+\begin{equation*}
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi)
+\ge L_{\rolloutpi}'(\trainerpi) - 4\xi \cdot \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|} D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)) \right].
+\end{equation*}
+Equivalently, using the notation in \Cref{thm:llm_tr_bound}, this is
+\begin{equation*}
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi)
+\ge L_{\rolloutpi}'(\trainerpi) - 4\xi \bar{D}_{\mathrm{TV}}(\rolloutpi,\trainerpi).
+\end{equation*}
+
+Since both bounds hold simultaneously, an immediate corollary is the following composite guarantee:
+\begin{align*}  
+\mathcal{J}(\trainerpi) - \mathcal{J}(\rolloutpi) &\ge L_{\rolloutpi}'(\trainerpi) - \Delta(\rolloutpi, \trainerpi) \\  
+&\ge L_{\rolloutpi}'(\trainerpi) - \min \left( 2\xi T(T-1) \cdot {D_{\mathrm{TV}}^{\max}}^2, 4\xi \cdot \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|} D_{\mathrm{TV}}(\rolloutpi(\cdot|s_t) \|  \trainerpi(\cdot|s_t)) \right] \right).  
+\end{align*}  
+This composite bound leverages the quadratic bound for infinitesimal updates and the linear bound for larger updates or longer horizons.
+
+\subsection{Comparing Surrogate Objectives with Classical RL}  
+\label{app:compare_classical_rl}  
+  
+At first glance, the surrogate objective for the LLM regime in \Cref{eq:llm_surrogate} appears distinct from the classical RL surrogate in \Cref{eq:surrogate}. The former is an expectation over full trajectories $y$ weighted by the reward $R(y)$, while the latter is an expectation over state-action pairs $(s,a)$ weighted by the advantage $A^{\rolloutpi}(s,a)$. However, we will now show that their gradients with respect to the policy parameters $\theta$ are fundamentally analogous, confirming that our LLM-specific formulation is a valid adaptation of the standard policy gradient theorem.  
+  
+Let the policy $\trainerpi$ be parameterized by $\theta$. We will use the identity $\nabla_\theta \pi_\theta(a|s) = \pi_\theta(a|s) \nabla_\theta \log \pi_\theta(a|s)$.  
+  
+\textbf{Gradient of the Classical Surrogate Objective.}  
+We begin with the classical surrogate objective from \Cref{eq:surrogate}:  
+\begin{equation*}  
+L_{\rolloutpi}({\trainerpi}_\theta) = \frac{1}{1 - \gamma}  \mathbb{E}_{s \sim \rho^{\rolloutpi},\,a \sim \rolloutpi(a|s)} \left[ \frac{\trainerpi_\theta(a| s)}{\rolloutpi(a| s)} A^{\rolloutpi}(s,a) \right].  
+\end{equation*}  
+Taking the gradient with respect to $\theta$ and moving it inside the expectation, we get:  
+\begin{align}  
+\label{eq:grad_classical}
+\begin{split}
+\nabla_\theta L_{\rolloutpi}({\trainerpi}_\theta) &= \frac{1}{1 - \gamma} \mathbb{E}_{s \sim \rho^{\rolloutpi},\,a \sim \rolloutpi(a|s)} \left[ \frac{\nabla_\theta \trainerpi_\theta(a| s)}{\rolloutpi(a| s)} A^{\rolloutpi}(s,a) \right] \\  
+&= \frac{1}{1 - \gamma} \mathbb{E}_{s \sim \rho^{\rolloutpi},\,a \sim \rolloutpi(a|s)} \left[ \frac{\trainerpi_\theta(a| s)}{\rolloutpi(a| s)} \nabla_\theta \log {\trainerpi}_\theta(a| s) A^{\rolloutpi}(s,a) \right].  
+\end{split}
+\end{align}  
+\textbf{Gradient of the LLM Surrogate Objective.}  
+Next, we consider our LLM-specific surrogate from \Cref{eq:llm_surrogate}:  
+\begin{equation*}  
+L_{\rolloutpi}'({\trainerpi}_\theta) = \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \left( \frac{\trainerpi_\theta(y_t|s_t)}{\rolloutpi(y_t|s_t)} - 1 \right) \right].  
+\end{equation*}  
+Taking the gradient with respect to $\theta$ and noting that the $-1$ term has a zero gradient:  
+\begin{align*}  
+\nabla_\theta L_{\rolloutpi}'({\trainerpi}_\theta) &= \mathbb{E}_{y \sim \rolloutpi} \left[ R(y) \sum_{t=1}^{|y|} \frac{\nabla_\theta \trainerpi_\theta(y_t|s_t)}{\rolloutpi(y_t|s_t)} \right] \\  
+&= \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|} \frac{\trainerpi_\theta(y_t|s_t) }{\rolloutpi(y_t|s_t)} \nabla_\theta \log {\trainerpi}_\theta(y_t|s_t) R(y) \right].  
+\end{align*}  
+If we define a sequence-level advantage as $A^{\rolloutpi}(s_t, y_t) = R(y) - V(x)$, where $V(x)$ is a baseline value function for the prompt, the gradient becomes:  
+\begin{equation} 
+\label{eq:grad_llm_surrogate}
+\nabla_\theta L_{\rolloutpi}'({\trainerpi}_\theta) = \mathbb{E}_{y \sim \rolloutpi} \left[ \sum_{t=1}^{|y|}  \frac{\trainerpi_\theta(y_t|s_t) }{\rolloutpi(y_t|s_t)} \nabla_\theta \log {\trainerpi}_\theta(y_t|s_t) A^{\rolloutpi}(s_t, y_t) \right].  
+\end{equation}  
+This form is directly analogous to the classical policy gradient in \Cref{eq:grad_classical}, where the sum over timesteps in a trajectory replaces the expectation over the state distribution $\rho^{\rolloutpi}$. Thus, our LLM surrogate objective is a theoretically sound adaptation of the classical trust region framework to the undiscounted, sequence-reward setting.
+
+
+
+\section{Approximations as Lower Bounds of True Divergence}  
+\label{app:divergence_lower_bounds}  
+  
+In this section, we provide a formal justification for our Binary and Top-K divergence approximations. We demonstrate that both are principled lower bounds on the true divergence and explicitly state the conditions under which these approximations become exact.  
+  
+Let $\mathcal{C} = \{C_1, \dots, C_m\}$ be any partition of the vocabulary $\mathcal{A}$. Our Binary and Top-K approximations correspond to specific choices of this partition. We will show that the divergence computed on the partitioned space is a lower bound on the true divergence.  
+  
+\subsection{Total Variation Divergence}  
+  
+The true TV divergence is $D_{\mathrm{TV}}(\rolloutpi \|  \trainerpi) = \frac{1}{2} \sum_{a \in \mathcal{A}} |\rolloutpi(a|s_t) - \trainerpi(a|s_t)|$. The divergence on a partitioned space $\mathcal{C}$ is $D_{\mathrm{TV}}^{\mathcal{C}} = \frac{1}{2} \sum_{j=1}^m |\rolloutpi(C_j|s_t) - \trainerpi(C_j|s_t)|$.  
+  
+\textbf{Proof of Lower Bound.}  
+By definition, $|\rolloutpi(C_j|s_t) - \trainerpi(C_j|s_t)| = |\sum_{a \in C_j} (\rolloutpi(a|s_t) - \trainerpi(a|s_t))|$. The triangle inequality states that the absolute value of a sum is less than or equal to the sum of the absolute values. Applying this, we get $|\sum_{a \in C_j} (\rolloutpi(a|s_t) - \trainerpi(a|s_t))| \le \sum_{a \in C_j} |\rolloutpi(a|s_t) - \trainerpi(a|s_t)|$. Summing over all partitions $j$:  
+\begin{align*}  
+D_{\mathrm{TV}}^{\mathcal{C}} &= \frac{1}{2} \sum_{j=1}^m \left| \sum_{a \in C_j} (\rolloutpi(a|s_t) - \trainerpi(a|s_t)) \right| \\  
+&\le \frac{1}{2} \sum_{j=1}^m \sum_{a \in C_j} |\rolloutpi(a|s_t) - \trainerpi(a|s_t)| \\
+&= D_{\mathrm{TV}}(\rolloutpi \|  \trainerpi).  
+\end{align*}  
+Thus, $D_{\mathrm{TV}}(\rolloutpi \|  \trainerpi) \ge D_{\mathrm{TV}}^{\mathcal{C}}$. This holds for both Binary and Top-K partitions.  
+  
+\textbf{Analysis of the Approximation Gap.}  
+The gap between the true and approximated TV divergence is the sum of the gaps within each partition. For any partition $C_j$, the gap is $\frac{1}{2} \left( \sum_{a \in C_j} |\rolloutpi(a|s_t) - \trainerpi(a|s_t)| - \left|\sum_{a \in C_j} (\rolloutpi(a|s_t) - \trainerpi(a|s_t))\right| \right)$. This gap is bounded by the total probability mass of the partition:  
+\begin{equation*}  
+\text{Gap}(C_j) \le \frac{1}{2} \sum_{a \in C_j} (\rolloutpi(a|s_t) + \trainerpi(a|s_t)) = \frac{1}{2} (\rolloutpi(C_j|s_t) + \trainerpi(C_j|s_t)).  
+\end{equation*}  
+For the Top-K approximation, the only partition with a potential gap is the "other" category, which contains the tail of the distribution. The total probability mass of this tail, $\rolloutpi(C_{\text{other}}|s_t)$, is typically very small. Therefore, the approximation gap is also small, justifying Top-K TV as a high-fidelity approximation.  
+
+We further validate that this tail-mass bound remains small across training. In an RLHF run, we track the average probability mass covered by the top-20 tokens, matching the $K=20$ Top-K approximation used in our experiments. As shown in \Cref{fig:rlhf_top20_mass}, the top-20 mass is already 99.4\% at the beginning of training and increases to 99.9\% after 100 training steps. Equivalently, the ``other'' category contains only 0.6\% of the mass initially and about 0.1\% after the policy sharpens, so the Top-K TV approximation gap remains tiny and empirically improves during training rather than degrading.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figs/grpo_vs_dppo_rlhf_topk.pdf}
+    \caption{RLHF training curves and top-20 probability mass over training. The top-20 tokens cover nearly all probability mass throughout training, making the Top-K tail and the resulting TV approximation gap small.}
+    \label{fig:rlhf_top20_mass}
+\end{figure}
+  
+\textbf{Equality Condition.}  
+Equality $D_{\mathrm{TV}} = D_{\mathrm{TV}}^{\mathcal{C}}$ holds if the gap is zero for all partitions. This occurs when $\rolloutpi(a|s_t) - \trainerpi(a|s_t)$ has the same sign for all tokens $a$ within each partition $C_j$.  
+  
+\subsection{KL Divergence}  
+  
+The true KL divergence is $D_{\mathrm{KL}}(\rolloutpi \| \trainerpi) = \sum_{a \in \mathcal{A}} \rolloutpi(a|s_t) \log \frac{\rolloutpi(a|s_t)}{\trainerpi(a|s_t)}$. The divergence on the partitioned space is $D_{\mathrm{KL}}^{\mathcal{C}} = \sum_{j=1}^m \rolloutpi(C_j|s_t) \log \frac{\rolloutpi(C_j|s_t)}{\trainerpi(C_j|s_t)}$.  
+  
+\textbf{Proof of Lower Bound.}  
+The proof relies on the log-sum inequality, which states that for any two sets of non-negative numbers $\{x_1, \dots, x_n\}$ and $\{y_1, \dots, y_n\}$:  
+\begin{equation*}  
+\sum_{i=1}^n x_i \log \frac{x_i}{y_i} \ge \left(\sum_{i=1}^n x_i\right) \log \frac{\sum_{i=1}^n x_i}{\sum_{i=1}^n y_i}.  
+\end{equation*}  
+We apply this inequality to each partition $C_j$ in our vocabulary, setting $x_a = \rolloutpi(a|s_t)$ and $y_a = \trainerpi(a|s_t)$:  
+\begin{align*}  
+\sum_{a \in C_j} \rolloutpi(a|s_t) \log \frac{\rolloutpi(a|s_t)}{\trainerpi(a|s_t)} &\ge \left(\sum_{a \in C_j} \rolloutpi(a|s_t)\right) \log \frac{\sum_{a \in C_j} \rolloutpi(a|s_t)}{\sum_{a \in C_j} \trainerpi(a|s_t)} \\  
+&= \rolloutpi(C_j|s_t) \log \frac{\rolloutpi(C_j|s_t)}{\trainerpi(C_j|s_t)}.  
+\end{align*}  
+Summing over all partitions $j$ gives the desired result:  
+\begin{align*}  
+D_{\mathrm{KL}}(\rolloutpi \| \trainerpi) &= \sum_{j=1}^m \sum_{a \in C_j} \rolloutpi(a|s_t) \log \frac{\rolloutpi(a|s_t)}{\trainerpi(a|s_t)} \\  
+&\ge \sum_{j=1}^m \rolloutpi(C_j|s_t) \log \frac{\rolloutpi(C_j|s_t)}{\trainerpi(C_j|s_t)} = D_{\mathrm{KL}}^{\mathcal{C}}.  
+\end{align*}  
+  
+\textbf{Equality Condition.}  
+The log-sum inequality holds with equality if and only if the ratio $\frac{x_i}{y_i}$ is constant for all $i$. In our context, this means that for each partition $C_j$, the ratio $\frac{\rolloutpi(a|s_t)}{\trainerpi(a|s_t)}$ must be constant for all tokens $a \in C_j$. For both Binary and Top-K approximations, this implies the policy update must scale the probabilities of all tokens within the "other" category by a uniform factor.
+
+
+\section{More Details for Stability Analysis}
+\label{app:sanity_test}
+
+Our experimental setup strictly follows the sanity test established in \citet{qi2025defeating}. Each policy iteration begins by sampling a batch of 64 questions. For each question, we generate 8 responses (rollouts) using a maximum context length of 8,000. The collected data is then used to perform 4 gradient steps. All experiments are conducted using the VeRL framework \citep{sheng2024hybridflow} together with the ODC optimization \citep{wan2026revisiting}, and models are trained in BFloat16 precision to better expose potential numerical instabilities between algorithms. For the evaluation on AIME, we sample 32 responses for each test question to ensure a robust assessment.
+
+\subsection{Algorithmic Details for Stability Analysis}  
+\label{app:sanity_test_details}  
+  
+In this section, we provide the specific policy gradient formulations for each algorithm evaluated in our stability analysis (\Cref{sec:stability}). To facilitate a direct comparison, we show how each algorithm's gradient update can be interpreted through the lens of a single, unified framework.  
+  
+\textbf{A Unified Policy Gradient Formulation.}  
+The policy gradient for the algorithms we tested can be generalized into the following form, where the gradient of the objective $L(\theta)$ is expressed as:  
+\begin{equation}  
+\label{eq:unified_grad}  
+\nabla_\theta L(\theta) = \mathbb{E}_{y \sim \rolloutpi_{\theta'}} \left[ \sum_{t=1}^{|y|} M_t \cdot \min \left( \frac{\trainerpi_\theta(y_t|s_t)}{\rolloutpi_{\theta'}(y_t|s_t)}, C \right) \cdot \hat{A}_t \cdot \nabla_\theta \log {\trainerpi}_\theta(y_t|s_t) \right].  
+\end{equation}  
+In this formulation, $\hat{A}_t$ is the advantage, estimated following the GRPO method but without standard deviation normalization \citep{shao2024deepseekmath, liu2025understanding}. The algorithms differ primarily in their definition of the binary mask $M_t$ and the clipping bound $C$.  
+  
+\begin{itemize}  
+    \item For \textbf{PG-IS}, we have $M_t = 1$ and $C = \infty$.  
+    \item For \textbf{PG-TIS (CISPO)}, we have $M_t = 1$ and $C = 3$.  
+    \item For \textbf{GRPO}, the mask $M_t$ is the PPO-style clipping mask, and $C = \infty$.  
+    \item For \textbf{MiniRL}, the mask $M_t$ is also a PPO-style clipping mask but is conditioned on a recomputed policy ratio. For this algorithm, $C = \infty$.  
+    \item For \textbf{MiniRL-TIS}, the mask $M_t$ is the same as in MiniRL, but with $C = 3$.  
+    \item For \textbf{DPPO (Ours)}, the mask $M_t$ is conditioned on the policy divergence, and $C = \infty$.  
+\end{itemize}  
+  
+\textbf{Mask Definitions.}  
+The specific forms of the masks are as follows:  
+\begin{itemize}  
+    \item For \textbf{GRPO}, the mask uses the rollout ratio $r_t = \frac{\trainerpi_\theta(y_t|s_t)}{\rolloutpi_{\theta'}(y_t|s_t)}$ and experimental hyperparameters $\epsilon_\text{high}=0.28, \epsilon_\text{low}=0.2$:  
+    \begin{equation*}  
+    M_t =  
+        \begin{cases}  
+            0, & \text{if } (\hat{A}_t > 0 \text{ and } r_t > 1 + \epsilon_\text{high}) \text{ or } (\hat{A}_t < 0 \text{ and } r_t < 1 - \epsilon_\text{low}) \\  
+            1, & \text{otherwise}.  
+        \end{cases}  
+    \end{equation*}  
+  
+    \item For \textbf{MiniRL} and \textbf{MiniRL-TIS}, the mask is structurally identical to GRPO's and uses the same hyperparameters, but it is conditioned on the recomputed ratio $r'_t = \frac{\trainerpi_\theta(y_t|s_t)}{\trainerpi_{\theta'}(y_t|s_t)}$:  
+    \begin{equation*}  
+    M_t =  
+        \begin{cases}  
+            0, & \text{if } (\hat{A}_t > 0 \text{ and } r'_t > 1 + \epsilon_\text{high}) \text{ or } (\hat{A}_t < 0 \text{ and } r'_t < 1 - \epsilon_\text{low}) \\  
+            1, & \text{otherwise}.  
+        \end{cases}  
+    \end{equation*}  
+  
+    \item For \textbf{DPPO}, our mask is conditioned on the policy divergence $D_t$:  
+    \begin{equation*}  
+    M_t =  
+        \begin{cases}  
+            0, & \text{if } (\hat{A}_t > 0 \text{ and } r_t > 1 \text{ and } D_t > \delta) \text{ or } (\hat{A}_t < 0 \text{ and } r_t < 1 \text{ and } D_t > \delta) \\  
+            1, & \text{otherwise}.  
+        \end{cases}  
+    \end{equation*}  
+    In our experiments, we set the divergence threshold $\delta=0.15$ for TV divergence and $\delta=0.05$ for KL divergence.  
+\end{itemize}
+
+% \subsection{The Unexpected Harm of Truncated Importance Sampling}  
+  
+% Our results also reveal a surprising finding regarding Truncated Importance Sampling (TIS), a technique widely adopted to control the variance of policy gradient estimates \citep{yao2025offpolicy, chen2025minimax}. Contrary to its intended purpose, TIS consistently degrades training stability in our experiments. As shown in \Cref{fig:sanity_test}, the TIS-enabled variants (PG-TIS (CISPO) and MiniRL-TIS) collapse significantly earlier and perform much worse than their untruncated counterparts.  
+  
+% We hypothesize that this detrimental effect stems from the same core issue as PPO's ratio clipping: low-probability tokens, which naturally produce high-variance ratios, are the most likely to be truncated by TIS. While this does reduce variance, it systematically down-weights the gradient signal from these tokens, introducing a significant and harmful bias into the policy update. This suggests that naive truncation can be just as damaging as naive clipping.
+
+
+\section{Characterizing Clipped Tokens}  
+\label{app:clipped_tokens}  
+  
+To understand the practical consequences of ratio clipping, we analyzed which tokens are most frequently penalized by a PPO-style algorithm. We trained a Qwen3-4B-Base model on the DAPO dataset with GRPO and, at training step 50, collected two sets of tokens:  
+\begin{itemize}  
+    \item \textbf{Clipped Positive Tokens:} From samples with $\hat{A}_t > 0$, tokens whose updates were blocked due to a high ratio ($r_t > 1.28$).  
+    \item \textbf{Clipped Negative Tokens:} From samples with $\hat{A}_t < 0$, tokens whose updates were blocked due to a low ratio ($r_t < 0.8$).  
+\end{itemize}  
+  
+
+\begin{AIbox}{The 50 most frequently clipped tokens from \textbf{positively-rewarded} samples.}
+\begin{lstlisting}
+' the', ' \\(', '<@\textcolor{red}{1}@>', '<@\textcolor{blue}{Let}@>', ' in', ' ', ',', 'We', ' <@\textcolor{red}{+}@>', ' \\', ' numbers', ':\n\n', '<@\textcolor{blue}{Wait}@>', '<@\textcolor{red}{4}@>', '<@\textcolor{red}{6}@>', ' Identify', '(', '<@\textcolor{blue}{Next}@>', ' from', ')', ' k', ' <@\textcolor{red}{-}@>', '<@\textcolor{blue}{Since}@>', ' solve', '\\[', ' how', ' ->', ' to', ' are', '<@\textcolor{red}{Sub}@>', 'I', '):\n', '  \n\n', ' spiral', ' <@\textcolor{blue}{Instead}@>', ' this', '<@\textcolor{blue}{If}@>', '<@\textcolor{red}{div}@>', ' Conditions', ' vector', ' have', ' <@\textcolor{red}{=}@>', ' feasible', 'Or', ' inconsistency', ' express', '_{', ' increase', ' exact', ' consider'
+\end{lstlisting}
+\end{AIbox}
+
+
+
+\begin{AIbox}{The 50 most frequently clipped tokens from \textbf{negatively-rewarded} samples.}
+\begin{lstlisting}
+' \\(', ' the', ',', ' a', ' \\', ' ', '<@\textcolor{red}{2}@>', '<@\textcolor{red}{1}@>', ':\n\n', '<@\textcolor{red}{0}@>', '<@\textcolor{red}{3}@>', ' and', ' (', ' that', '<@\textcolor{red}{-}@>', ' to', '<@\textcolor{red}{5}@>', ' of', '<@\textcolor{blue}{However}@>', '\\', ' is', ' <@\textcolor{red}{=}@>', '<@\textcolor{red}{4}@>', ' in', ' for', ' all', ' we', 'We', ')', '.\n\n', ' our', '.', ':\n', ' <@\textcolor{blue}{but}@>', ' with', '<@\textcolor{blue}{So}@>', ' both', 'From', ' <@\textcolor{blue}{Let}@>', ' this', '<@\textcolor{blue}{Thus}@>', '<@\textcolor{blue}{Wait}@>', ' if', ' <@\textcolor{red}{-}@>', ' <@\textcolor{red}{+}@>', '^', ' only', ' at', '<@\textcolor{blue}{Since}@>', ' integer'
+\end{lstlisting}
+\end{AIbox}
+
+
+The 50 most frequent tokens in each category reveal a striking pattern. Far from being random noise, the clipped tokens are often critical for task performance. The lists for both positive and negative samples are dominated by two key categories:  
+\begin{enumerate}  
+    \item \textbf{Numerical and Mathematical Tokens:} A significant portion of the clipped tokens are numbers (e.g., `\textcolor{red}{1}', `\textcolor{red}{4}') and mathematical symbols (e.g., `\textcolor{red}{+}', `\textcolor{red}{=}', `\textcolor{red}{div}').  
+    \item \textbf{Reasoning and Structural Words:} The list also includes many words essential for logical exposition, such as `\textcolor{blue}{Wait}', `\textcolor{blue}{Next}', `\textcolor{blue}{Thus}', and `\textcolor{blue}{Since}'.  
+\end{enumerate}
+  
+These findings highlight a fundamental flaw in ratio-based clipping. For positive samples, it blocks beneficial updates to tokens that are integral to constructing correct solutions. For negative samples, it blocks the necessary suppression of these same tokens when they are part of an incorrect reasoning path. By systematically interfering with the learning signal for these high-utility tokens, the algorithm inadvertently slows learning, stifles exploration, and hinders the model's ability to refine its problem-solving capabilities.
+
+
+% \begin{AIbox}{The 50 most frequently clipped tokens from \textbf{positively-rewarded} samples.}
+% \begin{lstlisting}
+% ' the', ' \\(', ' \\', '\\', ',', ' <@\textcolor{red}{+}@>', '.\n\n', '<@\textcolor{red}{2}@>', ':\n\n', '<@\textcolor{red}{1}@>', ' (', ' a', ' ', '<@\textcolor{blue}{Given}@>', '<@\textcolor{red}{3}@>', '<@\textcolor{red}{4}@>', ' in', '<@\textcolor{blue}{So}@>', ' and', '<@\textcolor{blue}{Wait}@>', ' <@\textcolor{red}{=}@>', ' from', '.', '<@\textcolor{red}{5}@>', '<@\textcolor{red}{6}@>', ' all', ' to', '<@\textcolor{blue}{Now}@>', ' C', '<@\textcolor{red}{7}@>', ' point', ' invalid', '<@\textcolor{red}{8}@>', ' <@\textcolor{blue}{Since}@>', ' I', ' it', ' This', ' with', '<@\textcolor{red}{frac}@>', ' of', ' not', ' is', ' correct', '}', 'We', ' we', ' x', ' differences', ')', ' step'
+% \end{lstlisting}
+% \end{AIbox}
+
+
+% \begin{AIbox}{The 50 most frequently clipped tokens from \textbf{negatively-rewarded} samples.}
+% \begin{lstlisting}
+% ' the', ' \\(', ' \\', ',', ' ', '<@\textcolor{red}{1}@>', ' a', '<@\textcolor{red}{2}@>', ' is', '.\n\n', ':\n\n', ' we', ':\n', ' and', '<@\textcolor{blue}{Wait}@>', ' in', '<@\textcolor{blue}{Given}@>', ' <@\textcolor{red}{=}@>', '<@\textcolor{red}{0}@>', '<@\textcolor{red}{3}@>', '\\', ' for', ' of', '<@\textcolor{blue}{So}@>', 'This', ' each', ' this', '<@\textcolor{blue}{But}@>', ' can', ' to', '{', ' <@\textcolor{red}{+}@>', ' all', ' with', '<@\textcolor{red}{4}@>', ' (', ')', ' are', '<@\textcolor{red}{9}@>', '<@\textcolor{blue}{Since}@>', '.', '<@\textcolor{blue}{Let}@>', ' find', ' if', ' <@\textcolor{blue}{but}@>', '<@\textcolor{blue}{Now}@>', ' The', ':', ' <@\textcolor{blue}{given}@>', ' it'
+% \end{lstlisting}
+% \end{AIbox}
+
+
+\section{More Details for Broader Evaluation}
+\label{appendix:detailed_experimental_settings}
+
+In this section, we provide detailed training and evaluation settings of the \textbf{scaling experiments} in \Cref{sec:scaling_exp}. 
+
+\textbf{Training Settings.}
+We conduct experiments using the VeRL framework~\citep{sheng2024hybridflow} on NVIDIA H Series GPUs. All methods follow the hyperparameter configurations detailed in \Cref{tab:detailed_experimental_settings}. 
+Rollout router replay (R3) \citep{ma2025stabilizing} records the routed experts used in the inference engine and replays them in the training engine, which mitigates the training-inference mismatch and stabilizes RL training for MoE models. We only use R3 in the MoE Base w/ R3 experiment and do not use it in all other experiments.
+For experiments that utilize LoRA, as suggested by \citet{schulman2025lora}, we employ a larger learning rate of $1\times 10^{-5}$. For the MoE Base w/ LoRA experiment, we set \texttt{lora\_rank=32} and \texttt{lora\_alpha=64}.
+
+As suggested in \Cref{sec:correct_ancher_for_truct_region}, for all methods, we use the behavior policy ($\rolloutpi_{\theta'}$) instead of recomputed policy distribution ($\trainerpi_{\theta'}$) to construct the trust region (i.e., for clipping or masking). Under the unified policy gradient formulation (Equation~\ref{eq:unified_grad}), the method-specific hyperparameters ($C=5$ by default) are configured as follows:
+
+\begin{itemize}  
+    \item For \textbf{GRPO-ClipHigher}, we have 
+    \begin{equation*}  
+    M_t =  
+        \begin{cases}  
+            0, & \text{if } (\hat{A}_t > 0 \text{ and } r_t > 1 + \epsilon_\text{high}) \text{ or } (\hat{A}_t < 0 \text{ and } r_t < 1 - \epsilon_\text{low}) \\  
+            1, & \text{otherwise}.  
+        \end{cases}  
+    \end{equation*} 
+    where $\epsilon_\text{high}=0.27$ and $\epsilon_\text{low}=0.2$, which follows the hyperparameters used in \citet{zheng2025stabilizing}.
+
+    \item For \textbf{CISPO}, we have $M_t = 1$.
+
+    \item For \textbf{DPPO-Binary-KL} and \textbf{DPPO-Binary-TV}, we have 
+    \begin{equation*}  
+    M_t =  
+        \begin{cases}  
+            0, & \text{if } (\hat{A}_t > 0 \text{ and } r_t > 1 \text{ and } D_t > \delta) \text{ or } (\hat{A}_t < 0 \text{ and } r_t < 1 \text{ and } D_t > \delta) \\  
+            1, & \text{otherwise}.  
+        \end{cases}  
+    \end{equation*} 
+    where $D_t$ is binary approximation of KL or TV as defined in \Cref{sec:method_binary}. For \textbf{DPPO-Binary-KL}, $\delta=0.05$ for all scaling experiments. For \textbf{DPPO-Binary-TV}, we use $\delta=0.15$ for MoE Base w/ LoRA experiment and $\delta=0.2$ for all other scaling experiments.
+\end{itemize}
+
+
+\begin{table}[h]
+    % \vspace{-.4cm}
+    % \fontsize{7.5}{9}\selectfont
+    % \vspace{-0.9cm}
+    % \tabcolsep 2.0pt
+    \renewcommand{\arraystretch}{1.0}
+    \caption{Detailed RL training hyperparameters of scaling experiments.}
+    % \vspace{-0.25cm}
+    \label{tab:detailed_experimental_settings}
+    \centering
+    % \input{tables/qwen3_4b_without_condition_y}
+\begin{tabular}{l|cccccc}
+\toprule
+\textbf{Hyperparameters} & MoE Base & MoE Base w/ R3 & MoE Thinking & Dense Base & MoE Base w/ LoRA \\
+\midrule
+\texttt{max\_prompt\_length} & 1024 & 1024 & 1024 & 1024 & 1024 \\ 
+\texttt{max\_response\_length} & 16384 & 16384 & 16384 & 8000 & 8000 \\ 
+\texttt{train\_batch\_size} & 256 & 256 & 256 & 128 & 128 \\ 
+\texttt{ppo\_mini\_batch\_size} & 32 & 32 & 32 & 32 & 16\\ 
+\texttt{optim.lr} & 1e-6 & 1e-6 & 1e-6 & 1e-6 & 1e-5 \\ 
+% \texttt{tis\_imp\_ratio\_cap} & 5 & 5 & 5 & 5 & 5 \\ 
+\texttt{rollout.temperature} & 1.0 & 1.0  & 1.0 & 1.0 & 1.0 \\ 
+\texttt{rollout.n} & 16 & 16 & 16 & 8 & 8\\ 
+\midrule
+\textbf{Detailed Results} & \Cref{fig:appendix_base_woR3} & \Cref{fig:appendix_base_wR3} & \Cref{fig:appendix_a3b} & \Cref{fig:appendix_8b} & \Cref{fig:appendix_lora} \\
+\bottomrule
+\end{tabular}
+    % \vspace{-.3cm}
+\end{table}
+
+\textbf{Evaluation Settings.}
+We perform online evaluation for each method and experimental configuration, monitoring AIME24 and AIME25 scores throughout RL training. Evaluations are conducted every 5 training steps for MoE Base, MoE Base w/ R3, and MoE Thinking, and every 10 steps for Dense Base and MoE Base w/ LoRA.
+
+Across all scaling experiments, we use consistent sampling parameters: \texttt{temperature=0.7}, \texttt{top\_p=0.95}, and \texttt{n=32}. The \texttt{n=32} setting indicates that each question from AIME24 and AIME25 is sampled 32 times, and we report the average scores. The \texttt{max\_response\_length} remains identical to that used during training rollouts.
+
+
+\section{More Empirical Results}
+
+
+\subsection{AlpacaEval 2.0 Evaluation for RLHF}
+\label{appendix:rlhf_alpacaeval}
+
+To complement the RLHF experiments, we also evaluate the Qwen3-4B-Instruct-2507 model fine-tuned on UltraFeedback with Skywork-Reward-Llama-3.1-8B on AlpacaEval 2.0. In this run, DPPO also obtains higher learned reward than GRPO at step 150 (51.32 vs.\ 36.70) and step 450 (70.27 vs.\ 45.24). We report the checkpoint at step 150 for AlpacaEval, since later checkpoints obtain lower AlpacaEval scores despite higher reward, indicating reward hacking.
+
+\begin{table}[h]
+    \renewcommand{\arraystretch}{1.05}
+    \caption{AlpacaEval 2.0 results for RLHF fine-tuning on Qwen3-4B-Instruct-2507 with UltraFeedback. We report length-controlled win rate (LC-WR), raw win rate (WR), and average response length.}
+    \label{tab:rlhf_alpacaeval}
+    \centering
+    \small
+    \begin{tabular}{lccc}
+    \toprule
+    \textbf{Model} & \textbf{LC-WR} & \textbf{WR} & \textbf{Avg. Length} \\
+    \midrule
+    Initial model & 59.39 & 69.38 & 3147 \\
+    GRPO fine-tuning & 77.05 & 72.20 & 1756 \\
+    DPPO fine-tuning & \textbf{80.90} & \textbf{79.93} & 2003 \\
+    \bottomrule
+    \end{tabular}
+\end{table}
+
+As shown in \Cref{tab:rlhf_alpacaeval}, DPPO achieves the highest length-controlled and raw win rates among the compared checkpoints, establishing a new SOTA on the \href{https://tatsu-lab.github.io/alpaca_eval/}{AlpacaEval 2.0 community leaderboard}. This indicates that the reward improvement from DPPO transfers to an external open-ended alignment benchmark, rather than only increasing the training reward model score.
+
+
+\subsection{Extended Main Results}
+\label{appendix:extended_main_results}
+
+In addition to the results provided in \Cref{sec:scaling_exp}, here we provide more detailed results of the five scaling experiments: \Cref{fig:appendix_base_woR3} for MoE Base w/o R3, \Cref{fig:appendix_base_wR3} for MoE Base w/ R3, \Cref{fig:appendix_a3b} for MoE Thinking, \Cref{fig:appendix_8b} for Dense Base, \Cref{fig:appendix_lora} for MoE Base w/ LoRA. We record the following metrics throughout the RL training: training rewards (denoted as ``\textbf{Rewards}''), \textbf{AIME 2024} Avg@32 scores, \textbf{AIME 2025} Avg@32 scores, mean of $\vert\rolloutpi_{\theta'} - \trainerpi_{\theta'}\vert$ (denoted as ``\textbf{Mean of $\vert \pi-\mu \vert$}''), mean of the response length (denoted as ``\textbf{Response Length}''), and mean of token entropy (denoted as ``\textbf{Entropy}''). 
+For clearer visualization, all metrics except AIME24 and AIME25 are smoothed using a Gaussian filter with standard deviation $\sigma=2$. The original unsmoothed curves are shown in the background as shaded regions.
+
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-base_woR3.pdf}  
+    \caption{Evolution of metrics for \textbf{MoE Base w/o R3} experiment (based on Qwen3-30B-A3B-Base, without rollout router replay).}  
+    \label{fig:appendix_base_woR3}  
+\end{figure}
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-base_wR3.pdf}  
+    \caption{Evolution of metrics for \textbf{MoE Base w/ R3} experiment (based on Qwen3-30B-A3B-Base, with rollout router replay).}  
+    \label{fig:appendix_base_wR3}  
+\end{figure}
+
+Overall, across the five experiments, our method DPPO demonstrates consistent and robust improvements in training rewards, highlighting its \textit{stability} and \textit{efficiency}. On both AIME~24 and AIME~25 benchmarks, DPPO exhibits a clear, stable upward trend during training and maintains superior performance after convergence. The stability of our approach is evidenced by learning curves that generally show less fluctuation compared to baseline methods. Its efficiency is reflected in the rapid increase of training rewards and the strong final performance.
+
+DPPO variants consistently demonstrate healthy training dynamics. The training-inference mismatch (measured by the mean absolute deviation $\vert \pi - \mu\vert$) and policy entropy remain within a stable, proper region throughout RL training. DPPO also effectively increases the generated response length across all scaling experiments, except for MoE Thinking. We note that the model Qwen3-30B-A3B already produces extremely long responses; as our training enforces a maximum length of approximately 16k tokens, RL training naturally shortens responses to fit this constraint.
+
+In contrast, the GRPO-ClipHigher baseline, which relies on the ratio clipping mechanism of PPO, shows lower stability than DPPO and achieves inferior final performance in all five large-scale experiments. For example, in MoE Base w/o R3 (see \Cref{fig:appendix_base_woR3}), GRPO-ClipHigher, though more stable than CISPO, improves more slowly and converges to lower training rewards and AIME scores than DPPO. In MoE Thinking (see \Cref{fig:appendix_a3b}), GRPO-ClipHigher suffers a significant training collapse. Notably, GRPO-ClipHigher consistently leads to excessively high entropy in all large-scale experiments, a phenomenon not observed with other methods.
+
+The CISPO baseline, which retains gradients for all tokens, is generally less stable and prone to collapse in certain settings. For instance, in MoE~Base~w/o~R3 (see \Cref{fig:appendix_base_woR3}), CISPO experiences a sudden and severe collapse leading to complete failure. In Dense Base (see \Cref{fig:appendix_8b}), CISPO shows a degenerative trend, particularly on AIME25. In MoE Base w/ LoRA (see \Cref{fig:appendix_lora}), the AIME24 scores, mean of $\vert \pi - \mu\vert$, and response length exhibit noticeable fluctuations, further indicating instability.
+
+We also analyze the effect of rollout router replay (R3). Remarkably, DPPO variants \textit{without} R3 already outperform baselines that use R3, underscoring the importance of a proper masking mechanism in RL training (see \Cref{fig:appendix_base_woR3,fig:appendix_base_wR3}). Furthermore, incorporating R3 yields additional gains for DPPO, suggesting that the benefits of R3 and DPPO are largely orthogonal. This implies that DPPO provides a robust foundation for LLM RL fine-tuning, capable of further improvement even when training-inference mismatch is mitigated by other techniques.
+
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-a3b.pdf}  
+    \caption{Evolution of metrics for \textbf{MoE Thinking} experiment (based on Qwen3-30B-A3B).}  
+    \label{fig:appendix_a3b}  
+\end{figure}
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-8b.pdf}  
+    \caption{Evolution of metrics for \textbf{Dense Base} experiment (based on Qwen3-8B-Base).}  
+    \label{fig:appendix_8b}  
+\end{figure}
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-lora.pdf}  
+    \caption{Evolution of metrics for \textbf{MoE Base w/ LoRA} experiment (based on Qwen3-30B-A3B-Base, with LoRA).}  
+    \label{fig:appendix_lora}  
+\end{figure}
+
+
+\begin{figure}
+    \centering  
+    \includegraphics[width=\linewidth]{figs/appendix-topk.pdf}  
+    \caption{Evolution of metrics for baselines, DPPO with binary TV/KL approximation, and DPPO with Top-K (K=20) approximation under the same setting as MoE Base w/o R3.}  
+    \label{fig:appendix_topk}  
+\end{figure}
+
+
+\subsection{Ablation on Divergence Approximation}
+\label{appendix:ablation_topk_approximation}
+
+In the scaling experiments, we compared DPPO variants using binary TV/KL approximations (Equations~\ref{eq:binary_tv} and \ref{eq:binary_kl}) against several baselines. To further investigate the approximation strategy, we experiment with DPPO variants with top-K TV/KL approximations (Equations~\ref{eq:topk_tv} and \ref{eq:topk_kl}), where we set $K=20$; these variants are denoted as \textbf{DPPO-TopK-TV} and \textbf{DPPO-TopK-KL}. The choice $K=20$ is limited by vLLM \citep{vllm}, which supports returning log probabilities for at most 20 candidate tokens per step. We strictly replicate the experimental setting of MoE Base w/o R3. As in the main scaling experiments, for \textbf{DPPO-Binary-TV} and \textbf{DPPO-TopK-TV} we set the clip threshold $\delta=0.2$, while for \textbf{DPPO-Binary-KL} and \textbf{DPPO-TopK-KL} we set $\delta=0.05$.
+
+
+As presented in \Cref{fig:appendix_topk}, introducing the top-K approximation does not yield significant performance gains, indicating that the simpler binary approximation already provides a sufficient and efficient proxy for constructing the trust region. This finding is encouraging, suggesting that DPPO with binary TV/KL remains highly scalable without sacrificing effectiveness.
+
+\subsection{Hyperparameter Sensitivity}
+\label{appendix:hyperparameter_sensitivity}
+
+We further examine the sensitivity of the divergence threshold $\delta$ in DPPO. We fine-tune Qwen3-30B-A3B-Base on the DAPO dataset with an 8k context length and compare DPPO-Binary-TV with $\delta \in \{0.10, 0.15, 0.20\}$, DPPO-Binary-KL with $\delta \in \{0.05, 0.10, 0.15\}$, and GRPO variants using $\epsilon_{\text{low}}=0.2$ with different upper clipping values.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=\linewidth]{figs/grpo_vs_dppo_sensitivity.pdf}
+    \caption{Hyperparameter sensitivity of DPPO-Binary-TV, DPPO-Binary-KL, and GRPO on Qwen3-30B-A3B-Base trained on DAPO with 8k context length. DPPO remains robust across a broad range of thresholds, while GRPO is more sensitive to the clipping range.}
+    \label{fig:hyperparameter_sensitivity}
+\end{figure}
+
+As shown in \Cref{fig:hyperparameter_sensitivity}, DPPO is relatively insensitive within the tested ranges. DPPO-Binary-TV performs comparably for $\delta \in [0.10,0.20]$, and DPPO-Binary-KL remains strong for $\delta \in [0.05,0.15]$. In contrast, the GRPO curves vary more noticeably with the upper clipping parameter, and all tested DPPO configurations outperform the GRPO baselines. 
+% These results provide practical tuning guidance: $\delta=0.2$ for Binary-TV and $\delta=0.05$ for Binary-KL are reliable default choices, while nearby thresholds remain effective.
+
+
+\subsection{Extended Results for Different Model $\times$ Task Combinations}
+\label{appendix:extended_models_tasks}
+
+
+Besides experimental results presented in \Cref{sec:scaling_exp}, we evaluate DPPO on more model $\times$ task settings to validate its advantage over the GRPO baseline. The settings we considered include:
+
+\begin{enumerate}
+    \item \textbf{Different model family}. Training on a new model different from the Qwen family, OctoThinker-3B-Hybrid-Base~\citep{wang2025octothinker}, on the standard math reasoning dataset~\citep{hendrycks2021measuring}.
+
+    \item \textbf{Abstract reasoning and induction}. Training the Qwen3-1.7B-Base model on abstract reasoning task (Arc1D) and induction task (Acre) from the Gem library~\citep{liu2025gem}.
+
+    \item \textbf{Multi-turn reasoning}. Training the Qwen3-1.7B-Base model on the multi-turn reasoning environment (Sudoku-v0-easy) from Gem the library~\citep{liu2025gem}.
+\end{enumerate}
+
+The training is conducted using Oat~\citep{liu2025oat} with their example scripts (thereby the standard hyper-parameters) for math RL and Gem RL. For the TV divergence clipping, we use a threshold of $\delta=0.2$.
+\Cref{fig:more_settings} shows the comparison between the TV variant of DPPO and the vanilla ratio-based PPO, both based on the GRPO algorithmic framework with the only difference being the trust region masking strategy. We can observe DPPO improves the efficiency (and sometimes asymptotic performance) over the baseline across different settings, validating its general effectiveness.
+
+\label{appendix:more_settings}
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/more_settings.pdf}
+    \caption{Learning curve comparison of using ratio (PPO-Ratio) and TV divergence (DPPO-Binary-TV) for the trust region clipping.}
+    \label{fig:more_settings}
+\end{figure}
+
+
+%%%%%%%%%
+

@@ -1,0 +1,74 @@
+
+
+% \vspace{-0.5em}
+\section{Analysis on Training Efficiency}
+\label{sec:training_efficiency}
+
+
+
+
+
+Beyond training stability, the design of trust region is also critical for training \textit{efficiency}. As motivated in \Cref{sec:method_limitations}, PPO's ratio-clipping over-constrains the updates to low-probability tokens, which might be permitted by a divergence-based trust region. In this section, we aim to analyze how low-probability tokens affect the training dynamics, thus justifying the adoption of divergence-based trust region in our DPPO algorithm.
+
+\textbf{Experimental Setting:}  
+We fine-tune Qwen3-1.7B-Base \citep{yang2025qwen3} on the DAPO dataset \citep{yu2025dapo}. We employ GRPO~\citep{guo2025deepseekr1, liu2025understanding}  with the Clip-Higher trick~\citep{yu2025dapo} as the baseline algorithm. 
+% The probability ratio is defined as $r_t = \frac{{\trainerpi}_\theta(y_t|s_t)}{\rolloutpi_{\theta'}(y_t|s_t)}$.
+We  then \textit{relax} trust regions by setting the clipping threshold $\epsilon$ in \Cref{eq:ppo-clip} as infinity for tokens with $\rolloutpi(y_t|s_t) < \alpha$, thus isolating the effect of low-probability tokens.\looseness=-1
+
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=\linewidth]{figs/low_prob_sweep.pdf}
+    \caption{Analysis of relaxing trust regions for low-probability tokens. (\textbf{Left}) Training reward curves. (\textbf{Middle}) Rollout probability of clipped tokens. (\textbf{Right}) Entropy of clipped tokens.}
+    % \vspace{-1.2em}
+    \label{fig:low_prob_sweep}
+\end{figure}
+
+The learning curves for varying values of $\alpha$ are presented in Figure~\ref{fig:low_prob_sweep}. Notably, relaxing the clipping constraint for tokens with $\rolloutpi(y_t|s_t) < 0.1$ yields a substantial improvement in training efficiency compared to the GRPO baseline ($\alpha=0$). This observation validates our hypothesis that the ratio-clipping mechanism in PPO over-constrains updates to low-probability tokens, thereby hindering overall learning progress.
+The middle plot reveals that \textbf{clipped tokens are predominantly characterized by low probabilities} (typically below $0.15$ for the baseline in blue). As $\alpha$ increases, the probabilities of clipped tokens also rise, confirming that PPO's ratio-clipping is structurally biased against low-probability tokens. Furthermore, the right plot demonstrates that \textbf{clipped tokens frequently exhibit high entropy}. Consistent with \citet{wang2025beyond}, which posits that RL is driven primarily by high-entropy tokens in LLMs, our results suggest that relaxing constraints on these tokens enables more informative policy updates and thus achieves higher training efficiency (see Appendix \ref{app:clipped_tokens} for most frequent clipped tokens).\looseness=-1
+
+
+Furthermore, we examine the effect of directional clip relaxation with a fixed $\alpha \! = \! 0.1$. We generalize the clip operation with asymmetric thresholds, denoted as $\operatorname{clip}(r_t, 1 \! - \! \epsilon_{\text{low}}, 1 \! + \! \epsilon_{\text{high}})$, where $\epsilon_{\text{low}} \! = \! 0.2$ and $\epsilon_{\text{high}} \! = \!0.28$ by default. We relax either one end (\textit{Relax-high} or \textit{Relax-low}) or both ends (\textit{Relax-both}). For example, Relax-high is implemented by $(\epsilon_{\text{low}}=0.2, \epsilon_{\text{high}}=\infty)$ for tokens with $\rolloutpi(y_t|s_t) < \alpha$.\looseness=-1
+
+
+% \begin{figure}[t]
+%     \centering  
+%     \includegraphics[width=\linewidth]{figs/main-lora.pdf}  
+%     \caption{Evolution of AIME24 and AIME25 scores during RL training with LoRA based on Qwen3-30B-A3B-Base.}  
+%     \label{fig:main_lora}  
+% \end{figure}
+
+
+\begin{figure}[h]
+    \centering
+    % \vspace{-0.5em}
+    \includegraphics[width=\linewidth]{figs/clip_direction.pdf}
+    \caption{Analysis of trust region relaxation direction. (\textbf{Left}) Training reward curves. (\textbf{Right}) Policy entropy.}
+    % \vspace{-1.2em}
+    \label{fig:clip_direction}
+\end{figure}
+
+
+
+As illustrated in Figure~\ref{fig:clip_direction}, the direction of clip relaxation plays a critical role in the training efficiency and stability. Relax-high can be viewed as an extreme variant of the Clip-Higher trick \citep{yu2025dapo} applied only to low-probability tokens. While this approach maintains high entropy, it fails to yield significant gains in training efficiency. Conversely, Relax-low exhibits substantially faster initial learning\footnote{In contrast to the Clip-Higher intuition \citep{yu2025dapo}, we observe that ``Clip-Lower'' (relaxing $\epsilon_{\text{low}}$) for low-probability tokens is more vital for efficiency. This aligns with findings by \citet{pmlr-v235-tajwar24a} regarding the role of negative gradients in accelerating preference learning.}. However, this strategy eventually drops due to entropy collapse \citep{cui2025entropy}. Ultimately, we find that \textbf{Relax-both is the most effective strategy for achieving both efficient and stable training}, thereby validating the design of DPPO in relaxing both ends of the trust region.
+
+
+
+\begin{figure*}[t]
+    \centering  
+    \includegraphics[width=\linewidth]{figs/main-base.pdf}  
+    % \vspace{-1.8em}
+    \caption{Evolution of AIME24 and AIME25 Avg@32 scores during RL training using Qwen3-30B-A3B-Base. 
+    % The left two panels show AIME24 results, and the right two panels show AIME25 results. 
+    The first and third panels correspond to the same experiment without rollout router replay (w/o R3), while the second and fourth panels correspond to the same experiment with rollout router replay (w/ R3).}
+    % \vspace{-0.4cm}
+    \label{fig:main_base}  
+\end{figure*}  
+
+\begin{figure*}[t]
+    \centering  
+    \includegraphics[width=\linewidth]{figs/main-a3b_and_8b.pdf} 
+    % \vspace{-1.8em}
+    \caption{Evolution of AIME24 and AIME25 scores during RL training using Qwen3-30B-A3B (left) and Qwen3-8B-Base (right).}  
+    \label{fig:main_a3b_and_8b}  
+    % \vspace{-0.2cm}
+\end{figure*}  

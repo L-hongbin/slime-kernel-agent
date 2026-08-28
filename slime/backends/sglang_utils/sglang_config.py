@@ -68,7 +68,11 @@ class ModelConfig:
     def resolve(self, args) -> None:
         """Resolve per-group defaults from model-level then args-level values."""
         default_gpus_per_engine = self.num_gpus_per_engine or args.rollout_num_gpus_per_engine
-        default_model_path = self.model_path or args.hf_checkpoint
+        # --rollout-model-path lets rollout serve a different ckpt than the
+        # trainer (DSpark draft stages). This injection lands in g.overrides,
+        # which _compute_server_args applies LAST — it silently clobbers the
+        # kwargs-level model_path, so the fallback chain must live here too.
+        default_model_path = self.model_path or getattr(args, "rollout_model_path", None) or args.hf_checkpoint
         for g in self.server_groups:
             if g.num_gpus_per_engine is None:
                 g.num_gpus_per_engine = default_gpus_per_engine
@@ -89,7 +93,23 @@ class ModelConfig:
 
         # Auto-infer update_weights when not explicitly set.
         if self.update_weights is None:
-            if effective_model_path != args.hf_checkpoint:
+            if effective_model_path == (getattr(args, "rollout_model_path", None) or args.hf_checkpoint):
+                # --rollout-model-path serves a ckpt VARIANT of the trained model
+                # (e.g. -DSpark draft stages; backbone identical) — it IS the
+                # primary policy server and must receive weight/adapter sync.
+                # CAUTION: this keys on path-string equality. A genuinely-frozen
+                # auxiliary model that resolves to the same path (including via
+                # an omitted YAML model_path falling through to the default)
+                # would silently receive weight syncs — set update_weights
+                # explicitly in YAML for any multi-model config.
+                if self.model_path is None and self.name != "default":
+                    logger.warning(
+                        f"Model '{self.name}': update_weights auto-inferred True from a "
+                        f"DEFAULTED model_path ({effective_model_path}). If this model is "
+                        f"a frozen auxiliary, set update_weights: false explicitly."
+                    )
+                self.update_weights = True
+            elif effective_model_path != args.hf_checkpoint:
                 logger.warning(
                     f"Model '{self.name}' uses model_path='{effective_model_path}' which differs "
                     f"from hf_checkpoint='{args.hf_checkpoint}'. Defaulting update_weights to False. "

@@ -28,13 +28,19 @@ from types import SimpleNamespace
 
 # ``fully_async_rollout`` imports ``sglang_rollout``, which needs sglang_router
 # and (transitively) transformers — both deliberately absent from the CPU CI
-# env. The tests below never dial a server or touch a tokenizer, so stub the
-# imports, same as tests/test_agent/test_agent_rollout_cpu.py.
-if "sglang_router" not in sys.modules:
+# env. The tests below never dial a server or touch a tokenizer, so stub only
+# dependencies that are actually unavailable. This avoids replacing installed
+# packages and polluting later modules when a developer runs a combined suite.
+try:
+    import sglang_router  # noqa: F401
+except ImportError:
     _router_stub = types.ModuleType("sglang_router")
     _router_stub.__version__ = "0.2.3"
     sys.modules["sglang_router"] = _router_stub
-if "transformers" not in sys.modules:
+
+try:
+    import transformers  # noqa: F401
+except ImportError:
     _tf_stub = types.ModuleType("transformers")
     for _name in (
         "AutoProcessor",

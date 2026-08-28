@@ -17,6 +17,8 @@ DEFAULT_KERNELGYM_URL = "http://127.0.0.1:20211"
 DEFAULT_TIMEOUT = 5.0
 DEFAULT_ATTEMPTS = 3
 DEFAULT_INTERVAL = 2.0
+DEFAULT_BACKOFF_FACTOR = 1.0
+DEFAULT_MAX_INTERVAL = 60.0
 
 
 class KernelGymRequestError(RuntimeError):
@@ -226,9 +228,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--attempts",
         type=int,
         default=DEFAULT_ATTEMPTS,
-        help="Number of health attempts. Use >1 to wait for a starting service.",
+        help="Number of health attempts. Use 0 to retry indefinitely.",
     )
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL, help="Sleep seconds between attempts.")
+    parser.add_argument(
+        "--backoff-factor",
+        type=float,
+        default=DEFAULT_BACKOFF_FACTOR,
+        help="Multiply the retry interval by this factor after each failure.",
+    )
+    parser.add_argument(
+        "--max-interval",
+        type=float,
+        default=DEFAULT_MAX_INTERVAL,
+        help="Maximum sleep seconds between health attempts.",
+    )
     parser.add_argument(
         "--workers-status",
         action="store_true",
@@ -238,17 +252,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 async def run(args: argparse.Namespace) -> int:
-    if args.attempts < 1:
-        raise ValueError("--attempts must be >= 1")
+    if args.attempts < 0:
+        raise ValueError("--attempts must be >= 0")
     if args.timeout <= 0:
         raise ValueError("--timeout must be > 0")
     if args.interval < 0:
         raise ValueError("--interval must be >= 0")
+    if args.backoff_factor < 1:
+        raise ValueError("--backoff-factor must be >= 1")
+    if args.max_interval < 0:
+        raise ValueError("--max-interval must be >= 0")
 
     client = KernelGymHealthClient(args.url, timeout_s=args.timeout)
     try:
         last_error: Exception | None = None
-        for attempt in range(1, args.attempts + 1):
+        attempt = 0
+        retry_interval = min(args.interval, args.max_interval)
+        while args.attempts == 0 or attempt < args.attempts:
+            attempt += 1
+            attempt_limit = "unbounded" if args.attempts == 0 else str(args.attempts)
             try:
                 payload = await client.check_health()
                 print(f"OK: KernelGym healthy at {client.base_url}")
@@ -260,9 +282,15 @@ async def run(args: argparse.Namespace) -> int:
                 return 0
             except Exception as exc:
                 last_error = exc
-                print(f"FAIL attempt {attempt}/{args.attempts}: {exc}", file=sys.stderr)
-                if attempt < args.attempts:
-                    await asyncio.sleep(args.interval)
+                print(f"FAIL attempt {attempt}/{attempt_limit}: {exc}", file=sys.stderr)
+                if args.attempts == 0 or attempt < args.attempts:
+                    delay = retry_interval
+                    print(
+                        f"RETRY KernelGym health in {delay:g}s " f"(next attempt {attempt + 1}/{attempt_limit})",
+                        file=sys.stderr,
+                    )
+                    await asyncio.sleep(delay)
+                    retry_interval = min(retry_interval * args.backoff_factor, args.max_interval)
 
         print(f"KernelGym health check failed after {args.attempts} attempt(s): {last_error}", file=sys.stderr)
         return 1

@@ -1,0 +1,18 @@
+\section{Closing Remarks}
+
+Divergence-based trust-region masks (e.g., DPPO) improve PPO's proximity criterion, but they
+still inherit PPO's sampled-ratio direction criterion.
+We address this mismatch with the predictive divergence mask, which decides
+whether to mask an update from the predicted first-order change of the divergence
+itself.
+For softmax policies, this change decomposes into a local term that recovers the
+ratio-based criterion and a global term that captures distribution-wide softmax
+coupling.
+
+Empirically, the divergence-based direction criterion is better aligned with the
+realized divergence change, and the resulting mask improves
+training stability and effectiveness across model scales and precision settings.
+The method is still a local first-order approximation, since real parameter
+updates aggregate gradients from all tokens and can introduce token interactions.
+Nevertheless, the results suggest that the direction criterion should receive the
+same distributional treatment as the proximity criterion.

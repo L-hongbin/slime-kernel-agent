@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+import numpy as np
 import torch
 
 from slime.utils.misc import decode_int32_meta_array
@@ -123,6 +124,14 @@ class Sample:
     # token i, kept ids are rollout_top_p_token_ids[offsets[i]:offsets[i + 1]].
     rollout_top_p_token_ids: list[int] | torch.Tensor | None = None
     rollout_top_p_token_offsets: list[int] | torch.Tensor | None = None
+    # Compact behavior-policy support used by predictive-mask DPPO.  Each
+    # response-token row has width ``dppo_predictive_top_k + 1``: the rollout
+    # top-k tokens plus (when it was outside top-k) the sampled token.  Invalid
+    # padding slots are selected by ``rollout_topk_valid_mask`` rather than a
+    # sentinel token id, since token id 0 is a valid vocabulary item.
+    rollout_topk_token_ids: np.ndarray | None = None
+    rollout_topk_log_probs: np.ndarray | None = None
+    rollout_topk_valid_mask: np.ndarray | None = None
     rollout_routed_experts: list[list[int]] | torch.Tensor | None = None  # Routed experts from rollout engine
     remove_sample: bool = False
     teacher_log_probs: list[float] | None = None  # Log probabilities from teacher model for OPD
@@ -435,6 +444,30 @@ class Sample:
                 f"rollout_log_probs length {len(self.rollout_log_probs)} != response_length {self.response_length}"
             )
 
+        predictive_fields = (
+            self.rollout_topk_token_ids,
+            self.rollout_topk_log_probs,
+            self.rollout_topk_valid_mask,
+        )
+        if any(value is not None for value in predictive_fields):
+            if any(value is None for value in predictive_fields):
+                raise ValueError("predictive top-k replay must include token ids, log probabilities, and valid mask.")
+            expected_shape = self.rollout_topk_token_ids.shape
+            if len(expected_shape) != 2 or expected_shape[0] != self.response_length:
+                raise ValueError(
+                    "predictive top-k replay rows must equal response_length: "
+                    f"shape={expected_shape}, response_length={self.response_length}."
+                )
+            if (
+                self.rollout_topk_log_probs.shape != expected_shape
+                or self.rollout_topk_valid_mask.shape != expected_shape
+            ):
+                raise ValueError(
+                    "predictive top-k replay fields must have identical shapes: "
+                    f"token_ids={expected_shape}, log_probs={self.rollout_topk_log_probs.shape}, "
+                    f"valid_mask={self.rollout_topk_valid_mask.shape}."
+                )
+
         if self.rollout_top_p_token_ids is None and self.rollout_top_p_token_offsets is None:
             return
         if self.rollout_top_p_token_ids is None or self.rollout_top_p_token_offsets is None:
@@ -467,7 +500,7 @@ class ParamInfo:
 # A dict-based batch produced along the rollout -> training path
 # In Megatron backend, several fields are converted to torch.Tensor lists on GPU
 # before being consumed by data iterators (see megatron_utils.actor._get_rollout_data).
-RolloutBatch = dict[str, list[torch.Tensor] | list[int] | list[float] | list[str]]
+RolloutBatch = dict[str, list[torch.Tensor] | list[np.ndarray] | list[int] | list[float] | list[str]]
 
 
 @dataclass

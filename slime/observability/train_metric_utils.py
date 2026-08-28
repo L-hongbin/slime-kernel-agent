@@ -1,4 +1,5 @@
 import logging
+import math
 from argparse import Namespace
 from copy import deepcopy
 
@@ -13,6 +14,127 @@ from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.types import RolloutBatch
 
 logger = logging.getLogger(__name__)
+
+
+ENTROPY_COMMON_PROBE_MASK_KEY = "entropy_common_probe_loss_masks"
+ENTROPY_COMMON_PROBE_NUMERATOR_KEY = "_entropy_common_probe_numerator"
+ENTROPY_COMMON_PROBE_DENOMINATOR_KEY = "_entropy_common_probe_denominator"
+ENTROPY_COMMON_PROBE_METRIC_KEY = "entropy_common_probe"
+
+ENTROPY_GROUPS = (
+    "adv_positive_ratio_ge_1",
+    "adv_positive_ratio_lt_1",
+    "adv_negative_ratio_ge_1",
+    "adv_negative_ratio_lt_1",
+    "upper_clipped",
+    "lower_clipped",
+)
+
+
+def add_entropy_common_probe_metric(metrics: dict[str, float], *, required: bool = False) -> dict[str, float]:
+    """Finalize the fixed-batch entropy probe after DP×CP reduction."""
+    numerator_present = ENTROPY_COMMON_PROBE_NUMERATOR_KEY in metrics
+    denominator_present = ENTROPY_COMMON_PROBE_DENOMINATOR_KEY in metrics
+    if not numerator_present and not denominator_present:
+        if required:
+            raise RuntimeError(
+                "--entropy-common-probe is enabled but the reduced train metrics contain no "
+                "common-probe sufficient statistics"
+            )
+        return metrics
+    if numerator_present != denominator_present:
+        missing = ENTROPY_COMMON_PROBE_DENOMINATOR_KEY if numerator_present else ENTROPY_COMMON_PROBE_NUMERATOR_KEY
+        raise RuntimeError(f"entropy common-probe reduction is missing {missing}")
+
+    numerator = float(metrics.pop(ENTROPY_COMMON_PROBE_NUMERATOR_KEY))
+    denominator = float(metrics.pop(ENTROPY_COMMON_PROBE_DENOMINATOR_KEY))
+    if not math.isfinite(numerator):
+        raise RuntimeError(f"entropy common-probe numerator must be finite, got {numerator}")
+    if not math.isfinite(denominator) or denominator <= 0.0:
+        raise RuntimeError(f"entropy common-probe denominator must be finite and positive, got {denominator}")
+    metrics[ENTROPY_COMMON_PROBE_METRIC_KEY] = numerator / denominator
+    return metrics
+
+
+def format_train_metric_key(key: str, role_tag: str = "") -> str:
+    """Map reduced train metrics to their tracking namespace."""
+    if key == "entropy_loss":
+        return f"entropy/{role_tag}train"
+    if key == ENTROPY_COMMON_PROBE_METRIC_KEY:
+        return f"entropy/{role_tag}common_probe"
+    if key.startswith("entropy/"):
+        return f"entropy/{role_tag}{key.removeprefix('entropy/')}"
+    if key.startswith("dppo/"):
+        return f"dppo/{role_tag}{key.removeprefix('dppo/')}"
+    return f"train/{role_tag}{key}"
+
+
+def add_derived_entropy_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Turn globally reduced entropy joint moments into conditional means."""
+    for group in ENTROPY_GROUPS:
+        fraction_key = f"_entropy/{group}_fraction"
+        joint_key = f"_entropy/{group}_joint_mean"
+        if fraction_key not in metrics and joint_key not in metrics:
+            continue
+        if fraction_key not in metrics or joint_key not in metrics:
+            missing = joint_key if fraction_key in metrics else fraction_key
+            raise RuntimeError(f"entropy metric reduction is missing {missing}")
+        fraction = float(metrics.pop(fraction_key))
+        joint_mean = float(metrics.pop(joint_key))
+        metrics[f"entropy/{group}"] = joint_mean / fraction if fraction > 0.0 else 0.0
+    return metrics
+
+
+def add_derived_dppo_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    """Derive DPPO conditional diagnostics after global DP×CP reduction."""
+    if "dppo/adv_positive_token_frac" not in metrics:
+        return metrics
+
+    def ratio(numerator_key: str, denominator_key: str) -> float:
+        denominator = float(metrics[denominator_key])
+        return float(metrics[numerator_key]) / denominator if denominator > 0.0 else 0.0
+
+    metrics["dppo/upper_clip_rate_given_positive"] = ratio(
+        "dppo/upper_clip_joint_frac", "dppo/adv_positive_token_frac"
+    )
+    metrics["dppo/lower_clip_rate_given_negative"] = ratio(
+        "dppo/lower_clip_joint_frac", "dppo/adv_negative_token_frac"
+    )
+    metrics["dppo/masked_update_mass_positive_frac"] = ratio(
+        "dppo/masked_update_mass_positive_mean", "dppo/update_mass_positive_mean"
+    )
+    metrics["dppo/masked_update_mass_negative_frac"] = ratio(
+        "dppo/masked_update_mass_negative_mean", "dppo/update_mass_negative_mean"
+    )
+
+    unmasked_abs_mass = float(metrics["dppo/update_mass_positive_mean"]) + float(
+        metrics["dppo/update_mass_negative_mean"]
+    )
+    kept_abs_mass = float(metrics["dppo/kept_update_mass_mean"])
+    unmasked_push = (
+        float(metrics["dppo/net_logprob_push_unmasked_numerator_mean"]) / unmasked_abs_mass
+        if unmasked_abs_mass > 0.0
+        else 0.0
+    )
+    kept_push = (
+        float(metrics["dppo/net_logprob_push_kept_numerator_mean"]) / kept_abs_mass if kept_abs_mass > 0.0 else 0.0
+    )
+    metrics["dppo/net_logprob_push_unmasked"] = unmasked_push
+    metrics["dppo/net_logprob_push_kept"] = kept_push
+    metrics["dppo/mask_induced_push_delta"] = kept_push - unmasked_push
+
+    category_denominators = {
+        "positive_clipped": "dppo/upper_clip_joint_frac",
+        "positive_kept": "dppo/positive_kept_joint_frac",
+        "negative_clipped": "dppo/lower_clip_joint_frac",
+        "negative_kept": "dppo/negative_kept_joint_frac",
+    }
+    for category, denominator_key in category_denominators.items():
+        for value_name in ("train_sampled_prob", "rollout_sampled_prob"):
+            joint_key = f"dppo/{value_name}_{category}_joint_mean"
+            metrics[f"dppo/{value_name}_{category}"] = ratio(joint_key, denominator_key)
+
+    return metrics
 
 
 def reduce_train_step_metrics(
@@ -131,7 +253,15 @@ def gather_log_data(
     )
     if reduced is None:
         return None
-    reduced_log_dict = {f"{metric_name}/{key}": value for key, value in reduced.items()}
+    reduced_log_dict = {}
+    for key, value in reduced.items():
+        if metric_name == "rollout" and key == "entropy":
+            output_key = "entropy/rollout"
+        elif metric_name == "rollout" and key == "entropy_mc":
+            output_key = "entropy/rollout_mc"
+        else:
+            output_key = f"{metric_name}/{key}"
+        reduced_log_dict[output_key] = value
     logger.info(f"{metric_name} {rollout_id}: {reduced_log_dict}")
     step = compute_rollout_step(args, rollout_id)
     reduced_log_dict["rollout/step"] = step
@@ -157,6 +287,7 @@ def log_rollout_data(
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
+        max_seq_lens = rollout_data.get("max_seq_lens", None)
         rollout_mask_sums = rollout_data.get("rollout_mask_sums", None)
         dp_world = mpu.get_data_parallel_world_size(with_context_parallel=False)
         num_rollouts_in_rollout = sum(rollout_data["global_batch_sizes"])
@@ -165,12 +296,17 @@ def log_rollout_data(
             "tokens",
             "multimodal_train_inputs",
             "loss_masks",
+            ENTROPY_COMMON_PROBE_MASK_KEY,
             "sample_indices",
             "rollout_ids",
             "rollout_mask_sums",
             "rollout_top_p_token_ids",
             "rollout_top_p_token_offsets",
+            "rollout_topk_token_ids",
+            "rollout_topk_log_probs",
+            "rollout_topk_valid_mask",
             "rollout_routed_experts",
+            "max_seq_lens",
             "global_batch_sizes",
             "num_microbatches",
             "micro_batch_indices",
@@ -201,6 +337,8 @@ def log_rollout_data(
                             response_lengths,
                             loss_masks,
                             rollout_mask_sums,
+                            qkv_format=args.qkv_format,
+                            max_seq_lens=max_seq_lens,
                         )
                         sum_value, count = rollout_log_metric_contribution(
                             sum_of_sample_mean(tensor).item(),
@@ -209,6 +347,19 @@ def log_rollout_data(
                             dp_size=dp_world,
                         )
                         log_dict[key] = (sum_value, count)
+                        if key == "rollout_log_probs":
+                            token_sum = get_sum_of_sample_mean(
+                                total_lengths,
+                                response_lengths,
+                                loss_masks,
+                                calculate_per_token_loss=True,
+                                qkv_format=args.qkv_format,
+                                max_seq_lens=max_seq_lens,
+                            )
+                            log_dict["entropy_mc"] = (
+                                token_sum(-tensor).item(),
+                                token_sum(torch.ones_like(tensor)).item(),
+                            )
                         continue
                     per_rank_sum = tensor.mean() * cp_size * count
                     sum_value = per_rank_sum.item()
@@ -407,3 +558,30 @@ def log_perf_data(
     if args.wandb_always_use_train_step:
         log_dict["train/step"] = step
     logging_utils.log(args, log_dict, step_key="rollout/step")
+
+
+def log_named_perf_timers(rollout_id: int, args: Namespace, *timer_names: str) -> None:
+    """Report selected timers without resetting unrelated performance metrics."""
+    from megatron.core import mpu
+
+    timer_instance = Timer()
+    selected = {name: timer_instance.timers.pop(name) for name in timer_names if name in timer_instance.timers}
+    is_primary_rank = (
+        mpu.get_tensor_model_parallel_rank() == 0
+        and mpu.is_pipeline_last_stage()
+        and mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+    )
+    if not is_primary_rank or not selected:
+        return
+
+    metrics = {f"perf/{name}_time": value for name, value in selected.items()}
+    logger.info("perf checkpoint %s: %s", rollout_id, metrics)
+    step = compute_rollout_step(args, rollout_id)
+    metrics["rollout/step"] = step
+    if args.wandb_always_use_train_step:
+        metrics["train/step"] = step
+    try:
+        logging_utils.log(args, metrics, step_key="rollout/step")
+    except Exception:
+        # Metrics reporting must not strand a checkpoint lifecycle request.
+        logger.exception("Failed to report checkpoint perf metrics for rollout %s", rollout_id)

@@ -1,0 +1,117 @@
+\section{Background}
+\label{sec:background}
+
+\noindent\textbf{LLM RL as token-level policy optimization.}
+We follow the standard setup for RL fine-tuning of autoregressive language
+models~\citep{ouyang2022training,grpo,dppo}. Given a prompt $x$, the policy $\tpi$
+generates a response $y=(y_1,\dots,y_T)$ token by token.
+We write $s_t=(x,y_1,\dots,y_{t-1})$ for the state at step $t$, so that
+$\tpi(y\mid x)=\prod_{t=1}^{T}\tpi(y_t\mid s_t)$. A scalar reward $R(x,y)$ is
+returned after the full response, and the objective is
+$\mathcal{J}(\tpi)=\E_{y\sim\tpi}[R(x,y)]$. Responses are sampled from a \emph{behavior} (or rollout) policy $\bmu$,
+typically a slightly stale copy of the current policy served by an optimized
+inference engine.
+The per-token importance ratio is
+\begin{equation}
+\label{eq:ratio}
+r_t \;=\; \frac{\tpi(y_t\mid s_t)}{\bmu(y_t\mid s_t)}.
+\end{equation}
+Critic-free estimators such as GRPO~\citep{grpo} and its variants
+\citep{ahmadian2024back,drgrpo} form the advantage $\Adv_t$ from group-relative
+returns.
+We treat $\Adv_t$ as given and inherit it unchanged from the underlying
+algorithm.
+
+\noindent\textbf{PPO and the ratio-based trust region.}
+PPO~\citep{ppo} maximizes a clipped surrogate,
+\begin{equation}
+\label{eq:ppo}
+L^{\mathrm{PPO}}(\tpi)=\E_{y\sim\bmu}\!\left[\sum_{t=1}^{|y|}
+\min\!\Big(r_t\,\Adv_t,\;\operatorname{clip}(r_t,1-\eps,1+\eps)\,\Adv_t\Big)\right],
+\end{equation}
+which can equivalently be written as a masked policy-gradient objective
+\begin{equation}
+\label{eq:ppo-mask}
+\begin{aligned}
+&L^{\mathrm{PPO}}(\tpi)=\E_{y\sim\bmu}\!\left[\sum_{t=1}^{|y|} M_t^{\mathrm{PPO}}\,r_t\,\Adv_t\right],
+\\[4pt]
+&\text{where}\quad M_t^{\mathrm{PPO}}=
+\begin{cases}
+0, & \sign\big(\Adv_t\,(r_t-1)\big)>0 \;\text{ and }\; |r_t-1|>\eps,\\[2pt]
+1, & \text{otherwise.}
+\end{cases}
+\end{aligned}
+\end{equation}
+The two factors of the mask $M_t^{\mathrm{PPO}}$ are the
+\emph{proximity} criterion $|r_t-1|>\eps$ and the \emph{direction} criterion
+$\sign\big(\Adv_t\,(r_t-1)\big)>0$, where $\sign(x)\in\{-1,0,+1\}$ returns the sign of $x$.
+The proximity criterion measures how far the
+training policy is from the behavior policy, but only through a single sampled token. Notably,
+$D_{\mathrm{TV}}\big(\bmu(\cdot\mid s_t)\,\|\,\tpi(\cdot\mid s_t)\big)=
+\tfrac12\,\E_{y_t\sim\bmu}\big[\,|r_t-1|\,\big]$,
+which indicates that $|r_t-1|/2$ is a one-sample Monte Carlo estimate of the total variation distance.
+Thus, PPO in effect gates on a noisy single-sample estimate of a
+divergence~\citep{dppo}. 
+The direction criterion encodes the asymmetric nature of trust-region control.
+The mask acts only on outward-pointing updates.
+Only updates that drive the policy \emph{further} from the behavior policy
+threaten the trust region and need to be restrained.
+Updates that pull the policy back toward it relax the trust-region constraint
+and should be kept by the mask.
+The sign of $\Adv_t(r_t-1)$ identifies whether the update is outward-pointing at
+the sampled token.
+It is positive exactly when $\Adv_t>0$ raises a probability already above the
+behavior policy ($r_t>1$), or when $\Adv_t<0$ lowers a probability already below
+it ($r_t<1$).
+The PPO mask therefore removes only token updates that are both outside the trust
+region and outward-pointing, while keeping corrective updates.
+
+\noindent\textbf{DPPO and the divergence-based trust region.}
+DPPO~\citep{dppo} keeps this masked structure and its asymmetric direction
+criterion, but rebuilds the proximity criterion around the full divergence between
+the two policies. Instead of gating on the single-sample estimate $|r_t-1|>\eps$, it
+measures the per-token divergence directly,
+$\Dtok_t=\Dtok\big(\bmu(\cdot\mid s_t)\,\|\,\tpi(\cdot\mid s_t)\big)$,
+and uses $\Dtok_t>\delta$ as the proximity criterion.
+This gives
+\begin{equation}
+\label{eq:dppo}
+\begin{aligned}
+&L^{\mathrm{DPPO}}(\tpi)=\E_{y\sim\bmu}\!\left[\sum_{t=1}^{|y|} M_t\,r_t\,\Adv_t\right],
+\\[4pt]
+&\text{where}\quad M_t=
+\begin{cases}
+0, & \sign\big(\Adv_t\,(r_t-1)\big)>0 \;\text{ and }\; \Dtok_t>\delta,\\[2pt]
+1, & \text{otherwise.}
+\end{cases}
+\end{aligned}
+\end{equation}
+A common choice, and the one we use throughout, sets
+$\Dtok=\KL(\bmu\,\|\,\tpi)$, the forward KL, which controls total variation
+through Pinsker's inequality.
+
+The full-vocabulary KL is not computable from a production rollout, which exposes
+only the $K$ largest log-probabilities per step. The top-$K$ divergence addresses
+this by restricting attention to a reduced support
+$\Keep=\operatorname{TopK}(\bmu(\cdot\mid s_t),K)\cup\{y_t\}$, the $K$ highest-probability
+tokens under the behavior policy augmented with the sampled token $y_t$ when it falls
+outside the top $K$, and collapsing everything outside
+$\Keep$ into a single aggregated tail bucket carrying the residual mass
+$\bmu_{\mathrm{tail}}=1-\sum_{i\in\Keep}\bmu_i$ (and likewise $\tpi_{\mathrm{tail}}$). With this reduction,
+\begin{equation}
+\label{eq:topk-kl}
+\KLtopk(\bmu\,\|\,\tpi)
+\;=\; \sum_{i\in\Keep}\bmu_i\log\frac{\bmu_i}{\tpi_i}
+\;+\; \bmu_{\mathrm{tail}}\log\frac{\bmu_{\mathrm{tail}}}{\tpi_{\mathrm{tail}}},
+\end{equation}
+which is a lower bound on the true KL (by the log-sum inequality) and, since
+top-$K$ typically captures more than $99\%$ of the probability mass, an extremely
+tight one~\citep{dppo}. Instantiating the mask of Eq.~(\ref{eq:dppo}) with this top-$K$ divergence, $\Dtok=\KLtopk$, gives the DPPO-TopK-KL method that we take as the starting point and primary baseline for this work.
+
+DPPO upgrades only the proximity criterion.
+The direction criterion is inherited from PPO unchanged, still flagging a token as
+eligible for masking exactly when
+$\sign\big(\Adv_t\,(r_t-1)\big)>0$.
+The next section examines whether this sampled-ratio direction criterion tracks
+the sign of the divergence change, and derives a replacement from the divergence
+itself.

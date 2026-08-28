@@ -1,3 +1,4 @@
+from collections import Counter
 from collections.abc import Sequence
 
 import torch
@@ -8,13 +9,149 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from slime.utils import accelerator
 from slime.utils.types import RolloutBatch
 
-from .cp_utils import slice_with_cp
+from .cp_utils import compute_cp_padded_max_seq_len, slice_with_cp
+
+
+def compute_bshd_max_seq_lens(
+    total_lengths: Sequence[int],
+    micro_batch_indices: Sequence[Sequence[int]],
+    *,
+    pad_size: int,
+    cp_size: int,
+    cp_partition_mode: str,
+    pipeline_model_parallel_size: int = 1,
+) -> list[int]:
+    """Compute the padded BSHD width used by each scheduled sample.
+
+    ``get_batch`` stacks all samples in one microbatch, so every sample in that
+    microbatch must use the same width: the aligned maximum of its real
+    ``total_length`` values.  With PP1, different microbatches may use different
+    widths and avoid padding every sample to the longest sequence in the whole
+    rollout.
+
+    V4 PP communication shapes are currently fixed once per Megatron pipeline
+    schedule.  Until that schedule is split by sequence shape, PP>1 must keep a
+    rollout-wide width; doing otherwise would make the sender and receiver
+    allocate different P2P buffers.  The explicit fallback here preserves the
+    previously validated PP behavior instead of silently enabling unsafe
+    per-microbatch shapes.
+
+    The schedule is also validated as an exact partition of local samples.  A
+    duplicate or missing index would otherwise leave a sample with a stale or
+    unrelated padding width and can corrupt BSHD loss/routing offsets.
+    """
+    if pad_size <= 0:
+        raise ValueError(f"pad_size must be positive, got {pad_size}")
+    if cp_size <= 0:
+        raise ValueError(f"cp_size must be positive, got {cp_size}")
+    if pipeline_model_parallel_size <= 0:
+        raise ValueError("pipeline_model_parallel_size must be positive, " f"got {pipeline_model_parallel_size}")
+
+    num_samples = len(total_lengths)
+    if num_samples == 0:
+        if micro_batch_indices:
+            raise ValueError("empty total_lengths requires an empty microbatch schedule")
+        return []
+
+    max_seq_lens: list[int | None] = [None] * num_samples
+    microbatch_widths: list[int] = []
+    for microbatch_id, indices in enumerate(micro_batch_indices):
+        if not indices:
+            raise ValueError(f"microbatch {microbatch_id} is empty")
+
+        seen_in_microbatch: set[int] = set()
+        raw_max_seq_len = 0
+        for sample_index in indices:
+            if not isinstance(sample_index, int):
+                raise TypeError(f"microbatch {microbatch_id} has non-integer sample index " f"{sample_index!r}")
+            if sample_index < 0 or sample_index >= num_samples:
+                raise IndexError(
+                    f"microbatch {microbatch_id} sample index {sample_index} is outside " f"[0, {num_samples})"
+                )
+            if sample_index in seen_in_microbatch or max_seq_lens[sample_index] is not None:
+                raise ValueError(f"sample index {sample_index} appears more than once in the schedule")
+            seen_in_microbatch.add(sample_index)
+
+            total_length = int(total_lengths[sample_index])
+            if total_length <= 0:
+                raise ValueError(f"total_lengths[{sample_index}] must be positive, got {total_length}")
+            raw_max_seq_len = max(raw_max_seq_len, total_length)
+
+        padded_width = compute_cp_padded_max_seq_len(
+            raw_max_seq_len,
+            pad_size,
+            cp_size,
+            cp_partition_mode,
+        )
+        microbatch_widths.append(padded_width)
+        for sample_index in indices:
+            max_seq_lens[sample_index] = padded_width
+
+    missing = [i for i, width in enumerate(max_seq_lens) if width is None]
+    if missing:
+        raise ValueError(f"microbatch schedule is missing sample indices {missing}")
+
+    if pipeline_model_parallel_size > 1:
+        rollout_width = max(microbatch_widths)
+        return [rollout_width] * num_samples
+
+    return [int(width) for width in max_seq_lens]
+
+
+def summarize_bshd_padding(
+    total_lengths: Sequence[int],
+    max_seq_lens: Sequence[int],
+) -> dict[str, int | float | str]:
+    """Return compact, log-friendly actual-length padding statistics."""
+    if len(total_lengths) != len(max_seq_lens):
+        raise ValueError(
+            "total_lengths and max_seq_lens must have the same size, got "
+            f"{len(total_lengths)} and {len(max_seq_lens)}"
+        )
+    if not total_lengths:
+        return {
+            "samples": 0,
+            "unique_widths": 0,
+            "width_hist": "",
+            "raw_slots": 0,
+            "padded_slots": 0,
+            "rollout_wide_slots": 0,
+            "padding_overhead_pct": 0.0,
+            "saved_vs_rollout_wide_pct": 0.0,
+        }
+
+    raw_lengths = [int(length) for length in total_lengths]
+    padded_widths = [int(width) for width in max_seq_lens]
+    for sample_index, (raw_length, padded_width) in enumerate(zip(raw_lengths, padded_widths, strict=True)):
+        if raw_length <= 0:
+            raise ValueError(f"total_lengths[{sample_index}] must be positive, got {raw_length}")
+        if padded_width < raw_length:
+            raise ValueError(
+                f"max_seq_lens[{sample_index}]={padded_width} is smaller than "
+                f"total_lengths[{sample_index}]={raw_length}"
+            )
+
+    width_counts = Counter(padded_widths)
+    raw_slots = sum(raw_lengths)
+    padded_slots = sum(padded_widths)
+    rollout_wide_slots = max(padded_widths) * len(padded_widths)
+    return {
+        "samples": len(padded_widths),
+        "unique_widths": len(width_counts),
+        "width_hist": ",".join(f"{width}:{width_counts[width]}" for width in sorted(width_counts)),
+        "raw_slots": raw_slots,
+        "padded_slots": padded_slots,
+        "rollout_wide_slots": rollout_wide_slots,
+        "padding_overhead_pct": 100.0 * (padded_slots - raw_slots) / raw_slots,
+        "saved_vs_rollout_wide_pct": 100.0 * (rollout_wide_slots - padded_slots) / rollout_wide_slots,
+    }
 
 
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
     pad_multiplier: int = 128,
+    qkv_format: str = "thd",
     allgather_cp: bool = False,
 ) -> dict[str, torch.Tensor | PackedSeqParams | list[torch.Tensor] | None]:
     """
@@ -52,53 +189,64 @@ def get_batch(
     cp_size = mpu.get_context_parallel_world_size()
     cp_rank = mpu.get_context_parallel_rank()
 
-    if allgather_cp:
-        # DSA mode: concatenate all sequences first, then slice once with CP.
-        # We also pad the *global* concatenated stream to make per-rank chunks equal.
-        cu_seqlens_list: list[int] = [0]
-        for t in tokens:
-            cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
+    if qkv_format == "bshd":
+        max_seq_lens = batch["max_seq_lens"]
+        assert max_seq_lens and all(width == max_seq_lens[0] for width in max_seq_lens), (
+            "bshd samples in one microbatch must share max_seq_len, got " f"{max_seq_lens}"
+        )
+        max_seqlen = max_seq_lens[0]
+        assert max([t.size(0) for t in tokens]) <= max_seqlen
+        tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
+        tokens = torch.stack(tokens)
+        packed_seq_params = None
+    elif qkv_format == "thd":
+        if allgather_cp:
+            # DSA mode: concatenate all sequences first, then slice once with CP.
+            # We also pad the global stream to make per-rank chunks equal.
+            cu_seqlens_list: list[int] = [0]
+            for token_ids in tokens:
+                cu_seqlens_list.append(cu_seqlens_list[-1] + token_ids.size(0))
 
-        tokens = torch.cat(tokens, dim=0)
+            tokens = torch.cat(tokens, dim=0)
+            global_pad_size = cp_size * pad_size
+            pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
+            if pad != 0:
+                tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-        # Pad global stream so (1) divisible by cp_size (equal chunks),
-        # (2) divisible by pad_size (reduce fragmentation).
-        global_pad_size = cp_size * pad_size
-        pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
-        if pad != 0:
-            tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-            cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
+            cu_seqlens = torch.tensor(
+                cu_seqlens_list,
+                dtype=torch.int,
+                device=accelerator.current_device(),
+            )
+            tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+        else:
+            tokens = [slice_with_cp(token_ids, pad_token_id, qkv_format) for token_ids in tokens]
 
-        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())
-        tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+            cu_seqlens = [0]
+            for token_ids in tokens:
+                cu_seqlens.append(cu_seqlens[-1] + token_ids.size(0))
+
+            tokens = torch.cat(tokens)
+            pad = (pad_size - tokens.size(0) % pad_size) % pad_size
+            if pad != 0:
+                tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                cu_seqlens.append(cu_seqlens[-1] + pad)
+
+            # THD requires cu_seqlens in the original (pre-CP) lengths.
+            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.current_device()) * cp_size
+
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+            qkv_format="thd",
+        )
+        tokens = tokens.unsqueeze(0)
     else:
-        tokens = [slice_with_cp(t, pad_token_id) for t in tokens]
-
-        cu_seqlens = [0]
-        for t in tokens:
-            cu_seqlens.append(cu_seqlens[-1] + t.size(0))
-
-        tokens = torch.cat(tokens)
-
-        # Always pad to reduce memory fragmentation and maybe make the computation faster
-        pad = (pad_size - tokens.size(0) % pad_size) % pad_size
-        if pad != 0:
-            tokens = F.pad(tokens, (0, pad), value=pad_token_id)
-            cu_seqlens.append(cu_seqlens[-1] + pad)
-
-        # thd requires the cu_seqlens to be of the origin length
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.device()) * cp_size
-
-    max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-    packed_seq_params = PackedSeqParams(
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_kv=cu_seqlens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-        qkv_format="thd",
-    )
-
-    tokens = tokens.unsqueeze(0)
+        raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
@@ -114,13 +262,20 @@ def get_batch(
         prompt_length = total_length - response_length
         # Align mask to token stream positions (prompt_length-1 left pad, 1 right pad)
         loss_mask = F.pad(loss_mask, (prompt_length - 1, 1), value=0)
-        if allgather_cp:
+        if qkv_format == "thd" and allgather_cp:
             loss_masks.append(loss_mask)
             continue
-        loss_mask = slice_with_cp(loss_mask, 0)
+        loss_mask = slice_with_cp(
+            loss_mask,
+            0,
+            qkv_format,
+            max_seqlen if qkv_format == "bshd" else None,
+        )
         loss_masks.append(loss_mask)
 
-    if allgather_cp:
+    if qkv_format == "bshd":
+        loss_masks = torch.stack(loss_masks)
+    elif allgather_cp:
         # DSA: concatenate first (same as tokens), pad globally (same pad as above), then slice once.
         loss_masks = torch.cat(loss_masks, dim=0)
         if pad != 0:

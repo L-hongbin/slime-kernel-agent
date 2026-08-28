@@ -1,0 +1,91 @@
+
+
+% \vspace{-0.2em}
+\section{Analysis on Training Stability}  
+\label{sec:stability}  
+
+The RL fine-tuning of LLMs is prone to training instability due to \textit{training-inference mismatch} (see \Cref{app:related_work_mismatch}). 
+In this section, we conduct an empirical study to dissect this issue and verify the stability of our DPPO algorithm.
+% In this section, we conduct an empirical study to dissect the training instability issue caused by training-inference mismatch (see Appendix \ref{app:related_work_mismatch}). 
+To formalize our analysis, we denote the parameters being optimized as $\theta$ and the parameters used for data generation as $\theta'$. We aim to answer three fundamental research questions:
+\begin{enumerate}[nosep]
+    \item Given the extremely low learning rates (e.g., $10^{-6}$) common in LLM fine-tuning, is a trust region still necessary to ensure training stability?  
+    \item Should the trust region be defined with respect to the original rollout distribution ($\rolloutpi_{\theta'}$) or a recomputed policy distribution ($\trainerpi_{\theta'}$)?  
+    \item What specific types of policy updates are the primary drivers of training instability?  
+\end{enumerate}
+
+\textbf{Experimental Setting:}
+Our experimental setup follows the sanity test proposed by \citet{qi2025defeating}. We fine-tune DeepSeek-R1-Distill-Qwen-1.5B~\citep{guo2025deepseekr1} on a curated set of 1,460 problems from the MATH dataset \citep{hendrycks2021measuring}. In this setting, a stable algorithm should theoretically converge to 100\% training accuracy, as all problems are known to be solvable by the initial model. 
+
+We evaluate several algorithms, each representing a different approach to managing the policy update. The baselines include: \textbf{PG-IS} and its truncated variant \textbf{PG-TIS} (also known as CISPO \citep{chen2025minimax}), which use standard policy gradients with token-level importance sampling; \textbf{GRPO with Clip-Higher}, a PPO-like algorithm where clipping is based on the rollout policy ratio $r_t = \frac{\trainerpi_\theta}{\rolloutpi_{\theta'}}$ \citep{shao2024deepseekmath, liu2025understanding}; and \textbf{MiniRL \& MiniRL-TIS}, a PPO variant where clipping is based on a recomputed policy ratio $r_t = \frac{\trainerpi_\theta}{\trainerpi_{\theta'}}$ \citep{zheng2025stabilizing}. We compare these against \textbf{DPPO}, our proposed method using either binary KL or TV divergence, with the trust region defined with respect to the rollout distribution $\rolloutpi_{\theta'}$. Detailed configurations for each algorithm are provided in the Appendix \ref{app:sanity_test}.
+
+% We evaluate several algorithms, each representing a different approach to manage the policy update. We denote the parameters being optimized as $\theta$ and the parameters used for data generation as $\theta'$:  
+% \begin{itemize}  
+%     \item \textbf{PG-IS \& PG-TIS (CISPO):} Unconstrained policy gradient with token-level importance sampling. The TIS variant truncates the importance ratio, a method also known as CISPO \citep{chen2025minimax}.  
+%     \item \textbf{GRPO with Clip-Higher:} A PPO-like algorithm where the ratio clipping, $r_t = \frac{\trainerpi_\theta}{\rolloutpi_{\theta'}}$, is based on the rollout policy \citep{shao2024deepseekmath, liu2025understanding}.  
+%     \item \textbf{MiniRL \& MiniRL-TIS:} A PPO variant where the ratio clipping is based on a recomputed policy distribution, $r_t = \frac{\trainerpi_\theta}{\trainerpi_{\theta'}}$ \citep{zheng2025stabilizing}.  
+%     \item \textbf{DPPO (Ours):} Our proposed method using either binary KL or TV divergence, with the trust region defined with respect to the rollout distribution $\rolloutpi_{\theta'}$.  
+% \end{itemize}  
+% Detailed configurations for each algorithm are provided in the Appendix.
+
+
+% \vspace{-0.2cm}
+\subsection{The Necessity of a Trust Region}  
+  
+Our first question addresses whether a trust region is redundant at low learning rates. \Cref{fig:sanity_test} provides a clear answer. The unconstrained methods, PG-IS and PG-TIS (CISPO), both suffer from an increasing training-inference mismatch, which culminates in a collapse of performance. In contrast, our DPPO variants, which enforce a principled trust region, maintain a stable, low level of mismatch throughout training and achieve near-perfect final rewards.  
+
+\textbf{Takeaway 1:} A trust region is essential for stable training, even with very small learning rates. Without it, the training-inference mismatch accumulates and leads to collapse.  
+
+\begin{figure}[h]
+    \centering  
+    \includegraphics[width=1.0\linewidth]{figs/which_trust_region.pdf}  
+    \caption{Switching the stable DPPO-KL to a decoupled objective causes the mismatch to grow and performance to collapse, confirming that the trust region must be anchored to the rollout policy.}  
+    \vspace{-0.5cm}
+    \label{fig:which_trust_region}  
+\end{figure}  
+
+% \vspace{-0.2cm}
+\subsection{The Correct Anchor for the Trust Region}  
+\label{sec:correct_ancher_for_truct_region}
+% \vspace{-0.1cm}
+
+Next, we investigate to which distribution the trust region should be anchored. A common practice in open-source implementations \citep{sheng2024hybridflow, slime_github} is to use a \textit{decoupled} objective \citep{hilton2022batch}, where the trust region is enforced relative to a recomputed policy distribution ($\trainerpi_{\theta'}$) instead of the original behavior policy ($\rolloutpi_{\theta'}$). The MiniRL algorithm, for example, follows this design \citep{zheng2025stabilizing}.  
+Our results show this choice is detrimental. As in \Cref{fig:sanity_test}, MiniRL fails to control the training-inference mismatch and its performance collapses, despite using a trust region. To confirm this, we created a decoupled version of our stable DPPO-KL algorithm. \Cref{fig:which_trust_region} shows that this single change corrupts the stable training process, causing the mismatch to grow and performance to collapse.
+
+\textbf{Takeaway 2:} The trust region must be defined with respect to the original behavior policy ($\rolloutpi_{\theta'}$). Using a recomputed on-policy distribution as the anchor leads to instability. This finding aligns with the theoretical bound in \Cref{eq:llm-tv-bound} and offers a significant practical benefit: by removing the need for recomputation, we can reduce training costs by approximately 25\% \citep{qi2024zero}.  
+  
+\begin{figure}[h]
+    \centering  
+    \includegraphics[width=0.85\linewidth]{figs/rewards_mask_fraction_combined.pdf}  
+    \caption{Isolating the source of instability. The solid curves are training rewards, while the dashed lines are the percentage of \textit{bad updates}. Starting with the unstable PG-IS, applying a minimal mask that only blocks large-divergence bad updates on negative samples is sufficient to stabilize training, indicating these bad updates are the primary cause of training instability.}  
+    \label{fig:ablation_mask_negative}  
+    \vspace{-0.5cm}
+\end{figure}
+
+% \vspace{-0.2cm}
+\subsection{Identifying the Source of Instability}  
+% \vspace{-0.1cm}
+
+Finally, we seek to pinpoint which specific policy updates are most responsible for the instability. Our methodology is to start with the unstable \textbf{PG-IS} algorithm, which applies no update masking, and introduce the most minimal mask necessary to restore stability. This allows us to isolate the most detrimental class of updates.  
+Since updates on positively rewarded samples are typically safe, we focus on negative samples where the policy is penalized \citep{liu2025deepseek, ren2025learning_dynamics_LLM}. We design a simple mask that only blocks updates on negative samples where the probability of the sampled token is decreased by more than a threshold $\delta$: \looseness=-1
+% $
+% M_t = 0 \; \text{if} \; \hat{A}_t < 0 \; \text{and} \; {\rolloutpi}_{\theta'}(y_t|s_t) - {\trainerpi}_{\theta}(y_t|s_t) \ge \delta. 
+% $
+\begin{align*}  
+M_t = 0 \; \text{if} \; \hat{A}_t < 0 \; \text{and} \; {\rolloutpi}_{\theta'}(y_t|s_t) - {\trainerpi}_{\theta}(y_t|s_t) \ge \delta.  
+\end{align*}  
+As shown in \Cref{fig:ablation_mask_negative}, applying this minimal mask with $\delta=0.5$ is sufficient to stabilize the training. In contrast, a slightly looser mask ($\delta=0.8$) or one anchored to the recomputed distribution (``Mask-0.5-Recompute'') both fail to prevent the eventual collapse. We define \textit{bad updates} as those where this divergence exceeds 0.5 and plot their percentage over time. The plot reveals that only a very small fraction of updates are ``bad'' ($\leq 0.5\%$) yet they are the primary culprits behind training collapse. Furthermore, the percentage of these bad updates strongly correlates with reward fluctuation; as the fraction of bad updates rises, the reward curve becomes more erratic, reinforcing a causal link.\looseness=-1
+
+\textbf{Takeaway 3:} The primary source of instability is a small subset of updates on negative samples that push the policy far outside the trust region. A likely reason is that aggressively penalizing a token the model deems probable can corrupt the LLM's internal knowledge and destabilize the learning process. This finding confirms the critical need for a trust region, particularly when handling negative feedback.  
+
+
+% \vspace{-0.2cm}
+\subsection{The Pitfalls of Truncated Importance Sampling}  
+  
+% Our results also reveal an interesting finding regarding Truncated Importance Sampling (TIS), a technique widely adopted to control the variance of policy gradient estimates \citep{yao2025offpolicy, chen2025minimax}. Contrary to its intended purpose, TIS degrades training stability in our experiments. As illustrated in \Cref{fig:sanity_test}, the TIS-enabled variants (PG-TIS and MiniRL-TIS) suffer from premature collapse and significantly underperform their untruncated counterparts.  
+% We hypothesize that this detrimental effect stems from the same issue as PPO's ratio clipping: low-probability tokens, which naturally produce high-variance ratios, are the most likely to be truncated by TIS. While this does reduce variance, it systematically down-weights the gradient signal from these tokens, introducing a significant and harmful bias into the policy update. This suggests that naive truncation can be just as damaging as naive clipping.
+
+Our results also reveal an unexpected drawback of Truncated Importance Sampling (TIS), a common technique for reducing policy-gradient variance \citep{yao2025offpolicy, chen2025minimax}. In our experiments, TIS worsens training stability: as shown in \Cref{fig:sanity_test}, PG-TIS and MiniRL-TIS collapse prematurely and substantially underperform their untruncated counterparts. 
+
+We hypothesize that this detrimental effect stems from the same issue as PPO's ratio clipping: low-probability tokens, which naturally produce high-variance ratios, are the most likely to be truncated by TIS. While this does reduce variance, it systematically down-weights the gradient signal from these tokens, introducing a significant and harmful bias into the policy update. This suggests that naive truncation can be as damaging as naive clipping.
+% We hypothesize that, like PPO ratio clipping, TIS disproportionately suppresses low-probability tokens, whose large ratios carry high-variance but important gradient signals. This variance reduction therefore introduces a harmful bias, suggesting that naive truncation can be as damaging as naive clipping.

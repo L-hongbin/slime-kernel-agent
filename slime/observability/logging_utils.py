@@ -10,6 +10,44 @@ _LOGGER_CONFIGURED = False
 _TRACKING_ACTOR = None
 _OWNS_TRACKING_ACTOR = False
 
+# Metrics intentionally omitted from W&B.  They are either
+# duplicates of a retained metric, configuration constants, or low-information
+# extrema/derived sums.  Keep the filtering at the common W&B boundary so
+# rollout-side and Megatron-side producers cannot accidentally reintroduce the
+# redundant W&B panels while their values remain available to internal logic and
+# text logs (and other tracking backends).
+_REDUNDANT_WANDB_METRICS = frozenset(
+    {
+        "lora/lora_adapter/bytes",
+        "lora/lora_adapter/num_tensors",
+        "lora/lora_adapter/rank",
+        "perf/effective_tokens_per_gpu_per_sec",
+        "perf/longest_effective_sample_tokens_per_sec",
+        "rollout/coverage/num_coverage/max",
+        "rollout/coverage/num_coverage/min",
+        "rollout/coverage/time_coverage/max",
+        "rollout/coverage/time_coverage/min",
+        "rollout/env_extra_info/compilation/mean",
+        "rollout/env_extra_info/speedup/mean",
+        "rollout/env_extra_info/speedup/min",
+        "rollout/kernel/time/env_time/sum",
+        "rollout/kernel/time/model_time/sum",
+        "rollout/kl",
+        "rollout/response_lengths",
+        "rollout/returns",
+        "rollout/truncated_ratio",
+        "rollout/turn_indices",
+        "train/loss",
+    }
+)
+
+
+def _filter_wandb_metrics(metrics):
+    """Return W&B payload without intentionally redundant metric keys."""
+    if _REDUNDANT_WANDB_METRICS.isdisjoint(metrics):
+        return metrics
+    return {key: value for key, value in metrics.items() if key not in _REDUNDANT_WANDB_METRICS}
+
 
 class _CentralTrackingActor:
     def __init__(self, args):
@@ -19,9 +57,12 @@ class _CentralTrackingActor:
     def get_wandb_run_id(self):
         return getattr(self.args, "wandb_run_id", None)
 
+    def update_open_metrics(self, router_addr):
+        wandb_utils.reinit_wandb_primary_with_open_metrics(self.args, router_addr)
+
     def log(self, metrics, step_key: str):
         if self.args.use_wandb:
-            wandb.log(metrics)
+            wandb.log(_filter_wandb_metrics(metrics))
 
         if self.args.use_tensorboard:
             metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
@@ -33,7 +74,6 @@ class _CentralTrackingActor:
                 _TensorboardAdapter(self.args).finish()
             except Exception:
                 logging.getLogger(__name__).exception("Failed to finish tensorboard writer")
-
         if self.args.use_wandb:
             try:
                 if wandb.run is not None:
@@ -68,6 +108,18 @@ def init_tracking(args, primary: bool = True, **kwargs):
         wandb_utils.init_wandb_primary(args, **kwargs)
     else:
         wandb_utils.init_wandb_secondary(args, **kwargs)
+
+
+def update_tracking_open_metrics(args, router_addr):
+    if _use_centralized_tracking(args):
+        actor = _get_central_tracking_actor(args)
+        if actor is not None:
+            import ray
+
+            ray.get(actor.update_open_metrics.remote(router_addr))
+        return
+
+    wandb_utils.reinit_wandb_primary_with_open_metrics(args, router_addr)
 
 
 def finish_tracking(args):
@@ -109,7 +161,7 @@ def log(args, metrics, step_key: str):
             return
 
     if args.use_wandb:
-        wandb.log(metrics)
+        wandb.log(_filter_wandb_metrics(metrics))
 
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}

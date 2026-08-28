@@ -22,6 +22,12 @@ The scheduling philosophy is **pack first, distribute second**:
      each, with either a strided round-robin or a Karmarkar-Karp pass on
      estimated mbs FLOPs.
 
+When ``args.sort_train_microbatches_by_padded_length_desc`` is enabled, the
+micro-batches already assigned to each DP rank are executed from largest to
+smallest maximum sample length within each training step. Padding is a
+monotonic round-up of that maximum, so this is exactly padded-width order
+without coupling this pure scheduler to a model backend's padding multiple.
+
 Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
@@ -79,6 +85,22 @@ def _pack_step_into_mbs(
     return [list(range(i, min(i + micro_batch_size, n))) for i in range(0, n, micro_batch_size)]
 
 
+def _sort_microbatches_by_max_length_desc(
+    microbatches: list[list[int]],
+    lengths: list[int],
+) -> list[list[int]]:
+    """Stable largest-padded-width-first order for one DP rank and step.
+
+    Every supported BSHD padding rule rounds ``max(lengths[mbs])`` upward by
+    a positive alignment, so sorting on the raw maximum gives the same
+    non-increasing order as sorting on the eventual padded width. Stable ties
+    preserve the scheduler's existing order within one padding bucket.
+    """
+    if any(not microbatch for microbatch in microbatches):
+        raise ValueError("cannot sort an empty training microbatch")
+    return sorted(microbatches, key=lambda microbatch: max(lengths[i] for i in microbatch), reverse=True)
+
+
 def build_dp_schedule(
     args: Any,
     train_parallel_config: dict,
@@ -95,7 +117,8 @@ def build_dp_schedule(
 
     Args:
         args: Namespace with ``micro_batch_size``, ``use_dynamic_batch_size``,
-            ``max_tokens_per_gpu``, ``balance_data``.
+            ``max_tokens_per_gpu``, ``balance_data``, and optional
+            ``sort_train_microbatches_by_padded_length_desc``.
         train_parallel_config: ``{"dp_size", "cp_size", "vpp_size",
             "microbatch_group_size_per_vp_stage"}``.
         total_lengths: token count per sample, indexed globally.
@@ -119,6 +142,7 @@ def build_dp_schedule(
     cp_size = train_parallel_config["cp_size"]
     vpp_size = train_parallel_config["vpp_size"]
     mb_group = train_parallel_config["microbatch_group_size_per_vp_stage"]
+    sort_microbatches_desc = getattr(args, "sort_train_microbatches_by_padded_length_desc", False)
 
     max_per_bin = None
     if args.use_dynamic_batch_size:
@@ -169,6 +193,17 @@ def build_dp_schedule(
         )
 
         if pack_group_atomic:
+            if sort_microbatches_desc:
+                multi_sample_rollouts = [
+                    rollout_id for rollout_id in step_rollouts if len(rollout_id_to_samples[rollout_id]) != 1
+                ]
+                if multi_sample_rollouts:
+                    raise ValueError(
+                        "--sort-train-microbatches-by-padded-length-desc currently requires one training "
+                        "sample per trajectory when --enable-turns-dp-partitions is active; sorting turns "
+                        f"independently would break trajectory-major order (step={step_i}, "
+                        f"multi_sample_rollouts={multi_sample_rollouts[:8]})."
+                    )
             step_rollout_lengths = [
                 sum(total_lengths[pos] for pos in rollout_id_to_samples[rollout_id]) for rollout_id in step_rollouts
             ]
@@ -210,27 +245,44 @@ def build_dp_schedule(
 
             for rank in range(dp_size):
                 rank_lengths = [total_lengths[index] for index in rank_step_sample_indices[rank]]
-                if len(rank_step_mbs[rank]) == target_num_mbs:
-                    continue
-                if args.use_dynamic_batch_size:
-                    expand_bins_by_splitting(rank_step_mbs[rank], target_num_mbs, rank_lengths)
-                    assert len(rank_step_mbs[rank]) == target_num_mbs, (
-                        f"dynamic path: rank {rank} could only produce {len(rank_step_mbs[rank])} mbs; "
-                        f"need {target_num_mbs}. step {step_i} has {len(rank_lengths)} local samples."
-                    )
-                else:
-                    raise AssertionError(
-                        f"static path: rank {rank} has {len(rank_step_mbs[rank])} mbs, "
-                        f"need {target_num_mbs}. Adjust global_batch_size/micro_batch_size/dp_size."
+                if len(rank_step_mbs[rank]) != target_num_mbs:
+                    if args.use_dynamic_batch_size:
+                        expand_bins_by_splitting(rank_step_mbs[rank], target_num_mbs, rank_lengths)
+                        assert len(rank_step_mbs[rank]) == target_num_mbs, (
+                            f"dynamic path: rank {rank} could only produce {len(rank_step_mbs[rank])} mbs; "
+                            f"need {target_num_mbs}. step {step_i} has {len(rank_lengths)} local samples."
+                        )
+                    else:
+                        raise AssertionError(
+                            f"static path: rank {rank} has {len(rank_step_mbs[rank])} mbs, "
+                            f"need {target_num_mbs}. Adjust global_batch_size/micro_batch_size/dp_size."
+                        )
+                if sort_microbatches_desc:
+                    rank_step_mbs[rank] = _sort_microbatches_by_max_length_desc(
+                        rank_step_mbs[rank],
+                        rank_lengths,
                     )
 
             num_microbatches.append(target_num_mbs)
             for rank in range(dp_size):
                 rank_samples = rank_step_sample_indices[rank]
-                local_start = len(partitions[rank])
-                partitions[rank].extend(rank_samples)
-                for mbs_locals in rank_step_mbs[rank]:
-                    micro_batch_indices[rank].append([local_start + index for index in mbs_locals])
+                if sort_microbatches_desc:
+                    # Keep the rollout partition and its iterator schedule in
+                    # the same physical order. DataIterator requires flattened
+                    # micro_batch_indices to tile [0, n), rather than merely be
+                    # a permutation of it.
+                    for mbs_locals in rank_step_mbs[rank]:
+                        mbs_sample_indices = [rank_samples[i] for i in mbs_locals]
+                        local_start = len(partitions[rank])
+                        partitions[rank].extend(mbs_sample_indices)
+                        micro_batch_indices[rank].append(
+                            list(range(local_start, local_start + len(mbs_sample_indices)))
+                        )
+                else:
+                    local_start = len(partitions[rank])
+                    partitions[rank].extend(rank_samples)
+                    for mbs_locals in rank_step_mbs[rank]:
+                        micro_batch_indices[rank].append([local_start + index for index in mbs_locals])
             continue
 
         # 1. Pack samples in this step into mbs with one global pass.
@@ -276,6 +328,13 @@ def build_dp_schedule(
             rank_mbs_idx = get_seqlen_balanced_partitions(mbs_weights, dp_size, equal_size=True)
         else:
             rank_mbs_idx = [list(range(r, K, dp_size)) for r in range(dp_size)]
+
+        if sort_microbatches_desc:
+            for r in range(dp_size):
+                rank_mbs_idx[r].sort(
+                    key=lambda mbs_idx: max(step_lengths[i] for i in step_mbs[mbs_idx]),
+                    reverse=True,
+                )
 
         # 4. Build per-rank partitions (global sample indices) and micro_batch_indices
         # (local indices into partitions[r]).

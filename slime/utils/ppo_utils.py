@@ -134,6 +134,25 @@ class PolicyLossOutput(dict):
         yield self["pg_clipfrac"]
 
 
+def compute_sequence_log_ratio(
+    full_log_probs: list[torch.Tensor],
+    full_rollout_log_probs: list[torch.Tensor],
+    local_log_probs: list[torch.Tensor],
+    loss_masks: list[torch.Tensor],
+) -> torch.Tensor:
+    """Return each response's mean log-ratio expanded over its local tokens."""
+    sequence_log_ratios = [
+        (((log_prob.detach() - rollout_log_prob.detach()) * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1))
+        for log_prob, rollout_log_prob, loss_mask in zip(
+            full_log_probs, full_rollout_log_probs, loss_masks, strict=True
+        )
+    ]
+    return torch.cat(
+        [ratio.expand_as(log_prob) for ratio, log_prob in zip(sequence_log_ratios, local_log_probs, strict=True)],
+        dim=0,
+    )
+
+
 @torch.compile(dynamic=True)
 def _compute_policy_loss_tensors(
     ppo_kl: torch.Tensor,
@@ -181,6 +200,44 @@ def compute_policy_loss(
     )
 
 
+def _compute_policy_loss_eager(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+) -> PolicyLossOutput:
+    """Eager equivalent exposed through ``compute_policy_loss.__wrapped__`` for CPU tests."""
+    pg_losses, clipfrac, upper_clipfrac, lower_clipfrac = _compute_policy_loss_tensors.__wrapped__(
+        ppo_kl, advantages, eps_clip, eps_clip_high, eps_clip_c
+    )
+    return PolicyLossOutput(
+        pg_losses=pg_losses,
+        pg_clipfrac=clipfrac,
+        pg_upper_clipfrac=upper_clipfrac,
+        pg_lower_clipfrac=lower_clipfrac,
+    )
+
+
+compute_policy_loss.__wrapped__ = _compute_policy_loss_eager
+
+
+def compute_policy_loss_output(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+) -> dict[str, torch.Tensor]:
+    """Return ordinary PPO loss plus the richer metric mapping used by newer modes.
+
+    ``compute_policy_loss`` retains slime's established two-tensor return
+    protocol; this adapter supplies the mapping protocol used by the newer
+    policy-loss implementations.
+    """
+    return compute_policy_loss(ppo_kl, advantages, eps_clip, eps_clip_high, eps_clip_c)
+
+
 def compute_up_policy_loss(
     log_probs: torch.Tensor,
     old_log_probs: torch.Tensor,
@@ -200,7 +257,7 @@ def compute_up_policy_loss(
     no positive upper clip; UP-GSPO uses eps_clip=3e-4 and no positive upper
     clip.
     """
-    ppo_output = compute_policy_loss(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, eps_clip_c)
+    ppo_output = compute_policy_loss_output(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, eps_clip_c)
     positive_advantage_mask = advantages > 0
     positive_pg_losses = -advantages * log_probs
     pg_losses = torch.where(positive_advantage_mask, positive_pg_losses, ppo_output["pg_losses"])
@@ -239,7 +296,7 @@ def compute_aspo_policy_loss(
     ratio = torch.exp(torch.clamp(log_probs - old_log_probs, min=-20.0, max=20.0))
     positive_advantage_mask = advantages > 0
 
-    negative_output = compute_policy_loss(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, None)
+    negative_output = compute_policy_loss_output(old_log_probs - log_probs, advantages, eps_clip, eps_clip_high, None)
 
     invalid_positive_mask = positive_advantage_mask & (ratio > 1 + eps_clip_high)
     positive_valid_mask = 1.0 - invalid_positive_mask.detach().float()
@@ -552,6 +609,513 @@ def compute_cispo_loss(
     return pg_losses, clipfrac
 
 
+def compute_dis_policy_loss(
+    log_probs: torch.Tensor,
+    rollout_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    log_ratio: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compute Direct Double-Sided Importance Sampling (DIS).
+
+    DIS uses the rollout policy directly as the behavior policy,
+
+        r = exp(log pi_train - log pi_rollout),
+
+    and removes every token outside ``(1 - eps_clip, 1 + eps_clip_high)``
+    from the policy gradient.  Unlike PPO clipping and the DPPO masks, the
+    double-sided gate is independent of the advantage sign.  The importance
+    weight and gate are detached, matching the paper's score-function form
+    ``f(r) * A * log pi_train``; gradients flow only through ``log_probs``.
+    """
+    tensors = {
+        "log_probs": log_probs,
+        "rollout_log_probs": rollout_log_probs,
+        "advantages": advantages,
+    }
+    if log_ratio is not None:
+        tensors["log_ratio"] = log_ratio
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+        if not tensor.is_floating_point():
+            raise TypeError(f"{name} must have a floating-point dtype, got {tensor.dtype}")
+        if tensor.device != log_probs.device:
+            raise ValueError(f"{name} must be on {log_probs.device}, got {tensor.device}")
+    if log_probs.shape != rollout_log_probs.shape or log_probs.shape != advantages.shape:
+        raise ValueError(
+            "log_probs, rollout_log_probs, and advantages must have identical shapes; "
+            f"got {tuple(log_probs.shape)}, {tuple(rollout_log_probs.shape)}, "
+            f"and {tuple(advantages.shape)}"
+        )
+    if log_ratio is not None and log_ratio.shape != log_probs.shape:
+        raise ValueError(
+            f"log_ratio must match log_probs shape; got {tuple(log_ratio.shape)} and {tuple(log_probs.shape)}"
+        )
+
+    lower = 1.0 - float(eps_clip)
+    upper = 1.0 + float(eps_clip_high)
+    if not (0.0 < lower < 1.0):
+        raise ValueError(f"DIS requires 0 < 1 - eps_clip < 1, got eps_clip={eps_clip!r}")
+    if not torch.isfinite(torch.tensor(upper)) or upper <= 1.0:
+        raise ValueError(f"DIS requires a finite eps_clip_high > 0, got {eps_clip_high!r}")
+
+    calc_dtype = torch.float64 if log_probs.dtype == torch.float64 else torch.float32
+    with torch.no_grad():
+        if log_ratio is None:
+            log_ratio = log_probs.detach().to(calc_dtype) - rollout_log_probs.detach().to(calc_dtype)
+        else:
+            log_ratio = log_ratio.detach().to(calc_dtype)
+        detached_advantages = advantages.detach().to(calc_dtype)
+        finite_values = torch.isfinite(log_ratio).all() & torch.isfinite(detached_advantages).all()
+        if finite_values.device.type == "cuda":
+            torch._assert_async(finite_values, "DIS log-probs and advantages must contain only finite values")
+        elif not bool(finite_values):
+            raise ValueError("DIS log-probs and advantages must contain only finite values")
+
+        log_lower = torch.tensor(lower, dtype=calc_dtype, device=log_probs.device).log()
+        log_upper = torch.tensor(upper, dtype=calc_dtype, device=log_probs.device).log()
+        below = log_ratio <= log_lower
+        above = log_ratio >= log_upper
+        valid = ~(below | above)
+
+        # Keep the raw importance ratio observable independently of the DIS
+        # gate/weight.  Clamp only for finite diagnostics: the actual gate is
+        # still decided from the unclamped log-ratio above.
+        importance_ratio = log_ratio.clamp(min=-20.0, max=20.0).exp()
+
+        # The ratio only contributes for valid tokens.  Clamping before exp
+        # prevents an out-of-range token from producing inf that later meets a
+        # zero mask; values inside the open interval remain exact.
+        ratio = log_ratio.clamp(min=log_lower, max=log_upper).exp()
+        importance_weight = torch.where(valid, ratio, torch.zeros_like(ratio))
+
+    loss_dtype = log_probs.dtype
+    weight_for_loss = importance_weight.to(loss_dtype)
+    advantages_for_loss = advantages.detach().to(loss_dtype)
+    pg_losses = -advantages_for_loss * weight_for_loss * log_probs
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": (~valid).to(loss_dtype),
+        "pg_upper_clipfrac": above.to(loss_dtype),
+        "pg_lower_clipfrac": below.to(loss_dtype),
+        "dis_importance_ratio": importance_ratio.to(loss_dtype),
+        "dis_importance_weight": importance_weight.to(loss_dtype),
+        "dis_valid_token_frac": valid.to(loss_dtype),
+    }
+
+
+def compute_ppo_clip_diagnostics(
+    ppo_kl: torch.Tensor,
+    advantages: torch.Tensor,
+    eps_clip: float,
+    eps_clip_high: float,
+    eps_clip_c: float | None = None,
+) -> dict[str, torch.Tensor]:
+    """Return sign-resolved ordinary-PPO clipping indicators.
+
+    ``compute_policy_loss`` reports the union of the standard upper/lower
+    clipping events.  Keeping their advantage-sign decomposition observable is
+    important when a cross-engine old-policy anchor clips before any optimizer
+    update.  Dual clip is a separate negative-advantage high-ratio event and is
+    emitted only when configured.
+    """
+    ratio = (-ppo_kl.detach()).exp()
+    detached_advantages = advantages.detach()
+    positive_advantage = detached_advantages > 0
+    negative_advantage = detached_advantages < 0
+    diagnostics = {
+        "pg_upper_clipfrac": (positive_advantage & (ratio > 1 + eps_clip_high)).float(),
+        "pg_lower_clipfrac": (negative_advantage & (ratio < 1 - eps_clip)).float(),
+    }
+    if eps_clip_c is not None:
+        diagnostics["pg_dual_clipfrac"] = (negative_advantage & (ratio > eps_clip_c)).float()
+    return diagnostics
+
+
+def compute_dppo_predictive_topk_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    behavior_support_log_probs: torch.Tensor,
+    current_support_log_probs: torch.Tensor,
+    support_valid_mask: torch.Tensor,
+    advantages: torch.Tensor,
+    delta: float,
+    tail_estimator: str,
+    vocab_size: int,
+    eps_clip_c: float | None = 5.0,
+):
+    """Compute DPPO's predictive Top-K-KL masked policy loss.
+
+    ``behavior_support_log_probs`` and ``current_support_log_probs`` describe
+    the same retained support ``S = TopK(mu, K) union {sampled token}``.  The
+    last axis is the support axis and ``support_valid_mask`` excludes padding.
+    The retained support plus one residual-tail bucket defines
+
+        D = sum_{i in S} mu_i (log(mu_i) - log(pi_i))
+            + mu_tail log(mu_tail / pi_tail).
+
+    The predictive coefficient is the directional derivative of that
+    divergence along the sampled-token policy-gradient direction:
+
+        dot_D = (pi_k - mu_k) + sum_{i in S} pi_i (mu_i - pi_i)
+                + tail_term.
+
+    ``tail_term`` is either the aggregated-tail estimate
+    ``pi_tail * (mu_tail - pi_tail)`` or the uniform-tail estimate obtained by
+    dividing it by ``vocab_size - |S|``.  A token is masked exactly when it is
+    outside the KL trust region and its advantage-scaled ``dot_D`` is positive.
+
+    All quantities used to form the importance ratio and predictive mask are
+    detached.  Consequently, the returned loss has a gradient only through
+    the explicit sampled-token ``log_probs`` factor.
+    """
+
+    tensors = {
+        "log_probs": log_probs,
+        "old_log_probs": old_log_probs,
+        "behavior_support_log_probs": behavior_support_log_probs,
+        "current_support_log_probs": current_support_log_probs,
+        "support_valid_mask": support_valid_mask,
+        "advantages": advantages,
+    }
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+
+    if log_probs.shape != old_log_probs.shape or log_probs.shape != advantages.shape:
+        raise ValueError(
+            "log_probs, old_log_probs, and advantages must have identical shapes; "
+            f"got {tuple(log_probs.shape)}, {tuple(old_log_probs.shape)}, and {tuple(advantages.shape)}"
+        )
+    if behavior_support_log_probs.shape != current_support_log_probs.shape:
+        raise ValueError(
+            "behavior and current support log-probs must have identical shapes; "
+            f"got {tuple(behavior_support_log_probs.shape)} and {tuple(current_support_log_probs.shape)}"
+        )
+    if support_valid_mask.shape != behavior_support_log_probs.shape:
+        raise ValueError(
+            "support_valid_mask must have the same shape as support log-probs; "
+            f"got {tuple(support_valid_mask.shape)} and {tuple(behavior_support_log_probs.shape)}"
+        )
+    if behavior_support_log_probs.ndim != log_probs.ndim + 1:
+        raise ValueError(
+            "support log-probs must add exactly one trailing support dimension to sampled log-probs; "
+            f"got {tuple(behavior_support_log_probs.shape)} versus {tuple(log_probs.shape)}"
+        )
+    if behavior_support_log_probs.shape[:-1] != log_probs.shape:
+        raise ValueError(
+            "support log-prob leading dimensions must match sampled log-probs; "
+            f"got {tuple(behavior_support_log_probs.shape[:-1])} versus {tuple(log_probs.shape)}"
+        )
+    if behavior_support_log_probs.shape[-1] == 0:
+        raise ValueError("the retained support dimension must be non-empty")
+    if support_valid_mask.dtype != torch.bool:
+        raise TypeError(f"support_valid_mask must have dtype torch.bool, got {support_valid_mask.dtype}")
+
+    floating_tensors = {name: tensor for name, tensor in tensors.items() if name != "support_valid_mask"}
+    for name, tensor in floating_tensors.items():
+        if not tensor.is_floating_point():
+            raise TypeError(f"{name} must have a floating-point dtype, got {tensor.dtype}")
+        if tensor.device != log_probs.device:
+            raise ValueError(f"{name} must be on {log_probs.device}, got {tensor.device}")
+    if support_valid_mask.device != log_probs.device:
+        raise ValueError(f"support_valid_mask must be on {log_probs.device}, got {support_valid_mask.device}")
+
+    if tail_estimator not in {"aggregated", "uniform"}:
+        raise ValueError(f"tail_estimator must be 'aggregated' or 'uniform', got {tail_estimator!r}")
+    if isinstance(vocab_size, bool) or not isinstance(vocab_size, int) or vocab_size <= 0:
+        raise ValueError(f"vocab_size must be a positive integer, got {vocab_size!r}")
+    if not isinstance(delta, (int, float)) or not torch.isfinite(torch.tensor(float(delta))) or delta < 0:
+        raise ValueError(f"delta must be a finite non-negative number, got {delta!r}")
+
+    ratio_clip_c = 5.0 if eps_clip_c is None else eps_clip_c
+    if (
+        isinstance(ratio_clip_c, bool)
+        or not isinstance(ratio_clip_c, (int, float))
+        or not torch.isfinite(torch.tensor(float(ratio_clip_c)))
+        or ratio_clip_c <= 0
+    ):
+        raise ValueError(f"eps_clip_c must be a finite positive number, got {eps_clip_c!r}")
+
+    # Top-K statistics may be stored in fp16/bf16.  Use fp32 for the
+    # probability sums and KL unless the caller explicitly supplies fp64.
+    calc_dtype = torch.float64 if any(t.dtype == torch.float64 for t in floating_tensors.values()) else torch.float32
+    probability_tolerance = 1e-5
+
+    def require_tensor_condition(condition: torch.Tensor, message: str) -> None:
+        """Validate values without forcing a CUDA host synchronization."""
+        if condition.device.type == "cuda":
+            torch._assert_async(condition, message)
+        elif not bool(condition):
+            raise ValueError(message)
+
+    with torch.no_grad():
+        sampled_log_prob = log_probs.detach().to(calc_dtype)
+        sampled_old_log_prob = old_log_probs.detach().to(calc_dtype)
+        detached_advantages = advantages.detach().to(calc_dtype)
+        valid = support_valid_mask.detach()
+        behavior_support_logs = torch.where(
+            valid,
+            behavior_support_log_probs.detach().to(calc_dtype),
+            torch.zeros((), device=log_probs.device, dtype=calc_dtype),
+        )
+        current_support_logs = torch.where(
+            valid,
+            current_support_log_probs.detach().to(calc_dtype),
+            torch.zeros((), device=log_probs.device, dtype=calc_dtype),
+        )
+
+        valid_sampled_values = (
+            torch.isfinite(sampled_log_prob).all()
+            & torch.isfinite(sampled_old_log_prob).all()
+            & torch.isfinite(detached_advantages).all()
+        )
+        valid_support_values = torch.isfinite(behavior_support_logs).all() & torch.isfinite(current_support_logs).all()
+        require_tensor_condition(
+            valid_sampled_values,
+            "sampled log-probs and advantages must contain only finite values",
+        )
+        require_tensor_condition(valid_support_values, "valid support log-probs must contain only finite values")
+
+        behavior_support_probs = behavior_support_logs.exp() * valid
+        current_support_probs = current_support_logs.exp() * valid
+        behavior_support_mass = behavior_support_probs.sum(dim=-1)
+        current_support_mass = current_support_probs.sum(dim=-1)
+        support_size = valid.sum(dim=-1)
+
+        require_tensor_condition((support_size <= vocab_size).all(), "retained-support size cannot exceed vocab_size")
+        if tail_estimator == "uniform":
+            require_tensor_condition(
+                (support_size < vocab_size).all(),
+                "uniform-tail estimator requires vocab_size - retained_support_size > 0",
+            )
+        require_tensor_condition(
+            (behavior_support_mass <= 1.0 + probability_tolerance).all(),
+            "behavior retained-support probabilities sum to more than one",
+        )
+        require_tensor_condition(
+            (current_support_mass <= 1.0 + probability_tolerance).all(),
+            "current retained-support probabilities sum to more than one",
+        )
+
+        sampled_behavior_prob = sampled_old_log_prob.exp()
+        sampled_current_prob = sampled_log_prob.exp()
+        require_tensor_condition(
+            (sampled_behavior_prob <= 1.0 + probability_tolerance).all(),
+            "sampled old log-probs encode probabilities greater than one",
+        )
+        require_tensor_condition(
+            (sampled_current_prob <= 1.0 + probability_tolerance).all(),
+            "sampled current log-probs encode probabilities greater than one",
+        )
+
+        behavior_tail_mass = (1.0 - behavior_support_mass).clamp_min(0.0)
+        current_tail_mass = (1.0 - current_support_mass).clamp_min(0.0)
+        min_positive = torch.finfo(calc_dtype).tiny
+
+        retained_kl = (behavior_support_probs * (behavior_support_logs - current_support_logs) * valid).sum(dim=-1)
+        tail_kl = torch.where(
+            behavior_tail_mass > 0,
+            behavior_tail_mass
+            * (behavior_tail_mass.clamp_min(min_positive).log() - current_tail_mass.clamp_min(min_positive).log()),
+            torch.zeros_like(behavior_tail_mass),
+        )
+        has_support = support_size > 0
+        topk_kl = torch.where(has_support, (retained_kl + tail_kl).clamp_min(0.0), 0.0)
+
+        local_term = torch.where(has_support, sampled_current_prob - sampled_behavior_prob, 0.0)
+        retained_term = (current_support_probs * (behavior_support_probs - current_support_probs) * valid).sum(dim=-1)
+        aggregated_tail_term = current_tail_mass * (behavior_tail_mass - current_tail_mass)
+        if tail_estimator == "uniform":
+            tail_denominator = (vocab_size - support_size).to(calc_dtype)
+            tail_term = aggregated_tail_term / tail_denominator
+        else:
+            tail_term = aggregated_tail_term
+        predictive_dot = torch.where(has_support, local_term + retained_term + tail_term, 0.0)
+
+        outside = topk_kl > float(delta)
+        predictive_increasing = detached_advantages * predictive_dot > 0
+        ratio_increasing = detached_advantages * local_term > 0
+        direction_disagreement = predictive_increasing != ratio_increasing
+        invalid_mask = outside & predictive_increasing
+        positive_advantage = detached_advantages > 0
+        negative_advantage = detached_advantages < 0
+        zero_advantage = detached_advantages == 0
+
+        # Keep the raw sampled-token ratio observable independently of the
+        # cap used by the predictive-DPPO loss.  Both tensors are detached and
+        # linearly reducible, so logging them cannot alter the objective.
+        importance_ratio = (sampled_log_prob - sampled_old_log_prob).clamp(min=-20.0, max=20.0).exp()
+        importance_weight = importance_ratio.clamp(max=float(ratio_clip_c))
+        valid_loss_mask = (~invalid_mask).to(calc_dtype)
+
+        # Diagnostic sufficient statistics deliberately remain per-token and
+        # linearly reducible.  In particular, do not form conditional rates or
+        # mass ratios here: a microbatch can contain only one advantage sign,
+        # and averaging microbatch-local ratios would bias the step metric.
+        positive_clipped = invalid_mask & positive_advantage
+        negative_clipped = invalid_mask & negative_advantage
+        positive_kept = (~invalid_mask) & positive_advantage
+        negative_kept = (~invalid_mask) & negative_advantage
+        diagnostic_categories = {
+            "positive_clipped": positive_clipped.to(calc_dtype),
+            "positive_kept": positive_kept.to(calc_dtype),
+            "negative_clipped": negative_clipped.to(calc_dtype),
+            "negative_kept": negative_kept.to(calc_dtype),
+        }
+
+        update_mass = detached_advantages.abs() * importance_weight
+        signed_update = detached_advantages * importance_weight
+        kept_update_mass = update_mass * valid_loss_mask
+        kept_signed_update = signed_update * valid_loss_mask
+        sampled_logit_first_order_unmasked = signed_update * (1.0 - sampled_current_prob)
+        sampled_logit_first_order_kept = sampled_logit_first_order_unmasked * valid_loss_mask
+
+        # A row-wise additive shift in logits cancels from log-probabilities.
+        # Centering each retained support therefore recovers exactly the
+        # identifiable part of the logits without storing [token, vocab].
+        support_denominator = support_size.clamp_min(1).to(calc_dtype)
+        behavior_support_mean = (behavior_support_logs * valid).sum(dim=-1) / support_denominator
+        current_support_mean = (current_support_logs * valid).sum(dim=-1) / support_denominator
+        behavior_centered = torch.where(
+            valid,
+            behavior_support_logs - behavior_support_mean.unsqueeze(-1),
+            torch.zeros((), dtype=calc_dtype, device=log_probs.device),
+        )
+        current_centered = torch.where(
+            valid,
+            current_support_logs - current_support_mean.unsqueeze(-1),
+            torch.zeros((), dtype=calc_dtype, device=log_probs.device),
+        )
+        behavior_centered_std = torch.where(
+            has_support,
+            ((behavior_centered.square() * valid).sum(dim=-1) / support_denominator).sqrt(),
+            0.0,
+        )
+        current_centered_std = torch.where(
+            has_support,
+            ((current_centered.square() * valid).sum(dim=-1) / support_denominator).sqrt(),
+            0.0,
+        )
+        centered_logit_abs_diff = torch.where(
+            has_support,
+            ((current_centered - behavior_centered).abs() * valid).sum(dim=-1) / support_denominator,
+            0.0,
+        )
+        behavior_sampled_support_gap = torch.where(
+            has_support,
+            sampled_old_log_prob - behavior_support_mean,
+            0.0,
+        )
+        current_sampled_support_gap = torch.where(
+            has_support,
+            sampled_log_prob - current_support_mean,
+            0.0,
+        )
+
+        if behavior_support_logs.size(-1) >= 2:
+            negative_infinity = torch.tensor(float("-inf"), dtype=calc_dtype, device=log_probs.device)
+            behavior_top2 = behavior_support_logs.masked_fill(~valid, negative_infinity).topk(2, dim=-1).values
+            current_top2 = current_support_logs.masked_fill(~valid, negative_infinity).topk(2, dim=-1).values
+            has_two_support_tokens = support_size >= 2
+            behavior_top1_top2_margin = torch.where(
+                has_two_support_tokens,
+                behavior_top2[..., 0] - behavior_top2[..., 1],
+                0.0,
+            )
+            current_top1_top2_margin = torch.where(
+                has_two_support_tokens,
+                current_top2[..., 0] - current_top2[..., 1],
+                0.0,
+            )
+        else:
+            behavior_top1_top2_margin = torch.zeros_like(sampled_old_log_prob)
+            current_top1_top2_margin = torch.zeros_like(sampled_log_prob)
+
+        dppo_diagnostic_metrics = {
+            "dppo/adv_positive_token_frac": positive_advantage.to(calc_dtype),
+            "dppo/adv_negative_token_frac": negative_advantage.to(calc_dtype),
+            "dppo/adv_zero_token_frac": zero_advantage.to(calc_dtype),
+            "dppo/upper_clip_joint_frac": diagnostic_categories["positive_clipped"],
+            "dppo/lower_clip_joint_frac": diagnostic_categories["negative_clipped"],
+            "dppo/positive_kept_joint_frac": diagnostic_categories["positive_kept"],
+            "dppo/negative_kept_joint_frac": diagnostic_categories["negative_kept"],
+            "dppo/update_mass_positive_mean": update_mass * positive_advantage,
+            "dppo/update_mass_negative_mean": update_mass * negative_advantage,
+            "dppo/masked_update_mass_positive_mean": update_mass * positive_clipped,
+            "dppo/masked_update_mass_negative_mean": update_mass * negative_clipped,
+            "dppo/kept_update_mass_mean": kept_update_mass,
+            "dppo/net_logprob_push_unmasked_numerator_mean": signed_update,
+            "dppo/net_logprob_push_kept_numerator_mean": kept_signed_update,
+            # These three signed moments intentionally use the same original
+            # active-token denominator after the loss path's DP×CP reduction.
+            # Unlike ``net_logprob_push_*``, no absolute-mass normalization is
+            # applied, so the mask delta is directly additive and comparable.
+            "dppo/signed_update_unmasked": signed_update,
+            "dppo/signed_update_kept": kept_signed_update,
+            "dppo/signed_update_mask_delta": kept_signed_update - signed_update,
+            # For an optimizer-ascent coefficient c=A*pi/mu, the sampled-logit
+            # direction is exactly c*(1-pi_k).  These are observational
+            # logit-space moments; they do not alter the loss or its gradient.
+            "dppo/sampled_logit_first_order_unmasked": sampled_logit_first_order_unmasked,
+            "dppo/sampled_logit_first_order_kept": sampled_logit_first_order_kept,
+            "dppo/rollout_predictive_support_centered_logit_std": behavior_centered_std,
+            "dppo/train_predictive_support_centered_logit_std": current_centered_std,
+            "dppo/train_rollout_predictive_support_centered_logit_abs_diff": centered_logit_abs_diff,
+            "dppo/rollout_sampled_to_support_mean_logit_gap": behavior_sampled_support_gap,
+            "dppo/train_sampled_to_support_mean_logit_gap": current_sampled_support_gap,
+            "dppo/train_rollout_sampled_to_support_gap_delta": (
+                current_sampled_support_gap - behavior_sampled_support_gap
+            ),
+            "dppo/rollout_support_top1_top2_logit_margin": behavior_top1_top2_margin,
+            "dppo/train_support_top1_top2_logit_margin": current_top1_top2_margin,
+            "dppo/train_rollout_support_top1_top2_margin_delta": (
+                current_top1_top2_margin - behavior_top1_top2_margin
+            ),
+        }
+        for category, indicator in diagnostic_categories.items():
+            dppo_diagnostic_metrics[f"dppo/train_sampled_prob_{category}_joint_mean"] = (
+                sampled_current_prob * indicator
+            )
+            dppo_diagnostic_metrics[f"dppo/rollout_sampled_prob_{category}_joint_mean"] = (
+                sampled_behavior_prob * indicator
+            )
+
+    # Do not use sampled_log_prob here: it is detached.  This explicit factor
+    # is the sole autograd path by construction.
+    pg_losses = -detached_advantages * importance_weight * valid_loss_mask * log_probs
+    return {
+        "pg_losses": pg_losses,
+        "pg_clipfrac": invalid_mask.to(calc_dtype),
+        "pg_upper_clipfrac": (invalid_mask & positive_advantage).to(calc_dtype),
+        "pg_lower_clipfrac": (invalid_mask & negative_advantage).to(calc_dtype),
+        "dppo_importance_ratio": importance_ratio,
+        "dppo_importance_weight": importance_weight,
+        "dppo_topk_kl": topk_kl,
+        "dppo_predictive_dot": predictive_dot,
+        "dppo_outside": outside.to(calc_dtype),
+        "dppo_predictive_increasing": predictive_increasing.to(calc_dtype),
+        "dppo_ratio_increasing": ratio_increasing.to(calc_dtype),
+        "dppo_direction_disagreement": direction_disagreement.to(calc_dtype),
+        "dppo_behavior_tail_mass": behavior_tail_mass,
+        "dppo_current_tail_mass": current_tail_mass,
+        "dppo_predictive_tail_term": tail_term,
+        **dppo_diagnostic_metrics,
+    }
+
+
+def compute_log_probs(logits: torch.Tensor, tokens: torch.Tensor, process_group: dist.ProcessGroup | None):
+    # TODO: when megatron is not installed, fall back to naive implementation
+    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+
+    # convert to [seq_len, batch_size, vocab_size] as expected by fused_vocab_parallel_cross_entropy
+    logits = logits.unsqueeze(1)
+    tokens = tokens.unsqueeze(1)
+    return -fused_vocab_parallel_cross_entropy(logits, tokens, process_group)
+
+
 def _maybe_all_reduce(tensor: torch.Tensor, op: dist.ReduceOp, process_group) -> None:
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(tensor, op=op, group=process_group)
@@ -737,6 +1301,75 @@ def _calculate_log_probs_and_entropy_chunk(
     if not with_entropy:
         entropy = None
     return log_prob, entropy
+
+
+class _VocabParallelEntropyWithDirectionalMoment(torch.autograd.Function):
+    """Compute entropy plus the full-vocabulary DPPO directional moment.
+
+    For probabilities ``p=softmax(z)`` and entropy ``H``, the part of the
+    entropy derivative shared by every sampled-token policy-gradient direction
+    is
+
+        M = sum_i p_i^2 (log(p_i) + H)
+          = sum_i p_i^2 (z_i - E_p[z]).
+
+    Returning ``M`` from the same softmax pass avoids a second full-vocabulary
+    scan solely for diagnostics.  ``M`` is explicitly non-differentiable; the
+    entropy output keeps the exact backward used by ``_VocabParallelEntropy``.
+    """
+
+    @staticmethod
+    def forward(ctx, vocab_parallel_logits: torch.Tensor, process_group):
+
+        @torch.compile(dynamic=True)
+        def mul_reduce(a, b):
+            return (a * b).sum(dim=-1, keepdim=True)
+
+        @torch.compile(dynamic=True)
+        def directional_moment(probabilities, logits, expected_logit):
+            # Inductor fuses the elementwise expression, so this adds a
+            # reduction without retaining another [tokens, vocab] tensor.
+            return (probabilities.square() * (logits - expected_logit)).sum(dim=-1, keepdim=True)
+
+        logits_max = vocab_parallel_logits.max(dim=-1, keepdim=True).values
+        dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=process_group)
+        normalized_vocab_parallel_logits = vocab_parallel_logits - logits_max
+        normalized_exp_logits = normalized_vocab_parallel_logits.exp_()
+        normalized_sum_exp_logits = normalized_exp_logits.sum(dim=-1, keepdim=True)
+        dist.all_reduce(normalized_sum_exp_logits, group=process_group)
+        softmax_logits = normalized_exp_logits.div_(normalized_sum_exp_logits)
+        sum_softmax_times_logits = mul_reduce(softmax_logits, vocab_parallel_logits)
+        dist.all_reduce(sum_softmax_times_logits, group=process_group)
+        entropy = logits_max + normalized_sum_exp_logits.log() - sum_softmax_times_logits
+
+        moment = directional_moment(softmax_logits, vocab_parallel_logits, sum_softmax_times_logits)
+        dist.all_reduce(moment, group=process_group)
+
+        entropy = entropy.squeeze(dim=-1)
+        moment = moment.squeeze(dim=-1)
+        ctx.save_for_backward(vocab_parallel_logits, softmax_logits, sum_softmax_times_logits)
+        ctx.mark_non_differentiable(moment)
+        return entropy, moment
+
+    @staticmethod
+    def backward(ctx, grad_entropy: torch.Tensor, _grad_moment: torch.Tensor):
+        vocab_parallel_logits, softmax_logits, sum_softmax_times_logits = ctx.saved_tensors
+        # Match _VocabParallelEntropy.backward exactly.  The input is a clone
+        # owned by the entropy path, so the temporary in-place centering is safe.
+        vocab_parallel_logits.sub_(sum_softmax_times_logits)
+        softmax_logits.mul_(vocab_parallel_logits)
+        softmax_logits.mul_(grad_entropy.unsqueeze(dim=-1))
+        vocab_parallel_logits.add_(sum_softmax_times_logits)
+        softmax_logits.mul_(-1)
+        return softmax_logits, None
+
+
+def compute_entropy_and_dppo_directional_moment_from_logits(
+    logits: torch.Tensor,
+    process_group,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return entropy and ``sum p^2(log p + H)`` from one TP softmax pass."""
+    return _VocabParallelEntropyWithDirectionalMoment.apply(logits, process_group)
 
 
 def get_grpo_returns(
@@ -1133,9 +1766,15 @@ def calculate_log_probs_and_entropy(
     chunk_size: int = -1,
     log_prob_keep_mask=None,
     with_entropy_grad: bool = True,
+    with_dppo_directional_moment: bool = False,
 ):
+    if with_dppo_directional_moment and not with_entropy:
+        raise ValueError("DPPO entropy directional moments require with_entropy=True.")
+    if with_dppo_directional_moment and log_prob_keep_mask is not None:
+        raise ValueError("DPPO entropy directional moments do not support truncated top-p log-prob replay.")
     logits = logits.contiguous()
     entropy = None
+    dppo_directional_moment = None
     if logits.size(0) != 0:
         if chunk_size > 0:
             num_chunks = (logits.size(0) - 1) // chunk_size + 1
@@ -1145,17 +1784,34 @@ def calculate_log_probs_and_entropy(
                 log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
             )
 
+            if with_dppo_directional_moment:
+                entropys = []
+                dppo_directional_moments = []
+                for logits_chunk in logits_chunks:
+                    entropy_input = logits_chunk.clone() if with_entropy_grad else logits_chunk.detach().clone()
+                    entropy_chunk, moment_chunk = compute_entropy_and_dppo_directional_moment_from_logits(
+                        entropy_input, tp_group
+                    )
+                    entropys.append(entropy_chunk)
+                    dppo_directional_moments.append(moment_chunk)
+                entropy = torch.cat(entropys, dim=0)
+                dppo_directional_moment = torch.cat(dppo_directional_moments, dim=0)
+
             log_probs = []
             entropy_chunks = []
             for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
-                log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
-                    logits_chunk,
-                    tokens_chunk,
-                    tp_group,
-                    with_entropy=with_entropy,
-                    with_entropy_grad=with_entropy_grad,
-                    log_prob_keep_mask=mask_chunk,
-                )
+                if with_dppo_directional_moment:
+                    log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
+                    entropy_chunk = None
+                else:
+                    log_prob, entropy_chunk = _calculate_log_probs_and_entropy_chunk(
+                        logits_chunk,
+                        tokens_chunk,
+                        tp_group,
+                        with_entropy=with_entropy,
+                        with_entropy_grad=with_entropy_grad,
+                        log_prob_keep_mask=mask_chunk,
+                    )
                 log_probs.append(log_prob)
                 if entropy_chunk is not None:
                     entropy_chunks.append(entropy_chunk)
@@ -1163,17 +1819,28 @@ def calculate_log_probs_and_entropy(
             if entropy_chunks:
                 entropy = torch.cat(entropy_chunks, dim=0)
         else:
-            log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
-                logits,
-                tokens,
-                tp_group,
-                with_entropy=with_entropy,
-                with_entropy_grad=with_entropy_grad,
-                log_prob_keep_mask=log_prob_keep_mask,
-            )
+            if with_dppo_directional_moment:
+                entropy_input = logits.clone() if with_entropy_grad else logits.detach().clone()
+                entropy, dppo_directional_moment = compute_entropy_and_dppo_directional_moment_from_logits(
+                    entropy_input, tp_group
+                )
+                log_prob = compute_log_probs(logits.clone(), tokens, tp_group)
+            else:
+                log_prob, entropy = _calculate_log_probs_and_entropy_chunk(
+                    logits,
+                    tokens,
+                    tp_group,
+                    with_entropy=with_entropy,
+                    with_entropy_grad=with_entropy_grad,
+                    log_prob_keep_mask=log_prob_keep_mask,
+                )
     else:
         log_prob = logits.new_zeros((0,))
         if with_entropy:
             entropy = logits.new_zeros((0,))
+        if with_dppo_directional_moment:
+            dppo_directional_moment = logits.new_zeros((0,))
 
+    if with_dppo_directional_moment:
+        return log_prob, entropy, dppo_directional_moment
     return log_prob, entropy

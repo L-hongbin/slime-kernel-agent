@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_ripo_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_ripo_uses_old_probability_dependent_dynamic_bounds():
@@ -73,3 +76,7 @@ def test_ripo_clips_negative_advantages_at_dynamic_lower_bound():
     torch.testing.assert_close(output["ripo_clip_lower"], expected_lower)
     torch.testing.assert_close(output["pg_losses"], expected_lower)
     torch.testing.assert_close(output["pg_lower_clipfrac"], torch.tensor([1.0]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

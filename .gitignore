@@ -3,8 +3,6 @@ __pycache__/
 *.py[codz]
 *$py.class
 
-data/
-
 # C extensions
 *.so
 
@@ -255,3 +253,5 @@ RUNTIME.md
 hostfile
 gpu_mem_trend.png
 *.bundle
+local_artifacts/
+.slime-v4-source-provenance

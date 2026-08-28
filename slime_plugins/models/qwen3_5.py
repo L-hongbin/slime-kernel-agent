@@ -217,6 +217,61 @@ def get_qwen3_5_spec(args, config, vp_stage):
     hf_config = _load_hf_config(args.hf_checkpoint)
     text_config = _get_text_config(hf_config)
 
+    use_distributed_gdn = getattr(args, "qwen_gdn_implementation", "replicated") == "distributed"
+    if use_distributed_gdn:
+        requires_rank_ordered_p2p = (
+            getattr(args, "sequence_parallel", False) and getattr(config, "pipeline_model_parallel_size", 1) > 1
+        )
+        if requires_rank_ordered_p2p:
+            if not getattr(args, "qwen_gdn_sp_disable_batch_p2p_comm", False):
+                raise ValueError(
+                    "Distributed Qwen GDN with sequence parallel and pipeline parallelism requires "
+                    "--qwen-gdn-sp-disable-batch-p2p-comm."
+                )
+            if getattr(config, "overlap_p2p_comm", False):
+                raise ValueError(
+                    "--qwen-gdn-sp-disable-batch-p2p-comm cannot be combined with overlap P2P communication."
+                )
+            config.batch_p2p_comm = False
+        if (
+            getattr(config, "context_parallel_size", 1) > 1
+            and getattr(args, "cp_partition_mode", "zigzag") != "zigzag"
+        ):
+            raise ValueError("Distributed Qwen GDN supports only zigzag context-parallel partitioning.")
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_gated_delta_net_module_spec,
+        )
+
+        # The pinned Megatron CLI does not expose these TransformerConfig
+        # fields.  Bind them from the checkpoint before building the native
+        # GDN module spec.
+        for name in (
+            "linear_conv_kernel_dim",
+            "linear_key_head_dim",
+            "linear_value_head_dim",
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+        ):
+            setattr(config, name, getattr(text_config, name))
+
+        tp_cp_size = config.tensor_model_parallel_size * config.context_parallel_size
+        if config.linear_num_key_heads % tp_cp_size != 0:
+            raise ValueError(
+                f"linear_num_key_heads={config.linear_num_key_heads} must be divisible by "
+                f"TP*CP={tp_cp_size} for distributed GDN."
+            )
+        if config.linear_num_value_heads % tp_cp_size != 0:
+            raise ValueError(
+                f"linear_num_value_heads={config.linear_num_value_heads} must be divisible by "
+                f"TP*CP={tp_cp_size} for distributed GDN."
+            )
+
+        from .distributed_gdn import DistributedQwenGatedDeltaNet
+
+        distributed_gdn_spec = get_gated_delta_net_module_spec(config=config)
+        distributed_gdn_spec.module = DistributedQwenGatedDeltaNet
+        distributed_gdn_spec.params = {"args": args}
+
     # Compute layer_types if the config class doesn't expose it
     if not hasattr(text_config, "layer_types"):
         interval = getattr(text_config, "full_attention_interval", 4)
@@ -228,9 +283,12 @@ def get_qwen3_5_spec(args, config, vp_stage):
     for layer_id in range(num_layers_to_build):
         if text_config.layer_types[layer_id + offset] == "linear_attention":
             layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
-            layer_specs.submodules.self_attention = ModuleSpec(
-                module=Attention,
-                params={"args": args},
-            )
+            if use_distributed_gdn:
+                layer_specs.submodules.self_attention = copy.deepcopy(distributed_gdn_spec)
+            else:
+                layer_specs.submodules.self_attention = ModuleSpec(
+                    module=Attention,
+                    params={"args": args},
+                )
             transformer_layer_spec.layer_specs[layer_id] = layer_specs
     return transformer_layer_spec

@@ -27,7 +27,7 @@ import os
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
-import summarize_eval as se
+from eval import summarize_eval as se
 import torch
 
 MARKER = "=== RECOMPUTED: unified denominator (Tk & best share traj total) ==="

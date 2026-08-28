@@ -1,6 +1,9 @@
+import pytest
 import torch
 
-from slime.utils.ppo_utils import compute_aspo_policy_loss, compute_policy_loss
+from slime.utils.ppo_utils import compute_aspo_policy_loss, compute_policy_loss_output
+
+NUM_GPUS = 0
 
 
 def test_aspo_positive_advantages_use_reciprocal_ratio_weight():
@@ -55,7 +58,7 @@ def test_aspo_negative_advantages_match_ppo_clipped_branch():
         eps_clip_high=0.28,
         eps_clip_c=2.0,
     )
-    ppo_output = compute_policy_loss(
+    ppo_output = compute_policy_loss_output(
         old_log_probs - log_probs,
         advantages,
         eps_clip=0.2,
@@ -65,3 +68,7 @@ def test_aspo_negative_advantages_match_ppo_clipped_branch():
 
     for key in ["pg_losses", "pg_clipfrac", "pg_upper_clipfrac", "pg_lower_clipfrac"]:
         torch.testing.assert_close(aspo_output[key], ppo_output[key])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

@@ -15,6 +15,7 @@ from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
 from slime.observability.logging_utils import configure_logger
 from slime.utils import accelerator
+from slime.utils.arguments import add_qwen_gdn_arguments
 from slime.utils.memory_utils import print_memory
 
 
@@ -51,6 +52,7 @@ def add_convertion_args(parser):
         parser.add_argument("--padded-vocab-size", type=int, default=None)
     except Exception:
         pass
+    add_qwen_gdn_arguments(parser)
     return parser
 
 

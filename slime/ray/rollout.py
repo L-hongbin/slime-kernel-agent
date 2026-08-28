@@ -4,6 +4,7 @@ import sys
 import time
 from typing import Any
 
+import numpy as np
 import ray
 import torch
 
@@ -24,6 +25,7 @@ from slime.utils.data import get_source
 from slime.utils.dp_schedule import build_dp_schedule
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import init_http_client
+from slime.utils.lora_utils import use_lora_weight_sync
 from slime.utils.misc import Box, load_function
 from slime.utils.types import Sample
 
@@ -33,6 +35,168 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+_PREDICTIVE_SUPPORT_FIELDS = (
+    "rollout_topk_token_ids",
+    "rollout_topk_log_probs",
+    "rollout_topk_valid_mask",
+)
+
+
+def _validate_predictive_support_sample(sample: Sample, top_k: int, sample_position: int) -> None:
+    """Validate/normalize one Sample at the rollout -> Ray train boundary.
+
+    This is deliberately strict for nonzero-loss tokens: silently training with
+    a partial behavior support changes the predictive KL and its directional
+    derivative.  Fully masked padding/abort samples may omit the fields and are
+    normalized to compact all-invalid numpy rows.
+    """
+    response_length = int(sample.response_length)
+    width = top_k + 1
+    expected_shape = (response_length, width)
+    loss_mask = sample.loss_mask
+    if loss_mask is None or len(loss_mask) != response_length:
+        raise ValueError(
+            f"sample[{sample_position}] loss_mask must have response_length={response_length} entries "
+            "before predictive-support validation"
+        )
+
+    values = [getattr(sample, field) for field in _PREDICTIVE_SUPPORT_FIELDS]
+    if all(value is None for value in values):
+        if any(loss_mask):
+            raise ValueError(
+                f"sample[{sample_position}] has trainable response tokens but predictive support is missing"
+            )
+        values = [
+            np.zeros(expected_shape, dtype=np.int32),
+            np.zeros(expected_shape, dtype=np.float32),
+            np.zeros(expected_shape, dtype=np.bool_),
+        ]
+        for field, value in zip(_PREDICTIVE_SUPPORT_FIELDS, values, strict=True):
+            setattr(sample, field, value)
+    elif any(value is None for value in values):
+        missing = [field for field, value in zip(_PREDICTIVE_SUPPORT_FIELDS, values, strict=True) if value is None]
+        raise ValueError(f"sample[{sample_position}] has incomplete predictive support; missing {missing}")
+
+    expected_dtypes = (np.dtype(np.int32), np.dtype(np.float32), np.dtype(np.bool_))
+    for field, value, expected_dtype in zip(_PREDICTIVE_SUPPORT_FIELDS, values, expected_dtypes, strict=True):
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                f"sample[{sample_position}].{field} must stay a numpy.ndarray through Ray, "
+                f"got {type(value).__name__}"
+            )
+        if value.shape != expected_shape:
+            raise ValueError(f"sample[{sample_position}].{field} shape must be {expected_shape}, got {value.shape}")
+        if value.dtype != expected_dtype:
+            raise TypeError(f"sample[{sample_position}].{field} dtype must be {expected_dtype}, got {value.dtype}")
+
+    token_ids, behavior_log_probs, valid_mask = values
+    if response_length and len(sample.tokens) < response_length:
+        raise ValueError(
+            f"sample[{sample_position}] has response_length={response_length} but only {len(sample.tokens)} tokens"
+        )
+    if not response_length:
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = []
+        elif len(sample.rollout_log_probs) != 0:
+            raise ValueError(f"sample[{sample_position}] zero-length response has non-empty rollout_log_probs")
+        return
+
+    # Keep the 16k-token validation path entirely in NumPy.  A Python loop plus
+    # np.unique per token would execute ~4.2M tiny loops for a 256-sample batch.
+    def first_bad_index(bad_rows: np.ndarray) -> int:
+        return int(np.flatnonzero(bad_rows)[0])
+
+    nonfinite_rows = np.any(valid_mask & ~np.isfinite(behavior_log_probs), axis=1)
+    if nonfinite_rows.any():
+        token_index = first_bad_index(nonfinite_rows)
+        raise ValueError(
+            f"sample[{sample_position}] predictive support token {token_index} contains non-finite logprobs"
+        )
+
+    negative_id_rows = np.any(valid_mask & (token_ids < 0), axis=1)
+    if negative_id_rows.any():
+        token_index = first_bad_index(negative_id_rows)
+        raise ValueError(
+            f"sample[{sample_position}] predictive support token {token_index} contains a negative token id"
+        )
+
+    # Invalid slots become -1, which is outside the validated vocabulary-id
+    # domain.  Sorting once per row makes a duplicate an adjacent equal pair;
+    # repeated invalid -1 slots are explicitly excluded.
+    sorted_ids = np.sort(np.where(valid_mask, token_ids, -1), axis=1)
+    duplicate_rows = np.any((sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (sorted_ids[:, 1:] >= 0), axis=1)
+    if duplicate_rows.any():
+        token_index = first_bad_index(duplicate_rows)
+        raise ValueError(
+            f"sample[{sample_position}] predictive support token {token_index} contains duplicate token ids"
+        )
+
+    trainable = np.asarray(loss_mask, dtype=np.bool_)
+    valid_counts = valid_mask.sum(axis=1)
+    bad_count_rows = trainable & (valid_counts != top_k) & (valid_counts != top_k + 1)
+    if bad_count_rows.any():
+        token_index = first_bad_index(bad_count_rows)
+        raise ValueError(
+            f"sample[{sample_position}] trainable token {token_index} has {valid_counts[token_index]} valid "
+            f"support entries; expected {top_k} or {top_k + 1}"
+        )
+
+    # Padding/aborted/partial-off-policy tokens may intentionally carry an
+    # all-invalid row.  The remaining invariants only apply to trainable rows.
+    if not trainable.any():
+        # The legacy transfer path keys off samples[0].rollout_log_probs.  Keep
+        # even an all-masked first sample non-None so a later trainable sample
+        # cannot cause the whole field to be omitted from train_data.
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = [0.0] * response_length
+        elif len(sample.rollout_log_probs) != response_length:
+            raise ValueError(
+                f"sample[{sample_position}] masked rollout_log_probs must have "
+                f"response_length={response_length} entries"
+            )
+        elif not np.isfinite(np.asarray(sample.rollout_log_probs, dtype=np.float64)).all():
+            raise ValueError(f"sample[{sample_position}] masked rollout_log_probs contains non-finite values")
+        return
+
+    sampled_token_ids = np.asarray(sample.tokens[-response_length:], dtype=np.int64)
+    sampled_matches = valid_mask & (token_ids.astype(np.int64, copy=False) == sampled_token_ids[:, None])
+    sampled_match_counts = sampled_matches.sum(axis=1)
+    bad_match_rows = trainable & (sampled_match_counts != 1)
+    if bad_match_rows.any():
+        token_index = first_bad_index(bad_match_rows)
+        raise ValueError(
+            f"sample[{sample_position}] trainable token {token_index} must contain sampled token id "
+            f"{sampled_token_ids[token_index]} exactly once; found {sampled_match_counts[token_index]}"
+        )
+
+    sampled_log_probs = sample.rollout_log_probs
+    if sampled_log_probs is None or len(sampled_log_probs) != response_length:
+        raise ValueError(
+            f"sample[{sample_position}] rollout_log_probs must have response_length={response_length} entries"
+        )
+    sampled_log_probs_array = np.asarray(sampled_log_probs, dtype=np.float64)
+    nonfinite_sampled_rows = trainable & ~np.isfinite(sampled_log_probs_array)
+    if nonfinite_sampled_rows.any():
+        token_index = first_bad_index(nonfinite_sampled_rows)
+        raise ValueError(f"sample[{sample_position}] sampled token {token_index} has non-finite rollout logprob")
+
+    sampled_slots = np.argmax(sampled_matches, axis=1)
+    support_sampled_log_probs = np.take_along_axis(behavior_log_probs, sampled_slots[:, None], axis=1)[:, 0]
+    mismatch_rows = trainable & ~np.isclose(
+        support_sampled_log_probs,
+        sampled_log_probs_array,
+        rtol=1e-5,
+        atol=1e-6,
+    )
+    if mismatch_rows.any():
+        token_index = first_bad_index(mismatch_rows)
+        raise ValueError(
+            f"sample[{sample_position}] sampled-token logprob mismatch at token {token_index}: "
+            f"support={support_sampled_log_probs[token_index]}, "
+            f"rollout_log_probs={sampled_log_probs_array[token_index]}"
+        )
 
 
 @ray.remote
@@ -184,11 +348,45 @@ class RolloutManager:
         assert self.args.rollout_global_dataset
         return len(self.data_source) // self.args.rollout_batch_size
 
-    def generate(self, rollout_id):
+    def _refresh_active_lora_name(self) -> None:
+        """Pull the engine's currently-served LoRA adapter name into the rollout's
+        GenerateState so every /generate payload routes to the live (alternating)
+        adapter. No-op unless the LoRA-adapter sync path is on. The engine is the
+        source of truth: the weight sync (in the training actor process) loads the
+        new name onto the engines before this rollout runs, so a single query here
+        picks it up. ``None`` (no adapter loaded yet) leaves lora_path unset ->
+        base-only serving, which is correct for the zero-init initial adapter."""
+        if self.args.debug_train_only or not use_lora_weight_sync(self.args):
+            return
+        srv = self._get_updatable_server()
+        engines = srv.engines if srv else []
+        if not engines:
+            return
+        try:
+            active_name = ray.get(engines[0].get_active_lora_name.remote())
+        except Exception as e:  # never let a name refresh break the rollout
+            logger.warning(f"Failed to refresh active LoRA adapter name: {e}")
+            return
+        # GenerateState is a process-global singleton shared with generate_rollout
+        # (which runs in this same process). Accessing it here constructs it if
+        # needed; generate_rollout then reuses the same instance.
+        from slime.rollout.sglang_rollout import GenerateState
+
+        GenerateState(self.args).active_lora_name = active_name
+
+    def generate(self, rollout_id, weight_version=None):
         start_time = time.time()
         self.rollout_id = rollout_id
         set_current_rollout_id(rollout_id)
+        # Weight version this generation samples under (stamped into each
+        # sample's metadata by _set_rollout_step_metadata). Under the async
+        # loop the batch is TRAINED under weight_version+1, so per-sample
+        # weight staleness = (this batch's version + 1) - sample's stamped
+        # version: exactly 1 for fresh samples, >1 for buffer carry-overs.
+        self.gen_weight_version = weight_version
+        self.args.gen_weight_version = weight_version
         self.health_monitoring_resume()
+        self._refresh_active_lora_name()
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
@@ -211,6 +409,7 @@ class RolloutManager:
             return
         set_current_rollout_id(rollout_id)
         self.health_monitoring_resume()
+        self._refresh_active_lora_name()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         data = result.data
@@ -333,10 +532,53 @@ class RolloutManager:
 
         return raw_rewards, raw_rewards
 
+    def _filter_missing_routing_replay_samples(self, samples: list[Sample]) -> list[Sample]:
+        if not getattr(self.args, "use_rollout_routing_replay", False):
+            return samples
+
+        missing_positions = [
+            i for i, sample in enumerate(samples) if getattr(sample, "rollout_routed_experts", None) is None
+        ]
+        if not missing_positions:
+            return samples
+
+        drop_positions = set(missing_positions)
+        filter_mode = "sample"
+        if getattr(self.args, "enable_turns_dp_partitions", False):
+            missing_indices = {
+                samples[i].index for i in missing_positions if getattr(samples[i], "index", None) is not None
+            }
+            if missing_indices:
+                drop_positions = {
+                    i
+                    for i, sample in enumerate(samples)
+                    if getattr(sample, "index", None) in missing_indices or i in drop_positions
+                }
+                filter_mode = "trajectory"
+
+        kept_samples = [sample for i, sample in enumerate(samples) if i not in drop_positions]
+        logger.warning(
+            "Dropped %d/%d rollout samples before train-data sharding because %d sample(s) "
+            "were missing rollout_routed_experts while routing replay is enabled "
+            "(filter_mode=%s).",
+            len(drop_positions),
+            len(samples),
+            len(missing_positions),
+            filter_mode,
+        )
+        if not kept_samples:
+            raise ValueError(
+                "All rollout samples were missing rollout_routed_experts while "
+                "--use-rollout-routing-replay is enabled."
+            )
+        return kept_samples
+
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
         Convert inference generated samples to training data.
         """
+        samples = self._filter_missing_routing_replay_samples(samples)
+
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
@@ -387,6 +629,13 @@ class RolloutManager:
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
 
+        predictive_top_k = int(getattr(self.args, "dppo_predictive_top_k", 0) or 0)
+        if predictive_top_k:
+            for sample_position, sample in enumerate(samples):
+                _validate_predictive_support_sample(sample, predictive_top_k, sample_position)
+            for field in _PREDICTIVE_SUPPORT_FIELDS:
+                train_data[field] = [getattr(sample, field) for sample in samples]
+
         # Per-rollout aggregate, precomputed at the step level (where we can
         # see every sample of every rollout) and broadcast per-sample so the
         # per-mb loss reducer uses the correct whole-rollout denominator even
@@ -436,11 +685,32 @@ class RolloutManager:
             train_data["rollout_top_p_token_ids"] = [sample.rollout_top_p_token_ids for sample in samples]
             train_data["rollout_top_p_token_offsets"] = [sample.rollout_top_p_token_offsets for sample in samples]
 
-        if samples[0].rollout_routed_experts is not None:
+        # Per-sample generation weight version (stamped once at first submission in
+        # _set_rollout_step_metadata). The LoRA old-actor asserts every scored
+        # sample shares the snapshot's behavioral version; a buffered carry-over
+        # keeps its original (older) stamp and would trip that assert loudly.
+        if any(s.metadata and "gen_weight_version" in s.metadata for s in samples):
+            train_data["gen_weight_versions"] = [
+                (s.metadata.get("gen_weight_version") if isinstance(getattr(s, "metadata", None), dict) else None)
+                for s in samples
+            ]
+
+        if getattr(self.args, "use_rollout_routing_replay", False):
+            missing_routing = [
+                i for i, sample in enumerate(samples) if getattr(sample, "rollout_routed_experts", None) is None
+            ]
+            if missing_routing:
+                raise ValueError(
+                    "rollout_routed_experts is required on every remaining sample when "
+                    f"--use-rollout-routing-replay is enabled; missing positions: {missing_routing[:8]}"
+                )
             routed_experts = [torch.as_tensor(sample.rollout_routed_experts) for sample in samples]
-            if getattr(self.args, "use_rollout_routing_replay", False):
-                validate_rollout_routed_experts_for_replay(routed_experts, self.args)
+            validate_rollout_routed_experts_for_replay(routed_experts, self.args)
             train_data["rollout_routed_experts"] = routed_experts
+        elif all(sample.rollout_routed_experts is not None for sample in samples):
+            train_data["rollout_routed_experts"] = [
+                torch.as_tensor(sample.rollout_routed_experts) for sample in samples
+            ]
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
@@ -553,6 +823,10 @@ class RolloutManager:
                 "rollout_log_probs",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",
+                "rollout_topk_token_ids",
+                "rollout_topk_log_probs",
+                "rollout_topk_valid_mask",
+                "gen_weight_versions",
                 "rollout_routed_experts",
                 "source_names",
                 "prompt",

@@ -4,6 +4,8 @@ from copy import deepcopy
 
 import wandb
 
+from slime.utils.secret_redaction import redact_secrets_for_logging
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,6 +81,48 @@ def init_wandb_primary(args):
     args.wandb_run_id = wandb.run.id
 
 
+def reinit_wandb_primary_with_open_metrics(args, router_addr):
+    """Attach the live SGLang Prometheus endpoint to the primary W&B run."""
+    if not args.use_wandb or _is_offline_mode(args):
+        return
+    if getattr(args, "wandb_mode", None) == "disabled" or router_addr is None:
+        return
+    wandb_run_id = getattr(args, "wandb_run_id", None)
+    if wandb_run_id is None:
+        return
+
+    import sglang_router
+
+    if "slime" not in sglang_router.__version__:
+        logger.warning(
+            "Only customized sglang_router from https://github.com/zhuzilin/sgl-router supports uploading metrics."
+        )
+        return
+
+    logger.info("Re-initializing primary W&B with SGLang metrics at %s.", router_addr)
+    wandb.finish()
+
+    init_kwargs = {
+        "id": wandb_run_id,
+        "entity": args.wandb_team,
+        "project": args.wandb_project,
+        "resume": "allow",
+        "reinit": True,
+        "settings": wandb.Settings(
+            mode="shared",
+            x_primary=True,
+            x_stats_open_metrics_endpoints={"sgl_engine": f"{router_addr}/engine_metrics"},
+            x_stats_open_metrics_filters={"sgl_engine.*": {}},
+        ),
+    }
+    if args.wandb_dir:
+        os.makedirs(args.wandb_dir, exist_ok=True)
+        init_kwargs["dir"] = args.wandb_dir
+
+    wandb.init(**init_kwargs)
+    _init_wandb_common()
+
+
 def _compute_config_for_logging(args):
     output = _args_to_config_dict(args)
 
@@ -96,7 +140,7 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    return redact_secrets_for_logging(deepcopy(args.__dict__))
 
 
 def _prefix_config_keys(config, prefix):
@@ -167,6 +211,9 @@ def init_wandb_secondary(args, role=None):
 def _init_wandb_common():
     wandb.define_metric("train/step")
     wandb.define_metric("train/*", step_metric="train/step")
+    wandb.define_metric("dppo/*", step_metric="train/step")
+    wandb.define_metric("entropy/*", step_metric="train/step")
+    wandb.define_metric("entropy/rollout*", step_metric="rollout/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
     wandb.define_metric("multi_turn/*", step_metric="rollout/step")

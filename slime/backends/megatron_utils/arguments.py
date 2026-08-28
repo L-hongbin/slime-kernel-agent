@@ -1,6 +1,13 @@
 import ast
+import copy
 import logging
+import sys
 
+from .path_bootstrap import ensure_megatron_lm_on_sys_path
+
+ensure_megatron_lm_on_sys_path()
+
+import megatron.training.arguments as _megatron_arguments
 from megatron.training.arguments import parse_args as _megatron_parse_args
 from megatron.training.arguments import validate_args as _megatron_validate_args
 from transformers import AutoConfig
@@ -10,9 +17,41 @@ try:
 except ImportError:
     from megatron.training.tokenizer.tokenizer import _vocab_size_with_padding
 
+from slime.utils.secret_redaction import redact_secrets_for_logging
+
 __all__ = ["validate_args", "megatron_parse_args", "set_default_megatron_args"]
 
 logger = logging.getLogger(__name__)
+
+
+def _redacted_argument_view(args):
+    """Copy an args namespace for printing while leaving runtime values intact."""
+    view = copy.copy(args)
+    for name, value in vars(args).items():
+        setattr(view, name, redact_secrets_for_logging(value, key=name))
+    return view
+
+
+def _print_args_with_secret_redaction(printer, title, args):
+    return printer(title, _redacted_argument_view(args))
+
+
+def _install_secret_redacting_argument_printer():
+    """Protect Megatron's central argument table without changing validation."""
+    current_printer = getattr(_megatron_arguments, "_print_args", None)
+    if current_printer is None:
+        return
+    if getattr(current_printer, "_slime_secret_redacting", False):
+        return
+
+    def redacting_printer(title, args):
+        return _print_args_with_secret_redaction(current_printer, title, args)
+
+    redacting_printer._slime_secret_redacting = True
+    _megatron_arguments._print_args = redacting_printer
+
+
+_install_secret_redacting_argument_printer()
 
 
 _ALLGATHER_CP_DSA_ARCHITECTURES = {
@@ -73,6 +112,25 @@ def _is_moe_config(hf_config):
     )
 
 
+def _bind_checkpoint_moe_router_topk(args, hf_config, *, explicit_moe_router_topk=False):
+    """Use checkpoint metadata as the source of truth for MoE router top-k."""
+    text_config = getattr(hf_config, "text_config", None)
+    if text_config is not None:
+        hf_config = text_config
+    if not hasattr(hf_config, "num_experts_per_tok"):
+        return
+
+    checkpoint_topk = int(hf_config.num_experts_per_tok)
+    cli_topk = getattr(args, "moe_router_topk", None)
+    if explicit_moe_router_topk and cli_topk is not None and int(cli_topk) != checkpoint_topk:
+        raise ValueError(
+            "--moe-router-topk conflicts with checkpoint metadata: "
+            f"CLI={cli_topk}, config.num_experts_per_tok={checkpoint_topk}. "
+            "Remove the CLI option; model structure is checkpoint-defined."
+        )
+    args.moe_router_topk = checkpoint_topk
+
+
 def validate_args(args):
     """Run megatron's own validate_args plus slime-specific megatron validations."""
 
@@ -121,6 +179,7 @@ def _hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("moe_intermediate_size", "moe_ffn_hidden_size", equal),
+        ("num_experts_per_tok", "moe_router_topk", equal),
         ("shared_expert_intermediate_size", "moe_shared_expert_intermediate_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
         ("rms_norm_eps", "norm_epsilon", equal),
@@ -149,8 +208,21 @@ def _hf_validate_args(args, hf_config):
 
 
 def _set_default_megatron_args(args):
-    # always use zero optimizer
-    args.use_distributed_optimizer = True
+    use_muon = "muon" in getattr(args, "optimizer", "")
+    if use_muon:
+        if getattr(args, "use_distributed_optimizer", False):
+            logger.info("Disabling distributed optimizer because Megatron Muon does not support it.")
+        if getattr(args, "overlap_grad_reduce", False):
+            logger.info("Disabling overlap_grad_reduce because Megatron Muon does not support it.")
+        if getattr(args, "overlap_param_gather", False):
+            logger.info("Disabling overlap_param_gather because Megatron Muon does not support it.")
+        args.use_distributed_optimizer = False
+        args.overlap_grad_reduce = False
+        args.overlap_param_gather = False
+        args.overlap_param_gather_with_optimizer_step = False
+    else:
+        # always use zero optimizer
+        args.use_distributed_optimizer = True
     if not hasattr(args, "enable_gloo_process_groups"):
         args.enable_gloo_process_groups = True
     # TODO: maybe change this after megatron has good fp8 support
@@ -195,9 +267,18 @@ def megatron_parse_args(extra_args_provider, skip_hf_validate=False):
     args = _megatron_parse_args(extra_args_provider=extra_args_provider, ignore_unknown_args=True)
 
     hf_config = None
-    if args.hf_checkpoint and not skip_hf_validate:
+    if args.hf_checkpoint:
         hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-        _hf_validate_args(args, hf_config)
+        explicit_moe_router_topk = any(
+            token == "--moe-router-topk" or token.startswith("--moe-router-topk=") for token in sys.argv[1:]
+        )
+        _bind_checkpoint_moe_router_topk(
+            args,
+            hf_config,
+            explicit_moe_router_topk=explicit_moe_router_topk,
+        )
+        if not skip_hf_validate:
+            _hf_validate_args(args, hf_config)
 
     if not skip_hf_validate:
         _validate_allgather_cp_supported(args, hf_config)

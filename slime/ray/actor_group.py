@@ -148,8 +148,23 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
+    def async_finalize_async_save(self, iteration, terminate=False, wake_if_offloaded=False):
+        """Finalize pending async saves in actor order and return their Ray refs."""
+        return [
+            actor.finalize_async_save.remote(
+                iteration,
+                terminate=terminate,
+                wake_if_offloaded=wake_if_offloaded,
+            )
+            for actor in self._actor_handlers
+        ]
+
     def save_model(self, rollout_id, force_sync=False):
-        """Save actor model"""
+        """Run checkpoint collectives, then update release-train reload state."""
+        if getattr(self.args, "offload_train", False):
+            # Finish the all-rank wake phase before any actor is allowed into
+            # checkpoint collectives.
+            ray.get([actor.prepare_save_model.remote() for actor in self._actor_handlers])
         ret = ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])
         if self._release_train_enabled():
             self.args.load = self.args.save
@@ -158,6 +173,12 @@ class RayTrainGroup:
             self.args.no_load_optim = self.args.no_save_optim
             self.args.no_load_rng = False
         return ret
+
+    def finish_save_model(self, rollout_id):
+        """Run rank-local HF export/offload only after checkpoint completion."""
+        if not getattr(self.args, "offload_train", False) and getattr(self.args, "save_hf", None) is None:
+            return None
+        return ray.get([actor.finish_save_model.remote(rollout_id) for actor in self._actor_handlers])
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
@@ -215,11 +236,11 @@ class RayTrainGroup:
         return ray.get([actor.set_rollout_manager.remote(rollout_manager) for actor in self._actor_handlers])
 
     def _release_train_enabled(self):
-        return self.role == "actor" and getattr(self.args, "release_train", False)
+        return getattr(self, "role", None) == "actor" and getattr(self.args, "release_train", False)
 
     def _full_disk_weight_update_enabled(self):
         return (
-            self.role == "actor"
+            getattr(self, "role", None) == "actor"
             and self.args.update_weight_mode == "full"
             and self.args.update_weight_transport == "disk"
         )

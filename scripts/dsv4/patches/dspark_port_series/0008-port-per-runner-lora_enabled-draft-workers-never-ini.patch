@@ -1,0 +1,147 @@
+From ad8ff5386d9f9c1d8bc182b74d339dc6b82e9fbb Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 10:09:24 +0900
+Subject: [PATCH 08/13] port: per-runner lora_enabled (draft workers never
+ init/prepare LoRA)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Completes the mtp_lora_phase1 dependency flagged in the phase 4+6 port
+report: with only the allowlist (8610d91), a DSPARK/DFLASH draft
+ModelRunner would still init a LoRAManager and take per-batch LoRA paths
+on base-weight draft forwards.
+
+- ModelRunner.lora_enabled = enable_lora and not is_draft_worker;
+  init gate, forward_batch_info.init_forward_metadata LoRA block, and all
+  per-runner gates in runner/{eager,base,decode_cuda_graph}_runner.py flip
+  to it (draft graph capture no longer allocates LoRA metadata).
+- init_lora_manager asserts not is_draft_worker (fail-closed).
+- cpu_graph_runner.py:588 left on server_args.enable_lora (CPU path,
+  no draft workers; out of scope).
+- DSpark compact-ragged-verify incompat check (decode_cuda_graph_runner
+  :284) now keys on the TARGET runner's lora_enabled — static verify mode
+  (our config) unaffected.
+---
+ python/sglang/srt/model_executor/forward_batch_info.py    | 2 +-
+ python/sglang/srt/model_executor/model_runner.py          | 8 +++++++-
+ python/sglang/srt/model_executor/runner/base_runner.py    | 2 +-
+ .../srt/model_executor/runner/decode_cuda_graph_runner.py | 8 ++++----
+ python/sglang/srt/model_executor/runner/eager_runner.py   | 2 +-
+ 5 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index cf3ad2e..8f56ff1 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -856,7 +856,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+                 ret._compute_mrope_positions(model_runner, batch)
+ 
+         # Init lora information
+-        if model_runner.server_args.enable_lora:
++        if model_runner.lora_enabled:
+             # In the non-LoRA overlap loading case, we fetch LoRA adapters into the memory pool
+             # as a batch, right before running the batch
+             if not model_runner.server_args.enable_lora_overlap_loading:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index f8e829c..2a55d67 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -391,6 +391,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+         self.dist_port = nccl_port
+         self.server_args = server_args
+         self.is_draft_worker = is_draft_worker
++        # LoRA is target-only: draft workers (EAGLE/DFLASH/DSPARK) run base
++        # weights; verification on the target owns the output distribution.
++        self.lora_enabled = bool(server_args.enable_lora) and not is_draft_worker
+         self.is_generation = model_config.is_generation
+         self.device_timer = None
+         self.is_multimodal = model_config.is_multimodal
+@@ -806,7 +809,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             self.apply_torch_tp()
+ 
+         # Init lora
+-        if server_args.enable_lora:
++        if self.lora_enabled:
+             self.init_lora_manager()
+             if not cuda_graph_fully_disabled():
+                 # Phase 1 of LoRA CUDA graph init: pre-allocate large MoE
+@@ -2198,6 +2201,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             return None
+ 
+     def init_lora_manager(self):
++        assert not self.is_draft_worker, (
++            "LoRA manager must never be initialized on a draft ModelRunner"
++        )
+         self.lora_manager = LoRAManager(
+             base_model=self.model,
+             base_hf_config=self.model_config.hf_config,
+diff --git a/python/sglang/srt/model_executor/runner/base_runner.py b/python/sglang/srt/model_executor/runner/base_runner.py
+index 1be6c95..cefcfb8 100644
+--- a/python/sglang/srt/model_executor/runner/base_runner.py
++++ b/python/sglang/srt/model_executor/runner/base_runner.py
+@@ -628,7 +628,7 @@ class BaseRunner(ABC):
+                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+             )
+ 
+-        if mr.server_args.enable_lora:
++        if mr.lora_enabled:
+             lora_ids = [None] * batch_size
+         else:
+             lora_ids = None
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+index 45921c5..a6d36dd 100644
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -281,7 +281,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         )
+         self._ragged_graph_size = 0
+         if self.ragged_verify_mode and (
+-            self.enable_two_batch_overlap or model_runner.server_args.enable_lora
++            self.enable_two_batch_overlap or model_runner.lora_enabled
+         ):
+             raise ValueError(
+                 "DSpark compact ragged verify does not support "
+@@ -316,7 +316,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         if self.enable_torch_compile:
+             set_torch_compile_config()
+ 
+-        if self.model_runner.server_args.enable_lora:
++        if self.model_runner.lora_enabled:
+             # Phase 2 of LoRA CUDA graph init: dense LoRA batch metadata.
+             # Phase 1 (MoE buffers) was handled earlier in ModelRunner via
+             # lora_manager.init_cuda_graph_moe_buffers().
+@@ -732,7 +732,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+                 spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+             )
+ 
+-        if self.model_runner.server_args.enable_lora:
++        if self.model_runner.lora_enabled:
+             # It is safe to capture CUDA graph using empty LoRA id, as the LoRA kernels will always be launched whenever
+             # `--enable-lora` is set to True (and return immediately if the LoRA id is empty for perf optimization).
+             lora_ids = [None] * bs
+@@ -1044,7 +1044,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
+         # plus an empty-id fast-path; confirm on GPU the idle lora_ids==[] case
+         # still slips through and needs this refresh.
+         if (
+-            self.model_runner.server_args.enable_lora
++            self.model_runner.lora_enabled
+             and not forward_batch.lora_ids
+             # The chunked backend's prep raises on IDLE mode
+             # (generate_sequence_lengths: "Unsupported forward mode"); only the
+diff --git a/python/sglang/srt/model_executor/runner/eager_runner.py b/python/sglang/srt/model_executor/runner/eager_runner.py
+index f89e2c9..7b40de4 100644
+--- a/python/sglang/srt/model_executor/runner/eager_runner.py
++++ b/python/sglang/srt/model_executor/runner/eager_runner.py
+@@ -404,7 +404,7 @@ class EagerRunner(BaseRunner):
+             # heuristic would otherwise target the static graph buffers and leave
+             # the eager state stale). Confirm on GPU this is still needed vs
+             # upstream's native idle-LoRA handling.
+-            if model_runner.server_args.enable_lora:
++            if model_runner.lora_enabled:
+                 if forward_batch.lora_ids is None:
+                     forward_batch.lora_ids = [None] * forward_batch.batch_size
+                 model_runner.lora_manager.prepare_lora_batch(
+-- 
+2.43.0
+

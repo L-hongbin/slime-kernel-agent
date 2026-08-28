@@ -1,4 +1,5 @@
 import asyncio
+import base64 as pybase64
 import copy
 import inspect
 import json
@@ -30,6 +31,7 @@ from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, get_sglang_client_concurrency, post
+from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -47,13 +49,188 @@ logger = logging.getLogger(__name__)
 
 _PROCESSOR_PROMPT_KEYS = {"input_ids", "attention_mask"}
 
+_PREDICTIVE_SUPPORT_FIELDS = (
+    "rollout_topk_token_ids",
+    "rollout_topk_log_probs",
+    "rollout_topk_valid_mask",
+)
+
+
+def _empty_predictive_support(num_tokens: int, top_k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return compact all-invalid predictive-support rows.
+
+    All-invalid rows are only suitable for tokens whose loss mask is zero
+    (padding/aborted samples).  Real training tokens are validated later on the
+    rollout-manager boundary before they enter Ray's train-data object.
+    """
+    if num_tokens < 0:
+        raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+    shape = (num_tokens, top_k + 1)
+    return (
+        np.zeros(shape, dtype=np.int32),
+        np.zeros(shape, dtype=np.float32),
+        np.zeros(shape, dtype=np.bool_),
+    )
+
+
+def _parse_sglang_logprob_item(item: Any, *, field: str, token_index: int, support_index: int | None = None):
+    location = f"{field}[{token_index}]"
+    if support_index is not None:
+        location += f"[{support_index}]"
+    if not isinstance(item, (list, tuple)) or len(item) < 2:
+        raise ValueError(f"{location} must be a (logprob, token_id, ...) sequence, got {item!r}")
+
+    log_prob, token_id = item[0], item[1]
+    if isinstance(token_id, (bool, np.bool_)) or not isinstance(token_id, (int, np.integer)):
+        raise ValueError(f"{location} has a non-integer token id: {token_id!r}")
+    token_id = int(token_id)
+    if token_id < 0 or token_id > np.iinfo(np.int32).max:
+        raise ValueError(f"{location} token id is outside int32 range: {token_id}")
+
+    try:
+        log_prob = float(log_prob)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{location} has a non-numeric log probability: {log_prob!r}") from exc
+    if not np.isfinite(log_prob):
+        raise ValueError(f"{location} has a non-finite log probability: {log_prob!r}")
+    return log_prob, token_id
+
+
+def _extract_predictive_support(
+    meta_info: dict[str, Any], top_k: int
+) -> tuple[list[int], list[float], np.ndarray, np.ndarray, np.ndarray]:
+    """Parse one SGLang response into a unique fixed-width behavior support.
+
+    SGLang returns ``output_top_logprobs`` independently from the sampled-token
+    logprob and does not promise that the sample is in top-k.  We therefore use
+    the top-k order as the first K slots, overwrite its entry with the sampled
+    logprob when present, or append the sampled token in slot K otherwise.  At
+    non-unit temperature these values must already be log-probabilities from
+    SGLang's temperature-scaled sampling distribution; do not re-temperature a
+    sparse Top-K result because its missing tail prevents exact normalization.
+    """
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+
+    sampled_items = meta_info.get("output_token_logprobs", [])
+    top_rows = meta_info.get("output_top_logprobs", [])
+    if sampled_items is None:
+        sampled_items = []
+    if top_rows is None:
+        top_rows = []
+    if not isinstance(sampled_items, (list, tuple)):
+        raise ValueError("meta_info.output_token_logprobs must be a sequence")
+    if not isinstance(top_rows, (list, tuple)):
+        raise ValueError("meta_info.output_top_logprobs must be a sequence")
+    if len(top_rows) != len(sampled_items):
+        raise ValueError(
+            "predictive support token-count mismatch: "
+            f"len(output_top_logprobs)={len(top_rows)} != "
+            f"len(output_token_logprobs)={len(sampled_items)}"
+        )
+
+    token_count = len(sampled_items)
+    token_ids, log_probs, valid_mask = _empty_predictive_support(token_count, top_k)
+    sampled_token_ids: list[int] = []
+    sampled_log_probs: list[float] = []
+
+    for token_index, (sampled_item, top_row) in enumerate(zip(sampled_items, top_rows, strict=True)):
+        sampled_log_prob, sampled_token_id = _parse_sglang_logprob_item(
+            sampled_item,
+            field="output_token_logprobs",
+            token_index=token_index,
+        )
+        if not isinstance(top_row, (list, tuple)) or len(top_row) != top_k:
+            actual = len(top_row) if isinstance(top_row, (list, tuple)) else type(top_row).__name__
+            raise ValueError(f"output_top_logprobs[{token_index}] must contain exactly {top_k} entries, got {actual}")
+
+        support_slot_by_id: dict[int, int] = {}
+        for support_index, top_item in enumerate(top_row):
+            top_log_prob, top_token_id = _parse_sglang_logprob_item(
+                top_item,
+                field="output_top_logprobs",
+                token_index=token_index,
+                support_index=support_index,
+            )
+            if top_token_id in support_slot_by_id:
+                raise ValueError(f"output_top_logprobs[{token_index}] contains duplicate token id {top_token_id}")
+            support_slot_by_id[top_token_id] = support_index
+            token_ids[token_index, support_index] = top_token_id
+            log_probs[token_index, support_index] = top_log_prob
+            valid_mask[token_index, support_index] = True
+
+        sampled_slot = support_slot_by_id.get(sampled_token_id, top_k)
+        token_ids[token_index, sampled_slot] = sampled_token_id
+        # This must be the independently-returned sampled logprob, even when a
+        # rounded copy of the token is already present in output_top_logprobs.
+        log_probs[token_index, sampled_slot] = sampled_log_prob
+        valid_mask[token_index, sampled_slot] = True
+        sampled_token_ids.append(sampled_token_id)
+        sampled_log_probs.append(sampled_log_prob)
+
+    return sampled_token_ids, sampled_log_probs, token_ids, log_probs, valid_mask
+
+
+def _append_predictive_support(
+    sample: Sample,
+    support: tuple[np.ndarray, np.ndarray, np.ndarray],
+    *,
+    previous_response_length: int,
+    top_k: int,
+) -> None:
+    """Append a partial-generation support chunk without Python-list expansion."""
+    expected_width = top_k + 1
+    expected_dtypes = (np.dtype(np.int32), np.dtype(np.float32), np.dtype(np.bool_))
+    chunk_rows = support[0].shape[0]
+    for field, value, expected_dtype in zip(_PREDICTIVE_SUPPORT_FIELDS, support, expected_dtypes, strict=True):
+        if not isinstance(value, np.ndarray):
+            raise TypeError(f"{field} chunk must be a numpy.ndarray, got {type(value).__name__}")
+        if value.shape != (chunk_rows, expected_width):
+            raise ValueError(f"{field} chunk shape must be {(chunk_rows, expected_width)}, got {value.shape}")
+        if value.dtype != expected_dtype:
+            raise TypeError(f"{field} chunk dtype must be {expected_dtype}, got {value.dtype}")
+
+        existing = getattr(sample, field)
+        if existing is None:
+            if previous_response_length:
+                previous_mask = sample.loss_mask
+                if (
+                    previous_mask is None
+                    or len(previous_mask) < previous_response_length
+                    or any(previous_mask[:previous_response_length])
+                ):
+                    raise ValueError(
+                        f"cannot enable predictive support after {previous_response_length} existing trainable "
+                        f"response tokens: {field} is missing"
+                    )
+                existing = np.zeros((previous_response_length, expected_width), dtype=expected_dtype)
+            else:
+                existing = np.zeros((0, expected_width), dtype=expected_dtype)
+        if not isinstance(existing, np.ndarray):
+            raise TypeError(f"existing {field} must be a numpy.ndarray, got {type(existing).__name__}")
+        if existing.shape != (previous_response_length, expected_width):
+            raise ValueError(
+                f"existing {field} shape must be {(previous_response_length, expected_width)}, got {existing.shape}"
+            )
+        if existing.dtype != expected_dtype:
+            raise TypeError(f"existing {field} dtype must be {expected_dtype}, got {existing.dtype}")
+        setattr(sample, field, np.concatenate((existing, value), axis=0))
+
 
 def _set_rollout_step_metadata(args: Namespace, rollout_id: int, samples: list[list[Sample]]) -> None:
     rollout_step = compute_rollout_step(args, rollout_id)
+    gen_weight_version = getattr(args, "gen_weight_version", None)
     for group in samples:
         for sample in group:
             sample.metadata = sample.metadata or {}
             sample.metadata["rollout_step"] = rollout_step
+            # Stamp ONCE at first submission: a buffered prompt re-submitted in
+            # a later cycle keeps its original version, which is what makes the
+            # weight-staleness metric detect carry-overs.
+            if gen_weight_version is not None and "gen_weight_version" not in sample.metadata:
+                sample.metadata["gen_weight_version"] = gen_weight_version
 
 
 def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
@@ -76,6 +253,39 @@ def _prepare_prompt_ids(sample: Sample, tokenizer, processor: Any) -> list[int]:
         return sample.tokens
 
     return tokenizer.encode(sample.prompt, add_special_tokens=False)
+
+
+def _decode_routed_experts(
+    meta_info: dict[str, Any],
+    *,
+    token_count: int,
+    num_layers: int,
+    expected_topk: int | None,
+) -> np.ndarray:
+    raw = np.frombuffer(
+        pybase64.b64decode(meta_info["routed_experts"].encode("ascii")),
+        dtype=np.int32,
+    )
+    denom = token_count * num_layers
+    if denom <= 0:
+        raise ValueError(
+            "cannot decode routed_experts with non-positive shape: "
+            f"token_count={token_count}, num_layers={num_layers}"
+        )
+    if raw.size % denom != 0:
+        raise ValueError(
+            "routed_experts payload size is not divisible by token_count*num_layers: "
+            f"size={raw.size}, token_count={token_count}, num_layers={num_layers}, "
+            f"expected_topk={expected_topk}"
+        )
+    actual_topk = raw.size // denom
+    if expected_topk is not None and actual_topk != expected_topk:
+        logger.warning(
+            "routed_experts payload topk=%s differs from args.moe_router_topk=%s; using payload shape",
+            actual_topk,
+            expected_topk,
+        )
+    return raw.reshape(token_count, num_layers, actual_topk)
 
 
 class PromptTemplate:
@@ -186,6 +396,12 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_counts = [0] * (args.sglang_dp_size or 1)
         self.dp_rank = 0
 
+        # Name of the LoRA adapter the engines currently serve (alternating sync
+        # path). Refreshed each rollout step from the engine (the source of truth)
+        # by the RolloutManager; ``None`` until the first adapter is loaded. Every
+        # /generate payload routes to this exact name.
+        self.active_lora_name: str | None = None
+
         self.reset()
 
     def _warn_history_thinking_template(self) -> None:
@@ -287,8 +503,18 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "return_logprob": True,
     }
 
+    predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
+    if predictive_top_k < 0:
+        raise ValueError(f"dppo_predictive_top_k must be non-negative, got {predictive_top_k}")
+    if predictive_top_k:
+        payload["top_logprobs_num"] = predictive_top_k
+
     if args.use_rollout_routing_replay:
         payload["return_routed_experts"] = True
+
+    lora_path = _rollout_lora_path(args, state.active_lora_name)
+    if lora_path is not None:
+        payload["lora_path"] = lora_path
 
     images = sample.multimodal_inputs.get("images") if sample.multimodal_inputs else None
     if images:
@@ -312,11 +538,35 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         output = await post(url, payload, headers=headers)
         span.update(build_sglang_meta_trace_attrs(output["meta_info"]))
 
-    if "output_token_logprobs" in output["meta_info"]:
+    predictive_support = None
+    if predictive_top_k:
+        (
+            new_response_tokens,
+            new_response_log_probs,
+            support_token_ids,
+            support_log_probs,
+            support_valid_mask,
+        ) = _extract_predictive_support(output["meta_info"], predictive_top_k)
+        predictive_support = (support_token_ids, support_log_probs, support_valid_mask)
+        if output.get("text") and not new_response_tokens:
+            raise ValueError(
+                "SGLang returned non-empty response text without output_token_logprobs "
+                "while predictive-mask support is enabled"
+            )
+    elif "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
     else:
         new_response_tokens, new_response_log_probs = [], []
+
+    previous_response_length = sample.response_length
+    if predictive_support is not None:
+        _append_predictive_support(
+            sample,
+            predictive_support,
+            previous_response_length=previous_response_length,
+            top_k=predictive_top_k,
+        )
 
     sample.append_response_tokens(
         args,
@@ -354,6 +604,15 @@ async def generate_and_rm(
     async with state.semaphore:
         if state.aborted:
             sample.status = Sample.Status.ABORTED
+            # Multi-turn contract: every element of the gathered group must be
+            # list[Sample] with per-sample turn_idx (_split_turns_as_sample_groups
+            # asserts both). This semaphore-abort path bypasses the custom
+            # generate's _abort_result (which builds a proper aborted turn list),
+            # so a bare Sample here crashed rollout 2 of formal r7e (2026-07-10)
+            # when the dynamic-sampling fill aborted queued tasks.
+            if getattr(args, "use_multi_turn", False):
+                sample.metadata = {**(sample.metadata or {}), "turn_idx": 0}
+                return [sample]
             return sample
 
         with state.dp_rank_context() as _:
@@ -471,6 +730,24 @@ def _split_turns_as_sample_groups(group: list[Sample] | list[list[Sample]]) -> l
     return [turn_groups[turn_idx] for turn_idx in sorted_turn_indices]
 
 
+def _groups_missing_routing_replay(args: Namespace, groups: list[list[Sample]]) -> bool:
+    """True if routing replay is on and any sample lacks its routed-experts record.
+
+    Failed/aborted generations come back without ``routed_experts`` in meta_info;
+    such samples would crash the replay consumer downstream (``torch.from_numpy(None)``)
+    and post-hoc dropping underfills the fixed global batch (num_steps floors to 0).
+    Rejecting the group HERE lets over-sampling refill it, keeping the batch exact.
+    Pad turns are fine: they carry an EMPTY (not None) routed array.
+    """
+    if not getattr(args, "use_rollout_routing_replay", False):
+        return False
+    return any(
+        getattr(sample, "rollout_routed_experts", None) is None
+        for group in groups
+        for sample in (group if isinstance(group, list) else [group])
+    )
+
+
 def _get_last_non_pad_turn_group(groups: list[list[Sample]]) -> list[Sample]:
     """Return each trajectory's last real turn sample, excluding padded turns."""
     last_turn_group: list[Sample | None] = [None] * len(groups[0])
@@ -525,6 +802,27 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     return aborted_samples
 
 
+def _get_over_sampling_fetch_size(args: Namespace, target_data_size: int, accepted_count: int) -> int:
+    """Return the number of *prompt groups* to submit on the next refill.
+
+    ``over_sampling_batch_size`` remains the hard cap and, unless an adaptive
+    factor is configured, preserves slime's historical fixed-granularity
+    behavior.  With ``over_sampling_refill_factor=2``, a rollout that still
+    needs ``k`` accepted prompt groups submits at most ``2 * k`` candidates.
+    Each candidate is expanded separately to ``n_samples_per_prompt``
+    completions by the data source.
+    """
+    max_prompt_groups = int(args.over_sampling_batch_size)
+    refill_factor = getattr(args, "over_sampling_refill_factor", None)
+    if refill_factor is None:
+        return max_prompt_groups
+
+    missing_groups = target_data_size - accepted_count
+    if missing_groups <= 0:
+        return 0
+    return min(max_prompt_groups, int(refill_factor) * missing_groups)
+
+
 async def generate_rollout_async(
     args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
@@ -568,12 +866,33 @@ async def generate_rollout_async(
     data = []
     all_data = []
     do_print = True
+    # Routing-replay reject-and-refill bookkeeping (see the check inside the loop).
+    missing_routing_reject_count = 0
+    missing_routing_reject_limit = max(4 * target_data_size, 64)
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     while accepted_count < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
-            # If over_sampling_batch_size is None, rollout_batch_size will be used as the default over_sampling_batch_size.
-            samples = data_source(args.over_sampling_batch_size)
+            # If no adaptive factor is configured this keeps slime's fixed
+            # over_sampling_batch_size behavior. The formal DS-V4 path uses factor=2,
+            # so a tail deficit of k accepted groups refills only 2*k prompt
+            # groups instead of launching another full 32-prompt wave.
+            fetch_prompt_groups = _get_over_sampling_fetch_size(args, target_data_size, accepted_count)
+            assert fetch_prompt_groups > 0
+            logger.info(
+                "Rollout candidate refill: accepted_groups=%s missing_groups=%s "
+                "candidate_groups_remaining=%s fetch_prompt_groups=%s "
+                "samples_per_prompt=%s completion_requests=%s max_prompt_groups=%s refill_factor=%s",
+                accepted_count,
+                target_data_size - accepted_count,
+                state.remaining_batch_size,
+                fetch_prompt_groups,
+                args.n_samples_per_prompt,
+                fetch_prompt_groups * args.n_samples_per_prompt,
+                args.over_sampling_batch_size,
+                getattr(args, "over_sampling_refill_factor", None),
+            )
+            samples = data_source(fetch_prompt_groups)
             _set_rollout_step_metadata(args, rollout_id, samples)
             state.submit_generate_tasks(samples)
 
@@ -593,6 +912,33 @@ async def generate_rollout_async(
                 last_turn_group = _get_last_non_pad_turn_group(groups)
                 last_turn_dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, last_turn_group)
             all_data.extend(groups)
+
+            # Routing-replay reject-and-refill: a missing routed-experts record ANYWHERE
+            # in the task_group rejects the WHOLE trajectory atomically (never a subset —
+            # partially accepting sibling turn-groups would ship an incomplete trajectory
+            # and the post-hoc drop would underfill the fixed global batch). is_filtered
+            # stays True so remaining_batch_size is decremented and over-sampling refills.
+            # NOTE: the groups stay in all_data on purpose — all_data holds every generated
+            # sample including dynamic-filter-dropped ones; consumers of
+            # --rollout-all-samples-process-path must not assume routed_experts is present.
+            if _groups_missing_routing_replay(args, groups):
+                for _ in groups:
+                    metric_gatherer.on_dynamic_filter_drop(reason="missing_routing_replay")
+                missing_routing_reject_count += 1
+                # Livelock guard: a persistent stream of routing-less groups means the
+                # engine isn't returning routed_experts at all — fail loudly instead of
+                # resampling forever.
+                if missing_routing_reject_count >= missing_routing_reject_limit:
+                    raise RuntimeError(
+                        f"{missing_routing_reject_count} rollout groups were missing "
+                        "rollout_routed_experts while --use-rollout-routing-replay is enabled "
+                        f"(accepted {accepted_count}/{target_data_size}). The rollout engine is "
+                        "likely not configured to return routed experts (check SGLANG "
+                        "routed-experts capture)."
+                    )
+                state.remaining_batch_size -= 1
+                assert state.remaining_batch_size >= 0
+                continue
 
             for group in groups:
                 assert group and all(

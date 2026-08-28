@@ -1,0 +1,26 @@
+--- a/python/sglang/srt/arg_groups/deepseek_v4_hook.py
++++ b/python/sglang/srt/arg_groups/deepseek_v4_hook.py
+@@ -29,9 +29,20 @@
+         logger.warning(
+             f"Setting KV cache dtype to {server_args.kv_cache_dtype} for {model_arch}."
+         )
+-    assert server_args.kv_cache_dtype in [
+-        "fp8_e4m3"
+-    ], f"{server_args.kv_cache_dtype} is not supported for {model_arch}"
++    # bf16 KV is an explicit opt-in (auto still defaults to fp8_e4m3 above).
++    # Motivation: the train<->rollout mismatch study (handoffs/deepseek-v4/
++    # mismatch_breakdown.md) found fp8-KV decode-vs-prefill is the dominant
++    # mismatch floor (0.077 of ~0.114 mean|log-ratio| at the truncated
++    # microscope); bf16 KV removes it without touching train-side numerics.
++    # The MLA pool handles it natively: dsa_kv_cache_store_fp8 derives from
++    # pool dtype (mem_cache/memory_pool.py) and the dsa backend carries
++    # non-fp8 branches. Cost: 2x KV bytes (compact MLA latent) + 2x KV read
++    # bandwidth in decode.
++    if server_args.kv_cache_dtype not in ["fp8_e4m3", "bf16", "bfloat16"]:
++        raise ValueError(
++            f"{server_args.kv_cache_dtype} is not supported for {model_arch} "
++            "(supported: fp8_e4m3 default, bf16/bfloat16 opt-in)."
++        )
+ 
+     if server_args.speculative_algorithm is not None:
+         assert (

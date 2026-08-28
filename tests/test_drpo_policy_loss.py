@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_dppo_binary_policy_loss, compute_drpo_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_drpo_matches_quadratic_binary_tv_objective():
@@ -54,3 +57,7 @@ def test_drpo_keeps_smooth_loss_where_dppo_binary_masks_update():
     torch.testing.assert_close(dppo_output["pg_losses"], torch.zeros_like(advantages))
     assert torch.all(drpo_output["pg_clipfrac"] == 1.0)
     assert torch.all(drpo_output["pg_losses"] != 0.0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

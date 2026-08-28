@@ -1,3 +1,4 @@
+import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -16,17 +17,25 @@ from slime.utils.ppo_utils import (
     compute_aspo_policy_loss,
     compute_cispo_policy_loss,
     compute_cppo_policy_loss,
+    compute_dis_policy_loss,
     compute_dppo_binary_policy_loss,
+    compute_dppo_predictive_topk_policy_loss,
     compute_drpo_policy_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
     compute_ripo_policy_loss,
+    compute_sequence_log_ratio,
     compute_up_policy_loss,
     get_advantages_and_returns_batch,
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+)
+from slime.observability.train_metric_utils import (
+    ENTROPY_COMMON_PROBE_DENOMINATOR_KEY,
+    ENTROPY_COMMON_PROBE_MASK_KEY,
+    ENTROPY_COMMON_PROBE_NUMERATOR_KEY,
 )
 from slime.utils.types import RolloutBatch
 
@@ -87,7 +96,7 @@ def _maybe_capture_log_probs(batch: RolloutBatch, log_probs: list[torch.Tensor])
 
 
 def get_rollout_top_p_logprob_kwargs(args: Namespace, batch: dict[str, Any]) -> dict[str, Any]:
-    if args.rollout_top_p == 1.0:
+    if getattr(args, "rollout_top_p", 1.0) == 1.0:
         return {}
 
     top_p_token_ids = batch.get("rollout_top_p_token_ids")
@@ -136,8 +145,16 @@ def get_responses(
     assert logits.size(0) == 1, f"{logits.shape}"
     logits = logits.squeeze(0)
 
-    if apply_temperature and args.rollout_temperature != 1.0:
-        logits = logits.div(args.rollout_temperature)
+    # rollout_temperature == 0 (greedy) would divide logits by zero here:
+    # Inf -> log_softmax NaN -> NaN loss/grads (R6 full-loop NaN root cause).
+    # slime_validate_args rejects it at launch; assert as defense in depth.
+    if apply_temperature:
+        assert args.rollout_temperature > 0, (
+            f"rollout_temperature must be > 0 in the train-side log-prob path, got "
+            f"{args.rollout_temperature}: dividing logits by it would produce a NaN loss."
+        )
+        if args.rollout_temperature != 1.0:
+            logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
     end = 0
@@ -544,7 +561,13 @@ def get_log_probs_and_entropy(
     logits = logits.squeeze(0)
 
     # Apply rollout temperature scaling to logits to match rollout-time log-probs.
+    # rollout_temperature == 0 (greedy) would divide by zero -> NaN loss;
+    # slime_validate_args rejects it at launch; assert as defense in depth.
     rollout_temperature = getattr(args, "rollout_temperature", 1.0)
+    assert rollout_temperature > 0, (
+        f"rollout_temperature must be > 0 in the train-side log-prob path, got "
+        f"{rollout_temperature}: dividing logits by it would produce a NaN loss."
+    )
     if rollout_temperature != 1.0:
         logits = logits / rollout_temperature
     logits = logits.contiguous()
@@ -574,7 +597,10 @@ def get_log_probs_and_entropy(
         )
 
     # --- compute on full [T,V] logits at once via calculate_log_probs_and_entropy ---
-    log_prob_full, entropy_full = calculate_log_probs_and_entropy(
+    with_dppo_directional_moment = (
+        with_entropy and getattr(args, "policy_loss_mode", "ppo") == "dppo_topk_kl_predictive"
+    )
+    log_prob_outputs = calculate_log_probs_and_entropy(
         logits,
         full_tokens,
         tp_group,
@@ -582,7 +608,13 @@ def get_log_probs_and_entropy(
         with_entropy_grad=with_entropy_grad,
         chunk_size=chunk_size,
         log_prob_keep_mask=top_p_keep_mask,
+        with_dppo_directional_moment=with_dppo_directional_moment,
     )
+    if with_dppo_directional_moment:
+        log_prob_full, entropy_full, dppo_directional_moment_full = log_prob_outputs
+    else:
+        log_prob_full, entropy_full = log_prob_outputs
+        dppo_directional_moment_full = None
     log_prob_full = log_prob_full.squeeze(-1)  # [T, 1] -> [T]
 
     # --- extract per-sample response portions ---
@@ -597,6 +629,15 @@ def get_log_probs_and_entropy(
     res = {"log_probs": log_probs_list}
     if with_entropy:
         res["entropy"] = entropy_list
+    if with_dppo_directional_moment:
+        _, dppo_directional_moment_list = _extract_per_sample(
+            log_prob_full,
+            dppo_directional_moment_full,
+            total_lengths,
+            response_lengths,
+            args.allgather_cp,
+        )
+        res["dppo_entropy_directional_moment"] = dppo_directional_moment_list
 
     # we need to turn the all gather kv into zigzag ring attn kv
     if args.allgather_cp:
@@ -608,6 +649,335 @@ def get_log_probs_and_entropy(
         )
 
     return torch.empty((0,), device=device), res
+
+
+def _embed_cp_local_response_values(
+    values: list[torch.Tensor],
+    *,
+    logits_rows: int,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
+    allgather_cp: bool,
+) -> torch.Tensor:
+    """Embed CP-local response rows into the flattened local-logit layout.
+
+    ``slice_log_prob_with_cp`` stores response-only tensors as the first CP
+    response chunk followed by the second.  This is the inverse placement: it
+    puts those compact rows at the exact logit positions that predict them.
+    Trailing dimensions are preserved, so it works for predictive Top-K
+    support ids and masks without ever copying a ``[response, vocab]`` tensor.
+    """
+    if allgather_cp:
+        raise ValueError(
+            "Predictive Top-K support placement does not support allgather_cp; "
+            "slime_validate_args should reject this configuration."
+        )
+    if not values:
+        raise ValueError("Predictive Top-K support cannot be empty for a training microbatch.")
+    if not (len(values) == len(total_lengths) == len(response_lengths)):
+        raise ValueError(
+            "Predictive Top-K support/sample count mismatch: "
+            f"values={len(values)}, total_lengths={len(total_lengths)}, response_lengths={len(response_lengths)}"
+        )
+
+    reference = values[0]
+    if reference.ndim != 2:
+        raise ValueError(f"Predictive Top-K response values must be rank 2, got {reference.shape}.")
+    width = reference.size(1)
+    embedded = torch.zeros((logits_rows, width), dtype=reference.dtype, device=reference.device)
+    cp_size = mpu.get_context_parallel_world_size()
+
+    if cp_size > 1:
+        pos = 0
+        for i, (value, total_length, response_length) in enumerate(
+            zip(values, total_lengths, response_lengths, strict=True)
+        ):
+            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+            chunk_size, chunks_offset, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+                total_length, response_length, qkv_format, max_seq_len
+            )
+            lo0 = logits_offset[0][0] - chunks_offset[0][0]
+            hi0 = logits_offset[0][1] - chunks_offset[0][0]
+            lo1 = logits_offset[1][0] - chunks_offset[1][0]
+            hi1 = logits_offset[1][1] - chunks_offset[1][0]
+            len0, len1 = hi0 - lo0, hi1 - lo1
+            if value.ndim != 2 or value.size(1) != width or value.size(0) != len0 + len1:
+                raise ValueError(
+                    "Predictive Top-K CP response shape mismatch for sample "
+                    f"{i}: got {tuple(value.shape)}, expected ({len0 + len1}, {width})."
+                )
+            embedded[pos + lo0 : pos + hi0] = value[:len0]
+            embedded[pos + chunk_size + lo1 : pos + chunk_size + hi1] = value[len0:]
+            pos += 2 * chunk_size
+        if pos > logits_rows:
+            raise ValueError(f"Predictive Top-K CP placement used {pos} rows, but logits have {logits_rows}.")
+        return embedded
+
+    if qkv_format == "thd":
+        offset = 0
+        for i, (value, total_length, response_length) in enumerate(
+            zip(values, total_lengths, response_lengths, strict=True)
+        ):
+            if value.ndim != 2 or value.shape != (response_length, width):
+                raise ValueError(
+                    f"Predictive Top-K response shape mismatch for sample {i}: "
+                    f"got {tuple(value.shape)}, expected ({response_length}, {width})."
+                )
+            end = offset + total_length
+            start = end - response_length
+            embedded[start - 1 : end - 1] = value
+            offset = end
+    elif qkv_format == "bshd":
+        if max_seq_lens is None:
+            raise ValueError("max_seq_lens is required for BSHD predictive Top-K support placement.")
+        for i, (value, total_length, response_length) in enumerate(
+            zip(values, total_lengths, response_lengths, strict=True)
+        ):
+            if value.ndim != 2 or value.shape != (response_length, width):
+                raise ValueError(
+                    f"Predictive Top-K response shape mismatch for sample {i}: "
+                    f"got {tuple(value.shape)}, expected ({response_length}, {width})."
+                )
+            end = max_seq_lens[i] * i + total_length
+            start = end - response_length
+            embedded[start - 1 : end - 1] = value
+    else:
+        raise ValueError(f"Unsupported qkv_format for predictive Top-K support: {qkv_format}")
+    return embedded
+
+
+def _cp_local_response_row_ranges(
+    *,
+    logits_rows: int,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
+    allgather_cp: bool,
+) -> list[tuple[int, int]]:
+    """Return local-logit row ranges that predict response tokens."""
+    if allgather_cp:
+        raise ValueError("Predictive Top-K response ranges do not support allgather_cp.")
+    cp_size = mpu.get_context_parallel_world_size()
+    ranges: list[tuple[int, int]] = []
+    if cp_size > 1:
+        pos = 0
+        for i, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=True)):
+            max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+            chunk_size, chunks_offset, logits_offset, _ = get_logits_and_tokens_offset_with_cp(
+                total_length, response_length, qkv_format, max_seq_len
+            )
+            lo0 = logits_offset[0][0] - chunks_offset[0][0]
+            hi0 = logits_offset[0][1] - chunks_offset[0][0]
+            lo1 = logits_offset[1][0] - chunks_offset[1][0]
+            hi1 = logits_offset[1][1] - chunks_offset[1][0]
+            if hi0 > lo0:
+                ranges.append((pos + lo0, pos + hi0))
+            if hi1 > lo1:
+                ranges.append((pos + chunk_size + lo1, pos + chunk_size + hi1))
+            pos += 2 * chunk_size
+    elif qkv_format == "thd":
+        offset = 0
+        for total_length, response_length in zip(total_lengths, response_lengths, strict=True):
+            end = offset + total_length
+            start = end - response_length
+            if response_length:
+                ranges.append((start - 1, end - 1))
+            offset = end
+    elif qkv_format == "bshd":
+        if max_seq_lens is None:
+            raise ValueError("max_seq_lens is required for BSHD predictive Top-K response ranges.")
+        for i, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=True)):
+            end = max_seq_lens[i] * i + total_length
+            start = end - response_length
+            if response_length:
+                ranges.append((start - 1, end - 1))
+    else:
+        raise ValueError(f"Unsupported qkv_format for predictive Top-K response ranges: {qkv_format}")
+
+    if any(start < 0 or end > logits_rows or end < start for start, end in ranges):
+        raise ValueError(f"Predictive Top-K response row range is outside logits_rows={logits_rows}: {ranges}")
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _require_tensor_condition(condition: torch.Tensor, message: str) -> None:
+    """Fail loudly without synchronizing the normal CUDA training path."""
+    if condition.device.type == "cuda":
+        torch._assert_async(condition, message)
+    elif not bool(condition):
+        raise ValueError(message)
+
+
+@torch.no_grad()
+def _vocab_parallel_selected_log_probs(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    valid_mask: torch.Tensor,
+    *,
+    tp_group,
+    tp_rank: int,
+    tp_world_size: int,
+    chunk_size: int,
+    row_ranges: list[tuple[int, int]] | None = None,
+) -> torch.Tensor:
+    """Return normalized log-probs for selected global token ids.
+
+    The implementation deliberately avoids ``log_softmax(logits)`` and avoids
+    gathering response logits.  It scans the existing local logits in bounded
+    row chunks, keeps only ``[T, K+1]``, and performs TP collectives only when
+    TP>1. This matters for formal DS-V4 training, which has roughly 3 GiB HBM headroom.
+    """
+    if logits.ndim != 2 or token_ids.ndim != 2 or valid_mask.shape != token_ids.shape:
+        raise ValueError(
+            "Predictive selected-logprob shape mismatch: "
+            f"logits={tuple(logits.shape)}, ids={tuple(token_ids.shape)}, valid={tuple(valid_mask.shape)}"
+        )
+    if logits.size(0) != token_ids.size(0):
+        raise ValueError(f"Predictive selected-logprob row mismatch: logits={logits.size(0)}, ids={token_ids.size(0)}")
+    if token_ids.dtype != torch.long or valid_mask.dtype != torch.bool:
+        raise ValueError(
+            f"Predictive support ids/mask must be torch.long/torch.bool, got {token_ids.dtype}/{valid_mask.dtype}."
+        )
+    if tp_world_size < 1 or not 0 <= tp_rank < tp_world_size:
+        raise ValueError(f"Invalid TP coordinates rank={tp_rank}, world_size={tp_world_size}.")
+
+    local_vocab_size = logits.size(1)
+    global_vocab_size = local_vocab_size * tp_world_size
+    _require_tensor_condition(
+        ((~valid_mask) | ((token_ids >= 0) & (token_ids < global_vocab_size))).all(),
+        f"Predictive support contains a token id outside the tensor-parallel vocabulary [0, {global_vocab_size}).",
+    )
+
+    result = torch.zeros(token_ids.shape, dtype=logits.dtype, device=logits.device)
+    row_chunk = chunk_size if chunk_size and chunk_size > 0 else 512
+    vocab_start = tp_rank * local_vocab_size
+    vocab_end = vocab_start + local_vocab_size
+
+    scan_ranges = row_ranges if row_ranges is not None else [(0, logits.size(0))]
+    for range_start, range_end in scan_ranges:
+        for start in range(range_start, range_end, row_chunk):
+            end = min(start + row_chunk, range_end)
+            chunk_valid = valid_mask[start:end]
+            chunk_logits = logits[start:end]
+            chunk_ids = token_ids[start:end]
+            local_owner = chunk_valid & (chunk_ids >= vocab_start) & (chunk_ids < vocab_end)
+            local_ids = (chunk_ids - vocab_start).clamp(min=0, max=local_vocab_size - 1)
+            selected_logits = chunk_logits.gather(1, local_ids)
+            selected_logits.masked_fill_(~local_owner, 0.0)
+
+            if tp_world_size == 1:
+                log_normalizer = torch.logsumexp(chunk_logits, dim=-1)
+            else:
+                row_max = chunk_logits.max(dim=-1).values
+                dist.all_reduce(row_max, op=dist.ReduceOp.MAX, group=tp_group)
+                shifted_exp = chunk_logits - row_max.unsqueeze(-1)
+                shifted_exp.exp_()
+                denominator = shifted_exp.sum(dim=-1)
+                del shifted_exp
+                dist.all_reduce(denominator, op=dist.ReduceOp.SUM, group=tp_group)
+                log_normalizer = row_max + denominator.log()
+                dist.all_reduce(selected_logits, op=dist.ReduceOp.SUM, group=tp_group)
+
+            selected_log_probs = selected_logits - log_normalizer.unsqueeze(-1)
+            selected_log_probs.masked_fill_(~chunk_valid, 0.0)
+            _require_tensor_condition(
+                torch.isfinite(torch.where(chunk_valid, selected_log_probs, 0.0)).all(),
+                "Non-finite current-policy predictive support log-probability.",
+            )
+            result[start:end] = selected_log_probs
+    return result
+
+
+def get_dppo_predictive_support_log_probs(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    support_token_ids: list[torch.Tensor],
+    support_valid_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+    max_seq_lens: list[int] | None,
+) -> list[torch.Tensor]:
+    """Compute current-policy probabilities on rollout's compact Top-K support."""
+    if logits.dtype != torch.float32 or logits.ndim != 3:
+        raise ValueError(f"Expected float32 rank-3 logits, got {logits.dtype} {tuple(logits.shape)}.")
+    if args.qkv_format == "thd":
+        if logits.size(0) != 1:
+            raise ValueError(f"THD predictive logits require leading size 1, got {tuple(logits.shape)}.")
+        flat_logits = logits.squeeze(0)
+    else:
+        flat_logits = logits.view(-1, logits.size(-1))
+
+    temperature = getattr(args, "rollout_temperature", 1.0)
+    if temperature <= 0:
+        raise ValueError(f"rollout_temperature must be positive, got {temperature}.")
+    if temperature != 1.0:
+        flat_logits = flat_logits / temperature
+
+    tp_world_size = mpu.get_tensor_model_parallel_world_size()
+    effective_vocab_size = flat_logits.size(-1) * tp_world_size
+    configured_vocab_size = getattr(args, "vocab_size", effective_vocab_size)
+    if effective_vocab_size != configured_vocab_size:
+        raise ValueError(
+            "Predictive Top-K requires the train softmax support to match SGLang's vocabulary exactly; "
+            f"train TP support={effective_vocab_size}, configured vocab_size={configured_vocab_size}. "
+            "A padded output vocabulary would put probability mass on tokens absent from rollout."
+        )
+
+    full_ids = _embed_cp_local_response_values(
+        support_token_ids,
+        logits_rows=flat_logits.size(0),
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        qkv_format=args.qkv_format,
+        max_seq_lens=max_seq_lens,
+        allgather_cp=args.allgather_cp,
+    )
+    full_valid = _embed_cp_local_response_values(
+        support_valid_masks,
+        logits_rows=flat_logits.size(0),
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        qkv_format=args.qkv_format,
+        max_seq_lens=max_seq_lens,
+        allgather_cp=args.allgather_cp,
+    )
+    response_row_ranges = _cp_local_response_row_ranges(
+        logits_rows=flat_logits.size(0),
+        total_lengths=total_lengths,
+        response_lengths=response_lengths,
+        qkv_format=args.qkv_format,
+        max_seq_lens=max_seq_lens,
+        allgather_cp=args.allgather_cp,
+    )
+    current_full = _vocab_parallel_selected_log_probs(
+        flat_logits,
+        full_ids,
+        full_valid,
+        tp_group=mpu.get_tensor_model_parallel_group(),
+        tp_rank=mpu.get_tensor_model_parallel_rank(),
+        tp_world_size=tp_world_size,
+        chunk_size=getattr(args, "log_probs_chunk_size", 512),
+        row_ranges=response_row_ranges,
+    )
+    current, _ = _extract_per_sample(
+        current_full,
+        None,
+        total_lengths,
+        response_lengths,
+        args.qkv_format,
+        max_seq_lens,
+        args.allgather_cp,
+    )
+    return current
 
 
 def get_values(
@@ -945,6 +1315,226 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+def _validate_dppo_predictive_support_batch(
+    args: Namespace,
+    batch: RolloutBatch,
+    sampled_old_log_probs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Validate and concatenate rollout Top-K support for one local CP batch."""
+    field_names = (
+        "rollout_topk_token_ids",
+        "rollout_topk_log_probs",
+        "rollout_topk_valid_mask",
+    )
+    missing = [name for name in field_names if name not in batch or batch[name] is None]
+    if missing:
+        raise ValueError(
+            "dppo_topk_kl_predictive requires rollout Top-K support fields; missing " + ", ".join(missing)
+        )
+
+    ids_list = batch["rollout_topk_token_ids"]
+    behavior_logs_list = batch["rollout_topk_log_probs"]
+    valid_list = batch["rollout_topk_valid_mask"]
+    sample_count = len(batch["response_lengths"])
+    if not (len(ids_list) == len(behavior_logs_list) == len(valid_list) == sample_count):
+        raise ValueError(
+            "Predictive Top-K sample-count mismatch: "
+            f"ids={len(ids_list)}, log_probs={len(behavior_logs_list)}, valid={len(valid_list)}, "
+            f"responses={sample_count}."
+        )
+
+    expected_width = args.dppo_predictive_top_k + 1
+    for i, (ids, behavior_logs, valid) in enumerate(zip(ids_list, behavior_logs_list, valid_list, strict=True)):
+        if (
+            not isinstance(ids, torch.Tensor)
+            or not isinstance(behavior_logs, torch.Tensor)
+            or not isinstance(valid, torch.Tensor)
+        ):
+            raise TypeError(f"Predictive Top-K sample {i} fields must be torch tensors after actor transfer.")
+        if ids.ndim != 2 or ids.size(1) != expected_width:
+            raise ValueError(
+                f"Predictive Top-K ids sample {i} has shape {tuple(ids.shape)}, "
+                f"expected [local_response, {expected_width}]."
+            )
+        if behavior_logs.shape != ids.shape or valid.shape != ids.shape:
+            raise ValueError(
+                f"Predictive Top-K field shape mismatch in sample {i}: "
+                f"ids={tuple(ids.shape)}, log_probs={tuple(behavior_logs.shape)}, valid={tuple(valid.shape)}."
+            )
+        if ids.dtype != torch.long or behavior_logs.dtype != torch.float32 or valid.dtype != torch.bool:
+            raise TypeError(
+                f"Predictive Top-K dtypes in sample {i} must be long/float32/bool, got "
+                f"{ids.dtype}/{behavior_logs.dtype}/{valid.dtype}."
+            )
+
+    support_ids = torch.cat(ids_list, dim=0)
+    behavior_support_logs = torch.cat(behavior_logs_list, dim=0)
+    support_valid = torch.cat(valid_list, dim=0)
+    if support_ids.size(0) != sampled_old_log_probs.numel():
+        raise ValueError(
+            "Predictive Top-K/local sampled-logprob row mismatch: "
+            f"support={support_ids.size(0)}, sampled={sampled_old_log_probs.numel()}."
+        )
+
+    local_sampled_ids: list[torch.Tensor] = []
+    local_loss_masks: list[torch.Tensor] = []
+    max_seq_lens = batch.get("max_seq_lens")
+    for i, (tokens, loss_mask, total_length, response_length) in enumerate(
+        zip(
+            batch["unconcat_tokens"],
+            batch["loss_masks"],
+            batch["total_lengths"],
+            batch["response_lengths"],
+            strict=True,
+        )
+    ):
+        max_seq_len = max_seq_lens[i] if max_seq_lens is not None else None
+        response_tokens = tokens[-response_length:] if response_length else tokens.new_empty((0,))
+        local_sampled_ids.append(
+            slice_log_prob_with_cp(
+                response_tokens,
+                total_length,
+                response_length,
+                args.qkv_format,
+                max_seq_len,
+            )
+        )
+        local_loss_masks.append(
+            slice_log_prob_with_cp(
+                loss_mask,
+                total_length,
+                response_length,
+                args.qkv_format,
+                max_seq_len,
+            )
+        )
+
+    sampled_ids = torch.cat(local_sampled_ids, dim=0).to(device=support_ids.device, dtype=torch.long)
+    active = torch.cat(local_loss_masks, dim=0).to(device=support_ids.device).bool()
+    if sampled_ids.shape != sampled_old_log_probs.shape or active.shape != sampled_old_log_probs.shape:
+        raise ValueError(
+            "Predictive Top-K CP alignment mismatch: "
+            f"sampled_ids={tuple(sampled_ids.shape)}, active={tuple(active.shape)}, "
+            f"sampled_log_probs={tuple(sampled_old_log_probs.shape)}."
+        )
+
+    valid_count = support_valid.sum(dim=-1)
+    bad_active_count = (
+        active & (valid_count != args.dppo_predictive_top_k) & (valid_count != args.dppo_predictive_top_k + 1)
+    )
+    _require_tensor_condition(
+        (~bad_active_count).all(),
+        f"Predictive Top-K active rows must have K or K+1 valid entries for K={args.dppo_predictive_top_k}.",
+    )
+    _require_tensor_condition(
+        torch.isfinite(torch.where(support_valid, behavior_support_logs, 0.0)).all(),
+        "Predictive Top-K behavior support contains a non-finite valid log-probability.",
+    )
+
+    vocab_size = args.vocab_size
+    _require_tensor_condition(
+        ((~support_valid) | ((support_ids >= 0) & (support_ids < vocab_size))).all(),
+        f"Predictive Top-K support token id is outside configured vocabulary [0, {vocab_size}).",
+    )
+    sorted_ids = torch.where(support_valid, support_ids, torch.full_like(support_ids, vocab_size)).sort(dim=-1).values
+    duplicate = (sorted_ids[:, 1:] == sorted_ids[:, :-1]) & (sorted_ids[:, 1:] != vocab_size)
+    _require_tensor_condition(~duplicate.any(), "Predictive Top-K support contains duplicate token ids in a row.")
+
+    sampled_matches = support_valid & (support_ids == sampled_ids.unsqueeze(-1))
+    sampled_match_count = sampled_matches.sum(dim=-1)
+    _require_tensor_condition(
+        ((~active) | (sampled_match_count == 1)).all(),
+        "Predictive Top-K active rows must contain the sampled token exactly once.",
+    )
+
+    sampled_behavior_log_prob = torch.where(
+        sampled_matches,
+        behavior_support_logs,
+        torch.zeros_like(behavior_support_logs),
+    ).sum(dim=-1)
+    old_logprob_matches = torch.isclose(
+        sampled_behavior_log_prob,
+        sampled_old_log_probs.detach().float(),
+        rtol=1e-5,
+        atol=2e-5,
+    )
+    _require_tensor_condition(
+        ((~active) | old_logprob_matches).all(),
+        "Predictive Top-K sampled behavior log-prob disagrees with rollout_log_probs.",
+    )
+    return support_ids, behavior_support_logs, support_valid
+
+
+def _entropy_common_probe_sufficient_stats(
+    entropy: torch.Tensor,
+    *,
+    total_lengths: list[int],
+    response_lengths: list[int],
+    loss_masks: list[torch.Tensor],
+    qkv_format: str,
+    max_seq_lens: list[int] | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return CP-local entropy sum/count for the frozen original population."""
+    field_lengths = {
+        "total_lengths": len(total_lengths),
+        "response_lengths": len(response_lengths),
+        "loss_masks": len(loss_masks),
+    }
+    if len(set(field_lengths.values())) != 1 or not loss_masks:
+        raise RuntimeError(f"entropy common-probe batch length mismatch: {field_lengths}")
+    if qkv_format == "bshd":
+        if max_seq_lens is None:
+            raise RuntimeError("entropy common-probe BSHD reduction requires max_seq_lens")
+        if len(max_seq_lens) != len(loss_masks):
+            raise RuntimeError(
+                "entropy common-probe max_seq_lens length mismatch: "
+                f"max_seq_lens={len(max_seq_lens)}, loss_masks={len(loss_masks)}"
+            )
+
+    for index, (total_length, response_length, loss_mask) in enumerate(
+        zip(total_lengths, response_lengths, loss_masks, strict=True)
+    ):
+        if not isinstance(loss_mask, torch.Tensor) or loss_mask.ndim != 1:
+            shape = tuple(loss_mask.shape) if isinstance(loss_mask, torch.Tensor) else None
+            raise RuntimeError(
+                f"entropy common-probe loss_masks[{index}] must be a 1-D tensor, "
+                f"got type={type(loss_mask).__name__} shape={shape}"
+            )
+        if loss_mask.numel() != int(response_length):
+            raise RuntimeError(
+                f"entropy common-probe mask/response length mismatch at sample {index}: "
+                f"mask={loss_mask.numel()}, response_length={response_length}"
+            )
+        if int(total_length) <= 0 or int(response_length) < 0 or int(response_length) > int(total_length):
+            raise RuntimeError(
+                f"entropy common-probe invalid lengths at sample {index}: "
+                f"response_length={response_length}, total_length={total_length}"
+            )
+
+    # Force global-token semantics regardless of the training loss reduction.
+    # Each CP rank contributes only the response rows it owns; the two values
+    # are all-reduced together by the normal train metric path, and their final
+    # ratio therefore cancels its outer normalization exactly.
+    global_token_reducer = get_sum_of_sample_mean(
+        total_lengths,
+        response_lengths,
+        loss_masks,
+        sample_denoms=None,
+        calculate_per_token_loss=True,
+        qkv_format=qkv_format,
+        max_seq_lens=max_seq_lens,
+    )
+    detached_entropy = entropy.detach()
+    numerator = global_token_reducer(detached_entropy)
+    denominator = global_token_reducer(torch.ones_like(detached_entropy))
+    if numerator.numel() != 1 or denominator.numel() != 1:
+        raise RuntimeError(
+            "entropy common-probe sufficient statistics must be scalars, got "
+            f"numerator={tuple(numerator.shape)}, denominator={tuple(denominator.shape)}"
+        )
+    return numerator.detach(), denominator.detach()
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -976,12 +1566,11 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
-    policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
-    use_dppo_binary = policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch.get("log_probs")
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
+    max_seq_lens = batch.get("max_seq_lens")
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -1004,8 +1593,17 @@ def policy_loss_function(
     if not train_log_probs_for_tis:
         train_log_probs_for_tis = [log_prob.detach() for log_prob in log_probs]
 
-    # Pre-gather log probs if needed by OPSM, GSPO, or response-level CPPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo" or policy_loss_mode == "cppo"
+    policy_loss_mode = getattr(args, "policy_loss_mode", "ppo")
+    dis_ratio_level = getattr(args, "dis_ratio_level", "token")
+
+    # Pre-gather log probs if needed by OPSM, GSPO, response-level CPPO,
+    # or sequence-level DIS.
+    need_full_log_probs = (
+        args.use_opsm
+        or args.advantage_estimator == "gspo"
+        or policy_loss_mode == "cppo"
+        or (policy_loss_mode == "dis" and dis_ratio_level == "sequence")
+    )
 
     full_log_probs = None
     full_old_log_probs = None
@@ -1030,6 +1628,15 @@ def policy_loss_function(
                     batch["advantages"], total_lengths, response_lengths, strict=False
                 )
             ]
+
+    dis_log_ratio = None
+    if policy_loss_mode == "dis" and dis_ratio_level == "sequence":
+        dis_log_ratio = compute_sequence_log_ratio(
+            full_log_probs=full_log_probs,
+            full_rollout_log_probs=full_old_log_probs,
+            local_log_probs=log_probs,
+            loss_masks=batch["loss_masks"],
+        )
 
     # Compute OPSM mask if enabled
     if args.use_opsm:
@@ -1056,16 +1663,81 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs - log_probs
 
-    if use_dppo_binary:
-        policy_loss_output = compute_dppo_binary_policy_loss(
-            log_probs,
-            old_log_probs,
-            advantages,
-            args.eps_clip,
-            args.eps_clip_high,
-            policy_loss_mode,
-            args.eps_clip_c,
+    # Policy diagnostics describe the policy/mask before any optional TIS/RS
+    # rejection changes the loss mask. Preserve this reducer now; using the
+    # rebuilt post-TIS reducer below would silently exclude rejected tokens.
+    sum_of_sample_mean_for_dppo_metrics = sum_of_sample_mean
+    _dppo = None
+    if policy_loss_mode == "dis":
+        _dppo = compute_dis_policy_loss(
+            log_probs=log_probs,
+            rollout_log_probs=old_log_probs,
+            advantages=advantages,
+            eps_clip=args.eps_clip,
+            eps_clip_high=args.eps_clip_high,
+            log_ratio=dis_log_ratio,
         )
+        policy_loss_output = _dppo
+    elif policy_loss_mode.startswith("dppo"):
+        assert args.advantage_estimator != "gspo", (
+            "DPPO ignores GSPO's sequence-level ppo_kl and would silently run "
+            "per-token — gspo+dppo is not supported."
+        )
+        if policy_loss_mode == "dppo_topk_kl_predictive":
+            support_ids, behavior_support_log_probs, support_valid_mask = _validate_dppo_predictive_support_batch(
+                args, batch, old_log_probs
+            )
+            current_support_log_probs = torch.cat(
+                get_dppo_predictive_support_log_probs(
+                    logits,
+                    args=args,
+                    support_token_ids=batch["rollout_topk_token_ids"],
+                    support_valid_masks=batch["rollout_topk_valid_mask"],
+                    total_lengths=total_lengths,
+                    response_lengths=response_lengths,
+                    max_seq_lens=max_seq_lens,
+                ),
+                dim=0,
+            )
+            if current_support_log_probs.shape != behavior_support_log_probs.shape:
+                raise ValueError(
+                    "Predictive Top-K current/behavior support shape mismatch after CP placement: "
+                    f"current={tuple(current_support_log_probs.shape)}, "
+                    f"behavior={tuple(behavior_support_log_probs.shape)}."
+                )
+            # ``support_ids`` is validated above and consumed by the selected
+            # logit gather. Keep this explicit assertion so a future plumbing
+            # refactor cannot accidentally validate one tensor and gather another.
+            if support_ids.shape != current_support_log_probs.shape:
+                raise ValueError(
+                    f"Predictive Top-K id/log-prob shape mismatch: {tuple(support_ids.shape)} "
+                    f"vs {tuple(current_support_log_probs.shape)}."
+                )
+            _dppo = compute_dppo_predictive_topk_policy_loss(
+                log_probs=log_probs,
+                old_log_probs=old_log_probs,
+                behavior_support_log_probs=behavior_support_log_probs,
+                current_support_log_probs=current_support_log_probs,
+                support_valid_mask=support_valid_mask,
+                advantages=advantages,
+                delta=args.eps_clip,
+                tail_estimator=args.dppo_predictive_tail_estimator,
+                vocab_size=args.vocab_size,
+                eps_clip_c=args.eps_clip_c,
+            )
+        else:
+            # Legacy binary divergence masks remain available for non-predictive
+            # DPPO modes and preserve their previous behavior exactly.
+            _dppo = compute_dppo_binary_policy_loss(
+                log_probs=log_probs,
+                old_log_probs=old_log_probs,
+                advantages=advantages,
+                eps_clip=args.eps_clip,
+                eps_clip_high=args.eps_clip_high,
+                loss_mode=policy_loss_mode,
+                eps_clip_c=args.eps_clip_c,
+            )
+        policy_loss_output = _dppo
     elif policy_loss_mode == "drpo":
         policy_loss_output = compute_drpo_policy_loss(
             log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
@@ -1131,8 +1803,11 @@ def policy_loss_function(
             args.eps_clip_high,
             eps_clip_c=args.eps_clip_c,
         )
+
     pg_loss = policy_loss_output["pg_losses"]
     policy_loss_metrics = {key: value for key, value in policy_loss_output.items() if key != "pg_losses"}
+    pg_clipfrac = policy_loss_metrics["pg_clipfrac"]
+    dppo_extra_metrics = policy_loss_metrics if _dppo is not None else {}
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1194,16 +1869,88 @@ def policy_loss_function(
         pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
-    policy_loss_metrics = {
-        metric_key: sum_of_sample_mean(metric_value) for metric_key, metric_value in policy_loss_metrics.items()
-    }
-    pg_clipfrac = policy_loss_metrics["pg_clipfrac"]
+    pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
     entropy_loss = sum_of_sample_mean(entropy)
+
+    entropy_common_probe_stats = {}
+    if getattr(args, "entropy_common_probe", False):
+        common_probe_loss_masks = batch.get(ENTROPY_COMMON_PROBE_MASK_KEY)
+        if common_probe_loss_masks is None:
+            raise RuntimeError(
+                f"--entropy-common-probe requires training batch field {ENTROPY_COMMON_PROBE_MASK_KEY!r}"
+            )
+        common_probe_numerator, common_probe_denominator = _entropy_common_probe_sufficient_stats(
+            entropy,
+            total_lengths=total_lengths,
+            response_lengths=response_lengths,
+            loss_masks=common_probe_loss_masks,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
+        entropy_common_probe_stats = {
+            ENTROPY_COMMON_PROBE_NUMERATOR_KEY: common_probe_numerator,
+            ENTROPY_COMMON_PROBE_DENOMINATOR_KEY: common_probe_denominator,
+        }
+
+    detached_entropy = entropy.detach()
+    detached_advantages = advantages.detach()
+    ratio_ge_1 = log_probs.detach() >= old_log_probs.detach()
+    positive_advantage = detached_advantages > 0
+    negative_advantage = detached_advantages < 0
+    clip_diagnostics = policy_loss_metrics
+    entropy_groups = {
+        "adv_positive_ratio_ge_1": positive_advantage & ratio_ge_1,
+        "adv_positive_ratio_lt_1": positive_advantage & ~ratio_ge_1,
+        "adv_negative_ratio_ge_1": negative_advantage & ratio_ge_1,
+        "adv_negative_ratio_lt_1": negative_advantage & ~ratio_ge_1,
+        "upper_clipped": clip_diagnostics["pg_upper_clipfrac"].detach().bool(),
+        "lower_clipped": clip_diagnostics["pg_lower_clipfrac"].detach().bool(),
+    }
+    entropy_group_metrics = {}
+    for group, indicator in entropy_groups.items():
+        indicator = indicator.to(detached_entropy.dtype)
+        entropy_group_metrics[f"_entropy/{group}_fraction"] = indicator
+        entropy_group_metrics[f"_entropy/{group}_joint_mean"] = detached_entropy * indicator
+
+    if _dppo is not None and args.policy_loss_mode == "dppo_topk_kl_predictive":
+
+        # Exact first-order entropy change in logit space for the same
+        # optimizer-ascent coefficient c=A*pi/mu used by the policy loss:
+        #
+        #   dz = c (e_k - p)
+        #   dH = c * [sum_i p_i^2(log p_i + H)
+        #             - p_k(log p_k + H)].
+        #
+        # The full-vocabulary sum is produced by the existing entropy softmax
+        # pass above, so this remains exact without retaining or rescanning a
+        # [response_tokens, vocab] tensor.  Every tensor below is observational
+        # and detached; the policy loss and gradient are unchanged.
+        directional_moment = torch.cat(log_probs_and_entropy["dppo_entropy_directional_moment"], dim=0).detach()
+        metric_dtype = dppo_extra_metrics["dppo/signed_update_unmasked"].dtype
+        entropy_for_metric = detached_entropy.to(metric_dtype)
+        sampled_log_prob_for_metric = log_probs.detach().to(metric_dtype)
+        sampled_prob_for_metric = sampled_log_prob_for_metric.exp()
+        entropy_unit_direction = directional_moment.to(metric_dtype) - sampled_prob_for_metric * (
+            sampled_log_prob_for_metric + entropy_for_metric
+        )
+        signed_update_unmasked = dppo_extra_metrics["dppo/signed_update_unmasked"]
+        signed_update_kept = dppo_extra_metrics["dppo/signed_update_kept"]
+        entropy_first_order_unmasked = entropy_unit_direction * signed_update_unmasked
+        entropy_first_order_kept = entropy_unit_direction * signed_update_kept
+        dppo_extra_metrics["entropy/first_order_unmasked"] = entropy_first_order_unmasked
+        dppo_extra_metrics["entropy/first_order_kept"] = entropy_first_order_kept
+        dppo_extra_metrics["entropy/first_order_mask_delta"] = entropy_first_order_kept - entropy_first_order_unmasked
+        dppo_extra_metrics["entropy/first_order_upper_clipped"] = (
+            entropy_first_order_unmasked * dppo_extra_metrics["dppo/upper_clip_joint_frac"]
+        )
+        dppo_extra_metrics["entropy/first_order_lower_clipped"] = (
+            entropy_first_order_unmasked * dppo_extra_metrics["dppo/lower_clip_joint_frac"]
+        )
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -1230,8 +1977,9 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"]:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        log_probs_to_compare = log_probs if args.use_rollout_logprobs else old_log_probs
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((log_probs_to_compare - rollout_log_probs).abs())
+        train_rollout_logprob_abs_diff = sum_of_sample_mean_for_dppo_metrics(
+            (log_probs.detach() - rollout_log_probs).abs()
+        )
 
     reported_loss = {
         "loss": loss.clone().detach(),
@@ -1240,10 +1988,13 @@ def policy_loss_function(
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
     }
-    for metric_key, metric_value in policy_loss_metrics.items():
-        if metric_key == "pg_clipfrac":
+    reported_loss.update(entropy_common_probe_stats)
+    for _k, _v in policy_loss_metrics.items():
+        if _k == "pg_clipfrac":
             continue
-        reported_loss[metric_key] = metric_value.clone().detach()
+        reported_loss[_k] = sum_of_sample_mean_for_dppo_metrics(_v).clone().detach()
+    for _k, _v in entropy_group_metrics.items():
+        reported_loss[_k] = sum_of_sample_mean_for_dppo_metrics(_v).clone().detach()
 
     if train_rollout_logprob_abs_diff is not None:
         reported_loss["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff.clone().detach()
@@ -1439,6 +2190,23 @@ def loss_function(
         loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, use_reentrant=False)
     else:
         loss, log = func(args, batch, logits, sum_of_sample_mean)
+
+    # Diagnostic (env-gated): print per-microbatch loss / logits magnitude / mask
+    # sums on the loss-computing stage, to compare the failing full loop against
+    # the passing debug-train-only replay (which reports loss=0.069).
+    if os.environ.get("SLIME_DEBUG_LOSS", "0") == "1":
+        try:
+            _l = loss.detach().float()
+            _lg = logits.detach().float()
+            print(
+                f"[SLIME_DEBUG_LOSS] rank={dist.get_rank() if dist.is_initialized() else -1} "
+                f"loss={_l.item():.6e} finite={bool(torch.isfinite(_l).all().item())} "
+                f"logits_absmax={_lg.abs().amax().item():.3e} num_tokens={int(num_tokens)} "
+                f"mask_sums={[int(m.sum().item()) for m in batch['loss_masks']][:4]}",
+                flush=True,
+            )
+        except Exception as _e:  # never break training from a diagnostic
+            print(f"[SLIME_DEBUG_LOSS] error: {_e}", flush=True)
 
     # With allgather-CP, some CP ranks may have no loss-contributing tokens (e.g., all
     # padding). Without this, gradient doesn't flow through their attention path, so

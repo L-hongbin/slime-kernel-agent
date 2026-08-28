@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_cispo_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_cispo_uses_detached_clipped_importance_weights():
@@ -26,3 +29,7 @@ def test_cispo_uses_detached_clipped_importance_weights():
 
     grad = torch.autograd.grad(output["pg_losses"].sum(), log_probs)[0]
     torch.testing.assert_close(grad, -expected_weight * advantages)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

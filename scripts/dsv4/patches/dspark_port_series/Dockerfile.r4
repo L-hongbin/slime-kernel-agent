@@ -1,0 +1,13 @@
+# Reproducible r4 rollover from the GPU-validated r3 image.  r3 contains
+# patches 0001..0012; add the two post-validation fixes that were previously
+# applied directly to the rollout containers.
+FROM sglang:dspark-r3
+
+COPY 0013-*.patch 0014-*.patch /opt/dspark_port_series_r4/
+RUN cd /sgl-workspace/sglang \
+    && test "$(git rev-parse HEAD)" = "692c5f7d532f129424b57961c262bbd253b411dc" \
+    && for p in /opt/dspark_port_series_r4/00*.patch; do \
+         git apply --check "$p" && git apply "$p" || exit 1; \
+       done \
+    && test "$(git diff --binary | sha256sum | cut -d' ' -f1)" = \
+       "d6261fe413b157ba4f06073a35cdce85e834cc8e5bd4efdb787345e1d091f2be"

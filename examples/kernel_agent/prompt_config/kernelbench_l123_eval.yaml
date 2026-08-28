@@ -1,0 +1,14 @@
+eval:
+  datasets:
+    - name: kb_l1_val
+      path: ${oc.env:EVAL_REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet
+      metadata_overrides:
+        eval_level: 1
+    - name: kb_l2_val
+      path: ${oc.env:EVAL_REPO_ROOT}/Data/kernelbench-level2-validation-tvm-v2/train.parquet
+      metadata_overrides:
+        eval_level: 2
+    - name: kb_l3_val
+      path: ${oc.env:EVAL_REPO_ROOT}/Data/kernelbench-level3-validation-tvm-v2/train.parquet
+      metadata_overrides:
+        eval_level: 3

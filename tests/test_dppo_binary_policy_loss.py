@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_dppo_binary_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_dppo_binary_tv_masks_advantage_direction_updates():
@@ -49,3 +52,7 @@ def test_dppo_binary_kl_masks_only_matching_probability_direction():
     # Both tokens have large binary KL, but their probability movement is opposite
     # to the advantage-specific invalid direction, so neither update is masked.
     torch.testing.assert_close(clipfrac, torch.zeros_like(clipfrac))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

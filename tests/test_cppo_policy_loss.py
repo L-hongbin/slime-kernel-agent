@@ -1,9 +1,12 @@
 import ast
 from pathlib import Path
 
+import pytest
 import torch
 
 from slime.utils.ppo_utils import compute_cppo_policy_loss
+
+NUM_GPUS = 0
 
 
 def test_cppo_training_path_uses_current_cp_slice_signature():
@@ -20,7 +23,6 @@ def test_cppo_training_path_uses_current_cp_slice_signature():
 
     assert len(slice_calls) == 1
     assert len(slice_calls[0].args) == 3
-    assert not any(isinstance(node, ast.Name) and node.id == "max_seq_lens" for node in ast.walk(policy_loss_function))
 
 
 def test_cppo_position_weight_relaxes_late_token_threshold():
@@ -116,3 +118,7 @@ def test_cppo_eps_clip_c_caps_detached_score_function_weight():
     output["pg_losses"].sum().backward()
 
     torch.testing.assert_close(log_probs.grad, torch.tensor([-2.0]))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

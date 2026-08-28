@@ -180,7 +180,58 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
     }
 
 
+def _resolve_output_mismatch_partial_credit(
+    env_state: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[float, bool, str]:
+    """Return the reviewed output-mismatch partial reward and audit reason.
+
+    KernelGym sets ``correctness_output_mismatch`` only after the candidate
+    forward returns, CUDA synchronization completes, and shape/value comparison
+    fails. Compilation is therefore a consistency assertion, not the rewarded
+    event. Runtime failures, timeouts, decoys, and generic compiled-but-wrong
+    results remain zero-reward failures.
+    """
+
+    partial_reward = float(config.get("output_mismatch_partial_reward", 0.0))
+    if partial_reward < 0.0:
+        raise ValueError("output_mismatch_partial_reward must be non-negative")
+    if partial_reward == 0.0:
+        return 0.0, False, "disabled"
+
+    correct_reward_floor = float(config["init_correct_weight"])
+    if partial_reward >= correct_reward_floor:
+        raise ValueError(
+            "output_mismatch_partial_reward must be lower than init_correct_weight "
+            f"({partial_reward} >= {correct_reward_floor})"
+        )
+
+    status = env_state.get("status")
+    if status != "completed":
+        return 0.0, False, "timeout" if status == "timeout" else "env_not_completed"
+    if bool(env_state.get("decoy_kernel", False)):
+        return 0.0, False, "decoy"
+    if bool(env_state.get("correctness", False)):
+        return 0.0, False, "already_correct"
+
+    metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
+    if metadata.get("runtime_error") or metadata.get("correctness_runtime_error"):
+        return 0.0, False, "runtime_error"
+    if not bool(metadata.get("correctness_output_mismatch", False)):
+        if not bool(env_state.get("compiled", False)):
+            return 0.0, False, "not_compiled"
+        if not bool(metadata.get("correctness_candidate_forward_completed", False)):
+            return 0.0, False, "candidate_forward_not_completed"
+        return 0.0, False, "no_output_mismatch"
+
+    if env_state.get("compiled") is not True:
+        raise AssertionError("KernelGym contract violation: correctness_output_mismatch=true requires compiled=true")
+    return partial_reward, True, "applied"
+
+
 def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    partial_reward, partial_applied, partial_reason = _resolve_output_mismatch_partial_credit(env_state, config)
+
     if env_state.get("status") != "completed":
         reward = _resolve_failure_reward(env_state, config)
         return {
@@ -191,6 +242,8 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "success": False,
             "correctness": False,
             "compiled": False,
+            "partial_credit_output_mismatch": partial_applied,
+            "partial_credit_output_mismatch_reason": partial_reason,
         }
 
     if env_state.get("decoy_kernel", False):
@@ -200,6 +253,9 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "reward": reward,
             "score": reward,
             "decoy_kernel": True,
+            "success": False,
+            "partial_credit_output_mismatch": partial_applied,
+            "partial_credit_output_mismatch_reason": partial_reason,
         }
 
     correctness = bool(env_state.get("correctness", False))
@@ -213,11 +269,14 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
 
     if not compiled and config["apply_compilation_fail_penalty"]:
         reward = float(config["compilation_fail_penalty"])
+    elif partial_applied:
+        reward = partial_reward
     else:
-        reward = (
-            float(config["init_correct_weight"]) * float(correctness)
-            + float(config["init_performance_weight"]) * reward_speedup
-        )
+        correctness_reward = float(config["init_correct_weight"]) * float(correctness)
+        performance_reward = float(config["init_performance_weight"]) * reward_speedup
+        if config.get("performance_reward_requires_correctness", False):
+            performance_reward *= float(correctness)
+        reward = correctness_reward + performance_reward
 
     coverage_info = {
         "coverage": 0.0,
@@ -229,7 +288,8 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
     if correctness:
         coverage_info = _compute_coverage(env_state, config)
         if config["coverage_reward_enable"]:
-            reward += float(config["coverage_reward_weight"]) * coverage_info["coverage"]
+            coverage_reward = float(config["coverage_reward_weight"]) * coverage_info["coverage"]
+            reward += coverage_reward
 
     return {
         **env_state,
@@ -240,5 +300,7 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
         "correctness": correctness,
         "compiled": compiled,
         "profiling": env_state.get("profiling"),
+        "partial_credit_output_mismatch": partial_applied,
+        "partial_credit_output_mismatch_reason": partial_reason,
         **coverage_info,
     }

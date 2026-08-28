@@ -1,0 +1,63 @@
+
+\section{Background}  
+\label{sec:background}  
+
+% In this section, we briefly review the standard trust region approach in classical RL paradigm.
+  
+\subsection{Policy Performance Difference}  
+  
+We begin with the standard formulation of a Markov Decision Process (MDP), defined by the tuple $\mathcal{M} = (\mathcal{S}, \mathcal{A}, P, r, \rho_0, \gamma)$, which includes the state space $\mathcal{S}$, action space $\mathcal{A}$, transition dynamics $P(s'|s,a)$, reward function $r(s,a)$, initial state distribution $\rho_0(s)$, and a discount factor $\gamma \in [0,1]$. A stochastic policy $\pi(a | s)$ generates trajectories $\tau = (s_0, a_0, r_0, s_1, a_1, r_1, \ldots)$ by sampling actions $a_t \sim \pi(\cdot | s_t)$ and transitioning to states $s_{t+1} \sim P(\cdot | s_t, a_t)$. The central goal of RL is to find a policy that maximizes the expected discounted return:
+$$  
+\eta(\pi) = \mathbb{E}_{\tau \sim \pi} \Bigg[ \sum_{t=0}^{\infty} \gamma^t r_t \Bigg].  
+$$  
+To facilitate policy optimization, we define the standard value functions under a policy $\pi$: the state-value function $V^\pi(s) = \mathbb{E}_{\tau \sim \pi}\Big[ \sum_{t=0}^{\infty} \gamma^t r_t \big| s_0 = s \Big]$, the action-value function $Q^\pi(s,a) = \mathbb{E}_{\tau \sim \pi}\Big[ \sum_{t=0}^{\infty} \gamma^t r_t \big| s_0 = s, a_0 = a \Big]$, and the advantage function $A^\pi(s,a) = Q^\pi(s,a) - V^\pi(s)$. A key theoretical tool for relating the performance of two distinct policies is the policy performance difference theorem \cite{kakade2002approximately}. It states that for any two policies, a target policy (to be optimized) $\trainerpi$ and a behavior policy (for rollout) $\rolloutpi$, their expected returns are related by:
+\begin{equation}
+\eta(\trainerpi) - \eta(\rolloutpi) = \frac{1}{1-\gamma} \, \mathbb{E}_{s \sim \rho^{\bluepi}, \, a \sim \bluepi(\cdot| s)} \big[ A^{\rolloutpi}(s,a) \big].  
+\label{eq:perf-diff}
+\end{equation}
+Here, $\rho^{\trainerpi}(s) = (1-\gamma) \sum_{t=0}^{\infty} \gamma^t \Pr(s_t = s | \trainerpi)$ is the normalized discounted state-visitation distribution induced by the policy $\trainerpi$. This identity is fundamental, as it implies that any policy update that results in a non-negative expected advantage guarantees monotonic performance improvement, i.e., $\eta(\trainerpi) \ge \eta(\rolloutpi)$.
+
+\subsection{Policy Improvement Bound}  
+
+While Equation \ref{eq:perf-diff} provides a direct expression for policy improvement, its dependence on the state-visitation distribution $\rho^{\trainerpi}$ of the new policy makes it intractable for direct optimization. To overcome this, \citet{schulman2015trust} derive a lower bound on performance improvement that can be estimated using samples from the behavior policy $\rolloutpi$, with a penalty term that measures the divergence between the old and new policies. This lower bound forms the basis of trust-region methods.
+
+\begin{theorem}\label{schulman2015trust}
+	\citep{schulman2015trust, achiam2017constrained} Given any two policies, $\rolloutpi$ and $\trainerpi$, the following bound holds:
+    \begin{equation} 
+    \label{eq:tv-bound}  
+    \begin{split}
+        \!\!\!
+        \eta(\trainerpi) \! - \! \eta(\rolloutpi)  
+        \ge & 
+        \frac{1}{1-\gamma} \mathbb{E}_{s \sim \rho^{\redmu},\, a \sim \redmu(\cdot| s)} \Bigg[\frac{\trainerpi(a| s)}{\rolloutpi(a| s)} A^{\rolloutpi}(s,a)\Bigg] \\ 
+        & - \frac{2 \xi \gamma}{(1-\gamma)^2} {D_{\mathrm{TV}}^{\mathrm{max}}(\rolloutpi \| \trainerpi)}^2,
+    \end{split}
+    \end{equation}
+    where $\xi = \max_{s,a} \Big| A^{\rolloutpi}(s,a) \Big|$ and $D_{\mathrm{TV}}^{\mathrm{max}}(\rolloutpi \| \trainerpi) = \max_s D_{\mathrm{TV}}\big( \rolloutpi(\cdot| s) \|  \trainerpi(\cdot| s) \big)$, which is the maximum Total Variation (TV) divergence among all states.
+\end{theorem}
+
+This bound provides a direct path to guaranteed policy improvement. The right-hand side of the inequality forms a surrogate objective that is a tight lower bound on the true performance improvement, touching the objective when $\trainerpi = \rolloutpi$. Therefore, iteratively maximizing this surrogate guarantees monotonic improvement in $\eta(\trainerpi)$, following the principles of the Minorize-Maximization (MM) algorithm \citep{hunter2004tutorial, schulman2015trust}.  
+
+\subsection{Trust Region Policy Optimization}
+
+The policy improvement bound in \Cref{eq:tv-bound} directly justifies a surrogate objective,
+\begin{equation}  
+\label{eq:surrogate}
+L_{\rolloutpi}(\trainerpi) = \frac{1}{1 - \gamma}  \mathbb{E}_{s \sim \rho^{\rolloutpi},\,a \sim \rolloutpi(a|s)} \left[ \frac{\trainerpi(a| s)}{\rolloutpi(a| s)} A^{\rolloutpi}(s,a) \right].  
+\end{equation}
+This objective serves as a \textbf{first-order approximation} of the true performance improvement $\eta(\trainerpi) - \eta(\rolloutpi)$, as their values and gradients match at the point of expansion $\trainerpi=\rolloutpi$ \citep{kakade2002approximately, schulman2015trust, zheng2025stabilizing}.
+Therefore, maximizing $L_{\rolloutpi}(\trainerpi)$ within a small \textit{trust region} guarantees stable and meaningful policy improvement. This insight motivates the trust-region optimization approach \citep{schulman2015trust, xie2024simple}, which involves maximizing $L_{\rolloutpi}(\trainerpi)$ subject to a constraint that keeps the new policy $\trainerpi$ within a trust region around the current policy $\rolloutpi$, thereby ensuring the validity of the approximation. Formally, this is expressed as the following constrained optimization problem:
+% \begin{equation}   
+% \label{eq:trpo-obj}  
+% \begin{split}
+% \max_{\trainerpi} \quad & L_{\rolloutpi}(\trainerpi) \\  
+% \text{s.t.} \quad & D_{\mathrm{TV}}^{\mathrm{max}}(\rolloutpi \| \trainerpi) \le \delta, 
+% \end{split}
+% \end{equation}
+\begin{equation}   
+\label{eq:trpo-obj}  
+\max_{\trainerpi} \quad L_{\rolloutpi}(\trainerpi), \quad \quad 
+\text{s.t.} \quad D_{\mathrm{TV}}^{\mathrm{max}}(\rolloutpi \| \trainerpi) \le \delta, 
+\end{equation} 
+where the constraint can also be applied on a KL divergence $D_{\mathrm{KL}}$, justified via Pinsker’s inequality:
+$$D_{\mathrm{TV}}(\rolloutpi \| \trainerpi)^2 \le \tfrac{1}{2} D_{\mathrm{KL}}(\rolloutpi \| \trainerpi).$$  

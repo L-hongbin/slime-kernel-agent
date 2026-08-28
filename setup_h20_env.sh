@@ -33,6 +33,18 @@ CUTLASS_DSL_VERSION="4.5.2"
 python3 -m pip install -e . --no-deps --break-system-packages
 python3 -m pip install debugpy --break-system-packages
 
+# Muon (the mandatory V4 optimizer) hard-asserts on this package at actor init
+# ("Emerging Optimizers is not installed" — bit the first node54 formal launch,
+# 2026-07-11: it was pip-installed post-creation on the older containers and
+# never part of the image). Pin the commit the fleet runs. Non-fatal when
+# offline: rsync site-packages/emerging_optimizers{,-*.dist-info} from any
+# working container instead.
+if ! python3 -c "import emerging_optimizers" >/dev/null 2>&1; then
+    python3 -m pip install --break-system-packages --no-deps \
+        "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@9ad154b5962e163c2fba67e5cb9f8d23d11e9165" \
+        || echo "[warn] emerging-optimizers install failed (offline?); rsync it from a working container"
+fi
+
 verify_flashinfer_gdn() {
     python3 - <<'PY'
 import sys

@@ -1,0 +1,132 @@
+"""Unit tests for the DAPO-style soft overlong penalty + filter semantics.
+
+The per-sample cap is min(response cap, context cap - prompt length). Responses
+longer than cap-B lose factor*min(1, exceed/B) training reward. The low-variance
+filter still judges the pre-penalty task reward in metadata["task_reward"].
+"""
+
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO))
+
+NUM_GPUS = 0
+
+
+def _utils():
+    import examples.kernel_agent.utils as utils
+
+    return utils
+
+
+def _args(
+    penalty_on: bool,
+    buffer_len: int = 2048,
+    factor: float = 1.0,
+    response_cap: int = 16384,
+    context_cap: int | None = None,
+    effective_response_cap: bool = False,
+):
+    return SimpleNamespace(
+        rollout_max_response_len=response_cap,
+        rollout_max_context_len=context_cap if context_cap is not None else response_cap,
+        overlong_penalty=penalty_on,
+        overlong_buffer_len=buffer_len,
+        overlong_penalty_factor=factor,
+        overlong_use_effective_response_cap=effective_response_cap,
+    )
+
+
+def _sample(reward, response_length, removed=False, prompt_length=0):
+    return SimpleNamespace(
+        reward=reward,
+        response_length=response_length,
+        tokens=[0] * (prompt_length + response_length),
+        remove_sample=removed,
+        metadata={},
+    )
+
+
+def test_disabled_by_default():
+    sample = _sample(1.0, 16384)
+    _utils()._apply_overlong_penalty(_args(False), [sample])
+    assert sample.reward == 1.0
+    assert "overlong_penalty" not in sample.metadata
+
+
+def test_no_penalty_below_threshold():
+    sample = _sample(1.0, 16384 - 2048)
+    _utils()._apply_overlong_penalty(_args(True), [sample])
+    assert sample.reward == 1.0
+    assert sample.metadata["task_reward"] == 1.0
+    assert sample.metadata["overlong_penalty"] == 0.0
+
+
+def test_linear_ramp_and_cap():
+    half = _sample(1.0, 16384 - 1024)
+    full = _sample(1.0, 16384)
+    over = _sample(0.0, 16384)
+    _utils()._apply_overlong_penalty(_args(True), [half, full, over])
+    assert half.reward == pytest.approx(0.5)
+    assert full.reward == pytest.approx(0.0)
+    assert over.reward == pytest.approx(-1.0)
+    assert half.metadata["overlong_penalty"] == pytest.approx(0.5)
+    assert full.metadata["overlong_penalty"] == pytest.approx(1.0)
+
+
+def test_removed_samples_untouched():
+    sample = _sample(1.0, 16384, removed=True)
+    _utils()._apply_overlong_penalty(_args(True), [sample])
+    assert sample.reward == 1.0
+
+
+def test_custom_factor_and_buffer():
+    sample = _sample(2.0, 16384 - 500)
+    _utils()._apply_overlong_penalty(_args(True, buffer_len=1000, factor=0.5), [sample])
+    assert sample.reward == pytest.approx(1.75)
+
+
+def test_task_reward_recorded_for_filter():
+    fail_short = _sample(0.0, 5000)
+    fail_long = _sample(0.0, 16384)
+    _utils()._apply_overlong_penalty(_args(True), [fail_short, fail_long])
+    assert fail_short.metadata["task_reward"] == 0.0
+    assert fail_short.metadata["overlong_penalty"] == 0.0
+    assert fail_long.metadata["task_reward"] == 0.0
+    assert fail_long.reward == -1.0
+    filter_view = [sample.metadata.get("task_reward", sample.reward) for sample in (fail_short, fail_long)]
+    assert filter_view == [0.0, 0.0]
+
+
+def test_reviewed_24k_policy_uses_effective_response_cap_after_prompt():
+    # With a 4K prompt inside a 24K context, the response can use at most 20K.
+    partial = _sample(0.25, 20480, prompt_length=4096)
+    correct = _sample(0.5, 20480, prompt_length=4096)
+
+    _utils()._apply_overlong_penalty(
+        _args(
+            True,
+            buffer_len=4096,
+            factor=0.2,
+            response_cap=24576,
+            context_cap=24576,
+            effective_response_cap=True,
+        ),
+        [partial, correct],
+    )
+
+    assert partial.reward == pytest.approx(0.05)
+    assert correct.reward == pytest.approx(0.3)
+    assert partial.metadata["overlong_prompt_len"] == 4096
+    assert partial.metadata["overlong_effective_response_cap"] == 20480
+    assert partial.metadata["task_reward"] == pytest.approx(0.25)
+    assert partial.metadata["overlong_penalty"] == pytest.approx(0.2)
+    assert "reward_components" not in partial.metadata
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

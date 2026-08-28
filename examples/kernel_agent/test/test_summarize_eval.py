@@ -5,10 +5,10 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from examples.kernel_agent.summarize_eval import summarize_with_best
+from examples.kernel_agent.eval.summarize_eval import summarize_with_best
 
 
-def _sample(group_id, index, turn_idx, env_extra_info=None, is_pad_turn=False):
+def _sample(group_id, index, turn_idx, env_extra_info=None, is_pad_turn=False, status="completed"):
     metadata = {"turn_idx": turn_idx}
     if is_pad_turn:
         metadata.update({"is_pad_turn": True, "remove_reason": "pad_turn"})
@@ -25,6 +25,7 @@ def _sample(group_id, index, turn_idx, env_extra_info=None, is_pad_turn=False):
     return {
         "group_id": group_id,
         "index": index,
+        "status": status,
         "remove_sample": is_pad_turn,
         "metadata": metadata,
     }
@@ -77,6 +78,20 @@ def test_best_metrics_are_skipped_for_single_turn():
 
     assert res["best_source"] == "skipped_single_turn"
     assert "BestCorrect" not in res
+
+
+def test_truncated_ratio_is_recomputed_from_dumped_sample_status():
+    samples = [
+        _sample(0, 0, 0, status="completed"),
+        _sample(1, 1, 0, status="truncated"),
+        _sample(2, 2, 0, status="aborted"),
+        _sample(3, 3, 0, status="truncated"),
+    ]
+
+    res = summarize_with_best(samples, (1.0,), max_turns=1)
+
+    assert res["truncated_count"] == 2
+    assert res["TruncatedRatio"] == pytest.approx(0.5)
 
 
 def test_best_metrics_are_skipped_without_group_id():

@@ -55,6 +55,12 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
 def init(args):
     set_args(args)
+    # Pin the process-wide CP sequence-partition mode from args before any
+    # data slicing / loss reduction runs (cp_utils reads a module global; see
+    # get_logits_and_tokens_offset_with_cp / slice_with_cp). No-op at cp_size==1.
+    from .cp_utils import set_cp_partition_mode
+
+    set_cp_partition_mode(getattr(args, "cp_partition_mode", "zigzag"))
     if args.enable_experimental:
         logger.info("Enable megatron experimental")
         set_experimental_flag(True)

@@ -1,0 +1,77 @@
+From b4e465b62e3dcc48c9f6cca34a79348aa6b8c322 Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 17:02:24 +0900
+Subject: [PATCH 11/13] port: harden capture-pitch fix per codex review of
+ f6a0104
+
+- ragged/compact verify guard: runner.bs is already token-rows in
+  ragged_verify_mode (_ragged_capture_slots); multiplying by draft width
+  would double-scale the dp slice pitch (mirrors _capture_graph_size's own
+  ragged bypass). Unreachable with LoRA (compact+LoRA raises at init) but
+  live for non-LoRA compact deployments.
+- indexer-capturer call site now passes the same row pitch as
+  routed-experts (base ignores it today; keeps the sites consistent so a
+  future DP-shared indexer buffer doesn't reintroduce the pitch bug).
+- ngram_worker: thread routed_experts_output/indexer_topk_output through
+  its GenerationBatchResult rebuild (same field-drop class as the
+  DSpark/DFlash fix; EAGLE workers already thread them).
+---
+ python/sglang/srt/model_executor/model_runner.py | 15 +++++++++++++--
+ python/sglang/srt/speculative/ngram_worker.py    |  5 +++++
+ 2 files changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index cb1bbc8..d36aad4 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -3035,7 +3035,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             _runner = self.decode_cuda_graph_runner
+             _graph_rows = None
+             if _runner is not None and getattr(_runner, "bs", None) is not None:
+-                _graph_rows = _runner.bs * getattr(_runner, "num_tokens_per_bs", 1)
++                if getattr(_runner, "ragged_verify_mode", False):
++                    # Ragged/compact verify: runner.bs is ALREADY a token-row
++                    # count (_ragged_capture_slots) — multiplying by the draft
++                    # width would double-scale (cf. _capture_graph_size's own
++                    # ragged bypass).
++                    _graph_rows = _runner.bs
++                else:
++                    _graph_rows = _runner.bs * getattr(_runner, "num_tokens_per_bs", 1)
+             output.routed_experts_output = experts_capturer.on_forward_end(
+                 forward_batch=forward_batch,
+                 can_run_graph=output.can_run_graph,
+@@ -3044,10 +3051,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
+             )
+ 
+         if (indexer_capturer := get_global_indexer_capturer()) is not None:
++            # Same row pitch as routed-experts above. The indexer capturer's
++            # base _get_local_slice ignores it today (per-rank-local buffer),
++            # but keep the two call sites consistent so a future DP-shared
++            # indexer buffer doesn't silently reintroduce the pitch bug.
+             output.indexer_topk_output = indexer_capturer.on_forward_end(
+                 forward_batch=forward_batch,
+                 can_run_graph=output.can_run_graph,
+-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
++                cuda_graph_batch=_graph_rows if self.decode_cuda_graph_runner is not None else None,
+                 no_copy_to_cpu=no_copy_to_cpu,
+             )
+ 
+diff --git a/python/sglang/srt/speculative/ngram_worker.py b/python/sglang/srt/speculative/ngram_worker.py
+index 4cbcb7f..1ae3206 100644
+--- a/python/sglang/srt/speculative/ngram_worker.py
++++ b/python/sglang/srt/speculative/ngram_worker.py
+@@ -509,6 +509,11 @@ class NGRAMWorker(BaseSpecWorker):
+         )
+         return GenerationBatchResult(
+             logits_output=logits_output,
++            # Deferred state-capturer outputs from the inner verify forward —
++            # dropping them zeroes the trainer's routing replay (same defect
++            # class as the DSpark/DFlash rebuild, commit f6a0104).
++            routed_experts_output=getattr(batch_result, "routed_experts_output", None),
++            indexer_topk_output=getattr(batch_result, "indexer_topk_output", None),
+             next_token_ids=next_token_ids,
+             can_run_cuda_graph=can_run_cuda_graph,
+             accept_lens=accept_lens,
+-- 
+2.43.0
+

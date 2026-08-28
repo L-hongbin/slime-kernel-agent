@@ -209,6 +209,6 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${MISC_ARGS[@]}"
 
 SUMMARY_PATH="${EVAL_DIR}/summary.${LOG_STAMP}.txt"
-python3 "${SCRIPT_DIR}/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
+python3 "${SCRIPT_DIR}/eval/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
 echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
 echo "summary -> ${SUMMARY_PATH}"

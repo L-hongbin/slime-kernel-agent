@@ -2,7 +2,7 @@
 #
 # Single-node eval-only of a trained kernel-agent checkpoint, FAITHFUL to
 # training: same generate fn (generate_with_cuda_agent.generate), tvm_ffi
-# backend, response_prompt/cuda_kernel prompt. examples/kernel_agent/summarize_eval.py
+# backend, response_prompt/cuda_kernel prompt. examples/kernel_agent/eval/summarize_eval.py
 # turns the dumped env_result.env_state into Compile / Correct / Fast@1.0 /
 # Fast@1.2 (in_all). NOTE: the sibling summarize_kernelgym_eval.py does NOT read
 # this dump schema (it expects metadata.kernelgym); use summarize_eval.py.
@@ -191,6 +191,6 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${MISC_ARGS[@]}"
 
 SUMMARY_PATH="${EVAL_DIR}/summary.${LOG_STAMP}.txt"
-python3 "${REPO_ROOT}/examples/kernel_agent/summarize_eval.py" "${EVAL_DIR}" --max-turns 1 | tee "${SUMMARY_PATH}"
+python3 "${REPO_ROOT}/examples/kernel_agent/eval/summarize_eval.py" "${EVAL_DIR}" --max-turns 1 | tee "${SUMMARY_PATH}"
 echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
 echo "summary -> ${SUMMARY_PATH}"

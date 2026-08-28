@@ -49,6 +49,7 @@ WHITEN_CASES = [(1, 1), (2, 1), (1, 2), (2, 2), (1, 4), (4, 1)]
 
 class _Args:
     advantage_estimator = "grpo"
+    qkv_format = "thd"
     normalize_advantages = True
     kl_coef = 0.0
     use_kl_loss = False

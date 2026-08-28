@@ -1,0 +1,262 @@
+% Bibliography for the predictive divergence mask paper.
+% All entries copied verbatim from the reference papers' .bib files
+% (DPPO/example_paper.bib, DRPO/ref.bib). No invented entries.
+
+% ---------- Trust-region / policy optimization foundations ----------
+@article{ppo,
+  title={Proximal policy optimization algorithms},
+  author={Schulman, John and Wolski, Filip and Dhariwal, Prafulla and Radford, Alec and Klimov, Oleg},
+  journal={arXiv preprint arXiv:1707.06347},
+  year={2017}
+}
+
+@inproceedings{kwon2023efficient,
+  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
+  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
+  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
+  year={2023}
+}
+
+@article{megatron-lm,
+  title={Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism},
+  author={Shoeybi, Mohammad and Patwary, Mostofa and Puri, Raul and LeGresley, Patrick and Casper, Jared and Catanzaro, Bryan},
+  journal={arXiv preprint arXiv:1909.08053},
+  year={2019}
+}
+
+@article{sheng2024hybridflow,
+  title   = {HybridFlow: A Flexible and Efficient RLHF Framework},
+  author  = {Guangming Sheng and Chi Zhang and Zilingfeng Ye and Xibin Wu and Wang Zhang and Ru Zhang and Yanghua Peng and Haibin Lin and Chuan Wu},
+  year    = {2024},
+  journal = {arXiv preprint arXiv: 2409.19256}
+}
+
+@inproceedings{trpo,
+  title={Trust region policy optimization},
+  author={Schulman, John and Levine, Sergey and Abbeel, Pieter and Jordan, Michael and Moritz, Philipp},
+  booktitle={International conference on machine learning},
+  pages={1889--1897},
+  year={2015},
+  organization={PMLR}
+}
+
+@inproceedings{cpo,
+  title={Constrained policy optimization},
+  author={Achiam, Joshua and Held, David and Tamar, Aviv and Abbeel, Pieter},
+  booktitle={International conference on machine learning},
+  pages={22--31},
+  year={2017},
+  organization={PMLR}
+}
+
+@article{wang2019trust,
+  title={Trust region-guided proximal policy optimization},
+  author={Wang, Yuhui and He, Hao and Tan, Xiaoyang and Gan, Yaozhong},
+  journal={Advances in Neural Information Processing Systems},
+  volume={32},
+  year={2019}
+}
+
+@inproceedings{wang2020truly,
+  title={Truly proximal policy optimization},
+  author={Wang, Yuhui and He, Hao and Tan, Xiaoyang},
+  booktitle={Uncertainty in artificial intelligence},
+  pages={113--122},
+  year={2020},
+  organization={PMLR}
+}
+
+@inproceedings{tomar2022mirror,
+  title={Mirror Descent Policy Optimization},
+  author={Manan Tomar and Lior Shani and Yonathan Efroni and Mohammad Ghavamzadeh},
+  booktitle={International Conference on Learning Representations},
+  year={2022},
+  url={https://openreview.net/forum?id=aBO5SvgSt1}
+}
+
+@article{spo,
+  title={Simple policy optimization},
+  author={Xie, Zhengpeng and Zhang, Qiang and Yang, Fan and Hutter, Marco and Xu, Renjing},
+  journal={arXiv preprint arXiv:2401.16025},
+  year={2024}
+}
+
+% ---------- LLM RL: advantage estimators / systems ----------
+@article{grpo,
+  title={Deepseekmath: Pushing the limits of mathematical reasoning in open language models},
+  author={Shao, Zhihong and Wang, Peiyi and Zhu, Qihao and Xu, Runxin and Song, Junxiao and Bi, Xiao and Zhang, Haowei and Zhang, Mingchuan and Li, YK and Wu, Y and others},
+  journal={arXiv preprint arXiv:2402.03300},
+  year={2024}
+}
+
+@article{guo2025deepseekr1,
+  title={Deepseek-r1: Incentivizing reasoning capability in llms via reinforcement learning},
+  author={Guo, Daya and Yang, Dejian and Zhang, Haowei and Song, Junxiao and Zhang, Ruoyu and Xu, Runxin and Zhu, Qihao and Ma, Shirong and Wang, Peiyi and Bi, Xiao and others},
+  journal={arXiv preprint arXiv:2501.12948},
+  year={2025}
+}
+
+@article{ahmadian2024back,
+  title={Back to basics: Revisiting reinforce style optimization for learning from human feedback in llms},
+  author={Ahmadian, Arash and Cremer, Chris and Gall{\'e}, Matthias and Fadaee, Marzieh and Kreutzer, Julia and Pietquin, Olivier and {\"U}st{\"u}n, Ahmet and Hooker, Sara},
+  journal={arXiv preprint arXiv:2402.14740},
+  year={2024}
+}
+
+@article{drgrpo,
+  title={Understanding r1-zero-like training: A critical perspective},
+  author={Liu, Zichen and Chen, Changyu and Li, Wenjun and Qi, Penghui and Pang, Tianyu and Du, Chao and Lee, Wee Sun and Lin, Min},
+  journal={arXiv preprint arXiv:2503.20783},
+  year={2025}
+}
+
+@article{yang2025qwen3,
+  title={Qwen3 technical report},
+  author={Yang, An and Li, Anfeng and Yang, Baosong and Zhang, Beichen and Hui, Binyuan and Zheng, Bo and Yu, Bowen and Gao, Chang and Huang, Chengen and Lv, Chenxu and others},
+  journal={arXiv preprint arXiv:2505.09388},
+  year={2025}
+}
+
+@article{yu2025dapo,
+  title={Dapo: An open-source llm reinforcement learning system at scale},
+  author={Yu, Qiying and Zhang, Zheng and Zhu, Ruofei and Yuan, Yufeng and Zuo, Xiaochen and Yue, Yu and Dai, Weinan and Fan, Tiantian and Liu, Gaohong and Liu, Lingjun and others},
+  journal={arXiv preprint arXiv:2503.14476},
+  year={2025}
+}
+
+@article{cispo,
+  title={MiniMax-M1: Scaling Test-Time Compute Efficiently with Lightning Attention},
+  author={Chen, Aili and Li, Aonian and Gong, Bangwei and Jiang, Binyang and Fei, Bo and Yang, Bo and Shan, Boji and Yu, Changqing and Wang, Chao and Zhu, Cheng and others},
+  journal={arXiv preprint arXiv:2506.13585},
+  year={2025}
+}
+
+@article{zheng2025stabilizing,
+  title={Stabilizing Reinforcement Learning with LLMs: Formulation and Practices},
+  author={Zheng, Chujie and Dang, Kai and Yu, Bowen and Li, Mingze and Jiang, Huiqiang and Lin, Junrong and Liu, Yuqiong and Lin, Hao and Wu, Chencan and Hu, Feng and others},
+  journal={arXiv preprint arXiv:2512.01374},
+  year={2025}
+}
+
+@article{team2025kimi,
+  title={Kimi k1.5: Scaling reinforcement learning with llms},
+  author={Team, Kimi and Du, Angang and Gao, Bofei and Xing, Bowei and Jiang, Changjiu and Chen, Cheng and Li, Cheng and Xiao, Chenjun and Du, Chenzhuang and Liao, Chonghua and others},
+  journal={arXiv preprint arXiv:2501.12599},
+  year={2025}
+}
+
+@article{yao2026rethinking,
+  title={Rethinking the Divergence Regularization in LLM RL},
+  author={Yao, Jiarui and Zhou, Xiangxin and Qi, Penghui and Lee, Wee Sun and Bo, Liefeng and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2606.09821},
+  year={2026}
+}
+
+@article{r2vpo,
+  title={Ratio-Variance Regularized Policy Optimization for Efficient LLM Fine-tuning},
+  author={Luo, Yu and Han, Shuo and Hu, Yihan and Li, Dong and Hao, Jianye},
+  journal={arXiv preprint arXiv:2601.03320},
+  year={2026}
+}
+
+% ---------- RLHF / preference optimization ----------
+@article{ouyang2022training,
+  title={Training language models to follow instructions with human feedback},
+  author={Ouyang, Long and Wu, Jeffrey and Jiang, Xu and Almeida, Diogo and Wainwright, Carroll and Mishkin, Pamela and Zhang, Chong and Agarwal, Sandhini and Slama, Katarina and Ray, Alex and others},
+  journal={Advances in neural information processing systems},
+  volume={35},
+  pages={27730--27744},
+  year={2022}
+}
+
+@article{rafailov2023direct,
+  title={Direct preference optimization: Your language model is secretly a reward model},
+  author={Rafailov, Rafael and Sharma, Archit and Mitchell, Eric and Manning, Christopher D and Ermon, Stefano and Finn, Chelsea},
+  journal={Advances in neural information processing systems},
+  volume={36},
+  pages={53728--53741},
+  year={2023}
+}
+
+% ---------- Training--inference mismatch / off-policy in LLM RL ----------
+@article{qi2025defeating,
+  title={Defeating the training-inference mismatch via fp16},
+  author={Qi, Penghui and Liu, Zichen and Zhou, Xiangxin and Pang, Tianyu and Du, Chao and Lee, Wee Sun and Lin, Min},
+  journal={arXiv preprint arXiv:2510.26788},
+  year={2025}
+}
+
+@misc{yao2025offpolicy,
+  title={Your Efficient RL Framework Secretly Brings You Off-Policy RL Training},
+  note={https://fengyao.notion.site/off-policy-rl},
+  author={Yao, Feng and Liu, Liyuan and Zhang, Dinghuai and Dong, Chengyu and Shang, Jingbo and Gao, Jianfeng},
+  journal={Feng Yao's Notion},
+  year={2025},
+  month=aug,
+}
+
+@article{wang2025beyond,
+  title={Beyond the 80/20 rule: High-entropy minority tokens drive effective reinforcement learning for llm reasoning},
+  author={Wang, Shenzhi and Yu, Le and Gao, Chang and Zheng, Chujie and Liu, Shixuan and Lu, Rui and Dang, Kai and Chen, Xionghui and Yang, Jianxin and Zhang, Zhenru and others},
+  journal={arXiv preprint arXiv:2506.01939},
+  year={2025}
+}
+
+@misc{liu-li-2025,
+  title = {When Speed Kills Stability: Demystifying RL Collapse from the Inference-Training Mismatch},
+  note =  {https://yingru.notion.site/When-Speed-Kills-Stability-Demystifying-RL-Collapse-from-the-Inference-Training-Mismatch-271211a558b7808d8b12d403fd15edda},
+  author = {Jiacai Liu and Yingru Li and Yuqian Fu and Jiawei Wang and Qian Liu and Yu Shen},
+  year = {2025},
+}
+
+@article{Team2025EveryAM,
+  title = {Every Attention Matters: An Efficient Hybrid Architecture for Long-Context Reasoning},
+  author = {Ling Team and Han, Bin and Tang, Caizhi and Liang, Chen and Zhang, Donghao and Yuan, Fan and Zhu, Feng and Gao, Jie and Hu, Jingyu and Li, Longfei and Li, Meng and Zhang, Mingyang and Jiang, Peijie and Jiao, Peng and Zhao, Qian and Yang, Qingyuan and Shen, Wenbo and Yang, Xinxing and Zhang, Yalin and Ren, Yankun and Zhao, Yao and Cao, Yibo and Sun, Yixuan and Zhang, Yue and Fang, Yuchen and Lin, Zibin and Cheng, Zixuan and Zhou, Jun},
+  journal = {arXiv preprint arXiv:2510.19338},
+  year = {2025},
+}
+
+@article{he2025nondeterminism,
+  author = {Horace He},
+  title = {Defeating Nondeterminism in LLM Inference},
+  journal = {Thinking Machines Lab: Connectionism},
+  year = {2025},
+  note = {https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/},
+  doi = {10.64434/tml.20250910}
+}
+
+@article{team2025every,
+  title={Every step evolves: Scaling reinforcement learning for trillion-scale thinking model},
+  author={Team, Ling and Shen, Anqi and Li, Baihui and Hu, Bin and Jing, Bin and Chen, Cai and Huang, Chao and Zhang, Chao and Yang, Chaokun and Lin, Cheng and others},
+  journal={arXiv preprint arXiv:2510.18855},
+  year={2025}
+}
+
+% ---------- Immediate predecessor: DPPO ----------
+@article{dppo,
+  title={Rethinking the Trust Region in LLM Reinforcement Learning},
+  author={Qi, Penghui and Zhou, Xiangxin and Liu, Zichen and Pang, Tianyu and Du, Chao and Lin, Min and Lee, Wee Sun},
+  journal={arXiv preprint arXiv:2602.04879},
+  year={2026}
+}
+
+@article{mao2026beyond,
+  title={Beyond Uniform Token-Level Trust Region in LLM Reinforcement Learning},
+  author={Mao, Renjie and Zhou, Xiangxin and Tao, Lvfang and Ding, Yixin and Shi, Yu and Lin, Yongguang and Wu, Yuheng and Zhu, Honglin and Qiu, Qian and Zhu, Wenxi},
+  journal={arXiv preprint arXiv:2606.10968},
+  year={2026}
+}
+
+@article{zhou2025reinforcing,
+  title={Reinforcing general reasoning without verifiers},
+  author={Zhou, Xiangxin and Liu, Zichen and Sims, Anya and Wang, Haonan and Pang, Tianyu and Li, Chongxuan and Wang, Liang and Lin, Min and Du, Chao},
+  journal={arXiv preprint arXiv:2505.21493},
+  year={2025}
+}
+
+@article{zhou2025variational,
+  title={Variational Reasoning for Language Models},
+  author={Zhou, Xiangxin and Liu, Zichen and Wang, Haonan and Du, Chao and Lin, Min and Li, Chongxuan and Wang, Liang and Pang, Tianyu},
+  journal={arXiv preprint arXiv:2509.22637},
+  year={2025}
+}

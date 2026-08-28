@@ -1,0 +1,47 @@
+From 88a7b24f74571b9757abf22b2f351f4871c213c4 Mon Sep 17 00:00:00 2001
+From: chenshuailin <chen.shuailin@intellif.com>
+Date: Fri, 17 Jul 2026 09:22:54 +0900
+Subject: [PATCH 05/13] port: capturer verify-width bound (re-port from fork
+ lora_serve_and_capturer.patch)
+
+state_capturer/routed_experts.py: scale the RoutedExpertsCapturer device/gather
+buffer bound (max_batch_size) by max_speculative_num_draft_tokens. Closes the
+upstream "# FIXME: spec decoding's num_verify_tokens is still not accounted for":
+a DSPARK/DFLASH target-verify forward emits bs*num_draft_tokens request-major
+rows, which overflow both the device_cache (BaseDeviceCache(max_batch_size,...))
+and the DeepEP gather_buffer (device_cache.buffer.shape[0]*attn_tp_size) without
+this scaling. `or 1` keeps the non-spec bound identical (env-off byte-identical).
+
+Only the __init__ verify-width hunk is ported here (task b). The capture()
+attn_tp==1 write-through hunk from the fork is a decode-path collective
+optimization, out of scope, and left unported.
+---
+ python/sglang/srt/state_capturer/routed_experts.py | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/python/sglang/srt/state_capturer/routed_experts.py b/python/sglang/srt/state_capturer/routed_experts.py
+index 982cd4a..3d9aafe 100644
+--- a/python/sglang/srt/state_capturer/routed_experts.py
++++ b/python/sglang/srt/state_capturer/routed_experts.py
+@@ -63,10 +63,16 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
+         # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+         # and otherwise overflows on dp_rank > 0 when max_running_requests >
+         # chunked_prefill_size.
+-        # FIXME: spec decoding's num_verify_tokens is still not accounted for.
++        # Spec decoding: a target-verify forward routes bs * num_draft_tokens rows
++        # (request-major blocks), so the decode-side bound must scale by the max
++        # draft width (adaptive spec exposes it via max_speculative_num_draft_tokens).
++        # This closes the upstream FIXME: DSPARK verify emits bs*num_draft_tokens
++        # rows, which would overflow the device_cache / gather buffers (both sized
++        # from max_batch_size) without this scaling.
++        verify_tokens = server_args.max_speculative_num_draft_tokens or 1
+         max_batch_size = max(
+             server_args.chunked_prefill_size * server_args.dp_size,
+-            max_running_requests * server_args.dp_size,
++            max_running_requests * verify_tokens * server_args.dp_size,
+         )
+ 
+         super().__init__(
+-- 
+2.43.0
+
