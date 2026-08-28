@@ -13,6 +13,10 @@
 3. Do not keep compatibility shims unless an active caller requires them
 4. Keep implementations simple and remove redundant validation or defensive branches that do not protect a demonstrated contract
 
+## Tests and launchers
+
+1. Do not commit unit tests that assert launcher parameters, launcher-specific defaults, or assembled launcher command lines. Cover the underlying argument validation and runtime safety contracts in Python tests; validate launchers with syntax checks and manual dry runs.
+
 ## Simplicity and canonical ownership
 
 1. Each workflow, document, and evidence set has exactly one canonical owner; extend it instead of creating parallel versions, and store details once — other places keep only the conclusion plus a link
