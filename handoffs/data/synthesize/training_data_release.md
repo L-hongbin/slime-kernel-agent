@@ -394,6 +394,105 @@ python -m tools.data.synthesize.review_only.build_combined_training_release_dedu
 
 这份合并产物完成了两部分之间及各自 selected pool 内部的一轮统一去重。进入训练前仍需核定 source/license、对后续加入的数据重复执行相同口径、完成 KernelGym 环境抽检与 token-budget ablation，并获得显式训练批准 -->
 
+# 数据字段与按来源筛选
+
+正式训练数据为 `Data/prompt_tvm_v4/release/train.parquet`，逐行来源记录为同目录的 `manifest.jsonl`。两者行数相同，manifest 的 `output_position` 与 parquet 的零基行号一一对应。parquet 保存训练实际读取的内容，manifest 保存发版来源、去重后的 identity 和审计信息；需要按数据来源拆分时，应以 manifest 为准。
+
+## `train.parquet` 字段
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `data_source` | string | 样本原始来源标签，例如 DrKernel 系数据使用 `cuda_llm`，高复杂度数据当前使用 `project_generated_open_csp_dag_canary_v4`。这是样本内部标签，不等同于 manifest 的发版分组 `source_dataset` |
+| `prompt` | list of `{role, content}` | 实际送入模型的对话 prompt；当前任务的题面和输出格式约束位于 `content` |
+| `ability` | string | 任务能力标签；本发版为 `kernel_optimization` |
+| `reward_model.ground_truth` | string | 作为正确性与性能基准的 PyTorch `Model`、`get_inputs()` 和 `get_init_inputs()` 源码 |
+| `reward_model.style` | string | reward 解释方式；本发版为 `rule` |
+| `extra_info.entry_point` / `module_name` | string | 被替换和执行的模型入口；通常为 `Model` |
+| `extra_info.uuid` | string | 样本唯一标识；与 manifest 的 `uuid` 对齐 |
+| `extra_info.ops` | JSON string | 上游记录的算子列表。两类数据的提取范围不同，不适合直接跨来源统计；统一算子集合应使用 manifest 的 `unified_forward_operator_set` |
+| `extra_info.original_prompt` | list of `{role, content}` | 进入 v4 prompt contract 前的上游题面，主要用于追溯，不是训练时实际读取的 `prompt` |
+| `extra_info.repo_name` / `type` / `level` | string | 上游仓库、生成类型和内部层级标签；`level` 不是经过校准的统一难度标签 |
+| `extra_info.v4` | struct | v4 清洗、运行验证、来源、许可证、parent identity、reference/AST hash 和原训练集 operator profile 等元数据；不适用于某一来源的子字段会是 null |
+| `extra_info.augmentation` | struct or null | 当前行记录的末端 random-value、dtype 或 layout intervention 及 parent/child hash、目标值和验证状态。该字段为 null 不足以证明样本未经扩增，例如 shape-only 和部分其他来源需要结合上游 lineage 判断 |
+
+`extra_info.v4.operator_count` / `operator_bucket` 只在原训练集部分完整存在，高复杂度部分为 null；`extra_info.level`、UUID 前缀以及 `extra_info.ops` 也都不是统一难度 contract。因此不要用这些字段代替来源筛选，或据此给全量数据做未经校准的难度阈值切分。
+
+## `manifest.jsonl` 字段
+
+| 字段 | 含义 |
+| --- | --- |
+| `output_position` | 对应 `train.parquet` 的零基行号 |
+| `source_dataset` | 本次合并使用的权威来源分组：`original_training` 或 `high_complexity` |
+| `source_row_index` / `source_parquet_path` | 该行在合并前来源 parquet 中的位置和路径 |
+| `source_parquet_sha256` / `source_manifest_sha256` / `source_manifest_row_sha256` | 对来源产物和具体 manifest 行的内容绑定 |
+| `uuid` / `reference_sha256` / `normalized_ast_sha256` | 样本、reference 源码和归一化 AST 的 identity；均与 parquet 内容核验过 |
+| `unified_forward_operator_set` | 从有效 `Model.forward` 统一重提的 input-dependent compute operator set，适合跨两类来源比较；它是去重用的唯一算子集合，不是算子调用次数 |
+| `selection_policy` / `release_status` / `training_approved` | 发版选择策略和准入状态；当前正式版本仍为 `training_approved=false` |
+
+## 剔除高复杂度算子合成数据
+
+最终 parquet 中保留了 4,861 道高复杂度题；本章前面提到的 4,946 是内部去重前数量。如果暂时不训练这批题，应删除 manifest 中 `source_dataset == "high_complexity"` 对应的行，结果为 34,775 道原训练集题。下面的脚本同时生成对齐的派生 parquet 和 manifest，并保留原发版行号便于追溯：
+
+```python
+import json
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
+
+release_dir = Path("Data/prompt_tvm_v4/release")
+output_dir = Path("local_artifacts/data/prompt_tvm_v4_without_high_complexity")
+output_dir.mkdir(parents=True, exist_ok=False)
+
+table = pq.read_table(release_dir / "train.parquet")
+records = [
+    json.loads(line)
+    for line in (release_dir / "manifest.jsonl").read_text(encoding="utf-8").splitlines()
+    if line.strip()
+]
+
+# 先验证 manifest 与 parquet 的逐行绑定，防止错位过滤。
+assert len(records) == table.num_rows == 39_636
+assert [record["output_position"] for record in records] == list(range(table.num_rows))
+parquet_uuids = pc.struct_field(table["extra_info"], "uuid").to_pylist()
+assert all(record["uuid"] == parquet_uuids[i] for i, record in enumerate(records))
+
+kept = [
+    (old_position, record)
+    for old_position, record in enumerate(records)
+    if record["source_dataset"] != "high_complexity"
+]
+filtered = table.take(pa.array([position for position, _ in kept], type=pa.int64()))
+assert filtered.num_rows == len(kept) == 34_775
+
+# 标明这是正式 release 的派生子集，不覆盖原始发版文件。
+metadata = dict(filtered.schema.metadata or {})
+metadata[b"derived.parent_release"] = b"Data/prompt_tvm_v4/release"
+metadata[b"derived.filter"] = b"source_dataset != high_complexity"
+metadata[b"release.status"] = b"derived_subset"
+filtered = filtered.replace_schema_metadata(metadata)
+pq.write_table(filtered, output_dir / "train.parquet", compression="zstd")
+
+derived_records = []
+for new_position, (old_position, record) in enumerate(kept):
+    derived = dict(record)
+    derived["parent_release_output_position"] = old_position
+    derived["output_position"] = new_position
+    derived["derived_filter"] = "source_dataset != high_complexity"
+    derived_records.append(derived)
+
+(output_dir / "manifest.jsonl").write_text(
+    "".join(
+        json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        for record in derived_records
+    ),
+    encoding="utf-8",
+)
+```
+
+当前所有高复杂度行的 parquet `data_source` 也恰好都是 `project_generated_open_csp_dag_canary_v4`，但这是实现细节；使用 manifest 的 `source_dataset` 可以直接表达“剔除整个高复杂度合成来源”，不会依赖 UUID 命名或内部标签。如果目标不是剔除整批来源，而是只移除其中最难的一部分，则需要先定义并人工校准新的逐题难度指标；本发版没有可直接当作真实难度分数的字段。
+
 # 发版目录与可复验中间产物
 
 `Data/prompt_tvm_v4/` 是这一版数据的稳定入口，正式训练数据和可复验中间产物分开存放：
