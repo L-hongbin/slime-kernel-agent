@@ -44,9 +44,17 @@ METADATA_POP_KEYS = (
     "correctness_reference_cache_poison_enabled",
     "correctness_reference_alias_clone_trials",
     "correctness_tolerance_source",
+    "correctness_inputs_generated_on_gpu",
+    "correctness_requested_trials",
+    "correctness_effective_trials",
+    "correctness_input_perturbation_trials",
+    "correctness_reference_skipped_perturbations",
+    "correctness_candidate_forward_completed",
+    "correctness_candidate_forward_completed_trials",
     "correctness_current_trial",
     "correctness_current_substage",
     "correctness_early_stopped",
+    "correctness_issue",
     "correctness_issue_name",
     "kernel_task_id",
     "coverage_backend",
@@ -190,6 +198,62 @@ def _normalize_ncu_metadata(ncu_metadata: Any) -> Any:
     return normalized_ncu
 
 
+def _runtime_sanitizer_has_structured_issues(runtime_sanitizer: Any) -> bool:
+    if not isinstance(runtime_sanitizer, dict) or runtime_sanitizer.get("status") != "issues_found":
+        return False
+
+    check_results = runtime_sanitizer.get("check_results")
+    if not isinstance(check_results, list):
+        return False
+    return any(
+        isinstance(check_result, dict)
+        and isinstance(check_result.get("issues"), list)
+        and any(isinstance(issue, dict) for issue in check_result["issues"])
+        for check_result in check_results
+    )
+
+
+def _normalize_runtime_sanitizer(runtime_sanitizer: Any) -> Any:
+    if not isinstance(runtime_sanitizer, dict):
+        return runtime_sanitizer
+
+    normalized = {
+        key: runtime_sanitizer[key]
+        for key in ("status", "measurement_complete", "primary_check", "check_results", "error")
+        if key in runtime_sanitizer
+    }
+
+    check_results = normalized.get("check_results")
+    if not isinstance(check_results, list):
+        return normalized
+    normalized_check_results = []
+    for check_result in check_results:
+        if not isinstance(check_result, dict):
+            normalized_check_results.append(check_result)
+            continue
+        compact_check = {
+            key: check_result[key]
+            for key in ("check", "status", "detected_issue_count", "issues", "error")
+            if key in check_result
+        }
+        if check_result.get("issues_truncated") is True:
+            compact_check["issues_truncated"] = True
+        issues = compact_check.get("issues")
+        if isinstance(issues, list):
+            compact_issues = []
+            for issue in issues:
+                compact_issue = dict(issue) if isinstance(issue, dict) else issue
+                if isinstance(compact_issue, dict) and compact_issue.get("message"):
+                    compact_issue.pop("raw_excerpt", None)
+                if isinstance(compact_issue, dict):
+                    compact_issue.pop("representative_occurrences", None)
+                compact_issues.append(compact_issue)
+            compact_check["issues"] = compact_issues
+        normalized_check_results.append(compact_check)
+    normalized["check_results"] = normalized_check_results
+    return normalized
+
+
 def _compact_aten_ops(operators: Any) -> Any:
     if not isinstance(operators, list):
         return operators
@@ -240,6 +304,13 @@ def _extract_detail_env_time(env_state: dict[str, Any]) -> dict[str, float]:
     ncu_wall_time = _as_float_or_none(ncu_metadata.get("wall_time_s")) if isinstance(ncu_metadata, dict) else None
     if ncu_wall_time is not None and ncu_wall_time > 0.0:
         detail_env_time["ncu_profile_time_s"] = round(ncu_wall_time, 4)
+
+    runtime_sanitizer = env_state.get("runtime_sanitizer")
+    sanitizer_wall_time = (
+        _as_float_or_none(runtime_sanitizer.get("wall_time_s")) if isinstance(runtime_sanitizer, dict) else None
+    )
+    if sanitizer_wall_time is not None and sanitizer_wall_time > 0.0:
+        detail_env_time["runtime_sanitizer_time_s"] = round(sanitizer_wall_time, 4)
 
     reference_warmup_time = _as_float_or_none(metadata.get("kg_reference_perf_warmup_s"))
     reference_measure_time = _as_float_or_none(metadata.get("kg_reference_perf_measure_wall_s"))
@@ -306,6 +377,7 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     runtime_error = metadata.get("runtime_error")
     metadata_error = metadata.get("error")
+    sanitizer_has_structured_issues = _runtime_sanitizer_has_structured_issues(env_state.get("runtime_sanitizer"))
     correctness_issue = metadata.get("correctness_issue")
     error_message = env_state.get("error_message") or env_state.get("error")
     env_precheck_error_message = _extract_env_precheck_error_message(env_state)
@@ -363,8 +435,9 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     elif env_state.get("error_code") == CORRECTNESS_ERROR:
         correctness_error_message = str(error_message or "Kernel produced incorrect results")
         if correctness_issue not in (None, ""):
-            correctness_detail = f"correctness error ：{correctness_issue}"
-            if correctness_detail not in correctness_error_message:
+            correctness_issue = str(correctness_issue)
+            correctness_detail = f"correctness error: {correctness_issue}"
+            if correctness_issue not in correctness_error_message:
                 correctness_error_message = f"{correctness_error_message}\n{correctness_detail}"
         env_state.update(
             {
@@ -382,7 +455,7 @@ def _normalize_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
             }
         )
 
-    if runtime_error:
+    if runtime_error and not sanitizer_has_structured_issues:
         runtime_error = str(runtime_error)
         current_error_message = str(env_state.get("error_message") or "")
         if runtime_error == current_error_message:
@@ -407,6 +480,8 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     env_state = dict(env_state or {})
     for key in ("submitted_at", "completed_at", "error_code"):
         env_state.pop(key, None)
+    if "runtime_sanitizer" in env_state:
+        env_state["runtime_sanitizer"] = _normalize_runtime_sanitizer(env_state["runtime_sanitizer"])
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
@@ -421,9 +496,9 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
         for key in METADATA_POP_KEYS:
             metadata.pop(key, None)
         for key in list(metadata):
-            if key.startswith(("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_")) or (
-                key.startswith("correctness_") and key.endswith("_trial_s")
-            ):
+            if key.startswith(
+                ("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_", "runtime_sanitizer_")
+            ) or (key.startswith("correctness_") and key.endswith("_trial_s")):
                 metadata.pop(key, None)
             elif key.startswith("kg_kernel_") and key != "kg_kernel_total_s":
                 metadata.pop(key, None)

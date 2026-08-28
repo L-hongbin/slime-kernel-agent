@@ -517,6 +517,12 @@ async def cuda_kernel_env(
             "verbose_errors": _kernel_eval_config_value(args, env_config, "verbose_errors", True),
             "enable_profiling": _kernel_eval_config_value(args, env_config, "enable_profiling", True),
             "enable_ncu": bool(env_config.get("enable_ncu", False)),
+            "enable_compute_sanitizer": bool(env_config.get("enable_compute_sanitizer", False)),
+            "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
+            "enable_correctness_input_perturbations": bool(
+                env_config.get("enable_correctness_input_perturbations", False)
+            ),
+            "memory_ratio_threshold": env_config.get("memory_ratio_threshold", 1.8),
             "detect_decoy_kernel": _kernel_eval_config_value(args, env_config, "detect_decoy_kernel", True),
         }
         use_reference_cache = _kernel_eval_config_value(args, env_config, "use_reference_cache", False)
@@ -895,7 +901,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         messages.append(
             {
                 "role": "assistant",
-                "content": _sanitize_assistant_history_content(response),
+                "content": response,
             }
         )
 

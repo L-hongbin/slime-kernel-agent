@@ -9,6 +9,7 @@ from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent import utils as kernel_agent_utils
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.utils import (
+    CORRECTNESS_ERROR,
     PRECHECK_ERROR,
     extract_cuda_agent_kernel_code,
     normalize_env_feedback,
@@ -394,6 +395,10 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_ncu", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_compute_sanitizer", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "compute_sanitizer_mode", "full")
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_correctness_input_perturbations", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "memory_ratio_threshold", 2.25)
 
     captured_payload = {}
 
@@ -446,6 +451,10 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     assert captured_payload["kernel_code"] == extract_cuda_agent_kernel_code(VALID_CUDA_AGENT_RESPONSE)
     assert captured_payload["backend"] == "cuda"
     assert captured_payload["enable_ncu"] is False
+    assert captured_payload["enable_compute_sanitizer"] is True
+    assert captured_payload["compute_sanitizer_mode"] == "full"
+    assert captured_payload["enable_correctness_input_perturbations"] is True
+    assert captured_payload["memory_ratio_threshold"] == pytest.approx(2.25)
     assert "turn_idx" not in captured_payload
     assert "response" not in captured_payload
     assert "ground_truth" not in captured_payload
@@ -853,6 +862,117 @@ def test_normalize_env_feedback_extra_info_defaults_missing_decoy_kernel():
     )
 
     assert env_extra_info["decoy_kernel"] is False
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall_time():
+    raw_env_state = {
+        "status": "failed",
+        "compiled": True,
+        "correctness": False,
+        "speedup": 0.0,
+        "error_code": "RUNTIME_ERROR",
+        "error_message": "Runtime Sanitizer detected an unsafe CUDA kernel",
+        "metadata": {
+            "runtime_error": "Traceback: original correctness failure",
+            "runtime_sanitizer_status": "issues_found",
+            "runtime_sanitizer_issue_count": 1,
+        },
+        "runtime_sanitizer": {
+            "status": "issues_found",
+            "measurement_complete": True,
+            "primary_check": "memcheck",
+            "wall_time_s": 3.45678,
+            "replayed_input_seed": 123456,
+            "run_all_checks": False,
+            "check_results": [
+                {
+                    "check": "memcheck",
+                    "status": "issues_found",
+                    "detected_issue_count": 1,
+                    "raw_output_tail": "duplicated output",
+                    "issues": [
+                        {
+                            "hazard_type": "invalid_global_write",
+                            "message": "Invalid __global__ write of size 4 bytes",
+                            "raw_excerpt": "duplicated issue output",
+                            "representative_occurrences": [{"thread": {"x": 232}}],
+                        }
+                    ],
+                }
+            ],
+        },
+    }
+
+    normalized, env_extra_info = normalize_env_feedback(raw_env_state)
+
+    sanitizer = normalized["runtime_sanitizer"]
+    assert set(sanitizer) == {"status", "measurement_complete", "primary_check", "check_results"}
+    assert set(sanitizer["check_results"][0]) == {"check", "status", "detected_issue_count", "issues"}
+    assert "raw_excerpt" not in sanitizer["check_results"][0]["issues"][0]
+    assert "representative_occurrences" not in sanitizer["check_results"][0]["issues"][0]
+    assert normalized["error_message"] == "Runtime Sanitizer detected an unsafe CUDA kernel"
+    assert "runtime_sanitizer_status" not in normalized["metadata"]
+    assert "runtime_sanitizer_issue_count" not in normalized["metadata"]
+    assert env_extra_info["detail_env_time"]["runtime_sanitizer_time_s"] == pytest.approx(3.4568)
+    assert raw_env_state["runtime_sanitizer"]["replayed_input_seed"] == 123456
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_keeps_runtime_error_without_structured_sanitizer_issue():
+    runtime_error = "Traceback: original correctness failure"
+    normalized, _ = normalize_env_feedback(
+        {
+            "status": "failed",
+            "compiled": True,
+            "correctness": False,
+            "speedup": 0.0,
+            "error_code": "RUNTIME_ERROR",
+            "error_message": "Kernel execution failed",
+            "metadata": {"runtime_error": runtime_error},
+            "runtime_sanitizer": {"status": "skipped", "reason": "disabled", "check_results": []},
+        }
+    )
+
+    assert runtime_error in normalized["error_message"]
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_deduplicates_issue_and_strips_correctness_progress():
+    correctness_issue = (
+        "Numerical output mismatch under input perturbation scale_up: " "max_difference=11.4672, avg_difference=1.5962"
+    )
+    progress_fields = {
+        "correctness_inputs_generated_on_gpu": True,
+        "correctness_requested_trials": 5,
+        "correctness_effective_trials": 5,
+        "correctness_input_perturbation_trials": [{"trial": 1, "name": "scale_up"}],
+        "correctness_reference_skipped_perturbations": [],
+        "correctness_candidate_forward_completed": True,
+        "correctness_candidate_forward_completed_trials": [0, 1, 2, 3, 4],
+    }
+    raw_error_message = f"Kernel produced incorrect results: {correctness_issue}"
+    raw_env_state = {
+        "status": "completed",
+        "compiled": True,
+        "correctness": False,
+        "speedup": 0.0,
+        "error_code": CORRECTNESS_ERROR,
+        "error_message": raw_error_message,
+        "metadata": {
+            **progress_fields,
+            "correctness_issue": correctness_issue,
+            "correctness_trials": "(5 / 5)",
+        },
+    }
+
+    normalized, _ = normalize_env_feedback(raw_env_state)
+
+    assert normalized["error_message"] == raw_error_message
+    assert progress_fields.keys().isdisjoint(normalized["metadata"])
+    assert "correctness_issue" not in normalized["metadata"]
+    assert normalized["metadata"]["correctness_trials"] == "(5 / 5)"
+    assert raw_env_state["metadata"]["correctness_issue"] == correctness_issue
 
 
 def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():

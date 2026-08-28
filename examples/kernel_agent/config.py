@@ -36,6 +36,26 @@ correctness_timeout = (
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 
+# KernelGYM diagnostics and validation features controlled by each request.
+# NCU, Compute Sanitizer, correctness input perturbations, and adaptive perf
+# trials are opt-in because they add latency or change the evaluated inputs.
+enable_profiling = bool(int(os.environ.get("CUDA_AGENT_ENABLE_PROFILING", 1)))
+enable_ncu = bool(int(os.environ.get("CUDA_AGENT_ENABLE_NCU", 0)))
+enable_compute_sanitizer = bool(int(os.environ.get("CUDA_AGENT_ENABLE_COMPUTE_SANITIZER", 0)))
+compute_sanitizer_mode = os.environ.get("CUDA_AGENT_COMPUTE_SANITIZER_MODE", "error_based").strip().lower()
+if compute_sanitizer_mode not in {"error_based", "full"}:
+    raise ValueError("CUDA_AGENT_COMPUTE_SANITIZER_MODE must be 'error_based' or 'full'")
+enable_correctness_input_perturbations = bool(
+    int(os.environ.get("CUDA_AGENT_ENABLE_CORRECTNESS_INPUT_PERTURBATIONS", 0))
+)
+
+_memory_ratio_threshold = os.environ.get("CUDA_AGENT_MEMORY_RATIO_THRESHOLD", "1.8").strip()
+memory_ratio_threshold = (
+    None if _memory_ratio_threshold.lower() in {"", "none", "null"} else float(_memory_ratio_threshold)
+)
+if memory_ratio_threshold is not None and memory_ratio_threshold <= 1.0:
+    raise ValueError("CUDA_AGENT_MEMORY_RATIO_THRESHOLD must be greater than 1.0, or null to disable")
+
 CUDA_AGENT_CONFIGS = {
     "max_feedback_chars": 0,
     "log_rollout_info": log_rollout_info,
@@ -73,7 +93,12 @@ CUDA_AGENT_CONFIGS = {
         "correctness_timeout": correctness_timeout,
         "correctness_timeout_enabled": correctness_timeout_enabled,
         "verbose_errors": True,
-        "enable_profiling": True,
+        "enable_profiling": enable_profiling,
+        "enable_ncu": enable_ncu,
+        "enable_compute_sanitizer": enable_compute_sanitizer,
+        "compute_sanitizer_mode": compute_sanitizer_mode,
+        "enable_correctness_input_perturbations": enable_correctness_input_perturbations,
+        "memory_ratio_threshold": memory_ratio_threshold,
         "detect_decoy_kernel": True,
         "split_compile_and_execute": True,
         "enable_compile_artifact_cache": True,

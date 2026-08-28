@@ -125,6 +125,12 @@ async def _run(args) -> None:
         "verbose_errors": args.verbose_errors,
         "enable_profiling": args.enable_profiling,
         "enable_ncu": bool(env_config.get("enable_ncu", False)),
+        "enable_compute_sanitizer": bool(env_config.get("enable_compute_sanitizer", False)),
+        "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
+        "enable_correctness_input_perturbations": bool(
+            env_config.get("enable_correctness_input_perturbations", False)
+        ),
+        "memory_ratio_threshold": env_config.get("memory_ratio_threshold", 1.8),
         "detect_decoy_kernel": args.detect_decoy_kernel,
     }
     if env_config.get("use_reference_cache", False) and uuid is not None:
