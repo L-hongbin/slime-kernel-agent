@@ -8,6 +8,7 @@ import random
 import re
 import time
 from copy import deepcopy
+from string import Formatter
 from typing import Any
 
 import numpy as np
@@ -220,28 +221,676 @@ def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     response_template = getattr(state, "multi_turn_template", None)
     if response_template is None:
         logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
-        return PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
+        response_template = PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
+    _validate_model_feedback_template(response_template)
     return response_template
+
+
+def _validate_model_feedback_template(response_template: PromptTemplate) -> None:
+    """Require exactly one plain feedback placeholder and no budget bypass."""
+
+    template = response_template.template
+    if "feedback_dict" in template:
+        raise ValueError(
+            "Model feedback templates must use {feedback}; feedback_dict bypasses the strict text budget."
+        )
+
+    if response_template.render_mode == "format":
+        fields = [item for item in Formatter().parse(template) if item[1] is not None]
+        if len(fields) != 1 or fields[0][1:] != ("feedback", "", None):
+            raise ValueError("Model feedback format templates require exactly one plain {feedback} placeholder.")
+        return
+    if response_template.render_mode == "jinja":
+        output_expressions = re.findall(r"{{(.*?)}}", template, flags=re.DOTALL)
+        block_expressions = re.findall(r"{%(.*?)%}", template, flags=re.DOTALL)
+        if (
+            len(output_expressions) != 1
+            or output_expressions[0].strip() != "feedback"
+            or any(re.search(r"\bfeedback\b", expression) for expression in block_expressions)
+        ):
+            raise ValueError("Model feedback Jinja templates require exactly one plain {{ feedback }} placeholder.")
+        return
+    raise ValueError(f"Unsupported model feedback template mode: {response_template.render_mode}")
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:
         return text
-    keep = max_chars // 2
-    return text[:keep] + "...(truncated)..." + text[-keep:]
+
+    marker = "...(truncated)..."
+    if max_chars <= len(marker):
+        return text[:max_chars]
+    remaining = max_chars - len(marker)
+    keep_start = (remaining + 1) // 2
+    keep_end = remaining - keep_start
+    suffix = text[-keep_end:] if keep_end else ""
+    return text[:keep_start] + marker + suffix
 
 
-def _apply_feedback_template(env_result: dict[str, Any], response_template: PromptTemplate) -> str:
-    feedback_dict = env_result.get("env_state") or env_result
-    try:
-        feedback = json.dumps(feedback_dict, ensure_ascii=False, indent=2)
-    except TypeError:
-        feedback = str(feedback_dict)
+_MODEL_FEEDBACK_TOP_LEVEL_KEYS = (
+    "status",
+    "error",
+    "precheck",
+    "compiled",
+    "correctness",
+    "decoy_kernel",
+)
+_MODEL_FEEDBACK_ERROR_DETAIL_KEYS = (
+    "model_load_error",
+    "model_load_error_name",
+    "compilation_error_name",
+    "compilation_error_detail",
+    "runtime_error_name",
+    "correctness_runtime_error",
+)
+_MODEL_FEEDBACK_CORRECTNESS_KEYS = (
+    "correctness_issue",
+    "correctness_issue_name",
+    "max_difference",
+    "avg_difference",
+    "correctness_failed_trial",
+    "num_correct_trials",
+    "correctness_trials_run",
+    "correctness_output_mismatch",
+    "correctness_candidate_forward_completed",
+)
+_MODEL_FEEDBACK_PROFILE_KEYS = (
+    "num_custom_kernels",
+    "num_total_kernels",
+    "custom_kernel_names",
+    "custom_kernel_not_in_profiling",
+    "custom_kernel_coverage",
+    "custom_kernel_cuda_time_coverage",
+    "coverage_measurement_valid",
+)
+_MODEL_FEEDBACK_BACKEND_PROBE_KEYS = (
+    "attempted",
+    "valid",
+    "custom_kernel_observed",
+    "decoy_detected",
+    "skip_reason",
+    "error",
+    "num_total_kernels",
+    "num_matched_custom_kernels",
+    "matched_kernel_names",
+    "missing_kernel_names",
+)
+_MODEL_FEEDBACK_MAX_DETAIL_CHARS = 2048
+_MODEL_FEEDBACK_MAX_LIST_ITEMS = 32
+_COMPILER_PRIMARY_DIAGNOSTIC_RE = re.compile(
+    r"(?:fatal error:|\berror:|undefined reference|unresolved external symbol|nvcc fatal|collect2: error)",
+    re.IGNORECASE,
+)
+_COMPILER_NOTE_RE = re.compile(r"\bnote:", re.IGNORECASE)
+_COMPILER_MACRO_NOTE_RE = re.compile(
+    r"\bnote:.*(?:in (?:definition|expansion) of macro|expanded from macro)",
+    re.IGNORECASE,
+)
+_COMPILER_CANDIDATE_NOTE_RE = re.compile(r"\bnote:.*\bcandidate:", re.IGNORECASE)
+_COMPILER_REJECTION_NOTE_RE = re.compile(
+    r"\bnote:.*(?:no known conversion|candidate expects|deduced conflicting types|"
+    r"template argument deduction/substitution failed|constraints not satisfied|could not convert|cannot convert)",
+    re.IGNORECASE,
+)
+_COMPILER_HIGH_VALUE_NOTE_RE = re.compile(
+    r"\bnote:.*(?:candidate:|no known conversion|candidate expects|deduced conflicting types|"
+    r"template argument deduction/substitution failed|required from|constraints not satisfied|"
+    r"could not convert|cannot convert)",
+    re.IGNORECASE,
+)
+_COMPILER_TERMINAL_EXCEPTION_RE = re.compile(r"^\s*(?:(?:Error|Exception)|[A-Za-z_][\w.]*(?:Error|Exception)):\s*\S")
+_COMPILER_BUILD_STEP_RE = re.compile(r"^\[(?P<step>\d+/\d+)\]\s+(?P<command>.*)$")
+_ABSOLUTE_SOURCE_PATH_RE = re.compile(
+    r"(?P<dir>/(?:[^/\s:'\"]+/)+)(?P<file>[^/\s:'\"]+\.(?:cc|cpp|cu|cuh|h|hpp|py))" r"(?P<location>:\d+(?::\d+)?)?"
+)
+_COMPILER_MAX_ACTIONABLE_NOTES = 4
+_COMPILER_SUPPLEMENT_MAX_CHARS = 768
+_COMPILER_CONTEXT_LINE_MAX_CHARS = 384
+
+
+def _shorten_diagnostic_paths(text: str) -> str:
+    def replace_path(match: re.Match[str]) -> str:
+        directory = match.group("dir")
+        parent = directory.rstrip("/").rsplit("/", 1)[-1]
+        if "/dev/shm/kernelgym/compile_cache/" in directory and parent != "kernels":
+            parent = "generated"
+        return f".../{parent}/{match.group('file')}{match.group('location') or ''}"
+
+    return _ABSOLUTE_SOURCE_PATH_RE.sub(replace_path, text)
+
+
+def _summarize_compiler_build_step(line: str) -> str | None:
+    match = _COMPILER_BUILD_STEP_RE.match(line.strip())
+    if match is None:
+        return None
+    command = match.group("command")
+    if not any(tool in command for tool in ("nvcc", "c++", "g++")):
+        return None
+
+    source_match = re.search(r"(?P<source>[^\s/]+\.(?:cpp|cu))(?=\s|$)", command)
+    output_match = re.search(r"(?:^|\s)-o\s+(?P<output>[^\s]+)", command)
+    source = source_match.group("source") if source_match else None
+    output = output_match.group("output").rsplit("/", 1)[-1] if output_match else None
+    operation = "link" if " -shared " in command else "compile"
+    operands = " -> ".join(value for value in (source, output) if value)
+    return f"[{match.group('step')}] {operation}{f' {operands}' if operands else ''}"
+
+
+def _is_repeated_compiler_command(line: str) -> bool:
+    stripped = line.lstrip()
+    if not any(tool in stripped for tool in ("nvcc", "c++", "g++")):
+        return False
+    return stripped.startswith(("/usr/", "/opt/", ": &&", "nvcc ", "c++ ", "g++ "))
+
+
+def _select_actionable_compiler_notes(notes: list[str], limit: int) -> list[str]:
+    """Prefer complete overload-candidate/rejection pairs, then other useful notes."""
+
+    selected: list[str] = []
+
+    def add(line: str) -> None:
+        if len(selected) < limit and line not in selected:
+            selected.append(line)
+
+    for index in range(len(notes) - 1):
+        if len(selected) + 2 > limit:
+            break
+        if _COMPILER_CANDIDATE_NOTE_RE.search(notes[index]) and _COMPILER_REJECTION_NOTE_RE.search(notes[index + 1]):
+            add(notes[index])
+            add(notes[index + 1])
+
+    for note in notes:
+        if len(selected) >= limit:
+            break
+        if _COMPILER_HIGH_VALUE_NOTE_RE.search(note):
+            add(note)
+    for note in notes:
+        if len(selected) >= limit:
+            break
+        add(note)
+    return selected
+
+
+def _fit_supplemental_diagnostics(
+    terminal_exception: str | None,
+    actionable_notes: list[str],
+    max_chars: int,
+) -> str:
+    """Fit terminal failure and a bounded actionable-note summary."""
+
+    if max_chars <= 0:
+        return ""
+
+    terminal = _truncate_middle(terminal_exception, min(512, max_chars)) if terminal_exception else None
+    selected = [
+        _truncate_middle(note, min(384, max_chars))
+        for note in _select_actionable_compiler_notes(actionable_notes, _COMPILER_MAX_ACTIONABLE_NOTES)
+    ]
+    for shown in range(len(selected), -1, -1):
+        omitted = len(actionable_notes) - shown
+        parts = ([terminal] if terminal else []) + selected[:shown]
+        if omitted > 0:
+            parts.append(f"[omitted {omitted} additional unique actionable diagnostic notes]")
+        result = "\n".join(parts)
+        if len(result) <= max_chars:
+            return result
+
+    # A terminal exception has higher priority than the note omission marker.
+    return _truncate_middle(terminal, max_chars) if terminal else ""
+
+
+def _uniformly_sample_indices(indices: list[int], count: int) -> list[int]:
+    if count <= 1:
+        return [indices[-1]]
+    return list(dict.fromkeys(indices[round(slot * (len(indices) - 1) / (count - 1))] for slot in range(count)))
+
+
+def _diagnostic_excerpt(text: str, max_chars: int) -> str:
+    """Fit an oversized diagnostic and make any omitted errors explicit.
+
+    All recognized errors are retained when they fit. If even the primary error
+    blocks exceed the fixed budget, uniformly sampled blocks are shown with an
+    explicit omitted-count marker. Unknown formats use the conservative
+    head+tail fallback instead of speculative parsing.
+    """
+
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    lines = text.splitlines()
+    primary_indices = [index for index, line in enumerate(lines) if _COMPILER_PRIMARY_DIAGNOSTIC_RE.search(line)]
+    if not primary_indices:
+        return _truncate_middle(text, max_chars)
+
+    selected: set[int] = set()
+    for index in primary_indices:
+        selected.update(range(max(0, index - 2), min(len(lines), index + 3)))
+    for index, line in enumerate(lines):
+        if _COMPILER_NOTE_RE.search(line):
+            selected.update(range(max(0, index - 1), min(len(lines), index + 2)))
+    terminal_indices = [index for index, line in enumerate(lines) if _COMPILER_TERMINAL_EXCEPTION_RE.search(line)]
+    terminal_index = terminal_indices[-1] if terminal_indices else None
+    if terminal_index is not None:
+        selected.add(terminal_index)
+
+    excerpt = "\n".join(lines[index] for index in sorted(selected))
+    marker = f"[compiler context compacted from {len(text)} characters]\n"
+    if len(marker) + len(excerpt) <= max_chars:
+        return marker + excerpt
+
+    if max_chars < 128:
+        return _truncate_middle(text, max_chars)
+
+    primary_context_indices: set[int] = set()
+    for index in primary_indices:
+        primary_context_indices.update(range(max(0, index - 2), min(len(lines), index + 3)))
+    primary_context_indices = {
+        index for index in primary_context_indices if not _COMPILER_MACRO_NOTE_RE.search(lines[index])
+    }
+
+    visible_notes = {lines[index] for index in primary_context_indices if _COMPILER_NOTE_RE.search(lines[index])}
+    actionable_notes = list(
+        dict.fromkeys(
+            line
+            for line in lines
+            if _COMPILER_NOTE_RE.search(line)
+            and not _COMPILER_MACRO_NOTE_RE.search(line)
+            and line not in visible_notes
+        )
+    )
+    terminal_exception = lines[terminal_index] if terminal_index is not None else None
+    supplement = _fit_supplemental_diagnostics(
+        terminal_exception if terminal_index not in primary_context_indices else None,
+        actionable_notes,
+        min(_COMPILER_SUPPLEMENT_MAX_CHARS, max_chars // 5),
+    )
+
+    primary_context = "\n".join(lines[index] for index in sorted(primary_context_indices))
+    complete_sections = [marker.rstrip(), primary_context]
+    if supplement:
+        complete_sections.append(supplement)
+    complete_result = "\n\n".join(complete_sections)
+    if len(complete_result) <= max_chars:
+        return complete_result
+
+    def render_blocks(blocks: list[list[str]], extra: str, footer: str | None) -> str:
+        sections = [marker.rstrip(), "\n\n".join("\n".join(block) for block in blocks)]
+        if extra:
+            sections.append(extra)
+        if footer:
+            sections.append(footer)
+        return "\n\n".join(sections)
+
+    total_blocks = len(primary_indices)
+    terminal_only = _fit_supplemental_diagnostics(
+        terminal_exception,
+        [],
+        min(512, max_chars // 5),
+    )
+    sampled_indices = primary_indices
+    footer = None
+    blocks = [[lines[index]] for index in sampled_indices]
+    if len(render_blocks(blocks, terminal_only, footer)) > max_chars:
+        for block_count in range(total_blocks - 1, 0, -1):
+            candidate_indices = _uniformly_sample_indices(primary_indices, block_count)
+            candidate_footer = (
+                f"[omitted {total_blocks - len(candidate_indices)} of {total_blocks} primary diagnostic blocks]"
+            )
+            candidate_blocks = [[lines[index]] for index in candidate_indices]
+            if len(render_blocks(candidate_blocks, terminal_only, candidate_footer)) <= max_chars:
+                sampled_indices = candidate_indices
+                footer = candidate_footer
+                blocks = candidate_blocks
+                break
+        else:
+            sampled_indices = [primary_indices[-1]]
+            footer = f"[omitted {total_blocks - 1} of {total_blocks} primary diagnostic blocks]"
+            fixed = render_blocks([[""]], terminal_only, footer)
+            primary_budget = max(1, max_chars - len(fixed))
+            blocks = [[_truncate_middle(lines[sampled_indices[0]], primary_budget)]]
+
+    used_indices = set(sampled_indices)
+    actionable_notes = list(
+        dict.fromkeys(
+            line
+            for index, line in enumerate(lines)
+            if _COMPILER_NOTE_RE.search(line)
+            and not _COMPILER_MACRO_NOTE_RE.search(line)
+            and index not in used_indices
+        )
+    )
+    base_result = render_blocks(blocks, "", footer)
+    supplement_budget = min(
+        _COMPILER_SUPPLEMENT_MAX_CHARS,
+        max_chars // 5,
+        max(0, max_chars - len(base_result) - 2),
+    )
+    supplement = _fit_supplemental_diagnostics(terminal_exception, actionable_notes, supplement_budget)
+
+    # Add source/caret and preceding context only after the terminal exception
+    # and actionable-note summary are fixed. Oversized diagnostics may contain
+    # dozens of repeated source snippets; those must not crowd out the reason an
+    # overload candidate was rejected.
+    for offset in (1, 2, -1, -2):
+        for block_index, primary_index in enumerate(sampled_indices):
+            context_index = primary_index + offset
+            if (
+                context_index < 0
+                or context_index >= len(lines)
+                or context_index in used_indices
+                or context_index == terminal_index
+                or _COMPILER_PRIMARY_DIAGNOSTIC_RE.search(lines[context_index])
+                or _COMPILER_MACRO_NOTE_RE.search(lines[context_index])
+                or _COMPILER_NOTE_RE.search(lines[context_index])
+            ):
+                continue
+            blocks[block_index].append(_truncate_middle(lines[context_index], _COMPILER_CONTEXT_LINE_MAX_CHARS))
+            if len(render_blocks(blocks, supplement, footer)) > max_chars:
+                blocks[block_index].pop()
+            else:
+                used_indices.add(context_index)
+
+    return render_blocks(blocks, supplement, footer)
+
+
+def compact_compiler_diagnostics(text: str, max_chars: int = 6000) -> str:
+    """Remove high-confidence build boilerplate while preserving diagnostics."""
+
+    if not isinstance(text, str):
+        text = str(text)
+
+    compacted_lines: list[str] = []
+    for raw_line in text.splitlines():
+        line = _shorten_diagnostic_paths(raw_line.rstrip())
+        stripped = line.strip()
+        if stripped in {"stdout:", "stderr:"} or stripped.startswith("ninja exited with status"):
+            continue
+
+        build_summary = None
+        if not _COMPILER_PRIMARY_DIAGNOSTIC_RE.search(line):
+            build_summary = _summarize_compiler_build_step(line)
+        if build_summary is not None:
+            if not compacted_lines or compacted_lines[-1] != build_summary:
+                compacted_lines.append(build_summary)
+            continue
+        if _is_repeated_compiler_command(line) and not _COMPILER_PRIMARY_DIAGNOSTIC_RE.search(line):
+            continue
+        if stripped.startswith("ninja: build stopped: subcommand failed"):
+            continue
+        if compacted_lines and compacted_lines[-1] == line:
+            continue
+        compacted_lines.append(line)
+
+    compacted = "\n".join(compacted_lines).strip()
+    if not compacted:
+        compacted = text.strip()
+    return _diagnostic_excerpt(compacted, max_chars)
+
+
+def _bounded_feedback_value(
+    value: Any,
+    max_chars: int = _MODEL_FEEDBACK_MAX_DETAIL_CHARS,
+    max_items: int = _MODEL_FEEDBACK_MAX_LIST_ITEMS,
+    _seen: set[int] | None = None,
+    _depth: int = 0,
+) -> Any:
+    if _depth >= 12:
+        return "...(nested detail omitted)..."
+    if _seen is None:
+        _seen = set()
+    if isinstance(value, str):
+        return _truncate_middle(value, max_chars)
+    if isinstance(value, (list, tuple)):
+        if id(value) in _seen:
+            return "...(cyclic reference omitted)..."
+        _seen.add(id(value))
+        try:
+            items = [
+                _bounded_feedback_value(item, max_chars, max_items, _seen, _depth + 1) for item in value[:max_items]
+            ]
+            if len(value) > max_items:
+                items.append(f"...({len(value) - max_items} items omitted)...")
+            return items
+        finally:
+            _seen.remove(id(value))
+    if isinstance(value, dict):
+        if id(value) in _seen:
+            return "...(cyclic reference omitted)..."
+        _seen.add(id(value))
+        try:
+            items = list(value.items())
+            compacted = {
+                str(key): _bounded_feedback_value(item_value, max_chars, max_items, _seen, _depth + 1)
+                for key, item_value in items[:max_items]
+            }
+            if len(items) > max_items:
+                compacted["_omitted_fields"] = len(items) - max_items
+            return compacted
+        finally:
+            _seen.remove(id(value))
+    return deepcopy(value)
+
+
+def _serialize_feedback_dict(feedback: dict[str, Any]) -> str:
+    return json.dumps(feedback, ensure_ascii=False, indent=2, default=str)
+
+
+def _fit_model_feedback_to_budget(feedback: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], str, bool]:
+    """Shrink feedback structurally so the injected text remains valid JSON."""
+
+    serialized = _serialize_feedback_dict(feedback)
+    if max_chars <= 0 or len(serialized) <= max_chars:
+        return feedback, serialized, False
+    if max_chars < 2:
+        raise ValueError("max_feedback_chars must be 0 or at least 2 to preserve valid JSON feedback.")
+
+    for detail_chars, list_items in ((1024, 16), (512, 8), (256, 4), (128, 2), (64, 1)):
+        candidate = {key: _bounded_feedback_value(value, detail_chars, list_items) for key, value in feedback.items()}
+        candidate["_feedback_budget"] = {"structured_reduction": True}
+        candidate_text = _serialize_feedback_dict(candidate)
+        if len(candidate_text) <= max_chars:
+            return candidate, candidate_text, True
+
+    # Extremely small budgets cannot carry every section. Preserve the outcome
+    # and primary error in priority order, adding each field only when the whole
+    # payload remains valid JSON inside the requested budget.
+    minimal: dict[str, Any] = {}
+    omitted_marker = {"_omitted": len(feedback)}
+    if len(_serialize_feedback_dict(omitted_marker)) <= max_chars:
+        minimal = omitted_marker
+    for key in ("status", "error", "error_message", "precheck", "compiled", "correctness", "decoy_kernel"):
+        if key not in feedback:
+            continue
+        value = _bounded_feedback_value(feedback[key], 64, 1)
+        candidate = {**minimal, key: value}
+        if "_omitted" in candidate:
+            candidate["_omitted"] = max(0, len(feedback) - len(candidate) + 1)
+        if len(_serialize_feedback_dict(candidate)) <= max_chars:
+            minimal = candidate
+            continue
+        if not isinstance(value, str):
+            continue
+        low, high = 0, len(value)
+        best: dict[str, Any] | None = None
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = {**minimal, key: _truncate_middle(value, midpoint)}
+            if "_omitted" in candidate:
+                candidate["_omitted"] = max(0, len(feedback) - len(candidate) + 1)
+            if len(_serialize_feedback_dict(candidate)) <= max_chars:
+                best = candidate
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        if best is not None:
+            minimal = best
+    return minimal, _serialize_feedback_dict(minimal), True
+
+
+def _copy_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    return {key: _bounded_feedback_value(mapping[key]) for key in keys if key in mapping and mapping[key] is not None}
+
+
+def _compact_forbidden_aten_ops(metadata: dict[str, Any]) -> list[dict[str, Any]] | list[str] | None:
+    forbidden_ops = metadata.get("forbidden_aten_ops")
+    if isinstance(forbidden_ops, list):
+        compacted: list[dict[str, Any]] = []
+        for item in forbidden_ops[:_MODEL_FEEDBACK_MAX_LIST_ITEMS]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("normalized_name") or item.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            compact_item: dict[str, Any] = {"name": name}
+            count = item.get("count")
+            if isinstance(count, int) and not isinstance(count, bool):
+                compact_item["count"] = count
+            compacted.append(compact_item)
+        if len(forbidden_ops) > _MODEL_FEEDBACK_MAX_LIST_ITEMS:
+            compacted.append({"omitted_items": len(forbidden_ops) - _MODEL_FEEDBACK_MAX_LIST_ITEMS})
+        if compacted:
+            return compacted
+
+    forbidden_names = metadata.get("forbidden_aten_op_names")
+    if isinstance(forbidden_names, list):
+        names = [
+            _truncate_middle(name, _MODEL_FEEDBACK_MAX_DETAIL_CHARS)
+            for name in forbidden_names[:_MODEL_FEEDBACK_MAX_LIST_ITEMS]
+            if isinstance(name, str) and name
+        ]
+        if len(forbidden_names) > _MODEL_FEEDBACK_MAX_LIST_ITEMS:
+            names.append(f"...({len(forbidden_names) - _MODEL_FEEDBACK_MAX_LIST_ITEMS} items omitted)...")
+        if names:
+            return names
+    return None
+
+
+def _compact_backend_probe(metadata: dict[str, Any]) -> dict[str, Any] | None:
+    probe = metadata.get("incorrect_backend_usage_probe")
+    if not isinstance(probe, dict):
+        return None
+    compacted = _copy_present(probe, _MODEL_FEEDBACK_BACKEND_PROBE_KEYS)
+    return compacted or None
+
+
+def build_model_feedback(env_result: dict[str, Any], *, compiler_max_chars: int | None = None) -> dict[str, Any]:
+    """Build the actionable feedback shown to the next model turn.
+
+    KernelGym's normalized ``env_state`` remains untouched and available to
+    reward code, logs, and audits. Only this separately-built payload drops
+    machine-facing metadata and summarizes repeated diagnostics.
+    """
+
+    if not isinstance(env_result, dict):
+        env_result = {}
+    raw_state = env_result.get("env_state")
+    state = raw_state if isinstance(raw_state, dict) else env_result
+    metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
+
+    feedback = _copy_present(state, _MODEL_FEEDBACK_TOP_LEVEL_KEYS)
+    error_message = state.get("error_message")
+    if error_message is not None:
+        error_message = str(error_message)
+        if compiler_max_chars is None:
+            feedback_cap = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
+            compiler_max_chars = max(512, min(6000, feedback_cap - 1024)) if feedback_cap > 0 else 6000
+        if state.get("error") == "COMPILATION_ERROR":
+            error_message = compact_compiler_diagnostics(error_message, compiler_max_chars)
+        else:
+            error_message = _shorten_diagnostic_paths(error_message)
+            error_message = _truncate_middle(error_message, compiler_max_chars)
+        feedback["error_message"] = error_message
+
+    performance = _copy_present(state, ("speedup", "kernel_runtime", "reference_runtime"))
+    if performance:
+        feedback["performance"] = performance
+
+    error_details = _copy_present(metadata, _MODEL_FEEDBACK_ERROR_DETAIL_KEYS)
+    metadata_error = metadata.get("error")
+    if metadata_error is not None and str(metadata_error) != str(state.get("error_message") or ""):
+        error_details["metadata_error"] = _bounded_feedback_value(metadata_error)
+    if error_details:
+        feedback["error_details"] = error_details
+
+    correctness_details = _copy_present(metadata, _MODEL_FEEDBACK_CORRECTNESS_KEYS)
+    if correctness_details:
+        feedback["correctness_details"] = correctness_details
+
+    policy_details: dict[str, Any] = {}
+    if "aten_detection_valid" in metadata:
+        policy_details["aten_detection_valid"] = bool(metadata["aten_detection_valid"])
+    forbidden_ops = _compact_forbidden_aten_ops(metadata)
+    if forbidden_ops:
+        policy_details["forbidden_aten_ops"] = forbidden_ops
+    decoy_reasons: list[str] = []
+    for key in ("decoy_reason", "policy_violation_reason"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value and value not in decoy_reasons:
+            decoy_reasons.append(_truncate_middle(value, _MODEL_FEEDBACK_MAX_DETAIL_CHARS))
+    policy_warnings: list[str] = []
+    suspected_reason = metadata.get("suspected_decoy_reason")
+    if isinstance(suspected_reason, str) and suspected_reason:
+        policy_warnings.append(_truncate_middle(suspected_reason, _MODEL_FEEDBACK_MAX_DETAIL_CHARS))
+    values = metadata.get("suspected_decoy_reasons")
+    if isinstance(values, list):
+        available_slots = max(0, _MODEL_FEEDBACK_MAX_LIST_ITEMS - len(policy_warnings))
+        needs_omission = len(values) > available_slots
+        value_slots = max(0, available_slots - int(needs_omission))
+        for value in values[:value_slots]:
+            if isinstance(value, str) and value and value not in policy_warnings:
+                policy_warnings.append(_truncate_middle(value, _MODEL_FEEDBACK_MAX_DETAIL_CHARS))
+        if needs_omission:
+            policy_warnings.append(f"...({len(values) - value_slots} items omitted)...")
+    if decoy_reasons:
+        policy_details["decoy_reasons"] = decoy_reasons
+    if policy_warnings:
+        policy_details["policy_warnings"] = policy_warnings
+    if "suspected_decoy_effect" in metadata:
+        policy_details["suspected_decoy_effect"] = _bounded_feedback_value(metadata["suspected_decoy_effect"])
+    backend_probe = _compact_backend_probe(metadata)
+    if backend_probe:
+        policy_details["incorrect_backend_usage_probe"] = backend_probe
+    if policy_details:
+        feedback["policy_details"] = policy_details
+
+    profiling_summary = _copy_present(metadata, _MODEL_FEEDBACK_PROFILE_KEYS)
+    if profiling_summary:
+        feedback["profiling_summary"] = profiling_summary
+
+    return feedback
+
+
+def _apply_feedback_template(
+    env_result: dict[str, Any],
+    response_template: PromptTemplate,
+    *,
+    feedback_stats: dict[str, Any] | None = None,
+) -> str:
+    _validate_model_feedback_template(response_template)
+    raw_feedback_dict = env_result.get("env_state") or env_result
+    feedback_dict = build_model_feedback(env_result)
+    compacted_feedback = _serialize_feedback_dict(feedback_dict)
 
     max_chars = int(CUDA_AGENT_CONFIGS["max_feedback_chars"])
-    # max_chars <= 0 means no truncation
-    feedback = _truncate_middle(feedback, max_chars)
-    return response_template.format(feedback=feedback, feedback_dict=feedback_dict)
+    # A non-positive value disables only the final total budget. The
+    # model-facing schema and per-field safety bounds still remove redundant
+    # machine/debug data.
+    feedback_dict, feedback, structured_reduced = _fit_model_feedback_to_budget(feedback_dict, max_chars)
+    if feedback_stats is not None:
+        try:
+            original_chars = len(json.dumps(raw_feedback_dict, ensure_ascii=False, indent=2, default=str))
+        except (TypeError, ValueError, RecursionError):
+            original_chars = len(str(raw_feedback_dict))
+        feedback_stats.update(
+            {
+                "original_chars": original_chars,
+                "compacted_chars": len(compacted_feedback),
+                "final_chars": len(feedback),
+                "final_truncated": structured_reduced,
+                "structured_reduced": structured_reduced,
+            }
+        )
+    return response_template.format(feedback=feedback, feedback_dict={})
 
 
 def _format_log_value(value: Any, max_chars: int) -> str:
@@ -428,12 +1077,16 @@ def _log_rollout_info(
             for key in ("kernel_perf_cv", "refer_perf_cv")
             if (value := _as_float_or_none(env_extra_info.get(key))) is not None
         }
+        model_feedback_stats = (
+            item.get("model_feedback_stats") if isinstance(item.get("model_feedback_stats"), dict) else {}
+        )
         logger.info(
             "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s "
             "response_tokens=%s cached_tokens=%s next_turn_prompt_tokens=%s next_turn_exact_prefix_tokens=%s "
             "next_turn_inserted_close_think=%s "
             "finish_type=%s status=%s error=%s precheck=%s speedup=%s correctness=%s compiled=%s "
-            "partial_credit=%s partial_reason=%s reward=%s detail_env_time=%s perf_cv=%s",
+            "partial_credit=%s partial_reason=%s reward=%s feedback_chars=%s->%s->%s "
+            "feedback_truncated=%s detail_env_time=%s perf_cv=%s",
             prefix,
             item.get("turn_idx"),
             item.get("task_id"),
@@ -456,6 +1109,10 @@ def _log_rollout_info(
             env_extra_info.get("partial_credit_output_mismatch"),
             env_extra_info.get("partial_credit_output_mismatch_reason"),
             reward,
+            model_feedback_stats.get("original_chars"),
+            model_feedback_stats.get("compacted_chars"),
+            model_feedback_stats.get("final_chars"),
+            model_feedback_stats.get("final_truncated"),
             _format_log_value(detail_env_time, log_max_chars),
             _format_log_value(perf_cv, log_max_chars),
         )
@@ -1257,8 +1914,10 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             }
         )
 
-        format_feedback = _apply_feedback_template(env_result, template)
+        model_feedback_stats: dict[str, Any] = {}
+        format_feedback = _apply_feedback_template(env_result, template, feedback_stats=model_feedback_stats)
         turn_log["format_feedback"] = format_feedback
+        turn_log["model_feedback_stats"] = model_feedback_stats
 
         if _is_done(env_result, turn_idx, max_turns):
             finish_reason = "env_done" if turn_idx + 1 < max_turns else "max_turns"

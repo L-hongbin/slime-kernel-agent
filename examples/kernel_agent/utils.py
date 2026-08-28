@@ -59,6 +59,8 @@ METADATA_POP_KEYS = (
 )
 
 COMPILE_ARTIFACT_POP_KEYS = (
+    "error",
+    "compilation_error",
     "precheck",
     "compiled",
     "compile_mode",
@@ -101,9 +103,12 @@ def _format_compilation_error_message(env_state: dict[str, Any]) -> str:
 
     compile_error = None
     if isinstance(compile_artifact, dict):
-        compile_error = compile_artifact.pop("error", None)
+        # Normalization feeds a model-facing copy of the result, but callers
+        # also retain the raw KernelGym payload for logging and audit. Reading
+        # the nested artifact must therefore never consume its error fields.
+        compile_error = compile_artifact.get("error")
         if "compilation_error" in compile_artifact:
-            compile_error = compile_artifact.pop("compilation_error", None)
+            compile_error = compile_artifact.get("compilation_error")
     if compile_error:
         return f"Compilation failed. Compiler output:\n{compile_error}"
     return str(env_state.get("error_message") or "Compilation failed.")
