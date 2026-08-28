@@ -976,7 +976,7 @@ def test_normalize_env_feedback_deduplicates_issue_and_strips_correctness_progre
 
 
 def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
-    from slime.ray.rollout import _compute_kernel_agent_metrics
+    from slime.observability.rollout_metrics import _compute_kernel_agent_metrics
 
     samples = [
         Sample(

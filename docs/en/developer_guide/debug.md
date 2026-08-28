@@ -50,6 +50,12 @@ Specifically, slime currently provides the following parameters for separate deb
 
     When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)`, and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.
 
+5.  `--save-debug-train-data /your/saved/debug/train_{rollout_id}.pt`
+
+    Saves one train-side file per rollout. Only the last Pipeline Parallel stage and Tensor Parallel rank 0 participate. They restore response-token fields such as `log_probs`, `ref_log_probs`, `values`, `advantages`, `returns`, `kl`, and `entropy` across Context Parallel ranks. Context Parallel rank 0 moves each restored tensor to CPU immediately, so complete tensors do not accumulate on the GPU, and then gathers the distinct Data Parallel shards to one writer.
+
+    The version-2 payload mirrors the rollout debug dump: a top-level `samples` list holds one dict per training sample (`sample_index`, `data_parallel_rank`, and its per-sample fields such as `tokens`, `log_probs`, `advantages`), sorted by `sample_index` so it lines up one-to-one with the rollout dump's `samples` (join on `sample_index` ↔ the rollout side's `index`). A parallel `dp_shards` key preserves the DP/micro-batch layout — each entry records `rank`, `data_parallel_rank`, that shard's `sample_indices`, and the DP-local schedule (`micro_batch_indices`, `num_microbatches`, `global_batch_sizes`) — without duplicating any per-sample tensor. Whole-batch fields such as `raw_reward` are stored once at the top level. If any sample lacks a `sample_index` (custom rollouts that build fresh `Sample` objects leave it `None`), the samples stay in DP-gather order and a warning is logged. With or without CP, response-token fields use the same full-response format. In configs that skip the separate actor log-prob recompute (`can_reuse_log_probs_in_loss` or `--use-rollout-logprobs`), the actor `log_probs` are snapshotted from the training forward itself (keyed by rollout position, at no extra forward), so the dump still carries them.
+
 ## INT4 / Compressed-Tensors Quantization Checkpoint Issues
 
 When using INT4-quantized models (e.g., `compressed-tensors` with `W4A16`), the checkpoint's `config.json` contains a `quantization_config.ignore` list that specifies which parameters should **not** be quantized. During online weight updates (Megatron → SGLang), slime also reads this ignore list to decide which parameters to INT4-quantize. An incorrect ignore list can cause silent errors:
@@ -109,3 +115,48 @@ When running large scale RL, we will occationally meet the IMA in SGLang, there 
 4. Try CUDA Core Dump to find the error kernel
 
    We recommend reading the blog from the vLLM team: [CUDA Core Dump: An Effective Tool to Debug Memory Access Issues and Beyond](https://blog.vllm.ai/2025/08/11/cuda-debugging.html)
+
+## Step-by-Step Debugging with Ray Distributed Debugger
+
+Ray provides a [distributed debugger](https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html) based on debugpy that lets you set breakpoints in the driver process and step through code interactively.
+
+1. Install debugpy:
+
+   ```bash
+   pip install debugpy==1.8.0
+   ```
+
+2. Enable `RAY_DEBUG_POSTMORTEM` in your launch script:
+
+   ```bash
+   export RAY_DEBUG_POSTMORTEM=1
+
+   RUNTIME_ENV_JSON="{
+     \"env_vars\": {
+       ...
+       \"RAY_DEBUG_POSTMORTEM\": \"${RAY_DEBUG_POSTMORTEM:-0}\"
+     }
+   }"
+
+   ray job submit --address="http://127.0.0.1:8265" \
+      --runtime-env-json="${RUNTIME_ENV_JSON}" \
+      -- python3 train.py [args...]
+   ```
+
+3. Add `ray.init()` before `breakpoint()` in `train.py`:
+
+   ```python
+   if __name__ == "__main__":
+       ray.init()
+       breakpoint()
+       args = parse_args()
+       train(args)
+   ```
+
+   `ray.init()` is required because the distributed debugger depends on `core_worker`, which is only available after Ray initialization. Without it, `breakpoint()` raises `AttributeError: 'Worker' object has no attribute 'core_worker'`.
+
+4. Connect via VS Code:
+
+   Install the [Ray Distributed Debugger](https://marketplace.visualstudio.com/items?itemName=ray-project.ray-distributed-debugger) extension in VS Code. Run your launch script to submit the job. Once the job hits `breakpoint()`, open the Ray Dashboard panel in VS Code and click the active breakpoint to attach the debugger. You can then step through code, inspect variables, and set additional breakpoints directly in the editor.
+
+> **Note**: Remove `ray.init()` and `breakpoint()` after debugging. An explicit `ray.init()` without arguments may cause issues in multi-node training where Ray injects specific namespace and runtime environment configurations via `ray job submit`.

@@ -2,9 +2,9 @@
 import os
 
 import ray
-import torch
-from slime.ray.ray_actor import RayActor
 
+from slime.ray.ray_actor import RayActor
+from slime.utils import accelerator
 
 # Refer to
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/nvidia_gpu.py#L95-L96
@@ -16,6 +16,7 @@ from slime.ray.ray_actor import RayActor
 # https://github.com/ray-project/ray/blob/161849364a784442cc659fb9780f1a6adee85fce/python/ray/_private/accelerators/intel_gpu.py#L97-L98
 NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+    "RAY_EXPERIMENTAL_NOSET_MUSA_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ROCR_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES",
     "RAY_EXPERIMENTAL_NOSET_HABANA_VISIBLE_MODULES",
@@ -24,15 +25,33 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
     "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
 ]
 
+RAY_DEFAULT_ENV_VARS = {
+    # Ray's uvloop integration has caused intermittent async actor issues.
+    "RAY_USE_UVLOOP": "0",
+    # Let sglang's JIT loader (load_jit) find slime-hosted custom kernel .cuh
+    # sources (e.g. glm5_router_gemm) and try-cache compile them, so they need
+    # not be patched into the sglang source tree.
+    "SGLANG_JIT_KERNEL_EXTRA_PATH": os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "backends",
+        "sglang_utils",
+        "jit_kernels",
+    ),
+}
+
+
+def add_default_ray_env_vars(env_vars: dict[str, str] | None = None) -> dict[str, str]:
+    return RAY_DEFAULT_ENV_VARS | (env_vars or {})
+
 
 def ray_noset_visible_devices(env_vars=os.environ):
     return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
 
 
 def get_physical_gpu_id():
-    device = torch.cuda.current_device()
-    props = torch.cuda.get_device_properties(device)
-    return str(props.uuid)
+    device = accelerator.current_device()
+    props = accelerator.get_device_properties(device)
+    return str(getattr(props, "uuid", device))
 
 
 @ray.remote

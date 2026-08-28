@@ -19,7 +19,7 @@
 
 - `--actor-num-gpus-per-node`：RL 的 actor 训练的每个节点有卡；
 
-- `--rollout-num-gpus`：rollout （inference）一共需要多少卡；
+- `--rollout-num-gpus`：rollout （inference）一共需要多少卡。设置为 `0` 时，slime 仍会解析 SGLang 参数并启动 router，但不会启动本地 SGLang server；
 
 - `--rollout-num-gpus-per-engine`：每个 inference engine 有多少卡，这个参数会比较像 sglang 的 `tp_size`，也就是在进行多机 serving 的时候，这个数值应该是总卡数，例如 2 机 16 卡 serving 一个模型，这里的值应该是 16。
 
@@ -29,15 +29,14 @@
 
 当需要训推一体的时候，还需要配置上：
 
-- `--colocate`：开启训推一体。开启后会忽略 `--rollout-num-gpus` 让训练和推理的卡数相等。
+- `--colocate`：开启训推一体。开启后默认会让训练和推理的卡数相等；也可以显式设置一个不同的正数，例如让 rollout 卡数多于 actor，多出的 GPU 会作为 rollout-only 资源使用。如果显式设置 `--rollout-num-gpus 0`，则只启动 router，不启动本地 SGLang server。
 
 此外，slime 支持 Prefill 和 Decode 的分离部署 (PD Disaggregation)，可以通过设置 `--prefill-num-servers` 参数来指定用于 Prefill 的服务器数量。
 
 ### 选择训练后端
 
-slime 支持多种训练后端，可以通过 `--train-backend` 参数进行选择：
-
-- `megatron`（默认）：使用 Megatron-LM 作为训练后端，支持大规模模型的高效训练。
+slime 当前使用 Megatron-LM 作为训练后端。为了兼容已有脚本，仍然可以显式传入
+`--train-backend megatron`。
 
 ### 加载 megatron
 
@@ -151,12 +150,13 @@ sglang 的加载非常简单，只需要：
 - sglang 默认会从 huggingface ckpt 中 `config.json` 读取模型的最大 context length，可以使用 `--sglang-context-length` 参数来对这个值进行覆盖，从而支持进行更长的推理；
 - 在训推一体的训练过程中，虽然 megatron 和 sglang 会先后 offload，但是还是需要为对方留有一些空间，需要通过减小 `--sglang-mem-fraction-static` 来调整 sglang 的显存占用总量。
 - slime 支持透传 sgl-router 的参数，方式是在原参数名前加上 `router` 前缀。例如，sgl-router 的 `--balance-abs-threshold` 参数需要设置为 `--router-balance-abs-threshold`。由于 sgl-router 默认使用 cache-aware routing，可能会导致请求分配不均衡的问题。可以通过设置 `--router-balance-abs-threshold 0` 来强制均衡分配，但这可能会影响多轮对话场景下 prefix cache 的命中率。
+- 如果 SGLang engine 已经由外部系统预启动，可以通过 `--rollout-external-engine-addrs host1:port host2:port` 连接。此时如果训练器和 engine 无法建立 NCCL 权重同步 group，可以使用 `--update-weight-mode full --update-weight-transport disk --update-weight-disk-dir /shared/fs/updates`，slime 会写完整 HF checkpoint 并调用 SGLang 的 `update_weights_from_disk` 热加载；大模型或跨集群场景可进一步使用 `--update-weight-mode delta --update-weight-transport disk`。详见 [External Rollout Engines 配置路线图](../advanced/external-rollout-engines.md) 和 [Delta 权重同步](../advanced/delta-weight-sync.md)。
 
 对于一些 sglang 的自定义以及 slime 引入 sglang 的原理，请见 sglang 使用方法一节。
 
 ### 数据格式
 
-目前 slime 只支持加载 `.jsonl` 格式文件，即文件的每一行都是一个 json，一行数据的样例（展开后）为：
+slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要安装 `pyarrow`。两种格式中的每条记录都应包含 `--input-key` 和 `--label-key` 指定的字段。下面是一条 JSONL 数据展开后的示例：
 
 ```json
 {
@@ -182,11 +182,26 @@ sglang 的加载非常简单，只需要：
 请注意，这里的 `step_loss_mask`（默认值为 1）字段为 SFT 阶段提供，若设置为 0，则会将该轮 `loss_mask` 设置为 0；若设置为 1，则使用正常 `loss_mask`。
 另外我们还提供了一个 metadata_key，默认为 `"metadata"`，读取后我们会把数据中的 metadata 加载进 slime，可能会对自定义数据生成或者自定义 reward model 有帮助。
 
+如果同一次训练混合了多个数据 source，可以在 metadata 中写入 `source_name`：
+
+```json
+{
+  "prompt": "...",
+  "label": "...",
+  "metadata": {
+    "source_name": "math"
+  }
+}
+```
+
+推荐把 source 标识放在 `metadata["source_name"]` 中；自定义 data source 如果已经动态设置了 `sample.source`，slime 也会识别。rollout 转换成训练数据时，slime 会为每个样本生成 `source_names` 并传到训练侧。source 的读取优先级为动态 `sample.source`、`metadata["source_name"]`，都不存在时为 `"unknown"`。这可以用于自定义 reward、filter、日志统计，以及后续按 source 路由 OPD teacher 等需要分 source 处理的场景。
+
 ### RL 训练需要的超参
 
 - `--advantage-estimator`: 当前训练需要的 RL 算法，目前支持：
   - `grpo`（https://arxiv.org/abs/2402.03300）；
   - `gspo`（https://arxiv.org/abs/2507.18071）；
+  - `cispo`（https://arxiv.org/abs/2506.13585）；
   - `reinforce_plus_plus` 与 `reinforce_plus_plus_baseline`（https://arxiv.org/abs/2501.03262）；
   - `ppo`（https://arxiv.org/abs/1707.06347）。
 
@@ -226,35 +241,17 @@ PPO（Proximal Policy Optimization）是经典的 RL 算法，使用 critic 模�
 --advantage-estimator ppo
 ```
 
-**注意：PPO 的 Critic 和 Actor 是并列申请 GPU 的**，在资源分配时需要考虑这一点。具体来说：
+**注意：当前 PPO 下 Critic 和 Actor 共享同一组训练 GPU**，资源分配时不需要为 critic 额外预留一组独立 GPU。具体来说：
 
-- Critic 模型会独立占用一组 GPU，与 Actor 的 GPU 资源分开；
-- 可以通过 `--critic-num-nodes` 和 `--critic-num-gpus-per-node` 来配置 critic 使用的资源；
-- 如果不配置 critic 的资源参数，默认会使用与 actor 相同的资源配置。
+- PPO 会创建 actor 和 critic 两套训练进程组，但它们会被放到同一组 train placement group 上；
+- critic 的训练规模跟随 actor 配置，当前 actor / critic 的 Megatron 并行拓扑必须保持一致；
+- PPO 会强制开启 train 侧 offload，使 actor 和 critic 在同一批 GPU 上轮流唤醒和释放显存；
+- 当前没有单独配置 critic 训练资源的 CLI 参数，critic 的节点数和每节点 GPU 数会由 actor 配置派生。
 
-集群资源分配示例：
-
-```bash
-# Actor 使用 1 个节点，4 张 GPU
---actor-num-nodes 1
---actor-num-gpus-per-node 4
-
-# Critic 使用 1 个节点，4 张 GPU（与 Actor 并列）
---critic-num-nodes 1
---critic-num-gpus-per-node 4
-
-# Rollout 使用 8 张 GPU
---rollout-num-gpus 8
-```
-
-在上述配置下，总共需要 `4 (actor) + 4 (critic) + 8 (rollout) = 16` 张 GPU。
 
 PPO 相关参数：
 
-- `--critic-load`：critic 模型的 checkpoint 路径；
-- `--critic-save`：critic 模型的保存路径；
-- `--critic-lr`：critic 模型的学习率；
-- `--critic-lr-warmup-iters`：critic 模型的 warmup 步数；
+- `--megatron-config-path`：通过 YAML 对 actor / critic 分别覆盖 Megatron 参数，例如为 critic 单独设置 `load`、`save`、`lr` 或 warmup 参数；
 - `--num-critic-only-steps`：训练开始时只训练 critic 的步数；
 - `--eps-clip`：PPO clip 范围；
 - `--value-clip`：value loss 的 clip 范围；

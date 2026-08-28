@@ -571,14 +571,18 @@ def _sample_for_turn(
     turn_sample.rollout_log_probs = log_probs
     turn_sample.reward = reward
     turn_sample.status = status
-    turn_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
+    turn_sample.rollout_id = base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index
     turn_sample.loss_mask = [1] * len(response_ids)
     turn_sample.metadata = dict(turn_sample.metadata or {})
+    env_extra_info = env_result.get("env_extra_info")
+    if not isinstance(env_extra_info, dict):
+        env_state = env_result.get("env_state", env_result)
+        env_extra_info = _extract_env_extra_info(env_state)
     turn_sample.metadata.update(
         {
             "turn_idx": turn_idx,
             "env_result": env_result,
-            "env_extra_info": env_result["env_extra_info"],
+            "env_extra_info": env_extra_info,
         }
     )
     # Populate speculative-decoding / prefix-cache stats from the engine meta_info
@@ -624,7 +628,7 @@ def _pad_turn_samples(
         fake_sample.rollout_log_probs = [0.0]
         fake_sample.reward = 0.0
         fake_sample.status = Sample.Status.COMPLETED
-        fake_sample.group_id = base_sample.group_id if base_sample.group_id is not None else base_sample.index
+        fake_sample.rollout_id = base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index
         fake_sample.loss_mask = [0]
         fake_sample.remove_sample = True
         fake_sample.metadata = dict(fake_sample.metadata or {})
@@ -688,7 +692,7 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
     aborted.rollout_log_probs = [0.0]
     aborted.reward = 0.0
     aborted.status = Sample.Status.ABORTED
-    aborted.group_id = sample.group_id if sample.group_id is not None else sample.index
+    aborted.rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
     aborted.loss_mask = [0]
     aborted.remove_sample = True
     max_turns_for_abort = getattr(args, "max_turns", None)

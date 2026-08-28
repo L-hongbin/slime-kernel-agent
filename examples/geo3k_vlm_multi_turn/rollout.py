@@ -12,7 +12,7 @@ from examples.geo3k_vlm_multi_turn.base_env import BaseInteractionEnv
 # When executed as a module: python -m examples.vlm_multi_turn.rollout
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
-from slime.utils.processing_utils import encode_image_for_rollout_engine
+from slime.utils.processing_utils import build_processor_kwargs, encode_image_for_rollout_engine
 from slime.utils.types import Sample
 
 DEFAULT_ENV_MODULE = "examples.vlm_multi_turn.env_geo3k"
@@ -95,7 +95,7 @@ def _encode_observation_for_generation(
 
         images, videos = process_vision_info([message])
         multimodal_inputs = {"images": images, "videos": videos}
-        processor_output = processor(text=formatted_prompt, **multimodal_inputs)
+        processor_output = processor(text=formatted_prompt, **build_processor_kwargs(multimodal_inputs))
         prompt_ids = processor_output["input_ids"][0]
         multimodal_train_inputs = {
             k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
@@ -206,7 +206,7 @@ async def _run_inference_step(url: str, tokens: list[int], sampling_params: dict
     else:
         new_tokens, new_log_probs = [], []
     finish_type = output["meta_info"]["finish_reason"]["type"]
-    return response_text, new_tokens, new_log_probs, finish_type
+    return response_text, new_tokens, new_log_probs, finish_type, output["meta_info"]
 
 
 def _process_env_step(env: BaseInteractionEnv, response_text: str, tokenizer, processor, args, sample_metadata):
@@ -239,11 +239,17 @@ def _append_to_sample(
     tokens_to_add: list[int],
     logprobs: list[float],
     loss_mask_val: int,
+    args: Any | None = None,
+    meta_info: dict | None = None,
 ) -> None:
-    sample.tokens.extend(tokens_to_add)
     response_tokens.extend(tokens_to_add)
-    sample.loss_mask.extend([loss_mask_val] * len(tokens_to_add))
-    sample.rollout_log_probs.extend(logprobs)
+    sample.append_response_tokens(
+        args,
+        tokens=tokens_to_add,
+        log_probs=logprobs,
+        trainable=loss_mask_val == 1,
+        meta_info=meta_info,
+    )
     sample.response_length = len(response_tokens)
 
 
@@ -326,10 +332,18 @@ async def generate(args: Any, sample: Sample, sampling_params) -> Sample:
             if budget is not None:
                 cur_sampling_params["max_new_tokens"] = budget
 
-            response_text, new_response_tokens, new_response_log_probs, finish_type = await _run_inference_step(
-                url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer
+            response_text, new_response_tokens, new_response_log_probs, finish_type, meta_info = (
+                await _run_inference_step(url, sample.tokens, cur_sampling_params, current_image_data, state.tokenizer)
             )
-            _append_to_sample(sample, response_tokens, new_response_tokens, new_response_log_probs, loss_mask_val=1)
+            _append_to_sample(
+                sample,
+                response_tokens,
+                new_response_tokens,
+                new_response_log_probs,
+                loss_mask_val=1,
+                args=args,
+                meta_info=meta_info,
+            )
             budget = _update_budget(budget, len(new_response_tokens))
 
             if _should_stop_on_finish(sample, finish_type):

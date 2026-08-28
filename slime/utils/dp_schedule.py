@@ -1,19 +1,18 @@
-"""Per-group DP/microbatch scheduling.
+"""Per-rollout DP/microbatch scheduling.
 
-Pure-Python logic that decides, for one rollout batch's worth of sample lengths,
+Pure-Python logic that decides, for one rollout's worth of sample lengths,
 how to group samples into micro-batches and which DP rank owns each mbs.
 Lives outside the ray/sglang-importing modules so it can be unit-tested
 under CPU-only CI.
 
 The scheduling philosophy is **pack first, distribute second**:
 
-  1. Group samples by training group id (``group_indices[i]`` =
-     ``samples[i].group_id`` with a fallback to ``samples[i].index``) and
-     split groups into steps of ``global_batch_size`` groups each. In the
-     common case one rollout emits one training sample so this is the same as
-     a contiguous chunk; under compact / subagent one rollout may emit
-     multiple training samples, in which case all of those samples stay in the
-     same step.
+  1. Group samples by rollout id (``rollout_indices[i]`` =
+     ``samples[i].index``) and split rollouts into steps of
+     ``global_batch_size`` rollouts each. In the common case one rollout
+     emits one training sample so this is the same as a contiguous chunk;
+     under compact / subagent one rollout may emit multiple training
+     samples, in which case all of those samples stay in the same step.
   2. For each step, pack its samples into ``K`` micro-batches with a
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
@@ -21,21 +20,17 @@ The scheduling philosophy is **pack first, distribute second**:
      by splitting the largest multi-sample bins (dynamic only).
   4. Distribute the ``K`` mbs across ``dp_size`` ranks, ``K / dp_size``
      each, with either a strided round-robin or a Karmarkar-Karp pass on
-     mbs token sums.
-
-When ``pack_group_atomic`` is enabled, groups are assigned to DP ranks first
-so multi-sample trajectories stay rank-local, then each rank packs those
-samples into micro-batches.
+     estimated mbs FLOPs.
 
 Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
-  - every mbs (dynamic path) holds ``<= max_tokens_per_gpu * cp_size``
-    tokens, with one exception — an individual sample larger than that cap
-    lands alone in its own mbs (and that mbs is the only one allowed to
-    exceed the cap);
+  - every mbs (dynamic path without ``balance_by_flops``) holds
+    ``<= max_tokens_per_gpu * cp_size`` tokens, with one exception — an
+    individual sample larger than that cap lands alone in its own mbs (and
+    that mbs is the only one allowed to exceed the cap);
   - the union of per-rank sample indices equals the set of samples kept
-    after trimming trailing groups (every kept sample placed exactly
+    after trimming trailing rollouts (every kept sample placed exactly
     once);
   - flattening ``micro_batch_indices`` for a rank yields
     ``range(num_samples_rank)`` (each rank's samples are tiled exactly
@@ -47,21 +42,37 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.seqlen_balancing import expand_bins_by_splitting, first_fit_pack, get_seqlen_balanced_partitions
 
 logger = logging.getLogger(__name__)
 
 
+def _calculate_workloads(step_lengths, args):
+    return [calculate_fwd_flops([sl], args) for sl in step_lengths]
+
+
 def _pack_step_into_mbs(
     step_lengths: list[int],
     *,
+    args: Any,
     use_dynamic_batch_size: bool,
     max_per_bin: int | None,
     micro_batch_size: int | None,
+    balance_by_flops: bool = False,
 ) -> list[list[int]]:
     """Group a step's samples into mbs. Returns ``mbs[k]`` = local indices into ``step_lengths``."""
     if use_dynamic_batch_size:
         assert max_per_bin is not None
+        if balance_by_flops:
+            total_tokens = sum(step_lengths)
+            num_mbs = max(1, (total_tokens + max_per_bin - 1) // max_per_bin)
+            if num_mbs >= len(step_lengths):
+                return [[i] for i in range(len(step_lengths))]
+            workloads = _calculate_workloads(step_lengths, args)
+            # FLOPs balancing does not enforce the token cap per mbs. A
+            # partition can exceed max_per_bin and may OOM if the cap is tight.
+            return get_seqlen_balanced_partitions(workloads, num_mbs, equal_size=False)
         return first_fit_pack(step_lengths, max_per_bin)
     assert micro_batch_size is not None
     n = len(step_lengths)
@@ -74,7 +85,7 @@ def build_dp_schedule(
     total_lengths: list[int],
     *,
     global_batch_size: int,
-    group_indices: list[int],
+    rollout_indices: list[int],
     pack_group_atomic: bool = False,
     group_sample_sort_keys: list[Any] | None = None,
 ) -> tuple[list[list[int]], list[list[list[int]]], list[int], list[int]]:
@@ -88,22 +99,20 @@ def build_dp_schedule(
         train_parallel_config: ``{"dp_size", "cp_size", "vpp_size",
             "microbatch_group_size_per_vp_stage"}``.
         total_lengths: token count per sample, indexed globally.
-        global_batch_size: number of groups (NOT training samples) per
+        global_batch_size: number of rollouts (NOT training samples) per
             training step. Number of training steps =
-            ``num_groups // global_batch_size``; trailing groups whose
+            ``num_rollouts // global_batch_size``; trailing rollouts whose
             samples don't fit are dropped.
-        group_indices: group id for each sample. Samples sharing the same id
-            are kept together in one step.
-        pack_group_atomic: when true, distribute whole groups to DP ranks
-            before packing each rank's samples into micro-batches. This keeps
-            all samples from one group on the same DP rank without forcing the
-            whole group into one micro-batch.
+        rollout_indices: rollout id for each sample (``samples[i].index``).
+            Samples sharing the same id are kept together in one step.
+        pack_group_atomic: assign whole rollout groups to DP ranks before
+            packing each rank's samples into micro-batches.
         group_sample_sort_keys: optional per-sample key used to order samples
-            inside a group before expanding it into the per-rank partition.
+            inside each rollout group before rank-local packing.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
-        ``global_batch_sizes[s]`` = group count for step s (constant
+        ``global_batch_sizes[s]`` = rollout count for step s (constant
         ``global_batch_size`` for every step).
     """
     dp_size = train_parallel_config["dp_size"]
@@ -121,29 +130,25 @@ def build_dp_schedule(
     # count is a multiple of mb_group.
     align_to = dp_size * (mb_group if vpp_size > 1 else 1)
 
-    assert len(group_indices) == len(
-        total_lengths
-    ), f"group_indices length ({len(group_indices)}) must match total_lengths ({len(total_lengths)})."
-
-    # Group samples by group id (preserve first-occurrence order). All samples
-    # from one group stay in a single step so the per-group loss reducer is
-    # well-defined.
-    group_id_to_samples: dict[int, list[int]] = {}
-    for sample_pos, group_id in enumerate(group_indices):
-        group_id_to_samples.setdefault(group_id, []).append(sample_pos)
+    # Group samples by rollout id (preserve first-occurrence order). All
+    # samples from one rollout stay in a single step so the per-rollout loss
+    # reducer is well-defined.
+    rollout_id_to_samples: dict[int, list[int]] = {}
+    for sample_pos, rid in enumerate(rollout_indices):
+        rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
     if group_sample_sort_keys is not None:
         assert len(group_sample_sort_keys) == len(total_lengths), (
             f"group_sample_sort_keys length ({len(group_sample_sort_keys)}) must match "
             f"total_lengths ({len(total_lengths)})."
         )
-        for samples in group_id_to_samples.values():
+        for samples in rollout_id_to_samples.values():
             samples.sort(key=lambda sample_pos: group_sample_sort_keys[sample_pos])
-    group_ids = list(group_id_to_samples.keys())
+    rollout_ids = list(rollout_id_to_samples.keys())
 
-    num_steps = len(group_ids) // global_batch_size
+    num_steps = len(rollout_ids) // global_batch_size
     assert num_steps >= 1, (
-        f"num_groups ({len(group_ids)}) < global_batch_size ({global_batch_size}); "
-        f"need at least one group per step."
+        f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
+        f"need at least one rollout per step."
     )
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
@@ -152,105 +157,108 @@ def build_dp_schedule(
     global_batch_sizes: list[int] = []
 
     for step_i in range(num_steps):
-        step_groups = group_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
-        sample_indices = [pos for group_id in step_groups for pos in group_id_to_samples[group_id]]
+        step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
+        sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
         global_batch_sizes.append(global_batch_size)
-        schedule_item_count = len(step_groups) if pack_group_atomic else len(sample_indices)
-        schedule_item_name = "groups" if pack_group_atomic else "samples"
+        schedule_item_count = len(step_rollouts) if pack_group_atomic else len(sample_indices)
+        schedule_item_name = "rollouts" if pack_group_atomic else "samples"
         assert schedule_item_count >= dp_size, (
             f"step {step_i}: {schedule_item_count} {schedule_item_name} < dp_size {dp_size}; "
             f"each step needs at least one {schedule_item_name[:-1]} per rank."
         )
 
         if pack_group_atomic:
-            step_group_lengths = [
-                sum(total_lengths[pos] for pos in group_id_to_samples[group_id]) for group_id in step_groups
+            step_rollout_lengths = [
+                sum(total_lengths[pos] for pos in rollout_id_to_samples[rollout_id]) for rollout_id in step_rollouts
             ]
             if args.balance_data:
-                rank_group_idx = get_seqlen_balanced_partitions(step_group_lengths, dp_size, equal_size=True)
+                rank_rollout_indices = get_seqlen_balanced_partitions(step_rollout_lengths, dp_size, equal_size=True)
             else:
-                assert len(step_groups) % dp_size == 0, (
-                    f"step {step_i}: group count ({len(step_groups)}) must be divisible by dp_size ({dp_size}) "
-                    "when pack_group_atomic=True and balance_data=False."
+                assert len(step_rollouts) % dp_size == 0, (
+                    f"step {step_i}: rollout count ({len(step_rollouts)}) must be divisible by "
+                    f"dp_size ({dp_size}) when pack_group_atomic=True and balance_data=False."
                 )
-                groups_per_rank = len(step_groups) // dp_size
-                rank_group_idx = [list(range(r * groups_per_rank, (r + 1) * groups_per_rank)) for r in range(dp_size)]
+                rollouts_per_rank = len(step_rollouts) // dp_size
+                rank_rollout_indices = [
+                    list(range(rank * rollouts_per_rank, (rank + 1) * rollouts_per_rank)) for rank in range(dp_size)
+                ]
 
-            rank_step_sample_indices = []
-            rank_step_mbs = []
-            for r in range(dp_size):
+            rank_step_sample_indices: list[list[int]] = []
+            rank_step_mbs: list[list[list[int]]] = []
+            for rank in range(dp_size):
                 rank_samples = [
                     sample_pos
-                    for group_local in rank_group_idx[r]
-                    for sample_pos in group_id_to_samples[step_groups[group_local]]
+                    for rollout_local in rank_rollout_indices[rank]
+                    for sample_pos in rollout_id_to_samples[step_rollouts[rollout_local]]
                 ]
-                rank_lengths = [total_lengths[i] for i in rank_samples]
+                rank_lengths = [total_lengths[index] for index in rank_samples]
                 rank_mbs = _pack_step_into_mbs(
                     rank_lengths,
+                    args=args,
                     use_dynamic_batch_size=args.use_dynamic_batch_size,
                     max_per_bin=max_per_bin,
                     micro_batch_size=getattr(args, "micro_batch_size", None),
+                    balance_by_flops=args.balance_by_flops,
                 )
                 rank_step_sample_indices.append(rank_samples)
                 rank_step_mbs.append(rank_mbs)
 
             target_num_mbs = max(len(mbs) for mbs in rank_step_mbs)
             if vpp_size > 1:
-                target_num_mbs = max(
-                    ((target_num_mbs + mb_group - 1) // mb_group) * mb_group,
-                    mb_group,
-                )
+                target_num_mbs = max(((target_num_mbs + mb_group - 1) // mb_group) * mb_group, mb_group)
 
-            for r in range(dp_size):
-                rank_lengths = [total_lengths[i] for i in rank_step_sample_indices[r]]
-                if len(rank_step_mbs[r]) != target_num_mbs:
-                    if args.use_dynamic_batch_size:
-                        expand_bins_by_splitting(rank_step_mbs[r], target_num_mbs, rank_lengths)
-                        assert len(rank_step_mbs[r]) == target_num_mbs, (
-                            f"dynamic path: rank {r} could only produce {len(rank_step_mbs[r])} mbs; "
-                            f"need {target_num_mbs}. step {step_i} has {len(rank_lengths)} local samples."
-                        )
-                    else:
-                        raise AssertionError(
-                            f"static path: rank {r} has {len(rank_step_mbs[r])} mbs, "
-                            f"need {target_num_mbs}. Adjust global_batch_size/micro_batch_size/dp_size."
-                        )
+            for rank in range(dp_size):
+                rank_lengths = [total_lengths[index] for index in rank_step_sample_indices[rank]]
+                if len(rank_step_mbs[rank]) == target_num_mbs:
+                    continue
+                if args.use_dynamic_batch_size:
+                    expand_bins_by_splitting(rank_step_mbs[rank], target_num_mbs, rank_lengths)
+                    assert len(rank_step_mbs[rank]) == target_num_mbs, (
+                        f"dynamic path: rank {rank} could only produce {len(rank_step_mbs[rank])} mbs; "
+                        f"need {target_num_mbs}. step {step_i} has {len(rank_lengths)} local samples."
+                    )
+                else:
+                    raise AssertionError(
+                        f"static path: rank {rank} has {len(rank_step_mbs[rank])} mbs, "
+                        f"need {target_num_mbs}. Adjust global_batch_size/micro_batch_size/dp_size."
+                    )
 
             num_microbatches.append(target_num_mbs)
-            for r in range(dp_size):
-                rank_samples = rank_step_sample_indices[r]
-                local_start = len(partitions[r])
-                partitions[r].extend(rank_samples)
-                for mbs_locals in rank_step_mbs[r]:
-                    micro_batch_indices[r].append([local_start + i for i in mbs_locals])
+            for rank in range(dp_size):
+                rank_samples = rank_step_sample_indices[rank]
+                local_start = len(partitions[rank])
+                partitions[rank].extend(rank_samples)
+                for mbs_locals in rank_step_mbs[rank]:
+                    micro_batch_indices[rank].append([local_start + index for index in mbs_locals])
             continue
 
         # 1. Pack samples in this step into mbs with one global pass.
         # ``step_mbs`` indices are LOCAL into ``sample_indices``.
         step_mbs = _pack_step_into_mbs(
             step_lengths,
+            args=args,
             use_dynamic_batch_size=args.use_dynamic_batch_size,
             max_per_bin=max_per_bin,
             micro_batch_size=getattr(args, "micro_batch_size", None),
+            balance_by_flops=args.balance_by_flops,
         )
-        packing_lengths = step_lengths
 
         # 2. Align mbs count to a multiple of ``align_to``.
         target_K = max(((len(step_mbs) + align_to - 1) // align_to) * align_to, align_to)
         if target_K != len(step_mbs):
             if args.use_dynamic_batch_size:
-                expand_bins_by_splitting(step_mbs, target_K, packing_lengths)
+                expand_bins_by_splitting(step_mbs, target_K, step_lengths)
                 assert len(step_mbs) == target_K, (
                     f"dynamic path: could only produce {len(step_mbs)} mbs after maximal splitting; "
-                    f"need {target_K}. step {step_i} has {schedule_item_count} "
-                    f"{schedule_item_name}, below the alignment threshold ({align_to})."
+                    f"need {target_K}. step {step_i} has {len(sample_indices)} samples, below the "
+                    f"alignment threshold ({align_to})."
                 )
             else:
                 raise AssertionError(
                     f"static path: num_mbs ({len(step_mbs)}) is not a multiple of "
                     f"dp_size * mb_group ({align_to}); got "
-                    f"step_size={schedule_item_count}, micro_batch_size={args.micro_batch_size}, "
+                    f"step_size={len(sample_indices)}, micro_batch_size={args.micro_batch_size}, "
                     f"dp_size={dp_size}, mb_group={mb_group if vpp_size > 1 else 1}. "
                     f"Splitting static mbs would break the fixed-size invariant; adjust the config "
                     f"so step_size % (dp_size * micro_batch_size * mb_group) == 0."
@@ -260,12 +268,12 @@ def build_dp_schedule(
         num_mbs_per_rank = K // dp_size
         num_microbatches.append(num_mbs_per_rank)
 
-        # 3. Distribute mbs across ranks: KK on mbs token sums when balance_data is on,
-        # otherwise a strided round-robin. Both produce ``num_mbs_per_rank`` mbs per
-        # rank (equal_size=True is what KK needs for PP to stay synced).
+        # 3. Distribute mbs across ranks: KK on estimated FLOPs when rank
+        # workload balancing is enabled, otherwise a strided round-robin.
         if args.balance_data:
-            mbs_token_sums = [sum(packing_lengths[i] for i in bin_) for bin_ in step_mbs]
-            rank_mbs_idx = get_seqlen_balanced_partitions(mbs_token_sums, dp_size, equal_size=True)
+            step_workloads = _calculate_workloads(step_lengths, args)
+            mbs_weights = [sum(step_workloads[i] for i in bin_) for bin_ in step_mbs]
+            rank_mbs_idx = get_seqlen_balanced_partitions(mbs_weights, dp_size, equal_size=True)
         else:
             rank_mbs_idx = [list(range(r, K, dp_size)) for r in range(dp_size)]
 
@@ -273,10 +281,9 @@ def build_dp_schedule(
         # (local indices into partitions[r]).
         for r in range(dp_size):
             for mbs_idx in rank_mbs_idx[r]:
-                mbs_locals = step_mbs[mbs_idx]
-                mbs_sample_indices = [sample_indices[i] for i in mbs_locals]
+                mbs_locals = step_mbs[mbs_idx]  # local indices into sample_indices
                 local_start = len(partitions[r])
-                partitions[r].extend(mbs_sample_indices)
-                micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_sample_indices))))
+                partitions[r].extend(sample_indices[i] for i in mbs_locals)
+                micro_batch_indices[r].append(list(range(local_start, local_start + len(mbs_locals))))
 
     return partitions, micro_batch_indices, num_microbatches, global_batch_sizes

@@ -9,12 +9,12 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import get_checkpoint_name, get_checkpoint_tracker_filename, save_checkpoint
 from megatron.training.training import get_model
 
-import slime_plugins.mbridge  # noqa: F401
-from mbridge import AutoBridge
 from slime.backends.megatron_utils.arguments import set_default_megatron_args
+from slime.backends.megatron_utils.hf_to_megatron import load_hf_weights
 from slime.backends.megatron_utils.initialize import init
 from slime.backends.megatron_utils.model_provider import get_model_provider_func
-from slime.utils.logging_utils import configure_logger
+from slime.observability.logging_utils import configure_logger
+from slime.utils import accelerator
 from slime.utils.memory_utils import print_memory
 
 
@@ -41,11 +41,12 @@ def add_convertion_args(parser):
     """Add conversion arguments to the parser"""
     parser.add_argument("--hf-checkpoint", type=str, required=True, help="HuggingFace model path")
     parser.add_argument(
-        "--megatron-to-hf-mode",
-        choices=["raw", "bridge"],
-        default="raw",
-        help="The method to convert megatron weights to hugging face weights for SGLang.",
+        "--custom-model-provider-path",
+        type=str,
+        default=None,
+        help="Path to a custom model provider function.",
     )
+    parser.add_argument("--allgather-cp", action="store_true", default=False)
     try:
         parser.add_argument("--padded-vocab-size", type=int, default=None)
     except Exception:
@@ -99,6 +100,14 @@ def get_args():
 def main():
     patch_checkpoint_preload_tensors()
 
+    if torch.version.hip:
+        import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
+
+        from slime.utils.rocm_checkpoint_writer import ROCmFileSystemWriterAsync
+
+        filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
+        print("[ROCm] Applied FileSystemWriterAsync patch for HIP compatibility")
+
     configure_logger()
 
     # Initialize distributed environment
@@ -106,17 +115,17 @@ def main():
     local_rank = int(os.getenv("LOCAL_RANK") or os.getenv("SLURM_LOCALID") or 0)
     global_rank = int(os.getenv("RANK") or os.getenv("SLURM_PROCID") or 0)
 
-    torch.cuda.set_device(local_rank)
+    accelerator.set_device(local_rank)
     os.environ.setdefault("WORLD_SIZE", str(world_size))
     os.environ.setdefault("RANK", str(global_rank))
     os.environ.setdefault("LOCAL_RANK", str(local_rank))
     os.environ.setdefault("MASTER_ADDR", "localhost")
     os.environ.setdefault("MASTER_PORT", "12355")
     dist.init_process_group(
-        backend="nccl",
+        backend=accelerator.process_group_backend(),
         world_size=world_size,
         rank=global_rank,
-        device_id=torch.device(f"cuda:{local_rank}"),
+        device_id=accelerator.distributed_device_id(local_rank),
     )
     args = get_args()
     init(args)
@@ -129,17 +138,16 @@ def main():
 
     # Load model
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
-    bridge.load_weights(model, hf_model_path, memory_efficient=True)
+    load_hf_weights(args, model, hf_model_path)
     print(f"Model loaded: {hf_model_path}")
 
     if args.use_cpu_initialization:
         model[0] = model[0].cpu()
 
     print_memory("after loading model")
-    torch.cuda.synchronize()
+    accelerator.synchronize()
     gc.collect()
-    torch.cuda.empty_cache()
+    accelerator.empty_cache()
 
     save_checkpoint(1, model, None, None, 0)
 

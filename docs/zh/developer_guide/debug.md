@@ -48,6 +48,12 @@ slime 支持将训练部分和推理部分分开进行调试，从而实现：
 
    开启后，会从 `args.load_debug_rollout_data.format(rollout_id=rollout_id)` 来加载数据，并且不会初始化 sglang（自动设置 `debug_train_only=True`）。可以以这种方式来固定训练部分的输入，对训练部分进行调优，例如切换各种并行。
 
+4. `--save-debug-train-data /your/saved/debug/train_{rollout_id}.pt`
+
+   每个 rollout 只保存一个训练侧文件。只有 Pipeline Parallel 最后一级和 Tensor Parallel rank 0 参与：跨 Context Parallel rank 逐个还原 `log_probs`、`ref_log_probs`、`values`、`advantages`、`returns`、`kl`、`entropy` 等 response-token tensor；Context Parallel rank 0 会将每个完整 tensor 立即搬到 CPU，避免它们在显存中累计，最后再把不同的 Data Parallel shard 汇总给一个 writer。
+
+   version 2 payload 对标 rollout debug dump：顶层 `samples` 列表每项是一个训练样本的 dict（含 `sample_index`、`data_parallel_rank` 以及 `tokens`、`log_probs`、`advantages` 等 per-sample 字段），并按 `sample_index` 排序，从而和 rollout dump 的 `samples` 一一对齐（用 `sample_index` ↔ rollout 侧的 `index` 来 join）。并列的 `dp_shards` key 保留 DP/micro-batch 排布——每项记录 `rank`、`data_parallel_rank`、该分片的 `sample_indices`，以及 DP-local 调度（`micro_batch_indices`、`num_microbatches`、`global_batch_sizes`）——且不重复存储任何 per-sample tensor。`raw_reward` 等整批字段在顶层只存一份。若某些样本没有 `sample_index`（自定义 rollout 新建 `Sample` 时会是 `None`），则 samples 保持 DP-gather 顺序并打印一条 warning。开启或关闭 CP 时，response-token 字段都是相同的完整 response 格式。在跳过 actor log-prob 单独重算的配置下（`can_reuse_log_probs_in_loss` 或 `--use-rollout-logprobs`），actor 的 `log_probs` 会直接从训练前向里快照下来（按 rollout position 归位，无额外前向），所以 dump 里依然会带上它。
+
 ## INT4 / Compressed-Tensors 量化 Checkpoint 问题
 
 使用 INT4 量化模型（如 `compressed-tensors` 的 `W4A16`）时，checkpoint 的 `config.json` 中有一个 `quantization_config.ignore` 列表，指定哪些参数**不**做量化。在线权重更新（Megatron → SGLang）时，slime 也会读取这个 ignore list 来决定哪些参数需要 INT4 量化。ignore list 不正确会导致静默错误：
@@ -107,3 +113,48 @@ slime 支持将训练部分和推理部分分开进行调试，从而实现：
 4. 尝试 CUDA Core Dump 确定报错 kernel
 
    这里推荐 vllm 团队的这一文档：[CUDA Core Dump: An Effective Tool to Debug Memory Access Issues and Beyond](https://blog.vllm.ai/2025/08/11/cuda-debugging.html)
+
+## 使用 Ray Distributed Debugger 单步调试
+
+Ray 提供了基于 debugpy 的[分布式调试器](https://docs.ray.io/en/latest/ray-observability/ray-distributed-debugger.html)，可以在 driver 进程中设置断点并单步执行代码。
+
+1. 安装 debugpy：
+
+   ```bash
+   pip install debugpy==1.8.0
+   ```
+
+2. 在启动脚本中启用 `RAY_DEBUG_POSTMORTEM`：
+
+   ```bash
+   export RAY_DEBUG_POSTMORTEM=1
+
+   RUNTIME_ENV_JSON="{
+     \"env_vars\": {
+       ...
+       \"RAY_DEBUG_POSTMORTEM\": \"${RAY_DEBUG_POSTMORTEM:-0}\"
+     }
+   }"
+
+   ray job submit --address="http://127.0.0.1:8265" \
+      --runtime-env-json="${RUNTIME_ENV_JSON}" \
+      -- python3 train.py [args...]
+   ```
+
+3. 在 `train.py` 中的 `breakpoint()` 前添加 `ray.init()`：
+
+   ```python
+   if __name__ == "__main__":
+       ray.init()
+       breakpoint()
+       args = parse_args()
+       train(args)
+   ```
+
+   必须先调用 `ray.init()`，因为分布式调试器依赖 `core_worker`，只有 Ray 初始化后才可用。否则 `breakpoint()` 会报错 `AttributeError: 'Worker' object has no attribute 'core_worker'`。
+
+4. 通过 VS Code 连接调试器：
+
+   在 VS Code 中安装 [Ray Distributed Debugger](https://marketplace.visualstudio.com/items?itemName=ray-project.ray-distributed-debugger) 扩展。运行启动脚本提交 job 后，当 job 执行到 `breakpoint()` 暂停后，在 VS Code 的 Ray Dashboard 面板中点击活跃的断点即可 attach 调试器，之后可以直接在编辑器中单步执行、查看变量、设置新断点。
+
+> **注意**：调试完成后务必移除 `ray.init()` 和 `breakpoint()`。不带参数的 `ray.init()` 在多节点训练中可能导致问题，因为 `ray job submit` 会注入特定的 namespace 和 runtime environment 配置。

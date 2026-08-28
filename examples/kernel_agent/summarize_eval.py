@@ -161,7 +161,9 @@ def _empty_counts(fast_thresholds):
 def _summarize_group_best(samples, fast_thresholds, max_turns=None):
     trajectories = {}
     for sample in samples:
-        group_id = sample.get("group_id")
+        group_id = sample.get("rollout_id")
+        if group_id is None:
+            group_id = sample.get("group_id")
         if group_id is None:
             continue
         trajectories.setdefault(group_id, []).append(sample)
@@ -177,6 +179,7 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
 
     overall = _empty_counts(fast_thresholds)
     by_turn = {turn_count: _empty_counts(fast_thresholds) for turn_count in range(1, max_turns + 1)}
+    best_by_turn = {turn_count: _empty_counts(fast_thresholds) for turn_count in range(1, max_turns + 1)}
     by_turn_present = {turn_count: 0 for turn_count in range(1, max_turns + 1)}
     missing = 0
 
@@ -205,6 +208,8 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             if this_turn:
                 by_turn_present[turn_count] += 1
                 _add_best_counts(counts, this_turn, fast_thresholds)
+            visible_turns = [metrics for turn_idx, metrics in turn_metrics if turn_idx < turn_count]
+            _add_best_counts(best_by_turn[turn_count], visible_turns, fast_thresholds)
         # Overall "best" stays cumulative over the whole trajectory (all turns).
         _add_best_counts(overall, [metrics for _, metrics in turn_metrics], fast_thresholds)
 
@@ -249,6 +254,20 @@ def _summarize_group_best(samples, fast_thresholds, max_turns=None):
             turn_out[f"Fast@{t:g}"] = prate(counts["fast"][t])
             turn_out[f"fast@{t:g}_count"] = counts["fast"][t]
         out["per_turn"][turn_count] = turn_out
+    out["best_by_turn"] = {}
+    for turn_count, counts in best_by_turn.items():
+        turn_out = {
+            "compile_count": counts["compiled"],
+            "Compile": rate(counts["compiled"]),
+            "correct_count": counts["correct"],
+            "Correct": rate(counts["correct"]),
+        }
+        if counts["speedup"]:
+            turn_out["SpeedupMean"] = sum(counts["speedup"]) / len(counts["speedup"])
+        for threshold in fast_thresholds:
+            turn_out[f"Fast@{threshold:g}"] = rate(counts["fast"][threshold])
+            turn_out[f"fast@{threshold:g}_count"] = counts["fast"][threshold]
+        out["best_by_turn"][turn_count] = turn_out
     return out
 
 

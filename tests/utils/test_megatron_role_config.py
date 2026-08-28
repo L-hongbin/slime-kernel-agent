@@ -1,10 +1,36 @@
 """Unit tests for Megatron role config parsing and application."""
 
+import sys
 import tempfile
+import types
 from argparse import Namespace
 
 import pytest
 import yaml
+
+NUM_GPUS = 0
+
+
+@pytest.fixture(autouse=True)
+def _stub_sglang_argument_dependencies(monkeypatch):
+    """Keep role-config parsing independent of the SGLang runtime package."""
+    sglang = types.ModuleType("sglang")
+    sglang.__path__ = []
+    sglang_srt = types.ModuleType("sglang.srt")
+    sglang_srt.__path__ = []
+    server_args = types.ModuleType("sglang.srt.server_args")
+    server_args.ServerArgs = type("ServerArgs", (), {})
+
+    sglang_router = types.ModuleType("sglang_router")
+    sglang_router.__path__ = []
+    launch_router = types.ModuleType("sglang_router.launch_router")
+    launch_router.RouterArgs = type("RouterArgs", (), {})
+
+    monkeypatch.setitem(sys.modules, "sglang", sglang)
+    monkeypatch.setitem(sys.modules, "sglang.srt", sglang_srt)
+    monkeypatch.setitem(sys.modules, "sglang.srt.server_args", server_args)
+    monkeypatch.setitem(sys.modules, "sglang_router", sglang_router)
+    monkeypatch.setitem(sys.modules, "sglang_router.launch_router", launch_router)
 
 
 def _write_yaml(data: dict) -> str:
@@ -119,28 +145,35 @@ class TestMegatronRoleConfig:
         args = _base_args(megatron_config_path=path, use_critic=False)
 
         class DummyModel:
-            def __init__(self, model_args):
+            def __init__(self, model_args, with_ref=False, with_opd_teacher=False):
                 self.args = model_args
-                self.init_calls = []
+                self.with_ref = with_ref
+                self.with_opd_teacher = with_opd_teacher
+                self.create_calls = []
                 self.rollout_manager = None
 
-            def async_init(self, model_args, role, with_ref=False, with_opd_teacher=False):
-                self.args = model_args
-                self.init_calls.append(
+            def create(self, rollout_manager=None):
+                self.rollout_manager = rollout_manager
+                self.create_calls.append(
                     {
-                        "args": model_args,
-                        "role": role,
-                        "with_ref": with_ref,
-                        "with_opd_teacher": with_opd_teacher,
+                        "args": self.args,
+                        "with_ref": self.with_ref,
+                        "with_opd_teacher": self.with_opd_teacher,
+                        "rollout_manager": rollout_manager,
                     }
                 )
                 return [7]
 
-            def set_rollout_manager(self, rollout_manager):
-                self.rollout_manager = rollout_manager
-
-        def fake_allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
-            return DummyModel(args)
+        def fake_allocate_train_group(
+            args,
+            num_nodes,
+            num_gpus_per_node,
+            pg,
+            role="actor",
+            with_ref=False,
+            with_opd_teacher=False,
+        ):
+            return DummyModel(args, with_ref=with_ref, with_opd_teacher=with_opd_teacher)
 
         monkeypatch.setattr(placement_group_module, "allocate_train_group", fake_allocate_train_group)
         monkeypatch.setattr(placement_group_module.ray, "get", lambda value: value)
@@ -153,6 +186,9 @@ class TestMegatronRoleConfig:
 
         assert critic_model is None
         assert actor_model.args.lr == 1e-6
-        assert actor_model.init_calls[0]["args"].lr == 1e-6
-        assert actor_model.init_calls[0]["role"] == "actor"
+        assert actor_model.create_calls[0]["args"].lr == 1e-6
         assert args.start_rollout_id == 7
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))

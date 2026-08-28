@@ -1,7 +1,11 @@
 import argparse
+import logging
 
 from sglang.srt.server_args import ServerArgs
+from sglang_router.launch_router import RouterArgs
 from slime.utils.http_utils import _wrap_ipv6
+
+logger = logging.getLogger(__name__)
 
 
 # TODO: use all sglang router arguments with `--sglang-router` prefix
@@ -27,6 +31,10 @@ def add_sglang_router_arguments(parser):
         default=14400,
         help="Timeout for requests to the SGLang router in seconds",
     )
+    RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
+    # Keep driver logs quiet by default while allowing --router-log-level to
+    # expose router dispatch and retry details when needed.
+    parser.set_defaults(router_log_level="warn")
     return parser
 
 
@@ -137,9 +145,30 @@ def add_sglang_arguments(parser):
 
 
 def validate_args(args):
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    # Older SGLang versions stored these CLI aliases under their long names,
+    # while newer versions use the short ServerArgs field names as argparse dests.
+    # Keep both attributes available for user code, preferring the newer names
+    # when a namespace happens to contain both.
+    for current_name, legacy_name in (
+        ("sglang_dp_size", "sglang_data_parallel_size"),
+        ("sglang_pp_size", "sglang_pipeline_parallel_size"),
+        ("sglang_ep_size", "sglang_expert_parallel_size"),
+        ("sglang_moe_dp_size", "sglang_moe_data_parallel_size"),
+    ):
+        if hasattr(args, current_name):
+            value = getattr(args, current_name)
+        elif hasattr(args, legacy_name):
+            value = getattr(args, legacy_name)
+        else:
+            logger.warning(
+                "The installed SGLang registered neither %s nor %s; "
+                "skipping compatibility alias normalization for this parameter.",
+                current_name,
+                legacy_name,
+            )
+            continue
+        setattr(args, current_name, value)
+        setattr(args, legacy_name, value)
 
     # Compute effective TP size considering PP size
     if args.sglang_pp_size > 1:
@@ -159,12 +188,12 @@ def validate_args(args):
 
     # Mutual-exclusion checks for PD disaggregation / sglang-config.
     assert not (
-        getattr(args, "prefill_num_servers", None) is not None and args.rollout_external
-    ), "prefill_num_servers cannot be set when rollout_external is set."
+        getattr(args, "prefill_num_servers", None) is not None and getattr(args, "rollout_external", False)
+    ), "prefill_num_servers cannot be set with --rollout-external-engine-addrs."
 
     assert not (
-        getattr(args, "sglang_config", None) is not None and args.rollout_external
-    ), "sglang_config cannot be set when rollout_external is set."
+        getattr(args, "sglang_config", None) is not None and getattr(args, "rollout_external", False)
+    ), "sglang_config cannot be set with --rollout-external-engine-addrs."
 
     assert not (
         getattr(args, "sglang_config", None) is not None and getattr(args, "prefill_num_servers", None) is not None

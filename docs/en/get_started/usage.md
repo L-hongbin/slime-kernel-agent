@@ -18,7 +18,7 @@ There are four main parameters for cluster resource allocation:
 
   - `--actor-num-nodes`: The number of nodes required for RL actor training.
   - `--actor-num-gpus-per-node`: The number of GPUs per node for RL actor training.
-  - `--rollout-num-gpus`: The total number of GPUs required for rollout (inference).
+  - `--rollout-num-gpus`: The total number of GPUs required for rollout (inference). Set it to `0` to still parse SGLang arguments and launch the router without launching local SGLang servers.
   - `--rollout-num-gpus-per-engine`: The number of GPUs per inference engine. This parameter is similar to SGLang's `tp_size`. When performing multi-node serving, this value should be the total number of GPUs. For example, if serving one model with 2 nodes and 16 GPUs, this value should be 16.
     The reason for not using a parameter like `--sglang-tp-size` is that we might consider supporting SGLang's `dp_size` parameter in the future, which means an engine could contain multiple SGLang servers (currently, only `--sglang-dp-size` under the `--sglang-enable-dp-attention` condition is supported).
 
@@ -26,15 +26,14 @@ With the default configuration, we use these parameters to allocate `actor_num_n
 
 For co-located training and inference, you also need to configure:
 
-  - `--colocate`: Enables co-located training and inference. When enabled, it ignores `--rollout-num-gpus` and makes the number of GPUs for training and inference equal.
+  - `--colocate`: Enables co-located training and inference. By default, this makes the number of GPUs for training and inference equal. You can explicitly set a different positive `--rollout-num-gpus`, for example to use more rollout GPUs than actor GPUs; the extra GPUs are used as rollout-only resources. If `--rollout-num-gpus 0` is set explicitly, slime launches only the router and no local SGLang servers.
 
 Additionally, slime supports Prefill and Decode disaggregation (PD Disaggregation). You can set the number of servers used for Prefill by setting the `--prefill-num-servers` argument.
 
 ### Choosing Training Backend
 
-slime supports multiple training backends, which can be selected via the `--train-backend` parameter:
-
-- `megatron` (default): Uses Megatron-LM as the training backend, supporting efficient training of large-scale models.
+slime currently uses Megatron-LM as its training backend. The compatibility option
+`--train-backend megatron` may still be supplied explicitly.
 
 ### Loading Megatron
 
@@ -147,12 +146,13 @@ Note:
   - By default, SGLang reads the maximum context length from the `config.json` in the Hugging Face checkpoint. You can use the `--sglang-context-length` parameter to override this value to support longer inference.
   - During co-located training and inference, although Megatron and SGLang will offload sequentially, they still need to leave some memory for each other. You need to adjust SGLang's total VRAM usage by reducing `--sglang-mem-fraction-static`.
   - slime supports passing through sgl-router parameters by adding a `router` prefix to the original parameter name. For example, sgl-router's `--balance-abs-threshold` parameter should be set as `--router-balance-abs-threshold`. Since sgl-router uses cache-aware routing by default, it may cause uneven request distribution. You can set `--router-balance-abs-threshold 0` to force balanced distribution, but this may affect prefix cache hit rate in multi-turn conversation scenarios.
+  - If SGLang engines are pre-launched by an external system, connect to them with `--rollout-external-engine-addrs host1:port host2:port`. When the trainer and engines cannot form an NCCL weight-update group, use `--update-weight-mode full --update-weight-transport disk --update-weight-disk-dir /shared/fs/updates`; slime writes a complete HF checkpoint and asks SGLang to hot-load it through `update_weights_from_disk`. For large models or cross-cluster deployments, use `--update-weight-mode delta --update-weight-transport disk` instead. See [External Rollout Engines Roadmap](../advanced/external-rollout-engines.md) and [Delta Weight Sync](../advanced/delta-weight-sync.md).
 
 For details on some of SGLang's customizations and the principles behind how slime incorporates SGLang, please see the "How to Use SGLang" section.
 
 ### Data Format
 
-Currently, slime only supports loading files in `.jsonl` format, where each line of the file is a JSON object. An example of a single data entry (expanded) is as follows:
+slime supports `.jsonl` and `.parquet` files; reading Parquet requires `pyarrow`. Each record in either format should contain the fields selected by `--input-key` and `--label-key`. An expanded JSONL record looks like this:
 
 ```json
 {
@@ -178,11 +178,26 @@ This corresponds to the following configuration:
 Please note that the `step_loss_mask` (default=1) here is for SFT phase. If it is set to 0, the turn will not contibute to the final loss; if it is set to 1, slime will use the normal `loss_mask`.
 Additionally, we provide a `metadata_key`, which defaults to `"metadata"`. When read, slime will load the metadata from the data, which can be helpful for custom data generation or creating custom reward models.
 
+If one run mixes multiple data sources, put `source_name` in the sample metadata:
+
+```json
+{
+  "prompt": "...",
+  "label": "...",
+  "metadata": {
+    "source_name": "math"
+  }
+}
+```
+
+The recommended contract is to put the source identifier in `metadata["source_name"]`; slime also recognizes a dynamically set `sample.source` from custom data sources. When rollout samples are converted to training data, slime carries one `source_names` entry per sample to the training side. The source lookup order is dynamic `sample.source`, then `metadata["source_name"]`; if neither is set, the source is `"unknown"`. This is useful for custom rewards, filters, logging, and future per-source routing such as OPD teacher selection.
+
 ### Hyperparameters for RL Training
 
 - `--advantage-estimator`: Specifies the RL algorithm for the training process. Currently supported algorithms include:
     - `grpo` ([https://arxiv.org/abs/2402.03300](https://arxiv.org/abs/2402.03300))
     - `gspo` ([https://arxiv.org/abs/2507.18071](https://arxiv.org/abs/2507.18071))
+    - `cispo` ([https://arxiv.org/abs/2506.13585](https://arxiv.org/abs/2506.13585))
     - `reinforce_plus_plus` and `reinforce_plus_plus_baseline` ([https://arxiv.org/abs/2501.03262](https://arxiv.org/abs/2501.03262))
     - `ppo` ([https://arxiv.org/abs/1707.06347](https://arxiv.org/abs/1707.06347))
 
@@ -222,35 +237,17 @@ To use PPO, set:
 --advantage-estimator ppo
 ```
 
-**Note: In PPO, the Critic and Actor request GPUs in parallel**, which should be considered when allocating resources. Specifically:
+**Note: In PPO, the critic and actor share the same training GPU group.** You do not need to reserve a separate set of GPUs for the critic. Specifically:
 
-- The critic model occupies a separate set of GPUs, independent from the actor's GPU resources.
-- You can configure critic resources using `--critic-num-nodes` and `--critic-num-gpus-per-node`.
-- If critic resource parameters are not configured, the same resource configuration as the actor will be used by default.
+- PPO creates separate actor and critic training process groups, but places them on the same train placement group.
+- The critic training scale follows the actor configuration, and the actor / critic Megatron parallel topology must currently stay identical.
+- PPO forces train-side offload so that actor and critic can wake up and release memory on the same GPUs in turn.
+- There are currently no separate CLI arguments for configuring critic training resources; the critic node count and GPUs per node are derived from the actor configuration.
 
-Cluster resource allocation example:
-
-```bash
-# Actor uses 1 node, 4 GPUs
---actor-num-nodes 1
---actor-num-gpus-per-node 4
-
-# Critic uses 1 node, 4 GPUs (parallel to Actor)
---critic-num-nodes 1
---critic-num-gpus-per-node 4
-
-# Rollout uses 8 GPUs
---rollout-num-gpus 8
-```
-
-With the above configuration, a total of `4 (actor) + 4 (critic) + 8 (rollout) = 16` GPUs are required.
 
 PPO-related parameters:
 
-- `--critic-load`: Checkpoint path for the critic model.
-- `--critic-save`: Save path for the critic model.
-- `--critic-lr`: Learning rate for the critic model.
-- `--critic-lr-warmup-iters`: Number of warmup steps for the critic model.
+- `--megatron-config-path`: YAML config for role-specific Megatron overrides, such as setting critic-specific `load`, `save`, `lr`, or warmup parameters.
 - `--num-critic-only-steps`: Number of steps to train only the critic at the beginning of training.
 - `--eps-clip`: PPO clip range.
 - `--value-clip`: Clip range for value loss.

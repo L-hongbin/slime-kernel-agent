@@ -13,7 +13,7 @@ slime 的设计目标，是让这两大能力彼此强化，同时避免把系�
 为什么这个设计重要
 ------------------
 
-- **经过 frontier model 训练验证**：slime 是 `GLM-5.1 <https://z.ai/blog/glm-5.1>`_、`GLM-5 <https://z.ai/blog/glm-5>`_、`GLM-4.7 <https://z.ai/blog/glm-4.7>`_、`GLM-4.6 <https://z.ai/blog/glm-4.6>`_、`GLM-4.5 <https://z.ai/blog/glm-4.5>`_ 背后的 RL 训练框架。
+- **经过 frontier model 训练验证**：slime 是 `GLM-5.2 <https://z.ai/blog/glm-5.2>`_、`GLM-5.1 <https://z.ai/blog/glm-5.1>`_、`GLM-5 <https://z.ai/blog/glm-5>`_、`GLM-4.7 <https://z.ai/blog/glm-4.7>`_、`GLM-4.6 <https://z.ai/blog/glm-4.6>`_、`GLM-4.5 <https://z.ai/blog/glm-4.5>`_ 背后的 RL 训练框架。
 - **从设计开始就是 native**：slime 直接透传 Megatron 参数，并通过 ``--sglang-`` 前缀暴露当前安装版本 SGLang 支持的参数。新的上游训练和 serving 优化可以直接使用，不需要在 slime 里再加一层 wrapper。
 - **专注 SGLang rollout**：slime 有意选择单一 rollout backend，避免为了同时兼容多个 inference engine 而被迫抽象成 lowest-common-denominator 的公共能力子集，从而可以直接发挥 SGLang-specific 的 serving、routing、caching、disaggregation 和 weight-sync 能力。
 - **Agentic workflow 就是数据生成**：tool use、sandbox interaction、verifier reward、environment feedback、multi-agent loop 和 long-horizon agentic workflow 都接入同一条 training / rollout / Data Buffer 路径，而不是 fork training kernel。
@@ -37,9 +37,10 @@ slime 的设计目标，是让这两大能力彼此强化，同时避免把系�
 - 添加 custom generation、reward 或 rollout function：:doc:`get_started/customization`
 - 构建 agentic RL workflow：:doc:`get_started/agent`
 - 配置生产级 SGLang rollout topology：:doc:`advanced/sglang-config`
+- 接入 external rollout engines：:doc:`advanced/external-rollout-engines`
+- 以字节级 delta 同步权重：:doc:`advanced/delta-weight-sync`
 - 使用 PD disaggregation：:doc:`advanced/pd-disaggregation`
 - 使用 BF16 训练 + FP8 rollout 或 FP8 KV cache：:doc:`advanced/low-precision`
-- 使用 delta weight sync：:doc:`advanced/delta-weight-sync`
 - 了解 CI 和可靠性覆盖：:doc:`developer_guide/ci`
 - 调试、trace 和 profiling 长时间任务：:doc:`developer_guide/debug`、:doc:`developer_guide/trace`、:doc:`developer_guide/profiling`
 
@@ -66,6 +67,7 @@ slime 的设计目标，是让这两大能力彼此强化，同时避免把系�
 
    examples/glm4.7-30B-A3B.md
    examples/qwen3-30B-A3B.md
+   examples/glm5.2-744B-A40B.md
    examples/glm4.7-355B-A32B.md
    examples/deepseek-r1.md
 
@@ -78,7 +80,9 @@ slime 的设计目标，是让这两大能力彼此强化，同时避免把系�
    advanced/low-precision.md
    advanced/reproducibility.md
    advanced/fault-tolerance.md
+   advanced/observability.md
    advanced/pd-disaggregation.md
+   advanced/external-rollout-engines.md
    advanced/delta-weight-sync.md
    advanced/sglang-config.md
    advanced/megatron-config.md

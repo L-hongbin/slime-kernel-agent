@@ -17,10 +17,39 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import core_transformer_config_from_args
 
-from slime.utils.megatron_bridge_utils import patch_auto_bridge_hf_config
 from slime.utils.misc import load_function
 
-from .fp32_lm_head import enable_fp32_lm_head
+_INDEXER_DIRECT_SUBMODULE_NAMES = frozenset(
+    {
+        "wq_b",
+        "wk",
+        "k_norm",
+        "weights_proj",
+        "index_kpool_compress_ape",
+        "index_kpool_compress_gate",
+    }
+)
+
+
+def _is_indexer_parameter(name: str) -> bool:
+    """Return whether *name* belongs to a DSA indexer.
+
+    The GLM plugin exposes indexer projections directly under
+    ``self_attention``. Megatron's upstream DSA implementation instead nests
+    them under ``self_attention.core_attention.indexer``. Keep the ownership
+    check structural so similarly named non-indexer projections stay trainable.
+    """
+
+    parts = name.split(".")
+    for index, part in enumerate(parts):
+        if part != "self_attention" or index + 1 >= len(parts):
+            continue
+        attention_parts = parts[index + 1 :]
+        if attention_parts[0] in _INDEXER_DIRECT_SUBMODULE_NAMES:
+            return True
+        if "indexer" in attention_parts[:-1]:
+            return True
+    return False
 
 
 # Adapt from https://github.com/volcengine/verl/blob/c3b20575d2bc815fcccd84bddb4c0401fc4b632b/verl/models/llama/megatron/layers/parallel_linear.py#L82
@@ -40,7 +69,10 @@ class LinearForLastLayer(torch.nn.Linear):
             if bias:
                 self.bias.sequence_parallel = True
 
-        self.weight.data.normal_(mean=0.0, std=0.02)
+        init_method_std = getattr(config, "init_method_std", None)
+        if init_method_std is None:
+            init_method_std = 0.02
+        self.weight.data.normal_(mean=0.0, std=init_method_std)
         if bias:
             self.bias.data.zero_()
 
@@ -59,6 +91,8 @@ class LinearForLastLayer(torch.nn.Linear):
 
 def _maybe_enable_fp32_lm_head(model: GPTModel, args: argparse.Namespace, role: str, post_process: bool) -> None:
     if post_process and role != "critic" and getattr(args, "enable_fp32_lm_head", False):
+        from slime.backends.megatron_utils.fp32_lm_head import enable_fp32_lm_head
+
         enable_fp32_lm_head(model)
 
 
@@ -89,54 +123,6 @@ def _get_model_provider_func(
 
         return wrapped_model_provider
 
-    if args.megatron_to_hf_mode == "bridge":
-        from megatron.bridge import AutoBridge
-
-        import slime_plugins.megatron_bridge  # noqa: F401  # register custom bridges
-
-        bridge = patch_auto_bridge_hf_config(AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True))
-        provider = bridge.to_megatron_provider(load_weights=False)
-        # TODO: we should not manually set this...
-        provider.tensor_model_parallel_size = args.tensor_model_parallel_size
-        provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
-        provider.expert_model_parallel_size = args.expert_model_parallel_size
-        provider.expert_tensor_parallel_size = args.expert_tensor_parallel_size
-        provider.sequence_parallel = args.sequence_parallel
-        provider.context_parallel_size = args.context_parallel_size
-        provider.variable_seq_lengths = args.variable_seq_lengths
-        if hasattr(args, "moe_token_dispatcher_type"):
-            provider.moe_token_dispatcher_type = args.moe_token_dispatcher_type
-        if getattr(args, "decoder_first_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
-        if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
-            provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
-        provider.finalize()
-
-        if role == "critic":
-            _original_provide = provider.provide
-
-            def _critic_provide(pre_process=True, post_process=True, vp_stage=None):
-                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-                if post_process:
-                    model.output_layer = LinearForLastLayer(
-                        input_size=model.config.hidden_size, output_size=1, config=model.config
-                    )
-                return model
-
-            return _critic_provide
-
-        if role == "actor" and getattr(args, "enable_fp32_lm_head", False):
-            _original_provide = provider.provide
-
-            def _actor_provide(pre_process=True, post_process=True, vp_stage=None):
-                model = _original_provide(pre_process=pre_process, post_process=post_process, vp_stage=vp_stage)
-                _maybe_enable_fp32_lm_head(model, args, role, post_process)
-                return model
-
-            return _actor_provide
-
-        return provider.provide
-
     def model_provider(pre_process: bool = True, post_process: bool = True, vp_stage: int | None = None) -> GPTModel:
         """Builds the model.
 
@@ -154,6 +140,10 @@ def _get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        # Older GLM Megatron forks consumed this flag from TransformerConfig.
+        # Preserve that contract for custom specs, while freeze_model_params()
+        # below provides the concrete implementation on current Megatron.
+        config.freeze_indexer = getattr(args, "freeze_indexer", False)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -252,7 +242,9 @@ def _get_model_provider_func(
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
+
         _maybe_enable_fp32_lm_head(model, args, role, post_process)
+
         return model
 
     return model_provider
@@ -300,3 +292,22 @@ def freeze_model_params(model: GPTModel, args: argparse.Namespace):
                 if re.search(pattern, name):
                     param.requires_grad = False
                     break
+
+    if getattr(args, "freeze_indexer", False):
+        frozen_indexer_params = []
+        has_self_attention_params = False
+        for name, param in model.named_parameters():
+            has_self_attention_params |= "self_attention" in name.split(".")
+            if _is_indexer_parameter(name):
+                param.requires_grad = False
+                frozen_indexer_params.append(name)
+
+        if has_self_attention_params and not frozen_indexer_params:
+            raise RuntimeError(
+                "--freeze-indexer was requested, but this model chunk has self-attention "
+                "parameters and no recognized DSA indexer parameters."
+            )
+
+        # Some pipeline stages may legitimately own no indexer weights, so an
+        # empty local tuple is not itself an error.
+        model._slime_frozen_indexer_param_names = tuple(frozen_indexer_params)

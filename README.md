@@ -3,6 +3,7 @@
 [中文版](./README_zh.md)
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://thudm.github.io/slime/)
+[![CI](https://img.shields.io/github/actions/workflow/status/THUDM/slime/pr-test.yml?branch=zilin%2Fci-dont-merge&event=pull_request&label=CI&logo=github)](https://github.com/THUDM/slime/pull/2053/checks)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/THUDM/slime)
 
 **slime** is an LLM post-training framework for RL scaling, providing two core capabilities:
@@ -16,7 +17,7 @@ This makes slime one of the most battle-tested open RL post-training frameworks:
 
 ## Why This Design Matters
 
-- **Battle-tested by frontier model training**: slime is the RL framework behind [GLM-5.1](https://z.ai/blog/glm-5.1), [GLM-5](https://z.ai/blog/glm-5), [GLM-4.7](https://z.ai/blog/glm-4.7), [GLM-4.6](https://z.ai/blog/glm-4.6), and [GLM-4.5](https://z.ai/blog/glm-4.5). This validates the full post-training loop, not only isolated examples.
+- **Battle-tested by frontier model training**: slime is the RL framework behind [GLM-5.3](https://z.ai/blog/glm-5.3), [GLM-5.2](https://z.ai/blog/glm-5.2), [GLM-5.1](https://z.ai/blog/glm-5.1), [GLM-5](https://z.ai/blog/glm-5), [GLM-4.7](https://z.ai/blog/glm-4.7), [GLM-4.6](https://z.ai/blog/glm-4.6), and [GLM-4.5](https://z.ai/blog/glm-4.5). This validates the full post-training loop, not only isolated examples.
 - **Correctness-first infrastructure**: RL bugs are often silent. slime keeps the dataflow explicit, supports separate rollout-only and train-only debugging paths, and documents reproducibility, fault tolerance, tracing, profiling, and CI as first-class engineering concerns.
 - **Native by design**: slime passes Megatron arguments through directly and exposes installed SGLang arguments with a `--sglang-` prefix. New upstream training and serving optimizations can be used without adding another abstraction layer inside slime.
 - **Maximum data-generation freedom**: math, code, search, tools, sandboxes, verifiers, environments, multi-agent systems, and long-horizon agentic workflows plug in as data generation or reward workflows. They do not fork the training kernel.
@@ -42,7 +43,7 @@ slime is not just a framework that can call an inference backend. It keeps the M
 - [PD Disaggregation](docs/en/advanced/pd-disaggregation.md) for multi-turn and agentic workloads with different prefill/decode resource needs;
 - router policies such as session affinity for multi-turn agents;
 - [Delta Weight Sync](docs/en/advanced/delta-weight-sync.md) for training/inference disaggregation and large-model update efficiency;
-- external rollout engines for deployments where serving is managed outside the training job.
+- [External Rollout Engines](docs/en/advanced/external-rollout-engines.md) for deployments where serving is managed outside the training job. The SGLang serving side can use an independent environment, and with disk transport can even run on different GPU models or vendors while using full-checkpoint update from disk or delta update over a shared filesystem.
 
 This pass-through design makes slime native from the start. Most upstream engine improvements remain accessible as the engines evolve, while slime focuses on the RL loop, dataflow, synchronization, and correctness checks.
 
@@ -101,7 +102,7 @@ We also provide examples for some use cases not covered in the quick start guide
 
 For agentic RL workloads, the following examples plug into the standard rollout / Data Buffer loop through customization interfaces — they are not separate frameworks:
 
-- [`examples/multi_agent`](examples/multi_agent/README.md): Multi-agent rollout via a custom `--rollout-function-path`.
+- [`examples/multi_agent`](examples/multi_agent/README.md): Multi-agent generation via `--custom-generate-function-path` inside the standard rollout loop.
 - [`examples/search-r1`](examples/search-r1/): Search/RAG-style multi-turn generation via `--custom-generate-function-path`.
 - [`examples/fully_async`](examples/fully_async/README.md): Fully-async rollout, useful for long-tail agentic generation where some samples take much longer than others.
 - [`examples/coding_agent_rl`](examples/coding_agent_rl/README.md): End-to-end SWE coding-agent RL with sandboxed tool use, test-based rewards, and token-correct trajectory segments via `--custom-generate-function-path`.
@@ -111,6 +112,18 @@ See the [Customization Guide](docs/en/get_started/customization.md) for which in
 ## Ecosystem Built on slime
 
 These are not just demos. They are independent systems that use slime as a reusable RL substrate for production-scale post-training, agentic RL, domain RL, and rollout-system research.
+
+### 🐎 Dressage: Scalable RL for Any Agent and Sandbox
+
+[**Dressage**](https://github.com/Accio-Lab/Dressage) is an agentic RL training framework built on slime by [Alibaba Accio](https://www.accio.com/work?im_ref=1O8wgT3poxyZWCj31F1ZJ0fNUkuTK6x9ZTHw0Y0&sharedid=&im_pid=5619512&im_pname=AI%20INTRO%20COPORATE), centered on unified RL for blackbox agents (e.g., [OpenCode](https://github.com/anomalyco/opencode), [OpenClaw](https://github.com/openclaw/openclaw)) and white loops across any sandbox environment (e.g., [bwrap](https://github.com/containers/bubblewrap), [E2B](https://github.com/e2b-dev/e2b), Kubernetes). It decouples interaction semantics, execution placement, and token-level trajectory capture through Paddock, Sandbox, and Proxy layers, adapting agent workflows without rewriting their internal loops. Dressage records token-wise logprobs, loss masks, weight versions, and MoE routing, then uses TITO and segment-aware training to turn long-horizon tool interactions into stable RL samples.
+
+### ⛵ Miles: Enterprise-Grade Reinforcement Learning for Large-Scale Model Training
+
+[Miles](https://github.com/radixark/miles) is an RL post-training framework for large-scale models, built on slime by [RadixArk](https://github.com/radixark). It stays closely aligned with slime's upstream development while extending it with enterprise-oriented features: deeper [SGLang](https://github.com/sgl-project/sglang) integration, operational tooling, deployment support, and optimizations for new [models](https://www.radixark.com/miles/docs/models) and [hardware](https://www.radixark.com/miles/docs/platforms). Miles also adds a growing set of production features, including LoRA, TITO, and low-precision training.
+
+### 🔷 vime: vLLM-Native RL Post-Training Built on slime
+
+[**vime**](https://github.com/vllm-project/vime) is a post-training framework built on slime and maintained by the vLLM project. It keeps slime's Megatron training stack, Data Buffer dataflow, and custom data-generation design, with its main change being a rollout backend swapped to [**vLLM**](https://github.com/vllm-project/vllm) with [vllm-router](https://github.com/vllm-project/router). Starting from an existing slime launch script, adjusting only rollout-related parameters is enough to quickly run training with vime.
 
 ### 🌈 Relax: Asynchronous RL Engine for Omni-Modal Agentic Training
 
@@ -140,6 +153,10 @@ These are not just demos. They are independent systems that use slime as a reusa
 
 [**qqr**](https://github.com/Alibaba-NLP/qqr) (a.k.a. hilichurl) is a lightweight extension for slime designed to evolve open-ended agents. It implements the **ArenaRL** algorithm to tackle discriminative collapse through tournament-based relative ranking (**e.g., Seeded Single-Elimination, Round-Robin**) and seamlessly integrates the **Model Context Protocol (MCP)**. qqr leverages slime's high-throughput training capabilities to enable scalable, distributed evolution of agents in standardized, decoupled tool environments.
 
+### ☁️ ART: Scalable and Sandboxed Agentic RL on AWS Bedrock AgentCore Runtime
+
+[**ART (AgentCore RL Toolkit)**](https://github.com/awslabs/agentcore-rl-toolkit) is an SDK that adapts production agents for RL training on **AWS Bedrock AgentCore Runtime**. AgentCore Runtime provides auto-scaled and sandboxed agent execution environments well-suited for running many parallel agent rollouts securely. Using ART, user only needs to apply a decorator (`@app.rollout_entrypoint`) to their agent codes for RL adaption while the same production agent harness is reused directly, where token capture for RL is handled at model gateway layer. ART uses slime as one option of training backends, enabling users to easily optimizing the production agent model with RL training algorithms in slime.
+
 Together, these projects show the main idea behind slime: one high-performance RL kernel can support frontier model post-training, online agent optimization, verifiable environments, omni-modal rollouts, kernel-generation agents, and rollout-system research without changing the core training loop.
 
 ## Arguments Walkthrough
@@ -151,6 +168,23 @@ Arguments in slime are divided into three categories:
 3.  **slime-specific arguments**: Please refer to: [slime/utils/arguments.py](slime/utils/arguments.py)
 
 For complete usage instructions, please refer to the [Usage Documentation](docs/en/get_started/usage.md).
+
+## Code Reading Path
+
+Start from the training loop and follow the calls only as deep as needed:
+
+```text
+train.py: train
+├─ slime/ray/placement_group.py       Ray resource and worker initialization
+├─ slime/ray/rollout.py              RolloutManager.generate: rollout orchestration
+│  └─ slime/rollout/sglang_rollout.py  Sample generation and reward computation
+└─ slime/ray/actor_group.py          RayTrainGroup.async_train: training dispatch
+   └─ slime/backends/megatron_utils/actor.py
+      ├─ model.py                    Megatron model execution
+      └─ loss.py                     RL losses and advantages
+```
+
+On a first pass, treat `slime/utils/arguments.py` as the configuration entry point. The deployment details in `slime/backends/sglang_utils/` and the weight-sync implementations under `slime/backends/megatron_utils/update_weight/` can also wait until you need to change those areas.
 
 ## Developer Guide
 

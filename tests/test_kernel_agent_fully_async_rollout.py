@@ -14,7 +14,6 @@ from examples.kernel_agent import fully_async_rollout
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
-
 pytestmark = pytest.mark.unit
 
 
@@ -32,6 +31,15 @@ def _make_rollout_args(**overrides):
     return Namespace(**values)
 
 
+def _make_group(index: int) -> list[Sample]:
+    sample = Sample(index=index, group_index=index, prompt=f"p{index}")
+    sample.status = Sample.Status.COMPLETED
+    sample.reward = 0.0
+    sample.response = "ok"
+    sample.response_length = 1
+    return [sample]
+
+
 def test_kernel_agent_group_concurrency_matches_client_capacity():
     args = _make_rollout_args()
 
@@ -40,6 +48,108 @@ def test_kernel_agent_group_concurrency_matches_client_capacity():
 
     assert client_concurrency == 64
     assert group_concurrency == 4
+
+
+def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(),
+        data_buffer=None,
+        concurrency=4,
+    )
+    for gid in range(10):
+        worker.output_queue.put((gid, _make_group(gid)))
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+
+    args = _make_rollout_args(
+        rollout_global_dataset=True,
+        rollout_batch_size=4,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+    )
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert [group[0].index for group in output.samples] == [0, 1, 2, 3]
+    assert worker.queue_size() == 6
+    assert [gid for gid, _ in worker.get_completed_groups()] == [4, 5, 6, 7, 8, 9]
+
+
+def test_kernel_agent_done_callback_never_blocks_on_full_queue(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(),
+        data_buffer=None,
+        concurrency=4,
+    )
+
+    class DoneTask:
+        def __init__(self, gid):
+            self._result = _make_group(gid)
+
+        def result(self):
+            return self._result
+
+    def push_all():
+        for gid in range(1001):
+            original_group = _make_group(gid)
+            worker._make_done_cb(gid, original_group)(DoneTask(gid))
+
+    pusher = threading.Thread(target=push_all, daemon=True)
+    pusher.start()
+    pusher.join(timeout=10)
+
+    assert not pusher.is_alive(), "done callback blocked on the output queue"
+    assert worker.queue_size() == 1001
+
+
+def test_kernel_agent_worker_applies_queue_backpressure(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
+    class FakeDataBuffer:
+        def __init__(self):
+            self.groups = [_make_group(index) for index in range(60)]
+
+        def get_samples(self, count):
+            out = self.groups[:count]
+            self.groups = self.groups[count:]
+            return out
+
+    async def instant_generate(args, group, sampling_params, evaluation):
+        return group
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+    monkeypatch.setattr(fully_async_rollout, "generate_and_rm_group", instant_generate)
+    concurrency = 3
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(),
+        FakeDataBuffer(),
+        concurrency=concurrency,
+    )
+    worker.poll_interval = 0.01
+
+    worker.start()
+    try:
+        deadline = time.monotonic() + 1.0
+        max_seen = 0
+        while time.monotonic() < deadline:
+            max_seen = max(max_seen, worker.queue_size())
+            if max_seen > 2 * concurrency:
+                break
+            time.sleep(0.02)
+    finally:
+        worker.stop()
+
+    assert 0 < max_seen <= 2 * concurrency
 
 
 def test_http_client_is_scoped_to_current_event_loop():
@@ -244,7 +354,7 @@ def test_kernel_agent_http_client_does_not_cancel_slow_posts():
 
 
 def test_full_async_kernel_agent_script_guards_critical_config():
-    script = Path("examples/kernel_agent/run.t1.qwen3.6.27B.full-async.sh").read_text()
+    script = Path("examples/kernel_agent/run.t1.qwen3.6.27B.fasync.sh").read_text()
 
     # Router retries/circuit-breaker must stay enabled (matches reference runs).
     assert "--router-disable-retries" not in script

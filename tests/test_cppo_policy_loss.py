@@ -1,6 +1,26 @@
+import ast
+from pathlib import Path
+
 import torch
 
 from slime.utils.ppo_utils import compute_cppo_policy_loss
+
+
+def test_cppo_training_path_uses_current_cp_slice_signature():
+    loss_path = Path(__file__).parents[1] / "slime" / "backends" / "megatron_utils" / "loss.py"
+    module = ast.parse(loss_path.read_text())
+    policy_loss_function = next(
+        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "policy_loss_function"
+    )
+    slice_calls = [
+        node
+        for node in ast.walk(policy_loss_function)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "slice_log_prob_with_cp"
+    ]
+
+    assert len(slice_calls) == 1
+    assert len(slice_calls[0].args) == 3
+    assert not any(isinstance(node, ast.Name) and node.id == "max_seq_lens" for node in ast.walk(policy_loss_function))
 
 
 def test_cppo_position_weight_relaxes_late_token_threshold():

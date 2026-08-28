@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.utils import logging_utils
+from slime.observability import logging_utils
 
 
 class _RemoteMethod:

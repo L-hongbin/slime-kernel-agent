@@ -216,6 +216,25 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 
+wandb/
+outputs/
+local/
+train_rollout_diff_exp/results/
+**/rollout_data/
+**/buffer_stats/
+*.out
+*.pkl
+*.code-workspace
+
+# Local workspace artifacts
+.idea/
+*.iml
+.DS_Store
+.venv*/
+glm/
+_examples_synced/
+settings.json
+
 # Streamlit
 .streamlit/secrets.toml
 
