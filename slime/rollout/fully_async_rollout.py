@@ -96,7 +96,9 @@ class AsyncRolloutWorker:
     def stop(self) -> None:
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
-            self.worker_thread.join(timeout=5)
+            self.worker_thread.join(timeout=15)
+            if self.worker_thread.is_alive():
+                logger.warning("fully-async: worker thread did not stop within timeout")
 
     def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
         completed: list[tuple[int, list[Sample]]] = []
@@ -161,15 +163,24 @@ class AsyncRolloutWorker:
                 "fully-async: waiting for %d in-flight tasks to drain",
                 len(active_tasks),
             )
-            try:
-                await asyncio.wait(active_tasks, timeout=30)
-            except Exception:  # noqa: BLE001
-                pass
+            done, pending = await asyncio.wait(active_tasks, timeout=10)
+            if pending:
+                logger.warning("fully-async: cancelling %d in-flight tasks after drain timeout", len(pending))
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                try:
+                    task.result()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("fully-async: in-flight task finished with error during stop: %r", exc)
 
     def _make_done_cb(self, gid: int):
         def _cb(done_task: asyncio.Task) -> None:
             try:
                 result = done_task.result()
+            except asyncio.CancelledError:
+                return
             except Exception:  # noqa: BLE001
                 logger.exception("fully-async: process task raised")
                 return
