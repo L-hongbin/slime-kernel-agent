@@ -43,9 +43,10 @@ output_mismatch_partial_reward = float(os.environ.get("CUDA_AGENT_OUTPUT_MISMATC
 performance_reward_requires_correctness = bool(
     int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
 )
+max_feedback_chars = int(os.environ.get("CUDA_AGENT_MAX_FEEDBACK_CHARS", "0"))
 
 CUDA_AGENT_CONFIGS = {
-    "max_feedback_chars": 0,
+    "max_feedback_chars": max_feedback_chars,
     "log_multi_turn_sample_rate": 0.01,
     "log_multi_turn_full_text": False,
     "log_rollout_info": log_rollout_info,

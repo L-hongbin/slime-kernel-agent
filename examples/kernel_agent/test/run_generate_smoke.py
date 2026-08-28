@@ -166,6 +166,13 @@ class ModelNew(nn.Module):
 
 
 class FakeTokenizer:
+    eos_token_id = 10_000
+    eos_token = "<|im_end|>"
+
+    def convert_tokens_to_ids(self, token):
+        assert token == self.eos_token
+        return self.eos_token_id
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
         rendered = []
         for message in messages:
@@ -178,7 +185,14 @@ class FakeTokenizer:
         return text
 
     def __call__(self, text, add_special_tokens=False):
+        if text == "</think>":
+            return {"input_ids": [9_001]}
+        if text == "\n</think>\n\n":
+            return {"input_ids": [9_000, 9_001, 9_002]}
         return {"input_ids": list(range(1, len(str(text).split()) + 1))}
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        return " ".join(str(token_id) for token_id in token_ids)
 
 
 class FakeGenerateState:
@@ -189,7 +203,7 @@ class FakeGenerateState:
         self.active_lora_name = None
 
     def _is_qwen3_5_model(self):
-        return False
+        return True
 
 
 def _json_dumps(payload: Any) -> str:
@@ -314,7 +328,7 @@ def _install_fake_generate_state() -> None:
 
 
 def _install_fake_model(response: str) -> None:
-    async def fake_post(url, payload, max_retries=None):
+    async def fake_post(url, payload, max_retries=None, headers=None):
         token_ids = list(range(1, len(response.split()) + 1))
         return {
             "text": response,

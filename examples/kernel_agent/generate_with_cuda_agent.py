@@ -150,6 +150,72 @@ def _sanitize_assistant_history_content(text: str) -> str:
     return _HARMONY_CTRL_RE.sub("", text).strip()
 
 
+def _tokenize_without_special_tokens(tokenizer: Any, text: str) -> list[int]:
+    return list(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+
+def _contains_token_subsequence(token_ids: list[int], subsequence: list[int]) -> bool:
+    if not subsequence or len(subsequence) > len(token_ids):
+        return False
+    width = len(subsequence)
+    return any(token_ids[start : start + width] == subsequence for start in range(len(token_ids) - width + 1))
+
+
+def _build_qwen_next_turn_prompt_ids(
+    tokenizer: Any,
+    prompt_ids: list[int],
+    response_ids: list[int],
+    feedback: str,
+    *,
+    enable_thinking: bool,
+) -> tuple[list[int], int, bool]:
+    """Append a Qwen user-feedback turn without re-encoding generated history.
+
+    The previous prompt and generated response tokens stay byte-for-byte intact.
+    A missing ``</think>`` is closed before ``<|im_end|>`` so length-truncated
+    reasoning remains a structurally valid assistant message. If the generated
+    response already ended in ``<|im_end|>``, only that terminal token may move
+    after the inserted close marker; every earlier generated token is still an
+    exact reusable prefix.
+    """
+
+    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    if eos_token_id is None or int(eos_token_id) < 0:
+        raise ValueError("Qwen token-prefix continuation requires the <|im_end|> token.")
+    eos_token_id = int(eos_token_id)
+
+    response_ids = list(response_ids)
+    had_terminal_eos = bool(response_ids and response_ids[-1] == eos_token_id)
+    response_body_ids = response_ids[:-1] if had_terminal_eos else response_ids
+    close_think_ids = _tokenize_without_special_tokens(tokenizer, "</think>")
+    inserted_close_think = enable_thinking and not _contains_token_subsequence(response_body_ids, close_think_ids)
+
+    next_prompt_ids = list(prompt_ids) + response_body_ids
+    if inserted_close_think:
+        next_prompt_ids.extend(_tokenize_without_special_tokens(tokenizer, "\n</think>\n\n"))
+    next_prompt_ids.append(eos_token_id)
+
+    thinking_prefix = "<think>\n" if enable_thinking else "<think>\n\n</think>\n\n"
+    next_prompt_ids.extend(
+        _tokenize_without_special_tokens(
+            tokenizer,
+            "\n<|im_start|>user\n" + feedback + "<|im_end|>\n<|im_start|>assistant\n" + thinking_prefix,
+        )
+    )
+
+    if had_terminal_eos and inserted_close_think:
+        exact_prefix_tokens = len(prompt_ids) + len(response_body_ids)
+    else:
+        exact_prefix_tokens = len(prompt_ids) + len(response_ids)
+    return next_prompt_ids, exact_prefix_tokens, inserted_close_think
+
+
+def _sglang_routing_headers(args: Any, sample: Sample) -> dict[str, str] | None:
+    if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
+        return {"X-SMG-Routing-Key": sample.session_id}
+    return None
+
+
 def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     response_template = getattr(state, "multi_turn_template", None)
     if response_template is None:
@@ -364,7 +430,8 @@ def _log_rollout_info(
         }
         logger.info(
             "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s "
-            "response_tokens=%s "
+            "response_tokens=%s cached_tokens=%s next_turn_prompt_tokens=%s next_turn_exact_prefix_tokens=%s "
+            "next_turn_inserted_close_think=%s "
             "finish_type=%s status=%s error=%s precheck=%s speedup=%s correctness=%s compiled=%s "
             "partial_credit=%s partial_reason=%s reward=%s detail_env_time=%s perf_cv=%s",
             prefix,
@@ -375,6 +442,10 @@ def _log_rollout_info(
             item.get("prompt_tokens"),
             item.get("max_new_tokens"),
             item.get("response_tokens"),
+            item.get("cached_tokens"),
+            item.get("next_turn_prompt_tokens"),
+            item.get("next_turn_exact_prefix_tokens"),
+            item.get("next_turn_inserted_close_think"),
             item.get("finish_type"),
             env_state.get("status"),
             env_state.get("error"),
@@ -958,13 +1029,16 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     """Generate CUDA-kernel multi-turn rollouts.
 
     This follows the drkernel-style structure: each assistant turn becomes one
-    training Sample. Environment feedback is appended to the conversation
-    messages and therefore becomes part of the next turn prompt, not part of the
-    current turn response.
+    training Sample. Environment feedback becomes part of the next turn prompt,
+    not the current response. Compatible Qwen runs can retain the previous
+    prompt and generated token IDs directly instead of rendering history again.
     """
 
     state = GenerateState(args)
     messages = _as_messages(sample.prompt)
+    preserve_history_thinking = bool(getattr(args, "preserve_history_thinking", False))
+    if preserve_history_thinking and not state._is_qwen3_5_model():
+        raise ValueError("--preserve-history-thinking is currently implemented only for Qwen3.5/Qwen3.8.")
     max_turns = getattr(args, "max_turns", None)
     if max_turns is None:
         raise ValueError("--max-turns must be set for CUDA kernel agent rollout")
@@ -988,15 +1062,30 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     log_first_rollout = _claim_first_rollout_log()
     turn_logs: list[dict[str, Any]] = []
     finish_reason = "max_turns"
+    next_prompt_ids: list[int] | None = None
+    next_exact_prefix_tokens: int | None = None
+    next_inserted_close_think = False
 
     for turn_idx in range(max_turns):
-        prompt_text = state.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **state.apply_chat_template_kwargs,
-        )
-        prompt_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        exact_prefix_tokens = next_exact_prefix_tokens
+        inserted_close_think = next_inserted_close_think
+        if next_prompt_ids is None:
+            prompt_text = state.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                **state.apply_chat_template_kwargs,
+            )
+            prompt_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+        else:
+            prompt_ids = next_prompt_ids
+            # Decode only for optional human-readable logging. The model request
+            # consumes prompt_ids directly, so this cannot perturb the prefix.
+            prompt_text = (
+                ""
+                if CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", False)
+                else state.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            )
         max_context_len = getattr(args, "rollout_max_context_len", None)
         if max_context_len is not None and len(prompt_ids) >= max_context_len:
             sample.status = Sample.Status.TRUNCATED
@@ -1042,7 +1131,12 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             payload["lora_path"] = lora_path
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
-        output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
+        output = await post(
+            url,
+            payload,
+            max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES,
+            headers=_sglang_routing_headers(args, sample),
+        )
         model_time = time.monotonic() - model_started_at
         finish_type = output["meta_info"]["finish_reason"]["type"]
         if finish_type == "abort":
@@ -1125,6 +1219,15 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time
+        if exact_prefix_tokens is not None:
+            turn_sample.metadata.update(
+                {
+                    "history_prefix_mode": "token_ids",
+                    "history_exact_prefix_tokens": exact_prefix_tokens,
+                    "history_prompt_tokens": len(prompt_ids),
+                    "history_inserted_close_think": inserted_close_think,
+                }
+            )
         turn_reward = await reward_func(args, turn_sample)
         turn_sample.reward = turn_reward
         turn_log = {
@@ -1135,6 +1238,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": turn_sampling_params.get("max_new_tokens"),
             "response_tokens": len(response_ids),
+            "cached_tokens": output["meta_info"].get("cached_tokens"),
             "finish_type": finish_type,
             "prompt": prompt_text,
             "response": response,
@@ -1161,6 +1265,22 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             break
 
         messages.append({"role": "user", "content": format_feedback})
+        if preserve_history_thinking:
+            enable_thinking = state.apply_chat_template_kwargs.get("enable_thinking", True) is not False
+            next_prompt_ids, next_exact_prefix_tokens, next_inserted_close_think = _build_qwen_next_turn_prompt_ids(
+                state.tokenizer,
+                prompt_ids,
+                response_ids,
+                format_feedback,
+                enable_thinking=enable_thinking,
+            )
+            turn_log.update(
+                {
+                    "next_turn_prompt_tokens": len(next_prompt_ids),
+                    "next_turn_exact_prefix_tokens": next_exact_prefix_tokens,
+                    "next_turn_inserted_close_think": next_inserted_close_think,
+                }
+            )
 
     total_request_time = sum(
         float(item.get("model_time", 0.0)) + float(item.get("env_time", 0.0)) for item in turn_logs

@@ -858,7 +858,7 @@ def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
     ``overlong_buffer_len`` tokens of each sample's effective response budget,
     capped at ``-factor`` at that budget. The effective budget is the smaller
     of ``rollout_max_response_len`` and ``rollout_max_context_len-prompt_len``;
-    this matters when context and response are both configured to 24K. Applied
+    this matters when context and response share the same long-context cap. Applied
     to per-turn ``sample.reward`` before multi-turn accumulation, so TRLOO
     trains on the penalized reward. The PRE-penalty reward is recorded in
     ``metadata["task_reward"]``: the group low-variance filter judges on it, so
@@ -871,11 +871,16 @@ def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
     factor = float(getattr(args, "overlong_penalty_factor", 1.0))
     response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
     context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0)
+    target_turn_idx = getattr(args, "overlong_penalty_turn_idx", None)
+    target_turn_idx = None if target_turn_idx is None else int(target_turn_idx)
     if buffer_len <= 0 or factor <= 0 or response_cap <= 0:
         return
 
     for sample in output_samples:
         if sample.remove_sample:
+            continue
+        turn_idx = sample.metadata.get("turn_idx") if isinstance(sample.metadata, dict) else None
+        if target_turn_idx is not None and turn_idx != target_turn_idx:
             continue
         sample.metadata = dict(sample.metadata or {})
         task_reward = float(sample.reward)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ from slime.backends.megatron_utils.actor import _slice_predictive_support_with_c
 from slime.ray.rollout import RolloutManager
 from slime.rollout import sglang_rollout
 from slime.rollout.sglang_rollout import _append_predictive_support, _extract_predictive_support
+from slime.utils.arguments import get_slime_extra_args_provider, slime_validate_args
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
@@ -127,6 +129,220 @@ class _GenerateState:
     multi_turn_templates = {}
 
 
+class _ContinuationTokenizer:
+    eos_token_id = 248046
+    pad_token_id = 248044
+    eos_token = "<|im_end|>"
+    pad_token = "<|endoftext|>"
+
+    def __init__(self):
+        self.encoded_texts = []
+
+    def convert_tokens_to_ids(self, token):
+        assert token == "<|im_end|>"
+        return self.eos_token_id
+
+    def __call__(self, text, add_special_tokens=False):
+        assert add_special_tokens is False
+        self.encoded_texts.append(text)
+        if text == "prompt":
+            return {"input_ids": [1, 2]}
+        if text == "</think>":
+            return {"input_ids": [91]}
+        if text == "\n</think>\n\n":
+            return {"input_ids": [90, 91, 92]}
+        return {"input_ids": [100, 101]}
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        return "prompt"
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        return "decoded"
+
+
+class _TokenHistoryGenerateState:
+    tokenizer = _ContinuationTokenizer()
+    processor = None
+    active_lora_name = None
+    apply_chat_template_kwargs = {"enable_thinking": True}
+    multi_turn_template = None
+
+    @staticmethod
+    def _is_qwen3_5_model():
+        return True
+
+
+@pytest.mark.unit
+def test_preserve_history_thinking_cli_enables_only_exact_history_mode():
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+
+    args = parser.parse_args(["--rollout-batch-size", "1", "--preserve-history-thinking"])
+
+    assert args.preserve_history_thinking is True
+    with pytest.raises(ValueError, match="requires --use-multi-turn"):
+        slime_validate_args(args)
+
+    removed_option = "--preserve-history-" + "token-prefix"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", removed_option])
+
+
+@pytest.mark.unit
+def test_preserve_history_thinking_does_not_inject_chat_template_kwargs(monkeypatch):
+    monkeypatch.setattr(sglang_rollout, "load_tokenizer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(sglang_rollout, "load_processor", lambda *args, **kwargs: None)
+    args = SimpleNamespace(
+        hf_checkpoint="unused",
+        apply_chat_template_kwargs={"enable_thinking": False},
+        preserve_history_thinking=True,
+        multi_turn_prompt_config_path=None,
+        rollout_num_gpus=1,
+        rollout_num_gpus_per_engine=1,
+        sglang_server_concurrency=1,
+        rollout_temperature=1.0,
+        rollout_top_p=1.0,
+        rollout_top_k=-1,
+        rollout_max_response_len=16,
+        rollout_stop=None,
+        rollout_stop_token_ids=None,
+        rollout_skip_special_tokens=False,
+        sglang_enable_deterministic_inference=False,
+        sglang_dp_size=1,
+    )
+    state = object.__new__(sglang_rollout.GenerateState)
+
+    sglang_rollout.GenerateState.__init__(state, args)
+
+    assert state.apply_chat_template_kwargs == {"enable_thinking": False}
+
+
+@pytest.mark.unit
+def test_qwen_token_history_preserves_complete_generated_prefix():
+    tokenizer = _ContinuationTokenizer()
+    prompt_ids = [1, 2]
+    response_ids = [3, 91, 4, tokenizer.eos_token_id]
+
+    next_ids, exact_prefix_tokens, inserted_close = cuda_agent._build_qwen_next_turn_prompt_ids(
+        tokenizer,
+        prompt_ids,
+        response_ids,
+        "feedback",
+        enable_thinking=True,
+    )
+
+    assert next_ids[: len(prompt_ids + response_ids)] == prompt_ids + response_ids
+    assert exact_prefix_tokens == len(prompt_ids + response_ids)
+    assert inserted_close is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("terminal_eos", [False, True])
+def test_qwen_token_history_closes_truncated_thinking_without_reencoding_response(terminal_eos):
+    tokenizer = _ContinuationTokenizer()
+    prompt_ids = [1, 2]
+    response_ids = [3, 4] + ([tokenizer.eos_token_id] if terminal_eos else [])
+
+    next_ids, exact_prefix_tokens, inserted_close = cuda_agent._build_qwen_next_turn_prompt_ids(
+        tokenizer,
+        prompt_ids,
+        response_ids,
+        "feedback",
+        enable_thinking=True,
+    )
+
+    assert next_ids[: len(prompt_ids) + 2] == prompt_ids + [3, 4]
+    assert next_ids[len(prompt_ids) + 2 : len(prompt_ids) + 5] == [90, 91, 92]
+    assert next_ids[len(prompt_ids) + 5] == tokenizer.eos_token_id
+    assert exact_prefix_tokens == len(prompt_ids) + len(response_ids) - int(terminal_eos)
+    assert inserted_close is True
+
+
+@pytest.mark.unit
+def test_cuda_agent_consistent_hashing_uses_sample_session_id():
+    sample = Sample(session_id="trajectory-7")
+    args = SimpleNamespace(router_policy="consistent_hashing")
+
+    assert cuda_agent._sglang_routing_headers(args, sample) == {"X-SMG-Routing-Key": "trajectory-7"}
+    assert cuda_agent._sglang_routing_headers(SimpleNamespace(router_policy="round_robin"), sample) is None
+
+
+@pytest.mark.unit
+def test_generate_group_assigns_unique_session_ids_before_custom_generation(monkeypatch):
+    seen_session_ids = []
+
+    async def fake_generate_and_rm(args, sample, sampling_params, evaluation=False):
+        seen_session_ids.append(sample.session_id)
+        return sample
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: SimpleNamespace(aborted=False))
+    monkeypatch.setattr(sglang_rollout, "generate_and_rm", fake_generate_and_rm)
+    group = [Sample(prompt="a"), Sample(prompt="b")]
+    args = SimpleNamespace(
+        sglang_enable_deterministic_inference=False,
+        use_multi_turn=False,
+        group_rm=False,
+    )
+
+    result = asyncio.run(sglang_rollout.generate_and_rm_group(args, group, {"max_new_tokens": 1}))
+
+    assert result == group
+    assert all(seen_session_ids)
+    assert len(set(seen_session_ids)) == len(group)
+
+
+@pytest.mark.unit
+def test_cuda_agent_two_turn_generation_uses_exact_history_and_same_session_header(monkeypatch):
+    payloads = []
+    captured_headers = []
+
+    async def recording_post(url, payload, max_retries=None, headers=None):
+        payloads.append(payload)
+        captured_headers.append(headers)
+        return {"text": "answer", "meta_info": _meta_info()}
+
+    async def fake_env(args, sample, response, turn_idx):
+        return {"env_state": {"done": turn_idx == 1}}
+
+    async def fake_reward(*args, **kwargs):
+        return 1.0
+
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _TokenHistoryGenerateState())
+    monkeypatch.setattr(cuda_agent, "post", recording_post)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", fake_env)
+    monkeypatch.setattr(cuda_agent, "reward_func", fake_reward)
+    monkeypatch.setattr(cuda_agent, "_extract_env_extra_info", lambda result: {})
+    monkeypatch.setattr(cuda_agent, "postprocess_turn_samples", lambda args, samples, finish_reason: samples)
+    args = SimpleNamespace(
+        max_turns=2,
+        use_multi_turn=True,
+        padding_turns=False,
+        preserve_history_thinking=True,
+        rollout_max_context_len=128,
+        sglang_speculative_algorithm=None,
+        dppo_predictive_top_k=0,
+        use_rollout_routing_replay=False,
+        use_lora_weight_sync=False,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+        router_policy="consistent_hashing",
+    )
+    sample = Sample(prompt="hello", session_id="trajectory-12")
+
+    result = asyncio.run(cuda_agent._generate_impl(args, sample, {"max_new_tokens": 2}))
+
+    assert len(payloads) == 2
+    assert payloads[0]["input_ids"] == [1, 2]
+    assert payloads[1]["input_ids"][:4] == [1, 2, 7, 99]
+    assert payloads[1]["input_ids"][4:8] == [90, 91, 92, _ContinuationTokenizer.eos_token_id]
+    assert captured_headers == [
+        {"X-SMG-Routing-Key": "trajectory-12"},
+        {"X-SMG-Routing-Key": "trajectory-12"},
+    ]
+    assert len(result) == 2
+    assert result[1].metadata["history_exact_prefix_tokens"] == 4
+    assert result[1].metadata["history_inserted_close_think"] is True
+
+
 def _default_generate_args() -> SimpleNamespace:
     return SimpleNamespace(
         ci_test=False,
@@ -165,8 +381,9 @@ def test_default_sglang_generate_requests_and_captures_top_logprobs(monkeypatch)
 def test_cuda_agent_generate_requests_and_captures_top_logprobs(monkeypatch):
     captured = {}
 
-    async def fake_post(url, payload, max_retries=None):
+    async def fake_post(url, payload, max_retries=None, headers=None):
         captured.update(payload)
+        captured["headers"] = headers
         return {"text": "answer", "meta_info": _meta_info()}
 
     async def fake_env(*args, **kwargs):
@@ -193,10 +410,18 @@ def test_cuda_agent_generate_requests_and_captures_top_logprobs(monkeypatch):
         use_lora_weight_sync=False,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
+        router_policy="consistent_hashing",
     )
-    result = asyncio.run(cuda_agent._generate_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
+    result = asyncio.run(
+        cuda_agent._generate_impl(
+            args,
+            Sample(prompt="hello", session_id="trajectory-11"),
+            {"max_new_tokens": 2},
+        )
+    )
 
     assert captured["top_logprobs_num"] == 2
+    assert captured["headers"] == {"X-SMG-Routing-Key": "trajectory-11"}
     assert len(result) == 1
     turn = result[0]
     assert turn.rollout_topk_token_ids.shape == (2, 3)

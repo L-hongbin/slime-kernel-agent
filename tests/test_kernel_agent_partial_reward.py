@@ -372,5 +372,37 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
     assert uniform_result.reason == "reward_std_lt_0.001"
 
 
+def test_overlong_penalty_can_target_only_second_turn():
+    args = SimpleNamespace(
+        overlong_penalty=True,
+        overlong_use_effective_response_cap=True,
+        overlong_buffer_len=4096,
+        overlong_penalty_factor=0.2,
+        overlong_penalty_turn_idx=1,
+        rollout_max_response_len=32768,
+        rollout_max_context_len=32768,
+    )
+    turn0 = Sample(
+        reward=1.0,
+        tokens=[0] * 32768,
+        response_length=32768,
+        metadata={"turn_idx": 0},
+    )
+    turn1 = Sample(
+        reward=1.0,
+        tokens=[0] * 32768,
+        response_length=8192,
+        metadata={"turn_idx": 1},
+    )
+
+    _apply_overlong_penalty(args, [turn0, turn1])
+
+    assert turn0.reward == 1.0
+    assert "overlong_penalty" not in turn0.metadata
+    assert turn1.reward == pytest.approx(0.8)
+    assert turn1.metadata["overlong_effective_response_cap"] == 8192
+    assert turn1.metadata["overlong_penalty"] == pytest.approx(0.2)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

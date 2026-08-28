@@ -368,9 +368,8 @@ class GenerateState(metaclass=SingletonMeta):
             args.hf_checkpoint, trust_remote_code=True, **getattr(args, "tokenizer_load_kwargs", {})
         )
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
-        self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
+        self.apply_chat_template_kwargs = dict(getattr(args, "apply_chat_template_kwargs", None) or {})
         logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)
-        self._warn_history_thinking_template()
         self.multi_turn_template = PromptTemplate.from_path(getattr(args, "multi_turn_prompt_config_path", None))
 
         self.semaphore = asyncio.Semaphore(get_sglang_client_concurrency(args))
@@ -401,29 +400,6 @@ class GenerateState(metaclass=SingletonMeta):
         self.active_lora_name: str | None = None
 
         self.reset()
-
-    def _warn_history_thinking_template(self) -> None:
-        if not bool(getattr(self.args, "preserve_history_thinking", False)):
-            return
-
-        if self._is_qwen3_5_model():
-            logger.warning(
-                "args.preserve_history_thinking=True with a Qwen3.5/Qwen3.6-series tokenizer. "
-                "Pass preserve_thinking=True to tokenizer.apply_chat_template when rendering multi-turn prompts."
-            )
-            return
-
-        logger.warning(
-            "args.preserve_history_thinking=True. The tokenizer.apply_chat_template behavior is model-specific "
-            "and may not preserve previous assistant <think> blocks; please verify the rendered multi-turn prompt "
-            "or add model-specific handling."
-        )
-
-    def _get_apply_chat_template_kwargs(self) -> dict[str, Any]:
-        kwargs = dict(getattr(self.args, "apply_chat_template_kwargs", None) or {})
-        if bool(getattr(self.args, "preserve_history_thinking", False)) and self._is_qwen3_5_model():
-            kwargs["preserve_thinking"] = True
-        return kwargs
 
     def _is_qwen3_5_model(self) -> bool:
         hf_checkpoint = getattr(self.args, "hf_checkpoint", None)

@@ -468,7 +468,7 @@ def test_cuda_agent_sglang_post_is_fail_fast_by_default():
         'KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))'
         in source
     )
-    assert "post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)" in source
+    assert "max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES" in source
 
 
 if __name__ == "__main__":

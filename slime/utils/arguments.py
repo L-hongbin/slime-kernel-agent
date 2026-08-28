@@ -865,8 +865,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help=(
-                    "Whether multi-turn prompt rendering should preserve previous assistant <think> blocks. "
-                    "Custom generate functions should pass this through to tokenizer.apply_chat_template when supported."
+                    "Let compatible custom multi-turn generate functions build later prompts from the exact "
+                    "prompt and generated token IDs of the previous turn. This avoids decode/re-encode drift "
+                    "and preserves both historical thinking and rollout prefix-cache locality."
                 ),
             )
             # partial rollout
@@ -2062,6 +2063,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Maximum reward subtraction applied by --overlong-penalty.",
             )
             parser.add_argument(
+                "--overlong-penalty-turn-idx",
+                type=int,
+                default=None,
+                help=(
+                    "Optional zero-based turn index to which --overlong-penalty is restricted. "
+                    "The default applies the penalty to every turn."
+                ),
+            )
+            parser.add_argument(
                 "--overlong-use-effective-response-cap",
                 action="store_true",
                 default=False,
@@ -2588,6 +2598,13 @@ def slime_validate_args(args):
             "for turn-aware reward normalization, for example "
             "examples.kernel_agent.kernel_reward.reward_post_process_by_group."
         )
+    if args.preserve_history_thinking and not args.use_multi_turn:
+        raise ValueError("--preserve-history-thinking requires --use-multi-turn.")
+    if args.overlong_penalty_turn_idx is not None:
+        if args.overlong_penalty_turn_idx < 0:
+            raise ValueError("--overlong-penalty-turn-idx must be non-negative.")
+        if args.max_turns is not None and args.overlong_penalty_turn_idx >= args.max_turns:
+            raise ValueError("--overlong-penalty-turn-idx must be smaller than --max-turns.")
 
     if args.get_mismatch_metrics:
         assert (

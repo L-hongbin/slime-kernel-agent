@@ -141,11 +141,10 @@ encode(decode(G))==G ? True   ← 不是 BPE 重分词的锅
 > <!-- 技术细节 -->
 <!-- > transformers 加载时 `.jinja` 文件优先于 tokenizer_config.json 内联字段（已实测）。 -->
 
-> <!-- 已清理 -->
-<!-- > dead flag `--preserve-history-thinking`（drkernel）从没接线，已删（args.py + design-docs）。 -->
-
-> <!-- 备选方案（未实现） -->
-<!-- > token 续接：保留 `prev input_ids + 生成 token_ids` 直接拼接、不重渲染 → LCP 222/222，免疫所有模板/分词边界问题（含截断）。但同样把 reasoning 留上下文。 -->
+> <!-- 后续实现 -->
+<!-- > 当时的 token 续接备选方案后来成为 `--preserve-history-thinking` 的正式实现：保留
+> `prev input_ids + 生成 token_ids` 直接拼接、不重渲染，也不再映射 chat template 的
+> `preserve_thinking` 参数。 -->
 
 ### 4.3 代价：preserve 撑大上下文 → 显存不足
 
