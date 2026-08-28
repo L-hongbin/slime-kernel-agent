@@ -61,6 +61,25 @@ def _fp32_lm_head_requested(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "fp32_lm_head", False) or getattr(args, "enable_fp32_lm_head", False))
 
 
+def _apply_qwen_gdn_pipeline_overrides(args: argparse.Namespace, config: TransformerConfig) -> None:
+    """Select the deadlock-safe PP transport required by distributed GDN SP."""
+    requires_rank_ordered_p2p = (
+        getattr(args, "qwen_gdn_implementation", "replicated") == "distributed"
+        and getattr(args, "sequence_parallel", False)
+        and getattr(config, "pipeline_model_parallel_size", 1) > 1
+    )
+    if not requires_rank_ordered_p2p:
+        return
+    if not getattr(args, "qwen_gdn_sp_disable_batch_p2p_comm", False):
+        raise ValueError(
+            "Distributed Qwen GDN with sequence parallel and pipeline parallelism requires "
+            "--qwen-gdn-sp-disable-batch-p2p-comm."
+        )
+    if getattr(config, "overlap_p2p_comm", False):
+        raise ValueError("--qwen-gdn-sp-disable-batch-p2p-comm cannot be combined with overlap P2P communication.")
+    config.batch_p2p_comm = False
+
+
 def _enable_actor_fp32_lm_head(model: GPTModel) -> GPTModel:
     """Compatibility wrapper for the main-branch helper name."""
     enable_fp32_lm_head(model)
@@ -120,6 +139,7 @@ def _get_model_provider_func(
             provider.num_layers_in_first_pipeline_stage = args.decoder_first_pipeline_num_layers
         if getattr(args, "decoder_last_pipeline_num_layers", None) is not None:
             provider.num_layers_in_last_pipeline_stage = args.decoder_last_pipeline_num_layers
+        _apply_qwen_gdn_pipeline_overrides(args, provider)
         provider.finalize()
 
         if role == "critic":
@@ -163,6 +183,7 @@ def _get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        _apply_qwen_gdn_pipeline_overrides(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)

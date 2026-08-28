@@ -216,10 +216,20 @@ def get_qwen3_5_spec(args, config, vp_stage):
 
     use_distributed_gdn = getattr(args, "qwen_gdn_implementation", "replicated") == "distributed"
     if use_distributed_gdn:
-        if getattr(args, "sequence_parallel", False):
-            raise ValueError(
-                "Distributed Qwen GDN with sequence parallel is unsupported in the pinned Megatron runtime."
-            )
+        requires_rank_ordered_p2p = (
+            getattr(args, "sequence_parallel", False) and getattr(config, "pipeline_model_parallel_size", 1) > 1
+        )
+        if requires_rank_ordered_p2p:
+            if not getattr(args, "qwen_gdn_sp_disable_batch_p2p_comm", False):
+                raise ValueError(
+                    "Distributed Qwen GDN with sequence parallel and pipeline parallelism requires "
+                    "--qwen-gdn-sp-disable-batch-p2p-comm."
+                )
+            if getattr(config, "overlap_p2p_comm", False):
+                raise ValueError(
+                    "--qwen-gdn-sp-disable-batch-p2p-comm cannot be combined with overlap P2P communication."
+                )
+            config.batch_p2p_comm = False
         if (
             getattr(config, "context_parallel_size", 1) > 1
             and getattr(args, "cp_partition_mode", "zigzag") != "zigzag"

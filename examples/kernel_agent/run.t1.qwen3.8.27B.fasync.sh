@@ -220,13 +220,13 @@ case "${CP_PARTITION_MODE}" in
       exit 1
       ;;
 esac
-ENABLE_SEQUENCE_PARALLEL=${ENABLE_SEQUENCE_PARALLEL:-0}
+DEFAULT_ENABLE_SEQUENCE_PARALLEL=0
+if [[ "${QWEN_GDN_IMPLEMENTATION}" == "distributed" ]]; then
+   DEFAULT_ENABLE_SEQUENCE_PARALLEL=1
+fi
+ENABLE_SEQUENCE_PARALLEL=${ENABLE_SEQUENCE_PARALLEL:-${DEFAULT_ENABLE_SEQUENCE_PARALLEL}}
 if [[ "${ENABLE_SEQUENCE_PARALLEL}" != "0" && "${ENABLE_SEQUENCE_PARALLEL}" != "1" ]]; then
    echo "ENABLE_SEQUENCE_PARALLEL must be 0 or 1." >&2
-   exit 1
-fi
-if [[ "${QWEN_GDN_IMPLEMENTATION}" == "distributed" && "${ENABLE_SEQUENCE_PARALLEL}" == "1" ]]; then
-   echo "distributed Qwen GDN with sequence parallel is unsupported in the pinned Megatron runtime; use ENABLE_SEQUENCE_PARALLEL=0." >&2
    exit 1
 fi
 if [[ "${QWEN_GDN_IMPLEMENTATION}" == "distributed" \
@@ -436,6 +436,11 @@ fi
 EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH:-${EXP_ROOT}/checkpoints}"
+MIN_CHECKPOINT_FREE_GIB="${MIN_CHECKPOINT_FREE_GIB:-180}"
+if ! [[ "${MIN_CHECKPOINT_FREE_GIB}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "MIN_CHECKPOINT_FREE_GIB must be a positive integer." >&2
+   exit 1
+fi
 DEFAULT_DEBUG_ROLLOUT_DATA="${EXP_ROOT}/debug_rollout/rollout_{rollout_id}.pt"
 DEFAULT_FULL_LOOP_SMOKE_DATA="${EXP_ROOT}/full_loop_smoke/rollout_{rollout_id}.pt"
 DEFAULT_FIRST_TRAIN_ROLLOUT_DATA="${EXP_ROOT}/train_rollout_capture/rollout_{rollout_id}.pt"
@@ -784,6 +789,40 @@ check_all_host_resources() {
    done
 }
 
+check_checkpoint_free_space() {
+   if [[ "${DISABLE_CHECKPOINT_SAVE}" == "1" || "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
+      return
+   fi
+
+   local checkpoint_parent
+   checkpoint_parent="$(dirname "${CHECKPOINT_SAVE_PATH}")"
+   mkdir -p "${checkpoint_parent}"
+
+   local min_free_kib=$((MIN_CHECKPOINT_FREE_GIB * 1024 * 1024))
+   local free_kib
+   free_kib="$(df -Pk -- "${checkpoint_parent}" | awk 'NR == 2 {print $4}')"
+   if ! [[ "${free_kib}" =~ ^[0-9]+$ ]] || ((free_kib < min_free_kib)); then
+      echo "head-${MASTER_ADDR}: checkpoint filesystem needs at least ${MIN_CHECKPOINT_FREE_GIB} GiB free at ${checkpoint_parent}; found $((free_kib / 1024 / 1024)) GiB." >&2
+      exit 1
+   fi
+
+   local i
+   for i in "${!REMOTE_HOSTS[@]}"; do
+      if [[ "${REMOTE_PLACEMENT_RESOURCES[$i]}" != "${ACTOR_PLACEMENT_RESOURCE}" ]]; then
+         continue
+      fi
+      run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
+         "mkdir -p $(shell_quote "${checkpoint_parent}")"
+      free_kib="$(run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" \
+         "df -Pk -- $(shell_quote "${checkpoint_parent}") | awk 'NR == 2 {print \$4}'")"
+      if ! [[ "${free_kib}" =~ ^[0-9]+$ ]] || ((free_kib < min_free_kib)); then
+         echo "worker-${REMOTE_HOSTS[$i]}: checkpoint filesystem needs at least ${MIN_CHECKPOINT_FREE_GIB} GiB free at ${checkpoint_parent}; found $((free_kib / 1024 / 1024)) GiB." >&2
+         exit 1
+      fi
+   done
+   echo "Checkpoint capacity gate passed: at least ${MIN_CHECKPOINT_FREE_GIB} GiB free on every actor node."
+}
+
 wait_for_cluster() {
    echo "Waiting for Ray cluster: expected nodes=${NUM_NODES}, expected GPUs=${NUM_GPUS}"
    local deadline=$((SECONDS + RAY_WAIT_TIMEOUT))
@@ -952,6 +991,9 @@ PERF_ARGS=(
 )
 if [[ "${ENABLE_SEQUENCE_PARALLEL}" == "1" ]]; then
    PERF_ARGS+=(--sequence-parallel)
+fi
+if [[ "${QWEN_GDN_IMPLEMENTATION}" == "distributed" && "${ENABLE_SEQUENCE_PARALLEL}" == "1" ]]; then
+   PERF_ARGS+=(--qwen-gdn-sp-disable-batch-p2p-comm)
 fi
 
 if [[ "${SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC}" == "1" ]]; then
@@ -1353,6 +1395,7 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
       "${DISABLE_CHECKPOINT_SAVE}" "${CHECKPOINT_SAVE_PATH}" \
       "${NUM_ROLLOUT}" "${ROLLOUT_BATCH_SIZE}" \
       "${N_SAMPLES_PER_PROMPT}" "${GLOBAL_BATCH_SIZE}"
+   printf 'MIN_CHECKPOINT_FREE_GIB=%s\n' "${MIN_CHECKPOINT_FREE_GIB}"
    printf 'DEBUG_ROLLOUT_TWO_NODE=%s\nHEAD_RESOURCE_JSON=%s\nROLLOUT_RESOURCE_JSON=%s\n' \
       "${DEBUG_ROLLOUT_TWO_NODE}" "${HEAD_RESOURCE_JSON}" "${ROLLOUT_RESOURCE_JSON}"
    printf 'USE_NODE64_ROLLOUT=%s\n' "${USE_NODE64_ROLLOUT}"
@@ -1389,6 +1432,11 @@ if [[ "${PREPARE_ONLY}" == "1" ]]; then
    echo "Qwen3.8 no-spec RL prepare-only sanity PASS (no process cleanup, Ray start, or GPU job submit)."
    exit 0
 fi
+
+# A full model+distributed-optimizer iteration occupies about 155 GiB per
+# actor node. Fail before process cleanup and GPU allocation instead of after
+# an otherwise successful training run reaches async checkpoint finalization.
+check_checkpoint_free_space
 
 if [[ "${DEBUG_ROLLOUT_ONLY}" == "1" || "${FULL_LOOP_SMOKE}" == "1" \
    || "${SAVE_FIRST_TRAIN_ROLLOUT}" == "1" ]]; then

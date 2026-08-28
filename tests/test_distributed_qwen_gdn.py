@@ -4,8 +4,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from slime.backends.megatron_utils import model_provider as model_provider_module
 from slime.backends.megatron_utils.megatron_to_hf import qwen3_5 as qwen3_5_converter
 from slime.backends.megatron_utils.megatron_to_hf.processors import quantizer_fp8
+from slime.backends.megatron_utils.model_provider import _apply_qwen_gdn_pipeline_overrides
 from slime.utils.arguments import add_qwen_gdn_arguments
 from slime_plugins.mbridge.qwen3_5 import Qwen3_5Bridge
 from slime_plugins.models import qwen3_5 as qwen3_5_model
@@ -21,10 +23,136 @@ NUM_GPUS = 0
 
 def test_shared_qwen_gdn_arguments_support_distributed_flashqla():
     parser = add_qwen_gdn_arguments(ArgumentParser())
-    args = parser.parse_args(["--qwen-gdn-implementation", "distributed", "--qwen-gdn-backend", "flashqla"])
+    args = parser.parse_args(
+        [
+            "--qwen-gdn-implementation",
+            "distributed",
+            "--qwen-gdn-backend",
+            "flashqla",
+            "--qwen-gdn-sp-disable-batch-p2p-comm",
+        ]
+    )
 
     assert args.qwen_gdn_implementation == "distributed"
     assert args.qwen_gdn_backend == "flashqla"
+    assert args.qwen_gdn_sp_disable_batch_p2p_comm is True
+
+
+def test_qwen_gdn_pipeline_override_disables_batched_p2p_and_rejects_overlap():
+    args = SimpleNamespace(
+        qwen_gdn_implementation="distributed",
+        qwen_gdn_sp_disable_batch_p2p_comm=True,
+        sequence_parallel=True,
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_size=2,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+    )
+
+    _apply_qwen_gdn_pipeline_overrides(args, config)
+    assert config.batch_p2p_comm is False
+
+    config = SimpleNamespace(
+        pipeline_model_parallel_size=2,
+        overlap_p2p_comm=True,
+        batch_p2p_comm=False,
+    )
+    with pytest.raises(ValueError, match="cannot be combined with overlap"):
+        _apply_qwen_gdn_pipeline_overrides(args, config)
+
+
+@pytest.mark.parametrize(
+    ("implementation", "sequence_parallel", "pipeline_size"),
+    [
+        ("distributed", True, 1),
+        ("replicated", True, 2),
+    ],
+)
+def test_qwen_gdn_pipeline_override_leaves_unaffected_paths_unchanged(
+    implementation, sequence_parallel, pipeline_size
+):
+    args = SimpleNamespace(
+        qwen_gdn_implementation=implementation,
+        qwen_gdn_sp_disable_batch_p2p_comm=False,
+        sequence_parallel=sequence_parallel,
+    )
+    config = SimpleNamespace(
+        pipeline_model_parallel_size=pipeline_size,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+    )
+
+    _apply_qwen_gdn_pipeline_overrides(args, config)
+
+    assert config.batch_p2p_comm is True
+
+
+def test_raw_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
+    class ExpectedStop(Exception):
+        pass
+
+    config = SimpleNamespace(
+        pipeline_model_parallel_size=2,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+    )
+    monkeypatch.setattr(model_provider_module, "core_transformer_config_from_args", lambda _: config)
+    monkeypatch.setattr(
+        model_provider_module,
+        "import_module",
+        lambda _: (_ for _ in ()).throw(ExpectedStop),
+    )
+    args = SimpleNamespace(
+        custom_model_provider_path=None,
+        megatron_to_hf_mode="raw",
+        transformer_impl="transformer_engine",
+        spec="unused",
+        qwen_gdn_implementation="distributed",
+        qwen_gdn_sp_disable_batch_p2p_comm=True,
+        sequence_parallel=True,
+    )
+
+    provider = model_provider_module._get_model_provider_func(args)
+    with pytest.raises(ExpectedStop):
+        provider()
+
+    assert config.batch_p2p_comm is False
+
+
+def test_bridge_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
+    from megatron.bridge import AutoBridge
+
+    finalized = []
+    provider_config = SimpleNamespace(
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+        finalize=lambda: finalized.append(True),
+        provide=lambda **_: None,
+    )
+    bridge = SimpleNamespace(to_megatron_provider=lambda load_weights: provider_config)
+    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", lambda *args, **kwargs: bridge)
+    monkeypatch.setattr(model_provider_module, "patch_auto_bridge_hf_config", lambda value: value)
+    args = SimpleNamespace(
+        custom_model_provider_path=None,
+        megatron_to_hf_mode="bridge",
+        hf_checkpoint="unused",
+        tensor_model_parallel_size=4,
+        pipeline_model_parallel_size=2,
+        expert_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        sequence_parallel=True,
+        context_parallel_size=2,
+        variable_seq_lengths=True,
+        qwen_gdn_implementation="distributed",
+        qwen_gdn_sp_disable_batch_p2p_comm=True,
+    )
+
+    result = model_provider_module._get_model_provider_func(args)
+
+    assert result == provider_config.provide
+    assert provider_config.batch_p2p_comm is False
+    assert finalized == [True]
 
 
 def test_gdn_tp_section_layout_round_trip():
@@ -183,7 +311,55 @@ def test_mbridge_native_gdn_out_norm_round_trip_converts_gamma_centering():
     assert torch.equal(restored[0], hf_one_centered_gamma)
 
 
-def test_distributed_gdn_python_spec_rejects_sequence_parallel(monkeypatch):
+def test_distributed_gdn_python_spec_supports_sequence_parallel(monkeypatch):
+    block_spec = SimpleNamespace(layer_specs=[SimpleNamespace(submodules=SimpleNamespace(self_attention=None))])
+    monkeypatch.setattr(qwen3_5_model, "get_gpt_decoder_block_spec", lambda *args, **kwargs: block_spec)
+    monkeypatch.setattr(qwen3_5_model, "get_num_layers_to_build", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(qwen3_5_model, "get_transformer_layer_offset", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(
+        qwen3_5_model,
+        "_load_hf_config",
+        lambda _: SimpleNamespace(
+            num_hidden_layers=1,
+            layer_types=["linear_attention"],
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_num_key_heads=16,
+            linear_num_value_heads=32,
+        ),
+    )
+    from megatron.core.models.gpt import experimental_attention_variant_module_specs
+
+    monkeypatch.setattr(
+        experimental_attention_variant_module_specs,
+        "get_gated_delta_net_module_spec",
+        lambda config: SimpleNamespace(module=None, params=None),
+    )
+    args = SimpleNamespace(
+        num_experts=None,
+        qwen_gdn_implementation="distributed",
+        qwen_gdn_sp_disable_batch_p2p_comm=True,
+        sequence_parallel=True,
+        hf_checkpoint="unused",
+    )
+    config = SimpleNamespace(
+        num_layers=1,
+        pipeline_model_parallel_layout=None,
+        tensor_model_parallel_size=4,
+        context_parallel_size=2,
+        pipeline_model_parallel_size=2,
+        overlap_p2p_comm=False,
+        batch_p2p_comm=True,
+    )
+
+    result = qwen3_5_model.get_qwen3_5_spec(args, config, vp_stage=None)
+
+    assert result.layer_specs[0].submodules.self_attention.params == {"args": args}
+    assert config.batch_p2p_comm is False
+
+
+def test_distributed_gdn_python_spec_rejects_sequence_parallel_with_batched_pp(monkeypatch):
     monkeypatch.setattr(qwen3_5_model, "get_gpt_decoder_block_spec", lambda *args, **kwargs: SimpleNamespace())
     monkeypatch.setattr(qwen3_5_model, "get_num_layers_to_build", lambda *args, **kwargs: 1)
     monkeypatch.setattr(qwen3_5_model, "get_transformer_layer_offset", lambda *args, **kwargs: 0)
@@ -195,12 +371,17 @@ def test_distributed_gdn_python_spec_rejects_sequence_parallel(monkeypatch):
     args = SimpleNamespace(
         num_experts=None,
         qwen_gdn_implementation="distributed",
+        qwen_gdn_sp_disable_batch_p2p_comm=False,
         sequence_parallel=True,
         hf_checkpoint="unused",
     )
-    config = SimpleNamespace(num_layers=1, pipeline_model_parallel_layout=None)
+    config = SimpleNamespace(
+        num_layers=1,
+        pipeline_model_parallel_layout=None,
+        pipeline_model_parallel_size=2,
+    )
 
-    with pytest.raises(ValueError, match="sequence parallel is unsupported"):
+    with pytest.raises(ValueError, match="requires --qwen-gdn-sp-disable-batch-p2p-comm"):
         qwen3_5_model.get_qwen3_5_spec(args, config, vp_stage=None)
 
 

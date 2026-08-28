@@ -286,6 +286,13 @@ def add_qwen_gdn_arguments(parser):
             "sequence-to-head all-to-all while retaining --qwen-gdn-backend."
         ),
     )
+    parser.add_argument(
+        "--qwen-gdn-sp-disable-batch-p2p-comm",
+        action="store_true",
+        help=(
+            "Use Megatron's rank-ordered pipeline isend/irecv path for distributed " "Qwen GDN with sequence parallel."
+        ),
+    )
     return parser
 
 
