@@ -693,6 +693,33 @@ def test_cuda_agent_sampling_params_reserve_context_for_eagle():
     assert sampling_params["max_new_tokens"] == 16384
 
 
+@pytest.mark.unit
+def test_cuda_agent_sampling_params_use_first_turn_context_cap_only_for_turn_zero():
+    args = SimpleNamespace(
+        rollout_max_context_len=32768,
+        first_turn_max_context_len=24576,
+        sglang_speculative_algorithm=None,
+    )
+    sampling_params = {"max_new_tokens": 32768, "temperature": 1.0}
+
+    first_turn = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        args,
+        sampling_params,
+        prompt_token_count=1536,
+        turn_idx=0,
+    )
+    second_turn = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        args,
+        sampling_params,
+        prompt_token_count=20000,
+        turn_idx=1,
+    )
+
+    assert first_turn["max_new_tokens"] == 24576 - 1536
+    assert second_turn["max_new_tokens"] == 32768 - 20000
+    assert sampling_params["max_new_tokens"] == 32768
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("case", REAL_KERNEL_EVAL_CASES)
 @pytest.mark.skipif(

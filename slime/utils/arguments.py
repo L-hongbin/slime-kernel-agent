@@ -2026,6 +2026,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Whether to enable coverage-based rejection sampling for kernel-agent turn samples.",
             )
             parser.add_argument(
+                "--first-turn-max-context-len",
+                type=int,
+                default=None,
+                help=(
+                    "Optional prompt-plus-response context cap for turn 0 of kernel-agent multi-turn rollout. "
+                    "Later turns continue to use --rollout-max-context-len."
+                ),
+            )
+            parser.add_argument(
                 "--coverage-rs-key",
                 type=str,
                 choices=["time_coverage", "num_coverage"],
@@ -2837,6 +2846,17 @@ def slime_validate_args(args):
         assert (
             args.rollout_max_prompt_len <= args.rollout_max_context_len - 1
         ), f"args.rollout_max_prompt_len ({args.rollout_max_prompt_len}) must be smaller than args.rollout_max_context_len ({args.rollout_max_context_len}) so that there is at least one generated token to compute loss."
+
+    if args.first_turn_max_context_len is not None:
+        assert args.use_multi_turn, "--first-turn-max-context-len requires --use-multi-turn."
+        assert args.first_turn_max_context_len > 0, "--first-turn-max-context-len must be positive."
+        assert (
+            args.rollout_max_context_len is not None
+        ), "--first-turn-max-context-len requires --rollout-max-context-len."
+        assert args.first_turn_max_context_len <= args.rollout_max_context_len, (
+            f"--first-turn-max-context-len ({args.first_turn_max_context_len}) must not exceed "
+            f"--rollout-max-context-len ({args.rollout_max_context_len})."
+        )
 
     if args.qkv_format == "bshd":
         assert args.train_backend == "megatron", "bshd format is only supported for megatron backend."

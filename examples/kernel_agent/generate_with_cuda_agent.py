@@ -1217,13 +1217,25 @@ def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
     return False
 
 
+def _context_len_for_turn(args, turn_idx: int | None) -> int | None:
+    max_context_len = getattr(args, "rollout_max_context_len", None)
+    first_turn_max_context_len = getattr(args, "first_turn_max_context_len", None)
+    if turn_idx != 0 or first_turn_max_context_len is None:
+        return max_context_len
+    if max_context_len is None:
+        return int(first_turn_max_context_len)
+    return min(int(max_context_len), int(first_turn_max_context_len))
+
+
 def _sampling_params_for_prompt_context(
     args,
     sampling_params: dict[str, Any],
     prompt_token_count: int,
+    *,
+    turn_idx: int | None = None,
 ) -> dict[str, Any]:
     turn_sampling_params = sampling_params.copy()
-    max_context_len = getattr(args, "rollout_max_context_len", None)
+    max_context_len = _context_len_for_turn(args, turn_idx)
     if max_context_len is None:
         return turn_sampling_params
 
@@ -1743,13 +1755,18 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                 if CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", False)
                 else state.tokenizer.decode(prompt_ids, skip_special_tokens=False)
             )
-        max_context_len = getattr(args, "rollout_max_context_len", None)
+        max_context_len = _context_len_for_turn(args, turn_idx)
         if max_context_len is not None and len(prompt_ids) >= max_context_len:
             sample.status = Sample.Status.TRUNCATED
             finish_reason = "prompt_truncated"
             logger.warning("CUDA agent prompt exceeds context length at turn %s: %s", turn_idx, len(prompt_ids))
             break
-        turn_sampling_params = _sampling_params_for_prompt_context(args, sampling_params, len(prompt_ids))
+        turn_sampling_params = _sampling_params_for_prompt_context(
+            args,
+            sampling_params,
+            len(prompt_ids),
+            turn_idx=turn_idx,
+        )
         if int(turn_sampling_params.get("max_new_tokens", 0) or 0) <= 0:
             sample.status = Sample.Status.TRUNCATED
             finish_reason = "response_budget_exhausted"
