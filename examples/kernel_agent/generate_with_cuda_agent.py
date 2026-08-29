@@ -222,14 +222,29 @@ def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     if response_template is None:
         logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
         response_template = PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
-    _validate_model_feedback_template(response_template)
+    _validate_model_feedback_template(
+        response_template,
+        kernel_backend=getattr(getattr(state, "args", None), "kernel_backend", None),
+    )
     return response_template
 
 
-def _validate_model_feedback_template(response_template: PromptTemplate) -> None:
+def _validate_model_feedback_template(
+    response_template: PromptTemplate,
+    *,
+    kernel_backend: str | None = None,
+) -> None:
     """Require exactly one plain feedback placeholder and no budget bypass."""
 
     template = response_template.template
+    if kernel_backend == "tvm_ffi":
+        forbidden_markers = ("PYBIND11_MODULE", "REGISTER_BINDING(", "binding_registry.h")
+        found_markers = [marker for marker in forbidden_markers if marker in template]
+        if found_markers:
+            raise ValueError(
+                "TVM-FFI multi-turn feedback template contains incompatible pybind binding instructions: "
+                + ", ".join(found_markers)
+            )
     if "feedback_dict" in template:
         raise ValueError(
             "Model feedback templates must use {feedback}; feedback_dict bypasses the strict text budget."

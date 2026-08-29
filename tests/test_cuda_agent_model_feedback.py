@@ -2,6 +2,7 @@ import json
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -362,6 +363,31 @@ def test_feedback_template_allows_one_plain_jinja_feedback_placeholder(monkeypat
 
     assert rendered.startswith("Server feedback: {")
     assert rendered.endswith("} after")
+
+
+def test_tvm_ffi_feedback_template_rejects_pybind_binding_instructions():
+    incompatible = PromptTemplate.from_path(
+        str(REPO_ROOT / "examples/kernel_agent/prompt_config/initial_prompt/multi_turn_cuda_kernel.yaml")
+    )
+    state = SimpleNamespace(
+        args=SimpleNamespace(kernel_backend="tvm_ffi"),
+        multi_turn_template=incompatible,
+    )
+
+    with pytest.raises(ValueError, match="incompatible pybind binding instructions"):
+        generate_with_cuda_agent._get_tool_response_template(state)
+
+
+def test_tvm_ffi_feedback_template_accepts_repository_tvm_ffi_prompt():
+    template = PromptTemplate.from_path(
+        str(REPO_ROOT / "examples/kernel_agent/prompt_config/multi_turn_tvm_ffi_short.yaml")
+    )
+    state = SimpleNamespace(
+        args=SimpleNamespace(kernel_backend="tvm_ffi"),
+        multi_turn_template=template,
+    )
+
+    assert generate_with_cuda_agent._get_tool_response_template(state) is template
 
 
 def test_feedback_template_strictly_applies_small_final_budget(monkeypatch):
