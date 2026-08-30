@@ -600,6 +600,18 @@ class RolloutManager:
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
 
+    def _call_rollout_lifecycle_hook(self, hook_name: str):
+        module = sys.modules.get(self.generate_rollout.__module__)
+        hook = getattr(module, hook_name, None) if module is not None else None
+        if hook is None:
+            return None
+        return hook()
+
+    def pause_rollout_submissions(self):
+        """Close an optional persistent-rollout admission gate before refit."""
+
+        return self._call_rollout_lifecycle_hook("pause_rollout_submissions")
+
     def _get_metrics_router_addr(self) -> str | None:
         """Return the router address for scraping SGLang engine metrics.
 

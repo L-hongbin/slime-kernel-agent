@@ -32,7 +32,6 @@ from examples.kernel_agent import fully_async_rollout, generate_with_cuda_agent
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
-
 pytestmark = pytest.mark.unit
 NUM_GPUS = 0
 
@@ -172,6 +171,84 @@ def test_kernel_agent_worker_does_not_exceed_group_concurrency(monkeypatch):
     )
 
 
+def test_kernel_agent_worker_admission_gate_blocks_new_submissions(monkeypatch):
+    class FakeGenerateState:
+        def __init__(self, args):
+            self.sampling_params = {}
+
+    class FakeDataBuffer:
+        def __init__(self):
+            self.groups = [[Sample(index=1, group_index=1)]]
+            self.get_count = 0
+
+        def get_samples(self, count):
+            self.get_count += 1
+            out = self.groups[:count]
+            self.groups = self.groups[count:]
+            return out
+
+    async def fake_generate_and_rm_group(args, group, sampling_params, evaluation):
+        group[0].status = Sample.Status.COMPLETED
+        group[0].reward = 0.0
+        return group
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", FakeGenerateState)
+    monkeypatch.setattr(fully_async_rollout, "generate_and_rm_group", fake_generate_and_rm_group)
+    data_buffer = FakeDataBuffer()
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(n_samples_per_prompt=1),
+        data_buffer,
+        concurrency=1,
+    )
+    worker.poll_interval = 0.01
+    worker.set_generation_context(rollout_id=0)
+    worker.pause_submissions()
+    worker.start()
+    try:
+        time.sleep(0.05)
+        assert data_buffer.get_count == 0
+        assert worker.active_count == 0
+
+        worker.resume_submissions()
+        deadline = time.monotonic() + 2.0
+        completed = []
+        while time.monotonic() < deadline and not completed:
+            completed = worker.get_completed_groups()
+            time.sleep(0.01)
+    finally:
+        worker.stop()
+
+    assert len(completed) == 1
+    assert data_buffer.get_count >= 1
+
+
+def test_kernel_agent_existing_worker_installs_context_before_reopening_admission(monkeypatch):
+    events = []
+
+    class _Thread:
+        @staticmethod
+        def is_alive():
+            return True
+
+    class _Worker:
+        worker_thread = _Thread()
+
+        @staticmethod
+        def set_generation_context(rollout_id):
+            events.append(("context", rollout_id))
+
+        @staticmethod
+        def resume_submissions():
+            events.append(("resume", None))
+
+    monkeypatch.setattr(fully_async_rollout, "_global_worker", _Worker())
+
+    worker = fully_async_rollout._get_global_worker(_make_rollout_args(), data_buffer=None, rollout_id=9)
+
+    assert worker is fully_async_rollout._global_worker
+    assert events == [("context", 9), ("resume", None)]
+
+
 def test_kernel_agent_worker_prefers_engine_generation_weight_version(monkeypatch):
     class FakeGenerateState:
         def __init__(self, args):
@@ -244,6 +321,59 @@ def test_kernel_agent_worker_restamps_a_fresh_retry_after_abort():
     worker._stamp_group_for_submission([sample])
     assert sample.metadata["rollout_step"] == 5
     assert sample.metadata["gen_weight_version"] == 8
+
+
+@pytest.mark.parametrize("metadata_key", ["finish_reason", "trajectory_finish_reason", "abort_reason"])
+def test_kernel_agent_worker_detects_model_abort_hidden_by_turn_padding(metadata_key):
+    padded = Sample(
+        index=1,
+        status=Sample.Status.COMPLETED,
+        remove_sample=True,
+        metadata={"is_pad_turn": True, metadata_key: "model_abort"},
+    )
+
+    assert fully_async_rollout._has_aborted_sample([[padded]])
+
+
+def test_kernel_agent_worker_requeues_original_group_for_metadata_model_abort():
+    class _DataBuffer:
+        def __init__(self):
+            self.groups = []
+
+        def add_samples(self, groups):
+            self.groups.extend(groups)
+
+    class _DoneTask:
+        @staticmethod
+        def result():
+            return [
+                [
+                    Sample(
+                        index=10,
+                        status=Sample.Status.COMPLETED,
+                        remove_sample=True,
+                        metadata={"is_pad_turn": True, "finish_reason": "model_abort"},
+                    )
+                ]
+            ]
+
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.running = True
+    worker.data_buffer = _DataBuffer()
+    worker.output_queue = queue.Queue()
+    worker.aborted_count = 0
+    worker.exception_count = 0
+    original = [Sample(index=1, group_index=7)]
+
+    worker._make_done_cb(gid=3, original_group=original)(_DoneTask())
+
+    assert worker.aborted_count == 1
+    assert worker.output_queue.empty()
+    assert len(worker.data_buffer.groups) == 1
+    assert worker.data_buffer.groups[0][0].index == 1
+    assert worker.data_buffer.groups[0] is not original
 
 
 def test_kernel_agent_turn_preserves_engine_weight_version():

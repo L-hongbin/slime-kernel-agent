@@ -1168,6 +1168,13 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        # Persistent rollout workers can otherwise race a fresh request into
+        # SGLang between pause/retract and the refit. This hook is a no-op for
+        # rollout implementations without a background submission loop.
+        if dist.get_rank() == 0:
+            ray.get(self.rollout_manager.pause_rollout_submissions.remote())
+        dist.barrier(group=get_gloo_group())
+
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())

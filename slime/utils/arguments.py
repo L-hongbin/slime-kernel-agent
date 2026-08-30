@@ -88,6 +88,15 @@ def _validate_dppo_predictive_args(args) -> None:
         )
 
 
+def _validate_partial_rollout_args(args) -> None:
+    if getattr(args, "rollout_weight_sync_pause_mode", "abort") == "retract" and not getattr(
+        args, "partial_rollout", False
+    ):
+        raise ValueError("--rollout-weight-sync-pause-mode=retract requires --partial-rollout.")
+    if getattr(args, "mask_offpolicy_in_partial_rollout", False) and not getattr(args, "partial_rollout", False):
+        raise ValueError("--mask-offpolicy-in-partial-rollout requires --partial-rollout.")
+
+
 def _validate_dis_args(args) -> None:
     """Validate the paper's direct rollout-policy DIS contract."""
     if getattr(args, "policy_loss_mode", "ppo") != "dis":
@@ -879,6 +888,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Whether to use partial rollout. "
                     "If set, the unfinished samples during dynamic sampling will be recycled back to data buffer. "
                     "This is useful for long responses."
+                ),
+            )
+            parser.add_argument(
+                "--rollout-weight-sync-pause-mode",
+                choices=("abort", "retract"),
+                default="abort",
+                help=(
+                    "How SGLang pauses in-flight generation around a rollout-weight update. "
+                    "'abort' returns interrupted requests to the caller; 'retract' parks them, "
+                    "releases KV/recurrent state, and re-prefills their retained token prefix "
+                    "after generation resumes. Retract requires --partial-rollout."
                 ),
             )
             parser.add_argument(
@@ -2609,6 +2629,7 @@ def slime_validate_args(args):
         )
     if args.preserve_history_thinking and not args.use_multi_turn:
         raise ValueError("--preserve-history-thinking requires --use-multi-turn.")
+    _validate_partial_rollout_args(args)
     if args.overlong_penalty_turn_idx is not None:
         if args.overlong_penalty_turn_idx < 0:
             raise ValueError("--overlong-penalty-turn-idx must be non-negative.")
@@ -2830,6 +2851,7 @@ def slime_validate_args(args):
             if hasattr(args, k):
                 logger.info(f"Warning: Argument {k} is already set to {getattr(args, k)}, will override with {v}.")
             setattr(args, k, v)
+        _validate_partial_rollout_args(args)
 
     if args.eval_max_context_len is None:
         logger.info(

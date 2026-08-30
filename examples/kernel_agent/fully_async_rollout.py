@@ -47,7 +47,15 @@ def _iter_samples(node: Any) -> Iterable[Sample]:
 
 
 def _has_aborted_sample(node: Any) -> bool:
-    return any(sample.status == Sample.Status.ABORTED for sample in _iter_samples(node))
+    for sample in _iter_samples(node):
+        if sample.status == Sample.Status.ABORTED:
+            return True
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if any(
+            metadata.get(key) == "model_abort" for key in ("finish_reason", "trajectory_finish_reason", "abort_reason")
+        ):
+            return True
+    return False
 
 
 def _as_sample_groups(task_group: RolloutTaskResult) -> list[RolloutGroup]:
@@ -122,6 +130,9 @@ def _get_global_worker(args, data_buffer, rollout_id: int) -> KernelAgentAsyncRo
             _global_worker.start()
         else:
             _global_worker.set_generation_context(rollout_id)
+            # Weight sync closes admission. Reopen only after the next rollout
+            # installs its new rollout-step / generation-version context.
+            _global_worker.resume_submissions()
         return _global_worker
 
 
@@ -131,6 +142,16 @@ def _stop_global_worker() -> None:
         if _global_worker is not None:
             _global_worker.stop()
             _global_worker = None
+
+
+def pause_rollout_submissions() -> dict[str, int]:
+    """Close the persistent worker's admission gate before a weight refit."""
+
+    with _worker_lock:
+        if _global_worker is None:
+            return {"active_groups": 0, "queued_groups": 0}
+        _global_worker.pause_submissions()
+        return _global_worker.stats()
 
 
 atexit.register(_stop_global_worker)
@@ -153,6 +174,11 @@ class KernelAgentAsyncRolloutWorker:
         self.completed_count = 0
         self.aborted_count = 0
         self.exception_count = 0
+        # The trainer closes this gate before SGLang pause/refit. The lock covers
+        # prompt dequeue + task registration; SGLang's tokenizer pause is the
+        # backstop for a registered task whose HTTP POST has not started yet.
+        self._submission_lock = threading.Lock()
+        self._submissions_paused = False
         # The collector thread advances this context at each rollout boundary,
         # while the background event loop snapshots it for each fresh request.
         # Keep rollout_step and generation weight version as an atomic pair.
@@ -221,6 +247,14 @@ class KernelAgentAsyncRolloutWorker:
             )
             self.worker_thread.start()
 
+    def pause_submissions(self) -> None:
+        with self._submission_lock:
+            self._submissions_paused = True
+
+    def resume_submissions(self) -> None:
+        with self._submission_lock:
+            self._submissions_paused = False
+
     def stop(self) -> None:
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
@@ -270,31 +304,30 @@ class KernelAgentAsyncRolloutWorker:
                     active_tasks -= done
                     self.active_count = len(active_tasks)
 
-                while (
-                    len(active_tasks) < self.concurrency
-                    and self.output_queue.qsize() < self.concurrency
-                    and self.running
-                ):
-                    groups = self.data_buffer.get_samples(1)
-                    if not groups:
-                        break
-                    for group in groups:
-                        gid = gid_counter
-                        gid_counter += 1
-                        self._stamp_group_for_submission(group)
-                        original_group = copy.deepcopy(group)
-                        task = asyncio.create_task(
-                            generate_and_rm_group(
-                                self.args,
-                                group,
-                                sampling_params=self.state.sampling_params.copy(),
-                                evaluation=False,
+                while len(active_tasks) < self.concurrency and self.output_queue.qsize() < self.concurrency:
+                    with self._submission_lock:
+                        if self._submissions_paused or not self.running:
+                            break
+                        groups = self.data_buffer.get_samples(1)
+                        if not groups:
+                            break
+                        for group in groups:
+                            gid = gid_counter
+                            gid_counter += 1
+                            self._stamp_group_for_submission(group)
+                            original_group = copy.deepcopy(group)
+                            task = asyncio.create_task(
+                                generate_and_rm_group(
+                                    self.args,
+                                    group,
+                                    sampling_params=self.state.sampling_params.copy(),
+                                    evaluation=False,
+                                )
                             )
-                        )
-                        task.add_done_callback(self._make_done_cb(gid, original_group))
-                        active_tasks.add(task)
-                        self.submitted_count += 1
-                        self.active_count = len(active_tasks)
+                            task.add_done_callback(self._make_done_cb(gid, original_group))
+                            active_tasks.add(task)
+                            self.submitted_count += 1
+                            self.active_count = len(active_tasks)
 
                 self.active_count = len(active_tasks)
                 await asyncio.sleep(self.poll_interval)

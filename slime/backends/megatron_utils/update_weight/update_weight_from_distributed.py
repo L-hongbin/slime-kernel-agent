@@ -21,7 +21,7 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
-from .common import _maybe_v4_global_name, all_gather_param, named_params_and_buffers
+from .common import _maybe_v4_global_name, all_gather_param, named_params_and_buffers, rollout_engine_weight_sync
 from .lora_adapter_sync import (
     all_alternating_lora_names,
     build_lora_adapter_state_dict,
@@ -250,34 +250,33 @@ class UpdateWeightFromDistributed:
         """
         self.weight_version += 1
 
-        if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+        is_rank0 = dist.get_rank() == 0
+        with rollout_engine_weight_sync(self.args, self.rollout_engines, enabled=is_rank0):
+            if is_rank0:
+                # int4/fp4 pre_process
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=True,
+                        post_process_quantization=False,
+                        rollout_engines=self.rollout_engines,
+                    )
+            dist.barrier(group=get_gloo_group())
 
-            # int4/fp4 pre_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=True,
-                    post_process_quantization=False,
-                    rollout_engines=self.rollout_engines,
-                )
-        dist.barrier(group=get_gloo_group())
+            if use_lora_weight_sync(self.args):
+                self._update_weights_lora_adapter()
+            else:
+                pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+                self._send_weights(pbar)
 
-        if use_lora_weight_sync(self.args):
-            self._update_weights_lora_adapter()
-        else:
-            pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
-            self._send_weights(pbar)
-
-        if dist.get_rank() == 0:
-            # int4/fp4 post_process
-            if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
-                post_process_weights(
-                    restore_weights_before_load=False,
-                    post_process_quantization=True,
-                    rollout_engines=self.rollout_engines,
-                )
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            if is_rank0:
+                # int4/fp4 post_process
+                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                    post_process_weights(
+                        restore_weights_before_load=False,
+                        post_process_quantization=True,
+                        rollout_engines=self.rollout_engines,
+                    )
+        if is_rank0:
             self._finish_lora_adapter_swap()
         dist.barrier(group=get_gloo_group())
 

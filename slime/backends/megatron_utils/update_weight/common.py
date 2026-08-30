@@ -1,8 +1,11 @@
 import inspect
+import logging
 import re
 from argparse import Namespace
 from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 
+import ray
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
@@ -10,6 +13,68 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 
 from slime.backends.megatron_utils.misc_utils import strip_param_name_prefix
 from slime.utils.types import ParamInfo
+
+logger = logging.getLogger(__name__)
+
+_PAUSE_GENERATION_MODES = {"abort", "retract"}
+
+
+def pause_and_flush_rollout_engines(args: Namespace, rollout_engines: Sequence) -> None:
+    """Quiesce SGLang before refit and fail closed if its cache cannot flush.
+
+    ``retract`` keeps each HTTP generation request pending while SGLang parks
+    its token/log-prob state. The cache flush remains mandatory: resumed
+    requests must re-prefill under the new weights rather than reuse KV or
+    recurrent state produced by the old policy.
+    """
+
+    mode = getattr(args, "rollout_weight_sync_pause_mode", "abort")
+    if mode not in _PAUSE_GENERATION_MODES:
+        raise ValueError(
+            f"Unsupported rollout weight-sync pause mode {mode!r}; "
+            f"expected one of {sorted(_PAUSE_GENERATION_MODES)}."
+        )
+    ray.get([engine.pause_generation.remote(mode=mode) for engine in rollout_engines])
+    # SGLangEngine.flush_cache raises when the server cannot prove the cache is
+    # safe to clear. Do not continue a refit with stale prefix/GDN state.
+    ray.get([engine.flush_cache.remote() for engine in rollout_engines])
+
+
+def _abort_and_resume_rollout_engines(rollout_engines: Sequence) -> None:
+    """Best-effort release of parked HTTP requests after a failed refit."""
+
+    try:
+        ray.get([engine.pause_generation.remote(mode="abort") for engine in rollout_engines])
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to abort parked rollout requests after a weight-sync error")
+    try:
+        ray.get([engine.continue_generation.remote() for engine in rollout_engines])
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to unpause rollout engines after a weight-sync error")
+
+
+@contextmanager
+def rollout_engine_weight_sync(args: Namespace, rollout_engines: Sequence, *, enabled: bool):
+    """Pause for refit, then resume or abort parked requests on failure.
+
+    On a failed refit, continuing a retracted trajectory could expose it to a
+    partially updated model. Abort those requests first, then release the
+    tokenizer pause so HTTP callers fail/requeue instead of hanging forever.
+    The cleanup is best effort and never masks the original refit exception.
+    """
+
+    if not enabled:
+        yield
+        return
+
+    try:
+        pause_and_flush_rollout_engines(args, rollout_engines)
+        yield
+    except BaseException:
+        _abort_and_resume_rollout_engines(rollout_engines)
+        raise
+    else:
+        ray.get([engine.continue_generation.remote() for engine in rollout_engines])
 
 
 def all_gather_param(name: str, param: torch.nn.Parameter) -> torch.Tensor:

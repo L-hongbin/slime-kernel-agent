@@ -52,8 +52,8 @@ from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.timer import Timer, timer
 
 from ..sglang import DeltaEncoding, DeltaParam, DeltaSpec
+from .common import rollout_engine_weight_sync
 from .update_weight_from_distributed import UpdateWeightFromDistributed
-
 
 logger = logging.getLogger(__name__)
 
@@ -590,28 +590,29 @@ class UpdateWeightFromDistributedDelta(UpdateWeightFromDistributed):
             if self._is_pp_src_rank:
                 os.makedirs(self._version_dir, exist_ok=True)
 
-        if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
-        dist.barrier(group=get_gloo_group())
-
-        self.density_nnz = self.density_numel = self.wire_bytes = self._flush_idx = 0
-        self._pending_files.clear()
-        self._pending_publishes.clear()
-        self._published_any = False
-        if self.writer is not None:
-            self.writer.reset_counters()
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
-
-        with timer("delta_encode"):
-            self._send_weights(pbar)
-            if self.writer is not None:
-                self.writer.drain()
-            self.delta_state.flush_snapshot()
+        is_rank0 = dist.get_rank() == 0
+        with rollout_engine_weight_sync(self.args, self.rollout_engines, enabled=is_rank0):
             dist.barrier(group=get_gloo_group())
 
-        with timer("delta_finalize"):
-            self._finalize_sync()
+            self.density_nnz = self.density_numel = self.wire_bytes = self._flush_idx = 0
+            self._pending_files.clear()
+            self._pending_publishes.clear()
+            self._published_any = False
+            if self.writer is not None:
+                self.writer.reset_counters()
+            pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+
+            with timer("delta_encode"):
+                self._send_weights(pbar)
+                if self.writer is not None:
+                    self.writer.drain()
+                self.delta_state.flush_snapshot()
+                dist.barrier(group=get_gloo_group())
+
+            with timer("delta_finalize"):
+                self._finalize_sync()
+
+        dist.barrier(group=get_gloo_group())
 
         self._record_metrics()
 
@@ -797,13 +798,11 @@ class UpdateWeightFromDistributedDelta(UpdateWeightFromDistributed):
 
     def _finalize_sync(self) -> None:
         """
-        Per-transport end-of-sync. NCCL: each flush already broadcasted; just resume.
+        Per-transport end-of-sync. NCCL: each flush already broadcasted.
         Disk: publish the trailing files, wait for all streamed applies to land, then
-        cleanup + resume.
+        clean up. The surrounding weight-sync guard resumes generation.
         """
         if self.transport == "nccl":
-            if dist.get_rank() == 0:
-                ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
             dist.barrier(group=get_gloo_group())
             return
 
@@ -824,7 +823,6 @@ class UpdateWeightFromDistributedDelta(UpdateWeightFromDistributed):
                 ray.get([engine.set_weight_version.remote(weight_version) for engine in self.rollout_engines])
             if not self.args.update_weight_delta_keep_files:
                 shutil.rmtree(self._version_dir, ignore_errors=True)
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
     def _record_metrics(self) -> None:
