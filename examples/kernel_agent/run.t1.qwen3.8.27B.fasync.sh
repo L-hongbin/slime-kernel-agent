@@ -65,9 +65,10 @@ if [[ "${CONFIG_DRY_RUN}" != "1" ]] && ! hostname -I 2>/dev/null | tr ' ' '\n' |
    hostname -I 2>/dev/null
    exit 1
 fi
-# Qwen3.8 cluster: node70 (head + BF16 actor), node69 (BF16 actor), and
-# node53/node64 (FP8 rollout). The dedicated containers listen on 23538 so this
-# run does not reuse or stop the long-lived :23522 slime containers.
+# Qwen3.8 cluster: node70 (head + BF16 actor), node69 (BF16 actor), and node53
+# (FP8 rollout). node64 remains an opt-in second rollout host. The dedicated
+# containers listen on 23538 so this run does not reuse or stop the long-lived
+# :23522 slime containers.
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
    # Replay trains only the actor and never creates SGLang. Keep node53 and its
    # rollout-only services entirely out of this isolated training diagnostic.
@@ -97,7 +98,7 @@ elif [[ "${USE_NODE64_ROLLOUT}" == "1" ]]; then
       "slime_rollout"
    )
 else
-   # Supported 24K three-node topology: node70+node69 host the BF16 actor;
+   # Supported three-node topology: node70+node69 host the BF16 actor;
    # node53 hosts two TP4 rollout engines. node64 remains outside the job.
    REMOTE_HOSTS=(
       "10.11.2.169"
@@ -151,8 +152,27 @@ else
 fi
 echo "ACTOR_GPUS ${ACTOR_GPUS} ROLLOUT_GPUS ${ROLLOUT_GPUS}"
 # EXP CONFIG
-MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-24576}
+MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-32768}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
+FIRST_TURN_CONTEXT_LEN=${FIRST_TURN_CONTEXT_LEN:-24576}
+DECODER_LAST_PIPELINE_NUM_LAYERS=${DECODER_LAST_PIPELINE_NUM_LAYERS:-31}
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-27}
+FINALIZE_MODE=${FINALIZE_MODE:-positive}
+if ! [[ "${DECODER_LAST_PIPELINE_NUM_LAYERS}" =~ ^[1-9][0-9]*$ \
+   && "${RECOMPUTE_NUM_LAYERS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "DECODER_LAST_PIPELINE_NUM_LAYERS and RECOMPUTE_NUM_LAYERS must be positive integers." >&2
+   exit 1
+fi
+DECODER_FIRST_PIPELINE_NUM_LAYERS=$((64 - DECODER_LAST_PIPELINE_NUM_LAYERS))
+if ((DECODER_FIRST_PIPELINE_NUM_LAYERS <= 0)); then
+   echo "DECODER_LAST_PIPELINE_NUM_LAYERS must be smaller than 64." >&2
+   exit 1
+fi
+if ((RECOMPUTE_NUM_LAYERS > DECODER_FIRST_PIPELINE_NUM_LAYERS \
+   || RECOMPUTE_NUM_LAYERS > DECODER_LAST_PIPELINE_NUM_LAYERS)); then
+   echo "RECOMPUTE_NUM_LAYERS must not exceed either PP stage's layer count." >&2
+   exit 1
+fi
 ROLLOUT_TEMPERATURE=${ROLLOUT_TEMPERATURE:-1.0}
 if ! [[ "${ROLLOUT_TEMPERATURE}" =~ ^[0-9]+([.][0-9]+)?$ ]] \
    || [[ "${ROLLOUT_TEMPERATURE}" =~ ^0+([.]0+)?$ ]]; then
@@ -185,6 +205,16 @@ case "${ROLLOUT_CORRECTION_MODE}" in
       ;;
 esac
 SGLANG_MAX_RUNNING_REQUESTS=${SGLANG_MAX_RUNNING_REQUESTS:-128}
+SGLANG_CUDA_GRAPH_MAX_BS=${SGLANG_CUDA_GRAPH_MAX_BS:-${SGLANG_MAX_RUNNING_REQUESTS}}
+if ! [[ "${SGLANG_MAX_RUNNING_REQUESTS}" =~ ^[1-9][0-9]*$ \
+   && "${SGLANG_CUDA_GRAPH_MAX_BS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "SGLANG_MAX_RUNNING_REQUESTS and SGLANG_CUDA_GRAPH_MAX_BS must be positive integers." >&2
+   exit 1
+fi
+if ((SGLANG_CUDA_GRAPH_MAX_BS > SGLANG_MAX_RUNNING_REQUESTS)); then
+   echo "SGLANG_CUDA_GRAPH_MAX_BS must not exceed SGLANG_MAX_RUNNING_REQUESTS." >&2
+   exit 1
+fi
 # Maintained Qwen3.8 training is no-spec only. DSpark was intentionally removed
 # after failing the production-maturity gate; MTP remains outside this launcher.
 SGLANG_SPECULATIVE_LABEL="NoSpec"
@@ -366,6 +396,11 @@ else
    ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
    N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 fi
+KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS=${KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS:-${ROLLOUT_BATCH_SIZE}}
+if ! [[ "${KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS must be a positive integer." >&2
+   exit 1
+fi
 if [[ "${FULL_LOOP_SMOKE}" == "0" \
    && "${DEBUG_ROLLOUT_ONLY}" == "0" \
    && -z "${LOAD_DEBUG_ROLLOUT_DATA}" \
@@ -401,7 +436,28 @@ if ! [[ "${TRAIN_DATA_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
    echo "TRAIN_DATA_LABEL must contain only letters, digits, dot, underscore, or hyphen and start with an alphanumeric character." >&2
    exit 1
 fi
-MULTI_TURN_PROMPT_CONFIG="${MULTI_TURN_PROMPT_CONFIG:-${SCRIPT_DIR}/prompt_config/initial_prompt/multi_turn_cuda_kernel.yaml}"
+MULTI_TURN_PROMPT_CONFIG="${MULTI_TURN_PROMPT_CONFIG:-${SCRIPT_DIR}/prompt_config/multi_turn_tvm_ffi_short.yaml}"
+PROMPT_POLICY_LABEL="${PROMPT_POLICY_LABEL:-TVMFFI2T}"
+if ! [[ "${PROMPT_POLICY_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+   echo "PROMPT_POLICY_LABEL must contain only letters, digits, dot, underscore, or hyphen and start with an alphanumeric character." >&2
+   exit 1
+fi
+DEFAULT_ROLLOUT_SYNC_LABEL="RetractPR"
+if [[ "${USE_NODE64_ROLLOUT}" == "1" \
+   && "${DEBUG_ROLLOUT_TWO_NODE}" == "0" \
+   && -z "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+   DEFAULT_ROLLOUT_SYNC_LABEL="RetractPR.R2N4E"
+fi
+ROLLOUT_SYNC_LABEL="${ROLLOUT_SYNC_LABEL:-${DEFAULT_ROLLOUT_SYNC_LABEL}}"
+if ! [[ "${ROLLOUT_SYNC_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+   echo "ROLLOUT_SYNC_LABEL must contain only letters, digits, dot, underscore, or hyphen and start with an alphanumeric character." >&2
+   exit 1
+fi
+MAX_FEEDBACK_CHARS="${MAX_FEEDBACK_CHARS:-8000}"
+if ! [[ "${MAX_FEEDBACK_CHARS}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "MAX_FEEDBACK_CHARS must be a positive integer." >&2
+   exit 1
+fi
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
 OVERLONG_PENALTY_FACTOR="${OVERLONG_PENALTY_FACTOR:-0.2}"
 OUTPUT_MISMATCH_PARTIAL_REWARD="${OUTPUT_MISMATCH_PARTIAL_REWARD:-0.25}"
@@ -420,7 +476,17 @@ then
 fi
 PARTIAL_REWARD_TAG="${OUTPUT_MISMATCH_PARTIAL_REWARD/./p}"
 PENALTY_FACTOR_TAG="${OVERLONG_PENALTY_FACTOR/./p}"
-REWARD_POLICY_LABEL="Mismatch${PARTIAL_REWARD_TAG}.NoPRS.Len${OVERLONG_BUFFER_LEN}Pen${PENALTY_FACTOR_TAG}"
+REWARD_POLICY_LABEL="Mismatch${PARTIAL_REWARD_TAG}.NoPRS.T2Len${OVERLONG_BUFFER_LEN}Pen${PENALTY_FACTOR_TAG}"
+case "${FINALIZE_MODE}" in
+   positive) FINALIZE_LABEL="P" ;;
+   none) FINALIZE_LABEL="N" ;;
+   improve) FINALIZE_LABEL="I" ;;
+   *)
+      echo "FINALIZE_MODE must be one of: positive, none, improve." >&2
+      exit 1
+      ;;
+esac
+TURN_POLICY_LABEL="TRLOO2T${FINALIZE_LABEL}.T1C${FIRST_TURN_CONTEXT_LEN}.TokHist.Fb${MAX_FEEDBACK_CHARS}.Aff"
 
 
 case "${ROLLOUT_CORRECTION_MODE}" in
@@ -428,12 +494,13 @@ case "${ROLLOUT_CORRECTION_MODE}" in
    tis) POLICY_OPTIMIZATION_LABEL="TISDiagnostic" ;;
    hard_sequence_mis) POLICY_OPTIMIZATION_LABEL="HardSequenceMISDiagnostic" ;;
 esac
-CUDA_GRAPH_LABEL="DefaultCG"
+CUDA_GRAPH_LABEL="CG${SGLANG_CUDA_GRAPH_MAX_BS}"
+TOPOLOGY_LABEL="PP${DECODER_FIRST_PIPELINE_NUM_LAYERS}x${DECODER_LAST_PIPELINE_NUM_LAYERS}.R${RECOMPUTE_NUM_LAYERS}"
 TRAIN_ORDER_LABEL=""
 if [[ "${SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC}" == "1" ]]; then
    TRAIN_ORDER_LABEL=".LongestFirst"
 fi
-EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
+EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${TOPOLOGY_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${TURN_POLICY_LABEL}.${PROMPT_POLICY_LABEL}.${ROLLOUT_SYNC_LABEL}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH:-${EXP_ROOT}/checkpoints}"
 MIN_CHECKPOINT_FREE_GIB="${MIN_CHECKPOINT_FREE_GIB:-180}"
@@ -473,7 +540,7 @@ else
    fi
    export WANDB_API_KEY
 fi
-DEFAULT_WANDB_GROUP="Qwen38.${SGLANG_SPECULATIVE_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.T${ROLLOUT_TEMPERATURE}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}"
+DEFAULT_WANDB_GROUP="Qwen38.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${ROLLOUT_REASONING_EFFORT}.T${ROLLOUT_TEMPERATURE}.${TURN_POLICY_LABEL}.${ROLLOUT_SYNC_LABEL}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}"
 WANDB_GROUP=${WANDB_GROUP:-${DEFAULT_WANDB_GROUP}}
 if (( ${#WANDB_GROUP} > 128 )); then
    echo "WANDB_GROUP exceeds the W&B 128-character GroupName limit." >&2
@@ -610,17 +677,25 @@ import importlib.metadata
 import inspect
 import os
 import sys
+from pathlib import Path
 
 import sglang
 import torch
 from megatron.core.models.gpt.gpt_model import GPTModel
+from sglang.srt.managers.scheduler import Scheduler
 from scripts.patch_fla_varlen_autotune_nb import patch_files as check_fla_varlen_patch
+from scripts.patch_sglang_retract_flush import patch_file as check_sglang_retract_flush_patch
 
 label = sys.argv[1]
 try:
     check_fla_varlen_patch(check_only=True)
 except (OSError, RuntimeError) as exc:
     raise SystemExit(f"{label}: FLA varlen autotune patch gate failed: {exc}") from exc
+try:
+    scheduler_source = Path(inspect.getsourcefile(Scheduler) or "")
+    check_sglang_retract_flush_patch(scheduler_source, check_only=True)
+except (OSError, RuntimeError) as exc:
+    raise SystemExit(f"{label}: SGLang retract-flush patch gate failed: {exc}") from exc
 gpt_model_source = os.path.realpath(inspect.getsourcefile(GPTModel) or "")
 expected_gpt_model_source = os.path.realpath(
     "/root/Megatron-LM/megatron/core/models/gpt/gpt_model.py"
@@ -649,7 +724,7 @@ print(
     f"{label}: runtime capability check passed "
     f"(mbridge={mbridge_version}, transformers={transformers_version}, "
     f"torch={torch.__version__}, sglang={version}, speculative=disabled, "
-    "fla_varlen_autotune=nb-removed)"
+    "fla_varlen_autotune=nb-removed, retract_flush=enabled)"
 )
 PY
 
@@ -938,6 +1013,8 @@ ROLLOUT_ARGS=(
    --rollout-temperature ${ROLLOUT_TEMPERATURE}
    --rollout-top-p 1.0
    --rollout-top-k -1
+   --partial-rollout
+   --rollout-weight-sync-pause-mode retract
 
    # eval args
    # --eval-interval 25
@@ -970,7 +1047,7 @@ fi
 PERF_ARGS=(
    --tensor-model-parallel-size 4
    --pipeline-model-parallel-size 2
-   --decoder-last-pipeline-num-layers 31
+   --decoder-last-pipeline-num-layers ${DECODER_LAST_PIPELINE_NUM_LAYERS}
    --context-parallel-size ${CONTEXT_PARALLEL_SIZE}
    --cp-partition-mode "${CP_PARTITION_MODE}"
    --expert-model-parallel-size 1
@@ -980,7 +1057,7 @@ PERF_ARGS=(
 
    --recompute-granularity full
    --recompute-method block
-   --recompute-num-layers 29
+   --recompute-num-layers ${RECOMPUTE_NUM_LAYERS}
 
    # --micro-batch-size 1
    --use-dynamic-batch-size
@@ -1010,6 +1087,7 @@ RL_ARGS=(
    --overlong-use-effective-response-cap
    --overlong-buffer-len ${OVERLONG_BUFFER_LEN}
    --overlong-penalty-factor ${OVERLONG_PENALTY_FACTOR}
+   --overlong-penalty-turn-idx 1
 
 )
 
@@ -1057,8 +1135,8 @@ SGLANG_ARGS=(
    --sglang-max-running-requests ${SGLANG_MAX_RUNNING_REQUESTS}
    --sglang-mem-fraction-static ${SGLANG_MEM_FRACTION_STATIC}
    --sglang-decode-log-interval 400
-   --router-policy round_robin
-   --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
+   --router-policy consistent_hashing
+   --sglang-cuda-graph-max-bs ${SGLANG_CUDA_GRAPH_MAX_BS}
    --sglang-disable-custom-all-reduce
    --sglang-attention-backend ${SGLANG_TARGET_ATTENTION_BACKEND}
    # triton (NOT flashinfer): the flashinfer GDN decode kernel diverges ~2e-3/layer
@@ -1179,10 +1257,15 @@ KERNEL_AGENT_ARGS=(
    --reference-backend torch
    --do-precheck
    --use-reference-cache
-   --finalize-mode positive
-   # True single-turn rollout. The generator still requires max-turns=1, but
-   # multi-turn list/padding/filter semantics are deliberately disabled.
-   --max-turns 1
+   --finalize-mode ${FINALIZE_MODE}
+   --max-turns 2
+   --first-turn-max-context-len ${FIRST_TURN_CONTEXT_LEN}
+   --use-multi-turn
+   --padding-turns
+   --filter-by-last-turn
+   # Qwen3.8 already preserves thinking by default in its chat template. This
+   # stronger contract bypasses history decode/re-encode entirely for turn 2.
+   --preserve-history-thinking
    --enable-turns-dp-partitions
 )
 
@@ -1206,6 +1289,10 @@ validate_local_inputs() {
       echo "MAX_RESPONSE_LEN (${MAX_RESPONSE_LEN}) must not exceed MAX_CONTEXT_LEN (${MAX_CONTEXT_LEN})." >&2
       exit 1
    fi
+   if ((FIRST_TURN_CONTEXT_LEN <= 0 || FIRST_TURN_CONTEXT_LEN > MAX_CONTEXT_LEN)); then
+      echo "FIRST_TURN_CONTEXT_LEN (${FIRST_TURN_CONTEXT_LEN}) must be between 1 and MAX_CONTEXT_LEN (${MAX_CONTEXT_LEN})." >&2
+      exit 1
+   fi
    if ((OVERLONG_BUFFER_LEN <= 0 || OVERLONG_BUFFER_LEN >= MAX_RESPONSE_LEN)); then
       echo "OVERLONG_BUFFER_LEN (${OVERLONG_BUFFER_LEN}) must be between 1 and MAX_RESPONSE_LEN-1." >&2
       exit 1
@@ -1227,6 +1314,21 @@ validate_local_inputs() {
          exit 1
       fi
    done
+
+   PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}" "${PYTHON_BIN}" - \
+      "${MULTI_TURN_PROMPT_CONFIG}" "${KERNEL_BACKEND}" <<'PY'
+import sys
+
+from examples.kernel_agent.generate_with_cuda_agent import _validate_model_feedback_template
+from slime.rollout.sglang_rollout import PromptTemplate
+
+config_path, kernel_backend = sys.argv[1:]
+template = PromptTemplate.from_path(config_path)
+if template is None:
+    raise SystemExit(f"Multi-turn prompt config has no non-empty tool_response template: {config_path}")
+_validate_model_feedback_template(template, kernel_backend=kernel_backend)
+print(f"multi-turn prompt contract verified: backend={kernel_backend} config={config_path}")
+PY
 
    "${PYTHON_BIN}" - "${BF16_MODEL_PATH}/config.json" "${HF_MODEL_PATH}/config.json" "${HF_MODEL_PATH}/model.safetensors.index.json" <<'PY'
 import json
@@ -1381,14 +1483,17 @@ prepare_node_local_resume_metadata() {
 if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'TRAIN_DTYPE=bf16\nROLLOUT_CHECKPOINT=%s\nTRAIN_CHECKPOINT=%s\n' \
       "${HF_MODEL_PATH}" "${MEGATRON_MODEL_PATH}"
-   printf 'MAX_CONTEXT_LEN=%s\nMAX_RESPONSE_LEN=%s\nOVERLONG_BUFFER_LEN=%s\nOVERLONG_PENALTY_FACTOR=%s\nOUTPUT_MISMATCH_PARTIAL_REWARD=%s\nREWARD_POLICY_LABEL=%s\n' \
-      "${MAX_CONTEXT_LEN}" "${MAX_RESPONSE_LEN}" "${OVERLONG_BUFFER_LEN}" "${OVERLONG_PENALTY_FACTOR}" \
-      "${OUTPUT_MISMATCH_PARTIAL_REWARD}" "${REWARD_POLICY_LABEL}"
+   printf 'MAX_CONTEXT_LEN=%s\nMAX_RESPONSE_LEN=%s\nFIRST_TURN_CONTEXT_LEN=%s\nMAX_FEEDBACK_CHARS=%s\nOVERLONG_BUFFER_LEN=%s\nOVERLONG_PENALTY_FACTOR=%s\nOUTPUT_MISMATCH_PARTIAL_REWARD=%s\nREWARD_POLICY_LABEL=%s\nTURN_POLICY_LABEL=%s\nPROMPT_POLICY_LABEL=%s\nROLLOUT_SYNC_LABEL=%s\n' \
+      "${MAX_CONTEXT_LEN}" "${MAX_RESPONSE_LEN}" "${FIRST_TURN_CONTEXT_LEN}" "${MAX_FEEDBACK_CHARS}" "${OVERLONG_BUFFER_LEN}" \
+      "${OVERLONG_PENALTY_FACTOR}" "${OUTPUT_MISMATCH_PARTIAL_REWARD}" "${REWARD_POLICY_LABEL}" "${TURN_POLICY_LABEL}" "${PROMPT_POLICY_LABEL}" "${ROLLOUT_SYNC_LABEL}"
    printf 'ROLLOUT_REASONING_EFFORT=%s\nCHAT_TEMPLATE_KWARGS=%s\n' \
       "${ROLLOUT_REASONING_EFFORT}" "${CHAT_TEMPLATE_KWARGS}"
    printf 'ROLLOUT_CORRECTION_MODE=%s\nROLLOUT_TEMPERATURE=%s\n' \
       "${ROLLOUT_CORRECTION_MODE}" "${ROLLOUT_TEMPERATURE}"
-   printf 'RL_DATA=%s\nTRAIN_DATA_LABEL=%s\n' "${RL_DATA}" "${TRAIN_DATA_LABEL}"
+   printf 'DECODER_LAST_PIPELINE_NUM_LAYERS=%s\nRECOMPUTE_NUM_LAYERS=%s\nFINALIZE_MODE=%s\n' \
+      "${DECODER_LAST_PIPELINE_NUM_LAYERS}" "${RECOMPUTE_NUM_LAYERS}" "${FINALIZE_MODE}"
+   printf 'RL_DATA=%s\nTRAIN_DATA_LABEL=%s\nMULTI_TURN_PROMPT_CONFIG=%s\n' \
+      "${RL_DATA}" "${TRAIN_DATA_LABEL}" "${MULTI_TURN_PROMPT_CONFIG}"
    printf 'WANDB_GROUP=%s\n' "${WANDB_GROUP}"
    printf 'FULL_LOOP_SMOKE=%s\nLOAD_DEBUG_ROLLOUT_DATA=%s\nSAVE_FIRST_TRAIN_ROLLOUT=%s\nDEBUG_ROLLOUT_DATA=%s\nDISABLE_CHECKPOINT_SAVE=%s\nCHECKPOINT_SAVE_PATH=%s\nNUM_ROLLOUT=%s\nROLLOUT_BATCH_SIZE=%s\nN_SAMPLES_PER_PROMPT=%s\nGLOBAL_BATCH_SIZE=%s\n' \
       "${FULL_LOOP_SMOKE}" "${LOAD_DEBUG_ROLLOUT_DATA}" "${SAVE_FIRST_TRAIN_ROLLOUT}" "${DEBUG_ROLLOUT_DATA}" \
@@ -1399,9 +1504,10 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'DEBUG_ROLLOUT_TWO_NODE=%s\nHEAD_RESOURCE_JSON=%s\nROLLOUT_RESOURCE_JSON=%s\n' \
       "${DEBUG_ROLLOUT_TWO_NODE}" "${HEAD_RESOURCE_JSON}" "${ROLLOUT_RESOURCE_JSON}"
    printf 'USE_NODE64_ROLLOUT=%s\n' "${USE_NODE64_ROLLOUT}"
-   printf 'SGLANG_SPECULATIVE_MODE=none\nSGLANG_SERVING_PROFILE=%s\nSGLANG_MEM_FRACTION_STATIC=%s\nSGLANG_TARGET_ATTENTION_BACKEND=%s\nSGLANG_MAMBA_RADIX_CACHE_STRATEGY=%s\n' \
+   printf 'SGLANG_SPECULATIVE_MODE=none\nSGLANG_SERVING_PROFILE=%s\nSGLANG_MEM_FRACTION_STATIC=%s\nSGLANG_MAX_RUNNING_REQUESTS=%s\nSGLANG_CUDA_GRAPH_MAX_BS=%s\nSGLANG_TARGET_ATTENTION_BACKEND=%s\nSGLANG_MAMBA_RADIX_CACHE_STRATEGY=%s\n' \
       "${SGLANG_SERVING_PROFILE}" \
-      "${SGLANG_MEM_FRACTION_STATIC}" \
+      "${SGLANG_MEM_FRACTION_STATIC}" "${SGLANG_MAX_RUNNING_REQUESTS}" \
+      "${SGLANG_CUDA_GRAPH_MAX_BS}" \
       "${SGLANG_TARGET_ATTENTION_BACKEND}" "${SGLANG_MAMBA_RADIX_CACHE_STRATEGY}"
    printf 'QWEN_GDN_BACKEND=%s\nQWEN_GDN_IMPLEMENTATION=%s\n' \
       "${QWEN_GDN_BACKEND}" "${QWEN_GDN_IMPLEMENTATION}"
@@ -1415,6 +1521,7 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'NCCL_IB_HCA=%s\n' "${NCCL_IB_HCA}"
    printf 'ACTOR_NUM_NODES=%s\nACTOR_GPUS=%s\nROLLOUT_GPUS=%s\nACTOR_PLACEMENT_RESOURCE=%s\nROLLOUT_PLACEMENT_RESOURCE=%s\n' \
       "${ACTOR_NUM_NODES}" "${ACTOR_GPUS}" "${ROLLOUT_GPUS}" "${ACTOR_PLACEMENT_RESOURCE}" "${ROLLOUT_PLACEMENT_RESOURCE}"
+   printf 'KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS=%s\n' "${KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS}"
    print_runtime_gate_plan
    declare -p MODEL_ARGS CKPT_ARGS ROLLOUT_ARGS PERF_ARGS RL_ARGS OPTIMIZER_ARGS SGLANG_ARGS MISC_ARGS DEBUG_ARGS KERNEL_AGENT_ARGS CUSTOM_ARGS
    exit 0
@@ -1563,6 +1670,8 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_AGENT_LOG_MULTI_TURN_TEXT": "0",
     "CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY": "1",
     "CUDA_AGENT_LOG_SLOWEST_INFO": "0",
+    "CUDA_AGENT_MAX_FEEDBACK_CHARS": "${MAX_FEEDBACK_CHARS}",
+    "KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS": "${KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS}",
     "CUDA_AGENT_OUTPUT_MISMATCH_PARTIAL_REWARD": "${OUTPUT_MISMATCH_PARTIAL_REWARD}",
     "CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS": "1",
     "SGLANG_RETURN_ORIGINAL_LOGPROB": "0",

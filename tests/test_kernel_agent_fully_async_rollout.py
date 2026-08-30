@@ -64,6 +64,20 @@ def test_kernel_agent_group_concurrency_matches_client_capacity():
     assert group_concurrency == 4
 
 
+def test_kernel_agent_group_concurrency_can_be_capped_without_shrinking_http_capacity(monkeypatch):
+    args = _make_rollout_args(
+        rollout_num_gpus=16,
+        sglang_max_running_requests=128,
+    )
+    monkeypatch.setitem(fully_async_rollout.CUDA_AGENT_CONFIGS, "max_active_prompt_groups", 16)
+
+    client_concurrency = http_utils.get_sglang_client_concurrency(args)
+    group_concurrency = fully_async_rollout._get_group_concurrency(args, client_concurrency)
+
+    assert client_concurrency == 512
+    assert group_concurrency == 16
+
+
 def test_http_client_is_scoped_to_current_event_loop():
     old_client = http_utils._http_client
     old_clients_by_loop = dict(http_utils._http_clients_by_loop)

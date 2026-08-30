@@ -44,9 +44,16 @@ performance_reward_requires_correctness = bool(
     int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
 )
 max_feedback_chars = int(os.environ.get("CUDA_AGENT_MAX_FEEDBACK_CHARS", "0"))
+max_active_prompt_groups = int(os.environ.get("KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS", "0"))
+if max_active_prompt_groups < 0:
+    raise ValueError("KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS must be non-negative")
 
 CUDA_AGENT_CONFIGS = {
     "max_feedback_chars": max_feedback_chars,
+    # Zero preserves the historical engine-scaled concurrency. Production
+    # launchers may cap prompt groups independently from the HTTP connection
+    # pool so adding engines does not also increase rollout queue depth.
+    "max_active_prompt_groups": max_active_prompt_groups,
     "log_multi_turn_sample_rate": 0.01,
     "log_multi_turn_full_text": False,
     "log_rollout_info": log_rollout_info,

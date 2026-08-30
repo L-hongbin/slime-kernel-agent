@@ -100,7 +100,11 @@ def _get_last_non_pad_turn_group(groups: list[RolloutGroup]) -> RolloutGroup:
 def _get_group_concurrency(args, client_concurrency: int) -> int:
     n_samples_per_prompt = max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1))
     client_concurrency = max(1, int(client_concurrency))
-    return max(1, client_concurrency // n_samples_per_prompt)
+    group_concurrency = max(1, client_concurrency // n_samples_per_prompt)
+    max_active_prompt_groups = int(CUDA_AGENT_CONFIGS.get("max_active_prompt_groups", 0) or 0)
+    if max_active_prompt_groups > 0:
+        group_concurrency = min(group_concurrency, max_active_prompt_groups)
+    return group_concurrency
 
 
 def _get_global_worker(args, data_buffer, rollout_id: int) -> KernelAgentAsyncRolloutWorker:
