@@ -8,6 +8,7 @@ expected_gpus=0
 min_cpus=64
 check_cpu_health=1
 check_gpu_occupancy=1
+gpu_memory_used_max_mib="${GPU_MEMORY_USED_MAX_MIB:-1024}"
 load_max_ratio="0.7"
 idle_min_percent=50
 cpu_window=1
@@ -39,6 +40,7 @@ Options:
   --kernelgym-health-max-interval S  Maximum seconds between attempts.
   --python-bin PATH            Python interpreter used for KernelGym health.
   --skip-cpu-health            Only check CPU count, not current load/idle.
+  --gpu-memory-used-max-mib N  Fail occupancy check if any GPU exceeds N MiB.
   --skip-gpu-occupancy         Check GPU count, but allow existing GPU processes.
   --skip-kernelgym-health      Skip KernelGym /health preflight.
 EOF
@@ -102,6 +104,10 @@ while [[ $# -gt 0 ]]; do
             check_cpu_health=0
             shift
             ;;
+        --gpu-memory-used-max-mib)
+            gpu_memory_used_max_mib="$2"
+            shift 2
+            ;;
         --skip-gpu-occupancy)
             check_gpu_occupancy=0
             shift
@@ -123,6 +129,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 status=0
+
+if ! [[ "${gpu_memory_used_max_mib}" =~ ^[0-9]+$ ]]; then
+    echo "error: --gpu-memory-used-max-mib must be a non-negative integer" >&2
+    exit 2
+fi
 
 fail() {
     echo "resource-check: FAILED: $*" >&2
@@ -180,7 +191,7 @@ check_cpu() {
 }
 
 check_gpu() {
-    local detected summary occupancy
+    local detected summary occupancy memory_used high_memory
 
     if ! command -v nvidia-smi >/dev/null 2>&1; then
         fail "${label}: nvidia-smi not found"
@@ -204,6 +215,16 @@ check_gpu() {
         return
     fi
 
+    if ! memory_used="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>&1)"; then
+        fail "${label}: GPU memory usage query failed: ${memory_used}"
+        return
+    fi
+    high_memory="$(echo "${memory_used}" | awk -v limit="${gpu_memory_used_max_mib}" '$1 + 0 > limit {print NR - 1 ", " $1 " MiB"}')"
+    if [[ -n "${high_memory}" ]]; then
+        fail "${label}: GPU memory usage exceeds ${gpu_memory_used_max_mib} MiB; compute processes may be hidden by a PID namespace:"
+        echo "${high_memory}" | sed 's/^/  gpu /' >&2
+    fi
+
     if ! occupancy="$(nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv,noheader,nounits 2>&1)"; then
         fail "${label}: GPU occupancy query failed: ${occupancy}"
         return
@@ -216,7 +237,7 @@ check_gpu() {
         return
     fi
 
-    echo "resource-check: ${label}: GPU occupancy check passed"
+    echo "resource-check: ${label}: GPU compute-process list is empty"
 }
 
 resolve_kernelgym_health_script() {
