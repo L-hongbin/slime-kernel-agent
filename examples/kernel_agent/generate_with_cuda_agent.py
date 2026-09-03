@@ -687,7 +687,7 @@ def _bounded_feedback_value(
 
 
 def _serialize_feedback_dict(feedback: dict[str, Any]) -> str:
-    return json.dumps(feedback, ensure_ascii=False, indent=2, default=str)
+    return json.dumps(feedback, ensure_ascii=False, default=str)
 
 
 def _fit_model_feedback_to_budget(feedback: dict[str, Any], max_chars: int) -> tuple[dict[str, Any], str, bool]:
@@ -803,6 +803,9 @@ def build_model_feedback(env_result: dict[str, Any], *, compiler_max_chars: int 
     metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
 
     feedback = _copy_present(state, _MODEL_FEEDBACK_TOP_LEVEL_KEYS)
+    precheck_diagnostic = metadata.get("precheck_diagnostic")
+    if isinstance(precheck_diagnostic, dict):
+        feedback["precheck_diagnostic"] = _bounded_feedback_value(precheck_diagnostic)
     error_message = state.get("error_message")
     if error_message is not None:
         error_message = str(error_message)

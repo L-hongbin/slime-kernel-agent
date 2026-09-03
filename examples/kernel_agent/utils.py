@@ -402,6 +402,142 @@ def split_think_response(response: str) -> tuple[str | None, str]:
     return None, response
 
 
+_PRECHECK_MAX_EVIDENCE = 16
+_PRECHECK_SNIPPET_MAX_CHARS = 160
+
+
+def _precheck_evidence(
+    kind: str,
+    value: str,
+    *,
+    section: str | None = None,
+    line: int | None = None,
+    column: int | None = None,
+    snippet: str | None = None,
+) -> dict[str, Any]:
+    evidence: dict[str, Any] = {"kind": kind, "value": value}
+    for key, item in (("section", section), ("line", line), ("column", column)):
+        if item is not None:
+            evidence[key] = item
+    if snippet:
+        normalized_snippet = snippet.strip()[:_PRECHECK_SNIPPET_MAX_CHARS]
+        if normalized_snippet != value:
+            evidence["snippet"] = normalized_snippet
+    return evidence
+
+
+def _record_precheck_diagnostic(
+    diagnostics: list[dict[str, Any]] | None,
+    *,
+    code: str,
+    phase: str,
+    evidence: list[dict[str, Any]] | None = None,
+) -> None:
+    """Record bounded candidate facts; never infer fixes or nearest matches."""
+    if diagnostics is None:
+        return
+    facts: list[dict[str, Any]] = []
+    seen_facts: set[tuple[Any, ...]] = set()
+    for item in evidence or []:
+        identity = (item.get("kind"), item.get("value"), item.get("section"))
+        if identity in seen_facts:
+            continue
+        seen_facts.add(identity)
+        facts.append(item)
+    diagnostic: dict[str, Any] = {"code": code, "phase": phase}
+    if facts:
+        diagnostic["evidence"] = facts[:_PRECHECK_MAX_EVIDENCE]
+        if len(facts) > _PRECHECK_MAX_EVIDENCE:
+            diagnostic["omitted_evidence"] = len(facts) - _PRECHECK_MAX_EVIDENCE
+    diagnostics.append(diagnostic)
+
+
+def _section_for_source_file(file_name: str) -> str:
+    return "CUDA_KERNELS" if file_name.lower().endswith(".cu") else "APPLY_BINDINGS"
+
+
+def _source_line(content: str, line: int) -> str | None:
+    lines = content.splitlines()
+    if line < 1 or line > len(lines):
+        return None
+    return lines[line - 1].strip()
+
+
+def _source_file_evidence(source_map: dict[str, str]) -> list[dict[str, Any]]:
+    return [
+        _precheck_evidence(
+            "parsed_source",
+            file_name,
+            section=_section_for_source_file(file_name),
+        )
+        for file_name in sorted(source_map)
+    ]
+
+
+def _source_marker_evidence(
+    source_map: dict[str, str],
+    markers: tuple[str, ...] | list[str],
+    *,
+    kind: str,
+    file_names: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    selected_files = sorted(file_names) if file_names is not None else sorted(source_map)
+    for file_name in selected_files:
+        content = str(source_map[file_name])
+        for marker in markers:
+            offset = content.find(marker)
+            if offset < 0:
+                continue
+            line = content.count("\n", 0, offset) + 1
+            line_start = content.rfind("\n", 0, offset) + 1
+            evidence.append(
+                _precheck_evidence(
+                    kind,
+                    marker,
+                    section=_section_for_source_file(file_name),
+                    line=line,
+                    column=offset - line_start + 1,
+                    snippet=_source_line(content, line),
+                )
+            )
+    return evidence
+
+
+def _python_syntax_evidence(exc: SyntaxError) -> list[dict[str, Any]]:
+    return [
+        _precheck_evidence(
+            "python_syntax_error",
+            str(exc.msg),
+            section="MODEL_NEW",
+            line=exc.lineno,
+            column=exc.offset,
+            snippet=exc.text,
+        )
+    ]
+
+
+def _model_validation_evidence(model_code: str | None, entry_point: str) -> list[dict[str, Any]]:
+    evidence = [_precheck_evidence("required_entry_point", entry_point, section="MODEL_NEW")]
+    if not model_code:
+        evidence.append(_precheck_evidence("parsed_section", "missing", section="MODEL_NEW"))
+        return evidence
+    for match in re.finditer(r"\bclass\s+([A-Za-z_]\w*)", model_code):
+        line = model_code.count("\n", 0, match.start()) + 1
+        line_start = model_code.rfind("\n", 0, match.start()) + 1
+        evidence.append(
+            _precheck_evidence(
+                "python_class",
+                match.group(1),
+                section="MODEL_NEW",
+                line=line,
+                column=match.start() - line_start + 1,
+                snippet=_source_line(model_code, line),
+            )
+        )
+    return evidence
+
+
 def validate_code(code: str | None, entry_point: str = "Model") -> tuple[bool, str]:
     if not code:
         return False, f"MODEL_NEW validation error: Python code is required and must contain a '{entry_point}' class"
@@ -455,11 +591,13 @@ def _find_register_binding_semicolon_issue(source_map: dict[str, str]) -> tuple[
 
 
 class _ExtensionCallVisitor(ast.NodeVisitor):
-    def __init__(self, module_name: str) -> None:
+    def __init__(self, module_name: str, source: str) -> None:
         self.module_name = module_name
+        self.source = source
         self.module_aliases: set[str] = {module_name}
         self.from_import_aliases: dict[str, str] = {}
         self.detected_calls: set[str] = set()
+        self.call_evidence: list[dict[str, Any]] = []
         self.imported = False
 
     def visit_Import(self, node: ast.Import) -> Any:
@@ -482,35 +620,65 @@ class _ExtensionCallVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> Any:
         func = node.func
+        detected_name = None
         if (
             isinstance(func, ast.Attribute)
             and isinstance(func.value, ast.Name)
             and func.value.id in self.module_aliases
         ):
-            self.detected_calls.add(func.attr)
+            detected_name = func.attr
         elif isinstance(func, ast.Name) and func.id in self.from_import_aliases:
-            self.detected_calls.add(self.from_import_aliases[func.id])
+            detected_name = self.from_import_aliases[func.id]
+        if detected_name is not None:
+            self.detected_calls.add(detected_name)
+            self.call_evidence.append(
+                _precheck_evidence(
+                    "extension_call",
+                    detected_name,
+                    section="MODEL_NEW",
+                    line=getattr(func, "lineno", None),
+                    column=(getattr(func, "col_offset", -1) + 1) or None,
+                    snippet=ast.get_source_segment(self.source, node),
+                )
+            )
         self.generic_visit(node)
 
 
-def _detect_extension_calls(model_code: str, module_name: str) -> tuple[bool, list[str]]:
+def _detect_extension_calls(model_code: str, module_name: str) -> tuple[bool, list[str], list[dict[str, Any]]]:
     tree = ast.parse(model_code)
-    visitor = _ExtensionCallVisitor(module_name)
+    visitor = _ExtensionCallVisitor(module_name, model_code)
     visitor.visit(tree)
-    return visitor.imported or module_name in model_code, sorted(visitor.detected_calls)
+    return visitor.imported or module_name in model_code, sorted(visitor.detected_calls), visitor.call_evidence
 
 
-def _extract_tvm_ffi_exports(source_map: dict[str, str]) -> list[str]:
+def _extract_tvm_ffi_exports_with_evidence(
+    source_map: dict[str, str],
+) -> tuple[list[str], list[dict[str, Any]]]:
     export_pattern = re.compile(
         r"\bTVM_FFI_DLL_EXPORT_TYPED_FUNC\s*\(\s*([A-Za-z_]\w*)\s*,",
         re.MULTILINE,
     )
     exports: set[str] = set()
+    evidence: list[dict[str, Any]] = []
     for name, content in source_map.items():
         if not name.lower().endswith((".cpp", ".cc", ".cxx")):
             continue
-        exports.update(export_pattern.findall(str(content)))
-    return sorted(exports)
+        source = str(content)
+        for match in export_pattern.finditer(source):
+            symbol = match.group(1)
+            exports.add(symbol)
+            line = source.count("\n", 0, match.start(1)) + 1
+            line_start = source.rfind("\n", 0, match.start(1)) + 1
+            evidence.append(
+                _precheck_evidence(
+                    "exported_symbol",
+                    symbol,
+                    section="APPLY_BINDINGS",
+                    line=line,
+                    column=match.start(1) - line_start + 1,
+                )
+            )
+    return sorted(exports), evidence
 
 
 def precheck_cuda_agent_code(
@@ -518,30 +686,67 @@ def precheck_cuda_agent_code(
     cuda_sources: dict[str, str],
     *,
     entry_point: str = "ModelNew",
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str | None, str]:
     try:
         source_map = cuda_sources or {}
 
-        def fail(message: str, error: str | None) -> tuple[str, str | None, str]:
+        def fail(
+            message: str,
+            error: str | None,
+            *,
+            code: str,
+            phase: str,
+            evidence: list[dict[str, Any]] | None = None,
+        ) -> tuple[str, str | None, str]:
+            _record_precheck_diagnostic(
+                diagnostics,
+                code=code,
+                phase=phase,
+                evidence=evidence,
+            )
             formatted_message = f"Code precheck failed: {message}"
             return formatted_message, error, "failed"
 
         is_valid, error_msg = validate_code(model_code, entry_point)
         if not is_valid:
-            return fail(error_msg, VALIDATION_ERROR)
+            return fail(
+                error_msg,
+                VALIDATION_ERROR,
+                code="MODEL_NEW_INVALID",
+                phase="response_structure",
+                evidence=_model_validation_evidence(model_code, entry_point),
+            )
 
         model_code = model_code or ""
         try:
             compile(model_code, "<string>", "exec")
         except SyntaxError as exc:
-            return fail(f"Syntax error in model code: {exc}", SYNTAX_ERROR)
+            return fail(
+                f"Syntax error in model code: {exc}",
+                SYNTAX_ERROR,
+                code="MODEL_NEW_PYTHON_SYNTAX",
+                phase="python_syntax",
+                evidence=_python_syntax_evidence(exc),
+            )
 
         if not source_map:
-            return fail("CUDA sources are required for CUDA-Agent compilation", VALIDATION_ERROR)
+            return fail(
+                "CUDA sources are required for CUDA-Agent compilation",
+                VALIDATION_ERROR,
+                code="CUDA_AGENT_SOURCES_MISSING",
+                phase="source_layout",
+            )
 
         cu_files = [name for name in source_map if name.endswith(".cu")]
         if not cu_files:
-            return fail("CUDA-Agent sources must include at least one .cu file", VALIDATION_ERROR)
+            return fail(
+                "CUDA-Agent sources must include at least one .cu file",
+                VALIDATION_ERROR,
+                code="CUDA_SOURCE_MISSING",
+                phase="source_layout",
+                evidence=_source_file_evidence(source_map),
+            )
 
         combined_sources = "\n".join(str(content) for content in source_map.values())
         combined_cpp = "\n".join(str(content) for name, content in source_map.items() if name.endswith(".cpp"))
@@ -578,35 +783,89 @@ def precheck_cuda_agent_code(
             binding_api = "unknown"
 
         try:
-            imported_extension, detected_calls = _detect_extension_calls(model_code, "cuda_extension")
+            imported_extension, detected_calls, call_evidence = _detect_extension_calls(model_code, "cuda_extension")
         except SyntaxError as exc:
-            return fail(f"Syntax error in model code: {exc}", SYNTAX_ERROR)
+            return fail(
+                f"Syntax error in model code: {exc}",
+                SYNTAX_ERROR,
+                code="MODEL_NEW_PYTHON_SYNTAX",
+                phase="python_syntax",
+                evidence=_python_syntax_evidence(exc),
+            )
         if not imported_extension:
-            return fail("model_new.py must import or reference cuda_extension", IMPORT_ERROR)
+            return fail(
+                "model_new.py must import or reference cuda_extension",
+                IMPORT_ERROR,
+                code="CUDA_EXTENSION_NOT_REFERENCED",
+                phase="python_extension",
+            )
         if not detected_calls:
-            return fail("model_new.py must call at least one cuda_extension function", VALIDATION_ERROR)
+            return fail(
+                "model_new.py must call at least one cuda_extension function",
+                VALIDATION_ERROR,
+                code="CUDA_EXTENSION_CALL_MISSING",
+                phase="python_extension",
+            )
 
         required_marker = '#include "../binding_registry.h"'
         if required_marker not in combined_cpp:
-            return fail("binding source must include ../binding_registry.h", VALIDATION_ERROR)
+            return fail(
+                "binding source must include ../binding_registry.h",
+                VALIDATION_ERROR,
+                code="BINDING_REGISTRY_HEADER_MISSING",
+                phase="binding_contract",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
 
         if binding_api == "tvm_ffi":
             return fail(
                 "binding source must use pybind/binding_registry style bindings, but TVM-FFI exports were detected",
                 VALIDATION_ERROR,
+                code="CUDA_AGENT_BINDING_API_MISMATCH",
+                phase="binding_contract",
+                evidence=_source_marker_evidence(
+                    source_map,
+                    tvm_ffi_markers,
+                    kind="binding_api_marker",
+                ),
             )
 
         if binding_api == "unknown":
-            return fail("No supported Python extension binding pattern detected in CUDA sources", VALIDATION_ERROR)
+            return fail(
+                "No supported Python extension binding pattern detected in CUDA sources",
+                VALIDATION_ERROR,
+                code="CUDA_AGENT_BINDING_API_UNKNOWN",
+                phase="binding_contract",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
 
         register_binding_issue = _find_register_binding_semicolon_issue(source_map)
         if register_binding_issue is not None:
             issue_file, issue_line = register_binding_issue
-            return fail(f"{issue_file}:{issue_line} has REGISTER_BINDING(...) without a trailing ';'", SYNTAX_ERROR)
+            return fail(
+                f"{issue_file}:{issue_line} has REGISTER_BINDING(...) without a trailing ';'",
+                SYNTAX_ERROR,
+                code="REGISTER_BINDING_MISSING_SEMICOLON",
+                phase="binding_syntax",
+                evidence=[
+                    _precheck_evidence(
+                        "binding_marker",
+                        "REGISTER_BINDING",
+                        section=_section_for_source_file(issue_file),
+                        line=issue_line,
+                        snippet=_source_line(str(source_map[issue_file]), issue_line),
+                    )
+                ],
+            )
 
         return "", None, "passed"
     except Exception as exc:
         message = f"Code precheck failed: internal validation error: {exc}"
+        _record_precheck_diagnostic(
+            diagnostics,
+            code="PRECHECK_INTERNAL_ERROR",
+            phase="internal",
+        )
         return message, VALIDATION_ERROR, "failed"
 
 
@@ -615,47 +874,115 @@ def precheck_cuda_tvm_code(
     cuda_sources: dict[str, str],
     *,
     entry_point: str = "ModelNew",
+    diagnostics: list[dict[str, Any]] | None = None,
 ) -> tuple[str, str | None, str]:
     try:
         source_map = cuda_sources or {}
 
-        def fail(message: str, error: str | None) -> tuple[str, str | None, str]:
+        def fail(
+            message: str,
+            error: str | None,
+            *,
+            code: str,
+            phase: str,
+            evidence: list[dict[str, Any]] | None = None,
+        ) -> tuple[str, str | None, str]:
+            _record_precheck_diagnostic(
+                diagnostics,
+                code=code,
+                phase=phase,
+                evidence=evidence,
+            )
             formatted_message = f"Code precheck failed: {message}"
             return formatted_message, error, "failed"
 
         is_valid, error_msg = validate_code(model_code, entry_point)
         if not is_valid:
-            return fail(error_msg, VALIDATION_ERROR)
+            return fail(
+                error_msg,
+                VALIDATION_ERROR,
+                code="MODEL_NEW_INVALID",
+                phase="response_structure",
+                evidence=_model_validation_evidence(model_code, entry_point),
+            )
 
         model_code = model_code or ""
         try:
             compile(model_code, "<string>", "exec")
         except SyntaxError as exc:
-            return fail(f"Syntax error in model code: {exc}", SYNTAX_ERROR)
+            return fail(
+                f"Syntax error in model code: {exc}",
+                SYNTAX_ERROR,
+                code="MODEL_NEW_PYTHON_SYNTAX",
+                phase="python_syntax",
+                evidence=_python_syntax_evidence(exc),
+            )
 
         try:
-            imported_extension, detected_calls = _detect_extension_calls(model_code, "tvm_ffi_extension")
+            imported_extension, detected_calls, call_evidence = _detect_extension_calls(
+                model_code, "tvm_ffi_extension"
+            )
         except SyntaxError as exc:
-            return fail(f"Syntax error in model code: {exc}", SYNTAX_ERROR)
+            return fail(
+                f"Syntax error in model code: {exc}",
+                SYNTAX_ERROR,
+                code="MODEL_NEW_PYTHON_SYNTAX",
+                phase="python_syntax",
+                evidence=_python_syntax_evidence(exc),
+            )
 
         if not imported_extension:
-            return fail("model_new.py must import or reference tvm_ffi_extension", IMPORT_ERROR)
+            return fail(
+                "model_new.py must import or reference tvm_ffi_extension",
+                IMPORT_ERROR,
+                code="TVM_FFI_EXTENSION_NOT_REFERENCED",
+                phase="python_extension",
+            )
         if not detected_calls:
-            return fail("model_new.py must call at least one tvm_ffi_extension function", VALIDATION_ERROR)
+            return fail(
+                "model_new.py must call at least one tvm_ffi_extension function",
+                VALIDATION_ERROR,
+                code="TVM_FFI_EXTENSION_CALL_MISSING",
+                phase="python_extension",
+            )
 
         if not source_map:
-            return fail("CUDA sources are required for TVM-FFI compilation", VALIDATION_ERROR)
+            return fail(
+                "CUDA sources are required for TVM-FFI compilation",
+                VALIDATION_ERROR,
+                code="TVM_FFI_SOURCES_MISSING",
+                phase="source_layout",
+                evidence=call_evidence,
+            )
 
         cu_files = [name for name in source_map if name.lower().endswith(".cu")]
         cpp_files = [name for name in source_map if name.lower().endswith((".cpp", ".cc", ".cxx"))]
         if not cu_files:
-            return fail("TVM-FFI sources must include at least one .cu file", VALIDATION_ERROR)
+            return fail(
+                "TVM-FFI sources must include at least one .cu file",
+                VALIDATION_ERROR,
+                code="CUDA_SOURCE_MISSING",
+                phase="source_layout",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
         if not cpp_files:
-            return fail("TVM-FFI sources must include at least one .cpp binding file", VALIDATION_ERROR)
+            return fail(
+                "TVM-FFI sources must include at least one .cpp binding file",
+                VALIDATION_ERROR,
+                code="TVM_FFI_CPP_SOURCE_MISSING",
+                phase="source_layout",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
 
         binding_candidates = [name for name in cpp_files if "binding" in name.lower() or "bind" in name.lower()]
         if not binding_candidates:
-            return fail("TVM-FFI sources must include a binding .cpp file", VALIDATION_ERROR)
+            return fail(
+                "TVM-FFI sources must include a binding .cpp file",
+                VALIDATION_ERROR,
+                code="TVM_FFI_BINDING_SOURCE_MISSING",
+                phase="source_layout",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
 
         combined_cpp = "\n".join(str(source_map[name]) for name in cpp_files)
         forbidden_markers = (
@@ -665,7 +992,18 @@ def precheck_cuda_tvm_code(
         )
         for marker in forbidden_markers:
             if marker in combined_cpp:
-                return fail(f"TVM-FFI binding source must not use pybind11 marker {marker}", VALIDATION_ERROR)
+                return fail(
+                    f"TVM-FFI binding source must not use pybind11 marker {marker}",
+                    VALIDATION_ERROR,
+                    code="TVM_FFI_PYBIND_MARKER_FORBIDDEN",
+                    phase="binding_contract",
+                    evidence=_source_marker_evidence(
+                        source_map,
+                        [marker],
+                        kind="binding_api_marker",
+                        file_names=cpp_files,
+                    ),
+                )
 
         host_cuda_runtime_markers = (
             "#include <cuda_runtime.h>",
@@ -678,6 +1016,14 @@ def precheck_cuda_tvm_code(
                     "TVM-FFI host binding source must keep CUDA runtime headers/types out of "
                     f"binding .cpp files; use an opaque void* stream handle instead of {marker}",
                     VALIDATION_ERROR,
+                    code="TVM_FFI_HOST_CUDA_MARKER_FORBIDDEN",
+                    phase="binding_contract",
+                    evidence=_source_marker_evidence(
+                        source_map,
+                        [marker],
+                        kind="host_cuda_marker",
+                        file_names=cpp_files,
+                    ),
                 )
 
         tvm_header_markers = (
@@ -686,25 +1032,43 @@ def precheck_cuda_tvm_code(
             "#include <tvm/ffi/container/tensor.h>",
         )
         if not any(marker in combined_cpp for marker in tvm_header_markers):
-            return fail("TVM-FFI binding source must include a tvm/ffi header", VALIDATION_ERROR)
+            return fail(
+                "TVM-FFI binding source must include a tvm/ffi header",
+                VALIDATION_ERROR,
+                code="TVM_FFI_HEADER_MISSING",
+                phase="binding_contract",
+                evidence=_source_file_evidence(source_map) + call_evidence,
+            )
 
-        exported_functions = _extract_tvm_ffi_exports(source_map)
+        exported_functions, export_evidence = _extract_tvm_ffi_exports_with_evidence(source_map)
         if not exported_functions:
             return fail(
                 "TVM-FFI binding source must export functions with TVM_FFI_DLL_EXPORT_TYPED_FUNC(...)",
                 VALIDATION_ERROR,
+                code="TVM_FFI_EXPORT_MISSING",
+                phase="binding_contract",
+                evidence=call_evidence,
             )
 
         missing_exports = sorted(set(detected_calls) - set(exported_functions))
         if missing_exports:
+            missing_call_evidence = [item for item in call_evidence if item.get("value") in missing_exports]
             return fail(
                 "TVM-FFI model calls are not exported: " + ", ".join(missing_exports),
                 VALIDATION_ERROR,
+                code="TVM_FFI_UNRESOLVED_CALL",
+                phase="binding_contract",
+                evidence=missing_call_evidence + export_evidence,
             )
 
         return "", None, "passed"
     except Exception as exc:
         message = f"Code precheck failed: internal validation error: {exc}"
+        _record_precheck_diagnostic(
+            diagnostics,
+            code="PRECHECK_INTERNAL_ERROR",
+            phase="internal",
+        )
         return message, VALIDATION_ERROR, "failed"
 
 
@@ -805,14 +1169,19 @@ def precheck_response(
         return True, None
 
     cuda_sources, model_new_code = parse_cuda_agent_response(response)
+    diagnostics: list[dict[str, Any]] = []
     error_message, error, precheck = precheck_func(
         model_new_code,
         cuda_sources,
         entry_point=entry_point,
+        diagnostics=diagnostics,
     )
     if precheck == "passed":
         return True, None
     else:
+        precheck_metadata: dict[str, Any] = {"kernel_eval_failure": True}
+        if diagnostics:
+            precheck_metadata["precheck_diagnostic"] = diagnostics[0]
         precheck_state = {
             "status": "failed",
             "precheck": precheck,
@@ -823,9 +1192,7 @@ def precheck_response(
             "decoy_kernel": False,
             "error": error,
             "error_message": error_message,
-            "metadata": {
-                "kernel_eval_failure": True,
-            },
+            "metadata": precheck_metadata,
         }
         return False, precheck_state
 

@@ -348,6 +348,59 @@ def test_precheck_rejects_tvm_ffi_missing_export():
     assert precheck_passed is False
     assert result is not None
     assert "TVM-FFI model calls are not exported: copy_forward" in result["error_message"]
+    diagnostic = result["metadata"]["precheck_diagnostic"]
+    assert diagnostic["code"] == "TVM_FFI_UNRESOLVED_CALL"
+    assert diagnostic["phase"] == "binding_contract"
+    assert [(item["kind"], item["value"]) for item in diagnostic["evidence"]] == [
+        ("extension_call", "copy_forward"),
+        ("exported_symbol", "copy_forward_exported"),
+    ]
+    assert diagnostic["evidence"][0]["section"] == "MODEL_NEW"
+    assert diagnostic["evidence"][0]["line"] > 0
+    assert diagnostic["evidence"][1]["section"] == "APPLY_BINDINGS"
+    assert diagnostic["evidence"][1]["line"] > 0
+    assert not ({"nearest_export", "suggested_edit", "repair_scope"} & diagnostic.keys())
+
+
+@pytest.mark.unit
+def test_precheck_reports_factual_python_syntax_location():
+    response = VALID_TVM_FFI_RESPONSE.replace("def forward(self, x):", "def forward(self, x)")
+
+    precheck_passed, result = precheck_response(response, "Model", "tvm_ffi")
+
+    assert precheck_passed is False
+    assert result is not None
+    diagnostic = result["metadata"]["precheck_diagnostic"]
+    assert diagnostic["code"] == "MODEL_NEW_PYTHON_SYNTAX"
+    assert diagnostic["phase"] == "python_syntax"
+    assert diagnostic["evidence"][0]["section"] == "MODEL_NEW"
+    assert diagnostic["evidence"][0]["line"] > 0
+    assert "def forward(self, x)" in diagnostic["evidence"][0]["snippet"]
+
+
+@pytest.mark.unit
+def test_precheck_reports_factual_host_cuda_marker_location():
+    response = VALID_TVM_FFI_RESPONSE.replace(
+        "#include <tvm/ffi/tvm_ffi.h>",
+        "#include <tvm/ffi/tvm_ffi.h>\n#include <cuda_runtime.h>",
+    )
+
+    precheck_passed, result = precheck_response(response, "Model", "tvm_ffi")
+
+    assert precheck_passed is False
+    assert result is not None
+    diagnostic = result["metadata"]["precheck_diagnostic"]
+    assert diagnostic["code"] == "TVM_FFI_HOST_CUDA_MARKER_FORBIDDEN"
+    assert diagnostic["phase"] == "binding_contract"
+    assert diagnostic["evidence"] == [
+        {
+            "kind": "host_cuda_marker",
+            "value": "#include <cuda_runtime.h>",
+            "section": "APPLY_BINDINGS",
+            "line": 2,
+            "column": 1,
+        }
+    ]
 
 
 @pytest.mark.unit

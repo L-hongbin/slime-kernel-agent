@@ -122,6 +122,57 @@ def test_build_model_feedback_keeps_actions_and_drops_machine_metadata():
     assert env_result == original
 
 
+def test_build_model_feedback_keeps_flat_factual_precheck_diagnostic():
+    env_result = {
+        "env_state": {
+            "status": "failed",
+            "error": "VALIDATION_ERROR",
+            "error_message": "Code precheck failed: unresolved extension call",
+            "precheck": "failed",
+            "compiled": None,
+            "correctness": None,
+            "decoy_kernel": False,
+            "metadata": {
+                "precheck_diagnostic": {
+                    "code": "TVM_FFI_UNRESOLVED_CALL",
+                    "phase": "binding_contract",
+                    "evidence": [
+                        {
+                            "kind": "extension_call",
+                            "value": "ml_forward_ops",
+                            "section": "MODEL_NEW",
+                            "line": 29,
+                        },
+                        {
+                            "kind": "exported_symbol",
+                            "value": "mlp_forward_ops",
+                            "section": "APPLY_BINDINGS",
+                            "line": 77,
+                        },
+                    ],
+                }
+            },
+        }
+    }
+
+    feedback = build_model_feedback(env_result)
+
+    assert feedback["precheck_diagnostic"] == env_result["env_state"]["metadata"]["precheck_diagnostic"]
+
+    def container_depth(value):
+        if isinstance(value, dict):
+            return 1 + max((container_depth(item) for item in value.values()), default=0)
+        if isinstance(value, list):
+            return 1 + max((container_depth(item) for item in value), default=0)
+        return 0
+
+    assert container_depth(feedback) == 4
+    serialized = json.dumps(feedback)
+    assert "nearest_export" not in serialized
+    assert "suggested_edit" not in serialized
+    assert "repair_scope" not in serialized
+
+
 def test_compact_compiler_diagnostics_preserves_each_actionable_error_block():
     compiler_output = """Compilation failed. Compiler output:
 ninja exited with status 1
@@ -332,6 +383,9 @@ def test_feedback_template_uses_compacted_text_and_reports_stats(monkeypatch):
     assert "missing_kernel" in rendered
     assert "DROP_ATEN_TRIAL" not in rendered
     assert "DROP_FULL_PROFILE" not in rendered
+    serialized = rendered.removeprefix("TEXT=")
+    assert serialized == json.dumps(json.loads(serialized), ensure_ascii=False, default=str)
+    assert "\n" not in serialized
     assert stats["original_chars"] > stats["compacted_chars"] == stats["final_chars"]
     assert stats["final_truncated"] is False
     assert env_result == original
