@@ -773,18 +773,18 @@ def update_weights_from_distributed(
     """
     Send metadata through Ray and tensors through the configured transport.
     """
-    refs = [
-        engine.update_weights_from_distributed.remote(
-            names=[name for name, _ in converted_named_tensors],
-            dtypes=[param.dtype for _, param in converted_named_tensors],
-            shapes=[param.shape for _, param in converted_named_tensors],
-            group_name=group_name,
-            weight_version=str(weight_version),
-            load_format=load_format,
-            delta=delta,
-        )
-        for engine in rollout_engines
-    ]
+    request_kwargs = {
+        "names": [name for name, _ in converted_named_tensors],
+        "dtypes": [param.dtype for _, param in converted_named_tensors],
+        "shapes": [param.shape for _, param in converted_named_tensors],
+        "group_name": group_name,
+        "weight_version": str(weight_version),
+    }
+    if load_format is not None:
+        request_kwargs["load_format"] = load_format
+    if delta is not None:
+        request_kwargs["delta"] = delta
+    refs = [engine.update_weights_from_distributed.remote(**request_kwargs) for engine in rollout_engines]
     handles = []
     for _, param in converted_named_tensors:
         handles.append(dist.broadcast(param.data, 0, group=group, async_op=True))

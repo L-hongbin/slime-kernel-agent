@@ -13,8 +13,16 @@ except ImportError:
     from sglang.srt.patch_torch import monkey_patch_torch_reductions
 
 
-from sglang.srt.utils import MultiprocessingSerializer
+try:
+    from sglang.srt.managers.io_struct import DeltaEncoding, DeltaParam, DeltaSpec
+except ImportError:
+    # Older SGLang images do not expose delta-sync request types. Only delta
+    # weight updates need them; the default full-sync path remains available.
+    DeltaEncoding = None
+    DeltaParam = None
+    DeltaSpec = None
 
+from sglang.srt.utils import MultiprocessingSerializer
 
 try:
     from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket  # type: ignore[import]
@@ -28,4 +36,7 @@ __all__ = [
     "monkey_patch_torch_reductions",
     "MultiprocessingSerializer",
     "FlattenedTensorBucket",
+    "DeltaEncoding",
+    "DeltaParam",
+    "DeltaSpec",
 ]

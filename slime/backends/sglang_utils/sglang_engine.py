@@ -617,6 +617,7 @@ class SGLangEngine(RayActor):
         flush_cache=False,
         weight_version: str | None = None,
         load_format: str | None = None,
+        delta=None,
     ):
         payload = {
             "names": names,
@@ -629,6 +630,19 @@ class SGLangEngine(RayActor):
             payload["weight_version"] = weight_version
         if load_format is not None:
             payload["load_format"] = load_format
+        if delta is not None:
+            # SGLang's request schema accepts a JSON-encoded DeltaSpec rather
+            # than relying on nested dataclass coercion through Ray/FastAPI.
+            import json
+            from dataclasses import asdict
+
+            payload["delta"] = json.dumps(
+                {
+                    "encoding": delta.encoding.value,
+                    "params": [asdict(param) for param in delta.params],
+                    "checksum": delta.checksum,
+                }
+            )
         return self._make_request(
             "update_weights_from_distributed",
             payload,
