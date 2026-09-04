@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from slime.backends.megatron_utils import model_provider as model_provider_module
+from slime.backends.megatron_utils.hf_to_megatron.qwen3_5 import qwen3_5_hf_tensor
 from slime.backends.megatron_utils.megatron_to_hf import qwen3_5 as qwen3_5_converter
 from slime.backends.megatron_utils.megatron_to_hf.processors import quantizer_fp8
 from slime.backends.megatron_utils.model_provider import _apply_qwen_gdn_pipeline_overrides
@@ -201,6 +202,146 @@ def test_native_gdn_converter_restores_hf_projection_order(monkeypatch):
     assert converted[1][1][:, 0].tolist() == [4.0] * 6
     assert converted[2][1][:, 0].tolist() == [5.0] * 2
     assert converted[3][1][:, 0].tolist() == [6.0] * 2
+
+
+def test_native_gdn_hf_loader_builds_tp_rank_major_projection_and_round_trips(monkeypatch):
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.hf_to_megatron.qwen3_5._get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(qwen3_5_converter, "_load_qwen_gdn_dimensions", lambda _: (4, 6, 2))
+    prefix = "model.language_model.layers.0.linear_attn"
+    logical_sections = [
+        torch.full((4, 3), 1.0),
+        torch.full((4, 3), 2.0),
+        torch.full((6, 3), 3.0),
+        torch.full((6, 3), 4.0),
+        torch.full((2, 3), 5.0),
+        torch.full((2, 3), 6.0),
+    ]
+    tensors = {
+        f"{prefix}.in_proj_qkv.weight": torch.cat(logical_sections[:3], dim=0),
+        f"{prefix}.in_proj_z.weight": logical_sections[3],
+        f"{prefix}.in_proj_b.weight": logical_sections[4],
+        f"{prefix}.in_proj_a.weight": logical_sections[5],
+    }
+    reader = SimpleNamespace(get_tensor=tensors.__getitem__)
+    text_config = SimpleNamespace(
+        linear_key_head_dim=2,
+        linear_num_key_heads=2,
+        linear_value_head_dim=3,
+        linear_num_value_heads=2,
+    )
+
+    loaded = qwen3_5_hf_tensor(
+        "module.module.decoder.layers.0.self_attention.in_proj.weight",
+        reader,
+        SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
+    )
+
+    expected = qwen3_5_converter.interleave_gdn_tp_sections(logical_sections, tp_size=2)
+    assert torch.equal(loaded, expected)
+    rank_size = sum(section.shape[0] // 2 for section in logical_sections)
+    assert loaded[:rank_size, 0].tolist() == [1.0] * 2 + [2.0] * 2 + [3.0] * 3 + [4.0] * 3 + [5.0, 6.0]
+    converted = dict(
+        qwen3_5_converter.convert_qwen3_5_to_hf(
+            Namespace(hf_checkpoint="unused", tensor_model_parallel_size=2, kv_channels=1),
+            "module.module.decoder.layers.0.self_attention.in_proj.weight",
+            loaded,
+        )
+    )
+    assert torch.equal(converted[f"{prefix}.in_proj_qkv.weight"], tensors[f"{prefix}.in_proj_qkv.weight"])
+    assert torch.equal(converted[f"{prefix}.in_proj_z.weight"], tensors[f"{prefix}.in_proj_z.weight"])
+    assert torch.equal(converted[f"{prefix}.in_proj_b.weight"], tensors[f"{prefix}.in_proj_b.weight"])
+    assert torch.equal(converted[f"{prefix}.in_proj_a.weight"], tensors[f"{prefix}.in_proj_a.weight"])
+
+
+def test_native_gdn_hf_loader_builds_tp_rank_major_convolution_and_round_trips(monkeypatch):
+    monkeypatch.setattr(
+        "slime.backends.megatron_utils.hf_to_megatron.qwen3_5._get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
+    monkeypatch.setattr(qwen3_5_converter, "_load_qwen_gdn_dimensions", lambda _: (4, 6, 2))
+    prefix = "model.language_model.layers.0.linear_attn"
+    sections = [
+        torch.full((4, 1, 2), 1.0),
+        torch.full((4, 1, 2), 2.0),
+        torch.full((6, 1, 2), 3.0),
+    ]
+    hf_conv = torch.cat(sections, dim=0)
+    reader = SimpleNamespace(get_tensor={f"{prefix}.conv1d.weight": hf_conv}.__getitem__)
+    text_config = SimpleNamespace(
+        linear_key_head_dim=2,
+        linear_num_key_heads=2,
+        linear_value_head_dim=3,
+        linear_num_value_heads=2,
+    )
+
+    loaded = qwen3_5_hf_tensor(
+        "module.module.decoder.layers.0.self_attention.conv1d.weight",
+        reader,
+        SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
+    )
+
+    expected = qwen3_5_converter.interleave_gdn_tp_sections(sections, tp_size=2)
+    assert torch.equal(loaded, expected)
+    converted = dict(
+        qwen3_5_converter.convert_qwen3_5_to_hf(
+            Namespace(hf_checkpoint="unused", tensor_model_parallel_size=2, kv_channels=1),
+            "module.module.decoder.layers.0.self_attention.conv1d.weight",
+            loaded,
+        )
+    )
+    assert torch.equal(converted[f"{prefix}.conv1d.weight"], hf_conv)
+
+
+@pytest.mark.parametrize(
+    ("mcore_name", "hf_suffix"),
+    [
+        ("in_proj.layer_norm_weight", "input_layernorm.weight"),
+        ("out_proj.weight", "linear_attn.out_proj.weight"),
+        ("A_log", "linear_attn.A_log"),
+        ("dt_bias", "linear_attn.dt_bias"),
+    ],
+)
+def test_native_gdn_hf_loader_maps_direct_parameters(mcore_name, hf_suffix):
+    prefix = "model.language_model.layers.0"
+    parameter = torch.randn(4, 3)
+    reader = SimpleNamespace(get_tensor={f"{prefix}.{hf_suffix}": parameter}.__getitem__)
+    text_config = SimpleNamespace(
+        linear_key_head_dim=2,
+        linear_num_key_heads=2,
+        linear_value_head_dim=3,
+        linear_num_value_heads=2,
+    )
+
+    loaded = qwen3_5_hf_tensor(
+        f"module.module.decoder.layers.0.self_attention.{mcore_name}",
+        reader,
+        SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
+    )
+
+    assert loaded is parameter
+
+
+def test_native_gdn_hf_loader_converts_out_norm_to_zero_centered_gamma():
+    prefix = "model.language_model.layers.0.linear_attn"
+    hf_gamma = torch.tensor([1.0, 1.25, 0.5])
+    reader = SimpleNamespace(get_tensor={f"{prefix}.norm.weight": hf_gamma}.__getitem__)
+    text_config = SimpleNamespace(
+        linear_key_head_dim=2,
+        linear_num_key_heads=2,
+        linear_value_head_dim=3,
+        linear_num_value_heads=2,
+    )
+
+    loaded = qwen3_5_hf_tensor(
+        "module.module.decoder.layers.0.self_attention.out_norm.weight",
+        reader,
+        SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
+    )
+
+    assert torch.equal(loaded, hf_gamma - 1)
 
 
 def test_native_gdn_fp8_quantization_preserves_b_and_a(monkeypatch):

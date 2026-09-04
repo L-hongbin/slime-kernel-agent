@@ -4,6 +4,7 @@ import re
 
 import torch
 
+from ..qwen_gdn_layout import interleave_gdn_tp_sections
 from .common import SafetensorReader, strip_mcore_wrappers
 
 
@@ -21,6 +22,66 @@ def _merge_qkv(reader: SafetensorReader, prefix: str, text_config, suffix: str) 
     k = k.reshape(num_groups, head_dim, *trailing_shape)
     v = v.reshape(num_groups, head_dim, *trailing_shape)
     return torch.cat((q, k, v), dim=1).reshape(-1, *trailing_shape).contiguous()
+
+
+def _get_tensor_model_parallel_world_size() -> int:
+    from megatron.core import mpu
+
+    return mpu.get_tensor_model_parallel_world_size()
+
+
+def _native_gdn_tensor(rest: str, reader: SafetensorReader, prefix: str, text_config) -> torch.Tensor | None:
+    """Return a full native distributed-GDN parameter in TP rank-major layout."""
+
+    native_names = {
+        "self_attention.in_proj.weight",
+        "self_attention.conv1d.weight",
+        "self_attention.in_proj.layer_norm_weight",
+        "self_attention.out_proj.weight",
+        "self_attention.out_norm.weight",
+        "self_attention.A_log",
+        "self_attention.dt_bias",
+    }
+    if rest not in native_names:
+        return None
+
+    hf_prefix = f"{prefix}.linear_attn"
+    qk_dim = text_config.linear_key_head_dim * text_config.linear_num_key_heads
+    value_dim = text_config.linear_value_head_dim * text_config.linear_num_value_heads
+    num_value_heads = text_config.linear_num_value_heads
+
+    if rest == "self_attention.in_proj.weight":
+        q, k, v = reader.get_tensor(f"{hf_prefix}.in_proj_qkv.weight").split((qk_dim, qk_dim, value_dim), dim=0)
+        sections = [
+            q,
+            k,
+            v,
+            reader.get_tensor(f"{hf_prefix}.in_proj_z.weight"),
+            reader.get_tensor(f"{hf_prefix}.in_proj_b.weight"),
+            reader.get_tensor(f"{hf_prefix}.in_proj_a.weight"),
+        ]
+        expected_sizes = (qk_dim, qk_dim, value_dim, value_dim, num_value_heads, num_value_heads)
+        actual_sizes = tuple(section.shape[0] for section in sections)
+        if actual_sizes != expected_sizes:
+            raise ValueError(f"Qwen GDN projection sections have sizes {actual_sizes}, expected {expected_sizes}.")
+        return interleave_gdn_tp_sections(sections, _get_tensor_model_parallel_world_size())
+
+    if rest == "self_attention.conv1d.weight":
+        sections = list(reader.get_tensor(f"{hf_prefix}.conv1d.weight").split((qk_dim, qk_dim, value_dim), dim=0))
+        return interleave_gdn_tp_sections(sections, _get_tensor_model_parallel_world_size())
+
+    direct_mapping = {
+        "self_attention.in_proj.layer_norm_weight": "input_layernorm.weight",
+        "self_attention.out_proj.weight": "linear_attn.out_proj.weight",
+        "self_attention.A_log": "linear_attn.A_log",
+        "self_attention.dt_bias": "linear_attn.dt_bias",
+    }
+    if rest in direct_mapping:
+        return reader.get_tensor(f"{prefix}.{direct_mapping[rest]}")
+    if rest == "self_attention.out_norm.weight":
+        # HuggingFace stores the regular gamma while native GDN uses zero-centered gamma.
+        return reader.get_tensor(f"{hf_prefix}.norm.weight") - 1
+    return None
 
 
 def qwen3_5_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.Tensor:
@@ -66,6 +127,10 @@ def qwen3_5_hf_tensor(name: str, reader: SafetensorReader, hf_config) -> torch.T
             raise KeyError(f"Unsupported Qwen3.5 Megatron parameter {name!r}")
         layer_idx, rest = layer_match.groups()
         hf_layer_prefix = f"model.language_model.layers.{layer_idx}"
+
+    native_gdn_tensor = _native_gdn_tensor(rest, reader, hf_layer_prefix, text_config)
+    if native_gdn_tensor is not None:
+        return native_gdn_tensor
 
     if rest.startswith("self_attention.linear_attn."):
         suffix = rest.removeprefix("self_attention.")
