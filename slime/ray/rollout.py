@@ -313,6 +313,17 @@ class RolloutManager:
             return None
         return next(iter(self.servers.values()))
 
+    def _get_metrics_router_addr(self) -> str | None:
+        """Return the default router address used to scrape SGLang metrics."""
+        srv = self.server
+        if srv is None or srv.router_ip is None or srv.router_port is None:
+            return None
+        return f"http://{srv.router_ip}:{srv.router_port}"
+
+    def get_metrics_router_addr(self) -> str | None:
+        """Expose the SGLang metrics router address to the driver."""
+        return self._get_metrics_router_addr()
+
     def _get_updatable_server(self) -> Any | None:
         """Return the server with ``update_weights=True``.
 

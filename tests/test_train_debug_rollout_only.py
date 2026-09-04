@@ -1,7 +1,10 @@
 import importlib
 from argparse import Namespace
+from types import SimpleNamespace
 
 import pytest
+
+from slime.ray.rollout import RolloutManager
 
 
 NUM_GPUS = 0
@@ -49,6 +52,22 @@ class _FakeActorModel:
 
     def save_model(self, rollout_id, force_sync=False):
         self.calls.append(("save_model", rollout_id, force_sync))
+
+
+@pytest.mark.parametrize(
+    ("servers", "expected"),
+    [
+        ({}, None),
+        ({"default": SimpleNamespace(router_ip=None, router_port=30000)}, None),
+        ({"default": SimpleNamespace(router_ip="127.0.0.1", router_port=30000)}, "http://127.0.0.1:30000"),
+    ],
+)
+def test_rollout_manager_exposes_metrics_router_addr(servers, expected):
+    manager_cls = RolloutManager.__ray_metadata__.modified_class
+    manager = manager_cls.__new__(manager_cls)
+    manager.servers = servers
+
+    assert manager.get_metrics_router_addr() == expected
 
 
 def _args(**overrides):
