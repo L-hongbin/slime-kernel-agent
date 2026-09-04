@@ -68,6 +68,14 @@ def test_adapter_inactive_for_non_v4_model():
     assert _v4_pp_adjust_tensor_shapes_fn(_args(), [_PlainModule()]) is None
 
 
+def test_adapter_allows_virtual_pp_for_non_v4_model():
+    class _PlainModule:
+        pass
+
+    args = _args(virtual_pipeline_model_parallel_size=2)
+    assert _v4_pp_adjust_tensor_shapes_fn(args, [_PlainModule()]) is None
+
+
 def test_adapter_rejects_virtual_pp():
     args = _args(virtual_pipeline_model_parallel_size=2)
     with pytest.raises(ValueError, match="virtual pipeline"):

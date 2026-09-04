@@ -111,8 +111,6 @@ def _v4_pp_adjust_tensor_shapes_fn(args: Namespace, model: Sequence[DDP]):
     """
     if getattr(args, "pipeline_model_parallel_size", 1) <= 1:
         return None
-    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
-        raise ValueError("V4LanguageModel does not support virtual pipeline parallelism yet")
 
     hf_config = None
     for module in unwrap_model(model):
@@ -121,6 +119,8 @@ def _v4_pp_adjust_tensor_shapes_fn(args: Namespace, model: Sequence[DDP]):
             break
     if hf_config is None or not hasattr(hf_config, "hc_mult"):
         return None
+    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
+        raise ValueError("V4LanguageModel does not support virtual pipeline parallelism yet")
 
     hc_mult = int(hf_config.hc_mult)
     hidden_size = int(hf_config.hidden_size)
