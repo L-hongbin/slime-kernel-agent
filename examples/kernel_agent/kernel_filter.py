@@ -41,7 +41,7 @@ def _low_variance_audit_record(args, samples: list[Sample], filter_rewards: list
             {
                 "id": stable_id(sample),
                 "sample_index": sample.index,
-                "group_id": sample.group_id,
+                "rollout_id": sample.rollout_id if sample.rollout_id is not None else sample.index,
                 # filter_reward is the pre-overlong-penalty task reward used
                 # for the variance decision; reward is the effective reward
                 # that would otherwise reach advantage computation.

@@ -45,9 +45,7 @@ def _fixed_samples(batch_size: int = 2):
     groups = []
     for sample_idx in range(batch_size):
         toks = torch.randint(0, _VOCAB, (_TOTAL_LEN,), generator=g).tolist()
-        s = Sample()
-        s.index = sample_idx
-        s.group_id = sample_idx
+        s = Sample(group_index=sample_idx, index=sample_idx, rollout_id=sample_idx)
         s.tokens = toks
         s.response_length = _RESP_LEN
         s.loss_mask = [1] * _RESP_LEN

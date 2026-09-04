@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
 from slime.utils.types import Sample
 
-
 NUM_GPUS = 0
 
 
@@ -27,14 +26,14 @@ def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
         Sample(
             group_index=41,
             index=100,
-            group_id=100,
+            rollout_id=100,
             reward=0.25,
             metadata={"uuid": "prompt-uuid", "start_rollout_id": 12, "task_reward": 0.5},
         ),
         Sample(
             group_index=41,
             index=101,
-            group_id=101,
+            rollout_id=101,
             reward=0.125,
             metadata={"uuid": "prompt-uuid", "start_rollout_id": 12, "task_reward": 0.5},
         ),
@@ -53,14 +52,14 @@ def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
         "samples": [
             {
                 "filter_reward": 0.5,
-                "group_id": 100,
+                "rollout_id": 100,
                 "id": "prompt-uuid",
                 "reward": 0.25,
                 "sample_index": 100,
             },
             {
                 "filter_reward": 0.5,
-                "group_id": 101,
+                "rollout_id": 101,
                 "id": "prompt-uuid",
                 "reward": 0.125,
                 "sample_index": 101,
