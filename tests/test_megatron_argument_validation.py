@@ -271,11 +271,9 @@ def test_default_args_disable_distributed_optimizer_for_muon(monkeypatch):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("megatron_to_hf_mode", ["raw", "bridge"])
 @pytest.mark.parametrize(("start_rollout_id", "expected"), [(100, 100), (None, 0)])
-def test_checkpoint_fallback_preserves_explicit_start_rollout_id(megatron_to_hf_mode, start_rollout_id, expected):
+def test_checkpoint_fallback_preserves_explicit_start_rollout_id(start_rollout_id, expected):
     args = types.SimpleNamespace(
-        megatron_to_hf_mode=megatron_to_hf_mode,
         load=None,
         ref_load=None,
         hf_checkpoint="/tmp/hf",
@@ -354,7 +352,6 @@ def make_slime_validate_args(**overrides):
         opd_type=None,
         opd_teacher_load=None,
         load=None,
-        megatron_to_hf_mode="raw",
         hf_checkpoint="/tmp/hf",
         ref_ckpt_step=None,
         ckpt_step=None,

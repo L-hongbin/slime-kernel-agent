@@ -2545,19 +2545,6 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 def _resolve_checkpoint_load_args(args) -> None:
     """Apply checkpoint fallbacks without replacing an explicit rollout id."""
-    if args.megatron_to_hf_mode == "bridge":
-        load_is_megatron = (
-            args.load is not None
-            and os.path.exists(args.load)
-            and os.path.exists(os.path.join(args.load, "latest_checkpointed_iteration.txt"))
-        )
-        if not load_is_megatron:
-            if args.load is None:
-                args.load = args.ref_load or args.hf_checkpoint
-            if args.start_rollout_id is None:
-                args.start_rollout_id = 0
-        return
-
     load_is_megatron = (
         args.load is not None
         and os.path.exists(args.load)

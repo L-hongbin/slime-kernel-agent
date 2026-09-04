@@ -88,7 +88,7 @@ def test_qwen_gdn_pipeline_override_leaves_unaffected_paths_unchanged(
     assert config.batch_p2p_comm is True
 
 
-def test_raw_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
+def test_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
     class ExpectedStop(Exception):
         pass
 
@@ -105,7 +105,6 @@ def test_raw_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
     )
     args = SimpleNamespace(
         custom_model_provider_path=None,
-        megatron_to_hf_mode="raw",
         transformer_impl="transformer_engine",
         spec="unused",
         qwen_gdn_implementation="distributed",
@@ -118,41 +117,6 @@ def test_raw_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
         provider()
 
     assert config.batch_p2p_comm is False
-
-
-def test_bridge_model_provider_applies_qwen_gdn_pipeline_override(monkeypatch):
-    from megatron.bridge import AutoBridge
-
-    finalized = []
-    provider_config = SimpleNamespace(
-        overlap_p2p_comm=False,
-        batch_p2p_comm=True,
-        finalize=lambda: finalized.append(True),
-        provide=lambda **_: None,
-    )
-    bridge = SimpleNamespace(to_megatron_provider=lambda load_weights: provider_config)
-    monkeypatch.setattr(AutoBridge, "from_hf_pretrained", lambda *args, **kwargs: bridge)
-    monkeypatch.setattr(model_provider_module, "patch_auto_bridge_hf_config", lambda value: value)
-    args = SimpleNamespace(
-        custom_model_provider_path=None,
-        megatron_to_hf_mode="bridge",
-        hf_checkpoint="unused",
-        tensor_model_parallel_size=4,
-        pipeline_model_parallel_size=2,
-        expert_model_parallel_size=1,
-        expert_tensor_parallel_size=1,
-        sequence_parallel=True,
-        context_parallel_size=2,
-        variable_seq_lengths=True,
-        qwen_gdn_implementation="distributed",
-        qwen_gdn_sp_disable_batch_p2p_comm=True,
-    )
-
-    result = model_provider_module._get_model_provider_func(args)
-
-    assert result == provider_config.provide
-    assert provider_config.batch_p2p_comm is False
-    assert finalized == [True]
 
 
 def test_gdn_tp_section_layout_round_trip():
