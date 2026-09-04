@@ -4,7 +4,7 @@ from functools import lru_cache
 import torch
 from transformers import AutoConfig
 
-from ..qwen_gdn_layout import deinterleave_gdn_tp_sections, interleave_gdn_tp_sections
+from ..qwen_gdn_layout import deinterleave_gdn_tp_sections
 
 
 @lru_cache(maxsize=8)
