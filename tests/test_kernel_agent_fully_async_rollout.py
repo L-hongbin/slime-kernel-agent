@@ -376,6 +376,88 @@ def test_kernel_agent_turn_preserves_engine_weight_version():
     assert turn_sample.weight_versions == ["8"]
 
 
+def test_kernel_agent_turn_preserves_top_p_replay_metadata():
+    base_sample = Sample(index=1)
+    turn_sample = generate_with_cuda_agent._sample_for_turn(
+        base_sample,
+        prompt_ids=[1, 2],
+        response="ok",
+        response_ids=[3, 4],
+        log_probs=[-0.1, -0.2],
+        reward=0.0,
+        status=Sample.Status.COMPLETED,
+        turn_idx=0,
+        env_result={"env_extra_info": {}},
+        args=Namespace(sglang_speculative_algorithm=None, use_rollout_routing_replay=False),
+        meta_info={
+            "top_p_token_ids": [3, 7, 4],
+            "top_p_token_offsets": [0, 2, 3],
+        },
+    )
+
+    assert turn_sample.rollout_top_p_token_ids.tolist() == [3, 7, 4]
+    assert turn_sample.rollout_top_p_token_offsets.tolist() == [0, 2, 3]
+
+
+def test_kernel_agent_turn_requires_sglang_top_p_metadata_for_real_tokens():
+    with pytest.raises(ValueError, match="SGLang did not return top-p replay metadata"):
+        generate_with_cuda_agent._sample_for_turn(
+            Sample(index=1),
+            prompt_ids=[1, 2],
+            response="ok",
+            response_ids=[3],
+            log_probs=[-0.1],
+            reward=0.0,
+            status=Sample.Status.COMPLETED,
+            turn_idx=0,
+            env_result={"env_extra_info": {}},
+            args=Namespace(
+                rollout_top_p=0.95,
+                sglang_speculative_algorithm=None,
+                use_rollout_routing_replay=False,
+            ),
+            meta_info={"finish_reason": {"type": "stop"}},
+        )
+
+
+def test_kernel_agent_top_p_request_is_forced_for_each_turn():
+    adjusted = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        Namespace(rollout_top_p=0.95, rollout_max_context_len=None),
+        {"max_new_tokens": 10},
+        prompt_token_count=3,
+    )
+
+    assert adjusted["custom_params"] == {"return_top_p_token_ids": True}
+
+
+def test_kernel_agent_synthetic_samples_have_singleton_top_p_replay():
+    base_sample = Sample(index=1)
+    padded = generate_with_cuda_agent._pad_turn_samples(
+        [],
+        base_sample,
+        max_turns=1,
+        pad_token_id=42,
+        pad_token="<pad>",
+        use_top_p_replay=True,
+    )
+    aborted = generate_with_cuda_agent._abort_result(
+        Namespace(
+            use_multi_turn=False,
+            dppo_predictive_top_k=0,
+            rollout_top_p=0.95,
+            max_turns=1,
+        ),
+        base_sample,
+        "test_abort",
+        1.0,
+    )
+
+    assert padded[0].rollout_top_p_token_ids == [42]
+    assert padded[0].rollout_top_p_token_offsets == [0, 1]
+    assert aborted.rollout_top_p_token_ids == [0]
+    assert aborted.rollout_top_p_token_offsets == [0, 1]
+
+
 def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch, caplog):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker

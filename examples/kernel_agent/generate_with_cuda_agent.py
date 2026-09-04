@@ -25,7 +25,7 @@ from slime.rollout.sglang_rollout import (
 )
 from slime.utils.http_utils import post
 from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
-from slime.utils.types import Sample
+from slime.utils.types import Sample, _extract_rollout_top_p_token_data
 
 try:
     from .config import CUDA_AGENT_CONFIGS
@@ -461,6 +461,10 @@ def _sampling_params_for_prompt_context(
     prompt_token_count: int,
 ) -> dict[str, Any]:
     turn_sampling_params = sampling_params.copy()
+    if getattr(args, "rollout_top_p", 1.0) != 1.0:
+        custom_params = dict(turn_sampling_params.get("custom_params") or {})
+        custom_params["return_top_p_token_ids"] = True
+        turn_sampling_params["custom_params"] = custom_params
     max_context_len = getattr(args, "rollout_max_context_len", None)
     if max_context_len is None:
         return turn_sampling_params
@@ -699,6 +703,21 @@ def _sample_for_turn(
     turn_sample.response = response
     turn_sample.response_length = len(response_ids)
     turn_sample.rollout_log_probs = log_probs
+    turn_sample.rollout_top_p_token_ids = None
+    turn_sample.rollout_top_p_token_offsets = None
+    if meta_info is not None:
+        top_p_data = _extract_rollout_top_p_token_data(meta_info, expected_num_tokens=len(response_ids))
+        if top_p_data is not None:
+            turn_sample.rollout_top_p_token_ids, turn_sample.rollout_top_p_token_offsets = top_p_data
+    if getattr(args, "rollout_top_p", 1.0) != 1.0 and turn_sample.rollout_top_p_token_ids is None:
+        if response_ids:
+            meta_keys = sorted(meta_info) if isinstance(meta_info, dict) else []
+            raise ValueError(
+                "SGLang did not return top-p replay metadata for a non-empty CUDA Agent response; "
+                f"meta_info keys={meta_keys}. Verify that the SGLang top-p patch is installed."
+            )
+        turn_sample.rollout_top_p_token_ids = []
+        turn_sample.rollout_top_p_token_offsets = [0]
     if predictive_support is None:
         turn_sample.rollout_topk_token_ids = None
         turn_sample.rollout_topk_log_probs = None
@@ -755,6 +774,22 @@ def _sample_for_turn(
     return turn_sample
 
 
+def _set_synthetic_top_p_replay(sample: Sample, *, enabled: bool) -> None:
+    sample.rollout_top_p_token_ids = None
+    sample.rollout_top_p_token_offsets = None
+    if not enabled:
+        return
+
+    response_length = int(sample.response_length)
+    if response_length < 0 or response_length > len(sample.tokens):
+        raise ValueError(
+            f"Cannot build synthetic top-p replay: response_length={response_length}, tokens={len(sample.tokens)}"
+        )
+    response_tokens = list(sample.tokens[-response_length:]) if response_length else []
+    sample.rollout_top_p_token_ids = response_tokens
+    sample.rollout_top_p_token_offsets = list(range(response_length + 1))
+
+
 def _pad_turn_samples(
     output_samples: list[Sample],
     base_sample: Sample,
@@ -763,6 +798,7 @@ def _pad_turn_samples(
     pad_token_id: int | None,
     pad_token: str | None,
     predictive_top_k: int = 0,
+    use_top_p_replay: bool = False,
 ) -> list[Sample]:
     if pad_token_id is None or pad_token is None:
         raise ValueError("CUDA kernel agent turn padding requires tokenizer pad_token_id or eos_token_id.")
@@ -809,6 +845,7 @@ def _pad_turn_samples(
         fake_sample.rollout_id = base_sample.rollout_id if base_sample.rollout_id is not None else base_sample.index
         fake_sample.loss_mask = [0]
         fake_sample.remove_sample = True
+        _set_synthetic_top_p_replay(fake_sample, enabled=use_top_p_replay)
         fake_sample.metadata = dict(fake_sample.metadata or {})
         fake_sample.metadata.update(
             {
@@ -884,6 +921,8 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
     aborted.rollout_id = sample.rollout_id if sample.rollout_id is not None else sample.index
     aborted.loss_mask = [0]
     aborted.remove_sample = True
+    use_top_p_replay = getattr(args, "rollout_top_p", 1.0) != 1.0
+    _set_synthetic_top_p_replay(aborted, enabled=use_top_p_replay)
     max_turns_for_abort = getattr(args, "max_turns", None)
     if max_turns_for_abort is not None:
         turn_idx = min(num_turns_completed, max(0, int(max_turns_for_abort) - 1))
@@ -904,6 +943,7 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
             pad_token_id=pad_token_id,
             pad_token=pad_token,
             predictive_top_k=predictive_top_k,
+            use_top_p_replay=use_top_p_replay,
         )
     return postprocess_turn_samples(args, output_samples, finish_reason="aborted")
 
@@ -1050,6 +1090,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                     pad_token_id=pad_token_id,
                     pad_token=pad_token,
                     predictive_top_k=predictive_top_k,
+                    use_top_p_replay=getattr(args, "rollout_top_p", 1.0) != 1.0,
                 )
             output_samples = postprocess_turn_samples(
                 args,
@@ -1058,7 +1099,10 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             )
             if getattr(args, "use_multi_turn", False):
                 return output_samples
-            return output_samples[-1] if output_samples else sample
+            if output_samples:
+                return output_samples[-1]
+            _set_synthetic_top_p_replay(sample, enabled=getattr(args, "rollout_top_p", 1.0) != 1.0)
+            return sample
 
         predictive_support = None
         if predictive_top_k:
@@ -1171,6 +1215,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             pad_token_id=pad_token_id,
             pad_token=pad_token,
             predictive_top_k=int(getattr(args, "dppo_predictive_top_k", 0) or 0),
+            use_top_p_replay=getattr(args, "rollout_top_p", 1.0) != 1.0,
         )
     output_samples = postprocess_turn_samples(
         args,
@@ -1179,7 +1224,10 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     )
     if getattr(args, "use_multi_turn", False):
         return output_samples
-    return output_samples[-1] if output_samples else sample
+    if output_samples:
+        return output_samples[-1]
+    _set_synthetic_top_p_replay(sample, enabled=getattr(args, "rollout_top_p", 1.0) != 1.0)
+    return sample
 
 
 async def reward_func(args, samples: Sample | list[Sample], **kwargs):
