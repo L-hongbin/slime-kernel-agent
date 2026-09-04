@@ -33,6 +33,7 @@ try:
     from .kernel_reward import calculate_reward, calculate_reward_speedup
     from .utils import (
         _extract_env_extra_info,
+        _truncate_middle,
         extract_cuda_agent_kernel_code,
         normalize_env_feedback,
         postprocess_turn_samples,
@@ -46,6 +47,7 @@ except ImportError:
 
     from utils import (
         _extract_env_extra_info,
+        _truncate_middle,
         extract_cuda_agent_kernel_code,
         normalize_env_feedback,
         postprocess_turn_samples,
@@ -60,16 +62,11 @@ KERNEL_AGENT_GENERATE_GUARD_SEC = int(os.environ.get("KERNEL_AGENT_GENERATE_GUAR
     + int(CUDA_AGENT_CONFIGS["env"].get("kernel_eval_task_timeout", 300))
     + 900
 )
-KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))
-LOG_FIRST_ROLLOUT = bool(int(os.environ.get("CUDA_AGENT_LOG_FIRST_ROLLOUT", "0")))
 _LOGGED_FIRST_ROLLOUT = False
 
 
-def _log_multiturn_full_text_enabled() -> bool:
-    value = os.environ.get("CUDA_AGENT_LOG_MULTI_TURN_TEXT")
-    if value is not None:
-        return value.strip().lower() not in {"0", "false", "no", "off"}
-    return bool(CUDA_AGENT_CONFIGS.get("log_multi_turn_full_text", True))
+def _log_multi_turn_info() -> bool:
+    return bool(CUDA_AGENT_CONFIGS.get("log_multi_turn_info", True))
 
 
 if ray is not None:
@@ -124,13 +121,6 @@ def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     return response_template
 
 
-def _truncate_middle(text: str, max_chars: int) -> str:
-    if max_chars <= 0 or len(text) <= max_chars:
-        return text
-    keep = max_chars // 2
-    return text[:keep] + "...(truncated)..." + text[-keep:]
-
-
 def _apply_feedback_template(env_result: dict[str, Any], response_template: PromptTemplate) -> str:
     feedback_dict = env_result.get("env_state") or env_result
     try:
@@ -177,10 +167,10 @@ def _should_log_rollout(sample: Sample) -> bool:
     return random.random() < log_rate
 
 
-def _claim_first_rollout_log() -> bool:
+def _log_first_rollout() -> bool:
     global _LOGGED_FIRST_ROLLOUT
 
-    if not LOG_FIRST_ROLLOUT or _LOGGED_FIRST_ROLLOUT:
+    if not CUDA_AGENT_CONFIGS.get("log_first_rollout", True) or _LOGGED_FIRST_ROLLOUT:
         return False
 
     _LOGGED_FIRST_ROLLOUT = True
@@ -258,17 +248,24 @@ def _log_rollout_info(
     *,
     should_log: bool = False,
     is_slowest: bool = False,
-    log_first_rollout: bool = False,
     total_request_time: float | None = None,
 ) -> None:
     if not logger.isEnabledFor(logging.INFO):
         return
-    if not (should_log or is_slowest or log_first_rollout):
+    is_first = _log_first_rollout()
+    if not (should_log or is_slowest or is_first):
         return
 
+    log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
+    stats_only = bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", True))
+    is_log_multi_turn = _log_multi_turn_info()
+    if is_first:
+        stats_only = False
+        is_log_multi_turn = True
+
     prefix = "[cuda_agent]"
-    if log_first_rollout:
-        prefix += "[first_rollout]"
+    if is_first:
+        prefix += "[first]"
     if is_slowest:
         prefix += "[slowest]"
 
@@ -296,9 +293,6 @@ def _log_rollout_info(
                 perf_cv_values[key].append(value)
     mean_perf_cv = {key: sum(values) / len(values) for key, values in perf_cv_values.items() if values}
 
-    log_max_chars = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
-    stats_only = bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", False))
-
     logger.info(
         "%s[rollout_info] sample=%s turns=%s finish_reason=%s total_request_time=%.3fs "
         "total_model_time=%.3fs total_env_time=%.3fs detail_env_time=%s perf_cv=%s",
@@ -312,6 +306,16 @@ def _log_rollout_info(
         _format_log_value(total_detail_env_time, log_max_chars),
         _format_log_value(mean_perf_cv, log_max_chars),
     )
+
+    if not stats_only:
+        logger.info(
+            "%s[messages]:\n%s",
+            prefix,
+            _format_log_value(messages, 300),
+        )
+
+    if not is_log_multi_turn:
+        return
 
     for item in turn_logs:
         env_result = item.get("env_result") if isinstance(item.get("env_result"), dict) else {}
@@ -355,6 +359,12 @@ def _log_rollout_info(
             _format_log_value(perf_cv, log_max_chars),
         )
         if stats_only:
+            logger.info(
+                "%s[turn %s] env_feedback:\n%s",
+                prefix,
+                item.get("turn_idx"),
+                _format_log_value(env_result, log_max_chars),
+            )
             continue
         logger.info(
             "%s[turn %s] prompt:\n%s",
@@ -383,62 +393,6 @@ def _log_rollout_info(
                 item.get("turn_idx"),
                 _format_log_value(item.get("format_feedback", ""), log_max_chars),
             )
-    if not stats_only:
-        logger.info(
-            "%s[messages]:\n%s",
-            prefix,
-            _format_log_value(messages, log_max_chars),
-        )
-
-
-def _log_multiturn_messages(
-    sample: Sample,
-    messages: list[dict[str, Any]],
-    turn_logs: list[dict[str, Any]],
-    finish_reason: str,
-    is_slowest: bool = False,
-    total_request_time: float | None = None,
-) -> None:
-    """Compatibility entry point for callers predating rollout-info logging."""
-    if not logger.isEnabledFor(logging.INFO):
-        return
-
-    metadata = sample.metadata or {}
-    sample_id = metadata.get("uuid") or metadata.get("uid") or metadata.get("index") or "unknown"
-    total_model_time = sum(float(item.get("model_time", 0.0)) for item in turn_logs)
-    total_env_time = sum(float(item.get("env_time", 0.0)) for item in turn_logs)
-    if total_request_time is None:
-        total_request_time = total_model_time + total_env_time
-    logger.info(
-        "[cuda_agent][multi_turn][%s] sample=%s turns=%s finish_reason=%s total_request_time=%.3fs "
-        "total_model_time=%.3fs total_env_time=%.3fs",
-        "slowest" if is_slowest else "sampled",
-        sample_id,
-        len(turn_logs),
-        finish_reason,
-        total_request_time,
-        total_model_time,
-        total_env_time,
-    )
-    if not _log_multiturn_full_text_enabled():
-        return
-
-    normalized_turn_logs = []
-    for item in turn_logs:
-        normalized_item = dict(item)
-        if not isinstance(normalized_item.get("env_result"), dict):
-            env_state = normalized_item.get("env_state")
-            normalized_item["env_result"] = {"env_state": env_state if isinstance(env_state, dict) else {}}
-        normalized_turn_logs.append(normalized_item)
-    _log_rollout_info(
-        sample,
-        messages,
-        normalized_turn_logs,
-        finish_reason,
-        should_log=True,
-        is_slowest=is_slowest,
-        total_request_time=total_request_time,
-    )
 
 
 def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
@@ -598,6 +552,8 @@ def _kernel_eval_config_value(args, config: dict[str, Any], name: str, default: 
     if value is not None:
         return value
     return config.get(name, default)
+
+
 async def cuda_kernel_env(
     args,
     sample: Sample,
@@ -655,6 +611,7 @@ async def cuda_kernel_env(
             "enable_correctness_input_perturbations": bool(
                 env_config.get("enable_correctness_input_perturbations", False)
             ),
+            "simplify_error": bool(env_config.get("simplify_error", True)),
             "memory_ratio_threshold": env_config.get("memory_ratio_threshold", 1.8),
             "detect_decoy_kernel": _kernel_eval_config_value(args, env_config, "detect_decoy_kernel", True),
         }
@@ -1007,10 +964,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             pad_token = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
     template = _get_tool_response_template(state)
     output_samples: list[Sample] = []
+    turn_logs: list[dict[str, Any]] = []
+
+    rollout_request_max_retries = int(CUDA_AGENT_CONFIGS.get("rollout_request_max_retries", 60))
     log_rollout_info = bool(CUDA_AGENT_CONFIGS.get("log_rollout_info", True))
     should_log = _should_log_rollout(sample) if log_rollout_info else False
-    log_first_rollout = _claim_first_rollout_log()
-    turn_logs: list[dict[str, Any]] = []
     finish_reason = "max_turns"
 
     for turn_idx in range(max_turns):
@@ -1066,7 +1024,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             payload["lora_path"] = lora_path
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
-        output = await post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)
+        output = await post(url, payload, max_retries=rollout_request_max_retries)
         model_time = time.monotonic() - model_started_at
         finish_type = output["meta_info"]["finish_reason"]["type"]
         if finish_type == "abort":
@@ -1080,7 +1038,6 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                 finish_reason,
                 should_log=should_log,
                 is_slowest=False,
-                log_first_rollout=log_first_rollout,
             )
             if padding_turns:
                 output_samples = _pad_turn_samples(
@@ -1204,7 +1161,6 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         finish_reason,
         should_log=should_log,
         is_slowest=is_slowest,
-        log_first_rollout=log_first_rollout,
         total_request_time=total_request_time,
     )
     if padding_turns:

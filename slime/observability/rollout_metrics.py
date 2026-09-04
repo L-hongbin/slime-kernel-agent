@@ -218,9 +218,18 @@ def _compute_kernel_trajectory_metrics(args, sample_trajectories):
 
 
 def _compute_kernel_agent_metrics(samples):
-    bool_keys = {"correctness", "compilation", "decoy_kernel"}
+    bool_keys = {
+        "correctness",
+        "compilation",
+        "decoy_kernel",
+        "correctness_candidate_forward_completed",
+        "correctness_output_mismatch",
+    }
     coverage_keys = {"time_coverage", "num_coverage"}
     values_by_key = {}
+    decoy_reason_count = {}
+    incorrect_backend_probe_skip_reason_count = {}
+    overlong_penalty_values = []
     time_values = {
         "model_time": [],
         "env_time": [],
@@ -228,6 +237,7 @@ def _compute_kernel_agent_metrics(samples):
         "detail_env_time/kernel_runtime": [],
         "detail_env_time/profile_time": [],
         "detail_env_time/ncu_profile_time_s": [],
+        "detail_env_time/runtime_sanitizer_time_s": [],
         "detail_env_time/refer_runtime": [],
     }
     total_count = len(samples)
@@ -242,9 +252,35 @@ def _compute_kernel_agent_metrics(samples):
     kernel_eval_client_timeout_count = 0
     non_pad_count = 0
     generate_guard_timeout_count = 0
+    incorrect_backend_probe_attempted_count = 0
+    incorrect_backend_probe_valid_count = 0
+    incorrect_backend_probe_custom_kernel_observed_count = 0
+    incorrect_backend_probe_decoy_detected_count = 0
+    partial_credit_applied_count = 0
+    partial_credit_rejected_decoy_count = 0
+    partial_credit_rejected_runtime_error_count = 0
+    partial_credit_rejected_timeout_count = 0
+
+    def record_reason(counter: dict[str, int], value) -> None:
+        if isinstance(value, str) and value:
+            key = "".join(char.lower() if char.isalnum() else "_" for char in value).strip("_")
+            if key:
+                counter[key] = counter.get(key, 0) + 1
 
     for sample in samples:
         metadata = sample.metadata or {}
+        partial_reason = metadata.get("partial_credit_output_mismatch_reason")
+        if metadata.get("partial_credit_output_mismatch") is True:
+            partial_credit_applied_count += 1
+        elif partial_reason == "decoy":
+            partial_credit_rejected_decoy_count += 1
+        elif partial_reason == "runtime_error":
+            partial_credit_rejected_runtime_error_count += 1
+        elif partial_reason == "timeout":
+            partial_credit_rejected_timeout_count += 1
+        overlong_penalty = metadata.get("overlong_penalty")
+        if isinstance(overlong_penalty, (int, float)) and not isinstance(overlong_penalty, bool):
+            overlong_penalty_values.append(float(overlong_penalty))
         coverage_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
         conditional_masked = bool(metadata.get("conditional_truncation_masked"))
         coverage_rs_masked_count += int(coverage_masked)
@@ -272,7 +308,14 @@ def _compute_kernel_agent_metrics(samples):
             time_values["env_time"].append(float(env_time))
             detail_env_time = env_extra_info.get("detail_env_time")
             if isinstance(detail_env_time, dict):
-                for key in ("compile_time", "kernel_runtime", "profile_time", "ncu_profile_time_s", "refer_runtime"):
+                for key in (
+                    "compile_time",
+                    "kernel_runtime",
+                    "profile_time",
+                    "ncu_profile_time_s",
+                    "runtime_sanitizer_time_s",
+                    "refer_runtime",
+                ):
                     value = detail_env_time.get(key)
                     if isinstance(value, (int, float)) and not isinstance(value, bool):
                         time_values[f"detail_env_time/{key}"].append(float(value))
@@ -293,6 +336,20 @@ def _compute_kernel_agent_metrics(samples):
             precheck_count += 1
             precheck_passed_count += int(precheck == "passed")
 
+        record_reason(decoy_reason_count, env_extra_info.get("decoy_reason"))
+        record_reason(
+            incorrect_backend_probe_skip_reason_count,
+            env_extra_info.get("incorrect_backend_probe_skip_reason"),
+        )
+        incorrect_backend_probe_attempted_count += int(env_extra_info.get("incorrect_backend_probe_attempted") is True)
+        incorrect_backend_probe_valid_count += int(env_extra_info.get("incorrect_backend_probe_valid") is True)
+        incorrect_backend_probe_custom_kernel_observed_count += int(
+            env_extra_info.get("incorrect_backend_probe_custom_kernel_observed") is True
+        )
+        incorrect_backend_probe_decoy_detected_count += int(
+            env_extra_info.get("incorrect_backend_probe_decoy_detected") is True
+        )
+
         is_correct = bool(env_extra_info.get("correctness")) and not bool(env_extra_info.get("decoy_kernel"))
         correct_count += int(is_correct)
         coverage_rs_correct_masked_count += int(is_correct and coverage_masked)
@@ -307,7 +364,7 @@ def _compute_kernel_agent_metrics(samples):
     for key, values in values_by_key.items():
         prefix = "coverage" if key in coverage_keys else "env_extra_info"
         stats = {"mean": np.mean(values).item()} if key in bool_keys else compute_statistics(values)
-        for stat_key in (("mean",) if key in bool_keys else ("min", "max", "mean")):
+        for stat_key in ("mean",) if key in bool_keys else ("min", "max", "mean"):
             metrics[f"{prefix}/{key}/{stat_key}"] = stats[stat_key]
     if total_count:
         metrics["sample_mask/coverage_rs_masked_fraction"] = coverage_rs_masked_count / total_count
@@ -326,6 +383,32 @@ def _compute_kernel_agent_metrics(samples):
     if non_pad_count:
         metrics["kernel/generate_guard_timeout_count"] = generate_guard_timeout_count
         metrics["kernel/generate_guard_timeout_ratio"] = generate_guard_timeout_count / non_pad_count
+        metrics["kernel/partial_credit/applied_rate"] = partial_credit_applied_count / non_pad_count
+        metrics["kernel/partial_credit/rejected_decoy_count"] = partial_credit_rejected_decoy_count
+        metrics["kernel/partial_credit/rejected_runtime_error_count"] = partial_credit_rejected_runtime_error_count
+        metrics["kernel/partial_credit/rejected_timeout_count"] = partial_credit_rejected_timeout_count
+        for reason, count in decoy_reason_count.items():
+            metrics[f"kernel/decoy_reason/{reason}_count"] = count
+        for reason, count in incorrect_backend_probe_skip_reason_count.items():
+            metrics[f"kernel/incorrect_backend_probe/skip_{reason}_count"] = count
+        metrics["kernel/incorrect_backend_probe/attempted_count"] = incorrect_backend_probe_attempted_count
+        metrics["kernel/incorrect_backend_probe/attempted_ratio"] = (
+            incorrect_backend_probe_attempted_count / non_pad_count
+        )
+        if incorrect_backend_probe_attempted_count:
+            metrics["kernel/incorrect_backend_probe/valid_count"] = incorrect_backend_probe_valid_count
+            metrics["kernel/incorrect_backend_probe/valid_ratio_of_attempted"] = (
+                incorrect_backend_probe_valid_count / incorrect_backend_probe_attempted_count
+            )
+        if incorrect_backend_probe_valid_count:
+            metrics["kernel/incorrect_backend_probe/custom_kernel_observed_ratio_of_valid"] = (
+                incorrect_backend_probe_custom_kernel_observed_count / incorrect_backend_probe_valid_count
+            )
+            metrics["kernel/incorrect_backend_probe/decoy_detected_ratio_of_valid"] = (
+                incorrect_backend_probe_decoy_detected_count / incorrect_backend_probe_valid_count
+            )
+    if overlong_penalty_values:
+        metrics["kernel/overlong_penalty/mean"] = np.mean(overlong_penalty_values).item()
     for key, values in time_values.items():
         if not values:
             continue

@@ -47,9 +47,7 @@ def _completed_env(
         "correctness_candidate_forward_completed": candidate_forward_completed,
         "correctness_output_mismatch": output_mismatch,
     }
-    if runtime_error is not None:
-        metadata["runtime_error"] = runtime_error
-    return {
+    env_state = {
         "status": "completed",
         "compiled": compiled,
         "correctness": correctness,
@@ -57,6 +55,10 @@ def _completed_env(
         "speedup": speedup,
         "metadata": metadata,
     }
+    if runtime_error is not None:
+        env_state["error"] = "RUNTIME_ERROR"
+        env_state["error_message"] = runtime_error
+    return env_state
 
 
 def test_output_mismatch_receives_reviewed_partial_reward():
@@ -150,17 +152,23 @@ def test_qwen_policy_gates_performance_reward_on_correctness_without_changing_gl
     assert legacy_details["reward"] == pytest.approx(1.0)
 
 
-def test_normalization_preserves_runtime_failure_guard_for_partial_reward():
+def test_normalization_uses_runtime_error_code_for_partial_reward():
     env_state, _ = normalize_env_feedback(
-        _completed_env(
-            output_mismatch=True,
-            candidate_forward_completed=True,
-            runtime_error="CUDA illegal memory access",
-        )
+        {
+            **_completed_env(output_mismatch=True, candidate_forward_completed=True),
+            "error_code": "RUNTIME_ERROR",
+            "error_message": "CUDA illegal memory access",
+            "metadata": {
+                "correctness_candidate_forward_completed": True,
+                "correctness_output_mismatch": True,
+                "runtime_error": "CUDA illegal memory access",
+            },
+        }
     )
 
     assert "runtime_error" not in env_state["metadata"]
-    assert env_state["metadata"]["correctness_runtime_error"] == "CUDA illegal memory access"
+    assert "correctness_runtime_error" not in env_state["metadata"]
+    assert env_state["error"] == "RUNTIME_ERROR"
     details = calculate_reward_speedup(env_state, _reward_config())
     assert details["reward"] == 0.0
     assert details["partial_credit_output_mismatch_reason"] == "runtime_error"
@@ -214,6 +222,7 @@ def test_normalization_preserves_mismatch_and_summarizes_backend_probe():
         }
     )
 
+    assert env_state["metadata"]["correctness_candidate_forward_completed"] is True
     assert env_extra_info["correctness_candidate_forward_completed"] is True
     assert env_extra_info["correctness_output_mismatch"] is True
     assert env_extra_info["incorrect_backend_probe_attempted"] is True
@@ -230,7 +239,7 @@ def test_normalization_preserves_mismatch_and_summarizes_backend_probe():
 
 
 def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
-    from slime.ray.rollout import _compute_kernel_agent_metrics
+    from slime.observability.rollout_metrics import _compute_kernel_agent_metrics
 
     sample = Sample(
         prompt="prompt",

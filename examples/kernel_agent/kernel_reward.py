@@ -4,9 +4,9 @@ from typing import Any
 import torch
 
 try:
-    from .utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
+    from .utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
 except ImportError:
-    from utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
+    from utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
 
 
 def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
@@ -215,7 +215,7 @@ def _resolve_output_mismatch_partial_credit(
         return 0.0, False, "already_correct"
 
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
-    if metadata.get("runtime_error") or metadata.get("correctness_runtime_error"):
+    if env_state.get("error") == RUNTIME_ERROR:
         return 0.0, False, "runtime_error"
     if not bool(metadata.get("correctness_output_mismatch", False)):
         if not bool(env_state.get("compiled", False)):

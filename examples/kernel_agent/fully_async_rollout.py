@@ -18,12 +18,13 @@ from collections.abc import Iterable
 from typing import Any
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+
+from slime.observability.metric_utils import compute_rollout_step
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_sglang_client_concurrency
-from slime.observability.metric_utils import compute_rollout_step
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
@@ -391,7 +392,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     started = time.time()
     last_log = started
     log_every = 30.0
-    log_sample_bodies = not bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", False))
+    log_sample_bodies = not bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", True))
     do_print = log_sample_bodies
     drop_reason_counts: Counter[str] = Counter()
 

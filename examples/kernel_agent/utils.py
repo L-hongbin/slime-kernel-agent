@@ -27,6 +27,14 @@ KERNEL_EVAL_TIMEOUT = "KERNEL_EVAL_TIMEOUT"
 
 CUDA_SECTIONS = ("CUDA_KERNELS", "APPLY_BINDINGS", "MODEL_NEW")
 
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    keep = max_chars // 2
+    return text[:keep] + "...(truncated)..." + text[-keep:]
+
+
 METADATA_POP_KEYS = (
     "compile_only",
     "device",
@@ -35,6 +43,9 @@ METADATA_POP_KEYS = (
     "inline_gpu_execute_completed",
     "inline_compile_worker_id",
     "inline_compile_worker_device",
+    "cpu_worker_id",
+    "compile_node_id",
+    "compile_hostname",
     "compile_timing",
     "build_backend",
     "compilation_error",
@@ -50,7 +61,6 @@ METADATA_POP_KEYS = (
     "correctness_effective_trials",
     "correctness_input_perturbation_trials",
     "correctness_reference_skipped_perturbations",
-    "correctness_candidate_forward_completed",
     "correctness_candidate_forward_completed_trials",
     "correctness_current_trial",
     "correctness_current_substage",
@@ -229,6 +239,10 @@ def _runtime_sanitizer_has_structured_issues(runtime_sanitizer: Any) -> bool:
     )
 
 
+def _runtime_sanitizer_was_executed(runtime_sanitizer: Any) -> bool:
+    return isinstance(runtime_sanitizer, dict) and runtime_sanitizer.get("status") not in {None, "skipped"}
+
+
 def _normalize_runtime_sanitizer(runtime_sanitizer: Any) -> Any:
     if not isinstance(runtime_sanitizer, dict):
         return runtime_sanitizer
@@ -247,11 +261,16 @@ def _normalize_runtime_sanitizer(runtime_sanitizer: Any) -> Any:
         if not isinstance(check_result, dict):
             normalized_check_results.append(check_result)
             continue
+        if check_result.get("status") == "clean":
+            continue
         compact_check = {
             key: check_result[key]
             for key in ("check", "status", "detected_issue_count", "issues", "error")
             if key in check_result
         }
+        raw_output_tail = check_result.get("raw_output_tail")
+        if raw_output_tail:
+            compact_check["raw_output_tail"] = _truncate_middle(str(raw_output_tail), 500)
         if check_result.get("issues_truncated") is True:
             compact_check["issues_truncated"] = True
         issues = compact_check.get("issues")
@@ -266,7 +285,10 @@ def _normalize_runtime_sanitizer(runtime_sanitizer: Any) -> Any:
                 compact_issues.append(compact_issue)
             compact_check["issues"] = compact_issues
         normalized_check_results.append(compact_check)
-    normalized["check_results"] = normalized_check_results
+    if normalized_check_results:
+        normalized["check_results"] = normalized_check_results
+    else:
+        normalized.pop("check_results", None)
     return normalized
 
 
@@ -525,8 +547,11 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     env_state = dict(env_state or {})
     for key in ("submitted_at", "completed_at", "error_code"):
         env_state.pop(key, None)
-    if "runtime_sanitizer" in env_state:
-        env_state["runtime_sanitizer"] = _normalize_runtime_sanitizer(env_state["runtime_sanitizer"])
+    runtime_sanitizer = env_state.get("runtime_sanitizer")
+    sanitizer_was_executed = _runtime_sanitizer_was_executed(runtime_sanitizer)
+    sanitizer_status = runtime_sanitizer.get("status") if isinstance(runtime_sanitizer, dict) else None
+    if runtime_sanitizer is not None:
+        env_state["runtime_sanitizer"] = _normalize_runtime_sanitizer(runtime_sanitizer)
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
@@ -541,12 +566,8 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
                 metadata.pop(key, None)
         for key in METADATA_POP_KEYS:
             metadata.pop(key, None)
-        if runtime_error:
-            # Preserve only a bounded correctness-stage summary after removing
-            # KernelGym's raw runtime field. The Qwen mismatch reward consumes
-            # this guard after normalization; multi-turn feedback does not need
-            # an unbounded duplicate of the error payload.
-            metadata["correctness_runtime_error"] = str(runtime_error)[:512]
+        if sanitizer_was_executed and sanitizer_status != "clean" and runtime_error:
+            metadata["runtime_error"] = _truncate_middle(str(runtime_error), 500)
         for key in list(metadata):
             if key.startswith(
                 ("kg_stage_", "kg_reference_", "wg_", "tm_", "correctness_budget_", "runtime_sanitizer_")

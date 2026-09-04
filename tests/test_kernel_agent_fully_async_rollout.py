@@ -458,7 +458,7 @@ def test_kernel_agent_synthetic_samples_have_singleton_top_p_replay():
     assert aborted.rollout_top_p_token_offsets == [0, 1]
 
 
-def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch, caplog):
+def test_kernel_agent_rollout_stats_only_keeps_surplus_completed_groups_queued(monkeypatch, caplog):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker
     )
@@ -657,11 +657,9 @@ def test_full_async_kernel_agent_script_guards_critical_config():
 def test_cuda_agent_sglang_post_is_fail_fast_by_default():
     source = (REPO_ROOT / "examples/kernel_agent/generate_with_cuda_agent.py").read_text()
 
-    assert (
-        'KERNEL_AGENT_GENERATE_MAX_RETRIES = max(1, int(os.environ.get("KERNEL_AGENT_GENERATE_MAX_RETRIES", "60") or 60))'
-        in source
-    )
-    assert "post(url, payload, max_retries=KERNEL_AGENT_GENERATE_MAX_RETRIES)" in source
+    assert 'rollout_request_max_retries = int(CUDA_AGENT_CONFIGS.get("rollout_request_max_retries", 60))' in source
+    assert "post(url, payload, max_retries=rollout_request_max_retries)" in source
+    assert "_generate_max_retries" not in source
 
 
 if __name__ == "__main__":

@@ -406,6 +406,10 @@ class ModelNew(nn.Module):
 def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, monkeypatch, caplog, case):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", True)
+    monkeypatch.setattr(generate_with_cuda_agent, "_LOGGED_FIRST_ROLLOUT", False)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_ncu", False)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_compute_sanitizer", True)
@@ -545,7 +549,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         total_request_time=1.0,
     )
 
-    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
+    assert "[cuda_agent][first][slowest][rollout_info]" in caplog.text
     assert "total_request_time=1.000s" in caplog.text
     assert f"compiled={case['feedback_compiled']}" in caplog.text
     assert "precheck=passed" in caplog.text
@@ -615,15 +619,17 @@ def test_split_think_response_handles_generation_prompt_prefilled_think():
 
 
 @pytest.mark.unit
-def test_multiturn_log_can_omit_full_prompt_and_response(monkeypatch, caplog):
-    monkeypatch.setenv("CUDA_AGENT_LOG_MULTI_TURN_TEXT", "0")
+def test_rollout_log_omits_turn_info_when_multi_turn_info_is_disabled(monkeypatch, caplog):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", False)
     sample = Sample(
         prompt="Write a CUDA implementation.",
         metadata={"uuid": "log-trim"},
     )
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
-    generate_with_cuda_agent._log_multiturn_messages(
+    generate_with_cuda_agent._log_rollout_info(
         sample,
         messages=[
             {"role": "user", "content": sample.prompt},
@@ -639,7 +645,6 @@ def test_multiturn_log_can_omit_full_prompt_and_response(monkeypatch, caplog):
                 "finish_type": "stop",
                 "prompt": sample.prompt,
                 "response": VALID_CUDA_AGENT_RESPONSE,
-                "env_state": {"status": "completed", "compiled": True},
                 "env_result": {"env_state": {"status": "completed", "compiled": True}},
             }
         ],
@@ -648,51 +653,127 @@ def test_multiturn_log_can_omit_full_prompt_and_response(monkeypatch, caplog):
         total_request_time=1.0,
     )
 
-    assert "[cuda_agent][multi_turn][slowest]" in caplog.text
+    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
     assert "sample=log-trim" in caplog.text
+    assert "[turn 0]" not in caplog.text
     assert "### CUDA_KERNELS" not in caplog.text
     assert "response_content" not in caplog.text
-    assert "messages:" not in caplog.text
+    assert "[prompt]:" not in caplog.text
 
 
 @pytest.mark.unit
-def test_rollout_stats_only_omits_slowest_sample_body(monkeypatch, caplog):
-    sentinel = "very-long-response-body-must-not-be-logged"
-    sample = Sample(prompt="long prompt", metadata={"uuid": "slowest-stats-only"})
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
+def test_first_rollout_logs_turn_info_when_multi_turn_info_is_disabled(monkeypatch, caplog):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", True)
+    monkeypatch.setattr(generate_with_cuda_agent, "_LOGGED_FIRST_ROLLOUT", False)
+    sample = Sample(prompt="first prompt", metadata={"uuid": "first-rollout"})
+    messages = [{"role": "user", "content": sample.prompt}]
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
     generate_with_cuda_agent._log_rollout_info(
         sample,
-        messages=[
-            {"role": "user", "content": sample.prompt},
-            {"role": "assistant", "content": sentinel},
-        ],
+        messages=messages,
         turn_logs=[
             {
                 "turn_idx": 0,
-                "task_id": "slowest-task",
-                "model_time": 12.5,
-                "env_time": 3.5,
-                "prompt_tokens": 128,
-                "response_tokens": 16384,
-                "finish_type": "length",
+                "model_time": 0.25,
+                "env_time": 0.75,
                 "prompt": sample.prompt,
-                "response": sentinel,
+                "response": VALID_CUDA_AGENT_RESPONSE,
+                "reward": 0.0,
                 "env_result": {"env_state": {"status": "completed"}},
-                "format_feedback": sentinel,
             }
         ],
         finish_reason="max_turns",
-        is_slowest=True,
-        total_request_time=16.0,
     )
 
-    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
-    assert "response_tokens=16384" in caplog.text
-    assert sentinel not in caplog.text
+    assert "[cuda_agent][first][rollout_info]" in caplog.text
+    assert "[turn 0]" in caplog.text
+    assert "[turn 0] prompt:" in caplog.text
+    assert "first prompt" in caplog.text
+    assert "[messages]:" in caplog.text
+    assert '"role": "user"' in caplog.text
+
+
+@pytest.mark.unit
+def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", False)
+    sample = Sample(prompt="hidden prompt", metadata={"uuid": "stats-only"})
+
+    caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
+    generate_with_cuda_agent._log_rollout_info(
+        sample,
+        messages=[{"role": "user", "content": sample.prompt}],
+        turn_logs=[
+            {
+                "turn_idx": 0,
+                "task_id": "stats-only-task",
+                "model_time": 0.25,
+                "env_time": 0.75,
+                "prompt": sample.prompt,
+                "response": VALID_CUDA_AGENT_RESPONSE,
+                "reward": 0.0,
+                "env_result": {"env_state": {"status": "completed"}},
+            }
+        ],
+        finish_reason="max_turns",
+        should_log=True,
+    )
+
+    assert "[turn 0] task_id=stats-only-task" in caplog.text
+    assert "[turn 0] env_feedback:" in caplog.text
+    assert '"status": "completed"' in caplog.text
+    assert "[prompt]:" not in caplog.text
+    assert "[turn 0] user_content:" not in caplog.text
     assert "response_content" not in caplog.text
-    assert "messages:" not in caplog.text
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_strips_compile_worker_routing_metadata():
+    normalized, _ = normalize_env_feedback(
+        {
+            "compiled": False,
+            "correctness": False,
+            "speedup": 0.0,
+            "error_code": "COMPILATION_ERROR",
+            "error_message": "Kernel compilation failed: nvcc error",
+            "metadata": {
+                "cpu_worker_id": "node-a_cpu_0",
+                "compile_node_id": "node-a",
+                "compile_hostname": "host-a",
+                "compilation_error_detail": "other",
+            },
+        }
+    )
+
+    assert normalized["metadata"] == {"compilation_error_detail": "other"}
+
+
+@pytest.mark.unit
+def test_log_multi_turn_info_uses_config_and_defaults_to_true(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", False)
+    assert generate_with_cuda_agent._log_multi_turn_info() is False
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", True)
+    assert generate_with_cuda_agent._log_multi_turn_info() is True
+
+    monkeypatch.delitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info")
+    assert generate_with_cuda_agent._log_multi_turn_info() is True
+
+
+@pytest.mark.unit
+def test_log_first_rollout_uses_config_and_logs_once(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", True)
+    monkeypatch.setattr(generate_with_cuda_agent, "_LOGGED_FIRST_ROLLOUT", False)
+    assert generate_with_cuda_agent._log_first_rollout() is True
+    assert generate_with_cuda_agent._log_first_rollout() is False
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", False)
+    monkeypatch.setattr(generate_with_cuda_agent, "_LOGGED_FIRST_ROLLOUT", False)
+    assert generate_with_cuda_agent._log_first_rollout() is False
 
 
 @pytest.mark.unit
@@ -738,6 +819,8 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "num_correct_trials", 1)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "num_perf_trials", 1)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
 
     sample = Sample(
@@ -765,11 +848,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
     generate_with_cuda_agent._log_rollout_info(
         sample,
-        messages=[
-            {"role": "user", "content": sample.prompt},
-            {"role": "assistant", "content": case["response"]},
-            {"role": "user", "content": format_feedback},
-        ],
+        prompt_text=f"{sample.prompt}\n{case['response']}\n{format_feedback}",
         turn_logs=[
             {
                 "turn_idx": 0,
@@ -792,7 +871,7 @@ def test_cuda_kernel_env_real_kernel_eval_server(request, monkeypatch, caplog, c
 
     assert env_state["status"] in {"completed", "failed", "timeout", "cancelled"}
     assert env_state.get("compiled") is case["expected_compiled"]
-    assert "[cuda_agent][slowest][rollout_info]" in caplog.text
+    assert "[cuda_agent][first][rollout_info]" in caplog.text
     assert case["uuid"] in caplog.text
     assert "format_feedback" in caplog.text
     assert "Server feedback (status/metrics/errors):" in caplog.text
@@ -919,6 +998,8 @@ def test_normalize_env_feedback_extra_info_defaults_missing_decoy_kernel():
 
 @pytest.mark.unit
 def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall_time():
+    runtime_error = "head:" + "H" * 320 + " middle " + "T" * 320 + ":tail"
+    raw_output_tail = "output-head:" + "O" * 320 + " middle " + "Z" * 320 + ":output-tail"
     raw_env_state = {
         "status": "failed",
         "compiled": True,
@@ -927,7 +1008,7 @@ def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall
         "error_code": "RUNTIME_ERROR",
         "error_message": "Runtime Sanitizer detected an unsafe CUDA kernel",
         "metadata": {
-            "runtime_error": "Traceback: original correctness failure",
+            "runtime_error": runtime_error,
             "runtime_sanitizer_status": "issues_found",
             "runtime_sanitizer_issue_count": 1,
         },
@@ -943,7 +1024,7 @@ def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall
                     "check": "memcheck",
                     "status": "issues_found",
                     "detected_issue_count": 1,
-                    "raw_output_tail": "duplicated output",
+                    "raw_output_tail": raw_output_tail,
                     "issues": [
                         {
                             "hazard_type": "invalid_global_write",
@@ -952,7 +1033,14 @@ def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall
                             "representative_occurrences": [{"thread": {"x": 232}}],
                         }
                     ],
-                }
+                },
+                {
+                    "check": "synccheck",
+                    "status": "clean",
+                    "detected_issue_count": 0,
+                    "raw_output_tail": "ERROR SUMMARY: 0 errors",
+                    "issues": [],
+                },
             ],
         },
     }
@@ -963,14 +1051,72 @@ def test_normalize_env_feedback_compacts_runtime_sanitizer_and_accounts_for_wall
     assert normalized["error"] == "RUNTIME_ERROR"
     assert "error_code" not in normalized
     assert set(sanitizer) == {"status", "measurement_complete", "primary_check", "check_results"}
-    assert set(sanitizer["check_results"][0]) == {"check", "status", "detected_issue_count", "issues"}
+    assert set(sanitizer["check_results"][0]) == {
+        "check",
+        "status",
+        "detected_issue_count",
+        "issues",
+        "raw_output_tail",
+    }
+    assert len(sanitizer["check_results"]) == 1
+    assert sanitizer["check_results"][0]["check"] == "memcheck"
+    assert sanitizer["check_results"][0]["raw_output_tail"] == (
+        f"{raw_output_tail[:250]}...(truncated)...{raw_output_tail[-250:]}"
+    )
     assert "raw_excerpt" not in sanitizer["check_results"][0]["issues"][0]
     assert "representative_occurrences" not in sanitizer["check_results"][0]["issues"][0]
     assert normalized["error_message"] == "Runtime Sanitizer detected an unsafe CUDA kernel"
+    assert normalized["metadata"]["runtime_error"] == f"{runtime_error[:250]}...(truncated)...{runtime_error[-250:]}"
     assert "runtime_sanitizer_status" not in normalized["metadata"]
     assert "runtime_sanitizer_issue_count" not in normalized["metadata"]
     assert env_extra_info["detail_env_time"]["runtime_sanitizer_time_s"] == pytest.approx(3.4568)
     assert raw_env_state["runtime_sanitizer"]["replayed_input_seed"] == 123456
+    assert len(raw_env_state["runtime_sanitizer"]["check_results"]) == 2
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_removes_check_results_when_all_sanitizer_checks_are_clean():
+    raw_env_state = {
+        "status": "failed",
+        "compiled": True,
+        "correctness": False,
+        "speedup": 0.0,
+        "error_code": "RUNTIME_ERROR",
+        "error_message": "Kernel execution failed",
+        "metadata": {"runtime_error": "TypeError: unsupported operand type"},
+        "runtime_sanitizer": {
+            "status": "clean",
+            "measurement_complete": True,
+            "primary_check": "memcheck",
+            "check_results": [
+                {
+                    "check": "memcheck",
+                    "status": "clean",
+                    "detected_issue_count": 0,
+                    "raw_output_tail": "ERROR SUMMARY: 0 errors",
+                    "issues": [],
+                },
+                {
+                    "check": "synccheck",
+                    "status": "clean",
+                    "detected_issue_count": 0,
+                    "raw_output_tail": "ERROR SUMMARY: 0 errors",
+                    "issues": [],
+                },
+            ],
+        },
+    }
+
+    normalized, _ = normalize_env_feedback(raw_env_state)
+
+    assert normalized["runtime_sanitizer"] == {
+        "status": "clean",
+        "measurement_complete": True,
+        "primary_check": "memcheck",
+    }
+    assert "runtime_error" not in normalized["metadata"]
+    assert "TypeError: unsupported operand type" in normalized["error_message"]
+    assert len(raw_env_state["runtime_sanitizer"]["check_results"]) == 2
 
 
 @pytest.mark.unit
@@ -992,6 +1138,7 @@ def test_normalize_env_feedback_keeps_runtime_error_without_structured_sanitizer
     assert normalized["error"] == "RUNTIME_ERROR"
     assert "error_code" not in normalized
     assert runtime_error in normalized["error_message"]
+    assert "runtime_error" not in normalized["metadata"]
 
 
 @pytest.mark.unit
@@ -1026,7 +1173,9 @@ def test_normalize_env_feedback_deduplicates_issue_and_strips_correctness_progre
     normalized, _ = normalize_env_feedback(raw_env_state)
 
     assert normalized["error_message"] == raw_error_message
-    assert progress_fields.keys().isdisjoint(normalized["metadata"])
+    assert normalized["metadata"]["correctness_candidate_forward_completed"] is True
+    removed_progress_fields = progress_fields.keys() - {"correctness_candidate_forward_completed"}
+    assert removed_progress_fields.isdisjoint(normalized["metadata"])
     assert "correctness_issue" not in normalized["metadata"]
     assert normalized["metadata"]["correctness_trials"] == "(5 / 5)"
     assert raw_env_state["metadata"]["correctness_issue"] == correctness_issue
@@ -1050,6 +1199,7 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
                         "compile_time": 1.0,
                         "kernel_runtime": 10.0,
                         "profile_time": 100.0,
+                        "runtime_sanitizer_time_s": 5.0,
                         "refer_runtime": 1000.0,
                     },
                 },
@@ -1069,6 +1219,7 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
                         "compile_time": 3.0,
                         "kernel_runtime": 30.0,
                         "profile_time": 300.0,
+                        "runtime_sanitizer_time_s": 7.0,
                         "refer_runtime": 3000.0,
                     },
                 },
@@ -1095,6 +1246,8 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
     assert metrics["kernel/time/detail_env_time/compile_time/p50"] == pytest.approx(2.0)
     assert metrics["kernel/time/detail_env_time/kernel_runtime/mean"] == pytest.approx(20.0)
     assert metrics["kernel/time/detail_env_time/profile_time/sum"] == pytest.approx(400.0)
+    assert metrics["kernel/time/detail_env_time/runtime_sanitizer_time_s/mean"] == pytest.approx(6.0)
+    assert metrics["kernel/time/detail_env_time/runtime_sanitizer_time_s/sum"] == pytest.approx(12.0)
     assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)
     assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)
 

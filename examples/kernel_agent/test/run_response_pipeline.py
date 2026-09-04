@@ -130,6 +130,7 @@ async def _run(args) -> None:
         "enable_correctness_input_perturbations": bool(
             env_config.get("enable_correctness_input_perturbations", False)
         ),
+        "simplify_error": bool(env_config.get("simplify_error", True)),
         "memory_ratio_threshold": env_config.get("memory_ratio_threshold", 1.8),
         "detect_decoy_kernel": args.detect_decoy_kernel,
     }

@@ -1,12 +1,20 @@
 import os
 
+# Rollout request settings.
+rollout_request_max_retries = max(1, int(os.environ.get("ROLLOUT_REQUEST_MAX_RETRIES", 60)))
+# Rollout logging settings.
 log_rollout_info = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_INFO", 1)))
 log_rollout_info_rate = float(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_INFO_RATE", 0.01))
-# When True, [rollout_info] logs only stats (summary + per-turn metrics) and skips the
-# verbose text: prompt, response_think, response_content, format_feedback, and [messages].
-log_rollout_stats_only = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY", 0)))
+log_multi_turn_info = bool(int(os.environ.get("CUDA_AGENT_LOG_MULTI_TURN_TEXT", 1)))
+log_rollout_stats_only = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY", 1)))
+log_first_rollout = bool(int(os.environ.get("CUDA_AGENT_LOG_FIRST_ROLLOUT", 1)))
+log_slowest_info = bool(int(os.environ.get("CUDA_AGENT_LOG_SLOWEST_INFO", 1)))
+log_slowest_step_window = int(os.environ.get("CUDA_AGENT_LOG_SLOWEST_STEP_WINDOW", 100))
+log_slowest_min_delta_seconds = float(os.environ.get("CUDA_AGENT_LOG_SLOWEST_MIN_DELTA_SECONDS", 10.0))
+# KernelGym request lifecycle settings.
 kernel_eval_heartbeat_interval = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL", 60.0))
 kernel_eval_task_timeout = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_TASK_TIMEOUT", 300.0))
+# Correctness and performance trial settings.
 num_correct_trials = int(os.environ.get("CUDA_AGENT_NUM_CORRECT_TRIALS", 5))
 num_perf_trials = int(os.environ.get("CUDA_AGENT_NUM_PERF_TRIALS", 50))
 # Warmup iterations before timed trials, and number of high/low trials trimmed
@@ -35,6 +43,7 @@ correctness_timeout = (
 )
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
+# Reward settings.
 # Optional reward for a candidate that compiled, completed its forward pass,
 # and reached KernelGym's shape/value comparison but produced a wrong output.
 # Default off so launchers keep their historical reward policy. Set a positive
@@ -43,7 +52,6 @@ output_mismatch_partial_reward = float(os.environ.get("CUDA_AGENT_OUTPUT_MISMATC
 performance_reward_requires_correctness = bool(
     int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
 )
-
 # KernelGYM diagnostics and validation features controlled by each request.
 # NCU, Compute Sanitizer, correctness input perturbations, and adaptive perf
 # trials are opt-in because they add latency or change the evaluated inputs.
@@ -56,24 +64,30 @@ if compute_sanitizer_mode not in {"error_based", "full"}:
 enable_correctness_input_perturbations = bool(
     int(os.environ.get("CUDA_AGENT_ENABLE_CORRECTNESS_INPUT_PERTURBATIONS", 0))
 )
-
+# Memory usage guard settings.
 _memory_ratio_threshold = os.environ.get("CUDA_AGENT_MEMORY_RATIO_THRESHOLD", "1.8").strip()
 memory_ratio_threshold = (
     None if _memory_ratio_threshold.lower() in {"", "none", "null"} else float(_memory_ratio_threshold)
 )
 if memory_ratio_threshold is not None and memory_ratio_threshold <= 1.0:
     raise ValueError("CUDA_AGENT_MEMORY_RATIO_THRESHOLD must be greater than 1.0, or null to disable")
-
+# Combined configuration consumed by the rollout pipeline.
 CUDA_AGENT_CONFIGS = {
+    # Rollout request settings.
+    "rollout_request_max_retries": rollout_request_max_retries,
+    # Rollout logging settings.
     "max_feedback_chars": 0,
     "log_multi_turn_sample_rate": 0.01,
-    "log_multi_turn_full_text": False,
     "log_rollout_info": log_rollout_info,
     "log_rollout_info_rate": log_rollout_info_rate,
+    "log_multi_turn_info": log_multi_turn_info,
     "log_rollout_stats_only": log_rollout_stats_only,
-    "log_slowest_step_window": 10,
-    "log_slowest_min_delta_seconds": 5.0,
+    "log_first_rollout": log_first_rollout,
+    "log_slowest_info": log_slowest_info,
+    "log_slowest_step_window": log_slowest_step_window,
+    "log_slowest_min_delta_seconds": log_slowest_min_delta_seconds,
     "slowest_tracker_timeout": 2.0,
+    # Rollout filtering settings.
     "filter": {
         "reject_low_variance_groups": True,
         "reject_small_groups": True,
@@ -82,41 +96,50 @@ CUDA_AGENT_CONFIGS = {
         "reward_std_threshold": 1e-3,
     },
     "env": {
+        # KernelGym request lifecycle settings.
         "kernel_eval_function_path": None,
         "kernel_eval_max_retries": 3,
         "kernel_eval_task_timeout": kernel_eval_task_timeout,
         "kernel_eval_client_timeout": 2400,
         "kernel_eval_poll_interval": 1.0,
         "kernel_eval_heartbeat_interval": kernel_eval_heartbeat_interval,
-        # Eval jobs can lower these independently when sharing the KernelGym
-        # backend pool with training. Training keeps the historical default 32.
+        # KernelGym scheduling settings. Eval jobs can lower these independently
+        # when sharing the backend pool with training; training defaults to 32.
         "kernel_eval_worker_max_concurrency": int(os.environ.get("KERNEL_EVAL_WORKER_MAX_CONCURRENCY", "32")),
         "kernel_eval_rate_limit": int(os.environ.get("KERNEL_EVAL_RATE_LIMIT", "32")),
         "kernel_eval_priority": os.environ.get("KERNEL_EVAL_PRIORITY", "normal"),
         "kernel_eval_acquire_timeout": 2400,
+        # Correctness and performance trial settings.
         "num_correct_trials": num_correct_trials,
         # 2026-07-11 (user direction): 30 warmup + 50 timed trials (was 3+100).
         "num_perf_trials": num_perf_trials,
         "num_warmup": num_warmup,
         "perf_trim_count": perf_trim_count,
+        # Reference cache and adaptive performance settings.
         "use_reference_cache": use_reference_cache,
         "adaptive_perf_trials": adaptive_perf_trials,
         "perf_min_trials": perf_min_trials,
         "perf_cv_threshold": perf_cv_threshold,
         "refer_num_perf_trials": refer_num_perf_trials,
+        # Correctness timeout settings.
         "correctness_timeout": correctness_timeout,
         "correctness_timeout_enabled": correctness_timeout_enabled,
+        # Diagnostic and validation settings.
         "verbose_errors": True,
         "enable_profiling": enable_profiling,
         "enable_ncu": enable_ncu,
         "enable_compute_sanitizer": enable_compute_sanitizer,
         "compute_sanitizer_mode": compute_sanitizer_mode,
         "enable_correctness_input_perturbations": enable_correctness_input_perturbations,
+        "simplify_error": True,
+        # Memory and decoy-kernel guards.
         "memory_ratio_threshold": memory_ratio_threshold,
         "detect_decoy_kernel": True,
+        # Compilation pipeline settings.
         "split_compile_and_execute": True,
         "enable_compile_artifact_cache": True,
     },
+    # Reward settings.
     "reward": {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
