@@ -6,7 +6,7 @@
 set -Eeo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 EVAL_SCRIPT="${SCRIPT_DIR}/eval.deepseek-v4-flash.sh"
 
 ADAPTER_ROOT="${ADAPTER_ROOT:-/nfs/FM/chenshuailin/projects/kernel_agents/slime-v4flash-lora/experiments/csl_v4r21_fp4_pp1cp2_12k_dppo_predictive_resume40_20260722/eval_adapters}"

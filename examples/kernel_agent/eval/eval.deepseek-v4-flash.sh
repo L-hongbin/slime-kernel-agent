@@ -20,8 +20,8 @@ trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/deepseek-v4-flash.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+source "${REPO_ROOT}/scripts/models/deepseek-v4-flash.sh"
 
 V4_RUNTIME="${V4_RUNTIME:-fleet}"
 RAY_WORKER_HOST="${RAY_WORKER_HOST:-}"
@@ -286,7 +286,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/tvm_ffi_short.yaml"
+   --multi-turn-prompt-config-path "${REPO_ROOT}/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_short.yaml"
 )
 
 KERNEL_AGENT_ARGS=(
@@ -517,6 +517,6 @@ SUMMARY_ARGS=("${EVAL_DIR}" --max-turns "${MAX_TURNS}")
 if [[ -n "${EVAL_SUMMARY_GROUP_KEY}" ]]; then
    SUMMARY_ARGS+=(--group-by-metadata "${EVAL_SUMMARY_GROUP_KEY}")
 fi
-python3 "${SCRIPT_DIR}/eval/summarize_eval.py" "${SUMMARY_ARGS[@]}" | tee "${SUMMARY_PATH}"
+python3 "${SCRIPT_DIR}/summarize_eval.py" "${SUMMARY_ARGS[@]}" | tee "${SUMMARY_PATH}"
 echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
 echo "summary -> ${SUMMARY_PATH}"

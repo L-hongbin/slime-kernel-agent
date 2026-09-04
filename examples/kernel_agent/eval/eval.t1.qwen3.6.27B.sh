@@ -13,7 +13,7 @@
 #
 # Usage:
 #   EVAL_HF_CKPT=.../hf/iter_39 \
-#     bash examples/kernel_agent/eval.t1.qwen3.6.27B.sh
+#     bash examples/kernel_agent/eval/eval.t1.qwen3.6.27B.sh
 set -euo pipefail
 trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
 
@@ -168,7 +168,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_AGENT_LOG_MULTI_TURN_TEXT": "${CUDA_AGENT_LOG_MULTI_TURN_TEXT:-1}",
     "CUDA_AGENT_LOG_MULTI_TURN_SAMPLE_RATE": "${CUDA_AGENT_LOG_MULTI_TURN_SAMPLE_RATE:-0}",
     "CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL": "${CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL:-0}",
-    "CUDA_AGENT_LOG_FIRST_ROLLOUT": "${CUDA_AGENT_LOG_FIRST_ROLLOUT:-0}",
+    "CUDA_AGENT_LOG_FIRST_ROLLOUT": "${CUDA_AGENT_LOG_FIRST_ROLLOUT:-1}",
     "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
     "NCCL_DEBUG": "WARN"
   }

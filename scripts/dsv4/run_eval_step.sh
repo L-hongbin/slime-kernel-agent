@@ -190,12 +190,12 @@ test -s "${HOST_MODEL}/chat_template.jinja"
 test -s "${HOST_MEGATRON}/megatron/training/arguments.py"
 if [[ "${MODE}" == "curve" ]]; then
   test -s "${HOST_REPO}/Data/kernelbench-level1-validation-tvm-v2/train.parquet"
-  test -s "${HOST_REPO}/examples/kernel_agent/eval.deepseek-v4-flash-lora-curve.sh"
+  test -s "${HOST_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash-lora-curve.sh"
   if [[ "${PROFILE}" == "h200" ]]; then
     test -d "${ROOT}/cache/tvm-ffi"
   fi
 else
-  test -s "${HOST_REPO}/examples/kernel_agent/eval.deepseek-v4-flash.sh"
+  test -s "${HOST_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash.sh"
   test -s "${HOST_EVAL_DATA}"
 fi
 if [[ "${STEP}" -ne 0 ]]; then
@@ -336,7 +336,7 @@ if [[ "${MODE}" == "curve" ]]; then
     -e KERNEL_EVAL_RATE_LIMIT="${KERNEL_EVAL_RATE_LIMIT}" \
     -e KERNEL_EVAL_PRIORITY="${KERNEL_EVAL_PRIORITY}" \
     "${CONTAINER}" \
-    bash "${CONTAINER_REPO}/examples/kernel_agent/eval.deepseek-v4-flash-lora-curve.sh"
+    bash "${CONTAINER_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash-lora-curve.sh"
   echo "step${STEP}_eval=PASS"
 else
   ADAPTER_PATH=""
@@ -381,7 +381,7 @@ else
     -e RAY_DASHBOARD_PORT=8269 \
     -e RAY_TEMP_DIR="/dev/shm/ray_eval_dsv4_l${LEVEL}_step${STEP}" \
     "${CONTAINER}" \
-    bash "${CONTAINER_REPO}/examples/kernel_agent/eval.deepseek-v4-flash.sh"
+    bash "${CONTAINER_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash.sh"
 
   SUMMARY_DIR="${HOST_EVAL_ROOT}/experiments/Eval.KernelBenchL${LEVEL}.DeepSeekV4FlashLoRA.12k.turn1.n8.h20/step${STEP}"
   SUMMARY_PATH=""

@@ -23,9 +23,9 @@
 #     the commented block in SGLANG_ARGS to enable it later for speed.
 #
 # Usage (the user-requested smoke -> 8 -> full staging is driven by EVAL_NUM_PROMPTS):
-#   EVAL_NUM_PROMPTS=1 N_SAMPLES_PER_EVAL_PROMPT=1 bash examples/kernel_agent/eval.step37flash.l1.sh   # smoke
-#   EVAL_NUM_PROMPTS=8                              bash examples/kernel_agent/eval.step37flash.l1.sh   # 8 prompts
-#                                                   bash examples/kernel_agent/eval.step37flash.l1.sh   # full (all 100)
+#   EVAL_NUM_PROMPTS=1 N_SAMPLES_PER_EVAL_PROMPT=1 bash examples/kernel_agent/eval/eval.step37flash.l1.sh   # smoke
+#   EVAL_NUM_PROMPTS=8                              bash examples/kernel_agent/eval/eval.step37flash.l1.sh   # 8 prompts
+#                                                   bash examples/kernel_agent/eval/eval.step37flash.l1.sh   # full (all 100)
 
 set -Eeo pipefail
 trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
@@ -39,7 +39,7 @@ export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # Step-3.7-Flash is a custom step3p7 arch; megatron is not built in
 # --debug-rollout-only, so no model-arch script is sourced (MODEL_ARGS empty).
@@ -195,7 +195,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/tvm_ffi_short.yaml"
+   --multi-turn-prompt-config-path "${REPO_ROOT}/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_short.yaml"
 )
 
 KERNEL_AGENT_ARGS=(
@@ -293,6 +293,6 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${MISC_ARGS[@]}"
 
 SUMMARY_PATH="${EVAL_DIR}/summary.${LOG_STAMP}.txt"
-python3 "${SCRIPT_DIR}/eval/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
+python3 "${SCRIPT_DIR}/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
 echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
 echo "summary -> ${SUMMARY_PATH}"

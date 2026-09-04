@@ -125,7 +125,7 @@ fi
 if [[ -n "${HOST_LAUNCHER_OVERRIDE}" ]]; then
   test -s "${HOST_LAUNCHER_OVERRIDE}"
   DOCKER_OVERRIDE_MOUNTS+=(
-    -v "${HOST_LAUNCHER_OVERRIDE}:${CONTAINER_REPO}/examples/kernel_agent/eval.deepseek-v4-flash.sh:ro"
+    -v "${HOST_LAUNCHER_OVERRIDE}:${CONTAINER_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash.sh:ro"
   )
 fi
 
@@ -233,7 +233,7 @@ fi
 echo "image_id=${IMAGE_ID} snapshot=${IMAGE_SNAPSHOT}"
 
 test -s "${HOST_REPO}/train.py"
-test -s "${HOST_REPO}/examples/kernel_agent/eval.deepseek-v4-flash.sh"
+test -s "${HOST_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash.sh"
 test -s "${HOST_REPO}/examples/kernel_agent/prompt_config/kernelbench_l123_eval.yaml"
 test -s "${HOST_MODEL}/config.json"
 test -s "${HOST_MODEL}/model.safetensors.index.json"
@@ -369,7 +369,7 @@ docker exec \
   -e RAY_DASHBOARD_PORT=8269 \
   -e RAY_TEMP_DIR="/dev/shm/ray_dsv4_${RAY_TEMP_TAG}" \
   "${CONTAINER}" \
-  bash "${CONTAINER_REPO}/examples/kernel_agent/eval.deepseek-v4-flash.sh"
+  bash "${CONTAINER_REPO}/examples/kernel_agent/eval/eval.deepseek-v4-flash.sh"
 
 SUMMARY_PATH=""
 DUMP_PATH=""

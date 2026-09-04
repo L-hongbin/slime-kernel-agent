@@ -13,8 +13,8 @@ trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-source "${SCRIPT_DIR}/../../scripts/models/gpt-oss-120b.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+source "${REPO_ROOT}/scripts/models/gpt-oss-120b.sh"
 
 DEFAULT_MODEL_PATH="/nfs/FM/chenshuailin/checkpoints/openai-mirror/gpt-oss-120b"
 MODEL_PATH="${MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
@@ -131,7 +131,7 @@ ROLLOUT_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
-   --multi-turn-prompt-config-path "${SCRIPT_DIR}/prompt_config/response_prompt/tvm_ffi_short.yaml"
+   --multi-turn-prompt-config-path "${REPO_ROOT}/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_short.yaml"
 )
 
 KERNEL_AGENT_ARGS=(
@@ -229,6 +229,6 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    "${MISC_ARGS[@]}"
 
 SUMMARY_PATH="${EVAL_DIR}/summary.${LOG_STAMP}.txt"
-python3 "${SCRIPT_DIR}/eval/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
+python3 "${SCRIPT_DIR}/summarize_eval.py" "${EVAL_DIR}" --max-turns "${MAX_TURNS}" | tee "${SUMMARY_PATH}"
 echo "=== eval complete; dumps -> ${DUMP_DIR} ==="
 echo "summary -> ${SUMMARY_PATH}"
