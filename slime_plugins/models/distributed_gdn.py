@@ -7,10 +7,11 @@ module backports the packed THD permutation from newer Megatron releases while
 keeping the recurrent kernel selectable between FLA and FlashQLA.
 """
 
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import torch
 import torch.nn.functional as F
+from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, causal_conv1d, tensor_a2a_cp2hp, tensor_a2a_hp2cp
@@ -202,6 +203,10 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
         if not self.config.deterministic_mode:
             self.gated_delta_rule = get_chunk_gated_delta_rule(backend)
         self.gdn_backend = backend
+        self.recompute_norm_out = bool(
+            getattr(self, "recompute_norm_out", False) or getattr(args, "qwen_gdn_recompute_norm_out", False)
+        )
+        self.norm_out_checkpoint = getattr(self, "norm_out_checkpoint", None)
 
         self.in_proj_split_sections = (
             self.qk_dim_local_tp,
@@ -228,6 +233,27 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
             self.conv1d.bias.tensor_model_parallel = True
             self.conv1d.bias.partition_dim = 0
             self.conv1d.bias.partition_stride = 1
+
+    def _gated_norm_and_a2a(
+        self,
+        core_output: torch.Tensor,
+        gate: torch.Tensor,
+        inverse: torch.Tensor | None,
+        batch: int,
+        total_seq_len: int,
+        packed_seq_params: PackedSeqParams | None,
+    ) -> torch.Tensor:
+        nvtx_range_push(suffix="gated_norm")
+        norm_output = self._apply_gated_norm(core_output, gate)
+        nvtx_range_pop(suffix="gated_norm")
+        norm_output = norm_output.reshape(batch, total_seq_len, -1).transpose(0, 1).contiguous()
+        return a2a_hp_to_cp_packed(
+            norm_output,
+            self.cp_size,
+            self.pg_collection.cp,
+            packed_seq_params,
+            inverse,
+        )
 
     def forward(
         self,
@@ -373,19 +399,30 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        nvtx_range_push(suffix="gated_norm")
-        norm_output = self._apply_gated_norm(core_output, gate.contiguous())
-        nvtx_range_pop(suffix="gated_norm")
-        norm_output = norm_output.reshape(batch, total_seq_len, -1).transpose(0, 1).contiguous()
-        norm_output = a2a_hp_to_cp_packed(
-            norm_output,
-            self.cp_size,
-            self.pg_collection.cp,
-            packed_seq_params,
-            inverse,
-        )
+        gate = gate.contiguous()
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_func = partial(
+                self._gated_norm_and_a2a,
+                inverse=inverse,
+                batch=batch,
+                total_seq_len=total_seq_len,
+                packed_seq_params=packed_seq_params,
+            )
+            norm_output = self.norm_out_checkpoint.checkpoint(norm_func, core_output, gate)
+        else:
+            norm_output = self._gated_norm_and_a2a(
+                core_output,
+                gate,
+                inverse,
+                batch,
+                total_seq_len,
+                packed_seq_params,
+            )
 
         nvtx_range_push(suffix="out_proj")
         output, output_bias = self.out_proj(norm_output)
         nvtx_range_pop(suffix="out_proj")
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(output)
         return output, output_bias

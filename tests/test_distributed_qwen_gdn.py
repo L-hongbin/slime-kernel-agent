@@ -17,6 +17,7 @@ from slime_plugins.models.distributed_gdn import (
     _get_parameter_local_cp,
     _resolve_cu_seqlens,
 )
+from slime_plugins.models.qwen3_5 import _validate_qwen_gdn_recompute_norm_out
 
 NUM_GPUS = 0
 
@@ -30,12 +31,37 @@ def test_shared_qwen_gdn_arguments_support_distributed_flashqla():
             "--qwen-gdn-backend",
             "flashqla",
             "--qwen-gdn-sp-disable-batch-p2p-comm",
+            "--qwen-gdn-recompute-norm-out",
         ]
     )
 
     assert args.qwen_gdn_implementation == "distributed"
     assert args.qwen_gdn_backend == "flashqla"
     assert args.qwen_gdn_sp_disable_batch_p2p_comm is True
+    assert args.qwen_gdn_recompute_norm_out is True
+
+
+def test_qwen_gdn_recompute_norm_out_defaults_to_disabled():
+    args = add_qwen_gdn_arguments(ArgumentParser()).parse_args([])
+
+    assert args.qwen_gdn_recompute_norm_out is False
+
+
+def test_qwen_gdn_recompute_norm_out_rejects_replicated_and_full_recompute():
+    args = SimpleNamespace(qwen_gdn_recompute_norm_out=True)
+
+    with pytest.raises(ValueError, match="requires --qwen-gdn-implementation distributed"):
+        _validate_qwen_gdn_recompute_norm_out(args, SimpleNamespace(recompute_granularity=None), False)
+
+    with pytest.raises(ValueError, match="cannot be combined with full"):
+        _validate_qwen_gdn_recompute_norm_out(args, SimpleNamespace(recompute_granularity="full"), True)
+
+
+@pytest.mark.parametrize("recompute_granularity", [None, "selective"])
+def test_qwen_gdn_recompute_norm_out_accepts_distributed_non_full_recompute(recompute_granularity):
+    args = SimpleNamespace(qwen_gdn_recompute_norm_out=True)
+
+    _validate_qwen_gdn_recompute_norm_out(args, SimpleNamespace(recompute_granularity=recompute_granularity), True)
 
 
 def test_qwen_gdn_pipeline_override_disables_batched_p2p_and_rejects_overlap():

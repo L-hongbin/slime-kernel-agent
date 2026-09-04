@@ -27,6 +27,15 @@ def _get_text_config(hf_config):
     return hf_config
 
 
+def _validate_qwen_gdn_recompute_norm_out(args, config, use_distributed_gdn):
+    if not getattr(args, "qwen_gdn_recompute_norm_out", False):
+        return
+    if not use_distributed_gdn:
+        raise ValueError("--qwen-gdn-recompute-norm-out requires --qwen-gdn-implementation distributed.")
+    if getattr(config, "recompute_granularity", None) == "full":
+        raise ValueError("--qwen-gdn-recompute-norm-out cannot be combined with full activation recomputation.")
+
+
 # Adapted from Qwen3NextGatedDeltaNet but with separate in_proj_qkv and in_proj_z
 class Qwen3_5GatedDeltaNet(nn.Module):
     """
@@ -218,6 +227,7 @@ def get_qwen3_5_spec(args, config, vp_stage):
     text_config = _get_text_config(hf_config)
 
     use_distributed_gdn = getattr(args, "qwen_gdn_implementation", "replicated") == "distributed"
+    _validate_qwen_gdn_recompute_norm_out(args, config, use_distributed_gdn)
     if use_distributed_gdn:
         requires_rank_ordered_p2p = (
             getattr(args, "sequence_parallel", False) and getattr(config, "pipeline_model_parallel_size", 1) > 1

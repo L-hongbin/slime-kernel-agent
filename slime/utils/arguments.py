@@ -293,6 +293,14 @@ def add_qwen_gdn_arguments(parser):
             "Use Megatron's rank-ordered pipeline isend/irecv path for distributed " "Qwen GDN with sequence parallel."
         ),
     )
+    parser.add_argument(
+        "--qwen-gdn-recompute-norm-out",
+        action="store_true",
+        help=(
+            "Recompute the distributed Qwen GDN output norm and head-to-context-parallel "
+            "all-to-all during backward to reduce activation memory."
+        ),
+    )
     return parser
 
 
