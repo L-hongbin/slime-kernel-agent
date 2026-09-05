@@ -14,6 +14,9 @@ subdirectories below.
 | `_dsv4_task_args.sh` | Shared task-argument assembly |
 | `train_smoke.sh` / `rollout_smoke.sh` | Isolated train and rollout bring-up |
 | `convert_torch_dist.sh` | HF-to-`torch_dist` conversion and chained verification |
+| `run_eval_step.sh` | Evaluate a selected checkpoint step |
+| `run_h20_eval_suite.sh` | H20 evaluation suite |
+| `wait_and_run_h200_eval_queue.sh` | Wait for resources and run the H200 evaluation queue |
 | `verify_rollout_dump.py` | Saved-rollout inspection |
 
 ## Reusable tooling
@@ -29,5 +32,5 @@ subdirectories below.
 
 Closed one-off probes are retained only under ignored
 `local_artifacts/deepseek-v4/retired_scripts/diagnostics/`. Design and evidence start at
-`handoffs/deepseek-v4/release/00_overview.md`; reviewable logs belong under
+`handoffs/deepseek-v4/handoff_deepseek_v4_flash_lora_megatron.md`; reviewable logs belong under
 `local_artifacts/deepseek-v4/`.

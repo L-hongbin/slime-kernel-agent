@@ -1,5 +1,7 @@
 # DeepSeek-V4-0731 fresh RL entropy 下降审计（2026-08-16）
 
+本文记录 2026 年 8 月的训练审计，run 的服务存活状态不延续到现在；部署状态见 `RUNTIME.md`
+
 ## 结论先行
 
 首轮审计截至 2026-08-16 11:13 JST，0731 formal lineage 的 rollout step 37 已完成：
@@ -33,7 +35,7 @@
 
 ## 2026-08-17 更新：换回旧模型后仍以同量级下降
 
-最新 fresh run 是
+该次 fresh run 是
 `formal_dsv4r21_fp4_pp1cp2_12k_prompt_tvm_v4_release_dtypefix_verified_20260816_fresh`，W&B
 [`tpcqslzo`](https://wandb.ai/shuailin_chen/slime/runs/tpcqslzo)。截至 2026-08-17 09:10 JST，
 step 36 已完整完成，rollout/train H 为 `0.265962/0.254420`。它使用旧

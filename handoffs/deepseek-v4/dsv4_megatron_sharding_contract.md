@@ -21,7 +21,7 @@ world_size = TP × PP × CP × DP = 16
 
 DS-V4 正式训练当前仍按 `RUNTIME.md` 挂起；本文记录保留 launcher 的分片能力和恢复约束，不构成启动授权
 
-## 1. 当前物理布局与 rank 组
+## 1. 已验证的 CP2 物理布局与 rank 组
 
 正式入口是 `scripts/dsv4/launch_formal_managed.sh`，它调用 `scripts/dsv4/run.deepseek_v4_flash.fp4.formal.rl.sh`。训练 actor 按 IP、再按 GPU id 排序，所以逻辑 rank 与物理节点的映射为：
 
@@ -224,3 +224,14 @@ PP、EP、world size 或节点集合变化都必须先生成/验证 topology-mat
 - 正式 native resume 证据：`local_artifacts/deepseek-v4/r2_logs/r21_formal_launch_iter64_20260719.txt`
 
 保留的 launcher、CP2 canary 和 native resume 证据共同确认 `world_size=16`、`PP1/EP8/TP1/CP2`、node64 ranks 0–7、node69 ranks 8–15；动态运行状态以 `RUNTIME.md` 和正式 launcher 为准
+
+
+## CP2→CP1 恢复验证与容量边界
+
+一次已记录的 iteration-9 恢复把 PP1/CP2/EP8、world size 16 的 32 个 DCP shards，恢复到 PP1/CP1/EP8、world size 8。Adapter、Muon optimizer 的 766 tensors / 459,735,040 bytes 与 RNG 均恢复；dataset cursor 为 `offset=404, epoch=0, group=404, sample_index=6464`，从 rollout 10 继续。聚合的 `io.BytesIO` payload 需要按受信 checkpoint 路径执行 `torch.load(..., weights_only=False)`
+
+该次 CP1 rollout 10 在原 microbatch 顺序下于 6/32 OOM；padded-length 降序重试完成 32/32 和 optimizer update，actor 847.79s，W&B [svi5x846](https://wandb.ai/shuailin_chen/slime/runs/svi5x846)。排序只改变已分配给 DP rank 的执行顺序，不减少最大 microbatch 的理论峰值；它证明一次碎片相关失败被避开，没有证明长期容量充足
+
+后续 node69-train、node53/node70-rollout 的 CP1 recipe 反复 OOM，已从正式启动方案撤下，正式训练暂停等待替代拓扑，当前状态以 [RUNTIME.md](../../RUNTIME.md) 为准。已移除“继续从 iter9 重启”的待办和健康启动快照，不能用一次恢复成功或 step10 update 作为稳定上线证据
+
+Lineage identity：fresh W&B `6j035ear`，后续 CP1 `svi5x846` / `c1cq2gu0`；fresh root 为 `/nfs/FM/csl_v4r21_fp4_pp1cp2_12k_prompt_tvm_v4_release_dppo_predictive_delta015_ratio_logged_20260817/out`，最后留存恢复点为 iteration 9。启动过的进程、当时 GPU 空闲和 worker 数量不作为当前资源事实

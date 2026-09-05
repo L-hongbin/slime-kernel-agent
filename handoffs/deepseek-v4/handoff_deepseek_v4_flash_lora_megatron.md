@@ -16,7 +16,7 @@
 |---|---|
 | 自定义模型与 kernel 边界 | `handoffs/deepseek-v4/dsv4_kernel_inventory.md` |
 | Packed-MXFP4 storage、转换与 W4A16 compute | `handoffs/deepseek-v4/fp4_w4a16_design.md` |
-| Megatron 分片、CP/EP 与 checkpoint contract | `handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md` |
+| Megatron 分片、CP/EP、checkpoint 与 restore lineage | `handoffs/deepseek-v4/dsv4_megatron_sharding_contract.md` |
 | LoRA training、old actor、TIS/MIS、rsLoRA 与 LoRA+ | `handoffs/deepseek-v4/lora_training_features.md` |
 | LoRA adapter serving 与 CUDA Graph contract | `handoffs/deepseek-v4/lora_serve_design.md` |
 | MTP/speculative decoding | `handoffs/deepseek-v4/mtp_speculative_decoding.md` |
@@ -25,11 +25,9 @@
 | DPPO tail contraction | `handoffs/deepseek-v4/dppo_tail_contraction_20260723.md` |
 | Dynamic filter 与零 reward 归因 | `handoffs/deepseek-v4/dynamic_filter_zero_reward_analysis_20260816.md` |
 | 0731 fresh entropy 审计 | `handoffs/deepseek-v4/entropy_0731_v4_fresh_audit_20260816.md` |
-| Predictive-DPPO restart lineage | `handoffs/deepseek-v4/dppo_predictive_restart_20260817.md` |
 | H200 train/H20 rollout 可行性 | `handoffs/deepseek-v4/h200_train_h20_rollout_feasibility_20260722.md` |
 | KernelBench L1 LoRA 训练曲线 | `handoffs/deepseek-v4/kernelbench_l1_lora_curve_20260724.md` |
-| Step440/620 failure attribution | `handoffs/deepseek-v4/step440_step620_kernelbench_failure_attribution_20260729.md` |
-| 三轮评估 | `handoffs/deepseek-v4/deepseek_v4_flash_3turn_eval_20260801.md` |
+| KernelBench 单轮/三轮端点与失败归因 | `handoffs/deepseek-v4/kernelbench_eval.md` |
 
 专题文档只维护自己的 contract。运行过程、一次性排障和节点快照应进入 ignored `local_artifacts/deepseek-v4/`，不回填为第二份设计说明
 

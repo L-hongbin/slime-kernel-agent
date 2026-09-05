@@ -1,12 +1,6 @@
 # DeepSeek-V4 fresh RL 全零 reward group 审计（2026-08-16）
 
-## 1. Handoff 状态
-
-- **全零 group / dynamic filter 的原因分析已完成。** 大量 drop 不是计数器或标准差实现错误；它来自大量 prompt 的 16 个候选在 pre-overlong task reward 上全部为 0。
-- **Slime 与 KernelGym 现已支持任务级 dtype/precision。** Slime 解析 `fp32`、`fp16`、`bf16` 并随请求发送；KernelGym 将该字段传到 CUDA-Agent 和 TVM-FFI 的静态 precheck。
-- **修复后的 formal 训练已完成在线影响量化。** 在两条 fresh lineage 共同可比的 step 0--26，低方差 drop 从 576 降到 404（`-29.9%`），工作口径下的 drop 概率从 57.1% 降到 48.3%。真实请求中的 FP16/BF16 precision 与静态检查均正确，不再出现旧的 `required FP32` 门禁误判。
-- **收益不是“全部低精度题恢复”。** 同一窗口 low-precision drop 从 171 降到 110，但 FP32 drop 也从 405 降到 294；剩余失败已进入真实 compile/correctness 路径。由于 refill 提前停止后两跑访问的 prompt 不同，不能把 172 个总降幅逐个归因给 dtype。
-- **修复后 entropy 确实下降更快，但 dtype 不直接改 logits。** 共同 step 0--25 的 rollout/train entropy OLS（Ordinary Least Squares，普通最小二乘） 斜率约为修复前的 2.3 倍；而 grad norm、PPO KL、train-rollout MAE 和平均长度基本不变。当前最符合证据的是 dtype 通过 reward/filter 改写 accepted population 和 TRLOO 梯度方向，再由无 entropy/reference 恢复项的目标放大；尚无冻结 replay 能给出 dtype 对降熵加速的独立因果效应。
+本文记录 2026-08-16/17 的 reward/filter 与 dtype 修复实验；下文配置、失败计分和 run 状态均以该次实验为准，当前默认由 launcher 与 `RUNTIME.md` 决定
 
 ## 2. 结论
 
@@ -79,7 +73,7 @@ q=\frac{414}{414+304}=57.7\%
 | 原始 V4 | 39.00% | 27.00% | 65.12% |
 | V4-0731 | 53.62% | 39.88% | 85.12% |
 
-原始证据见 `handoffs/in_progress/handoff_kernelbench_l1_model_accuracy.md` 和 `handoffs/deepseek-v4/deepseek_v4_flash_3turn_eval_20260801.md`。首轮与三轮的差距说明环境反馈本来能修复大量错误，而 formal 的单轮设置关闭了这条路径。
+原始证据见 `handoffs/evaluation/kernelbench_l1_registry.md` 和 `handoffs/deepseek-v4/kernelbench_eval.md`。首轮与三轮的差距说明环境反馈本来能修复大量错误，而 formal 的单轮设置关闭了这条路径。
 
 ## 5. Reward/filter 如何放大问题
 
@@ -229,7 +223,7 @@ accepted-pool 的平均成功率自然可能下降。与此同时 rollout 平均
 - 没有 accepted/all-candidate 的 `precision × reward × advantage × length × entropy` 样本级联表，
   因而 entropy 加速只能定位到 selection-mediated 机制，不能量化其中 dtype 的独立份额。
 
-## 8. 下一步最小验证
+## 8. 因果结论仍缺少的验证
 
 不需要先启动另一轮完整训练。建议按以下顺序闭环：
 

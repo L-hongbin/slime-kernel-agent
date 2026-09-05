@@ -2,7 +2,7 @@
 
 Kernel agent 已经能生成、修复并迭代优化固定 contract 下的 CUDA/Triton kernel。下一阶段的核心问题是判断：什么值得优化、哪个变换产生收益、结果在哪些输入与系统中成立，以及 sandbox speedup 能否转化为生产收益
 
-本文只维护研究优先级、最小交付物和验收指标。Evaluator 攻击面与当前实现缺口由 `handoffs/deepseek-v4/step440_step620_kernelbench_failure_attribution_20260729.md` 维护；数据构建、训练 recipe、评测结果和运行状态由各自 handoff 维护
+本文只维护研究优先级、最小交付物和验收指标。Evaluator 攻击面与当前实现缺口由 `handoffs/deepseek-v4/kernelbench_eval.md` 维护；数据构建、训练 recipe、评测结果和运行状态由各自 handoff 维护
 
 ## 决策
 
@@ -86,7 +86,7 @@ system_throughput_or_p99
 
 ### P0-A harness 验收
 
-先冻结 `verifier_regression_v1` manifest，包含 `step440_step620_kernelbench_failure_attribution_20260729.md` 已确认的全部 bypass artifacts、等量 matched benign kernels、hidden inputs、环境 fingerprint 和 SHA256。实现完成的门禁为
+先冻结 `verifier_regression_v1` manifest，包含 `../deepseek-v4/kernelbench_eval.md` 已确认的全部 bypass artifacts、等量 matched benign kernels、hidden inputs、环境 fingerprint 和 SHA256。实现完成的门禁为
 
 - 已知 attack recall `100%`，matched benign pass `100%`
 - PyTorch fallback、旧输出缓存、计时篡改和 hidden-feedback probing 四类 ASR 均为 `0%`

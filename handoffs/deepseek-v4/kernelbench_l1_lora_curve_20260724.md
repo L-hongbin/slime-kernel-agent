@@ -54,7 +54,7 @@ zombie，主机现存 zombie 均来自更早的非 init 探针容器。
 `output_padding`，实际计算 groups=1。官方曲线为保持跨点合同不变仍保留该题，
 但不应把它当作模型正确性学习信号。step620 排除整题后的敏感性口径为
 97.98%/91.29%/26.01%/20.20%；完整归因见
-`step440_step620_kernelbench_failure_attribution_20260729.md` 的 Level1 逐题审计节。
+`kernelbench_eval.md` 的 Level1 逐题审计节。
 
 ## 主结果
 
@@ -443,7 +443,7 @@ idx184 的 LogSoftmax response 完整、有 EOS、formal precheck 通过，且�
 的请求，KernelGym 查询也显示 task 不存在。代码闭因是客户端只重试 timeout 和
 connect error，而该 `httpx.RemoteProtocolError` 落入广义异常后被立即包装成
 `COMPILATION_ERROR`；候选实际从未编译或执行。因此独立 reviewer 对其余完整性
-给 PASS、对 clean formal point 给 CONDITIONAL。用户在 unattended-user-decide
+给 PASS、对 clean formal point 给 CONDITIONAL。用户在 unattended-escalate
 选择 A：保留可复现的正式 dump 原始口径，不整点重跑、不改分，并明确记录最多
 0.125 pct-pt 的保守偏差。
 
