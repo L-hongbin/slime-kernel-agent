@@ -332,6 +332,52 @@ _MODEL_FEEDBACK_BACKEND_PROBE_KEYS = (
 )
 _MODEL_FEEDBACK_MAX_DETAIL_CHARS = 2048
 _MODEL_FEEDBACK_MAX_LIST_ITEMS = 32
+_MODEL_FEEDBACK_SANITIZER_SUMMARY_KEYS = (
+    "status",
+    "passed",
+    "measurement_complete",
+    "requested_checks",
+    "executed_checks",
+    "detected_issue_count",
+    "primary_check",
+    "primary_detected_issue_count",
+    "issue_count_by_check",
+    "issues_truncated",
+    "kernel_filter_empty",
+    "selection_mode",
+    "mode",
+    "error_classification",
+    "run_all_checks",
+    "reason",
+    "replayed_input_seed",
+    "wall_time_s",
+    "error",
+)
+_MODEL_FEEDBACK_SANITIZER_CHECK_KEYS = (
+    "check",
+    "status",
+    "passed",
+    "process_completed",
+    "target_application_failed",
+    "sanitizer_issue_found",
+    "input_generation",
+    "input_values_exactly_replayed",
+    "return_code",
+    "summary_error_count",
+    "parsed_issue_count",
+    "detected_issue_count",
+    "issues_truncated",
+    "wall_time_s",
+    "error",
+)
+_MODEL_FEEDBACK_SANITIZER_ISSUE_KEYS = (
+    "hazard_type",
+    "message",
+    "occurrence_count",
+    "access_type",
+    "memory_space",
+    "access_size_bytes",
+)
 _COMPILER_PRIMARY_DIAGNOSTIC_RE = re.compile(
     r"(?:fatal error:|\berror:|undefined reference|unresolved external symbol|nvcc fatal|collect2: error)",
     re.IGNORECASE,
@@ -788,6 +834,89 @@ def _compact_backend_probe(metadata: dict[str, Any]) -> dict[str, Any] | None:
     return compacted or None
 
 
+def _format_sanitizer_location(issue: dict[str, Any]) -> tuple[str | None, str | None]:
+    kernel = issue.get("kernel")
+    source = issue.get("source")
+    kernel_text = str(kernel) if kernel is not None else None
+    source_text = None
+    if isinstance(source, dict):
+        file_name = source.get("file")
+        line = source.get("line")
+        if file_name is not None:
+            source_text = f"{file_name}:{line}" if line is not None else str(file_name)
+
+    kernel_info = issue.get("kernel_info")
+    if isinstance(kernel_info, list):
+        locations = []
+        for item in kernel_info:
+            if not isinstance(item, dict):
+                continue
+            parts = [str(value) for value in (item.get("name"), item.get("source")) if value is not None]
+            if parts:
+                locations.append(" @ ".join(parts))
+        if locations:
+            kernel_text = "; ".join(locations)
+    return kernel_text, source_text
+
+
+def _format_sanitizer_range(value: Any) -> str | None:
+    if not isinstance(value, dict):
+        return None
+    parts = []
+    for axis in ("x", "y", "z"):
+        bounds = value.get(axis)
+        if isinstance(bounds, list) and bounds:
+            parts.append(f"{axis}={bounds[0]}..{bounds[-1]}")
+    ranges = value.get("ranges")
+    if isinstance(ranges, list) and ranges:
+        parts.append("address=" + "..".join(str(item) for item in ranges))
+    return ",".join(parts) or None
+
+
+def _compact_runtime_sanitizer(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep bounded factual diagnostics without replay payloads or raw tool output."""
+
+    compacted = _copy_present(value, _MODEL_FEEDBACK_SANITIZER_SUMMARY_KEYS)
+    checks = []
+    issues = []
+    for check_result in value.get("check_results") or []:
+        if not isinstance(check_result, dict):
+            continue
+        check_summary = _copy_present(check_result, _MODEL_FEEDBACK_SANITIZER_CHECK_KEYS)
+        if check_summary:
+            checks.append(check_summary)
+        check_name = check_result.get("check")
+        for issue in check_result.get("issues") or []:
+            if not isinstance(issue, dict):
+                continue
+            compact_issue = _copy_present(issue, _MODEL_FEEDBACK_SANITIZER_ISSUE_KEYS)
+            if check_name is not None:
+                compact_issue["check"] = str(check_name)
+            kernel, source = _format_sanitizer_location(issue)
+            if kernel:
+                compact_issue["kernel"] = _truncate_middle(kernel, _MODEL_FEEDBACK_MAX_DETAIL_CHARS)
+            if source:
+                compact_issue["source"] = _truncate_middle(source, _MODEL_FEEDBACK_MAX_DETAIL_CHARS)
+            for source_key, target_key in (
+                ("threads", "thread_range"),
+                ("blocks", "block_range"),
+                ("addresses", "address_range"),
+            ):
+                rendered = _format_sanitizer_range(issue.get(source_key))
+                if rendered:
+                    compact_issue[target_key] = rendered
+            if compact_issue:
+                issues.append(compact_issue)
+
+    if checks:
+        compacted["checks"] = checks[:_MODEL_FEEDBACK_MAX_LIST_ITEMS]
+    if issues:
+        compacted["issues"] = issues[:_MODEL_FEEDBACK_MAX_LIST_ITEMS]
+        if len(issues) > _MODEL_FEEDBACK_MAX_LIST_ITEMS:
+            compacted["omitted_issues"] = len(issues) - _MODEL_FEEDBACK_MAX_LIST_ITEMS
+    return compacted
+
+
 def build_model_feedback(env_result: dict[str, Any], *, compiler_max_chars: int | None = None) -> dict[str, Any]:
     """Build the actionable feedback shown to the next model turn.
 
@@ -803,11 +932,21 @@ def build_model_feedback(env_result: dict[str, Any], *, compiler_max_chars: int 
     metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
 
     feedback = _copy_present(state, _MODEL_FEEDBACK_TOP_LEVEL_KEYS)
+    precheck_failed = feedback.get("precheck") == "failed"
+    if precheck_failed:
+        # These checks did not run when static precheck rejected the candidate.
+        feedback.pop("decoy_kernel", None)
     precheck_diagnostic = metadata.get("precheck_diagnostic")
     if isinstance(precheck_diagnostic, dict):
         feedback["precheck_diagnostic"] = _bounded_feedback_value(precheck_diagnostic)
+    runtime_sanitizer = state.get("runtime_sanitizer")
+    if isinstance(runtime_sanitizer, dict):
+        feedback["runtime_sanitizer"] = _compact_runtime_sanitizer(runtime_sanitizer)
     error_message = state.get("error_message")
-    if error_message is not None:
+    diagnostic_has_error_message = isinstance(precheck_diagnostic, dict) and isinstance(
+        precheck_diagnostic.get("error_message"), str
+    )
+    if error_message is not None and not (precheck_failed and diagnostic_has_error_message):
         error_message = str(error_message)
         if compiler_max_chars is None:
             feedback_cap = int(CUDA_AGENT_CONFIGS.get("max_feedback_chars", 0) or 0)
@@ -819,13 +958,17 @@ def build_model_feedback(env_result: dict[str, Any], *, compiler_max_chars: int 
             error_message = _truncate_middle(error_message, compiler_max_chars)
         feedback["error_message"] = error_message
 
-    performance = _copy_present(state, ("speedup", "kernel_runtime", "reference_runtime"))
+    performance = {} if precheck_failed else _copy_present(state, ("speedup", "kernel_runtime", "reference_runtime"))
     if performance:
         feedback["performance"] = performance
 
-    error_details = _copy_present(metadata, _MODEL_FEEDBACK_ERROR_DETAIL_KEYS)
+    error_details = {} if precheck_failed else _copy_present(metadata, _MODEL_FEEDBACK_ERROR_DETAIL_KEYS)
     metadata_error = metadata.get("error")
-    if metadata_error is not None and str(metadata_error) != str(state.get("error_message") or ""):
+    if (
+        not precheck_failed
+        and metadata_error is not None
+        and str(metadata_error) != str(state.get("error_message") or "")
+    ):
         error_details["metadata_error"] = _bounded_feedback_value(metadata_error)
     if error_details:
         feedback["error_details"] = error_details

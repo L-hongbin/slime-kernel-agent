@@ -97,6 +97,159 @@ INCORRECT_BACKEND_PROBE_KEEP_KEYS = (
 )
 
 
+_PRECHECK_MAX_EVIDENCE = 16
+_PRECHECK_SNIPPET_MAX_CHARS = 160
+_PRECHECK_FINDINGS_MESSAGE_MAX_CHARS = 2000
+_PRECHECK_FINDING_HEADER_MAX_CHARS = 256
+_PRECHECK_FINDING_LOCATION_MAX_CHARS = 128
+
+
+def _kernelgym_finding_location(finding: dict[str, Any]) -> str | None:
+    source_name = finding.get("source_name")
+    if source_name == "model_code":
+        source_name = "MODEL_NEW"
+    elif isinstance(source_name, str) and source_name:
+        source_name = source_name.rsplit("/", 1)[-1]
+    else:
+        source_name = None
+
+    line = finding.get("line")
+    column = finding.get("column")
+    end_line = finding.get("end_line")
+    end_column = finding.get("end_column")
+    if line is None:
+        return source_name
+
+    start = f"{line}:{column}" if column is not None else str(line)
+    if end_line is not None and end_column is not None:
+        end = str(end_column) if end_line == line else f"{end_line}:{end_column}"
+        start = f"{start}-{end}"
+    return f"{source_name}:{start}" if source_name else start
+
+
+def _format_kernelgym_static_findings(findings: Any) -> str | None:
+    """Render bounded factual source findings as one compact model-facing message."""
+
+    if not isinstance(findings, list):
+        return None
+    valid_findings = [
+        finding
+        for finding in findings
+        if isinstance(finding, dict)
+        and any(finding.get(key) not in (None, "") for key in ("code", "message", "source_name", "line", "snippet"))
+    ]
+    if not valid_findings:
+        return None
+
+    def render(shown: list[dict[str, Any]]) -> str:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for finding in shown:
+            message = " ".join(
+                str(finding.get("message") or finding.get("code") or "Static precheck finding").split()
+            )[:_PRECHECK_FINDING_HEADER_MAX_CHARS]
+            grouped.setdefault(message, []).append(finding)
+
+        lines: list[str] = []
+        for message, message_findings in grouped.items():
+            lines.append(f"{message}:")
+            for finding in message_findings:
+                location = _kernelgym_finding_location(finding)
+                if location:
+                    location = location[:_PRECHECK_FINDING_LOCATION_MAX_CHARS]
+                snippet = finding.get("snippet")
+                snippet = " ".join(str(snippet).split())[:_PRECHECK_SNIPPET_MAX_CHARS] if snippet else None
+                detail = ": ".join(part for part in (location, snippet) if part)
+                lines.append(f"- {detail or 'location unavailable'}")
+
+        omitted = len(valid_findings) - len(shown)
+        if omitted:
+            lines.append(f"- ... {omitted} more locations omitted")
+        return "\n".join(lines)
+
+    # Keep this below the downstream 2048-character per-field bound so the
+    # structured omission count cannot be broken by a second middle truncation.
+    max_shown = min(len(valid_findings), _PRECHECK_MAX_EVIDENCE)
+    for shown_count in range(max_shown, 0, -1):
+        message = render(valid_findings[:shown_count])
+        if len(message) <= _PRECHECK_FINDINGS_MESSAGE_MAX_CHARS:
+            return message
+    return None
+
+
+def _kernelgym_precheck_diagnostic(precheck: Any) -> dict[str, Any] | None:
+    """Lift bounded factual server-precheck data before artifact cleanup."""
+
+    if not isinstance(precheck, dict) or precheck.get("passed") is not False:
+        return None
+
+    evidence: list[dict[str, Any]] = []
+    static_check = precheck.get("static_check")
+    static_errors = static_check.get("errors") if isinstance(static_check, dict) else None
+    findings = static_check.get("findings") if isinstance(static_check, dict) else None
+    findings_message = _format_kernelgym_static_findings(findings)
+
+    first_finding = next(
+        (finding for finding in findings or [] if isinstance(finding, dict)),
+        None,
+    )
+    first_static_error = static_errors[0] if isinstance(static_errors, list) and static_errors else None
+    category = first_finding.get("code") if first_finding is not None else None
+    if not category and first_static_error:
+        category = str(first_static_error).split(":", 1)[0]
+    normalized_category = re.sub(r"[^A-Za-z0-9]+", "_", str(category or "")).strip("_").upper()
+    if findings_message:
+        return {
+            "code": f"KERNELGYM_STATIC_{normalized_category}" if normalized_category else "KERNELGYM_PRECHECK",
+            "phase": "kernelgym_static",
+            "error_message": findings_message,
+        }
+
+    seen_evidence: set[tuple[str, str]] = set()
+
+    def add_evidence(kind: str, value: str) -> None:
+        item = (kind, value[:_PRECHECK_SNIPPET_MAX_CHARS])
+        if item in seen_evidence:
+            return
+        seen_evidence.add(item)
+        evidence.append({"kind": item[0], "value": item[1]})
+
+    if isinstance(static_errors, list):
+        for error in static_errors:
+            if isinstance(error, str) and error:
+                add_evidence("static_error", error)
+
+    for source_key, kind in (
+        ("detected_extension_calls", "extension_call"),
+        ("exported_functions", "exported_symbol"),
+        ("binding_files", "parsed_source"),
+        ("cu_files", "parsed_source"),
+        ("cpp_files", "parsed_source"),
+        ("header_files", "parsed_source"),
+    ):
+        values = precheck.get(source_key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            if isinstance(value, str) and value:
+                add_evidence(kind, value)
+
+    if not evidence:
+        error_message = precheck.get("error_message")
+        if isinstance(error_message, str) and error_message:
+            add_evidence("server_error", error_message)
+
+    return {
+        "code": f"KERNELGYM_STATIC_{normalized_category}" if normalized_category else "KERNELGYM_PRECHECK",
+        "phase": "kernelgym_static" if first_static_error else "kernelgym_precheck",
+        "evidence": evidence[:_PRECHECK_MAX_EVIDENCE],
+        **(
+            {"omitted_evidence": len(evidence) - _PRECHECK_MAX_EVIDENCE}
+            if len(evidence) > _PRECHECK_MAX_EVIDENCE
+            else {}
+        ),
+    }
+
+
 def _format_compilation_error_message(env_state: dict[str, Any]) -> str:
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     compile_artifact = metadata.get("compile_artifact")
@@ -368,6 +521,10 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
         compile_artifact = metadata.get("compile_artifact")
         if isinstance(compile_artifact, dict):
             compile_artifact = dict(compile_artifact)
+            if "precheck_diagnostic" not in metadata:
+                precheck_diagnostic = _kernelgym_precheck_diagnostic(compile_artifact.get("precheck"))
+                if precheck_diagnostic is not None:
+                    metadata["precheck_diagnostic"] = precheck_diagnostic
             for key in COMPILE_ARTIFACT_POP_KEYS:
                 compile_artifact.pop(key, None)
             if "entry_point" in compile_artifact:
@@ -400,10 +557,6 @@ def split_think_response(response: str) -> tuple[str | None, str]:
         return response_think, response_content
 
     return None, response
-
-
-_PRECHECK_MAX_EVIDENCE = 16
-_PRECHECK_SNIPPET_MAX_CHARS = 160
 
 
 def _precheck_evidence(

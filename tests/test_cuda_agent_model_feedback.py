@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.generate_with_cuda_agent import (
     _apply_feedback_template,
+    _serialize_feedback_dict,
     _truncate_middle,
     build_model_feedback,
     compact_compiler_diagnostics,
@@ -167,10 +168,112 @@ def test_build_model_feedback_keeps_flat_factual_precheck_diagnostic():
         return 0
 
     assert container_depth(feedback) == 4
-    serialized = json.dumps(feedback)
+    serialized = _serialize_feedback_dict(feedback)
+    assert "\n" not in serialized
+    assert json.loads(serialized) == feedback
     assert "nearest_export" not in serialized
     assert "suggested_edit" not in serialized
     assert "repair_scope" not in serialized
+
+
+def test_build_model_feedback_compacts_runtime_sanitizer_to_four_levels():
+    env_result = {
+        "env_state": {
+            "status": "failed",
+            "error": "RUNTIME_ERROR",
+            "error_message": "Runtime Sanitizer detected an unsafe CUDA kernel",
+            "compiled": True,
+            "correctness": False,
+            "runtime_sanitizer": {
+                "status": "issues_found",
+                "passed": False,
+                "measurement_complete": True,
+                "requested_checks": ["memcheck"],
+                "executed_checks": ["memcheck"],
+                "detected_issue_count": 17,
+                "primary_check": "memcheck",
+                "selection_mode": "error_based",
+                "mode": "memcheck",
+                "error_classification": "memcheck",
+                "wall_time_s": 2.5,
+                "check_results": [
+                    {
+                        "check": "memcheck",
+                        "status": "issues_found",
+                        "process_completed": True,
+                        "detected_issue_count": 17,
+                        "issues_truncated": True,
+                        "raw_output_tail": "DROP_RAW_OUTPUT",
+                        "issues": [
+                            {
+                                "hazard_type": "invalid_global_write",
+                                "message": "Invalid __global__ write of size 4 bytes",
+                                "occurrence_count": 17,
+                                "access_type": "write",
+                                "memory_space": "global",
+                                "access_size_bytes": 4,
+                                "kernel_info": [
+                                    {
+                                        "name": "bad_kernel",
+                                        "source": "file candidate.cu line 42",
+                                    }
+                                ],
+                                "threads": {"x": [0, 31], "y": [0, 0], "z": [0, 0]},
+                                "blocks": {"x": [8, 8], "y": [0, 0], "z": [0, 0]},
+                                "addresses": {"ranges": ["0x10", "0x50"]},
+                                "representative_occurrences": [{"address": "0x10"}],
+                                "raw_excerpt": "DROP_RAW_EXCERPT",
+                            }
+                        ],
+                    }
+                ],
+                "replay_payload": {"source": "DROP_REPLAY_PAYLOAD"},
+            },
+        }
+    }
+    original = deepcopy(env_result)
+
+    feedback = build_model_feedback(env_result)
+
+    sanitizer = feedback["runtime_sanitizer"]
+    assert sanitizer["status"] == "issues_found"
+    assert sanitizer["checks"] == [
+        {
+            "check": "memcheck",
+            "status": "issues_found",
+            "process_completed": True,
+            "detected_issue_count": 17,
+            "issues_truncated": True,
+        }
+    ]
+    assert sanitizer["issues"] == [
+        {
+            "hazard_type": "invalid_global_write",
+            "message": "Invalid __global__ write of size 4 bytes",
+            "occurrence_count": 17,
+            "access_type": "write",
+            "memory_space": "global",
+            "access_size_bytes": 4,
+            "check": "memcheck",
+            "kernel": "bad_kernel @ file candidate.cu line 42",
+            "thread_range": "x=0..31,y=0..0,z=0..0",
+            "block_range": "x=8..8,y=0..0,z=0..0",
+            "address_range": "address=0x10..0x50",
+        }
+    ]
+
+    def container_depth(value):
+        if isinstance(value, dict):
+            return 1 + max((container_depth(item) for item in value.values()), default=0)
+        if isinstance(value, list):
+            return 1 + max((container_depth(item) for item in value), default=0)
+        return 0
+
+    assert container_depth(feedback) == 4
+    serialized = json.dumps(feedback)
+    for omitted in ("DROP_RAW_OUTPUT", "DROP_RAW_EXCERPT", "DROP_REPLAY_PAYLOAD", "representative_occurrences"):
+        assert omitted not in serialized
+    assert env_result == original
 
 
 def test_compact_compiler_diagnostics_preserves_each_actionable_error_block():
@@ -507,6 +610,253 @@ def test_normalize_env_feedback_does_not_consume_raw_compile_error():
     assert raw == original
     assert raw["metadata"]["compile_artifact"]["error"] == "generated_binding.cpp:9: error: missing symbol"
     assert "missing symbol" in normalized["error_message"]
+
+
+def test_normalize_env_feedback_lifts_failed_kernelgym_precheck_facts():
+    raw = {
+        "status": "failed",
+        "compiled": False,
+        "correctness": None,
+        "speedup": None,
+        "error_message": "Precheck failed: static check failed: framework_compute",
+        "metadata": {
+            "compile_artifact": {
+                "compiled": False,
+                "entry_point": "ModelNew",
+                "precheck": {
+                    "passed": False,
+                    "error_message": "Precheck failed: static check failed: framework_compute",
+                    "detected_extension_calls": ["fused_forward"],
+                    "exported_functions": ["fused_forward"],
+                    "cu_files": ["kernel.cu"],
+                    "binding_files": ["binding.cpp"],
+                    "static_check": {
+                        "passed": False,
+                        "errors": ["framework_compute: Uses PyTorch/ATen compute instead of custom CUDA kernels"],
+                        "warnings": [],
+                        "precision": "fp32",
+                    },
+                },
+            }
+        },
+    }
+    original = deepcopy(raw)
+
+    normalized, _ = normalize_env_feedback(raw)
+    diagnostic = normalized["metadata"]["precheck_diagnostic"]
+
+    assert raw == original
+    assert diagnostic == {
+        "code": "KERNELGYM_STATIC_FRAMEWORK_COMPUTE",
+        "phase": "kernelgym_static",
+        "evidence": [
+            {
+                "kind": "static_error",
+                "value": "framework_compute: Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            },
+            {"kind": "extension_call", "value": "fused_forward"},
+            {"kind": "exported_symbol", "value": "fused_forward"},
+            {"kind": "parsed_source", "value": "binding.cpp"},
+            {"kind": "parsed_source", "value": "kernel.cu"},
+        ],
+    }
+    assert "precheck" not in normalized["metadata"]["compile_artifact"]
+    feedback = build_model_feedback({"env_state": normalized})
+    assert feedback["precheck_diagnostic"] == diagnostic
+    assert feedback["error_message"]
+
+
+def test_normalize_env_feedback_formats_all_kernelgym_findings_in_one_error_message():
+    findings = [
+        {
+            "code": "framework_compute",
+            "message": "Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            "source_name": "model_code",
+            "line": 9,
+            "column": 13,
+            "end_line": 9,
+            "end_column": 25,
+            "snippet": "torch.relu(x)",
+        },
+        {
+            "code": "framework_compute",
+            "message": "Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            "source_name": "model_code",
+            "line": 10,
+            "column": 13,
+            "end_line": 10,
+            "end_column": 48,
+            "snippet": "torch.matmul(a, a.transpose(-1, -2))",
+        },
+        {
+            "code": "framework_compute",
+            "message": "Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            "source_name": "model_code",
+            "line": 11,
+            "column": 13,
+            "end_line": 11,
+            "end_column": 32,
+            "snippet": "F.softmax(b, dim=-1)",
+        },
+    ]
+    raw = {
+        "status": "failed",
+        "compiled": False,
+        "correctness": False,
+        "decoy_kernel": False,
+        "reference_runtime": -1.0,
+        "kernel_runtime": -1.0,
+        "speedup": 0.0,
+        "error_message": "Kernel compilation failed",
+        "metadata": {
+            "compilation_error": (
+                "Precheck failed: static check failed: framework_compute: Uses PyTorch/ATen compute instead of "
+                "custom CUDA kernels at model_code:9:13: torch.relu(x) (+2 more locations)"
+            ),
+            "compilation_error_name": "compile_error",
+            "compilation_error_detail": "other",
+            "compile_artifact": {
+                "compiled": False,
+                "entry_point": "ModelNew",
+                "precheck": {
+                    "passed": False,
+                    "error_message": "Precheck failed: static check failed: framework_compute",
+                    "detected_extension_calls": ["mlp_forward"],
+                    "exported_functions": ["mlp_forward"],
+                    "binding_files": ["kernels/generated_binding.cpp"],
+                    "cu_files": ["kernels/generated.cu"],
+                    "cpp_files": ["kernels/generated_binding.cpp"],
+                    "static_check": {
+                        "passed": False,
+                        "errors": [
+                            "framework_compute: Uses PyTorch/ATen compute instead of custom CUDA kernels "
+                            "at model_code:9:13: torch.relu(x) (+2 more locations)"
+                        ],
+                        "findings": findings,
+                    },
+                },
+            },
+        },
+    }
+
+    normalized, _ = normalize_env_feedback(raw)
+    diagnostic = normalized["metadata"]["precheck_diagnostic"]
+
+    assert diagnostic == {
+        "code": "KERNELGYM_STATIC_FRAMEWORK_COMPUTE",
+        "phase": "kernelgym_static",
+        "error_message": (
+            "Uses PyTorch/ATen compute instead of custom CUDA kernels:\n"
+            "- MODEL_NEW:9:13-25: torch.relu(x)\n"
+            "- MODEL_NEW:10:13-48: torch.matmul(a, a.transpose(-1, -2))\n"
+            "- MODEL_NEW:11:13-32: F.softmax(b, dim=-1)"
+        ),
+    }
+    assert build_model_feedback({"env_state": normalized}) == {
+        "status": "failed",
+        "error": "PRECHECK_ERROR",
+        "precheck": "failed",
+        "precheck_diagnostic": diagnostic,
+    }
+
+
+def test_normalize_env_feedback_reports_omitted_kernelgym_findings_in_message():
+    findings = [
+        {
+            "code": "framework_compute",
+            "message": "Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            "source_name": "model_code",
+            "line": line,
+            "column": 13,
+            "end_line": line,
+            "end_column": 25,
+            "snippet": "torch.relu(x)",
+        }
+        for line in range(7, 27)
+    ]
+    raw = {
+        "status": "failed",
+        "compiled": False,
+        "correctness": False,
+        "decoy_kernel": False,
+        "speedup": 0.0,
+        "error_message": "Kernel compilation failed",
+        "metadata": {
+            "compilation_error": "Precheck failed: static check failed: framework_compute",
+            "compile_artifact": {
+                "compiled": False,
+                "precheck": {
+                    "passed": False,
+                    "static_check": {
+                        "passed": False,
+                        "errors": ["framework_compute: first location (+19 more locations)"],
+                        "findings": findings,
+                    },
+                },
+            },
+        },
+    }
+
+    normalized, _ = normalize_env_feedback(raw)
+    message = normalized["metadata"]["precheck_diagnostic"]["error_message"]
+
+    assert message.count("- MODEL_NEW:") == 16
+    assert "- MODEL_NEW:7:13-25: torch.relu(x)" in message
+    assert "- MODEL_NEW:22:13-25: torch.relu(x)" in message
+    assert "MODEL_NEW:23:" not in message
+    assert message.endswith("- ... 4 more locations omitted")
+
+
+def test_kernelgym_findings_message_respects_downstream_bound_with_long_snippets():
+    findings = [
+        {
+            "code": "framework_compute",
+            "message": "Uses PyTorch/ATen compute instead of custom CUDA kernels",
+            "source_name": "model_code",
+            "line": line,
+            "column": 13,
+            "end_line": line,
+            "end_column": 173,
+            "snippet": "torch.relu(" + "very_long_expression," * 20 + "x)",
+        }
+        for line in range(7, 27)
+    ]
+    raw = {
+        "status": "failed",
+        "compiled": False,
+        "correctness": False,
+        "decoy_kernel": False,
+        "speedup": 0.0,
+        "error_message": "Kernel compilation failed",
+        "metadata": {
+            "compilation_error": "Precheck failed: static check failed: framework_compute",
+            "compile_artifact": {
+                "compiled": False,
+                "precheck": {
+                    "passed": False,
+                    "static_check": {
+                        "passed": False,
+                        "errors": ["framework_compute: first location (+19 more locations)"],
+                        "findings": findings,
+                    },
+                },
+            },
+        },
+    }
+
+    normalized, _ = normalize_env_feedback(raw)
+    feedback = build_model_feedback({"env_state": normalized})
+    message = feedback["precheck_diagnostic"]["error_message"]
+    omitted = int(message.rsplit("\n", 1)[-1].split()[2])
+    displayed = message.count("- MODEL_NEW:")
+    serialized = _serialize_feedback_dict(feedback)
+
+    assert len(message) <= 2000
+    assert "...(truncated)..." not in message
+    assert displayed + omitted == len(findings)
+    assert "\n" not in serialized
+    assert "\\n" in serialized
+    assert json.loads(serialized) == feedback
 
 
 def test_build_model_feedback_handles_empty_and_non_json_values(monkeypatch):
