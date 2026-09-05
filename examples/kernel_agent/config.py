@@ -7,6 +7,7 @@ log_rollout_info_rate = float(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_INFO_RATE",
 log_rollout_stats_only = bool(int(os.environ.get("CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY", 0)))
 kernel_eval_heartbeat_interval = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL", 60.0))
 kernel_eval_task_timeout = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_TASK_TIMEOUT", 300.0))
+kernel_eval_client_timeout = int(os.environ.get("CUDA_AGENT_KERNEL_EVAL_CLIENT_TIMEOUT", 2400))
 num_correct_trials = int(os.environ.get("CUDA_AGENT_NUM_CORRECT_TRIALS", 5))
 num_perf_trials = int(os.environ.get("CUDA_AGENT_NUM_PERF_TRIALS", 50))
 # Warmup iterations before timed trials, and number of high/low trials trimmed
@@ -73,7 +74,7 @@ CUDA_AGENT_CONFIGS = {
         "kernel_eval_function_path": None,
         "kernel_eval_max_retries": 3,
         "kernel_eval_task_timeout": kernel_eval_task_timeout,
-        "kernel_eval_client_timeout": 2400,
+        "kernel_eval_client_timeout": kernel_eval_client_timeout,
         "kernel_eval_poll_interval": 1.0,
         "kernel_eval_heartbeat_interval": kernel_eval_heartbeat_interval,
         # Eval jobs can lower these independently when sharing the KernelGym

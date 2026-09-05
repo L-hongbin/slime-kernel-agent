@@ -165,7 +165,12 @@ class _HybridHttpWorker:
                     attempt += 1
                     continue
                 response.raise_for_status()
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            # A reused keep-alive connection can be closed by the server or an
+            # intervening tunnel before it sends response headers.  httpx raises
+            # RemoteProtocolError for that case; it is just as retryable as a
+            # connect/read timeout.  Reusing the caller-provided task_id keeps
+            # retries idempotent when the first POST actually reached KernelGym.
+            except httpx.TransportError as exc:
                 try:
                     self._rate_limit_worker.release.remote()
                 except Exception:
