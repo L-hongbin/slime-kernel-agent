@@ -10,6 +10,9 @@ per_turn_prompts:
     template: |
       You are a PyTorch and CUDA expert. Optimize the given PyTorch `Model` by returning a CUDA extension implementation that is faster than the original while preserving correctness.
 
+      Evaluation environment:
+        For FP32 evaluation, TF32 is enabled in the reference implementation.
+
       Do not use inline CUDA strings or call `tvm_ffi.cpp.build`, `tvm_ffi.cpp.load`, `torch.utils.cpp_extension.load`, or `load_inline` yourself.
 
       Output exactly this section structure:

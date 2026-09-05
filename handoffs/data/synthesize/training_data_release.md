@@ -493,6 +493,31 @@ for new_position, (old_position, record) in enumerate(kept):
 
 当前所有高复杂度行的 parquet `data_source` 也恰好都是 `project_generated_open_csp_dag_canary_v4`，但这是实现细节；使用 manifest 的 `source_dataset` 可以直接表达“剔除整个高复杂度合成来源”，不会依赖 UUID 命名或内部标签。如果目标不是剔除整批来源，而是只移除其中最难的一部分，则需要先定义并人工校准新的逐题难度指标；本发版没有可直接当作真实难度分数的字段。
 
+# prompt_tvm_v4_1 prompt-only 派生
+
+`prompt_tvm_v4_1` 直接派生自 v4 正式数据，contract 为 `prompt_tvm_v4_1_tf32_notice`。每行首轮 prompt 在开场段落后只插入下面的原文
+
+```text
+Evaluation environment:
+  For FP32 evaluation, TF32 is enabled in the reference implementation.
+```
+
+除这段说明外，原有提示词、题目集合、行序及其他数据列均保留。派生训练数据标记为 review candidate（`training_approved=false`）；训练 launcher 继续默认读取 v4
+
+| 产物 | 行数 | SHA-256 |
+| --- | ---: | --- |
+| [训练 parquet](../../../Data/prompt_tvm_v4_1/release/train.parquet) | 39,636 | `7438ec0eec6b7f0cec07602bec86e665c46014f9b8e59277aa87fef91328f7c0` |
+| [训练 manifest](../../../Data/prompt_tvm_v4_1/release/manifest.jsonl) | 39,636 | `71e0bd20b046b37000e7cc9d40a08045815c833999cb756cbac4abb5730956d0` |
+| [L3 评测 parquet](../../../Data/kernelbench-level3-validation-tvm-v4_1/train.parquet) | 50 | `03d13218750e6f6c1ba2015f7348518a89dbae04cc383a22c74a76670e2ed6ec` |
+
+[构造器](../../../tools/data/synthesize/build_prompt_tvm_v4_1.py)核对父 parquet/manifest SHA，写出后逐行验证：说明恰好出现一次，删除它就能恢复原始完整 prompt；其余 Arrow 数据列和行序完全一致。派生 manifest 记录父/子 prompt SHA，文件级 metadata 记录派生 contract 与来源 hash。L3 的父集仍是 `Data/kernelbench-level3-validation-tvm-v2/train.parquet`，保持评测题与训练集分离
+
+完整复现信息见[训练 summary](../../../Data/prompt_tvm_v4_1/release/summary.json)与[L3 summary](../../../Data/kernelbench-level3-validation-tvm-v4_1/summary.json)；首行、中间行、末行的完整 prompt 和 diff 保存在两份产物各自的 `review_samples/`，例如[训练首行差分](../../../Data/prompt_tvm_v4_1/release/review_samples/row_0.diff)。构造命令要求输出目录尚不存在
+
+```bash
+python tools/data/synthesize/build_prompt_tvm_v4_1.py --scope all
+```
+
 # 发版目录与可复验中间产物
 
 `Data/prompt_tvm_v4/` 是这一版数据的稳定入口，正式训练数据和可复验中间产物分开存放：
