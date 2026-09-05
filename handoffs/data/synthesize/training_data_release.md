@@ -1,7 +1,7 @@
 # prompt_tvm_v4 data card
 
 本 v4 正式数据有两个来源：
-1. [合成的高复杂度算子数据](./operator_structure_augmentation.md)：使用 typed CSP-DAG 构造的高复杂度合成数据， 共 4,946 条；
+1. [合成的高复杂度算子数据](operator_structure_augmentation.md)：使用 typed CSP-DAG 构造的高复杂度合成数据， 共 4,946 条；
 2. [清洗后的原训练数据合集](../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md) ：包含 DrKernel 45,505 条、CUDA-Agent 4,995 条、KernelBook 11,814 条和 Oubo-generated 2,001 条，共 64,315 条
 
 下文将简要介绍两个数据来源的合成方法，以及最终合成的数据集的组成和分布。

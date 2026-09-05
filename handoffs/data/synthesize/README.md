@@ -44,7 +44,7 @@ KernelBench Level 1/2/3 共 250 道官方题只用于评测、分布参照和去
 
 `prompt_tvm_v4` canonical union 有 64,315 个 parent，来自统一审计后的 DrKernel 45,505、CUDA-Agent 4,995、KernelBook 11,814 和 Oubo-generated 2,001 条数据。它包含 mode-same 和经过审计保留的 mode-variant 分区，不是未经清洗的 DrKernel 原始数据
 
-来源清洗、GPU runtime、mode 划分、人工复核、许可和使用边界见 [`handoff_drkernel_and_accepted_v5_cleanup_20260729.md`](../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md)
+来源清洗、GPU runtime、mode 划分、人工复核、许可和使用边界见 [`../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md`](../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md)
 
 ### Parent-preserving 串行扩增
 
@@ -83,7 +83,7 @@ KernelBench Level 1/2/3 共 250 道官方题只用于评测、分布参照和去
 | Shape 扩增 | [`shape_expansion.md`](shape_expansion.md) |
 | 随机值、dtype、layout | [`random_distribution_augmentation.md`](random_distribution_augmentation.md)、[`serial_dtype_layout_augmentation.md`](serial_dtype_layout_augmentation.md) |
 | 高复杂度与 operator canary | [`operator_structure_augmentation.md`](operator_structure_augmentation.md)、[`operator_structure_canary.md`](operator_structure_canary.md) |
-| 清洗后的上游来源 | [`handoff_drkernel_and_accepted_v5_cleanup_20260729.md`](../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md) |
+| 清洗后的上游来源 | [`../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md`](../cleaning/handoff_drkernel_and_accepted_v5_cleanup_20260729.md) |
 | 数据构建代码 | [`tools/data/synthesize/`](../../../tools/data/synthesize/) |
 | 正式 release | [`Data/prompt_tvm_v4/release/`](../../../Data/prompt_tvm_v4/release/) |
 | 可复验中间产物 | [`Data/prompt_tvm_v4/intermediate_artifacts/`](../../../Data/prompt_tvm_v4/intermediate_artifacts/) |

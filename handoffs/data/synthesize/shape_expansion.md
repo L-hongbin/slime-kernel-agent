@@ -327,66 +327,9 @@ Shape 产物继续保持 `training_approved=false`。
 
 ## GPU-valid child 的语义抽检
 
-GPU reference 和 changed-region 只证明 child 可执行且新增区域影响输出，不能证明 shape 保留了任务语义。为此，抽取 264 条启发式极端、分层覆盖的 parent→child 对照，抽样细节如下：
+对 63,979 个 H20-valid child 的 264 条启发式极端、分层覆盖样本做了 parent→child 人工审计，最终 A=193、B=52、C=19；其中确认由 child 新引入的问题为 1 条，其余 18 条 C 为 parent 原有问题。该抽样用于发现问题，不能外推全量缺陷率
 
-| 阶段 | 规则 | 抽样数 |
-| --- | --- | ---: |
-| 启发式极端 | axis比例、最大单axis、input 扩增倍数、direct-input bytes、changed factory/logical slot 五个排序各取 Top-22，再按 UUID 去重 | 107 |
-| 分层补齐 | 按 lane、Static/DSV4F、source、variant、slot/factory 数和 operator family 分层；层内按稳定 SHA256 排序并轮询取样 | 157 |
-| Fallback | 若仍不足则从全体剩余 child 按稳定 SHA256 补齐 | 0 |
-| **合计** | 不是等概率随机抽样 | **264** |
-
-这里的 axis 比例是 changed tensor 的最大维度除以最小维度，用来找细长 tensor，不判断 axis 是
-batch、channel、sequence 还是 spatial；它与生产合同的“最大维度/第二大维度不超过 1,000”不是
-同一个指标。样本含 DSV4F 224 条、Static solver 40 条，不代表总体方法比例。完整口径见
-`artifacts/shape_semantic_audit/SUMMARY.md`。
-
-抽样的最终评级如下：
-
-| 评级 | 含义 | 数量 | 占比 |
-| --- | --- | ---: | ---: |
-| A | 无问题 | 193 | 73.11% |
-| B | 存在axis解释、比例、coupling、有效工作量或资源代表性疑点 | 52 | 19.70% |
-| C | 破坏任务语义或违反明确约束 | 19 | 7.20% |
-| D | 证据不足，无法判断 | 0 | 0.00% |
-| **合计** | 每个 child 恰好一个主评级 | **264** | **100.00%** |
-
-
-
-| 52 个 B 中的问题标签 | 数量 | 示例；标签可重叠 |
-| --- | ---: | --- |
-| 有效工作量/任务价值不足 | 41 | 巨大 Linear 输出最终只保留少量对角元素 |
-| Direct-input 门禁缺口 | 35 | Conv 输出或 attention score 远大于 direct input；这些 child 已在 H20 实测通过 |
-| axis语义可疑 | 16 | 3-D interpolate 实际按 `(N,C,L)` 而不是二维 H/W 工作 |
-| Coupling 较弱 | 14 | scatter index 的覆盖范围没有随目标轴增长 |
-| axis比例导致代表性差 | 13 | `triu` 在 `(128,8192)` 上几乎退化为恒等 |
-| 重复访问/重复计算 | 4 | 大量 edge 重复访问同一小组节点 |
-| 其他代数恒等或任务域疑点 | 4 | uint8 XOR 后的 `clamp(0,255)` 恒等 |
-
-
-| C 级问题来源 | 数量 |
-| --- | ---: |
-| Child 新引入 | 1 |
-| Parent 原有问题被放大或暴露 | 18 |
-
-### C 级核心代码示例
-
-注释明确要求输入长度小于 10，但 child 改成了 1,137,654,321：
-
-```python
-# Generates sample inputs with the requirement of size above 1 and less than 10
-def get_inputs():
-    x = torch.randint(0, 2, (1137654321,), dtype=torch.uint8)
-    y = torch.randint(0, 2, (1137654321,), dtype=torch.uint8)
-    return [x, y]
-```
-
-
-该样本刻意富集极端和复杂 shape，1/264 不能外推为全量 child 新增问题率。完整证据和建议门禁见
-`artifacts/shape_semantic_audit/SUMMARY.md`。在问题进入最终采样门禁前，Shape 产物继续保持
-`training_approved=false`。
-
-# 遗留问题与产物记录
+GPU reference 和 changed-region 通过只证明可执行性与新增区域影响，不证明任务语义。抽样方法、具体 UUID、边界复核及门禁建议统一见 [Shape 语义审计](artifacts/shape_semantic_audit/SUMMARY.md)。历史候选的 `training_approved=false` 与正式 release 使用授权分开记录，发版状态见 [数据发版](training_data_release.md)
 
 ## 遗留问题
 
@@ -416,7 +359,6 @@ Static solver 的常量解析目前只支持一元正负号以及 `+`、`-`、`*
 - Operator-complexity 图：`handoffs/data/synthesize/artifacts/shape_child_vs_kernelbench_operator_complexity.png`
 - 分布统计：`local_artifacts/data/synthesize/shape_child_vs_kernelbench_numel.json`
 - GPU-valid child 语义抽检：`handoffs/data/synthesize/artifacts/shape_semantic_audit/SUMMARY.md`
-- B 级样本最终裁定：`handoffs/data/synthesize/artifacts/shape_semantic_audit/b_review/FINAL.md`
 - 语义抽样清单：`local_artifacts/data/synthesize/shape_semantic_audit/manifest.tsv`
 - 语义抽样代码：`tools/data/synthesize/model_shape/sample_shape_semantic_audit.py`
 - 分布图生成代码：`tools/data/synthesize/model_shape/plot_shape_child_vs_kernelbench.py`
