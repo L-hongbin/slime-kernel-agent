@@ -36,6 +36,8 @@ correctness_timeout = (
 )
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
+enable_compute_sanitizer = bool(int(os.environ.get("CUDA_AGENT_ENABLE_COMPUTE_SANITIZER", "1")))
+compute_sanitizer_mode = os.environ.get("CUDA_AGENT_COMPUTE_SANITIZER_MODE") or "error_based"
 # Optional reward for a candidate that compiled, completed its forward pass,
 # and reached KernelGym's shape/value comparison but produced a wrong output.
 # Default off so other launchers keep their historical reward policy; the
@@ -95,6 +97,10 @@ CUDA_AGENT_CONFIGS = {
         "refer_num_perf_trials": refer_num_perf_trials,
         "correctness_timeout": correctness_timeout,
         "correctness_timeout_enabled": correctness_timeout_enabled,
+        # Enable error-based runtime diagnostics by default; callers can
+        # explicitly disable them or override the diagnostic mode.
+        "enable_compute_sanitizer": enable_compute_sanitizer,
+        "compute_sanitizer_mode": compute_sanitizer_mode,
         "verbose_errors": True,
         "enable_profiling": True,
         "detect_decoy_kernel": True,

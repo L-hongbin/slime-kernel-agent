@@ -132,6 +132,28 @@ def test_kernel_eval_payload_includes_precision():
     assert task_payload["precision"] == "bf16"
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_kernel_eval_payload_includes_explicit_runtime_sanitizer_options(enabled):
+    config = {
+        **CONFIG,
+        "enable_compute_sanitizer": enabled,
+        "compute_sanitizer_mode": "error_based",
+    }
+
+    task_payload = _build_kernel_eval_payload(SimpleNamespace(), _payload(uuid="problem_1"), config)
+
+    assert task_payload["timeout"] == 300
+    assert task_payload["enable_compute_sanitizer"] is enabled
+    assert task_payload["compute_sanitizer_mode"] == "error_based"
+
+
+def test_kernel_eval_payload_omits_unset_runtime_sanitizer_options():
+    task_payload = _build_kernel_eval_payload(SimpleNamespace(), _payload(uuid="problem_1"), CONFIG)
+
+    assert "enable_compute_sanitizer" not in task_payload
+    assert "compute_sanitizer_mode" not in task_payload
+
+
 def test_cuda_kernel_env_sends_resolved_precision(monkeypatch):
     reference = """
 import torch
@@ -163,4 +185,4 @@ def get_inputs():
 
 
 if __name__ == "__main__":
-    pytest.main([__file__])
+    raise SystemExit(pytest.main([__file__]))

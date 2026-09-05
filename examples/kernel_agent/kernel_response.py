@@ -385,6 +385,16 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
     )
     if correctness_timeout_enabled is not None:
         task_payload["correctness_timeout_enabled"] = correctness_timeout_enabled
+    enable_compute_sanitizer = payload.get(
+        "enable_compute_sanitizer", _kernel_eval_param(args, config, "enable_compute_sanitizer", None)
+    )
+    if enable_compute_sanitizer is not None:
+        task_payload["enable_compute_sanitizer"] = bool(enable_compute_sanitizer)
+    compute_sanitizer_mode = payload.get(
+        "compute_sanitizer_mode", _kernel_eval_param(args, config, "compute_sanitizer_mode", None)
+    )
+    if compute_sanitizer_mode is not None:
+        task_payload["compute_sanitizer_mode"] = str(compute_sanitizer_mode)
     return task_payload
 
 
