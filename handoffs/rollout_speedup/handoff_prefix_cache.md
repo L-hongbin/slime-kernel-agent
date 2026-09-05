@@ -250,4 +250,4 @@ preserve 把历史 reasoning 全留 → 常驻上下文显著变大。
 | 每轮精度 | `scripts/analysis/per_turn_acc.py` |
 | 单测 | `tests/utils/test_drkernel_cache_template.py` |
 | Ablation launcher | `scripts/eval_drkernel/rollout_speedup_ablation/debug.27b.hicache_ablation.sh` |
-| 主 rollout handoff | `handoffs/complete/handoff_drkernel_w8a8_rollout.md` | -->
+| 主 rollout handoff | `handoffs/rollout_speedup/handoff_low_precision.md` | -->
