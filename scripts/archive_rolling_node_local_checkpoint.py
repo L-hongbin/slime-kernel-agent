@@ -3,11 +3,14 @@
 
 Megatron assumes ``--save`` is shared, while the Qwen3.8 actor nodes mount
 ``/nfs/FM`` from different local disks.  A full optimizer checkpoint consumes
-roughly 236 GiB on each actor host, so the next save cannot coexist there.
+roughly 155 GiB on each actor host, so stale generations materially reduce
+the headroom available for later saves.
 This watcher pulls every finalized iteration to an archive host, verifies every
 file by SHA256 and atomically publishes the archive.  The default rolling mode
 then removes the exact remote ``iter_XXXXXXX`` directories; ``--retain-source``
 keeps every node-local source checkpoint intact for non-destructive archival.
+Production launchers may instead use ``--source-only`` to keep a bounded number
+of finalized node-local generations without creating a second archive copy.
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
-
 
 LOG = logging.getLogger("rolling-checkpoint-archive")
 ITER_RE = re.compile(r"^iter_(\d{7})$")
@@ -87,10 +89,97 @@ def select_finalized_iterations(
     return sorted(iteration for iteration in common if iteration <= max(finalized))
 
 
+def source_prune_plan(
+    trackers: dict[str, int | None],
+    iterations: dict[str, set[int]],
+    complete_iterations: set[int],
+    *,
+    keep_sources: int,
+) -> dict[str, list[int]]:
+    """Plan safe per-host deletion while retaining the newest finalized sources.
+
+    Retention is anchored by ``keep_sources`` structurally complete node-local
+    checkpoints. Other published directories are removable, including stale
+    incomplete generations and remnants of a previous partial cleanup. A newer
+    in-flight save remains protected because it is beyond the published tracker.
+    """
+
+    if keep_sources < 1:
+        raise ValueError("keep_sources must be positive")
+    plan = {label: [] for label in iterations}
+    published_values = [value for value in trackers.values() if value is not None]
+    if not published_values:
+        return plan
+    published = max(published_values)
+    finalized = sorted(iteration for iteration in complete_iterations if iteration <= published)
+    if published not in complete_iterations or len(finalized) < keep_sources:
+        return plan
+
+    retained = set(finalized[-keep_sources:])
+    for label, host_iterations in iterations.items():
+        plan[label] = sorted(
+            iteration for iteration in host_iterations if iteration <= published and iteration not in retained
+        )
+    return plan
+
+
+def select_complete_source_iterations(
+    trackers: dict[str, int | None],
+    layouts: dict[str, dict[int, dict[str, object]]],
+) -> set[int]:
+    """Find restorable source generations using the latest published layout.
+
+    Torch DCP writes global metadata only on its coordinator, while every actor
+    host owns a different subset of shard files. The global tracker is written
+    after all-rank finalization, so its iteration is the trustworthy per-host
+    shard-layout template. Older candidates must match that layout on every
+    host and have global metadata on at least one host.
+    """
+
+    published_values = [value for value in trackers.values() if value is not None]
+    if not published_values or not layouts:
+        return set()
+    published = max(published_values)
+    if any(published not in host_layouts for host_layouts in layouts.values()):
+        return set()
+
+    reference_shards: dict[str, set[str]] = {}
+    for label, host_layouts in layouts.items():
+        shards = host_layouts[published].get("shards")
+        if not isinstance(shards, dict) or not shards or any(int(size) <= 0 for size in shards.values()):
+            return set()
+        reference_shards[label] = set(shards)
+    if not any(bool(host_layouts[published].get("has_global_metadata")) for host_layouts in layouts.values()):
+        return set()
+
+    common = set.intersection(*(set(host_layouts) for host_layouts in layouts.values()))
+    complete: set[int] = set()
+    for iteration in common:
+        if iteration > published:
+            continue
+        if not any(bool(host_layouts[iteration].get("has_global_metadata")) for host_layouts in layouts.values()):
+            continue
+        valid = True
+        for label, host_layouts in layouts.items():
+            shards = host_layouts[iteration].get("shards")
+            if (
+                not isinstance(shards, dict)
+                or set(shards) != reference_shards[label]
+                or any(int(size) <= 0 for size in shards.values())
+            ):
+                valid = False
+                break
+        if valid:
+            complete.add(iteration)
+    return complete
+
+
 class Transport(Protocol):
     def read_tracker(self, host: HostSpec, checkpoint_dir: str) -> int | None: ...
 
     def list_iterations(self, host: HostSpec, checkpoint_dir: str) -> set[int]: ...
+
+    def inspect_iterations(self, host: HostSpec, checkpoint_dir: str) -> dict[int, dict[str, object]]: ...
 
     def remote_manifest(
         self, host: HostSpec, checkpoint_dir: str, iteration: int
@@ -154,6 +243,28 @@ class SshTransport:
             "if p.is_dir() and (m:=pat.fullmatch(p.name)))))"
         )
         return set(json.loads(self._python(host, code, checkpoint_dir)))
+
+    def inspect_iterations(self, host: HostSpec, checkpoint_dir: str) -> dict[int, dict[str, object]]:
+        code = r"""
+from pathlib import Path
+import json, re, sys
+root = Path(sys.argv[1])
+pat = re.compile(r'^iter_(\d{7})$')
+out = {}
+for path in root.glob('iter_*'):
+    match = pat.fullmatch(path.name)
+    if not path.is_dir() or match is None:
+        continue
+    out[int(match.group(1))] = {
+        'shards': {shard.name: shard.stat().st_size for shard in path.glob('*.distcp') if shard.is_file()},
+        'has_global_metadata': all((path / name).is_file() for name in ('.metadata', 'common.pt', 'metadata.json')),
+    }
+print(json.dumps(out, sort_keys=True))
+"""
+        return {
+            int(iteration): layout
+            for iteration, layout in json.loads(self._python(host, code, checkpoint_dir)).items()
+        }
 
     def remote_manifest(self, host: HostSpec, checkpoint_dir: str, iteration: int) -> dict[str, dict[str, int | str]]:
         code = r"""
@@ -257,6 +368,7 @@ class RollingArchiver:
             return {futures[future].label: future.result() for future in concurrent.futures.as_completed(futures)}
 
     def _write_status(self, payload: dict) -> None:
+        payload = {**payload, "watcher_pid": os.getpid()}
         temporary = self.archive_dir / ".watcher_status.json.tmp"
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, self.archive_dir / "watcher_status.json")
@@ -371,15 +483,118 @@ class RollingArchiver:
         return processed
 
 
+class RollingSourcePruner:
+    """Keep only the newest complete node-local checkpoint generations."""
+
+    def __init__(
+        self,
+        *,
+        hosts: list[HostSpec],
+        checkpoint_dir: str,
+        status_dir: Path,
+        transport: Transport,
+        keep_sources: int,
+    ) -> None:
+        if len(hosts) < 2:
+            raise ValueError("at least two node-local checkpoint hosts are required")
+        if len({host.label for host in hosts}) != len(hosts):
+            raise ValueError("checkpoint host labels must be unique")
+        if keep_sources < 1:
+            raise ValueError("keep_sources must be positive")
+        self.hosts = hosts
+        self.checkpoint_dir = validate_checkpoint_dir(checkpoint_dir)
+        self.status_dir = status_dir.resolve()
+        checkpoint_path = Path(self.checkpoint_dir).resolve()
+        if self.status_dir == checkpoint_path or checkpoint_path in self.status_dir.parents:
+            raise ValueError("status_dir must not be inside the checkpoint dir")
+        self.transport = transport
+        self.keep_sources = keep_sources
+        self.status_dir.mkdir(parents=True, exist_ok=True)
+
+    def _parallel(self, function, items):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(self.hosts)) as pool:
+            futures = {pool.submit(function, item): item for item in items}
+            return {futures[future].label: future.result() for future in concurrent.futures.as_completed(futures)}
+
+    def _write_status(self, payload: dict) -> None:
+        payload = {**payload, "watcher_pid": os.getpid()}
+        temporary = self.status_dir / ".watcher_status.json.tmp"
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, self.status_dir / "watcher_status.json")
+
+    def poll_once(self) -> int:
+        trackers = self._parallel(lambda host: self.transport.read_tracker(host, self.checkpoint_dir), self.hosts)
+        iterations = self._parallel(lambda host: self.transport.list_iterations(host, self.checkpoint_dir), self.hosts)
+        layouts = self._parallel(lambda host: self.transport.inspect_iterations(host, self.checkpoint_dir), self.hosts)
+        complete_iterations = select_complete_source_iterations(trackers, layouts)
+        plan = source_prune_plan(
+            trackers,
+            iterations,
+            complete_iterations,
+            keep_sources=self.keep_sources,
+        )
+        removed: dict[str, list[int]] = {host.label: [] for host in self.hosts}
+
+        self._write_status(
+            {
+                "state": "pruning" if any(plan.values()) else "poll",
+                "time": time.time(),
+                "trackers": trackers,
+                "iterations": {key: sorted(value) for key, value in iterations.items()},
+                "complete_iterations": sorted(complete_iterations),
+                "keep_sources": self.keep_sources,
+                "plan": plan,
+                "removed": removed,
+            }
+        )
+
+        for iteration in sorted({value for values in plan.values() for value in values}):
+            targets = [host for host in self.hosts if iteration in plan[host.label]]
+            if not targets:
+                continue
+            self._parallel(
+                lambda host, iteration=iteration: self.transport.remove_iteration(
+                    host, self.checkpoint_dir, iteration
+                ),
+                targets,
+            )
+            for host in targets:
+                removed[host.label].append(iteration)
+            LOG.info(
+                "pruned superseded node-local checkpoint iter_%07d from %s", iteration, [h.label for h in targets]
+            )
+
+        self._write_status(
+            {
+                "state": "pruned" if any(removed.values()) else "poll",
+                "time": time.time(),
+                "trackers": trackers,
+                "iterations": {key: sorted(value) for key, value in iterations.items()},
+                "complete_iterations": sorted(complete_iterations),
+                "keep_sources": self.keep_sources,
+                "plan": plan,
+                "removed": removed,
+            }
+        )
+        return sum(len(values) for values in removed.values())
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", action="append", type=parse_host, required=True)
     parser.add_argument("--ssh-port", type=int, default=23538)
     parser.add_argument("--checkpoint-dir", required=True)
-    parser.add_argument("--archive-dir", type=Path, required=True)
+    parser.add_argument("--archive-dir", type=Path)
     parser.add_argument("--keep-archives", type=int, default=1)
     parser.add_argument("--min-free-gib", type=int, default=64)
     parser.add_argument("--poll-interval", type=int, default=60)
+    parser.add_argument(
+        "--source-only",
+        action="store_true",
+        help="prune superseded node-local checkpoints without copying them to an archive",
+    )
+    parser.add_argument("--keep-sources", type=int, default=2)
+    parser.add_argument("--status-dir", type=Path)
     parser.add_argument(
         "--retain-source",
         action="store_true",
@@ -394,16 +609,35 @@ def main() -> None:
     if args.poll_interval < 10:
         raise SystemExit("poll interval must be at least 10 seconds")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    archiver = RollingArchiver(
-        hosts=args.host,
-        checkpoint_dir=args.checkpoint_dir,
-        archive_dir=args.archive_dir,
-        transport=SshTransport(ssh_port=args.ssh_port),
-        keep_archives=args.keep_archives,
-        min_free_bytes=args.min_free_gib * 1024**3,
-        retain_source=args.retain_source,
-    )
-    lock_path = archiver.archive_dir / ".watcher.lock"
+    transport = SshTransport(ssh_port=args.ssh_port)
+    if args.source_only:
+        if args.archive_dir is not None or args.retain_source:
+            raise SystemExit("--source-only cannot be combined with --archive-dir or --retain-source")
+        if args.status_dir is None:
+            raise SystemExit("--source-only requires --status-dir")
+        runner = RollingSourcePruner(
+            hosts=args.host,
+            checkpoint_dir=args.checkpoint_dir,
+            status_dir=args.status_dir,
+            transport=transport,
+            keep_sources=args.keep_sources,
+        )
+        lock_path = runner.status_dir / ".watcher.lock"
+    else:
+        if args.archive_dir is None:
+            raise SystemExit("archive mode requires --archive-dir")
+        if args.status_dir is not None:
+            raise SystemExit("archive mode does not accept --status-dir")
+        runner = RollingArchiver(
+            hosts=args.host,
+            checkpoint_dir=args.checkpoint_dir,
+            archive_dir=args.archive_dir,
+            transport=transport,
+            keep_archives=args.keep_archives,
+            min_free_bytes=args.min_free_gib * 1024**3,
+            retain_source=args.retain_source,
+        )
+        lock_path = runner.archive_dir / ".watcher.lock"
     with lock_path.open("w", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -411,11 +645,11 @@ def main() -> None:
             raise SystemExit(f"another watcher holds {lock_path}") from exc
         while True:
             try:
-                processed = archiver.poll_once()
+                processed = runner.poll_once()
                 LOG.info("poll complete: processed=%s", processed)
             except Exception:
-                LOG.exception("checkpoint archive poll failed; source checkpoints were not pruned")
-                archiver._write_status({"state": "error", "time": time.time()})
+                LOG.exception("rolling checkpoint poll failed")
+                runner._write_status({"state": "error", "time": time.time()})
                 if args.once:
                     raise
             if args.once:

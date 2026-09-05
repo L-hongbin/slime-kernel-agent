@@ -3,7 +3,64 @@
 # Do not enable xtrace here: WANDB_API_KEY and other credentials are exported
 # into Ray's runtime environment later in this script.
 set -Ee
-trap 'status=$?; echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"' EXIT
+ROLLING_CHECKPOINT_WATCHER_PID=""
+ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE=""
+cleanup_rolling_checkpoint_watcher() {
+   local watcher_child_pid=""
+   local recorded_supervisor_pid=""
+   local recorded_child_pid=""
+   if [[ -n "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}" \
+      && -f "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}" ]]; then
+      read -r recorded_supervisor_pid recorded_child_pid < "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}" || true
+      if [[ "${recorded_supervisor_pid:-}" == "${ROLLING_CHECKPOINT_WATCHER_PID}" \
+         && "${recorded_child_pid:-}" =~ ^[1-9][0-9]*$ ]]; then
+         watcher_child_pid="${recorded_child_pid}"
+      fi
+   fi
+   local supervisor_alive=0
+   local child_group_alive=0
+   if [[ -n "${ROLLING_CHECKPOINT_WATCHER_PID}" ]] \
+      && kill -0 "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null; then
+      supervisor_alive=1
+   fi
+   if [[ -n "${watcher_child_pid}" ]] && kill -0 -- "-${watcher_child_pid}" 2>/dev/null; then
+      child_group_alive=1
+   fi
+   if [[ "${supervisor_alive}" == "1" || "${child_group_alive}" == "1" ]]; then
+      echo "Stopping rolling checkpoint watcher pid=${ROLLING_CHECKPOINT_WATCHER_PID}"
+      if [[ "${supervisor_alive}" == "1" ]]; then
+         kill "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null || true
+      elif [[ "${child_group_alive}" == "1" ]]; then
+         kill -TERM -- "-${watcher_child_pid}" 2>/dev/null || true
+      fi
+      for _ in $(seq 1 15); do
+         if { [[ "${supervisor_alive}" != "1" ]] \
+               || ! kill -0 "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null; } \
+            && { [[ "${child_group_alive}" != "1" ]] \
+               || ! kill -0 -- "-${watcher_child_pid}" 2>/dev/null; }; then
+            wait "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null || true
+            ROLLING_CHECKPOINT_WATCHER_PID=""
+            return
+         fi
+         sleep 1
+      done
+      echo "Rolling checkpoint watcher did not exit within 15s; forcing process-group shutdown." >&2
+      if [[ "${child_group_alive}" == "1" ]]; then
+         kill -KILL -- "-${watcher_child_pid}" 2>/dev/null || true
+      fi
+      if [[ "${supervisor_alive}" == "1" ]]; then
+         kill -9 "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null || true
+      fi
+      wait "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null || true
+   fi
+   ROLLING_CHECKPOINT_WATCHER_PID=""
+}
+on_exit() {
+   local status=$?
+   cleanup_rolling_checkpoint_watcher
+   echo "Script exiting with status ${status} at line ${LINENO}: ${BASH_COMMAND}"
+}
+trap on_exit EXIT
 trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 # will prevent ray from buffering stdout/stderr
@@ -26,6 +83,9 @@ LOAD_DEBUG_ROLLOUT_DATA="${LOAD_DEBUG_ROLLOUT_DATA:-}"
 SAVE_FIRST_TRAIN_ROLLOUT="${SAVE_FIRST_TRAIN_ROLLOUT:-0}"
 DISABLE_CHECKPOINT_SAVE="${DISABLE_CHECKPOINT_SAVE:-0}"
 DISABLE_WANDB="${DISABLE_WANDB:-0}"
+ROLLING_CHECKPOINT_CLEANUP="${ROLLING_CHECKPOINT_CLEANUP:-1}"
+ROLLING_CHECKPOINT_KEEP="${ROLLING_CHECKPOINT_KEEP:-2}"
+ROLLING_CHECKPOINT_POLL_SEC="${ROLLING_CHECKPOINT_POLL_SEC:-60}"
 if [[ "${FULL_LOOP_SMOKE}" != "0" && "${FULL_LOOP_SMOKE}" != "1" ]]; then
    echo "FULL_LOOP_SMOKE must be 0 or 1." >&2
    exit 1
@@ -36,6 +96,19 @@ if [[ "${REUSE_RAY_CLUSTER}" != "0" && "${REUSE_RAY_CLUSTER}" != "1" ]]; then
 fi
 if [[ "${DISABLE_WANDB}" != "0" && "${DISABLE_WANDB}" != "1" ]]; then
    echo "DISABLE_WANDB must be 0 or 1." >&2
+   exit 1
+fi
+if [[ "${ROLLING_CHECKPOINT_CLEANUP}" != "0" && "${ROLLING_CHECKPOINT_CLEANUP}" != "1" ]]; then
+   echo "ROLLING_CHECKPOINT_CLEANUP must be 0 or 1." >&2
+   exit 1
+fi
+if ! [[ "${ROLLING_CHECKPOINT_KEEP}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "ROLLING_CHECKPOINT_KEEP must be a positive integer." >&2
+   exit 1
+fi
+if ! [[ "${ROLLING_CHECKPOINT_POLL_SEC}" =~ ^[1-9][0-9]*$ ]] \
+   || ((ROLLING_CHECKPOINT_POLL_SEC < 10)); then
+   echo "ROLLING_CHECKPOINT_POLL_SEC must be an integer of at least 10 seconds." >&2
    exit 1
 fi
 if [[ "${DEBUG_ROLLOUT_TWO_NODE}" != "0" && "${DEBUG_ROLLOUT_TWO_NODE}" != "1" ]]; then
@@ -503,6 +576,7 @@ fi
 EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${TOPOLOGY_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${TURN_POLICY_LABEL}.${PROMPT_POLICY_LABEL}.${ROLLOUT_SYNC_LABEL}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH:-${EXP_ROOT}/checkpoints}"
+ROLLING_CHECKPOINT_STATUS_DIR="${ROLLING_CHECKPOINT_STATUS_DIR:-${EXP_ROOT}/rolling_checkpoint_cleanup}"
 MIN_CHECKPOINT_FREE_GIB="${MIN_CHECKPOINT_FREE_GIB:-180}"
 if ! [[ "${MIN_CHECKPOINT_FREE_GIB}" =~ ^[1-9][0-9]*$ ]]; then
    echo "MIN_CHECKPOINT_FREE_GIB must be a positive integer." >&2
@@ -896,6 +970,129 @@ check_checkpoint_free_space() {
       fi
    done
    echo "Checkpoint capacity gate passed: at least ${MIN_CHECKPOINT_FREE_GIB} GiB free on every actor node."
+}
+
+start_rolling_checkpoint_cleanup() {
+   if [[ "${ROLLING_CHECKPOINT_CLEANUP}" != "1" \
+      || "${DISABLE_CHECKPOINT_SAVE}" == "1" \
+      || "${DEBUG_ROLLOUT_ONLY}" == "1" \
+      || "${FULL_LOOP_SMOKE}" == "1" \
+      || -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+      return
+   fi
+
+   local watcher_args=(
+      "${PYTHON_BIN}"
+      "${REPO_ROOT}/scripts/archive_rolling_node_local_checkpoint.py"
+      --source-only
+      --host "head=local"
+      --ssh-port 23538
+      --checkpoint-dir "${CHECKPOINT_SAVE_PATH}"
+      --status-dir "${ROLLING_CHECKPOINT_STATUS_DIR}"
+      --keep-sources "${ROLLING_CHECKPOINT_KEEP}"
+      --poll-interval "${ROLLING_CHECKPOINT_POLL_SEC}"
+   )
+   local actor_hosts=1
+   local i
+   for i in "${!REMOTE_HOSTS[@]}"; do
+      if [[ "${REMOTE_PLACEMENT_RESOURCES[$i]}" != "${ACTOR_PLACEMENT_RESOURCE}" ]]; then
+         continue
+      fi
+      watcher_args+=(--host "actor_${i}=${REMOTE_HOSTS[$i]}")
+      actor_hosts=$((actor_hosts + 1))
+   done
+   if ((actor_hosts != ACTOR_NUM_NODES || actor_hosts < 2)); then
+      echo "rolling checkpoint cleanup expected ${ACTOR_NUM_NODES} actor hosts, resolved ${actor_hosts}." >&2
+      exit 1
+   fi
+
+   mkdir -p "${ROLLING_CHECKPOINT_STATUS_DIR}"
+   echo "Starting rolling checkpoint cleanup: keep=${ROLLING_CHECKPOINT_KEEP}, poll=${ROLLING_CHECKPOINT_POLL_SEC}s"
+   local watcher_start_epoch
+   watcher_start_epoch=$(date +%s.%N)
+   ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE="${ROLLING_CHECKPOINT_STATUS_DIR}/watcher_child.pid"
+   if ! command -v setsid >/dev/null 2>&1; then
+      echo "rolling checkpoint cleanup requires setsid for process-group lifecycle management." >&2
+      exit 1
+   fi
+   (
+      watcher_child_pid=""
+      stop_watcher_supervisor() {
+         # Ctrl-C may reach both launcher and supervisor before EXIT cleanup.
+         trap '' TERM INT
+         if [[ -n "${watcher_child_pid}" ]] && kill -0 "${watcher_child_pid}" 2>/dev/null; then
+            kill -TERM -- "-${watcher_child_pid}" 2>/dev/null || true
+            wait "${watcher_child_pid}" 2>/dev/null || true
+         fi
+         exit 0
+      }
+      trap stop_watcher_supervisor TERM INT
+      while true; do
+         setsid "${watcher_args[@]}" &
+         watcher_child_pid=$!
+         printf '%s %s\n' "${BASHPID}" "${watcher_child_pid}" \
+            > "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}.tmp"
+         mv "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}.tmp" \
+            "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}"
+         set +e
+         wait "${watcher_child_pid}"
+         watcher_status=$?
+         # A crashed watcher can leave SSH/rsync children in its process group.
+         kill -TERM -- "-${watcher_child_pid}" 2>/dev/null || true
+         set -e
+         watcher_child_pid=""
+         echo "rolling checkpoint watcher exited with status ${watcher_status}; restarting in 10s" >&2
+         sleep 10
+      done
+   ) &
+   ROLLING_CHECKPOINT_WATCHER_PID=$!
+   local watcher_ready=0
+   local watcher_deadline=$((SECONDS + 30))
+   while ((SECONDS < watcher_deadline)); do
+      if ! kill -0 "${ROLLING_CHECKPOINT_WATCHER_PID}" 2>/dev/null; then
+         break
+      fi
+      if "${PYTHON_BIN}" - \
+         "${ROLLING_CHECKPOINT_STATUS_DIR}/watcher_status.json" \
+         "${watcher_start_epoch}" \
+         "${ROLLING_CHECKPOINT_WATCHER_CHILD_PID_FILE}" \
+         "${ROLLING_CHECKPOINT_WATCHER_PID}" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+start_epoch = float(sys.argv[2])
+pid_path = Path(sys.argv[3])
+supervisor_pid = int(sys.argv[4])
+if not path.is_file() or path.stat().st_mtime < start_epoch:
+    raise SystemExit(1)
+payload = json.loads(path.read_text(encoding="utf-8"))
+if float(payload.get("time", 0)) < start_epoch:
+    raise SystemExit(1)
+try:
+    recorded_supervisor_pid, child_pid = (int(value) for value in pid_path.read_text().split())
+    os.kill(child_pid, 0)
+except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+    raise SystemExit(1)
+if recorded_supervisor_pid != supervisor_pid or payload.get("watcher_pid") != child_pid:
+    raise SystemExit(1)
+state = payload.get("state")
+raise SystemExit(0 if state in {"poll", "pruning", "pruned"} else 1)
+PY
+      then
+         watcher_ready=1
+         break
+      fi
+      sleep 1
+   done
+   if [[ "${watcher_ready}" != "1" ]]; then
+      cleanup_rolling_checkpoint_watcher
+      echo "rolling checkpoint cleanup failed its first-poll readiness gate." >&2
+      exit 1
+   fi
+   echo "Rolling checkpoint cleanup started: pid=${ROLLING_CHECKPOINT_WATCHER_PID}, status=${ROLLING_CHECKPOINT_STATUS_DIR}/watcher_status.json"
 }
 
 wait_for_cluster() {
@@ -1501,6 +1698,9 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
       "${NUM_ROLLOUT}" "${ROLLOUT_BATCH_SIZE}" \
       "${N_SAMPLES_PER_PROMPT}" "${GLOBAL_BATCH_SIZE}"
    printf 'MIN_CHECKPOINT_FREE_GIB=%s\n' "${MIN_CHECKPOINT_FREE_GIB}"
+   printf 'ROLLING_CHECKPOINT_CLEANUP=%s\nROLLING_CHECKPOINT_KEEP=%s\nROLLING_CHECKPOINT_POLL_SEC=%s\nROLLING_CHECKPOINT_STATUS_DIR=%s\n' \
+      "${ROLLING_CHECKPOINT_CLEANUP}" "${ROLLING_CHECKPOINT_KEEP}" \
+      "${ROLLING_CHECKPOINT_POLL_SEC}" "${ROLLING_CHECKPOINT_STATUS_DIR}"
    printf 'DEBUG_ROLLOUT_TWO_NODE=%s\nHEAD_RESOURCE_JSON=%s\nROLLOUT_RESOURCE_JSON=%s\n' \
       "${DEBUG_ROLLOUT_TWO_NODE}" "${HEAD_RESOURCE_JSON}" "${ROLLOUT_RESOURCE_JSON}"
    printf 'USE_NODE64_ROLLOUT=%s\n' "${USE_NODE64_ROLLOUT}"
@@ -1644,6 +1844,8 @@ done
 
 wait_for_cluster
 fi
+
+start_rolling_checkpoint_cleanup
 
 # Cover every node IP in BOTH no_proxy spellings: reqwest (sglang router) and
 # other HTTP clients must never reach in-cluster engines through the egress
