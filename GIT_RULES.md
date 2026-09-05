@@ -30,6 +30,6 @@
 
 ## Before committing
 
-1. Group the entire dirty worktree (including untracked files) into commits upfront; define each commit as one independently revertible responsibility instead of choosing boundaries file-by-file or by a broad label like train, eval, or docs
-2. Before a commit adding 3+ documents or 500+ documentation lines, do a semantic-duplication review and resolve it first
-3. Use `--amend` on the latest unpushed commit for review feedback instead of adding fix-up commits
+1. Group task-related changes, including relevant untracked files, into independently revertible responsibilities; plan the whole dirty worktree only when the user asks to organize all pending changes
+2. Resolve semantic duplication in documentation being committed
+3. Use `--amend` for review feedback only when the latest unpushed commit belongs to your current task and the feedback has the same responsibility; preserve unrelated commits

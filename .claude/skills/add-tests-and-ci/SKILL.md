@@ -5,26 +5,7 @@ description: Guide for adding or updating slime tests and CI wiring. Use when ta
 
 # Add Tests and CI
 
-Add reliable tests and integrate them with slime CI flow.
-
-## When to Use
-
-Use this skill when:
-
-- User asks to add tests for new behavior
-- User asks to fix or update existing tests in `tests/`
-- User asks to update CI workflow behavior
-- User asks how to run targeted checks before PR
-
-## Step-by-Step Guide
-
-### Step 1: Pick the Right Test Pattern
-
-- Follow existing naming: `tests/test_<feature>.py`
-- Start from nearest existing test file for your model/path
-- Keep test scope small and behavior-focused
-
-### Step 2: Keep CI Compatibility
+## Test execution contract
 
 - CI executes registered test files with `python tests/<file>.py`, not only pytest discovery. New CPU pytest files should include:
 
@@ -40,13 +21,13 @@ if __name__ == "__main__":
 - `run-ci-changed` extracts a top-level `NUM_GPUS = <N>` constant from added/modified `tests/test_*.py` and `tests/plugin_contracts/test_*.py`; if missing, it defaults to 8 GPUs. Set `NUM_GPUS = 0` for CPU-only tests.
 - For GPU/e2e tests, follow the nearby file pattern (`prepare()`, `execute()`, `NUM_GPUS`, and any model/dataset constants).
 
-### Step 3: Run Local Validation
+## Local validation
 
 - Run the exact existing test files you changed, if any.
 - Run repository-wide checks only when they are already part of the task or workflow.
-- Avoid documenting placeholder test commands that may not exist in the current tree.
+- Report the commands executed, results, and GPU requirements or untested paths.
 
-### Step 4: Update Workflow Template Correctly
+## Workflow generation
 
 For CI workflow changes:
 
@@ -58,24 +39,6 @@ python .github/workflows/generate_github_workflows.py
 ```
 
 3. Include both the template and generated workflow file in the change set (`.j2` and `.yml`). If the user asked for a commit, commit both.
-
-### Step 5: Provide Verifiable PR Notes
-
-Include:
-
-- Which tests were added/changed
-- Exact commands executed
-- GPU assumptions for each test path
-- Why this coverage protects against regression
-
-## Common Mistakes
-
-- Editing generated workflow file only
-- Forgetting `NUM_GPUS = 0` on a CPU-only changed test, causing `run-ci-changed` to default to 8 GPUs
-- Adding a CPU pytest file that passes under `pytest tests/foo.py` but fails under CI's `python tests/foo.py`
-- Adding tests without following existing constants/conventions
-- Making tests too large or non-deterministic
-- Skipping local validation and relying only on remote CI
 
 ## Reference Locations
 
