@@ -2886,6 +2886,9 @@ def slime_validate_args(args):
 
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
+    if args.enable_mtp_training and args.spec == ["slime_plugins.models.qwen3_5", "get_qwen3_5_spec"]:
+        if args.mtp_num_layers != 1 or args.megatron_to_hf_mode == "bridge":
+            raise ValueError("Native Qwen MTP training requires --mtp-num-layers 1 and raw weight export")
 
     if args.use_rollout_routing_replay:
         args.use_routing_replay = True

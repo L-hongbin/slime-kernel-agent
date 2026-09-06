@@ -1395,7 +1395,12 @@ def _sampling_params_for_prompt_context(
     draft_token_reserve = 0
     if getattr(args, "sglang_speculative_algorithm", None):
         draft_token_reserve = max(0, int(getattr(args, "sglang_speculative_num_draft_tokens", 0) or 0))
-    remaining_context = int(max_context_len) - int(prompt_token_count) - draft_token_reserve
+    serving_context = getattr(args, "sglang_context_length", None) or getattr(args, "rollout_max_context_len", None)
+    if serving_context is not None:
+        max_context_len = min(int(max_context_len), int(serving_context) - draft_token_reserve)
+    elif draft_token_reserve:
+        max_context_len = int(max_context_len) - draft_token_reserve
+    remaining_context = int(max_context_len) - int(prompt_token_count)
     configured_max_new_tokens = turn_sampling_params.get("max_new_tokens")
     if configured_max_new_tokens is None:
         max_new_tokens = remaining_context

@@ -139,7 +139,7 @@ if [[ "${CONFIG_DRY_RUN}" != "1" ]] && ! hostname -I 2>/dev/null | tr ' ' '\n' |
    exit 1
 fi
 # Qwen3.8 cluster: node70 (head + BF16 actor), node69 (BF16 actor), and node53
-# (FP8 rollout). node64 remains an opt-in second rollout host. The dedicated
+# (FP8 rollout). node64 supplies the second rollout host by default. The dedicated
 # containers listen on 23538 so this run does not reuse or stop the long-lived
 # :23522 slime containers.
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
@@ -171,8 +171,8 @@ elif [[ "${USE_NODE64_ROLLOUT}" == "1" ]]; then
       "slime_rollout"
    )
 else
-   # Supported three-node topology: node70+node69 host the BF16 actor;
-   # node53 hosts two TP4 rollout engines. node64 remains outside the job.
+   # USE_NODE64_ROLLOUT=0 selects the three-node topology: node70+node69
+   # host the actor and node53 hosts two TP4 rollout engines.
    REMOTE_HOSTS=(
       "10.11.2.169"
       "10.11.2.153"
@@ -236,7 +236,21 @@ if ! [[ "${PACK_MULTI_TURN_TRAJECTORIES}" =~ ^[01]$ ]]; then
    exit 1
 fi
 read -r -a TURN_MAX_CONTEXT_LEN_VALUES <<< "${TURN_MAX_CONTEXT_LENS}"
-DECODER_LAST_PIPELINE_NUM_LAYERS=${DECODER_LAST_PIPELINE_NUM_LAYERS:-31}
+ENABLE_MTP_TRAINING=${ENABLE_MTP_TRAINING:-1}
+if ! [[ "${ENABLE_MTP_TRAINING}" =~ ^[01]$ ]]; then
+   echo "ENABLE_MTP_TRAINING must be 0 or 1." >&2
+   exit 1
+fi
+if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" && "${ENABLE_MTP_TRAINING}" == "1" ]]; then
+   echo "Trajectory packing does not support MTP training; set ENABLE_MTP_TRAINING=0 for packing." >&2
+   exit 1
+fi
+# MTP adds a head and embedding replica to the last stage.
+DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS=31
+if [[ "${ENABLE_MTP_TRAINING}" == "1" ]]; then
+   DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS=27
+fi
+DECODER_LAST_PIPELINE_NUM_LAYERS=${DECODER_LAST_PIPELINE_NUM_LAYERS:-${DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS}}
 RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-27}
 FINALIZE_MODE=${FINALIZE_MODE:-positive}
 if ! [[ "${DECODER_LAST_PIPELINE_NUM_LAYERS}" =~ ^[1-9][0-9]*$ \
@@ -296,9 +310,18 @@ if ((SGLANG_CUDA_GRAPH_MAX_BS > SGLANG_MAX_RUNNING_REQUESTS)); then
    echo "SGLANG_CUDA_GRAPH_MAX_BS must not exceed SGLANG_MAX_RUNNING_REQUESTS." >&2
    exit 1
 fi
-# Maintained Qwen3.8 training is no-spec only. DSpark was intentionally removed
-# after failing the production-maturity gate; MTP remains outside this launcher.
-SGLANG_SPECULATIVE_LABEL="NoSpec"
+# The single native MTP head trains with one-step teacher forcing.
+# MTP_STEPS controls only its autoregressive rollout expansion.
+MTP_STEPS=${MTP_STEPS:-3}
+MTP_LOSS_SCALING_FACTOR=${MTP_LOSS_SCALING_FACTOR:-0.2}
+case "${MTP_STEPS}" in 0|1|2|3) ;; *) echo "MTP_STEPS must be 0, 1, 2 or 3" >&2; exit 1 ;; esac
+SGLANG_SPECULATIVE_LABEL="MTP${MTP_STEPS}.Train${ENABLE_MTP_TRAINING}"
+REQUIRE_MTP_RUNTIME_PATCH=0
+if (( MTP_STEPS > 0 || ENABLE_MTP_TRAINING == 1 )); then
+   REQUIRE_MTP_RUNTIME_PATCH=1
+fi
+SGLANG_MTP_OVERLAY=${SGLANG_MTP_OVERLAY:-${REPO_ROOT}/local_artifacts/qwen38/mtp_runtime}
+QWEN_RUNTIME_PYTHONPATH="${SGLANG_MTP_OVERLAY}:${REPO_ROOT}:/root/Megatron-LM"
 
 # Training kernel contract. FlashQLA is the production GDN backend. FLA remains
 # an opt-in fixed-replay diagnostic for isolating recurrent-kernel regressions.
@@ -425,8 +448,8 @@ if [[ "${DISABLE_CHECKPOINT_SAVE}" == "1" \
    echo "DISABLE_CHECKPOINT_SAVE=1 is allowed only with LOAD_DEBUG_ROLLOUT_DATA or FULL_LOOP_SMOKE=1." >&2
    exit 1
 fi
-if [[ "${DISABLE_CHECKPOINT_SAVE}" == "1" && "${RESUME_FROM_SAVE:-0}" == "1" ]]; then
-   echo "DISABLE_CHECKPOINT_SAVE=1 cannot be combined with RESUME_FROM_SAVE=1." >&2
+if [[ "${DISABLE_CHECKPOINT_SAVE}" == "1" && "${RESUME_FROM_SAVE:-0}" == "1" && -z "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
+   echo "DISABLE_CHECKPOINT_SAVE=1 with resume requires an isolated LOAD_DEBUG_ROLLOUT_DATA replay." >&2
    exit 1
 fi
 if [[ -n "${DEBUG_ROLLOUT_NUM_GPUS:-}" ]]; then
@@ -465,7 +488,7 @@ elif [[ "${FULL_LOOP_SMOKE}" == "1" ]]; then
       || "${NUM_ROLLOUT}" != "1" \
       || "${ROLLOUT_BATCH_SIZE}" != "2" \
       || "${N_SAMPLES_PER_PROMPT}" != "16" ]]; then
-      echo "FULL_LOOP_SMOKE requires no-spec/matched/medium/dppo_predictive, num_rollout=1, rollout_batch_size=2, n_samples_per_prompt=16." >&2
+      echo "FULL_LOOP_SMOKE requires matched/medium/dppo_predictive, num_rollout=1, rollout_batch_size=2, n_samples_per_prompt=16." >&2
       exit 1
    fi
 elif [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
@@ -502,7 +525,11 @@ BF16_MODEL_PATH="${BF16_MODEL_PATH:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.
 HF_MODEL_PATH="${HF_MODEL_PATH:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.8-27B-FP8}"
 # Keep the large immutable torch_dist input on /mnt/data (mounted as
 # /nfs/LOCAL) so /mnt/md1 remains available for full-parameter optimizer saves.
-MEGATRON_MODEL_PATH="${MEGATRON_MODEL_PATH:-/nfs/LOCAL/chenshuailin/checkpoints/Qwen/Qwen3.8-27B/torch_dist_tp4_pp2_distributed_gdn_flashqla}"
+MTP_CHECKPOINT_SUFFIX=""
+if [[ "${ENABLE_MTP_TRAINING}" == "1" ]]; then
+   MTP_CHECKPOINT_SUFFIX="_mtp"
+fi
+MEGATRON_MODEL_PATH="${MEGATRON_MODEL_PATH:-/nfs/LOCAL/chenshuailin/checkpoints/Qwen/Qwen3.8-27B/torch_dist_tp4_pp2_distributed_gdn_flashqla${MTP_CHECKPOINT_SUFFIX}}"
 DEFAULT_RL_DATA="${REPO_ROOT}/Data/prompt_tvm_v4/release/train.parquet"
 VERIFIED_CLUSTER_RL_DATA="/nfs/FM/chenshuailin/projects/kernel_agents/slime-dev-csl-2-qwen38-rl-20260819/Data/prompt_tvm_v4/release/train.parquet"
 if [[ ! -f "${DEFAULT_RL_DATA}" && -f "${VERIFIED_CLUSTER_RL_DATA}" ]]; then
@@ -597,6 +624,13 @@ fi
 EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${TOPOLOGY_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${TURN_POLICY_LABEL}.${PROMPT_POLICY_LABEL}.${ROLLOUT_SYNC_LABEL}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
 EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
 CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH:-${EXP_ROOT}/checkpoints}"
+while [[ "${CHECKPOINT_SAVE_PATH}" != "/" && "${CHECKPOINT_SAVE_PATH}" == */ ]]; do
+   CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH%/}"
+done
+CHECKPOINT_LOAD_PATH="${CHECKPOINT_SAVE_PATH}"
+if [[ "${ENABLE_MTP_TRAINING}" == "1" ]]; then
+   CHECKPOINT_LOAD_PATH+=".mtp_resume"
+fi
 ROLLING_CHECKPOINT_STATUS_DIR="${ROLLING_CHECKPOINT_STATUS_DIR:-${EXP_ROOT}/rolling_checkpoint_cleanup}"
 MIN_CHECKPOINT_FREE_GIB="${MIN_CHECKPOINT_FREE_GIB:-180}"
 if ! [[ "${MIN_CHECKPOINT_FREE_GIB}" =~ ^[1-9][0-9]*$ ]]; then
@@ -666,7 +700,7 @@ fi
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8268}"
 RAY_PORT="${RAY_PORT:-6388}"
 RAY_HEAD_ADDR="${MASTER_ADDR}:${RAY_PORT}"
-RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_qwen38_nospec}"
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_qwen38_mtp3}"
 RAY_NODE_MANAGER_PORT="${RAY_NODE_MANAGER_PORT:-23901}"
 RAY_OBJECT_MANAGER_PORT="${RAY_OBJECT_MANAGER_PORT:-23902}"
 RAY_DASHBOARD_AGENT_LISTEN_PORT="${RAY_DASHBOARD_AGENT_LISTEN_PORT:-23903}"
@@ -780,6 +814,11 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from sglang.srt.managers.scheduler import Scheduler
 from scripts.patch_fla_varlen_autotune_nb import patch_files as check_fla_varlen_patch
 from scripts.patch_sglang_retract_flush import patch_file as check_sglang_retract_flush_patch
+from scripts.patch_sglang_qwen_mtp import patch_package
+mtp_runtime_status = "disabled"
+if sys.argv[2] == "1":
+    patch_package(Path(sglang.__file__).parent, check_only=True)
+    mtp_runtime_status = "patched"
 
 label = sys.argv[1]
 try:
@@ -818,7 +857,7 @@ if version != "0.5.16":
 print(
     f"{label}: runtime capability check passed "
     f"(mbridge={mbridge_version}, transformers={transformers_version}, "
-    f"torch={torch.__version__}, sglang={version}, speculative=disabled, "
+    f"torch={torch.__version__}, sglang={version}, native_mtp={mtp_runtime_status}, "
     "fla_varlen_autotune=nb-removed, retract_flush=enabled)"
 )
 PY
@@ -861,8 +900,8 @@ check_all_tilelang_cuda_headers() {
 }
 
 check_local_qwen38_runtime() {
-   PYTHONPATH="${REPO_ROOT}:/root/Megatron-LM:${PYTHONPATH:-}" \
-      "${PYTHON_BIN}" - "head-${MASTER_ADDR}" <<<"${QWEN38_RUNTIME_CHECK_PY}"
+   PYTHONPATH="${QWEN_RUNTIME_PYTHONPATH}:${PYTHONPATH:-}" \
+      "${PYTHON_BIN}" - "head-${MASTER_ADDR}" "${REQUIRE_MTP_RUNTIME_PATCH}" <<<"${QWEN38_RUNTIME_CHECK_PY}"
 }
 
 check_remote_qwen38_runtime() {
@@ -870,7 +909,7 @@ check_remote_qwen38_runtime() {
    local port="$2"
    local label="$3"
    run_ssh "${host}" "${port}" \
-      "PYTHONPATH=$(shell_quote "${REPO_ROOT}:/root/Megatron-LM") ${PYTHON_BIN} - $(shell_quote "${label}")" \
+      "PYTHONPATH=$(shell_quote "${QWEN_RUNTIME_PYTHONPATH}") ${PYTHON_BIN} - $(shell_quote "${label}") ${REQUIRE_MTP_RUNTIME_PATCH}" \
       <<<"${QWEN38_RUNTIME_CHECK_PY}"
 }
 
@@ -887,7 +926,7 @@ check_all_qwen38_runtime() {
 print_runtime_gate_plan() {
    local i
    for i in "${!REMOTE_HOSTS[@]}"; do
-      printf 'RUNTIME_GATE host=%s resource=%s speculative=disabled\n' \
+      printf 'RUNTIME_GATE host=%s resource=%s speculative=native-mtp\n' \
          "${REMOTE_HOSTS[$i]}" \
          "${REMOTE_PLACEMENT_RESOURCES[$i]}"
    done
@@ -1195,23 +1234,18 @@ if [[ "${DISABLE_CHECKPOINT_SAVE}" == "0" ]]; then
       # /nfs/FM is per-node local disk: ranks write shards to their own node;
       # gather with scripts/sync/gather_convert_ckpt.sh afterwards.
       --save ${CHECKPOINT_SAVE_PATH}
-      --save-interval 20
+      --save-interval ${SAVE_INTERVAL:-20}
       # async save overlaps disk writes with the next train step; the worker
       # flag is required or Megatron disables --async-save. Keep the default
       # dp_reshardable optimizer format (do NOT add fully-reshardable).
       --async-save
       --use-persistent-ckpt-worker
    )
-   if [[ "${RESUME_FROM_SAVE:-0}" == "1" ]]; then
-      # Slime derives start_rollout_id from the latest finalized checkpoint.
-      # A resumed formal run normally extends --num-rollout. Keep the current
-      # launcher's constant-LR scheduler bounds instead of requiring its total
-      # iteration count to equal the shorter checkpointed run exactly.
-      CKPT_ARGS+=(
-         --load ${CHECKPOINT_SAVE_PATH}
-         --override-opt-param-scheduler
-      )
-   fi
+fi
+if [[ "${RESUME_FROM_SAVE:-0}" == "1" ]]; then
+   # The view provides the MTP stage's shared embedding on node-local storage.
+   # Saving and archival keep using the canonical checkpoint directory.
+   CKPT_ARGS+=(--load "${CHECKPOINT_LOAD_PATH}" --override-opt-param-scheduler)
 fi
 
 ROLLOUT_ARGS=(
@@ -1383,7 +1417,19 @@ if [[ -n "${SGLANG_MAMBA_SSM_DTYPE}" ]]; then
    SGLANG_ARGS+=(--sglang-mamba-ssm-dtype "${SGLANG_MAMBA_SSM_DTYPE}")
 fi
 
-echo "speculative decoding disabled for FP8 target control"
+if (( MTP_STEPS > 0 )); then
+   SGLANG_ARGS+=(
+      --sglang-speculative-algorithm NEXTN
+      --sglang-speculative-num-steps "${MTP_STEPS}"
+      --sglang-speculative-eagle-topk 1
+      --sglang-speculative-num-draft-tokens "$((MTP_STEPS + 1))"
+   )
+fi
+MTP_ARGS=()
+if [[ "${ENABLE_MTP_TRAINING}" == "1" ]]; then
+   MTP_ARGS=(--enable-mtp-training --mtp-num-layers 1 --mtp-loss-scaling-factor "${MTP_LOSS_SCALING_FACTOR}")
+fi
+echo "Native MTP: rollout depth=${MTP_STEPS}, one-step training=${ENABLE_MTP_TRAINING}"
 
 MISC_ARGS=(
    # slime also defaults to BF16 whenever --fp16 is absent. Keep this explicit
@@ -1589,7 +1635,7 @@ if missing_weight_files:
         f"FP8 rollout checkpoint is missing {len(missing_weight_files)}/{len(weight_files)} indexed weight files; "
         f"first missing: {missing_weight_files[0]}"
     )
-print(f"checkpoint roles verified: train=BF16 rollout={method} speculative=disabled")
+print(f"checkpoint roles verified: train=BF16 rollout={method}")
 PY
 }
 
@@ -1709,9 +1755,33 @@ prepare_node_local_resume_metadata() {
          "compgen -G $(shell_quote "${CHECKPOINT_SAVE_PATH}/${iteration_dir}/*.distcp") >/dev/null"
    done
    echo "resume metadata synchronized for ${iteration_dir} across actor nodes"
+
+   if [[ "${ENABLE_MTP_TRAINING}" != "1" ]]; then
+      return
+   fi
+   local view_args=(
+      --checkpoint-root "${CHECKPOINT_SAVE_PATH}"
+      --output-root "${CHECKPOINT_LOAD_PATH}"
+      --iteration "${best_iteration}"
+      --source "${MASTER_ADDR}" 23538
+   )
+   for i in "${!REMOTE_HOSTS[@]}"; do
+      if [[ "${REMOTE_PLACEMENT_RESOURCES[$i]}" == "${ACTOR_PLACEMENT_RESOURCE}" ]]; then
+         view_args+=(--source "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}")
+      fi
+   done
+   "${PYTHON_BIN}" "${REPO_ROOT}/scripts/prepare_mtp_resume_view.py" "${view_args[@]}"
+   local view_command
+   printf -v view_command '%q ' "${PYTHON_BIN}" "${REPO_ROOT}/scripts/prepare_mtp_resume_view.py" "${view_args[@]}"
+   for i in "${!REMOTE_HOSTS[@]}"; do
+      if [[ "${REMOTE_PLACEMENT_RESOURCES[$i]}" == "${ACTOR_PLACEMENT_RESOURCE}" ]]; then
+         run_ssh "${REMOTE_HOSTS[$i]}" "${REMOTE_PORTS[$i]}" "${view_command}"
+      fi
+   done
 }
 
 if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
+   printf 'ENABLE_MTP_TRAINING=%s\n' "${ENABLE_MTP_TRAINING}"
    printf 'PACK_MULTI_TURN_TRAJECTORIES=%s\nMAX_TURNS=%s\nTURN_MAX_CONTEXT_LENS=%s\n' \
       "${PACK_MULTI_TURN_TRAJECTORIES}" "${MAX_TURNS}" "${TURN_MAX_CONTEXT_LENS}"
    printf 'TRAIN_DTYPE=bf16\nROLLOUT_CHECKPOINT=%s\nTRAIN_CHECKPOINT=%s\n' \
@@ -1740,8 +1810,8 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'DEBUG_ROLLOUT_TWO_NODE=%s\nHEAD_RESOURCE_JSON=%s\nROLLOUT_RESOURCE_JSON=%s\n' \
       "${DEBUG_ROLLOUT_TWO_NODE}" "${HEAD_RESOURCE_JSON}" "${ROLLOUT_RESOURCE_JSON}"
    printf 'USE_NODE64_ROLLOUT=%s\n' "${USE_NODE64_ROLLOUT}"
-   printf 'SGLANG_SPECULATIVE_MODE=none\nSGLANG_SERVING_PROFILE=%s\nSGLANG_MEM_FRACTION_STATIC=%s\nSGLANG_MAX_RUNNING_REQUESTS=%s\nSGLANG_CUDA_GRAPH_MAX_BS=%s\nSGLANG_TARGET_ATTENTION_BACKEND=%s\nSGLANG_MAMBA_RADIX_CACHE_STRATEGY=%s\n' \
-      "${SGLANG_SERVING_PROFILE}" \
+   printf 'SGLANG_SPECULATIVE_MODE=%s\nSGLANG_SERVING_PROFILE=%s\nSGLANG_MEM_FRACTION_STATIC=%s\nSGLANG_MAX_RUNNING_REQUESTS=%s\nSGLANG_CUDA_GRAPH_MAX_BS=%s\nSGLANG_TARGET_ATTENTION_BACKEND=%s\nSGLANG_MAMBA_RADIX_CACHE_STRATEGY=%s\n' \
+      "${SGLANG_SPECULATIVE_LABEL}" "${SGLANG_SERVING_PROFILE}" \
       "${SGLANG_MEM_FRACTION_STATIC}" "${SGLANG_MAX_RUNNING_REQUESTS}" \
       "${SGLANG_CUDA_GRAPH_MAX_BS}" \
       "${SGLANG_TARGET_ATTENTION_BACKEND}" "${SGLANG_MAMBA_RADIX_CACHE_STRATEGY}"
@@ -1759,7 +1829,7 @@ if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
       "${ACTOR_NUM_NODES}" "${ACTOR_GPUS}" "${ROLLOUT_GPUS}" "${ACTOR_PLACEMENT_RESOURCE}" "${ROLLOUT_PLACEMENT_RESOURCE}"
    printf 'KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS=%s\n' "${KERNEL_AGENT_MAX_ACTIVE_PROMPT_GROUPS}"
    print_runtime_gate_plan
-   declare -p MODEL_ARGS CKPT_ARGS ROLLOUT_ARGS PERF_ARGS RL_ARGS OPTIMIZER_ARGS SGLANG_ARGS MISC_ARGS DEBUG_ARGS KERNEL_AGENT_ARGS CUSTOM_ARGS
+   declare -p MODEL_ARGS CKPT_ARGS ROLLOUT_ARGS PERF_ARGS RL_ARGS OPTIMIZER_ARGS SGLANG_ARGS MISC_ARGS MTP_ARGS DEBUG_ARGS KERNEL_AGENT_ARGS CUSTOM_ARGS
    exit 0
 fi
 
@@ -1772,7 +1842,7 @@ check_all_host_resources
 check_all_tilelang_cuda_headers
 
 if [[ "${PREPARE_ONLY}" == "1" ]]; then
-   echo "Qwen3.8 no-spec RL prepare-only sanity PASS (no process cleanup, Ray start, or GPU job submit)."
+   echo "Qwen3.8 native MTP RL prepare-only sanity PASS."
    exit 0
 fi
 
@@ -1903,7 +1973,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_PATH": "${CUDA_PATH}",
     "PATH": "${RUNTIME_PATH}",
     "LD_LIBRARY_PATH": "${RUNTIME_LD_LIBRARY_PATH}",
-    "PYTHONPATH": ".:/root/Megatron-LM/",
+    "PYTHONPATH": "${QWEN_RUNTIME_PYTHONPATH}",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "CUDA_AGENT_LOG_MULTI_TURN_TEXT": "0",
     "CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY": "1",
@@ -1928,7 +1998,7 @@ RAY_JOB_TIMEOUT_PREFIX=()
 RAY_JOB_ID_ARGS=()
 SMOKE_SUBMISSION_ID=""
 if [[ "${FULL_LOOP_SMOKE}" == "1" ]]; then
-   SMOKE_SUBMISSION_ID="qwen38-nospec-full-loop-smoke-${LOG_STAMP}"
+   SMOKE_SUBMISSION_ID="qwen38-mtp${MTP_STEPS}-full-loop-smoke-${LOG_STAMP}"
    RAY_JOB_TIMEOUT_PREFIX=(timeout --signal=TERM --kill-after=30s "${FULL_LOOP_SMOKE_TIMEOUT_SEC}s")
    RAY_JOB_ID_ARGS=(--submission-id="${SMOKE_SUBMISSION_ID}")
    echo "Full-loop smoke hard timeout: ${FULL_LOOP_SMOKE_TIMEOUT_SEC}s; submission_id=${SMOKE_SUBMISSION_ID}"
@@ -1957,6 +2027,7 @@ set +e
    "${PERF_ARGS[@]}" \
    "${SGLANG_ARGS[@]}" \
    "${MISC_ARGS[@]}" \
+   "${MTP_ARGS[@]}" \
    "${DEBUG_ARGS[@]}" \
    "${KERNEL_AGENT_ARGS[@]}" \
    "${CUSTOM_ARGS[@]}"

@@ -796,8 +796,9 @@ def _compute_server_args(
         "ep_size": args.sglang_ep_size,
         # always skip warmup to prevent warmup timeout.
         "skip_server_warmup": True,
-        # always enable draft weights cpu backup so that we run training without mtp weights.
-        "enable_draft_weights_cpu_backup": True,
+        # A trained native head arrives with each actor update. Restoring the
+        # startup backup would silently replace that head with stale weights.
+        "enable_draft_weights_cpu_backup": not getattr(args, "enable_mtp_training", False),
         # Always enable Prometheus metrics so the /engine_metrics endpoint is
         # available for W&B scraping (regardless of --sglang-enable-metrics).
         "enable_metrics": True,

@@ -746,6 +746,31 @@ def test_cuda_agent_sampling_params_reserve_context_for_eagle():
     assert sampling_params["max_new_tokens"] == 16384
 
 
+@pytest.mark.parametrize("draft_tokens", [2, 3, 4])
+def test_mtp_reserve_applies_only_at_serving_context_wall(draft_tokens):
+    args = SimpleNamespace(
+        rollout_max_context_len=40960,
+        sglang_context_length=40960,
+        turn_max_context_lens=[24576, 32768, 40960],
+        sglang_speculative_algorithm="NEXTN",
+        sglang_speculative_num_draft_tokens=draft_tokens,
+    )
+    actual = [
+        generate_with_cuda_agent._sampling_params_for_prompt_context(
+            args, {"max_new_tokens": 40960}, 20000, turn_idx=turn
+        )["max_new_tokens"]
+        for turn in range(3)
+    ]
+    assert actual == [4576, 12768, 20960 - draft_tokens]
+    args.sglang_context_length = 32768
+    assert (
+        generate_with_cuda_agent._sampling_params_for_prompt_context(
+            args, {"max_new_tokens": 40960}, 32767, turn_idx=2
+        )["max_new_tokens"]
+        == 0
+    )
+
+
 @pytest.mark.unit
 def test_cuda_agent_sampling_params_use_first_turn_context_cap_only_for_turn_zero():
     args = SimpleNamespace(

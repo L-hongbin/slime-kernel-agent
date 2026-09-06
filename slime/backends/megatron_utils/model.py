@@ -1006,13 +1006,13 @@ def train(
 
             mtp_loss_scale = 1 / num_microbatches[step_id]
             tracker = MTPLossLoggingHelper.tracker
+            mtp_losses = None
             if "values" in tracker:
                 values = tracker["values"]
                 if tracker.get("reduce_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker.get("reduce_group"))
                 if tracker.get("avg_group") is not None:
                     torch.distributed.all_reduce(values, group=tracker["avg_group"], op=torch.distributed.ReduceOp.AVG)
-                # here we assume only one mtp layer
                 mtp_losses = (tracker["values"] * mtp_loss_scale).item()
                 MTPLossLoggingHelper.clean_loss_in_tracker()
 
@@ -1043,6 +1043,10 @@ def train(
             }
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
+                if mtp_losses is None:
+                    raise RuntimeError(
+                        "MTP training produced no losses on the output stage; check the head and labels"
+                    )
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)

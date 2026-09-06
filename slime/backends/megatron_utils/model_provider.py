@@ -278,7 +278,12 @@ def _get_model_provider_func(
             kwargs["mtp_block_spec"] = mtp_block_spec
 
         with build_model_context(**build_model_context_args):
-            model = GPTModel(**kwargs)
+            if args.enable_mtp_training and args.spec == ["slime_plugins.models.qwen3_5", "get_qwen3_5_spec"]:
+                from slime_plugins.models.qwen3_5_mtp import QwenMTPGPTModel
+
+                model = QwenMTPGPTModel(**kwargs)
+            else:
+                model = GPTModel(**kwargs)
 
         if post_process and role == "critic":
             model.output_layer = LinearForLastLayer(input_size=config.hidden_size, output_size=1, config=config)
