@@ -300,6 +300,59 @@ def test_current_trloo_configuration_is_supported():
     validate_trajectory_packing_args(_args(pack_multi_turn_trajectories=True))
 
 
+def test_native_mtp_packing_requires_token_normalization():
+    args = _args(
+        pack_multi_turn_trajectories=True,
+        enable_mtp_training=True,
+        spec=["slime_plugins.models.qwen3_5", "get_qwen3_5_spec"],
+    )
+    validate_trajectory_packing_args(args)
+    args.calculate_per_token_loss = False
+    with pytest.raises(ValueError, match="calculate-per-token-loss"):
+        validate_trajectory_packing_args(args)
+    args.calculate_per_token_loss = True
+    args.spec = None
+    with pytest.raises(ValueError, match="native Qwen"):
+        validate_trajectory_packing_args(args)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("qkv_format", ["thd", "bshd"])
+def test_mtp_targets_preserve_history_and_cp_padding(cpu_mpu, cp_size, qkv_format):
+    cpu_mpu.setattr(torch.Tensor, "cuda", lambda self, *a, **kw: self)
+    cpu_mpu.setattr(cp_utils.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    data = _manager(_args(pack_multi_turn_trajectories=True))._convert_samples_to_train_data(
+        _samples(TinyCausalModel(), repair=True, filtered=True)
+    )
+    for key in ("tokens", "target_tokens", "loss_masks"):
+        data[key] = [torch.tensor(value) for value in data[key]]
+    data["total_lengths"] = [len(value) for value in data["tokens"]]
+    width = (max(data["total_lengths"]) + 15) // 16 * 16
+    data["max_seq_lens"] = [width] * len(data["tokens"])
+    for rank in range(cp_size):
+        cpu_mpu.setattr(cp_utils.mpu, "get_context_parallel_rank", lambda rank=rank: rank)
+        batch = get_batch(DataIterator(data, [[0, 1]]), list(data), pad_multiplier=16, qkv_format=qkv_format)
+        # Independent layout oracle: each rank owns the first/mirrored chunk.
+        expected_inputs, expected_targets = [], []
+        for inputs, targets in zip(data["tokens"], data["target_tokens"], strict=True):
+            padded_width = (
+                width if qkv_format == "bshd" else (len(inputs) + 2 * cp_size - 1) // (2 * cp_size) * (2 * cp_size)
+            )
+            for values, output in ((inputs, expected_inputs), (targets, expected_targets)):
+                padded = torch.nn.functional.pad(values, (0, padded_width - len(values)))
+                chunks = padded.chunk(2 * cp_size)
+                output.append(torch.cat([chunks[rank], chunks[2 * cp_size - 1 - rank]]))
+        for actual, parts in ((batch["tokens"], expected_inputs), (batch["mtp_labels"], expected_targets)):
+            if qkv_format == "bshd":
+                expected = torch.stack(parts)
+            else:
+                expected = torch.cat(parts)
+                expected = torch.nn.functional.pad(expected, (0, (-len(expected)) % 16)).unsqueeze(0)
+            torch.testing.assert_close(actual, expected)
+        assert batch["target_tokens"][0][4] == 9
+        assert batch["unconcat_tokens"][0][4] == 10
+
+
 def test_advantage_whitening_keeps_the_original_scored_token_population(cpu_mpu):
     cpu_mpu.setattr(cp_utils.mpu, "get_data_parallel_group", lambda **kw: None)
     # A one-rank collective is the identity; use the production whitening math.
@@ -367,6 +420,7 @@ def test_uneven_and_fully_masked_trajectories_keep_denominators_and_end_targets(
 
 def test_dp_partition_and_actor_transfer_preserve_packed_fields(cpu_mpu):
     from slime.backends.megatron_utils import actor as actor_module
+    from slime.backends.megatron_utils import model as model_module
     from slime.ray import rollout as rollout_module
     from slime.utils import data as data_module
 
@@ -404,6 +458,48 @@ def test_dp_partition_and_actor_transfer_preserve_packed_fields(cpu_mpu):
     assert shard["global_batch_sizes"] == [2]
     assert shard["target_tokens"][0][4] == 9
     assert shard["tokens"][0][4] == 10
+
+    # Continue through the actual trainer's forward_step. Checking only the
+    # converter or duplicating mtp_kwargs in a model test misses a handoff
+    # regression that silently falls back to the causal input history.
+    args.enable_mtp_training = True
+    args.custom_megatron_before_train_step_hook_path = None
+    args.data_pad_size_multiplier = 1
+    args.seq_length = 32
+    args.decoder_seq_length = None
+    cpu_mpu.setattr(torch.Tensor, "cuda", lambda self, *a, **kw: self)
+    cpu_mpu.setattr(model_module, "get_args", lambda: args)
+    cpu_mpu.setattr(model_module, "_v4_pp_adjust_tensor_shapes_fn", lambda *a: None)
+
+    class ForwardCaptured(Exception):
+        pass
+
+    class CaptureModel:
+        def zero_grad_buffer(self):
+            pass
+
+        def __call__(self, **kwargs):
+            assert kwargs["input_ids"][0, 4] == 10
+            assert kwargs["mtp_kwargs"]["mtp_labels"][0, 4] == 9
+            assert kwargs["loss_mask"].shape == kwargs["input_ids"].shape
+            raise ForwardCaptured
+
+    def run_forward(**kwargs):
+        kwargs["forward_step_func"](kwargs["data_iterator"][0], kwargs["model"][0])
+
+    cpu_mpu.setattr(model_module, "get_forward_backward_func", lambda: run_forward)
+    with pytest.raises(ForwardCaptured):
+        model_module.train_one_step(
+            args,
+            0,
+            0,
+            [DataIterator(shard, [[0]])],
+            [CaptureModel()],
+            SimpleNamespace(zero_grad=lambda: None),
+            None,
+            1,
+            2,
+        )
 
 
 if __name__ == "__main__":

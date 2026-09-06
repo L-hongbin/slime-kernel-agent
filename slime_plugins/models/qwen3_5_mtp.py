@@ -54,7 +54,9 @@ class QwenMTPGPTModel(GPTModel):
         def shift(tensor):
             return roll_tensor(tensor, shifts=-1, dims=-1, cp_group=self.cp_group, packed_seq_params=packed)[0]
 
-        # Labels are unshifted input tokens, as in slime's native MTP path.
+        # Labels are unshifted supervision tokens. Trajectory packing may
+        # restore a turn's terminal target without changing input_ids: later
+        # turns must retain their actual (possibly template-repaired) history.
         # Depth 1 predicts x[t+2] from target h[t] and embedding x[t+1].
         labels = shift(labels.clone())
         mask = kwargs.get("loss_mask")

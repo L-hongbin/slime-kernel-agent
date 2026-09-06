@@ -17,6 +17,11 @@ def validate_trajectory_packing_args(args) -> None:
         raise ValueError("--pack-multi-turn-trajectories requires --use-multi-turn and --advantage-estimator trloo")
     if not args.custom_reward_post_process_path:
         raise ValueError("--pack-multi-turn-trajectories requires turn-aware --custom-reward-post-process-path")
+    if getattr(args, "enable_mtp_training", False):
+        if getattr(args, "spec", None) != ["slime_plugins.models.qwen3_5", "get_qwen3_5_spec"]:
+            raise ValueError("Trajectory packing with MTP training requires the native Qwen3.5/Qwen3.8 spec")
+        if not getattr(args, "calculate_per_token_loss", False):
+            raise ValueError("Trajectory packing with MTP training requires --calculate-per-token-loss")
     if getattr(args, "loss_type", "policy_loss") != "policy_loss" or getattr(args, "policy_loss_mode", "ppo") not in {
         "ppo",
         "dppo_topk_kl_predictive",
@@ -34,7 +39,6 @@ def validate_trajectory_packing_args(args) -> None:
         "use_rollout_routing_replay",
         "allgather_cp",
         "lora_dim",
-        "enable_mtp_training",
         "log_correct_samples",
         "log_passrate",
         "custom_convert_samples_to_train_data_path",

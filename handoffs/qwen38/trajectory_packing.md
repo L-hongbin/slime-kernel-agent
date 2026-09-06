@@ -8,11 +8,11 @@
 
 ## 配置
 
-维护入口支持 `PACK_MULTI_TURN_TRAJECTORIES=1`。以下命令只打印三轮配置，使用与原三轮部署相同的 context cap 和 R31；实际执行前仍需同步节点代码、数据及运行环境，按[训练验证](training_validation.md)完成 rollout-only 和 train-only 检查
+维护入口支持 `PACK_MULTI_TURN_TRAJECTORIES=1`。以下命令只打印不含 MTP 辅助训练的三轮配置，使用与原三轮部署相同的 context cap 和 R31；实际执行前仍需同步节点代码、数据及运行环境，按[训练验证](training_validation.md)完成 rollout-only 和 train-only 检查
 
 ```bash
 CONFIG_DRY_RUN=1 \
-PACK_MULTI_TURN_TRAJECTORIES=1 \
+PACK_MULTI_TURN_TRAJECTORIES=1 ENABLE_MTP_TRAINING=0 \
 MAX_TURNS=3 TURN_MAX_CONTEXT_LENS="24576 32768 40960" \
 MAX_CONTEXT_LEN=40960 RECOMPUTE_NUM_LAYERS=31 USE_NODE64_ROLLOUT=0 \
 bash examples/kernel_agent/run.t1.qwen3.8.27B.fasync.sh
@@ -29,7 +29,7 @@ bash examples/kernel_agent/run.t1.qwen3.8.27B.fasync.sh
 - `loss_normalization_counts` 保留原来的 `sum_turn max(loss_mask.sum(), 1)`，包括被过滤或补齐轮次。按 trajectory 归一化时保留原 `group_mask_sums`；训练步仍按原 group 数切分
 - 逐轮 reward/truncation 指标通过 `packed_turn_metrics` 保留原分母。训练侧序列长度描述合并后的物理序列；rollout 侧逐轮长度指标仍在合并前记录
 
-当前支持 TRLOO 的 PPO 和 predictive Top-K DPPO policy loss。Sequence MIS、TIS、OPSM、routing replay、LoRA、critic/OPD、自定义 advantage/converter/reducer/postprocessor、MTP 和 allgather-CP 不在本次支持范围，参数检查会拒绝这些组合。要求 attention/hidden dropout 为零
+当前支持 TRLOO 的 PPO 和 predictive Top-K DPPO policy loss。Sequence MIS、TIS、OPSM、routing replay、LoRA、critic/OPD、自定义 advantage/converter/reducer/postprocessor 和 allgather-CP 不在本次支持范围，参数检查会拒绝这些组合。要求 attention/hidden dropout 为零。Qwen 原生 MTP 辅助训练可在 per-token 模式同时开启，标签接入、归一化约束和验收见 [MTP packing](mtp_training.md#多轮-packing-与-mtp)
 
 ## 验证与边界
 

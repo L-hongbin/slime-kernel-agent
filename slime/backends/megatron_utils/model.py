@@ -776,7 +776,7 @@ def train_one_step(
                 forward_kwargs.update(batch["multimodal_train_inputs"])
 
             if args.enable_mtp_training:
-                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
+                forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch.get("mtp_labels", batch["tokens"])}
 
             output_tensor = model(**forward_kwargs)
 

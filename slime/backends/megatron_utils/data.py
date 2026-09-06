@@ -269,6 +269,23 @@ def get_batch(
     batch["tokens"] = tokens
     batch["packed_seq_params"] = packed_seq_params
 
+    # Keep the causal input history separate from repaired turn-end targets.
+    # MTP needs unshifted labels in exactly the same padded CP layout as input_ids;
+    # policy loss still consumes the original, unpartitioned target_tokens lists.
+    if batch.get("target_tokens") is not None:
+        targets = batch["target_tokens"]
+        if allgather_cp and qkv_format == "thd":
+            targets = F.pad(torch.cat(targets), (0, pad), value=pad_token_id)
+            targets = targets.chunk(cp_size, dim=0)[cp_rank].unsqueeze(0)
+        else:
+            targets = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in targets]
+            if qkv_format == "bshd":
+                targets = torch.stack(targets)
+            else:
+                targets = F.pad(torch.cat(targets), (0, pad), value=pad_token_id).unsqueeze(0)
+        assert targets.shape == tokens.shape
+        batch["mtp_labels"] = targets
+
     # loss masks
     loss_masks = []
     for loss_mask, total_length, response_length in zip(

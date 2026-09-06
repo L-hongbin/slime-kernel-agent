@@ -241,10 +241,6 @@ if ! [[ "${ENABLE_MTP_TRAINING}" =~ ^[01]$ ]]; then
    echo "ENABLE_MTP_TRAINING must be 0 or 1." >&2
    exit 1
 fi
-if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" && "${ENABLE_MTP_TRAINING}" == "1" ]]; then
-   echo "Trajectory packing does not support MTP training; set ENABLE_MTP_TRAINING=0 for packing." >&2
-   exit 1
-fi
 # MTP adds a head and embedding replica to the last stage.
 DEFAULT_DECODER_LAST_PIPELINE_NUM_LAYERS=31
 if [[ "${ENABLE_MTP_TRAINING}" == "1" ]]; then
