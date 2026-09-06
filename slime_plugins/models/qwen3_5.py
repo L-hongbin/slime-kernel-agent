@@ -264,19 +264,25 @@ def get_qwen3_5_spec(args, config, vp_stage):
         ):
             setattr(config, name, getattr(text_config, name))
 
-        tp_cp_size = config.tensor_model_parallel_size * config.context_parallel_size
-        if config.linear_num_key_heads % tp_cp_size != 0:
+        tp_size = config.tensor_model_parallel_size
+        cp_size = config.context_parallel_size
+        if config.linear_num_key_heads % tp_size != 0:
             raise ValueError(
                 f"linear_num_key_heads={config.linear_num_key_heads} must be divisible by "
-                f"TP*CP={tp_cp_size} for distributed GDN."
+                f"TP={tp_size} for distributed GDN."
             )
-        if config.linear_num_value_heads % tp_cp_size != 0:
+        if config.linear_num_value_heads % tp_size != 0:
             raise ValueError(
                 f"linear_num_value_heads={config.linear_num_value_heads} must be divisible by "
-                f"TP*CP={tp_cp_size} for distributed GDN."
+                f"TP={tp_size} for distributed GDN."
             )
+        from .distributed_gdn import DistributedQwenGatedDeltaNet, _build_gdn_head_shards
 
-        from .distributed_gdn import DistributedQwenGatedDeltaNet
+        _build_gdn_head_shards(
+            config.linear_num_key_heads // tp_size,
+            config.linear_num_value_heads // tp_size,
+            cp_size,
+        )
 
         distributed_gdn_spec = get_gated_delta_net_module_spec(config=config)
         distributed_gdn_spec.module = DistributedQwenGatedDeltaNet

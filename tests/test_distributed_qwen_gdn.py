@@ -9,12 +9,18 @@ from slime.backends.megatron_utils.hf_to_megatron.qwen3_5 import qwen3_5_hf_tens
 from slime.backends.megatron_utils.megatron_to_hf import qwen3_5 as qwen3_5_converter
 from slime.backends.megatron_utils.megatron_to_hf.processors import quantizer_fp8
 from slime.backends.megatron_utils.model_provider import _apply_qwen_gdn_pipeline_overrides
+from slime.backends.megatron_utils.qwen_gdn_layout import interleave_gdn_tp_sections
 from slime.utils.arguments import add_qwen_gdn_arguments
+from slime_plugins.models import distributed_gdn as distributed_gdn_module
 from slime_plugins.models import qwen3_5 as qwen3_5_model
 from slime_plugins.models.distributed_gdn import (
+    _a2a_cp2hp_ragged,
+    _a2a_hp2cp_ragged,
+    _build_gdn_head_shards,
     _build_head_perm_for_split_sections,
     _build_thd_cp_a2a_perm,
     _get_parameter_local_cp,
+    _reorder_nonpacked_zigzag,
     _resolve_cu_seqlens,
 )
 from slime_plugins.models.qwen3_5 import _validate_qwen_gdn_recompute_norm_out
@@ -152,7 +158,7 @@ def test_gdn_tp_section_layout_round_trip():
         torch.arange(200, 204).reshape(2, 2),
     ]
 
-    interleaved = qwen3_5_converter.interleave_gdn_tp_sections(sections, tp_size=2)
+    interleaved = interleave_gdn_tp_sections(sections, tp_size=2)
     restored = qwen3_5_converter.deinterleave_gdn_tp_sections(
         interleaved,
         tuple(section.shape[0] for section in sections),
@@ -173,7 +179,7 @@ def test_native_gdn_converter_restores_hf_projection_order(monkeypatch):
         torch.full((2, 3), 5.0),
         torch.full((2, 3), 6.0),
     ]
-    gathered_native = qwen3_5_converter.interleave_gdn_tp_sections(logical_sections, tp_size=2)
+    gathered_native = interleave_gdn_tp_sections(logical_sections, tp_size=2)
     args = Namespace(hf_checkpoint="unused", tensor_model_parallel_size=2, kv_channels=1)
 
     converted = qwen3_5_converter.convert_qwen3_5_to_hf(
@@ -229,7 +235,7 @@ def test_native_gdn_hf_loader_builds_tp_rank_major_projection_and_round_trips(mo
         SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
     )
 
-    expected = qwen3_5_converter.interleave_gdn_tp_sections(logical_sections, tp_size=2)
+    expected = interleave_gdn_tp_sections(logical_sections, tp_size=2)
     assert torch.equal(loaded, expected)
     rank_size = sum(section.shape[0] // 2 for section in logical_sections)
     assert loaded[:rank_size, 0].tolist() == [1.0] * 2 + [2.0] * 2 + [3.0] * 3 + [4.0] * 3 + [5.0, 6.0]
@@ -273,7 +279,7 @@ def test_native_gdn_hf_loader_builds_tp_rank_major_convolution_and_round_trips(m
         SimpleNamespace(text_config=text_config, tie_word_embeddings=False),
     )
 
-    expected = qwen3_5_converter.interleave_gdn_tp_sections(sections, tp_size=2)
+    expected = interleave_gdn_tp_sections(sections, tp_size=2)
     assert torch.equal(loaded, expected)
     converted = dict(
         qwen3_5_converter.convert_qwen3_5_to_hf(
@@ -399,7 +405,8 @@ def test_native_gdn_out_norm_converts_between_one_and_zero_centered_gamma():
     assert torch.equal(converted[0][1], mcore_zero_centered_gamma + 1)
 
 
-def test_distributed_gdn_python_spec_supports_sequence_parallel(monkeypatch):
+@pytest.mark.parametrize("cp_size", [2, 3])
+def test_distributed_gdn_python_spec_supports_sequence_parallel(monkeypatch, cp_size):
     block_spec = SimpleNamespace(layer_specs=[SimpleNamespace(submodules=SimpleNamespace(self_attention=None))])
     monkeypatch.setattr(qwen3_5_model, "get_gpt_decoder_block_spec", lambda *args, **kwargs: block_spec)
     monkeypatch.setattr(qwen3_5_model, "get_num_layers_to_build", lambda *args, **kwargs: 1)
@@ -435,7 +442,7 @@ def test_distributed_gdn_python_spec_supports_sequence_parallel(monkeypatch):
         num_layers=1,
         pipeline_model_parallel_layout=None,
         tensor_model_parallel_size=4,
-        context_parallel_size=2,
+        context_parallel_size=cp_size,
         pipeline_model_parallel_size=2,
         overlap_p2p_comm=False,
         batch_p2p_comm=True,
@@ -504,6 +511,73 @@ def test_head_permutation_shards_each_fused_section():
     assert permutation.tolist() == [0, 1, 2, 3, 8, 9, 4, 5, 6, 7, 10, 11]
 
 
+def test_gdn_head_shards_balance_whole_gqa_groups_for_ragged_cp():
+    key_head_counts, value_head_counts = _build_gdn_head_shards(4, 8, cp_size=3)
+
+    assert key_head_counts == (2, 1, 1)
+    assert value_head_counts == (4, 2, 2)
+
+    with pytest.raises(ValueError, match="at least one TP-local key head"):
+        _build_gdn_head_shards(4, 8, cp_size=5)
+
+
+def test_distributed_gdn_builds_rank_local_shapes_for_ragged_cp(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 3
+
+        def rank(self):
+            return 1
+
+    def fake_gdn_init(module, *args, **kwargs):
+        del args, kwargs
+        torch.nn.Module.__init__(module)
+        module.config = SimpleNamespace(deterministic_mode=True)
+        module.pg_collection = SimpleNamespace(cp=FakeGroup())
+        module.cp_size = 3
+        module.tp_size = 1
+        module.num_key_heads = 4
+        module.num_value_heads = 8
+        module.key_head_dim = 2
+        module.value_head_dim = 3
+        module.qk_dim_local_tp = 8
+        module.v_dim_local_tp = 24
+        module.conv1d = SimpleNamespace(
+            weight=torch.nn.Parameter(torch.zeros(40, 1, 2)),
+            bias=None,
+        )
+        module.dt_bias = torch.nn.Parameter(torch.zeros(8))
+        module.A_log = torch.nn.Parameter(torch.zeros(8))
+
+    monkeypatch.setattr(distributed_gdn_module.GatedDeltaNet, "__init__", fake_gdn_init)
+
+    module = distributed_gdn_module.DistributedQwenGatedDeltaNet(args=SimpleNamespace(qwen_gdn_backend="fla"))
+
+    assert module.ragged_cp is True
+    assert module.num_key_heads_local_cp == 1
+    assert module.num_value_heads_local_cp == 2
+    assert module.in_proj_rank_split_sections == (
+        (4, 4, 12, 12, 4, 4),
+        (2, 2, 6, 6, 2, 2),
+        (2, 2, 6, 6, 2, 2),
+    )
+    assert module.feat_dim_split == (10, 6, 2, 2)
+    assert module.output_rank_widths == (12, 6, 6)
+
+
+def test_head_permutation_supports_ragged_cp_sections():
+    rank_split_sections = ((2, 4), (1, 2), (1, 2))
+
+    permutation = _build_head_perm_for_split_sections(
+        (4, 8),
+        cp_size=3,
+        device=torch.device("cpu"),
+        rank_split_sections=rank_split_sections,
+    )
+
+    assert permutation.tolist() == [0, 1, 4, 5, 6, 7, 2, 8, 9, 3, 10, 11]
+
+
 def test_thd_cp_permutation_restores_natural_multi_sequence_order():
     cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32)
     rank_major_zigzag = torch.tensor([0, 1, 6, 7, 8, 9, 10, 17, 18, 19, 2, 3, 4, 5, 11, 12, 13, 14, 15, 16])
@@ -512,6 +586,16 @@ def test_thd_cp_permutation_restores_natural_multi_sequence_order():
 
     assert rank_major_zigzag.index_select(0, permutation).tolist() == list(range(20))
     assert torch.equal(permutation.index_select(0, inverse), torch.arange(20))
+
+
+def test_thd_cp_permutation_restores_natural_order_with_odd_cp():
+    cu_seqlens = torch.tensor([0, 12], dtype=torch.int32)
+    rank_major_zigzag = torch.tensor([0, 1, 10, 11, 2, 3, 8, 9, 4, 5, 6, 7])
+
+    permutation, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size=3, total_seq_len=12)
+
+    assert rank_major_zigzag.index_select(0, permutation).tolist() == list(range(12))
+    assert torch.equal(permutation.index_select(0, inverse), torch.arange(12))
 
 
 def test_packed_boundaries_must_match_total_and_cp():
@@ -543,6 +627,111 @@ def test_parameter_cp_slice_preserves_fused_sections():
     actual = _get_parameter_local_cp(parameter, dim=0, cp_group=FakeGroup(), split_sections=(8, 4))
 
     assert actual[:, 0].tolist() == [4, 5, 6, 7, 10, 11]
+
+
+def test_parameter_cp_slice_supports_ragged_sections():
+    class FakeGroup:
+        def size(self):
+            return 3
+
+        def rank(self):
+            return 1
+
+    parameter = torch.arange(12).reshape(12, 1)
+    actual = _get_parameter_local_cp(
+        parameter,
+        dim=0,
+        cp_group=FakeGroup(),
+        split_sections=(4, 8),
+        rank_split_sections=((2, 4), (1, 2), (1, 2)),
+    )
+
+    assert actual[:, 0].tolist() == [2, 8, 9]
+
+
+def test_ragged_a2a_round_trip_layout(monkeypatch):
+    class FakeGroup:
+        def __init__(self, rank):
+            self._rank = rank
+
+        def size(self):
+            return 3
+
+        def rank(self):
+            return self._rank
+
+    rank_widths = (4, 2, 2)
+    local_inputs = [torch.arange(16).reshape(2, 1, 8) + source_rank * 100 for source_rank in range(3)]
+    head_shards = [
+        torch.cat(
+            [torch.split(source, rank_widths, dim=-1)[head_rank] for source in local_inputs],
+            dim=0,
+        )
+        for head_rank in range(3)
+    ]
+
+    for rank in range(3):
+        local_input = local_inputs[rank]
+        expected_packed = torch.cat(
+            [chunk.contiguous().view(-1) for chunk in torch.split(local_input, rank_widths, dim=-1)]
+        )
+        expected_exchanged = torch.cat(
+            [torch.split(source, rank_widths, dim=-1)[rank].contiguous().view(-1) for source in local_inputs]
+        )
+
+        def fake_cp2hp(
+            group,
+            tensor,
+            output_split_sizes,
+            input_split_sizes,
+            expected_rank=rank,
+            expected_input=expected_packed,
+            expected_output=expected_exchanged,
+        ):
+            assert group.rank() == expected_rank
+            assert torch.equal(tensor, expected_input)
+            assert input_split_sizes == [8, 4, 4]
+            assert output_split_sizes == [2 * rank_widths[expected_rank]] * 3
+            return expected_output
+
+        monkeypatch.setattr(distributed_gdn_module, "all_to_all", fake_cp2hp)
+        actual_head_shard = _a2a_cp2hp_ragged(local_input, rank_widths, FakeGroup(rank))
+        assert torch.equal(actual_head_shard, head_shards[rank])
+
+        expected_reverse_packed = torch.cat(
+            [chunk.contiguous().view(-1) for chunk in torch.chunk(head_shards[rank], 3, dim=0)]
+        )
+        expected_reverse_exchanged = torch.cat(
+            [torch.chunk(head_shard, 3, dim=0)[rank].contiguous().view(-1) for head_shard in head_shards]
+        )
+
+        def fake_hp2cp(
+            group,
+            tensor,
+            output_split_sizes,
+            input_split_sizes,
+            expected_rank=rank,
+            expected_input=expected_reverse_packed,
+            expected_output=expected_reverse_exchanged,
+        ):
+            assert group.rank() == expected_rank
+            assert torch.equal(tensor, expected_input)
+            assert input_split_sizes == [2 * rank_widths[expected_rank]] * 3
+            assert output_split_sizes == [8, 4, 4]
+            return expected_output
+
+        monkeypatch.setattr(distributed_gdn_module, "all_to_all", fake_hp2cp)
+        restored = _a2a_hp2cp_ragged(head_shards[rank], rank_widths, FakeGroup(rank))
+        assert torch.equal(restored, local_input)
+
+
+def test_nonpacked_zigzag_reorder_round_trip_with_odd_cp():
+    rank_major = torch.tensor([1, 6, 2, 5, 3, 4]).reshape(6, 1, 1)
+
+    natural = _reorder_nonpacked_zigzag(rank_major, cp_size=3, undo=True)
+
+    assert natural.flatten().tolist() == [1, 2, 3, 4, 5, 6]
+    assert torch.equal(_reorder_nonpacked_zigzag(natural, cp_size=3, undo=False), rank_major)
 
 
 if __name__ == "__main__":
