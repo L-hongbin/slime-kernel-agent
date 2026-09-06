@@ -4,9 +4,29 @@ from typing import Any
 import torch
 
 try:
-    from .utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
+    from .config import CUDA_AGENT_CONFIGS
+    from .utils import (
+        COMPILATION_ERROR,
+        CORRECTNESS_ERROR,
+        IMPORT_ERROR,
+        KERNEL_EVAL_TIMEOUT,
+        PRECHECK_ERROR,
+        RUNTIME_ERROR,
+        SYNTAX_ERROR,
+        VALIDATION_ERROR,
+    )
 except ImportError:
-    from utils import COMPILATION_ERROR, IMPORT_ERROR, PRECHECK_ERROR, RUNTIME_ERROR, SYNTAX_ERROR, VALIDATION_ERROR
+    from config import CUDA_AGENT_CONFIGS
+    from utils import (
+        COMPILATION_ERROR,
+        CORRECTNESS_ERROR,
+        IMPORT_ERROR,
+        KERNEL_EVAL_TIMEOUT,
+        PRECHECK_ERROR,
+        RUNTIME_ERROR,
+        SYNTAX_ERROR,
+        VALIDATION_ERROR,
+    )
 
 
 def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
@@ -80,7 +100,7 @@ def reward_post_process_by_group(args, samples):
     use_conditional_truncation_mask = getattr(args, "use_conditional_truncation_mask", False)
 
     idx_to_group_index: dict[int, object] = {}
-    reward_groups: dict[object, list[float]] = {}
+    reward_groups: dict[object, list[int]] = {}
     for idx, sample in enumerate(samples):
         if sample.remove_sample:
             rewards[idx] = raw_rewards[idx]
@@ -92,10 +112,19 @@ def reward_post_process_by_group(args, samples):
             assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
             group_index = group_index, int(turn_idx)
         idx_to_group_index[idx] = group_index
-        reward_groups.setdefault(group_index, []).append(raw_rewards[idx])
+        reward_groups.setdefault(group_index, []).append(idx)
 
     group_stats: dict[object, dict[str, float]] = {}
-    for group_index, group_reward_values in reward_groups.items():
+    reward_config = CUDA_AGENT_CONFIGS["reward"]
+    apply_failed_group_reward = bool(reward_config["apply_failed_group_reward"])
+    failed_score = float(reward_config["failed_score"])
+    for group_index, group_indices in reward_groups.items():
+        group_samples = [samples[idx] for idx in group_indices]
+        group_reward_values = [raw_rewards[idx] for idx in group_indices]
+        if apply_failed_group_reward:
+            group_reward_values = _apply_failed_group_reward(group_samples, group_reward_values, failed_score)
+        for idx, reward in zip(group_indices, group_reward_values, strict=True):
+            raw_rewards[idx] = reward
         group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
         group_stats[group_index] = {
             "mean": group_rewards.mean().item(),
@@ -132,21 +161,55 @@ def reward_post_process_by_group(args, samples):
     return raw_rewards, rewards
 
 
-def _resolve_failure_reward(env_state: dict[str, Any], config: dict[str, Any]) -> float:
+def _apply_failed_group_reward(samples, rewards, failed_score: float) -> list[float]:
+    """Use saved penalty scores when every group reward equals the failure score."""
+    rewards = [float(reward) for reward in rewards]
+    if not rewards or any(reward != failed_score for reward in rewards):
+        return rewards
+
+    metadata = [sample.metadata if isinstance(sample.metadata, dict) else {} for sample in samples]
+    if any("penalty_score" not in item for item in metadata):
+        return rewards
+
+    return [float(item["penalty_score"]) for item in metadata]
+
+
+def _resolve_penalty_score(env_state: dict[str, Any], config: dict[str, Any]) -> float:
+    """Classify evaluation progress and return its failed-group penalty."""
+    correctness = bool(env_state.get("correctness", False))
+    compiled = env_state.get("compiled")
+    if compiled is True and correctness and not bool(env_state.get("decoy_kernel", False)):
+        return 0.0
+
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     error = env_state.get("error")
     error_message = str(env_state.get("error_message") or "")
     lower_error_message = error_message.lower()
     precheck_error_codes = {PRECHECK_ERROR, VALIDATION_ERROR, SYNTAX_ERROR, IMPORT_ERROR}
-    if config["apply_precheck_fail_penalty"] and (
-        metadata.get("client_precheck") or error in precheck_error_codes or "pre-check error" in lower_error_message
+
+    if bool(env_state.get("decoy_kernel", False)):
+        stage = "decoy"
+    elif metadata.get("client_precheck") or error in precheck_error_codes or "pre-check error" in lower_error_message:
+        stage = "precheck"
+    elif error == RUNTIME_ERROR or metadata.get("runtime_error") or metadata.get("correctness_runtime_error"):
+        stage = "runtime"
+    elif error == KERNEL_EVAL_TIMEOUT and compiled is True:
+        stage = "runtime"
+    elif (
+        error == CORRECTNESS_ERROR
+        or metadata.get("correctness_output_mismatch")
+        or metadata.get("correctness_candidate_forward_completed")
+        or (env_state.get("status") == "completed" and compiled is True)
     ):
-        return float(config["precheck_fail_penalty"])
-    if config["apply_compilation_fail_penalty"] and (
-        error == COMPILATION_ERROR or "kernel compilation error" in lower_error_message
-    ):
-        return float(config["compilation_fail_penalty"])
-    return float(config["penalty_score"])
+        stage = "correctness"
+    elif compiled is True:
+        stage = "runtime"
+    elif error == COMPILATION_ERROR or compiled is False or "kernel compilation error" in lower_error_message:
+        stage = "compilation"
+    else:
+        stage = "other"
+
+    return float(config["penalty_score"].get(stage, config["failed_score"]))
 
 
 def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
@@ -231,9 +294,11 @@ def _resolve_output_mismatch_partial_credit(
 
 def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     partial_reward, partial_applied, partial_reason = _resolve_output_mismatch_partial_credit(env_state, config)
+    penalty_score = _resolve_penalty_score(env_state, config)
+    failed_score = float(config["failed_score"])
 
     if env_state.get("status") != "completed":
-        reward = _resolve_failure_reward(env_state, config)
+        reward = failed_score
         return {
             **env_state,
             "reward": reward,
@@ -244,10 +309,11 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "compiled": False,
             "partial_credit_output_mismatch": partial_applied,
             "partial_credit_output_mismatch_reason": partial_reason,
+            "penalty_score": penalty_score,
         }
 
     if env_state.get("decoy_kernel", False):
-        reward = float(config["penalty_score"])
+        reward = failed_score
         return {
             **env_state,
             "reward": reward,
@@ -256,6 +322,7 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "success": False,
             "partial_credit_output_mismatch": partial_applied,
             "partial_credit_output_mismatch_reason": partial_reason,
+            "penalty_score": penalty_score,
         }
 
     correctness = bool(env_state.get("correctness", False))
@@ -267,12 +334,12 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
     if reward_speedup < float(config["speedup_reward_lower_bound"]):
         reward_speedup = 0.0
 
-    if not compiled and config["apply_compilation_fail_penalty"]:
-        reward = float(config["compilation_fail_penalty"])
+    if not compiled:
+        reward = failed_score
     elif partial_applied:
         reward = partial_reward
     else:
-        correctness_reward = float(config["init_correct_weight"]) * float(correctness)
+        correctness_reward = float(config["init_correct_weight"]) if correctness else failed_score
         performance_reward = float(config["init_performance_weight"]) * reward_speedup
         if config.get("performance_reward_requires_correctness", False):
             performance_reward *= float(correctness)
@@ -302,5 +369,6 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
         "profiling": env_state.get("profiling"),
         "partial_credit_output_mismatch": partial_applied,
         "partial_credit_output_mismatch_reason": partial_reason,
+        "penalty_score": penalty_score,
         **coverage_info,
     }

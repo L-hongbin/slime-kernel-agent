@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_reward import reward_post_process_by_group
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
@@ -117,6 +118,77 @@ def test_reward_post_process_by_group_handles_single_valid_sample_after_pad_mask
 
     assert raw_rewards == [3.0, 0.0]
     assert rewards == pytest.approx([0.0, 0.0])
+
+
+def test_trloo_uses_penalty_scores_only_for_all_failed_group():
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
+    samples = [
+        _make_sample(0, 0, 0.0),
+        _make_sample(1, 0, 0.0),
+        _make_sample(2, 0, 0.0),
+    ]
+    penalty_scores = [-1.0, -0.75, -0.25]
+    for sample, penalty_score in zip(samples, penalty_scores, strict=True):
+        sample.metadata.update({"multi_turn_reward": 0.0, "penalty_score": penalty_score})
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == penalty_scores
+    assert rewards == pytest.approx([-0.5, -0.125, 0.625])
+
+
+def test_failed_group_reward_uses_configured_nonzero_failed_score(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", -2.0)
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
+    samples = [_make_sample(index, 0, -2.0) for index in range(3)]
+    penalty_scores = [-1.0, -0.75, -0.25]
+    for sample, penalty_score in zip(samples, penalty_scores, strict=True):
+        sample.metadata.update({"multi_turn_reward": -2.0, "penalty_score": penalty_score})
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == penalty_scores
+    assert rewards == pytest.approx([-0.5, -0.125, 0.625])
+
+
+def test_failed_group_reward_can_be_disabled(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
+    samples = [_make_sample(index, 0, 0.0) for index in range(3)]
+    for sample, penalty_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
+        sample.metadata.update({"multi_turn_reward": 0.0, "penalty_score": penalty_score})
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == [0.0, 0.0, 0.0]
+    assert rewards == pytest.approx([0.0, 0.0, 0.0])
+
+
+def test_penalty_scores_do_not_change_group_with_nonzero_reward():
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
+    samples = [
+        _make_sample(0, 0, 0.0),
+        _make_sample(1, 0, 0.0),
+        _make_sample(2, 0, 0.5),
+    ]
+    for sample, penalty_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
+        sample.metadata.update({"multi_turn_reward": sample.reward, "penalty_score": penalty_score})
+
+    raw_rewards, _ = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == [0.0, 0.0, 0.5]
+
+
+def test_all_failed_reward_from_old_dump_without_penalties_is_unchanged():
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
+    samples = [_make_sample(index, 0, 0.0) for index in range(3)]
+    for sample in samples:
+        sample.metadata["multi_turn_reward"] = 0.0
+
+    raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == [0.0, 0.0, 0.0]
+    assert rewards == pytest.approx([0.0, 0.0, 0.0])
 
 
 def _make_ctm_candidate(

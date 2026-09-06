@@ -115,6 +115,72 @@ def test_correct_reward_remains_strictly_above_partial_reward():
     assert details["partial_credit_output_mismatch_reason"] == "already_correct"
 
 
+@pytest.mark.parametrize(
+    ("env_state", "penalty_score"),
+    [
+        (
+            {
+                "status": "failed",
+                "compiled": None,
+                "correctness": None,
+                "error": "PRECHECK_ERROR",
+                "metadata": {},
+            },
+            -1.0,
+        ),
+        (_completed_env(compiled=False), -0.75),
+        (_completed_env(runtime_error="CUDA illegal memory access"), -0.5),
+        (
+            {
+                **_completed_env(compiled=True),
+                "status": "timeout",
+                "error": "KERNEL_EVAL_TIMEOUT",
+            },
+            -0.5,
+        ),
+        (_completed_env(compiled=True, correctness=False), -0.25),
+        (_completed_env(compiled=True, decoy_kernel=True), -1.0),
+        (_completed_env(compiled=True, correctness=True), 0.0),
+    ],
+)
+def test_penalty_score_tracks_evaluation_progress(env_state, penalty_score):
+    details = calculate_reward_speedup(env_state, _reward_config(partial_reward=0.0))
+
+    assert details["penalty_score"] == pytest.approx(penalty_score)
+
+
+def test_failed_group_reward_config_separates_flag_and_penalty_scores():
+    reward_config = CUDA_AGENT_CONFIGS["reward"]
+
+    assert reward_config["failed_score"] == 0.0
+    assert reward_config["apply_failed_group_reward"] is True
+    assert reward_config["penalty_score"] == {
+        "precheck": -1.0,
+        "compilation": -0.75,
+        "runtime": -0.5,
+        "correctness": -0.25,
+        "decoy": -1.0,
+        "other": -1.0,
+    }
+    legacy_keys = {
+        "failure_stage_penalty_scores",
+        "precheck_fail_penalty",
+        "compilation_fail_penalty",
+        "apply_precheck_fail_penalty",
+        "apply_compilation_fail_penalty",
+    }
+    assert legacy_keys.isdisjoint(reward_config)
+
+
+def test_failed_score_is_the_base_reward_for_failed_sample():
+    config = {**_reward_config(partial_reward=0.0), "failed_score": -2.0}
+
+    details = calculate_reward_speedup(_completed_env(compiled=True, correctness=False), config)
+
+    assert details["reward"] == -2.0
+    assert details["penalty_score"] == -0.25
+
+
 def test_output_mismatch_requires_compilation_contract():
     with pytest.raises(AssertionError, match="correctness_output_mismatch=true requires compiled=true"):
         calculate_reward_speedup(
@@ -200,6 +266,9 @@ def test_reward_func_records_partial_audit_metadata(monkeypatch):
     assert sample.metadata["partial_credit_output_mismatch_reason"] == "applied"
     assert "reward_components" not in sample.metadata
     assert sample.metadata["env_extra_info"]["partial_credit_output_mismatch"] is True
+    assert "failure_stage" not in sample.metadata
+    assert sample.metadata["penalty_score"] == pytest.approx(-0.25)
+    assert "penalty_score" not in sample.metadata["env_extra_info"]
 
 
 def test_normalization_preserves_mismatch_and_summarizes_backend_probe():
@@ -379,6 +448,46 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
     uniform_result = filter_cuda_kernel_group(args, uniform_partial)
     assert uniform_result.keep is False
     assert uniform_result.reason == "reward_std_lt_0.001"
+
+
+@pytest.mark.parametrize("failed_score", [0.0, -2.0])
+def test_low_variance_filter_uses_penalties_for_all_failed_group(monkeypatch, failed_score):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", failed_score)
+    args = SimpleNamespace(
+        n_samples_per_prompt=3,
+        target_group_size=3,
+        min_group_size=2,
+        reward_std_threshold=0.001,
+        reward_key=None,
+    )
+    samples = [
+        Sample(index=index, group_index=0, reward=failed_score, metadata={"penalty_score": penalty_score})
+        for index, penalty_score in enumerate((-1.0, -0.75, -0.25))
+    ]
+
+    result = filter_cuda_kernel_group(args, samples)
+
+    assert result.keep is True
+
+
+def test_low_variance_filter_ignores_penalties_when_failed_group_reward_is_disabled(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    args = SimpleNamespace(
+        n_samples_per_prompt=3,
+        target_group_size=3,
+        min_group_size=2,
+        reward_std_threshold=0.001,
+        reward_key=None,
+    )
+    samples = [
+        Sample(index=index, group_index=0, reward=0.0, metadata={"penalty_score": penalty_score})
+        for index, penalty_score in enumerate((-1.0, -0.75, -0.25))
+    ]
+
+    result = filter_cuda_kernel_group(args, samples)
+
+    assert result.keep is False
+    assert result.reason == "reward_std_lt_0.001"
 
 
 if __name__ == "__main__":

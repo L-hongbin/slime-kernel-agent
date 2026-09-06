@@ -145,11 +145,19 @@ CUDA_AGENT_CONFIGS = {
         "init_performance_weight": 0.5,
         "speedup_reward_upper_bound": 2.0,
         "speedup_reward_lower_bound": 0.0,
-        "penalty_score": 0,
-        "compilation_fail_penalty": 0,
-        "precheck_fail_penalty": 0,
-        "apply_compilation_fail_penalty": True,
-        "apply_precheck_fail_penalty": True,
+        "failed_score": 0.0,
+        "apply_failed_group_reward": True,
+        # These scores are only used when every valid sample in a reward group
+        # has task reward equal to failed_score and apply_failed_group_reward is
+        # enabled. They rank progress without changing non-failure groups.
+        "penalty_score": {
+            "precheck": -1.0,
+            "compilation": -0.75,
+            "runtime": -0.5,
+            "correctness": -0.25,
+            "decoy": -1.0,
+            "other": -1.0,
+        },
         "coverage_reward_enable": True,
         "coverage_reward_type": "time_coverage",
         "coverage_reward_weight": 0.5,

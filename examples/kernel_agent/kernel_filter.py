@@ -11,8 +11,10 @@ from slime.utils.types import Sample
 
 try:
     from .config import CUDA_AGENT_CONFIGS
+    from .kernel_reward import _apply_failed_group_reward
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
+    from kernel_reward import _apply_failed_group_reward
 
 logger = logging.getLogger(__name__)
 _FILTER_CONFIG_LOGGED = False
@@ -42,9 +44,9 @@ def _low_variance_audit_record(args, samples: list[Sample], filter_rewards: list
                 "id": stable_id(sample),
                 "sample_index": sample.index,
                 "rollout_id": sample.rollout_id if sample.rollout_id is not None else sample.index,
-                # filter_reward is the pre-overlong-penalty task reward used
-                # for the variance decision; reward is the effective reward
-                # that would otherwise reach advantage computation.
+                # filter_reward is normally the pre-overlong task reward. For
+                # an all-failed group it is the failure-stage penalty fallback.
+                # reward is the effective sample reward before group processing.
                 "filter_reward": float(filter_reward),
                 "reward": float(sample.get_reward_value(args)),
             }
@@ -110,11 +112,9 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         )
 
     if reject_low_variance_groups:
-        # Variance is judged on the PRE-PENALTY task reward when the overlong
-        # penalty recorded one (metadata["task_reward"]): lengthy all-fail
-        # groups must be dropped exactly as without the penalty; the penalty
-        # only shapes advantages of groups that survive (user directive
-        # 2026-07-18).
+        # Variance normally uses the PRE-PENALTY task reward recorded by the
+        # overlong policy. An all-failed group instead uses failure-stage penalties
+        # so a group with different evaluation progress can reach TRLOO.
         rewards = [
             (
                 sample.metadata.get("task_reward")
@@ -123,6 +123,10 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
             )
             for sample in valid_samples
         ]
+        reward_config = CUDA_AGENT_CONFIGS["reward"]
+        if bool(reward_config["apply_failed_group_reward"]):
+            failed_score = float(reward_config["failed_score"])
+            rewards = _apply_failed_group_reward(valid_samples, rewards, failed_score)
         reward_std = torch.tensor(rewards, dtype=torch.float64).std(unbiased=False).item()
         if reward_std < reward_std_threshold:
             audit_record = _low_variance_audit_record(args, valid_samples, rewards)

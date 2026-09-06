@@ -1203,6 +1203,7 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
             {
                 "partial_credit_output_mismatch": partial_applied,
                 "partial_credit_output_mismatch_reason": partial_reason,
+                "penalty_score": float(reward_details["penalty_score"]),
             }
         )
         env_extra_info = metadata.get("env_extra_info")
