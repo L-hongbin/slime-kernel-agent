@@ -1430,6 +1430,12 @@ else
 fi
 
 DEBUG_ARGS=()
+if [[ -n "${SAVE_DEBUG_TRAIN_DATA:-}" ]]; then
+   DEBUG_ARGS+=(--save-debug-train-data "${SAVE_DEBUG_TRAIN_DATA}")
+fi
+if [[ -n "${CUSTOM_MEGATRON_BEFORE_TRAIN_STEP_HOOK_PATH:-}" ]]; then
+   DEBUG_ARGS+=(--custom-megatron-before-train-step-hook-path "${CUSTOM_MEGATRON_BEFORE_TRAIN_STEP_HOOK_PATH}")
+fi
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA}" ]]; then
    DEBUG_ARGS+=(--load-debug-rollout-data "${LOAD_DEBUG_ROLLOUT_DATA}")
 elif [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
