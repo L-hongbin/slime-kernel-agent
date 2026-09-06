@@ -450,6 +450,10 @@ def log_rollout_data(
                 "sample_indices",
                 "group_ids",
                 "group_mask_sums",
+                "target_tokens",
+                "token_rewards",
+                "loss_normalization_counts",
+                "packed_turn_metrics",
                 "rollout_routed_experts",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",
@@ -526,6 +530,13 @@ def log_rollout_data(
                 log_dict[key] = (val.float().mean().item(), 1)
             else:
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
+
+        # Preserve turn-level reward/truncation means, including uneven and
+        # padded trajectories, after the physical training records are merged.
+        if "packed_turn_metrics" in rollout_data:
+            for key in rollout_data["packed_turn_metrics"][0]:
+                values = [value for turns in rollout_data["packed_turn_metrics"] for value in turns[key]]
+                log_dict[key] = (sum(values), len(values))
 
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
         if args.ci_test and reduced_log_dict is not None:

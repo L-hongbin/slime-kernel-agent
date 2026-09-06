@@ -444,6 +444,11 @@ class MegatronTrainRayActor(TrainRayActor):
         rollout_data["tokens"] = [
             torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device()) for t in rollout_data["tokens"]
         ]
+        if "target_tokens" in rollout_data:
+            rollout_data["target_tokens"] = [
+                torch.tensor(t, dtype=torch.long, device=torch.cuda.current_device())
+                for t in rollout_data["target_tokens"]
+            ]
         rollout_data["loss_masks"] = [
             torch.tensor(t, dtype=torch.int, device=torch.cuda.current_device()) for t in rollout_data["loss_masks"]
         ]
@@ -545,7 +550,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     microbatch_widths_descending,
                 )
 
-        for key in ["rollout_log_probs", "teacher_log_probs"]:
+        for key in ["rollout_log_probs", "teacher_log_probs", "token_rewards"]:
             if key not in rollout_data:
                 continue
             rollout_data[key] = [

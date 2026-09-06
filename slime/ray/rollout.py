@@ -1099,6 +1099,18 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if getattr(self.args, "pack_multi_turn_trajectories", False):
+            from slime.utils.trajectory_packing import pack_multi_turn_trajectories
+
+            original_tokens = sum(len(tokens) for tokens in train_data["tokens"])
+            train_data = pack_multi_turn_trajectories(train_data, samples)
+            logger.info(
+                "Packed TRLOO trajectories: turns=%s trajectories=%s input_tokens=%s packed_tokens=%s",
+                len(samples),
+                len(train_data["tokens"]),
+                original_tokens,
+                sum(len(tokens) for tokens in train_data["tokens"]),
+            )
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -1196,6 +1208,10 @@ class RolloutManager:
                 "turn_indices",
                 "group_ids",
                 "group_mask_sums",
+                "target_tokens",
+                "token_rewards",
+                "loss_normalization_counts",
+                "packed_turn_metrics",
                 "rollout_log_probs",
                 "rollout_topk_token_ids",
                 "rollout_topk_log_probs",

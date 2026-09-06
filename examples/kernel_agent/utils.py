@@ -14,6 +14,28 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def _context_len_for_turn(args, turn_idx: int | None) -> int | None:
+    """Resolve the cumulative prompt-plus-response cap for one rollout turn."""
+    max_context_len = getattr(args, "rollout_max_context_len", None)
+    turn_max_context_lens = getattr(args, "turn_max_context_lens", None)
+    if turn_max_context_lens is not None and turn_idx is not None:
+        if turn_idx < 0 or turn_idx >= len(turn_max_context_lens):
+            raise ValueError(
+                f"turn_idx={turn_idx} is outside --turn-max-context-lens with "
+                f"{len(turn_max_context_lens)} entries."
+            )
+        turn_max_context_len = int(turn_max_context_lens[turn_idx])
+        if max_context_len is None:
+            return turn_max_context_len
+        return min(int(max_context_len), turn_max_context_len)
+    first_turn_max_context_len = getattr(args, "first_turn_max_context_len", None)
+    if turn_idx != 0 or first_turn_max_context_len is None:
+        return max_context_len
+    if max_context_len is None:
+        return int(first_turn_max_context_len)
+    return min(int(max_context_len), int(first_turn_max_context_len))
+
+
 VALIDATION_ERROR = "VALIDATION_ERROR"
 SYNTAX_ERROR = "SYNTAX_ERROR"
 IMPORT_ERROR = "IMPORT_ERROR"
@@ -1395,7 +1417,6 @@ def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
     buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
     factor = float(getattr(args, "overlong_penalty_factor", 1.0))
     response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
-    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0)
     target_turn_idx = getattr(args, "overlong_penalty_turn_idx", None)
     target_turn_idx = None if target_turn_idx is None else int(target_turn_idx)
     if buffer_len <= 0 or factor <= 0 or response_cap <= 0:
@@ -1414,6 +1435,7 @@ def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
         tokens = getattr(sample, "tokens", None)
         prompt_len = max(0, len(tokens) - resp_len) if isinstance(tokens, (list, tuple)) else 0
         effective_cap = response_cap
+        context_cap = int(_context_len_for_turn(args, turn_idx) or 0)
         if getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
             effective_cap = min(effective_cap, max(1, context_cap - prompt_len))
         effective_buffer_len = min(buffer_len, effective_cap)

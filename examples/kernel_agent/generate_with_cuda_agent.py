@@ -34,6 +34,7 @@ try:
     from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
     from .kernel_reward import calculate_reward, calculate_reward_speedup
     from .utils import (
+        _context_len_for_turn,
         _extract_env_extra_info,
         normalize_env_feedback,
         postprocess_turn_samples,
@@ -46,6 +47,7 @@ except ImportError:
     from kernel_reward import calculate_reward, calculate_reward_speedup
 
     from utils import (
+        _context_len_for_turn,
         _extract_env_extra_info,
         normalize_env_feedback,
         postprocess_turn_samples,
@@ -1376,16 +1378,6 @@ def _is_done(env_result: dict[str, Any], turn_idx: int, max_turns: int) -> bool:
             if key in env_state:
                 return bool(env_state[key])
     return False
-
-
-def _context_len_for_turn(args, turn_idx: int | None) -> int | None:
-    max_context_len = getattr(args, "rollout_max_context_len", None)
-    first_turn_max_context_len = getattr(args, "first_turn_max_context_len", None)
-    if turn_idx != 0 or first_turn_max_context_len is None:
-        return max_context_len
-    if max_context_len is None:
-        return int(first_turn_max_context_len)
-    return min(int(max_context_len), int(first_turn_max_context_len))
 
 
 def _sampling_params_for_prompt_context(

@@ -537,6 +537,7 @@ def forward_only(
             data_iterator,
             [
                 "tokens",
+                "target_tokens",
                 "loss_masks",
                 "multimodal_train_inputs",
                 "total_lengths",
@@ -547,7 +548,7 @@ def forward_only(
             args.qkv_format,
             args.allgather_cp,
         )
-        unconcat_tokens = batch["unconcat_tokens"]
+        unconcat_tokens = batch.get("target_tokens") or batch["unconcat_tokens"]
         tokens = batch["tokens"]
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
@@ -720,6 +721,8 @@ def train_one_step(
             data_iterator,
             [
                 "tokens",
+                "target_tokens",
+                "loss_normalization_counts",
                 "multimodal_train_inputs",
                 "packed_seq_params",
                 "total_lengths",

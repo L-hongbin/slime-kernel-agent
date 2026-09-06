@@ -1011,6 +1011,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         custom_adv_fn(args, rollout_data)
         advantages, returns = rollout_data["advantages"], rollout_data["returns"]
 
+    elif args.advantage_estimator == "trloo" and "token_rewards" in rollout_data:
+        returns = [reward.clone() for reward in rollout_data["token_rewards"]]
+        advantages = list(returns)
+
     elif args.advantage_estimator in ["grpo", "gspo", "rloo", "trloo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
         returns = get_grpo_returns(rewards, kl)
@@ -1260,7 +1264,7 @@ def _validate_dppo_predictive_support_batch(
     max_seq_lens = batch.get("max_seq_lens")
     for i, (tokens, loss_mask, total_length, response_length) in enumerate(
         zip(
-            batch["unconcat_tokens"],
+            batch.get("target_tokens") or batch["unconcat_tokens"],
             batch["loss_masks"],
             batch["total_lengths"],
             batch["response_lengths"],
@@ -1454,7 +1458,7 @@ def policy_loss_function(
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
-        unconcat_tokens=batch["unconcat_tokens"],
+        unconcat_tokens=batch.get("target_tokens") or batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         with_entropy=True,
@@ -2049,7 +2053,10 @@ def loss_function(
         - `logging_dict` has keys "keys" (list of str metric names) and
           "values" (1D tensor: [count, metric1, metric2, ...]).
     """
-    num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
+    if batch.get("loss_normalization_counts") is not None:
+        num_tokens = torch.tensor(sum(batch["loss_normalization_counts"]), device=logits.device)
+    else:
+        num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],

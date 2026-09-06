@@ -22,6 +22,7 @@ Qwen3.8 使用 BF16 actor、FP8 rollout、distributed GDN 和 no-spec serving。
 - 每个 rollout engine 的 request cap 与 CUDA Graph cap 为 128，static memory fraction 为 0.85。是否容得下负载取决于实际 active token 和 GDN state，不能用 128×最大 context 推断已通过容量验证
 - 首轮来自 parquet；后续轮使用 [TVM-FFI feedback 模板](../../examples/kernel_agent/prompt_config/multi_turn_tvm_ffi_short.yaml)，复用精确 token history 和一致的 routing key。模型反馈合同见[反馈与诊断](../kernel_agent/feedback.md)
 - 多轮使用 TRLOO、`finalize-mode=positive` 和 last-turn filter；长度惩罚作用于 zero-based `turn_idx=1`。三轮部署中第二轮仍使用 32K cap，而不是全局 40K cap
+- 可选 `PACK_MULTI_TURN_TRAJECTORIES=1` 合并训练中的重复前缀；配置、等价性合同和验证边界见[轨迹合并](trajectory_packing.md)
 - 仅 completed candidate forward 到达输出比较、确认为 value mismatch 且没有 runtime/timeout/decoy 证据时，Qwen launcher 才给予 0.25 partial reward。性能 reward 要求 correctness；coverage-RS/PRS 关闭，连续 correctness-gated coverage 保留，加速比 reward 上限为 2.0
 - 权重更新使用 `retract -> flush -> refit -> continue`。中断前后的 response token 都保留真实 behavior logprob/top-k 和 loss mask；最终单值 weight-version 不能表达 per-token version span
 - HCA 白名单、CUDA/FLA/SGLang 补丁、模型 manifest、GPU 占用与 KernelGym 健康由 launcher 的预检和 RUNTIME 合同约束

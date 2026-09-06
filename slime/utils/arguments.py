@@ -842,6 +842,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--pack-multi-turn-trajectories",
+                action="store_true",
+                help="Train all TRLOO turns in one causal sequence with per-turn targets and advantages.",
+            )
+            parser.add_argument(
                 "--filter-by-last-turn",
                 action="store_true",
                 default=False,
@@ -2055,6 +2060,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--turn-max-context-lens",
+                type=int,
+                nargs="+",
+                default=None,
+                help="Cumulative context cap for each turn; mutually exclusive with --first-turn-max-context-len.",
+            )
+            parser.add_argument(
                 "--coverage-rs-key",
                 type=str,
                 choices=["time_coverage", "num_coverage"],
@@ -2507,6 +2519,36 @@ def _resolve_checkpoint_load_args(args) -> None:
             args.start_rollout_id = 0
 
 
+def _validate_turn_context_limits(args):
+    turn_max_context_lens = getattr(args, "turn_max_context_lens", None)
+    if turn_max_context_lens is None:
+        return
+    if not args.use_multi_turn:
+        raise ValueError("--turn-max-context-lens requires --use-multi-turn.")
+    if args.first_turn_max_context_len is not None:
+        raise ValueError("--turn-max-context-lens and --first-turn-max-context-len are mutually exclusive.")
+    if args.max_turns is None:
+        raise ValueError("--turn-max-context-lens requires --max-turns.")
+    if len(turn_max_context_lens) != int(args.max_turns):
+        raise ValueError(
+            "--turn-max-context-lens must provide exactly --max-turns values; "
+            f"got {len(turn_max_context_lens)} values for max_turns={args.max_turns}."
+        )
+    if any(value <= 0 for value in turn_max_context_lens):
+        raise ValueError("--turn-max-context-lens values must be positive.")
+    if any(
+        current < previous for previous, current in zip(turn_max_context_lens, turn_max_context_lens[1:], strict=False)
+    ):
+        raise ValueError("--turn-max-context-lens values must be non-decreasing.")
+    if args.rollout_max_context_len is None:
+        raise ValueError("--turn-max-context-lens requires --rollout-max-context-len.")
+    if turn_max_context_lens[-1] > args.rollout_max_context_len:
+        raise ValueError(
+            f"--turn-max-context-lens last value ({turn_max_context_lens[-1]}) must not exceed "
+            f"--rollout-max-context-len ({args.rollout_max_context_len})."
+        )
+
+
 def slime_validate_args(args):
     if getattr(args, "enable_fp32_lm_head", False):
         args.fp32_lm_head = True
@@ -2629,6 +2671,10 @@ def slime_validate_args(args):
         )
     if args.preserve_history_thinking and not args.use_multi_turn:
         raise ValueError("--preserve-history-thinking requires --use-multi-turn.")
+    from slime.utils.trajectory_packing import validate_trajectory_packing_args
+
+    _validate_turn_context_limits(args)
+    validate_trajectory_packing_args(args)
     _validate_partial_rollout_args(args)
     if args.overlong_penalty_turn_idx is not None:
         if args.overlong_penalty_turn_idx < 0:

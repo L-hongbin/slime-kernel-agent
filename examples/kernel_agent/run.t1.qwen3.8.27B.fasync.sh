@@ -228,6 +228,14 @@ echo "ACTOR_GPUS ${ACTOR_GPUS} ROLLOUT_GPUS ${ROLLOUT_GPUS}"
 MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-32768}
 MAX_RESPONSE_LEN=${MAX_RESPONSE_LEN:-${MAX_CONTEXT_LEN}}
 FIRST_TURN_CONTEXT_LEN=${FIRST_TURN_CONTEXT_LEN:-24576}
+MAX_TURNS=${MAX_TURNS:-2}
+TURN_MAX_CONTEXT_LENS=${TURN_MAX_CONTEXT_LENS:-}
+PACK_MULTI_TURN_TRAJECTORIES=${PACK_MULTI_TURN_TRAJECTORIES:-0}
+if ! [[ "${PACK_MULTI_TURN_TRAJECTORIES}" =~ ^[01]$ ]]; then
+   echo "PACK_MULTI_TURN_TRAJECTORIES must be 0 or 1." >&2
+   exit 1
+fi
+read -r -a TURN_MAX_CONTEXT_LEN_VALUES <<< "${TURN_MAX_CONTEXT_LENS}"
 DECODER_LAST_PIPELINE_NUM_LAYERS=${DECODER_LAST_PIPELINE_NUM_LAYERS:-31}
 RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-27}
 FINALIZE_MODE=${FINALIZE_MODE:-positive}
@@ -510,7 +518,7 @@ if ! [[ "${TRAIN_DATA_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
    exit 1
 fi
 MULTI_TURN_PROMPT_CONFIG="${MULTI_TURN_PROMPT_CONFIG:-${SCRIPT_DIR}/prompt_config/multi_turn_tvm_ffi_short.yaml}"
-PROMPT_POLICY_LABEL="${PROMPT_POLICY_LABEL:-TVMFFI2T}"
+PROMPT_POLICY_LABEL="${PROMPT_POLICY_LABEL:-TVMFFI${MAX_TURNS}T}"
 if ! [[ "${PROMPT_POLICY_LABEL}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
    echo "PROMPT_POLICY_LABEL must contain only letters, digits, dot, underscore, or hyphen and start with an alphanumeric character." >&2
    exit 1
@@ -559,7 +567,20 @@ case "${FINALIZE_MODE}" in
       exit 1
       ;;
 esac
-TURN_POLICY_LABEL="TRLOO2T${FINALIZE_LABEL}.T1C${FIRST_TURN_CONTEXT_LEN}.TokHist.Fb${MAX_FEEDBACK_CHARS}.Aff"
+TURN_POLICY_LABEL="TRLOO${MAX_TURNS}T${FINALIZE_LABEL}.T1C${FIRST_TURN_CONTEXT_LEN}.TokHist.Fb${MAX_FEEDBACK_CHARS}.Aff"
+if [[ -n "${TURN_MAX_CONTEXT_LENS}" ]]; then
+   TURN_CONTEXT_SHORT_LABEL=""
+   for turn_context_len in "${TURN_MAX_CONTEXT_LEN_VALUES[@]}"; do
+      if [[ "${turn_context_len}" =~ ^[1-9][0-9]*$ ]] && ((turn_context_len % 1024 == 0)); then
+         turn_context_len="$((turn_context_len / 1024))K"
+      fi
+      TURN_CONTEXT_SHORT_LABEL+="${turn_context_len}-"
+   done
+   TURN_POLICY_LABEL="TRLOO${MAX_TURNS}T${FINALIZE_LABEL}.C${TURN_CONTEXT_SHORT_LABEL%-}.TH.Fb${MAX_FEEDBACK_CHARS}.Aff"
+fi
+if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
+   TURN_POLICY_LABEL+=".Packed"
+fi
 
 
 case "${ROLLOUT_CORRECTION_MODE}" in
@@ -1461,8 +1482,7 @@ KERNEL_AGENT_ARGS=(
    --do-precheck
    --use-reference-cache
    --finalize-mode ${FINALIZE_MODE}
-   --max-turns 2
-   --first-turn-max-context-len ${FIRST_TURN_CONTEXT_LEN}
+   --max-turns ${MAX_TURNS}
    --use-multi-turn
    --padding-turns
    --filter-by-last-turn
@@ -1471,6 +1491,14 @@ KERNEL_AGENT_ARGS=(
    --preserve-history-thinking
    --enable-turns-dp-partitions
 )
+if [[ -n "${TURN_MAX_CONTEXT_LENS}" ]]; then
+   KERNEL_AGENT_ARGS+=(--turn-max-context-lens "${TURN_MAX_CONTEXT_LEN_VALUES[@]}")
+else
+   KERNEL_AGENT_ARGS+=(--first-turn-max-context-len "${FIRST_TURN_CONTEXT_LEN}")
+fi
+if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
+   KERNEL_AGENT_ARGS+=(--pack-multi-turn-trajectories)
+fi
 
 if [[ "${ROLLOUT_CORRECTION_MODE}" == "hard_sequence_mis" ]]; then
    KERNEL_AGENT_ARGS+=(
@@ -1684,6 +1712,8 @@ prepare_node_local_resume_metadata() {
 }
 
 if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
+   printf 'PACK_MULTI_TURN_TRAJECTORIES=%s\nMAX_TURNS=%s\nTURN_MAX_CONTEXT_LENS=%s\n' \
+      "${PACK_MULTI_TURN_TRAJECTORIES}" "${MAX_TURNS}" "${TURN_MAX_CONTEXT_LENS}"
    printf 'TRAIN_DTYPE=bf16\nROLLOUT_CHECKPOINT=%s\nTRAIN_CHECKPOINT=%s\n' \
       "${HF_MODEL_PATH}" "${MEGATRON_MODEL_PATH}"
    printf 'MAX_CONTEXT_LEN=%s\nMAX_RESPONSE_LEN=%s\nFIRST_TURN_CONTEXT_LEN=%s\nMAX_FEEDBACK_CHARS=%s\nOVERLONG_BUFFER_LEN=%s\nOVERLONG_PENALTY_FACTOR=%s\nOUTPUT_MISMATCH_PARTIAL_REWARD=%s\nREWARD_POLICY_LABEL=%s\nTURN_POLICY_LABEL=%s\nPROMPT_POLICY_LABEL=%s\nROLLOUT_SYNC_LABEL=%s\n' \
