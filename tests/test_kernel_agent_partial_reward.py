@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -153,7 +154,7 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
     reward_config = CUDA_AGENT_CONFIGS["reward"]
 
     assert reward_config["failed_score"] == 0.0
-    assert reward_config["apply_failed_group_reward"] is True
+    assert isinstance(reward_config["apply_failed_group_reward"], bool)
     assert reward_config["penalty_score"] == {
         "precheck": -1.0,
         "compilation": -0.75,
@@ -170,6 +171,23 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
         "apply_compilation_fail_penalty",
     }
     assert legacy_keys.isdisjoint(reward_config)
+
+
+@pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expected):
+    env_name = "CUDA_AGENT_APPLY_FAILED_GROUP_REWARD"
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+
+    config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_config_env_test", config_path)
+    assert spec is not None and spec.loader is not None
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+
+    assert config_module.CUDA_AGENT_CONFIGS["reward"]["apply_failed_group_reward"] is expected
 
 
 def test_failed_score_is_the_base_reward_for_failed_sample():
@@ -452,6 +470,7 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
 
 @pytest.mark.parametrize("failed_score", [0.0, -2.0])
 def test_low_variance_filter_uses_penalties_for_all_failed_group(monkeypatch, failed_score):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", failed_score)
     args = SimpleNamespace(
         n_samples_per_prompt=3,

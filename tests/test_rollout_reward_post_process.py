@@ -120,7 +120,8 @@ def test_reward_post_process_by_group_handles_single_valid_sample_after_pad_mask
     assert rewards == pytest.approx([0.0, 0.0])
 
 
-def test_trloo_uses_penalty_scores_only_for_all_failed_group():
+def test_trloo_uses_penalty_scores_only_for_all_failed_group(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [
         _make_sample(0, 0, 0.0),
@@ -138,6 +139,7 @@ def test_trloo_uses_penalty_scores_only_for_all_failed_group():
 
 
 def test_failed_group_reward_uses_configured_nonzero_failed_score(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", -2.0)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [_make_sample(index, 0, -2.0) for index in range(3)]
@@ -164,7 +166,8 @@ def test_failed_group_reward_can_be_disabled(monkeypatch):
     assert rewards == pytest.approx([0.0, 0.0, 0.0])
 
 
-def test_penalty_scores_do_not_change_group_with_nonzero_reward():
+def test_penalty_scores_do_not_change_group_with_nonzero_reward(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [
         _make_sample(0, 0, 0.0),
@@ -179,7 +182,8 @@ def test_penalty_scores_do_not_change_group_with_nonzero_reward():
     assert raw_rewards == [0.0, 0.0, 0.5]
 
 
-def test_all_failed_reward_from_old_dump_without_penalties_is_unchanged():
+def test_all_failed_reward_from_old_dump_without_penalties_is_unchanged(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [_make_sample(index, 0, 0.0) for index in range(3)]
     for sample in samples:
