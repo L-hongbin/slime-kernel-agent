@@ -1,9 +1,13 @@
 """Executable CPU contracts for coarse memory regions and component lineage."""
 
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from .extract import (
+    build_graph,
     conflicting_writes,
     entry_read_regions,
     gemm_accesses,
@@ -342,6 +346,70 @@ class Correspondence(unittest.TestCase):
 
     def test_failed_trajectory_has_no_membership(self):
         self.assertEqual(trace_best([{"turn": 1, "correct": False}])["components"], [])
+
+
+class BoundedCapture(unittest.TestCase):
+    def raw_graph(self, *, memory=False, finish=True, dropped=0, exact=True, inspected=True):
+        records = [
+            {"type": "config", "schema": "coarse-memory-runs/v1", "cta_limit": -1, "capacity": 1},
+            {
+                "type": "launch",
+                "id": 0,
+                "seq": 1,
+                "parent": -1,
+                "stream": 0,
+                "name": "opaque",
+                "implementation": "0",
+                "implementation_version": "version42",
+                "implementation_inspected": inspected,
+                "grid": [1, 1, 1],
+                "block": [32, 1, 1],
+                "shared": 0,
+                "arguments": [],
+                "launch_num_attrs": 0,
+                "memory_traced": memory,
+                "memory_skip_reason": "vendor_memory_opaque",
+                "unsupported_memory_instructions": 0,
+            },
+        ]
+        if finish:
+            records += [
+                {"type": "complete", "seq": 2, "id": 0, "runs": 0, "dropped": dropped, "drop_count_exact": exact},
+                {"type": "end", "seq": 3, "launches": 1},
+            ]
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "trace"
+            prefix.with_suffix(".jsonl").write_text(
+                "\n".join(json.dumps(r) for r in records) + ("\n" if finish else '\n{"type":"complete","seq":')
+            )
+            if memory:
+                Path(str(prefix) + ".launch0.bin").write_bytes(b"")
+            return build_graph(prefix, buffers())
+
+    def test_opaque_vendor_preserves_call_version_not_fabricated_access(self):
+        graph = self.raw_graph()
+        n = graph["nodes"][0]
+        self.assertEqual(n["implementation"], "version42")
+        self.assertFalse(n["footprint_complete"])
+        self.assertEqual(n["reads"], [])
+        self.assertIn("vendor_memory_opaque", n["unknowns"])
+
+    def test_saturated_counter_lower_bound_marks_incomplete(self):
+        n = self.raw_graph(memory=True, dropped=1, exact=False)["nodes"][0]
+        self.assertFalse(n["footprint_complete"])
+        self.assertFalse(n["evidence"]["dropped_runs_exact"])
+
+    def test_uninspected_vendor_identity_stays_unknown(self):
+        n = self.raw_graph(inspected=False)["nodes"][0]
+        self.assertEqual(n["implementation"], "uninspected")
+        self.assertIn("opaque_implementation_configuration", n["unknowns"])
+
+    def test_failed_process_keeps_call_and_explicit_truncated_metadata(self):
+        graph = self.raw_graph(finish=False)
+        self.assertEqual(len(graph["nodes"]), 1)
+        self.assertFalse(graph["nodes"][0]["footprint_complete"])
+        self.assertFalse(graph["coverage"]["trace_process_complete"])
+        self.assertEqual(graph["coverage"]["memory_unknown_events"][0]["name"], "truncated_metadata_record")
 
 
 if __name__ == "__main__":

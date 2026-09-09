@@ -13,6 +13,13 @@ extern "C" __device__ __noinline__ void trace_memory(int pred,uint64_t address,
     uint64_t tid=threadIdx.x+uint64_t(blockDim.x)*(threadIdx.y+uint64_t(blockDim.y)*threadIdx.z);
     uint64_t owner=cta*uint64_t(blockDim.x)*blockDim.y*blockDim.z+tid;
     if(coalesced&&lane!=first)return;
-    TraceBuffer* b=(TraceBuffer*)buffer_pointer;auto index=atomicAdd(&b->count,1ULL);
+    TraceBuffer* b=(TraceBuffer*)buffer_pointer;
+    // Once full, stop contending on a global counter. Lost records become an
+    // explicit lower bound, never an exact sampled population estimate.
+    if(((volatile TraceBuffer*)b)->count>=b->capacity){
+        if(!((volatile TraceBuffer*)b)->truncated)atomicExch(&b->truncated,1u);
+        return;
+    }
+    auto index=atomicAdd(&b->count,1ULL);
     if(index<b->capacity)b->runs[index]={address,owner,width*uint32_t(coalesced?count:1),width,mode,0};
 }

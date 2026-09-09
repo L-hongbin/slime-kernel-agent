@@ -236,7 +236,21 @@ def launch_configuration(record):
 def build_graph(prefix, allocations, context=None):
     started = time.monotonic()
     prefix = Path(prefix)
-    records = [json.loads(line) for line in Path(str(prefix) + ".jsonl").read_text().splitlines()]
+    lines = Path(str(prefix) + ".jsonl").read_text().splitlines()
+    records = []
+    for index, line in enumerate(lines):
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            if index != len(lines) - 1 or not records:
+                raise
+            records.append(
+                {
+                    "type": "memory_api_unknown",
+                    "name": "truncated_metadata_record",
+                    "seq": max(r.get("seq", 0) for r in records) + 1,
+                }
+            )
     config = next(r for r in records if r["type"] == "config")
     if config["schema"] != "coarse-memory-runs/v1":
         raise ValueError("old instruction traces must not enter coarse workflow")
@@ -278,7 +292,10 @@ def build_graph(prefix, allocations, context=None):
         binding = Bindings(allocations, r["seq"])
         if kind == "kernel":
             node["evidence"] = {"name": r["name"], "launch_id": r["id"]}
-            node["implementation"] = r["implementation"]
+            node["implementation"] = r.get("implementation_version", r["implementation"])
+            if r.get("implementation_inspected") is False:
+                node["implementation"] = "uninspected"
+                node["unknowns"].append("opaque_implementation_configuration")
             node["configuration"] = {k: r[k] for k in ("grid", "block", "shared")}
             attrs, unknowns = launch_configuration(r)
             node["configuration"].update(attrs)
@@ -308,6 +325,11 @@ def build_graph(prefix, allocations, context=None):
                 nodes.append(node)
                 continue
             node["end_seq"] = done["seq"]
+            if not r["memory_traced"]:
+                node["footprint_complete"] = False
+                node["unknowns"].append(r.get("memory_skip_reason", "memory_capture_disabled"))
+                nodes.append(node)
+                continue
             full_ctas = config["cta_limit"] < 0 or config["cta_limit"] >= math.prod(r["grid"])
             if done["dropped"] or not full_ctas or r["unsupported_memory_instructions"]:
                 node["footprint_complete"] = False
@@ -339,7 +361,10 @@ def build_graph(prefix, allocations, context=None):
                 if mode == 3:
                     per_buffer[storage["id"]]["atomic"] = True
             node["evidence"].update(
-                raw_runs=done["runs"], dropped_runs=done["dropped"], unmapped_access_bytes=unmapped
+                raw_runs=done["runs"],
+                dropped_runs=done["dropped"],
+                unmapped_access_bytes=unmapped,
+                dropped_runs_exact=done.get("drop_count_exact", True),
             )
             if unmapped:
                 node["unknowns"].append("unmapped_storage_access")
@@ -379,14 +404,24 @@ def build_graph(prefix, allocations, context=None):
             if kind == "library":
                 node["configuration"] = {k: v for k, v in r["attrs"].items() if k not in ("a", "b", "c")}
                 children = [x for x in launches.values() if x["parent"] == r["seq"]]
+                if not children:
+                    node["unknowns"].append("opaque_library_implementation_configuration")
                 node["configuration"]["child_launch_num_attrs"] = [x.get("launch_num_attrs") for x in children]
                 for child in children:
                     node["unknowns"].extend(launch_configuration(child)[1])
+                    if child.get("implementation_inspected") is False:
+                        node["unknowns"].append("opaque_library_implementation_configuration")
                 if r["attrs"].get("workspace_mode", "unknown") == "unknown":
                     node["unknowns"].append("opaque_workspace_configuration")
                 node["evidence"]["kernel_launches"] = [x["id"] for x in children]
                 node["implementation"] = digest(
-                    [r["api"], [(x["name"], x["grid"], x["block"], x["shared"]) for x in children]]
+                    [
+                        r["api"],
+                        [
+                            (x["name"], x["grid"], x["block"], x["shared"], x.get("implementation_version"))
+                            for x in children
+                        ],
+                    ]
                 )
                 node["operation"] = "gemm"
                 end = endings.get(r["seq"])
@@ -493,6 +528,7 @@ def build_graph(prefix, allocations, context=None):
         "output_unknowns": output_unknowns,
         "coverage": {
             "kernel_launches": len(launches),
+            "total_launches_reported": next((r["launches"] for r in reversed(records) if r["type"] == "end"), None),
             "completed_kernel_launches": len(completions),
             "memory_traced_kernels": sum(x["memory_traced"] for x in launches.values()),
             "contract_covered_kernels": sum(x["parent"] >= 0 for x in launches.values()),

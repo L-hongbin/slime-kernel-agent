@@ -1,14 +1,16 @@
 """Tensor storage leases; argument presence records identity, never read/write."""
 
 import ctypes
+import json
 import weakref
+from pathlib import Path
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 
 class StorageObserver(TorchDispatchMode):
-    def __init__(self, traced=False):
+    def __init__(self, traced=False, checkpoint=None, max_leases=None):
         super().__init__()
         self.leases = []
         self.live = {}
@@ -16,6 +18,9 @@ class StorageObserver(TorchDispatchMode):
         if self.native:
             self.native.coarse_position.restype = ctypes.c_uint64
         self.host_position = 0
+        self.checkpoint = Path(checkpoint) if checkpoint else None
+        self.max_leases = max_leases
+        self.unknowns = set()
 
     def position(self):
         return self.native.coarse_position() if self.native else self.host_position
@@ -26,6 +31,9 @@ class StorageObserver(TorchDispatchMode):
             key = storage._cdata
             entry = self.live.get(key)
             if entry is None:
+                if self.max_leases is not None and len(self.leases) >= self.max_leases:
+                    self.unknowns.add("storage_registry_truncated")
+                    return
                 record = {
                     "id": f"storage:{len(self.leases)}",
                     "base": storage.data_ptr(),
@@ -69,10 +77,18 @@ class StorageObserver(TorchDispatchMode):
         start = self.position()
         self.observe(args, start=start)
         self.observe(kwargs or {}, start=start)
+        self.save_checkpoint()
         result = func(*args, **(kwargs or {}))
         self.observe(result, start=start)
         self.host_position += 1
+        self.save_checkpoint()
         return result
+
+    def save_checkpoint(self):
+        if self.checkpoint is not None:
+            temporary = self.checkpoint.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.as_dict()))
+            temporary.replace(self.checkpoint)
 
     def as_dict(self):
         return {
@@ -81,4 +97,5 @@ class StorageObserver(TorchDispatchMode):
             "identity_source": "weak storage lifetime plus CUDA storage address; views share identity",
             "argument_presence_is_read_write": False,
             "holds_tensor_values_alive": False,
+            "unknowns": sorted(self.unknowns),
         }

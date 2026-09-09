@@ -21,6 +21,10 @@ static std::thread::id launch_thread;
 static std::string prefix;
 static bool active=true,selected=false;
 static uint64_t position=0,launch_id=0,capacity=1048576;
+static uint64_t remaining_records=~0ULL;
+static int max_launches=-1;
+static bool memory_enabled=true,skip_vendor=false;
+static const char* skip_reason="";
 static int cta_limit=-1;
 struct FunctionInfo {uint64_t hash=1469598103934665603ULL;int unsupported=0;};
 static std::unordered_map<CUfunction,FunctionInfo> info;
@@ -41,9 +45,13 @@ extern "C" void coarse_library_end(long long id,int status){std::lock_guard<std:
 void nvbit_at_init(){
     const char* p=getenv("RUNTIME_TRACE_OUTPUT");if(!p)fail("RUNTIME_TRACE_OUTPUT required");prefix=p;
     active=env_int("RUNTIME_TRACE_START_ENABLED",1);cta_limit=env_int("RUNTIME_TRACE_CTAS",-1);capacity=env_int("RUNTIME_TRACE_CAPACITY",1048576);
+    max_launches=env_int("RUNTIME_TRACE_MAX_LAUNCHES",-1);
+    int total=env_int("RUNTIME_TRACE_TOTAL_RECORDS",-1);if(total>=0)remaining_records=total;
+    const char* policy=getenv("RUNTIME_TRACE_MEMORY_POLICY");memory_enabled=!policy||strcmp(policy,"interfaces");
+    skip_vendor=env_int("RUNTIME_TRACE_SKIP_VENDOR_MEMORY",0);
     if(capacity<1||capacity>16777216)fail("memory run capacity out of range");
     log_file=fopen((prefix+".jsonl").c_str(),"wx");if(!log_file)fail("trace output must be new");
-    fprintf(log_file,"{\"type\":\"config\",\"schema\":\"coarse-memory-runs/v1\",\"nvbit\":\"%s\",\"cta_limit\":%d,\"capacity\":%lu,\"serialized_diagnostic\":true}\n",NVBIT_VERSION,cta_limit,capacity);flush();
+    fprintf(log_file,"{\"type\":\"config\",\"schema\":\"coarse-memory-runs/v1\",\"nvbit\":\"%s\",\"cta_limit\":%d,\"capacity\":%lu,\"serialized_diagnostic\":true,\"max_launches\":%d,\"total_records\":%lld,\"memory_enabled\":%s,\"skip_vendor_memory\":%s,\"counter_mode\":\"saturating_lower_bound\"}\n",NVBIT_VERSION,cta_limit,capacity,max_launches,(long long)remaining_records,memory_enabled?"true":"false",skip_vendor?"true":"false");flush();
 }
 void nvbit_tool_init(CUcontext ctx){std::lock_guard<std::recursive_mutex> guard(lock);bool old=internal;internal=true;
     if(first_context&&first_context!=ctx)fail("multiple contexts unsupported");first_context=ctx;
@@ -102,21 +110,31 @@ void nvbit_at_cuda_event(CUcontext ctx,int exiting,nvbit_api_cuda_t cbid,const c
     if(ordinary){auto* p=(cuLaunchKernel_params*)params;f=p->f;stream=p->hStream;arguments=p->kernelParams;gx=p->gridDimX;gy=p->gridDimY;gz=p->gridDimZ;bx=p->blockDimX;by=p->blockDimY;bz=p->blockDimZ;shared=p->sharedMemBytes;}
     else{auto* p=(cuLaunchKernelEx_params*)params;f=p->f;arguments=p->kernelParams;auto* c=p->config;stream=c->hStream;gx=c->gridDimX;gy=c->gridDimY;gz=c->gridDimZ;bx=c->blockDimX;by=c->blockDimY;bz=c->blockDimZ;shared=c->sharedMemBytes;}
     if(!active){if(!exiting)nvbit_enable_instrumented(ctx,f,false);internal=false;return;}
+    if(max_launches>=0&&launch_id>=uint64_t(max_launches)){
+        if(!exiting){nvbit_enable_instrumented(ctx,f,false);if(launch_id==uint64_t(max_launches)){fprintf(log_file,"{\"type\":\"unsupported_launch\",\"seq\":%lu,\"name\":\"launch_budget_exhausted\"}\n",position++);flush();}}
+        else ++launch_id;internal=false;return;
+    }
     if(first_context&&first_context!=ctx)fail("multiple active CUDA contexts unsupported");
     if(launch_thread==std::thread::id())launch_thread=std::this_thread::get_id();if(launch_thread!=std::this_thread::get_id())fail("multiple host launch threads unsupported");
     if(!exiting){
-        if(!buffer)nvbit_tool_init(ctx);internal=true;CHECK(cuCtxSynchronize());selected=library_parent<0;
-        if(selected){instrument(ctx,f);buffer->count=0;}
+        if(!buffer)nvbit_tool_init(ctx);internal=true;CHECK(cuCtxSynchronize());
+        const char* symbol=nvbit_get_func_name(ctx,f);
+        bool vendor=skip_vendor&&(strstr(symbol,"cudnn")||strstr(symbol,"cublas")||strstr(symbol,"cutlass::")||strstr(symbol,"xmma_")||strstr(symbol,"gemv2"));
+        skip_reason=library_parent>=0?"library_api_contract":!memory_enabled?"interface_only_policy":vendor?"vendor_memory_opaque":remaining_records==0?"record_budget_exhausted":"";
+        selected=!skip_reason[0];if(selected)instrument(ctx,f);
+        if(selected){buffer->count=0;buffer->capacity=std::min(capacity,remaining_records);buffer->truncated=0;}
         FunctionInfo aggregate=selected?combined_info(ctx,f):FunctionInfo{};
         fprintf(log_file,"{\"type\":\"launch\",\"seq\":%lu,\"id\":%lu,\"parent\":%lld,\"name\":%s,\"stream\":%lu,\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared\":%u,\"memory_traced\":%s,\"implementation\":\"%016lx\",\"unsupported_memory_instructions\":%d,\"arguments\":[",position++,launch_id,library_parent,quote(nvbit_get_func_name(ctx,f)).c_str(),(uint64_t)stream,gx,gy,gz,bx,by,bz,shared,selected?"true":"false",selected?aggregate.hash:0,selected?aggregate.unsupported:0);
-        auto sizes=nvbit_get_kernel_argument_sizes(ctx,f);
+        bool inspect_arguments=!(skip_vendor&&(vendor||library_parent>=0));
+        auto sizes=inspect_arguments?nvbit_get_kernel_argument_sizes(ctx,f):std::vector<int>{};
         if(arguments)for(size_t i=0;i<sizes.size();++i){uint64_t value=0;if(sizes[i]<=8)memcpy(&value,arguments[i],sizes[i]);fprintf(log_file,"%s{\"index\":%lu,\"bytes\":%d,\"bits\":%lu}",i?",":"",i,sizes[i],value);}
         unsigned num_attrs=ordinary?0:((cuLaunchKernelEx_params*)params)->config->numAttrs;
-        fprintf(log_file,"],\"arguments_present\":%s,\"launch_api\":\"%s\",\"launch_num_attrs\":%u}\n",arguments||sizes.empty()?"true":"false",ordinary?"cuLaunchKernel":"cuLaunchKernelEx",num_attrs);nvbit_enable_instrumented(ctx,f,selected);flush();
+        fprintf(log_file,"],\"arguments_present\":%s,\"launch_api\":\"%s\",\"launch_num_attrs\":%u,\"memory_skip_reason\":%s,\"implementation_version\":\"%016lx\",\"implementation_inspected\":%s}\n",inspect_arguments&&(arguments||sizes.empty())?"true":"false",ordinary?"cuLaunchKernel":"cuLaunchKernelEx",num_attrs,quote(skip_reason).c_str(),aggregate.hash,selected?"true":"false");nvbit_enable_instrumented(ctx,f,selected);flush();
     }else{
-        CHECK(*status);CHECK(cuCtxSynchronize());uint64_t kept=selected?std::min((uint64_t)buffer->count,capacity):0;
+        CHECK(*status);CHECK(cuCtxSynchronize());uint64_t kept=selected?std::min((uint64_t)buffer->count,(uint64_t)buffer->capacity):0;
+        if(selected)remaining_records-=kept;
         if(selected){std::string path=prefix+".launch"+std::to_string(launch_id)+".bin";FILE* f=fopen(path.c_str(),"wbx");if(!f)fail("binary must be new");if(fwrite(buffer->runs,sizeof(MemoryRun),kept,f)!=kept||fclose(f))fail("binary write failed");}
-        fprintf(log_file,"{\"type\":\"complete\",\"seq\":%lu,\"id\":%lu,\"runs\":%lu,\"dropped\":%lu}\n",position++,launch_id,kept,selected?(uint64_t)buffer->count-kept:0);++launch_id;flush();
+        fprintf(log_file,"{\"type\":\"complete\",\"seq\":%lu,\"id\":%lu,\"runs\":%lu,\"dropped\":%lu,\"drop_count_exact\":%s}\n",position++,launch_id,kept,selected?(uint64_t)buffer->count-kept+buffer->truncated:0,selected&&buffer->truncated?"false":"true");++launch_id;flush();
     }internal=false;
 }
 void nvbit_at_term(){if(log_file){fprintf(log_file,"{\"type\":\"end\",\"seq\":%lu,\"launches\":%lu}\n",position++,launch_id);flush();fclose(log_file);}}

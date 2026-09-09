@@ -7,6 +7,7 @@ struct MemoryRun {
 };
 struct TraceBuffer {
     unsigned long long count, capacity;
+    unsigned int truncated;
     MemoryRun runs[1];
 };
 static_assert(sizeof(MemoryRun)==32,"memory run decoder layout");

@@ -62,4 +62,18 @@ python -m tools.data.runtime_trace.lineage --snapshots snapshots.json --output l
 - 多活跃 CUDA context、多个 launch 主机线程、CUDA graph capture 当前拒绝；未支持 launch/内存 API 显式记 unknown
 - 采集会串行化执行，冷 forward 成本只用于诊断，不能作为训练性能分数
 
+## KernelGym 集成入口
+
+`service_replay.py` 接收 KernelGym 在正常 correctness trial 记录的输入/RNG capsule，分别执行 control、trace 和 CPU report；不在正常计时进程 preload tracer。默认重建模型后逐项验证 tensor state 内容 hash，也支持完整 state 恢复。输入 archive 保留 storage alias，临时 storage registry 有上限与原子 checkpoint，失败进程可保留部分图
+
+```bash
+python -m tools.data.runtime_trace.export --native /absolute/path/runtime_trace.so --output /node-local/tracer-bundle
+```
+
+Bundle 包含逐文件 manifest，KernelGym 的 `KERNELGYM_RUNTIME_GRAPH_BUNDLE` 指向它。KernelGym 源码集成与操作方配置说明在 `KernelGYM-component-runtime/docs/design-doc/RUNTIME_COMPONENT_GRAPH.md`；部署由主 Agent 负责
+
+服务采集使用 `RUNTIME_TRACE_TOTAL_RECORDS` 与 `RUNTIME_TRACE_MAX_LAUNCHES`，并设 `RUNTIME_TRACE_SKIP_VENDOR_MEMORY=1`，跳过 vendor 内部访存及静态解析。保留库 API 的关键配置与库版本，未检查的实现/ABI 明确 unknown。满容量后计数饱和，`dropped_runs_exact=false` 表示丢弃量仅为下界；不能拿它计算精确采样覆盖率。`RUNTIME_TRACE_MEMORY_POLICY=interfaces` 保留调用清单，访存未知
+
+该路径与此前 coarse 冻结批次分别保留实际版本与证据，不混算旧全指令结果；它返回观测与缺口，不实现 scalar reward
+
 实际案例、成本、冻结批次和复现 manifest 见 [组件追踪报告](../../../handoffs/paper/runtime_component_tracking.md)

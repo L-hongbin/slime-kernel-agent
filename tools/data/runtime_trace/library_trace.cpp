@@ -40,10 +40,11 @@ static long long begin(const char* api,cublasHandle_t handle,int ta,int tb,int m
     if(host&&alpha&&beta){if(f32){av=number(*(const float*)alpha);bv=number(*(const float*)beta);}else if(f64){av=number(*(const double*)alpha);bv=number(*(const double*)beta);}}
     char data[1800];snprintf(data,sizeof(data),"{\"ta\":%d,\"tb\":%d,\"m\":%d,\"n\":%d,\"k\":%d,\"a\":%lu,\"b\":%lu,\"c\":%lu,\"at\":%d,\"bt\":%d,\"ct\":%d,\"lda\":%d,\"ldb\":%d,\"ldc\":%d,\"alpha\":%s,\"beta\":%s,\"compute\":%d,\"algorithm\":%d,\"math_mode\":%d,\"pointer_mode\":%d,\"state_query_ok\":%s}",ta,tb,m,n,k,(uint64_t)a,(uint64_t)b,(uint64_t)c,at,bt,ct,lda,ldb,ldc,av.c_str(),bv.c_str(),compute,algorithm,(int)math,(int)pointer,(gs==CUBLAS_STATUS_SUCCESS&&gm==CUBLAS_STATUS_SUCCESS&&gp==CUBLAS_STATUS_SUCCESS)?"true":"false");
     Workspace ws;{std::lock_guard<std::mutex> guard(state_lock);ws=workspace[handle];}
+    int version=0;auto version_status=real<decltype(&cublasGetVersion_v2)>("cublasGetVersion_v2")(handle,&version);
     std::string attributes=data;attributes.pop_back();attributes+=",\"workspace_known\":";attributes+=ws.known?"true":"false";
     attributes+=",\"workspace_custom\":";attributes+=ws.custom?"true":"false";
     const char* mode=!ws.known?"unknown":!ws.explicitly_set?"default_pool":ws.bytes==0?"default_pool_disabled":ws.custom?"custom":"unknown";
-    attributes+=",\"workspace_mode\":\""+std::string(mode)+"\",\"workspace_bytes\":"+std::to_string(ws.bytes)+"}";
+    attributes+=",\"workspace_mode\":\""+std::string(mode)+"\",\"workspace_bytes\":"+std::to_string(ws.bytes)+",\"library_version\":"+(version_status==CUBLAS_STATUS_SUCCESS?std::to_string(version):"null")+"}";
     return coarse_library_begin(api,attributes.c_str(),(uint64_t)stream);
 }
 extern "C" cublasStatus_t cublasSgemm_v2(cublasHandle_t h,cublasOperation_t ta,cublasOperation_t tb,int m,int n,int k,
