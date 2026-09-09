@@ -266,7 +266,7 @@ def _log_rollout_info(
     prefix = "[cuda_agent]"
     if is_first:
         prefix += "[first]"
-    if is_slowest:
+    elif is_slowest:
         prefix += "[slowest]"
 
     metadata = sample.metadata or {}

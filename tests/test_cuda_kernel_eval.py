@@ -549,7 +549,8 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
         total_request_time=1.0,
     )
 
-    assert "[cuda_agent][first][slowest][rollout_info]" in caplog.text
+    assert "[cuda_agent][first][rollout_info]" in caplog.text
+    assert "[cuda_agent][first][slowest][rollout_info]" not in caplog.text
     assert "total_request_time=1.000s" in caplog.text
     assert f"compiled={case['feedback_compiled']}" in caplog.text
     assert "precheck=passed" in caplog.text
