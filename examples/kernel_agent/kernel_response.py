@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import threading
 import time
@@ -396,6 +397,14 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
     )
     if compute_sanitizer_mode is not None:
         task_payload["compute_sanitizer_mode"] = str(compute_sanitizer_mode)
+    runtime_graph = payload.get("runtime_graph")
+    if runtime_graph is None and getattr(args, "component_reward", False):
+        runtime_graph = {
+            "enabled": True,
+            "timeout_s": float(getattr(args, "runtime_graph_timeout", 60.0)),
+        }
+    if runtime_graph is not None:
+        task_payload["runtime_graph"] = runtime_graph
     return task_payload
 
 
@@ -507,8 +516,24 @@ async def _wait_kernel_eval_result(
 
 async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     config = dict(config)
+    component_payload = None
+    if getattr(args, "component_reward", False):
+        component_payload = _build_kernel_eval_payload(args, payload, config)
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["runtime_graph_expected_identity"] = {
+            "task_sha256": hashlib.sha256(component_payload["reference_code"].encode()).hexdigest(),
+            "candidate_source_sha256": hashlib.sha256(component_payload["kernel_code"].encode()).hexdigest(),
+        }
     eval_func_path = _kernel_eval_param(args, config, "kernel_eval_function_path", None)
     if eval_func_path:
+        if component_payload is not None:
+            payload = {
+                **payload,
+                **{
+                    key: component_payload[key]
+                    for key in ("task_id", "reference_code", "kernel_code", "runtime_graph")
+                },
+            }
         task_payload = {
             "task_id": payload.get("task_id"),
             "entry_point": payload.get("entry_point"),
@@ -526,7 +551,9 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
         return result
 
     worker = _get_kernel_eval_worker(args, config)
-    task_payload = _build_kernel_eval_payload(args, payload, config)
+    task_payload = (
+        component_payload if component_payload is not None else _build_kernel_eval_payload(args, payload, config)
+    )
     object_ref = worker.submit_and_poll.remote(
         task_payload,
         client_timeout=int(_kernel_eval_param(args, config, "kernel_eval_client_timeout")),

@@ -1712,6 +1712,10 @@ def compute_metrics_from_samples(args, samples):
     )
     if getattr(args, "use_multi_turn", False) or has_turn_metadata:
         log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
+    if getattr(args, "component_reward", False):
+        from examples.kernel_agent.component_reward import compute_component_reward_metrics
+
+        log_dict |= compute_component_reward_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
     log_dict |= _compute_spec_metrics(args, samples)
     log_dict |= _compute_prefix_cache_metrics(args, samples)

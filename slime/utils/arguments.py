@@ -2544,8 +2544,8 @@ def _validate_component_reward_args(args):
     if getattr(args, "dynamic_sampling_filter_path", None) and not getattr(args, "filter_by_last_turn", False):
         raise ValueError("--component-reward dynamic filtering requires --filter-by-last-turn for atomic trajectories")
     timeout = float(getattr(args, "runtime_graph_timeout", 60.0))
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ValueError("--runtime-graph-timeout must be finite and positive")
+    if not math.isfinite(timeout) or not 0 < timeout <= 120:
+        raise ValueError("--runtime-graph-timeout must be finite and in (0, 120], matching KernelGym")
 
 
 def _validate_turn_context_limits(args):

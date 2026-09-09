@@ -1540,10 +1540,17 @@ async def cuda_kernel_env(
     if not precheck_passed:
         if precheck_state is None:
             raise ValueError("precheck_response must return precheck_state when precheck fails.")
-        return {
+        result = {
             "env_state": precheck_state,
             "env_extra_info": _extract_env_extra_info(precheck_state),
         }
+        if getattr(args, "component_reward", False):
+            result["runtime_graph"] = {
+                "schema": "kernelgym-runtime-graph/v1",
+                "status": "unavailable",
+                "unknowns": ["client_precheck"],
+            }
+        return result
     else:
         task_id = next_kernel_task_id()
         metadata = dict(sample.metadata or {})
@@ -1585,12 +1592,37 @@ async def cuda_kernel_env(
         raw_env_state = kernel_eval_result
     if not isinstance(raw_env_state, dict):
         raise TypeError("Kernel eval result must be a dict or contain dict env_state.")
+    # Runtime evidence belongs to reward attribution, not the model's repair
+    # context. Separate it before feedback normalization and scalar scoring.
+    raw_metadata = raw_env_state.get("metadata")
+    runtime_graph = None
+    if isinstance(raw_metadata, dict) and "runtime_graph" in raw_metadata:
+        runtime_graph = raw_metadata["runtime_graph"]
+        raw_env_state = {
+            **raw_env_state,
+            "metadata": {key: value for key, value in raw_metadata.items() if key != "runtime_graph"},
+        }
+        if not isinstance(runtime_graph, dict):
+            runtime_graph = {
+                "schema": "kernelgym-runtime-graph/v1",
+                "status": "invalid",
+                "unknowns": ["response_runtime_graph_not_object"],
+            }
+    elif getattr(args, "component_reward", False):
+        runtime_graph = {
+            "schema": "kernelgym-runtime-graph/v1",
+            "status": "unavailable",
+            "unknowns": ["missing_server_graph"],
+        }
     normalized_env_state, env_extra_info = normalize_env_feedback(raw_env_state)
-    return {
+    result = {
         "env_state": normalized_env_state,
         "env_extra_info": env_extra_info,
         "reward_extra_info": normalized_env_state,
     }
+    if runtime_graph is not None:
+        result["runtime_graph"] = runtime_graph
+    return result
 
 
 def _sample_for_turn(
@@ -1639,6 +1671,9 @@ def _sample_for_turn(
             "env_extra_info": env_extra_info,
         }
     )
+    turn_sample.metadata.pop("runtime_graph", None)
+    if "runtime_graph" in env_result:
+        turn_sample.metadata["runtime_graph"] = env_result["runtime_graph"]
     # Populate speculative-decoding / prefix-cache stats from the engine meta_info
     # so rollout/spec_accept_rate and rollout/prefix_cache_hit_rate are not silently 0.
     # Only the stat sub-updates are applied here (not the full update_from_meta_info)

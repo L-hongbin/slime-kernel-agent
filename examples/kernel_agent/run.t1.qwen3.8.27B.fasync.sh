@@ -231,6 +231,12 @@ FIRST_TURN_CONTEXT_LEN=${FIRST_TURN_CONTEXT_LEN:-24576}
 MAX_TURNS=${MAX_TURNS:-2}
 TURN_MAX_CONTEXT_LENS=${TURN_MAX_CONTEXT_LENS:-}
 PACK_MULTI_TURN_TRAJECTORIES=${PACK_MULTI_TURN_TRAJECTORIES:-0}
+COMPONENT_REWARD=${COMPONENT_REWARD:-0}
+RUNTIME_GRAPH_TIMEOUT=${RUNTIME_GRAPH_TIMEOUT:-60}
+if ! [[ "${COMPONENT_REWARD}" =~ ^[01]$ ]]; then
+   echo "COMPONENT_REWARD must be 0 or 1." >&2
+   exit 1
+fi
 if ! [[ "${PACK_MULTI_TURN_TRAJECTORIES}" =~ ^[01]$ ]]; then
    echo "PACK_MULTI_TURN_TRAJECTORIES must be 0 or 1." >&2
    exit 1
@@ -610,6 +616,9 @@ if [[ -n "${TURN_MAX_CONTEXT_LENS}" ]]; then
 fi
 if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
    TURN_POLICY_LABEL+=".Packed"
+fi
+if [[ "${COMPONENT_REWARD}" == "1" ]]; then
+   TURN_POLICY_LABEL+=".ComponentCredit"
 fi
 
 
@@ -1492,8 +1501,12 @@ esac
 # discard every completed group and replenish forever.  Keep the production
 # n=16 filter unchanged, and bypass it only for the n=1 diagnostic path.
 if [[ "${DEBUG_ROLLOUT_ONLY}" != "1" || "${N_SAMPLES_PER_PROMPT}" -gt 1 ]]; then
+   DYNAMIC_SAMPLING_FILTER=examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
+   if [[ "${COMPONENT_REWARD}" == "1" ]]; then
+      DYNAMIC_SAMPLING_FILTER=examples.kernel_agent.component_reward.filter_component_reward_group
+   fi
    CUSTOM_ARGS+=(
-      --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
+      --dynamic-sampling-filter-path "${DYNAMIC_SAMPLING_FILTER}"
    )
 else
    echo "debug-rollout-only with n_samples_per_prompt=1: bypassing zero-variance dynamic sampling filter"
@@ -1547,6 +1560,9 @@ else
 fi
 if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
    KERNEL_AGENT_ARGS+=(--pack-multi-turn-trajectories)
+fi
+if [[ "${COMPONENT_REWARD}" == "1" ]]; then
+   KERNEL_AGENT_ARGS+=(--component-reward --runtime-graph-timeout "${RUNTIME_GRAPH_TIMEOUT}")
 fi
 
 if [[ "${ROLLOUT_CORRECTION_MODE}" == "hard_sequence_mis" ]]; then
@@ -1785,6 +1801,7 @@ prepare_node_local_resume_metadata() {
 
 if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'ENABLE_MTP_TRAINING=%s\n' "${ENABLE_MTP_TRAINING}"
+   printf 'COMPONENT_REWARD=%s\nRUNTIME_GRAPH_TIMEOUT=%s\n' "${COMPONENT_REWARD}" "${RUNTIME_GRAPH_TIMEOUT}"
    printf 'PACK_MULTI_TURN_TRAJECTORIES=%s\nMAX_TURNS=%s\nTURN_MAX_CONTEXT_LENS=%s\n' \
       "${PACK_MULTI_TURN_TRAJECTORIES}" "${MAX_TURNS}" "${TURN_MAX_CONTEXT_LENS}"
    printf 'TRAIN_DTYPE=bf16\nROLLOUT_CHECKPOINT=%s\nTRAIN_CHECKPOINT=%s\n' \

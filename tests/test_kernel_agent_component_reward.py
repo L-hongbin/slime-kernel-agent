@@ -441,6 +441,7 @@ def test_default_off_matches_existing_rewards_metadata_and_rng():
         {"advantage_estimator": "grpo"},
         {"runtime_graph_timeout": 0},
         {"runtime_graph_timeout": float("inf")},
+        {"runtime_graph_timeout": 121},
         {"custom_reward_post_process_path": None},
         {"dynamic_sampling_filter_path": "examples.kernel_agent.kernel_filter.filter_cuda_kernel_group"},
         {"filter_by_last_turn": False},
