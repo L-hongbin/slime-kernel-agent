@@ -1204,12 +1204,23 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
                 "partial_credit_output_mismatch": partial_applied,
                 "partial_credit_output_mismatch_reason": partial_reason,
                 "penalty_score": float(reward_details["penalty_score"]),
+                "reward_components": {
+                    key: float(reward_details[key])
+                    for key in (
+                        "reward_correctness_component",
+                        "reward_performance_component",
+                        "reward_coverage_component",
+                        "reward_partial_component",
+                        "reward_penalty_component",
+                    )
+                },
             }
         )
         env_extra_info = metadata.get("env_extra_info")
         if isinstance(env_extra_info, dict):
             env_extra_info["partial_credit_output_mismatch"] = partial_applied
             env_extra_info["partial_credit_output_mismatch_reason"] = partial_reason
+            env_extra_info["speedup_log_standard_error"] = reward_details.get("speedup_log_standard_error")
         sample.metadata = metadata
         return float(reward_details["reward"])
 

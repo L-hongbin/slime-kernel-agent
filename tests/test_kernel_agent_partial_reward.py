@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,11 @@ sys.path.insert(0, repo_root_path)
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
-from examples.kernel_agent.kernel_reward import calculate_reward_speedup
+from examples.kernel_agent.kernel_reward import (
+    _compute_speedup_log_standard_error,
+    _compute_speedup_reward_value,
+    calculate_reward_speedup,
+)
 from examples.kernel_agent.utils import _apply_overlong_penalty, normalize_env_feedback
 from slime.utils.types import Sample
 
@@ -43,10 +48,12 @@ def _completed_env(
     candidate_forward_completed: bool = False,
     runtime_error: str | None = None,
     speedup: float = 0.0,
+    timing_metadata: dict | None = None,
 ) -> dict:
     metadata = {
         "correctness_candidate_forward_completed": candidate_forward_completed,
         "correctness_output_mismatch": output_mismatch,
+        **(timing_metadata or {}),
     }
     env_state = {
         "status": "completed",
@@ -174,6 +181,42 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
     assert legacy_keys.isdisjoint(reward_config)
 
 
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, "legacy"), ("improvement", "improvement"), ("lcb_improvement", "lcb_improvement")],
+)
+def test_speedup_reward_mode_reads_environment(monkeypatch, env_value, expected):
+    env_name = "CUDA_AGENT_SPEEDUP_REWARD_MODE"
+    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
+    monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+
+    config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_speedup_reward_mode_env_test", config_path)
+    assert spec is not None and spec.loader is not None
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+
+    assert config_module.CUDA_AGENT_CONFIGS["reward"]["speedup_reward_mode"] == expected
+
+
+def test_speedup_reward_mode_rejects_unknown_environment_value(monkeypatch):
+    monkeypatch.setenv("CUDA_AGENT_SPEEDUP_REWARD_MODE", "unknown")
+    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
+    monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
+
+    config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_invalid_speedup_reward_mode_env_test", config_path)
+    assert spec is not None and spec.loader is not None
+    config_module = importlib.util.module_from_spec(spec)
+
+    with pytest.raises(ValueError, match="CUDA_AGENT_SPEEDUP_REWARD_MODE"):
+        spec.loader.exec_module(config_module)
+
+
 @pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
 def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expected):
     env_name = "CUDA_AGENT_APPLY_FAILED_GROUP_REWARD"
@@ -284,6 +327,32 @@ def test_failed_score_is_the_base_reward_for_failed_sample():
 
     assert details["reward"] == -2.0
     assert details["penalty_score"] == -0.25
+    assert details["reward_correctness_component"] == -2.0
+
+
+@pytest.mark.parametrize(
+    "env_state",
+    [
+        _completed_env(correctness=True, speedup=2.0),
+        _completed_env(output_mismatch=True, candidate_forward_completed=True),
+        _completed_env(compiled=False),
+        {"status": "failed", "compiled": None, "correctness": None, "metadata": {}},
+    ],
+)
+def test_reward_components_sum_to_reward(env_state):
+    details = calculate_reward_speedup(env_state, _reward_config())
+
+    component_sum = sum(
+        details[key]
+        for key in (
+            "reward_correctness_component",
+            "reward_performance_component",
+            "reward_coverage_component",
+            "reward_partial_component",
+            "reward_penalty_component",
+        )
+    )
+    assert component_sum == pytest.approx(details["reward"])
 
 
 def test_output_mismatch_requires_compilation_contract():
@@ -321,6 +390,81 @@ def test_qwen_policy_gates_performance_reward_on_correctness_without_changing_gl
     assert CUDA_AGENT_CONFIGS["reward"]["performance_reward_requires_correctness"] is False
     assert qwen_details["reward"] == 0.0
     assert legacy_details["reward"] == pytest.approx(1.0)
+
+
+def test_improvement_speedup_reward_only_rewards_gain_over_reference():
+    config = {
+        **_reward_config(),
+        "coverage_reward_enable": False,
+        "speedup_reward_mode": "improvement",
+        "speedup_reward_upper_bound": 2.0,
+    }
+
+    baseline = calculate_reward_speedup(_completed_env(correctness=True, speedup=1.0), config)
+    improved = calculate_reward_speedup(_completed_env(correctness=True, speedup=1.5), config)
+
+    assert baseline["speedup_reward"] == 0.0
+    assert baseline["speedup_log_standard_error"] is None
+    assert baseline["reward"] == pytest.approx(0.5)
+    assert improved["speedup_reward"] == pytest.approx(0.5)
+    assert improved["reward_performance_component"] == pytest.approx(0.25)
+    assert improved["reward"] == pytest.approx(0.75)
+
+
+def test_lcb_improvement_uses_timing_uncertainty_before_reward_mapping():
+    config = {
+        **_reward_config(),
+        "coverage_reward_enable": False,
+        "speedup_reward_mode": "lcb_improvement",
+        "speedup_reward_upper_bound": 2.0,
+        "speedup_uncertainty_z_score": 2.0,
+        "speedup_uncertainty_log_std_floor": 0.01,
+    }
+    timing_metadata = {
+        "kg_kernel_perf_mean_ms": 10.0,
+        "kg_kernel_perf_std_ms": 2.0,
+        "kg_kernel_perf_num_trials": 100,
+        "kg_reference_perf_mean_ms": 20.0,
+        "kg_reference_perf_std_ms": 2.0,
+        "kg_reference_perf_num_trials": 25,
+    }
+
+    expected_log_se = (0.2**2 / 100 + 0.1**2 / 25 + 0.01**2) ** 0.5
+    actual_log_se = _compute_speedup_log_standard_error(timing_metadata, config)
+    speedup_reward = _compute_speedup_reward_value(2.0, "lcb_improvement", timing_metadata, config)
+    expected_lcb = 2.0 * math.exp(-2.0 * expected_log_se)
+    assert actual_log_se == pytest.approx(expected_log_se)
+    assert speedup_reward == pytest.approx(expected_lcb - 1.0)
+
+
+def test_lcb_improvement_rejects_missing_timing_metadata():
+    config = {**_reward_config(), "speedup_reward_mode": "lcb_improvement"}
+
+    with pytest.raises(ValueError, match="timing metadata"):
+        _compute_speedup_log_standard_error(None, config)
+
+
+def test_lcb_improvement_supports_cached_reference_with_noise_floor():
+    config = {
+        **_reward_config(),
+        "coverage_reward_enable": False,
+        "speedup_reward_mode": "lcb_improvement",
+        "speedup_uncertainty_z_score": 1.0,
+        "speedup_uncertainty_log_std_floor": 0.02,
+    }
+    timing_metadata = {
+        "cached": True,
+        "kg_kernel_perf_mean_ms": 10.0,
+        "kg_kernel_perf_std_ms": 1.0,
+        "kg_kernel_perf_num_trials": 100,
+    }
+
+    expected_log_se = (0.1**2 / 100 + 0.02**2) ** 0.5
+    actual_log_se = _compute_speedup_log_standard_error(timing_metadata, config)
+    speedup_reward = _compute_speedup_reward_value(1.5, "lcb_improvement", timing_metadata, config)
+    expected_lcb = 1.5 * math.exp(-expected_log_se)
+    assert actual_log_se == pytest.approx(expected_log_se)
+    assert speedup_reward == pytest.approx(expected_lcb - 1.0)
 
 
 def test_normalization_uses_runtime_error_code_for_partial_reward():
@@ -369,7 +513,13 @@ def test_reward_func_records_partial_audit_metadata(monkeypatch):
     assert reward == pytest.approx(0.25)
     assert sample.metadata["partial_credit_output_mismatch"] is True
     assert sample.metadata["partial_credit_output_mismatch_reason"] == "applied"
-    assert "reward_components" not in sample.metadata
+    assert sample.metadata["reward_components"] == {
+        "reward_correctness_component": 0.0,
+        "reward_performance_component": 0.0,
+        "reward_coverage_component": 0.0,
+        "reward_partial_component": 0.25,
+        "reward_penalty_component": 0.0,
+    }
     assert sample.metadata["env_extra_info"]["partial_credit_output_mismatch"] is True
     assert "failure_stage" not in sample.metadata
     assert sample.metadata["penalty_score"] == pytest.approx(-0.25)
@@ -426,6 +576,7 @@ def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
                 "correctness": False,
                 "compilation": True,
                 "speedup": 0.0,
+                "speedup_log_standard_error": 0.0125,
                 "decoy_kernel": False,
                 "correctness_candidate_forward_completed": True,
                 "correctness_output_mismatch": True,
@@ -458,6 +609,7 @@ def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
     assert metrics["kernel/partial_credit/rejected_timeout_count"] == 1
     assert metrics["kernel/overlong_penalty/mean"] == pytest.approx(0.1)
     assert "env_extra_info/partial_credit_output_mismatch/mean" not in metrics
+    assert metrics["env_extra_info/speedup_log_standard_error/mean"] == pytest.approx(0.0125)
     assert not any("reward_component" in key for key in metrics)
     assert metrics["kernel/incorrect_backend_probe/attempted_ratio"] == pytest.approx(0.25)
     assert metrics["kernel/incorrect_backend_probe/valid_ratio_of_attempted"] == 1.0

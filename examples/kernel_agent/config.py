@@ -44,6 +44,20 @@ correctness_timeout = (
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 # Reward settings.
+# Speedup reward mapping. ``legacy`` preserves the historical clipped raw
+# speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].
+# ``lcb_improvement`` applies a lower confidence bound to speedup first, using
+# timing statistics returned by KernelGYM, and then uses the same mapping.
+speedup_reward_mode = os.environ.get("CUDA_AGENT_SPEEDUP_REWARD_MODE", "legacy").strip().lower()
+if speedup_reward_mode not in {"legacy", "improvement", "lcb_improvement"}:
+    raise ValueError("CUDA_AGENT_SPEEDUP_REWARD_MODE must be one of: legacy, improvement, lcb_improvement")
+speedup_uncertainty_z_score = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE", 1.96))
+speedup_uncertainty_log_std_floor = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR", 0.0))
+enable_dynamic_reward_weight = bool(int(os.environ.get("CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT", "0")))
+if speedup_uncertainty_z_score < 0.0:
+    raise ValueError("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE must be non-negative")
+if speedup_uncertainty_log_std_floor < 0.0:
+    raise ValueError("CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR must be non-negative")
 # Optional reward for a candidate that compiled, completed its forward pass,
 # and reached KernelGym's shape/value comparison but produced a wrong output.
 # Default off so launchers keep their historical reward policy. Set a positive
@@ -147,8 +161,14 @@ CUDA_AGENT_CONFIGS = {
     "reward": {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
+        "speedup_reward_mode": speedup_reward_mode,
         "speedup_reward_upper_bound": 2.0,
         "speedup_reward_lower_bound": 0.0,
+        "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
+        "speedup_uncertainty_log_std_floor": speedup_uncertainty_log_std_floor,
+        # Keep the configured 0.5 maxima, but gate both auxiliary objectives by
+        # sqrt(max((num_correct - 1) / (group_size - 1), 0)).
+        "enable_dynamic_reward_weight": enable_dynamic_reward_weight,
         "failed_score": 0.0,
         "apply_penalty_score": apply_penalty_score,
         "apply_failed_group_reward": apply_failed_group_reward,

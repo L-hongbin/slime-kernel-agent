@@ -11,10 +11,10 @@ from slime.utils.types import Sample
 
 try:
     from .config import CUDA_AGENT_CONFIGS
-    from .kernel_reward import _apply_failed_group_reward
+    from .kernel_reward import _apply_dynamic_group_reward_weights, _apply_failed_group_reward
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
-    from kernel_reward import _apply_failed_group_reward
+    from kernel_reward import _apply_dynamic_group_reward_weights, _apply_failed_group_reward
 
 logger = logging.getLogger(__name__)
 _FILTER_CONFIG_LOGGED = False
@@ -124,6 +124,7 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
             for sample in valid_samples
         ]
         reward_config = CUDA_AGENT_CONFIGS["reward"]
+        rewards = _apply_dynamic_group_reward_weights(valid_samples, rewards, reward_config)
         if bool(reward_config["apply_failed_group_reward"]):
             failed_score = float(reward_config["failed_score"])
             rewards = _apply_failed_group_reward(valid_samples, rewards, failed_score)

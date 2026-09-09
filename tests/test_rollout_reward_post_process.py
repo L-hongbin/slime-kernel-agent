@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_reward import reward_post_process_by_group
+from examples.kernel_agent.kernel_reward import _compute_dynamic_auxiliary_gate, reward_post_process_by_group
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
 
@@ -23,6 +23,7 @@ def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_no
         rewards_normalization=True,
         rollout_batch_size=2,
         use_multi_turn=use_multi_turn,
+        multi_turn_gamma=1.0,
     )
     return manager
 
@@ -39,6 +40,118 @@ def _make_sample(index: int, group_index: int, reward: float, turn_idx: int | No
     if turn_idx is not None:
         metadata["turn_idx"] = turn_idx
     return Sample(index=index, group_index=group_index, reward=reward, metadata=metadata)
+
+
+def _set_reward_components(
+    sample: Sample,
+    *,
+    correctness: float = 0.0,
+    speedup: float = 0.0,
+    coverage: float = 0.0,
+    partial: float = 0.0,
+    penalty: float = 0.0,
+) -> None:
+    sample.metadata["reward_components"] = {
+        "reward_correctness_component": correctness,
+        "reward_performance_component": speedup,
+        "reward_coverage_component": coverage,
+        "reward_partial_component": partial,
+        "reward_penalty_component": penalty,
+    }
+    sample.metadata["env_extra_info"] = {
+        "correctness": correctness > 0.0,
+        "decoy_kernel": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_correct", "group_size", "expected"),
+    [
+        (0, 16, 0.0),
+        (1, 16, 0.0),
+        (4, 16, (3.0 / 15.0) ** 0.5),
+        (16, 16, 1.0),
+        (1, 1, 0.0),
+    ],
+)
+def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: float):
+    assert _compute_dynamic_auxiliary_gate(num_correct, group_size) == pytest.approx(expected)
+
+
+def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+    manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    samples = [
+        _make_sample(0, 0, 0.0),
+        _make_sample(1, 0, 0.8),
+        _make_sample(2, 0, 1.2),
+        _make_sample(3, 0, 0.0),
+    ]
+    _set_reward_components(samples[0])
+    _set_reward_components(samples[1], correctness=0.5, speedup=0.1, coverage=0.2)
+    _set_reward_components(samples[2], correctness=0.5, speedup=0.3, coverage=0.4)
+    _set_reward_components(samples[3])
+
+    raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
+
+    gate = (1.0 / 3.0) ** 0.5
+    expected_raw = [0.0, 0.5 + gate * 0.3, 0.5 + gate * 0.7, 0.0]
+    mean = sum(expected_raw) / len(expected_raw)
+    expected_advantages = [(reward - mean) * 4.0 / 3.0 for reward in expected_raw]
+    assert raw_rewards == pytest.approx(expected_raw)
+    assert advantages == pytest.approx(expected_advantages)
+
+
+def test_dynamic_reward_all_correct_matches_fixed_half_weights(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+    manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    samples = [_make_sample(index, 0, reward) for index, reward in enumerate([0.6, 0.8, 1.0])]
+    for sample, speedup in zip(samples, [0.1, 0.2, 0.3], strict=True):
+        _set_reward_components(sample, correctness=0.5, speedup=speedup, coverage=sample.reward - 0.5 - speedup)
+
+    raw_rewards, _advantages = reward_post_process_by_group(manager.args, samples)
+
+    assert raw_rewards == pytest.approx([0.6, 0.8, 1.0])
+
+
+def test_dynamic_reward_keeps_overlong_penalty_additive(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+    manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    correct = _make_sample(0, 0, 0.8)
+    incorrect = _make_sample(1, 0, 0.0)
+    _set_reward_components(correct, correctness=0.5, speedup=0.5)
+    _set_reward_components(incorrect)
+    correct.metadata["task_reward"] = 1.0
+    correct.metadata["overlong_penalty"] = 0.2
+
+    raw_rewards, _advantages = reward_post_process_by_group(manager.args, [correct, incorrect])
+
+    # C=1 makes the auxiliary gate zero: 0.5 correctness - 0.2 penalty.
+    assert raw_rewards == pytest.approx([0.3, 0.0])
+
+
+def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+    manager = _make_manager(advantage_estimator="trloo", use_multi_turn=True)
+    manager.args.multi_turn_gamma = 0.5
+    samples = [
+        _make_sample(0, 0, 0.6, turn_idx=0),
+        _make_sample(1, 0, 0.7, turn_idx=0),
+        _make_sample(0, 0, 0.9, turn_idx=1),
+        _make_sample(1, 0, 0.0, turn_idx=1),
+    ]
+    _set_reward_components(samples[0], correctness=0.5, speedup=0.1)
+    _set_reward_components(samples[1], correctness=0.5, speedup=0.2)
+    _set_reward_components(samples[2], correctness=0.5, speedup=0.4)
+    _set_reward_components(samples[3])
+    for sample in samples:
+        sample.metadata["multi_turn_reward"] = -999.0
+
+    raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
+
+    # turn 0: C=N => gate 1; turn 1: C=1 => gate 0.
+    assert raw_rewards == pytest.approx([0.85, 0.7, 0.5, 0.0])
+    assert advantages == pytest.approx([0.15, -0.15, 0.5, -0.5])
 
 
 @pytest.mark.parametrize(

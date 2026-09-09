@@ -1,3 +1,4 @@
+import math
 import random
 from typing import Any
 
@@ -32,6 +33,200 @@ except ImportError:
 def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
     env_state = env_result.get("env_state") if isinstance(env_result, dict) else {}
     return calculate_reward_speedup(env_state, config)["reward"]
+
+
+def _timing_cv_and_trials(metadata: dict[str, Any], prefix: str) -> tuple[float, int]:
+    mean = metadata.get(f"{prefix}_mean_ms")
+    std = metadata.get(f"{prefix}_std_ms")
+    num_trials = metadata.get(f"{prefix}_num_trials")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in (mean, std, num_trials)):
+        raise ValueError(f"{prefix} timing metadata must include numeric mean_ms, std_ms, and num_trials")
+
+    mean = float(mean)
+    std = float(std)
+    num_trials = int(num_trials)
+    if not math.isfinite(mean) or mean <= 0.0:
+        raise ValueError(f"{prefix}_mean_ms must be positive and finite")
+    if not math.isfinite(std) or std < 0.0:
+        raise ValueError(f"{prefix}_std_ms must be non-negative and finite")
+    if num_trials <= 0:
+        raise ValueError(f"{prefix}_num_trials must be positive")
+    return std / mean, num_trials
+
+
+def _compute_speedup_log_standard_error(metadata: dict[str, Any] | None, config: dict[str, Any]) -> float:
+    if not isinstance(metadata, dict):
+        raise ValueError("lcb_improvement requires timing metadata")
+    kernel_cv, kernel_trials = _timing_cv_and_trials(metadata, "kg_kernel_perf")
+    reference_keys = {
+        "kg_reference_perf_mean_ms",
+        "kg_reference_perf_std_ms",
+        "kg_reference_perf_num_trials",
+    }
+    if reference_keys.issubset(metadata):
+        reference_cv, reference_trials = _timing_cv_and_trials(metadata, "kg_reference_perf")
+    elif metadata.get("cached") is True:
+        # KernelGYM's reference cache currently stores only the mean runtime.
+        # Treat that shared baseline as fixed; the configured log-noise floor
+        # is the place to account for cache age and cross-block drift.
+        reference_cv, reference_trials = 0.0, 1
+    else:
+        raise ValueError("lcb_improvement requires reference timing metadata unless the reference runtime is cached")
+
+    log_std_floor = float(config.get("speedup_uncertainty_log_std_floor", 0.0))
+    if not math.isfinite(log_std_floor) or log_std_floor < 0.0:
+        raise ValueError("speedup_uncertainty_log_std_floor must be non-negative and finite")
+    return math.sqrt(kernel_cv**2 / kernel_trials + reference_cv**2 / reference_trials + log_std_floor**2)
+
+
+def _compute_speedup_reward_value(
+    speedup: float,
+    mode: str,
+    metadata: dict[str, Any] | None,
+    config: dict[str, Any],
+) -> float:
+    """Map a raw evaluator speedup to the scalar performance score."""
+
+    mode = str(mode).strip().lower()
+    allowed_modes = {"legacy", "improvement", "lcb_improvement"}
+    if mode not in allowed_modes:
+        raise ValueError(f"speedup_reward_mode must be one of {sorted(allowed_modes)}, got {mode!r}")
+
+    upper_bound = float(config["speedup_reward_upper_bound"])
+    lower_bound = float(config["speedup_reward_lower_bound"])
+    if mode == "legacy":
+        speedup_reward = min(speedup, upper_bound)
+        return 0.0 if speedup_reward < lower_bound else speedup_reward
+
+    if not math.isfinite(speedup) or speedup <= 0.0:
+        return 0.0
+    if not math.isfinite(upper_bound) or upper_bound <= 1.0:
+        raise ValueError("speedup_reward_upper_bound must be greater than 1.0 for improvement modes")
+
+    if mode == "lcb_improvement":
+        speedup_log_standard_error = _compute_speedup_log_standard_error(metadata, config)
+        z_score = float(config.get("speedup_uncertainty_z_score", 1.96))
+        if not math.isfinite(z_score) or z_score < 0.0:
+            raise ValueError("speedup_uncertainty_z_score must be non-negative and finite")
+        speedup *= math.exp(-z_score * speedup_log_standard_error)
+
+    if speedup < lower_bound:
+        return 0.0
+    return min(max((speedup - 1.0) / (upper_bound - 1.0), 0.0), 1.0)
+
+
+_REWARD_COMPONENT_KEYS = (
+    "reward_correctness_component",
+    "reward_performance_component",
+    "reward_coverage_component",
+    "reward_partial_component",
+    "reward_penalty_component",
+)
+
+
+def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int) -> float:
+    """Return the shared speedup/coverage gate for one valid reward group."""
+
+    if group_size <= 1 or num_correct <= 1:
+        return 0.0
+    return math.sqrt(max((num_correct - 1) / (group_size - 1), 0.0))
+
+
+def _sample_is_correct(sample) -> bool:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    env_extra_info = metadata.get("env_extra_info")
+    if isinstance(env_extra_info, dict) and "correctness" in env_extra_info:
+        return bool(env_extra_info["correctness"]) and not bool(env_extra_info.get("decoy_kernel", False))
+
+    components = metadata.get("reward_components")
+    return isinstance(components, dict) and float(components.get("reward_correctness_component", 0.0)) > 0.0
+
+
+def _apply_dynamic_group_reward_weights(
+    samples,
+    rewards,
+    config: dict[str, Any],
+) -> list[float]:
+    """Rescale speedup and coverage components with one gate shared by the group.
+
+    ``rewards`` may already contain additive shaping such as an overlong
+    penalty. The residual relative to the recorded task components is kept
+    unchanged, so only speedup and coverage are dynamically reweighted.
+    """
+
+    rewards = [float(reward) for reward in rewards]
+    if not config.get("enable_dynamic_reward_weight", False):
+        return rewards
+    if len(samples) != len(rewards):
+        raise ValueError("samples and rewards must have the same length")
+
+    group_size = len(samples)
+    num_correct = sum(_sample_is_correct(sample) for sample in samples)
+    gate = _compute_dynamic_auxiliary_gate(num_correct, group_size)
+    dynamic_rewards = []
+    for sample, reward in zip(samples, rewards, strict=True):
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        components = metadata.get("reward_components")
+        if not isinstance(components, dict) or any(key not in components for key in _REWARD_COMPONENT_KEYS):
+            dynamic_rewards.append(reward)
+            continue
+
+        correctness, performance, coverage, partial, penalty = (
+            float(components[key]) for key in _REWARD_COMPONENT_KEYS
+        )
+        static_task_reward = correctness + performance + coverage + partial + penalty
+        additive_residual = reward - static_task_reward
+        dynamic_task_reward = correctness + gate * (performance + coverage) + partial + penalty
+        dynamic_rewards.append(dynamic_task_reward + additive_residual)
+    return dynamic_rewards
+
+
+def _dynamic_raw_rewards(args, samples, config: dict[str, Any]) -> list[float]:
+    """Apply per-turn group weights and rebuild TRLOO trajectory returns."""
+
+    turn_rewards = [0.0 if sample.remove_sample else float(sample.get_reward_value(args)) for sample in samples]
+    reward_groups: dict[object, list[int]] = {}
+    for idx, sample in enumerate(samples):
+        if sample.remove_sample:
+            continue
+        group_key: object = sample.group_index
+        if getattr(args, "use_multi_turn", False):
+            turn_idx = sample.metadata.get("turn_idx") if isinstance(sample.metadata, dict) else None
+            assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
+            group_key = group_key, int(turn_idx)
+        reward_groups.setdefault(group_key, []).append(idx)
+
+    for group_indices in reward_groups.values():
+        group_samples = [samples[idx] for idx in group_indices]
+        group_values = _apply_dynamic_group_reward_weights(
+            group_samples,
+            [turn_rewards[idx] for idx in group_indices],
+            config,
+        )
+        for idx, reward in zip(group_indices, group_values, strict=True):
+            turn_rewards[idx] = reward
+
+    if args.advantage_estimator != "trloo" or not getattr(args, "use_multi_turn", False):
+        return turn_rewards
+
+    gamma = float(getattr(args, "multi_turn_gamma", 1.0))
+    trajectory_groups: dict[tuple[object, object], list[int]] = {}
+    for idx, sample in enumerate(samples):
+        trajectory_id = sample.rollout_id if sample.rollout_id is not None else sample.index
+        trajectory_groups.setdefault((sample.group_index, trajectory_id), []).append(idx)
+
+    raw_rewards = [0.0] * len(samples)
+    for trajectory_indices in trajectory_groups.values():
+        trajectory_indices.sort(
+            key=lambda idx: int(samples[idx].metadata.get("turn_idx", 0)),
+            reverse=True,
+        )
+        cumulative_reward = 0.0
+        for idx in trajectory_indices:
+            turn_reward = 0.0 if samples[idx].remove_sample else turn_rewards[idx]
+            cumulative_reward = turn_reward + gamma * cumulative_reward
+            raw_rewards[idx] = cumulative_reward
+    return raw_rewards
 
 
 def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
@@ -92,7 +287,10 @@ def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
 
 
 def reward_post_process_by_group(args, samples):
-    if args.advantage_estimator == "trloo":
+    reward_config = CUDA_AGENT_CONFIGS["reward"]
+    if reward_config.get("enable_dynamic_reward_weight", False):
+        raw_rewards = _dynamic_raw_rewards(args, samples, reward_config)
+    elif args.advantage_estimator == "trloo":
         raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     else:
         raw_rewards = [sample.get_reward_value(args) for sample in samples]
@@ -115,7 +313,6 @@ def reward_post_process_by_group(args, samples):
         reward_groups.setdefault(group_index, []).append(idx)
 
     group_stats: dict[object, dict[str, float]] = {}
-    reward_config = CUDA_AGENT_CONFIGS["reward"]
     apply_failed_group_reward = bool(reward_config["apply_failed_group_reward"])
     failed_score = float(reward_config["failed_score"])
     for group_index, group_indices in reward_groups.items():
@@ -313,6 +510,12 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "partial_credit_output_mismatch": partial_applied,
             "partial_credit_output_mismatch_reason": partial_reason,
             "penalty_score": penalty_score,
+            "reward_correctness_component": 0.0,
+            "reward_performance_component": 0.0,
+            "reward_coverage_component": 0.0,
+            "reward_partial_component": 0.0,
+            "reward_penalty_component": reward,
+            "speedup_log_standard_error": None,
         }
 
     if env_state.get("decoy_kernel", False):
@@ -326,26 +529,47 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
             "partial_credit_output_mismatch": partial_applied,
             "partial_credit_output_mismatch_reason": partial_reason,
             "penalty_score": penalty_score,
+            "reward_correctness_component": 0.0,
+            "reward_performance_component": 0.0,
+            "reward_coverage_component": 0.0,
+            "reward_partial_component": 0.0,
+            "reward_penalty_component": reward,
+            "speedup_log_standard_error": None,
         }
 
     correctness = bool(env_state.get("correctness", False))
     compiled = bool(env_state.get("compiled", False))
     speedup = env_state.get("speedup", 0.0)
     speedup = 0.0 if speedup is None else float(speedup)
+    speedup_reward_mode = str(config.get("speedup_reward_mode", "legacy")).strip().lower()
+    speedup_log_standard_error = None
+    if speedup_reward_mode == "lcb_improvement" and math.isfinite(speedup) and speedup > 0.0:
+        speedup_log_standard_error = _compute_speedup_log_standard_error(env_state.get("metadata"), config)
 
-    reward_speedup = min(speedup, float(config["speedup_reward_upper_bound"]))
-    if reward_speedup < float(config["speedup_reward_lower_bound"]):
-        reward_speedup = 0.0
+    speedup_reward = _compute_speedup_reward_value(
+        speedup,
+        speedup_reward_mode,
+        env_state.get("metadata"),
+        config,
+    )
 
+    correctness_reward = 0.0
+    performance_reward = 0.0
+    coverage_reward = 0.0
+    partial_component = 0.0
+    penalty_component = 0.0
     if apply_penalty_score and not (compiled and correctness):
         reward = penalty_score
+        penalty_component = reward
     elif not compiled:
         reward = failed_score
+        penalty_component = reward
     elif partial_applied:
         reward = partial_reward
+        partial_component = reward
     else:
         correctness_reward = float(config["init_correct_weight"]) if correctness else failed_score
-        performance_reward = float(config["init_performance_weight"]) * reward_speedup
+        performance_reward = float(config["init_performance_weight"]) * speedup_reward
         if config.get("performance_reward_requires_correctness", False):
             performance_reward *= float(correctness)
         reward = correctness_reward + performance_reward
@@ -375,5 +599,12 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
         "partial_credit_output_mismatch": partial_applied,
         "partial_credit_output_mismatch_reason": partial_reason,
         "penalty_score": penalty_score,
+        "reward_correctness_component": correctness_reward,
+        "reward_performance_component": performance_reward,
+        "reward_coverage_component": coverage_reward,
+        "reward_partial_component": partial_component,
+        "reward_penalty_component": penalty_component,
+        "speedup_reward": speedup_reward,
+        "speedup_log_standard_error": speedup_log_standard_error,
         **coverage_info,
     }
