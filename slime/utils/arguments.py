@@ -2045,6 +2045,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--component-reward",
+                action="store_true",
+                default=False,
+                help="Distribute the best same-trajectory score by observed component origins; opt-in TRLOO heuristic.",
+            )
+            parser.add_argument(
+                "--runtime-graph-timeout",
+                type=float,
+                default=60.0,
+                help="Separate runtime graph diagnostic timeout in seconds; does not change evaluation timing.",
+            )
+            parser.add_argument(
                 "--use-coverage-rs",
                 action="store_true",
                 default=False,
@@ -2519,6 +2531,23 @@ def _resolve_checkpoint_load_args(args) -> None:
             args.start_rollout_id = 0
 
 
+def _validate_component_reward_args(args):
+    if not getattr(args, "component_reward", False):
+        return
+    if not args.use_multi_turn or args.advantage_estimator != "trloo":
+        raise ValueError("--component-reward requires --use-multi-turn and --advantage-estimator trloo")
+    if args.custom_reward_post_process_path != "examples.kernel_agent.kernel_reward.reward_post_process_by_group":
+        raise ValueError("--component-reward requires the kernel agent turn-aware reward postprocess hook")
+    expected_filter = "examples.kernel_agent.component_reward.filter_component_reward_group"
+    if getattr(args, "dynamic_sampling_filter_path", None) not in (None, expected_filter):
+        raise ValueError("--component-reward requires the component target-vector dynamic filter")
+    if getattr(args, "dynamic_sampling_filter_path", None) and not getattr(args, "filter_by_last_turn", False):
+        raise ValueError("--component-reward dynamic filtering requires --filter-by-last-turn for atomic trajectories")
+    timeout = float(getattr(args, "runtime_graph_timeout", 60.0))
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("--runtime-graph-timeout must be finite and positive")
+
+
 def _validate_turn_context_limits(args):
     turn_max_context_lens = getattr(args, "turn_max_context_lens", None)
     if turn_max_context_lens is None:
@@ -2674,6 +2703,7 @@ def slime_validate_args(args):
     from slime.utils.trajectory_packing import validate_trajectory_packing_args
 
     _validate_turn_context_limits(args)
+    _validate_component_reward_args(args)
     validate_trajectory_packing_args(args)
     _validate_partial_rollout_args(args)
     if args.overlong_penalty_turn_idx is not None:

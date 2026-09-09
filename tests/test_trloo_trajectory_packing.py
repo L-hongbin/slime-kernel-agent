@@ -164,6 +164,9 @@ def _torch_logprobs(logits, tokens, _tp_group, *, with_entropy, chunk_size, with
 @pytest.fixture
 def cpu_mpu(monkeypatch):
     torch.set_num_threads(1)
+    # get_batch transfers cu_seqlens metadata explicitly; keep this CPU test's
+    # metadata on CPU as well. No production placement or math is replaced.
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda tensor, *args, **kwargs: tensor)
     mpu = cp_utils.mpu
     monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
     monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda: 0)

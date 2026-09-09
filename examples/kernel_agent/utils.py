@@ -1547,6 +1547,11 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
     if not output_samples:
         return []
 
+    if getattr(args, "component_reward", False):
+        from .component_reward import postprocess_component_turns
+
+        return postprocess_component_turns(args, output_samples, finish_reason)
+
     _apply_rollout_progress_metadata(output_samples, finish_reason)
 
     for sample in output_samples:

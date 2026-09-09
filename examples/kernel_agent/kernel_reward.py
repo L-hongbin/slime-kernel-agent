@@ -72,7 +72,14 @@ def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
 
 
 def reward_post_process_by_group(args, samples):
-    if args.advantage_estimator == "trloo":
+    if getattr(args, "component_reward", False):
+        from .component_reward import METHOD, ComponentRewardContractError
+
+        records = [sample.metadata.get("component_reward") for sample in samples]
+        if any(not isinstance(r, dict) or r.get("method") != METHOD for r in records):
+            raise ComponentRewardContractError("component reward normalization requires finalized turn targets")
+        raw_rewards = [r["turn_target"] for r in records]
+    elif args.advantage_estimator == "trloo":
         raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     else:
         raw_rewards = [sample.get_reward_value(args) for sample in samples]
