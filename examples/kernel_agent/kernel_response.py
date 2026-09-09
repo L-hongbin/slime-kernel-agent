@@ -2,6 +2,7 @@ import asyncio
 import inspect
 import threading
 import time
+from contextlib import suppress
 from typing import Any
 from uuid import uuid4
 
@@ -427,6 +428,57 @@ def _format_env_return(result: dict[str, Any], task_payload: dict[str, Any]) -> 
     return env_state
 
 
+async def _log_kernel_eval_heartbeats(
+    result_future,
+    worker,
+    task_payload: dict[str, Any],
+    heartbeat_interval: float,
+    rate_limit: int,
+    start_time: float,
+) -> None:
+    try:
+        while not result_future.done():
+            await asyncio.sleep(heartbeat_interval)
+            if result_future.done():
+                return
+            task_status = await asyncio.wait_for(
+                asyncio.wrap_future(worker.get_task_status.remote(task_payload.get("task_id")).future()),
+                timeout=heartbeat_interval,
+            )
+            if result_future.done():
+                return
+            tokens_in_use = await asyncio.wait_for(
+                asyncio.wrap_future(worker.get_token_in_use.remote().future()),
+                timeout=heartbeat_interval,
+            )
+            if result_future.done():
+                return
+            now = time.time()
+            status_last_seen = task_status.get("status", "unknown")
+            status_seen_at = task_status.get("seen_at")
+            status_age = now - status_seen_at if status_seen_at else None
+            print(
+                "[BatchHeartbeat] kernel_eval: "
+                f"completed=0/1, pending=1, pending_duration={now - start_time:.1f}s, "
+                f"total_elapsed={now - _HEARTBEAT_STARTED_AT:.1f}s "
+                f"status_last_seen={status_last_seen}, "
+                f"status_age={(f'{status_age:.1f}s' if status_age is not None else 'N/A')}, "
+                f"tokens_in_use={tokens_in_use}/{rate_limit}"
+            )
+            print(
+                "[BatchHeartbeat] pending_tasks: "
+                f"task_id={task_payload.get('task_id')} entry={task_payload.get('entry_point')} "
+                f"uuid={(task_payload.get('uuid') or 'N/A')[:8]}"
+            )
+    except Exception as exc:
+        # A timed-out remote query may still be queued on the actor. Stop this
+        # request's heartbeats instead of accumulating more control RPCs.
+        print(
+            f"[BatchHeartbeat] heartbeat stopped: task_id={task_payload.get('task_id')} "
+            f"error={type(exc).__name__}: {exc}; still awaiting evaluation result"
+        )
+
+
 async def _wait_kernel_eval_result(
     object_ref,
     worker,
@@ -434,42 +486,23 @@ async def _wait_kernel_eval_result(
     heartbeat_interval: float,
     rate_limit: int,
 ) -> dict[str, Any]:
-    start_time = time.time()
-    pending = [object_ref]
-    if heartbeat_interval <= 0:
-        result = await asyncio.to_thread(ray.get, object_ref)
-        return _format_env_return(result, task_payload)
-
-    while pending:
-        done, pending = await asyncio.to_thread(ray.wait, pending, num_returns=1, timeout=heartbeat_interval)
-        if done:
-            result = await asyncio.to_thread(ray.get, done[0])
-            return _format_env_return(result, task_payload)
-
-        elapsed = time.time() - start_time
-        total_elapsed = time.time() - _HEARTBEAT_STARTED_AT
-        task_status = await asyncio.to_thread(ray.get, worker.get_task_status.remote(task_payload.get("task_id")))
-        status_last_seen = task_status.get("status", "unknown")
-        status_seen_at = task_status.get("seen_at")
-        status_age = time.time() - status_seen_at if status_seen_at else None
-        tokens_in_use = await asyncio.to_thread(ray.get, worker.get_token_in_use.remote())
-        print(
-            "[BatchHeartbeat] kernel_eval: "
-            f"completed=0/1, pending=1, pending_duration={elapsed:.1f}s, total_elapsed={total_elapsed:.1f}s "
-            f"status_last_seen={status_last_seen}, "
-            f"status_age={(f'{status_age:.1f}s' if status_age is not None else 'N/A')}, "
-            f"tokens_in_use={tokens_in_use}/{rate_limit}"
+    # Await Ray's result directly: neither the shared thread pool nor a queued
+    # heartbeat RPC should gate delivery of an already-completed evaluation.
+    result_future = asyncio.wrap_future(object_ref.future())
+    heartbeat_task = None
+    if heartbeat_interval > 0:
+        heartbeat_task = asyncio.create_task(
+            _log_kernel_eval_heartbeats(
+                result_future, worker, task_payload, heartbeat_interval, rate_limit, time.time()
+            )
         )
-        print(
-            "[BatchHeartbeat] pending_tasks: "
-            f"task_id={task_payload.get('task_id')} entry={task_payload.get('entry_point')} "
-            f"uuid={(task_payload.get('uuid') or 'N/A')[:8]}"
-        )
-
-    return _format_env_return(
-        {"status": "failed", "error_message": "Kernel eval task disappeared before completion"},
-        task_payload,
-    )
+    try:
+        return _format_env_return(await result_future, task_payload)
+    finally:
+        if heartbeat_task is not None:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
 
 
 async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
