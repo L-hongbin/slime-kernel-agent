@@ -9,7 +9,12 @@ from slime.backends.megatron_utils.hf_to_megatron.qwen3_5 import qwen3_5_hf_tens
 from slime.backends.megatron_utils.megatron_to_hf import qwen3_5 as qwen3_5_converter
 from slime.backends.megatron_utils.megatron_to_hf.processors import quantizer_fp8
 from slime.backends.megatron_utils.model_provider import _apply_qwen_gdn_pipeline_overrides
-from slime.backends.megatron_utils.qwen_gdn_layout import interleave_gdn_tp_sections
+from slime.backends.megatron_utils.qwen_gdn_layout import (
+    get_gdn_factory_group,
+    group_gdn_factory_keys,
+    interleave_gdn_tp_sections,
+    merge_gdn_factory_tensors,
+)
 from slime.utils.arguments import add_qwen_gdn_arguments
 from slime_plugins.models import distributed_gdn as distributed_gdn_module
 from slime_plugins.models import qwen3_5 as qwen3_5_model
@@ -167,6 +172,68 @@ def test_gdn_tp_section_layout_round_trip():
 
     assert all(torch.equal(actual, expected) for actual, expected in zip(restored, sections, strict=True))
     assert interleaved[:, 0].tolist() == [0, 2, 100, 102, 104, 200, 4, 6, 106, 108, 110, 202]
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_distributed_gdn_factory_tensors_restore_fused_projection(tp_size):
+    fused_key = "decoder.layers.0.self_attention.in_proj.weight"
+    section_names = ("query", "key", "value", "z", "beta", "alpha")
+    sections = [torch.full((size, 3), float(index)) for index, size in enumerate((8, 8, 12, 12, 4, 4), 1)]
+    state_dict = {f"{fused_key}.{name}": section for name, section in zip(section_names, sections, strict=True)}
+
+    merged_keys = merge_gdn_factory_tensors(state_dict, tp_size=tp_size, implementation="distributed")
+
+    assert merged_keys == [fused_key]
+    assert list(state_dict) == [fused_key]
+    assert torch.equal(state_dict[fused_key], interleave_gdn_tp_sections(sections, tp_size=tp_size))
+
+
+def test_distributed_gdn_factory_tensors_support_layer_stacked_checkpoints():
+    fused_key = "decoder.layers.self_attention.conv1d.weight"
+    section_names = ("query", "key", "value")
+    sections = [
+        torch.stack([torch.full((size, 2), float(layer * 10 + index)) for layer in range(2)])
+        for index, size in enumerate((4, 4, 6), 1)
+    ]
+    state_dict = {f"{fused_key}.{name}": section for name, section in zip(section_names, sections, strict=True)}
+
+    merge_gdn_factory_tensors(state_dict, tp_size=2, implementation="auto")
+
+    for layer in range(2):
+        expected = interleave_gdn_tp_sections([section[layer] for section in sections], tp_size=2)
+        assert torch.equal(state_dict[fused_key][layer], expected)
+
+
+def test_distributed_gdn_factory_tensor_validation_is_actionable():
+    fused_key = "decoder.layers.0.self_attention.in_proj.weight"
+    state_dict = {f"{fused_key}.{name}": torch.ones(2, 2) for name in ("query", "key", "value", "z", "beta")}
+
+    with pytest.raises(ValueError, match=r"Missing GDN factory sections.*alpha"):
+        merge_gdn_factory_tensors(state_dict, tp_size=2, implementation="distributed")
+
+    state_dict[f"{fused_key}.alpha"] = torch.ones(2, 2)
+    with pytest.raises(ValueError, match=r"--qwen-gdn-implementation distributed or auto"):
+        merge_gdn_factory_tensors(state_dict, tp_size=2, implementation="replicated")
+
+
+def test_gdn_factory_group_matches_only_supported_factory_entries():
+    assert get_gdn_factory_group("decoder.layers.0.self_attention.in_proj.weight.z") == (
+        "decoder.layers.0.self_attention.in_proj.weight",
+        ("query", "key", "value", "z", "beta", "alpha"),
+    )
+    assert get_gdn_factory_group("decoder.layers.0.self_attention.out_proj.weight") is None
+
+
+def test_distributed_gdn_factory_keys_stay_in_one_conversion_worker():
+    fused_key = "decoder.layers.0.self_attention.in_proj.weight"
+    section_names = ("query", "key", "value", "z", "beta", "alpha")
+    factory_keys = [f"{fused_key}.{name}" for name in section_names]
+
+    grouped_keys = group_gdn_factory_keys(
+        [factory_keys[3], "decoder.final_layernorm.weight", *factory_keys[:3], *factory_keys[4:]]
+    )
+
+    assert grouped_keys == [factory_keys]
 
 
 def test_native_gdn_converter_restores_hf_projection_order(monkeypatch):
