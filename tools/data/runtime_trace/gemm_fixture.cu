@@ -1,0 +1,10 @@
+// Runtime calibration: naive versus shared-memory GEMM and tile-size changes.
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#define CUDA(call) do{auto e=(call);if(e!=cudaSuccess){fprintf(stderr,"%s\n",cudaGetErrorString(e));return 2;}}while(0)
+__global__ void naive(const float*A,const float*B,float*C,int n){int x=blockIdx.x*blockDim.x+threadIdx.x,y=blockIdx.y*blockDim.y+threadIdx.y;if(x<n&&y<n){float sum=0;for(int k=0;k<n;++k)sum+=A[y*n+k]*B[k*n+x];C[y*n+x]=sum;}}
+template<int TILE>__global__ void tiled(const float*A,const float*B,float*C,int n){__shared__ float a[TILE][TILE],b[TILE][TILE];int x=blockIdx.x*TILE+threadIdx.x,y=blockIdx.y*TILE+threadIdx.y;float sum=0;for(int base=0;base<n;base+=TILE){a[threadIdx.y][threadIdx.x]=A[y*n+base+threadIdx.x];b[threadIdx.y][threadIdx.x]=B[(base+threadIdx.y)*n+x];__syncthreads();for(int k=0;k<TILE;++k)sum+=a[threadIdx.y][k]*b[k][threadIdx.x];__syncthreads();}C[y*n+x]=sum;}
+int main(int argc,char**argv){int mode=argc>1?atoi(argv[1]):0;const int n=8;float input[n*n],out[n*n];for(int i=0;i<n*n;++i)input[i]=(i%7)-3;float *a,*b,*c;CUDA(cudaMalloc(&a,sizeof input));CUDA(cudaMalloc(&b,sizeof input));CUDA(cudaMalloc(&c,sizeof input));CUDA(cudaMemcpy(a,input,sizeof input,cudaMemcpyHostToDevice));CUDA(cudaMemcpy(b,input,sizeof input,cudaMemcpyHostToDevice));printf("{\"allocations\":[{\"role\":\"input:0\",\"base\":%llu,\"bytes\":%zu},{\"role\":\"input:1\",\"base\":%llu,\"bytes\":%zu},{\"role\":\"output:0\",\"base\":%llu,\"bytes\":%zu}]}\n",(unsigned long long)a,sizeof input,(unsigned long long)b,sizeof input,(unsigned long long)c,sizeof input);
+ if(mode==0)naive<<<dim3(1,1),dim3(8,8)>>>(a,b,c,n);else if(mode==1)tiled<4><<<dim3(2,2),dim3(4,4)>>>(a,b,c,n);else tiled<8><<<dim3(1,1),dim3(8,8)>>>(a,b,c,n);
+ CUDA(cudaDeviceSynchronize());CUDA(cudaMemcpy(out,c,sizeof out,cudaMemcpyDeviceToHost));printf("{\"mode\":%d,\"output\":[",mode);for(int i=0;i<n*n;++i){float expected=0;for(int k=0;k<n;++k)expected+=input[(i/n)*n+k]*input[k*n+(i%n)];if(out[i]!=expected)return 3;printf("%s%.9g",i?",":"",out[i]);}printf("]}\n");CUDA(cudaFree(a));CUDA(cudaFree(b));CUDA(cudaFree(c));return 0;}
