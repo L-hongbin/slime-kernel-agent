@@ -109,8 +109,17 @@ def _units(observation, *, output_only=True):
             raise ComponentRewardContractError("component node IDs must be unique strings")
         nodes[node["id"]] = node
     coverage = graph.get("coverage", {})
+    # Capture completion does not prove that the transmitted summary retained
+    # every call. A clipped denominator must never redistribute the full budget.
+    if coverage.get("summary_complete") is not True:
+        return [], ["incomplete_graph_summary"]
     if coverage.get("trace_process_complete") is not True:
         return [], ["incomplete_launch_enumeration"]
+    if any(
+        type(coverage.get(key)) is not int or coverage[key] < 0
+        for key in ("kernel_launches", "completed_kernel_launches")
+    ):
+        return [], ["unknown_launch_completion_counts"]
     if coverage.get("kernel_launches") != coverage.get("completed_kernel_launches"):
         return [], ["incomplete_launch_completion"]
 

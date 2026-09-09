@@ -151,6 +151,7 @@ def observation(implementations, *, candidate="candidate", unknown=(), unused=No
             ],
             "output_unknowns": [],
             "coverage": {
+                "summary_complete": True,
                 "trace_process_complete": True,
                 "kernel_launches": len(implementations),
                 "completed_kernel_launches": len(implementations),
@@ -224,6 +225,32 @@ def test_partial_best_unit_mass_is_not_discarded():
     assert result["credits"] == [0.5, 0.5]
     assert result["residual_fraction"] == 0.5
     assert result["status"] == "partial"
+
+
+@pytest.mark.parametrize("complete", [False, None])
+def test_capture_completion_does_not_authorize_truncated_http_summary(complete):
+    samples = trajectory([["a"], ["a"]], [0, 1])
+    coverage = samples[1].metadata["runtime_graph"]["graph"]["coverage"]
+    if complete is None:
+        coverage.pop("summary_complete")
+    else:
+        coverage["summary_complete"] = complete
+    assert coverage["trace_process_complete"]
+    assert coverage["kernel_launches"] == coverage["completed_kernel_launches"]
+    result = attribute_best_components(samples, [0, 1])
+    assert result["credits"] == [0, 1]
+    assert result["status"] == "unavailable_best_turn_fallback"
+    assert result["unknowns"] == ["incomplete_graph_summary"]
+
+
+def test_missing_launch_counts_cannot_compare_equal_as_none():
+    samples = trajectory([["a"]], [1])
+    coverage = samples[0].metadata["runtime_graph"]["graph"]["coverage"]
+    coverage.pop("kernel_launches")
+    coverage.pop("completed_kernel_launches")
+    result = attribute_best_components(samples, [1])
+    assert result["status"] == "unavailable_best_turn_fallback"
+    assert result["unknowns"] == ["unknown_launch_completion_counts"]
 
 
 def test_unknown_output_closure_does_not_normalize_observed_prefix():
