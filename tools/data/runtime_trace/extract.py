@@ -1,615 +1,674 @@
-"""Convert bounded NVBit events into an auditable observed program graph.
-
-No source parsing, task adapters or numerical equivalence assumptions. Register
-semantics are a conservative SASS subset. Byte-level memory dependencies require
-happens-before; atomic log order is never interpreted as cross-thread order.
-"""
-
-from __future__ import annotations
+"""Coarse kernel/library graph from memory runs, contracts and storage leases."""
 
 import argparse
+import bisect
 import hashlib
 import json
 import math
-import re
 import struct
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 
-EVENT = struct.Struct("<QQIIIIII")
-SCHEMA = "runtime_program_graph/v1"
-REG = re.compile(r"\b(?:UR\d+|R\d+|UP\d+|P\d+)\b")
-SIMPLE_DEST = {
-    "MOV",
-    "UMOV",
-    "LDC",
-    "ULDC",
-    "LDG",
-    "LDS",
-    "LDL",
-    "S2R",
-    "S2UR",
-    "FADD",
-    "FMUL",
-    "FFMA",
-    "DADD",
-    "DMUL",
-    "DFMA",
-    "IMAD",
-    "IADD",
-    "SHF",
-    "SHL",
-    "SHR",
-    "LOP",
-    "LOP3",
-    "ULOP3",
-    "F2F",
-    "F2I",
-    "I2F",
-    "I2I",
-    "FSEL",
-    "SEL",
-    "MUFU",
-    "PRMT",
-    "BREV",
-    "FLO",
-    "POPC",
-    "LEA",
-    "ULEA",
-    "VIADD",
-    "IADD3",
-    "UIADD3",
-    "UIMAD",
-    "IABS",
-    "I2FP",
-    "HFMA2",
-    "HADD2",
-    "HMUL2",
-}
-NO_DEST = {"STG", "STS", "STL", "EXIT", "BRA", "NOP", "BAR", "MEMBAR", "BSSY", "BSYNC", "BREAK", "WARPSYNC", "DEPBAR"}
+RUN = struct.Struct("<QQIIII")
 
 
-def canonical(v):
-    return json.dumps(v, sort_keys=True, separators=(",", ":"), allow_nan=False)
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def digest(v):
-    return hashlib.sha256(canonical(v).encode()).hexdigest()
+def digest(value):
+    return hashlib.sha256(canonical(value).encode()).hexdigest()
 
 
-def sha(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-def registers(operand, wide=False):
-    values = []
-    for m in REG.finditer(operand["text"]):
-        name = m.group()
-        values.append(name)
-        if name.startswith(("R", "UR")):
-            count = max(1, operand["bytes"] // 4) if operand["type"] in ("REG", "UREG") else 1
-            suffix = operand["text"][m.end() :]
-            if suffix.startswith(".128"):
-                count = max(count, 4)
-            elif suffix.startswith(".64"):
-                count = max(count, 2)
-            if wide:
-                count = max(count, 2)
-            prefix = re.match(r"[A-Z]+", name).group()
-            number = int(name[len(prefix) :])
-            values.extend(f"{prefix}{number+i}" for i in range(1, count))
-    return values
-
-
-def register_contract(inst):
-    op = inst["opcode"].split(".")[0]
-    operands = inst["operands"]
-    if op in SIMPLE_DEST:
-        n = 1
-        # Integer carry outputs precede the arithmetic inputs; carry inputs
-        # of .X forms follow them and are read normally, including !UP0.
-        if op in ("IMAD", "UIMAD", "IADD3", "UIADD3"):
-            while n < len(operands) and operands[n]["type"] in ("PRED", "UPRED"):
-                n += 1
-        elif ".X" in inst["opcode"] or len(operands) > 1 and operands[1]["type"] in ("PRED", "UPRED"):
-            return [], [], False
-    elif op in ("ISETP", "FSETP", "DSETP", "UISETP", "PLOP3", "UPLOP3"):
-        n = 2
-    elif op in NO_DEST:
-        n = 0
-    else:
-        return [], [], False
-    writes = []
-    reads = []
-    for i, operand in enumerate(operands):
-        wide = op in ("IMAD", "UIMAD") and ".WIDE" in inst["opcode"] and i in (0, n + 2)
-        rr = registers(operand, wide)
-        if i < n:
-            writes.extend(rr)
-        else:
-            reads.extend((r, i) for r in rr)
-    if inst["predicate"] >= 0:
-        reads.append((("UP" if inst["predicate_uniform"] else "P") + str(inst["predicate"]), "predicate"))
-    return writes, reads, True
-
-
-def normalized_operands(inst):
-    names = {}
-
-    def replace(m):
-        name = m.group()
-        prefix = re.match(r"[A-Z]+", name).group()
-        if name not in names:
-            names[name] = f"{prefix}@{len(names)}"
-        return names[name]
-
+def union(intervals):
     result = []
-    for op in inst["operands"]:
-        text = op["text"]
-        if op["type"] == "CBANK":
-            text = "constant_argument"
-        elif inst["opcode"].split(".")[0] == "BRA":
-            text = "observed_branch_target"
+    for lo, hi in sorted(set(intervals)):
+        if lo >= hi:
+            continue
+        if result and lo <= result[-1][1]:
+            result[-1][1] = max(hi, result[-1][1])
         else:
-            text = REG.sub(replace, text)
-        result.append({"type": op["type"], "expression": text, "bytes": op["bytes"]})
+            result.append([lo, hi])
     return result
 
 
-def allocation_at(address, allocations):
-    found = [a for a in allocations if a["base"] <= address < a["base"] + a["bytes"]]
-    if len(found) != 1:
+def overlap(a, b):
+    lo, hi = max(a[0], b[0]), min(a[1], b[1])
+    return (lo, hi) if lo < hi else None
+
+
+def normalize_leases(allocations):
+    result = []
+    for i, source in enumerate(allocations):
+        a = dict(source)
+        a.setdefault("id", f"storage:{i}")
+        a.setdefault("roles", [a["role"]] if "role" in a else [])
+        a.setdefault("views", [])
+        a.setdefault("first_seq", 0)
+        a.setdefault("last_seq", None)
+        result.append(a)
+    # Distinct live storage wrappers can alias the same physical bytes (e.g.
+    # DLPack views). Overlapping lifetimes distinguish aliasing from address reuse.
+    parents = list(range(len(result)))
+
+    def root(i):
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    for i, a in enumerate(result):
+        for j, b in enumerate(result[:i]):
+            memory_overlap = overlap((a["base"], a["base"] + a["bytes"]), (b["base"], b["base"] + b["bytes"]))
+            lifetime_overlap = max(a["first_seq"], b["first_seq"]) < min(
+                a["last_seq"] if a["last_seq"] is not None else math.inf,
+                b["last_seq"] if b["last_seq"] is not None else math.inf,
+            )
+            if memory_overlap and lifetime_overlap:
+                parents[root(i)] = root(j)
+    groups = defaultdict(list)
+    for i, a in enumerate(result):
+        groups[root(i)].append(a)
+    merged = []
+    for values in groups.values():
+        base = min(a["base"] for a in values)
+        first = values[0]
+        record = {
+            **first,
+            "base": base,
+            "bytes": max(a["base"] + a["bytes"] for a in values) - base,
+            "roles": sorted({r for a in values for r in a["roles"]}),
+            "first_seq": min(a["first_seq"] for a in values),
+            "last_seq": None if any(a["last_seq"] is None for a in values) else max(a["last_seq"] for a in values),
+            "aliased_storage_ids": [a["id"] for a in values],
+            "role_views": {},
+        }
+        for a in values:
+            for role, view in a.get("role_views", {}).items():
+                record["role_views"][role] = {**view, "offset_bytes": view["offset_bytes"] + a["base"] - base}
+        merged.append(record)
+    return merged
+
+
+class Bindings:
+    def __init__(self, allocations, seq):
+        self.active = sorted(
+            [a for a in allocations if a["first_seq"] <= seq and (a["last_seq"] is None or a["last_seq"] > seq)],
+            key=lambda a: a["base"],
+        )
+        self.bases = [a["base"] for a in self.active]
+
+    def find(self, address, size=1):
+        at = bisect.bisect_right(self.bases, address) - 1
+        if at < 0:
+            return None
+        a = self.active[at]
+        if a["base"] <= address and address + size <= a["base"] + a["bytes"]:
+            return a, address - a["base"]
         return None
-    a = found[0]
-    return (a["role"], address - a["base"])
 
 
-def build_graph(prefix, context, allocations=(), identity=None):
+def writer_index(runs):
+    values = sorted(runs)
+    starts, maximum = [], []
+    end = -1
+    for run in values:
+        starts.append(run[0])
+        end = max(end, run[1])
+        maximum.append(end)
+    return values, starts, maximum
+
+
+def related(index, lo, hi):
+    values, starts, maximum = index
+    return values[bisect.bisect_right(maximum, lo) : bisect.bisect_left(starts, hi)]
+
+
+def same_owner(read, write, lo, hi):
+    # Tuple: interval start/end, first thread owner, element width, log index.
+    if read[3] == write[3] and read[2] * read[3] - read[0] == write[2] * write[3] - write[0]:
+        return True
+
+    def owner(run, byte):
+        return run[2] + (byte - run[0]) // run[3]
+
+    return owner(read, lo) == owner(read, hi - 1) == owner(write, lo) == owner(write, hi - 1)
+
+
+def entry_read_regions(reads, writes):
+    """Reads with no in-kernel prior/other-thread writer are entry-version reads.
+
+    Atomic log order is used ONLY when affine ownership proves the same thread.
+    The remaining overlap is explicit unknown, not automatically an input edge.
+    """
+    index = writer_index(writes)
+    entry, unknown = [], []
+    for read in reads:
+        overlaps = [w for w in related(index, read[0], read[1]) if overlap(read, w)]
+        if len(overlaps) > 512:
+            unknown.append(read[:2])
+            continue
+        cuts = sorted({read[0], read[1], *[v for w in overlaps for v in overlap(read, w)]})
+        for lo, hi in zip(cuts, cuts[1:], strict=False):
+            relevant = [w for w in overlaps if w[0] < hi and w[1] > lo]
+            safe = all(same_owner(read, w, lo, hi) and read[4] < w[4] for w in relevant)
+            (entry if safe else unknown).append((lo, hi))
+    return union(entry), union(unknown)
+
+
+def conflicting_writes(writes):
+    index = writer_index(writes)
+    conflicts = []
+    for write in writes:
+        candidates = related(index, write[0], write[1])
+        if len(candidates) > 512:
+            conflicts.append(write[:2])
+            continue
+        for other in candidates:
+            common = overlap(write, other)
+            if common and not same_owner(write, other, *common):
+                conflicts.append(common)
+    return union(conflicts)
+
+
+def matrix_regions(pointer, rows, columns, leading, size):
+    if rows < 0 or columns < 0 or leading < max(1, rows):
+        raise ValueError("invalid GEMM matrix extent")
+    if not rows or not columns:
+        return []
+    if leading == rows:
+        return [(pointer, pointer + rows * columns * size)]
+    if columns > 100000:
+        raise ValueError("strided matrix region budget")
+    return [(pointer + col * leading * size, pointer + (col * leading + rows) * size) for col in range(columns)]
+
+
+def view_regions(view, budget=100000):
+    if any(size == 0 for size in view["shape"]):
+        return []
+    width = view["element_size"]
+    ranges = [[view["offset_bytes"], view["offset_bytes"] + width]]
+    for stride, size in sorted(zip(view["stride"], view["shape"], strict=True)):
+        step = stride * width
+        if size <= 1 or step == 0:
+            continue
+        if len(ranges) == 1 and step == ranges[0][1] - ranges[0][0]:
+            ranges[0][1] += (size - 1) * step
+        elif len(ranges) * size <= budget:
+            ranges = union((lo + i * step, hi + i * step) for lo, hi in ranges for i in range(size))
+        else:
+            raise ValueError("output view region budget")
+    return ranges
+
+
+def gemm_accesses(attrs):
+    sizes = {0: 4, 1: 8, 2: 2, 14: 2}  # CUDA real F32/F64/F16/BF16
+    if not attrs.get("state_query_ok") or attrs["alpha"] is None or attrs["beta"] is None:
+        raise ValueError("GEMM scalar or handle state unavailable")
+    if attrs["ta"] not in (0, 1, 2) or attrs["tb"] not in (0, 1, 2):
+        raise ValueError("unsupported transpose enum")
+    if any(attrs[t] not in sizes for t in ("at", "bt", "ct")):
+        raise ValueError("unsupported GEMM element type")
+    m, n, k = (attrs[x] for x in ("m", "n", "k"))
+    if min(m, n, k) < 0:
+        raise ValueError("negative GEMM dimension")
+    result = []
+    if not m or not n:
+        return result
+    if attrs["alpha"] != 0 and k:
+        ar, ac = (m, k) if attrs["ta"] == 0 else (k, m)
+        br, bc = (k, n) if attrs["tb"] == 0 else (n, k)
+        for key, rows, cols, ld, kind in [("a", ar, ac, "lda", "at"), ("b", br, bc, "ldb", "bt")]:
+            result.append((key, "read", matrix_regions(attrs[key], rows, cols, attrs[ld], sizes[attrs[kind]])))
+    c = matrix_regions(attrs["c"], m, n, attrs["ldc"], sizes[attrs["ct"]])
+    if attrs["beta"] != 0:
+        result.append(("c", "read", c))
+    result.append(("c", "write", c))
+    return result
+
+
+def launch_configuration(record):
+    count = record.get("launch_num_attrs")
+    return {"launch_num_attrs": count}, ([] if count == 0 else ["opaque_launch_configuration"])
+
+
+def build_graph(prefix, allocations, context=None):
     started = time.monotonic()
     prefix = Path(prefix)
-    meta = Path(str(prefix) + ".jsonl")
-    before = {str(meta): sha(meta)}
-    records = [json.loads(x) for x in meta.read_text().splitlines()]
-    configs = [r for r in records if r["type"] == "config"]
-    if len(configs) != 1:
-        raise ValueError("exactly one trace configuration required")
-    config = configs[0]
-    instructions = {r["id"]: r for r in records if r["type"] == "instruction"}
-    contracts = {iid: register_contract(inst) for iid, inst in instructions.items()}
-    operand_labels = {iid: normalized_operands(inst) for iid, inst in instructions.items()}
+    records = [json.loads(line) for line in Path(str(prefix) + ".jsonl").read_text().splitlines()]
+    config = next(r for r in records if r["type"] == "config")
+    if config["schema"] != "coarse-memory-runs/v1":
+        raise ValueError("old instruction traces must not enter coarse workflow")
+    allocations = normalize_leases(allocations)
+    by_buffer = {a["id"]: a for a in allocations}
     launches = {r["id"]: r for r in records if r["type"] == "launch"}
-    completed = {r["launch"]: r for r in records if r["type"] == "complete"}
-    memory_boundaries = {r["before_launch"] for r in records if r["type"] == "memory_api"}
-    memory_boundaries.update(r["launch"] for r in records if r["type"] == "scope" and r["enabled"])
-    gaps = {
-        "serialized_diagnostic_execution",
-        "unobserved_input_paths",
-        "compressed_instruction_graph_not_dynamic_isomorphism",
-    }
-    if not records or records[-1]["type"] != "end":
-        gaps.add("trace_process_incomplete")
-    if not allocations:
-        gaps.add("boundary_allocations_unavailable")
-    if any(r["type"] == "unsupported_api" for r in records):
-        gaps.add("unsupported_cuda_api")
-    nodes = {}
-    edge_counts = Counter()
-    edge_examples = {}
-    patterns = defaultdict(lambda: defaultdict(list))
-    constants = defaultdict(set)
-    event_count = 0
-    mem = []
-    prev = {}
-    last_reg = defaultdict(dict)
-    node_gaps = defaultdict(set)
-    launch_complete = {}
-    unsafe_memory_launches = {r.get("launch", 0) for r in records if r["type"] == "unsupported_api"}
-    thread_epoch = Counter()
-    barrier_counts = defaultdict(Counter)
-    barrier_nodes = defaultdict(dict)
-    barrier_ids = defaultdict(lambda: defaultdict(list))
-
-    def node(key, kind, attrs, evidence=None):
-        if key not in nodes:
-            nodes[key] = {"id": key, "kind": kind, "attrs": attrs, "unknowns": [], "evidence": evidence or {}}
-        return nodes[key]
-
-    def edge(a, b, kind, attrs=None, evidence=None):
-        key = (a, b, kind, canonical(attrs or {}))
-        edge_counts[key] += 1
-        if evidence and key not in edge_examples:
-            edge_examples[key] = evidence
-
-    for allocation in allocations:
-        node(
-            "buffer:" + allocation["role"],
-            "buffer",
-            {"role": allocation["role"], "bytes": allocation["bytes"]},
-            {"base": allocation["base"]},
-        )
-    for lid, launch in launches.items():
-        lk = f"launch:{lid}"
-        node(
-            lk,
-            "launch",
-            {"grid": launch["grid"], "block": launch["block"], "dynamic_shared": launch["dynamic_shared"]},
-            {"name": launch["name"], "stream": launch["stream"]},
-        )
-        if not launch["selected"]:
-            node_gaps[lk].add("launch_not_captured")
-            gaps.add("launches_not_captured")
-            launch_complete[lid] = False
+    completions = {r["id"]: r for r in records if r["type"] == "complete"}
+    endings = {r["parent"]: r for r in records if r["type"] == "library_end"}
+    scopes = [r["seq"] for r in records if r["type"] == "scope" and r["enabled"]]
+    first = scopes[0] if scopes else min((r["seq"] for r in launches.values()), default=0)
+    nodes, memory_unknown = [], []
+    current_parent = None
+    for r in records:
+        if r["type"] == "library_begin":
+            current_parent = r["seq"]
+        if r["type"] == "library_end":
+            current_parent = None
+        if r["type"] in ("memory_api_unknown", "unsupported_launch") and r["seq"] >= first and current_parent is None:
+            memory_unknown.append(r)
+        if r["type"] == "launch" and r["parent"] >= 0:
             continue
-        c = completed.get(lid)
-        if c is None:
-            node_gaps[lk].add("missing_launch_completion")
-            gaps.add("missing_launch_completion")
-            launch_complete[lid] = False
+        if r["type"] not in ("launch", "library_begin", "copy", "fill") or r["seq"] < first:
             continue
-        path = Path(f"{prefix}.launch{lid}.bin")
-        before[str(path)] = sha(path)
-        raw = path.read_bytes()
-        if len(raw) != c["events"] * EVENT.size:
-            raise ValueError("binary length does not match committed event count")
-        all_ctas = config["cta_limit"] < 0 or config["cta_limit"] >= math.prod(launch["grid"])
-        launch_complete[lid] = all_ctas and not c["dropped"]
-        if not all_ctas:
-            gaps.add("cta_sampling")
-            node_gaps[lk].add("cta_sampling")
-        if c["dropped"]:
-            gaps.add("events_dropped")
-            node_gaps[lk].add("events_dropped")
-        for seq, values in enumerate(EVENT.iter_unpack(raw)):
-            event_count += 1
-            addr, const, iid, cta, tid, pred, mask, _ = values
-            inst = instructions[iid]
-            key = f"l{lid}:i{iid}"
-            baseop = inst["opcode"].split(".")[0]
-            n = node(
-                key,
-                "instruction",
-                {
-                    "opcode": inst["opcode"],
-                    "space": inst["space"],
-                    "load": inst["load"],
-                    "store": inst["store"],
-                    "size": inst["size"],
-                    "operands": operand_labels[iid],
-                    "predicate_negated": inst["sass"].lstrip().startswith("@!"),
-                    "predicate_uniform": inst["predicate_uniform"],
-                },
-                {
-                    "function": inst["function"],
-                    "offset": inst["offset"],
-                    "sass": inst["sass"],
-                    "instruction_id": iid,
-                    "launch": lid,
-                },
-            )
-            t = (lid, cta, tid)
-            epoch = thread_epoch[t]
-            e = {
-                "node": key,
-                "launch": lid,
-                "cta": cta,
-                "thread": tid,
-                "seq": seq,
-                "epoch": epoch,
-                "addr": addr,
-                "size": inst["size"],
-                "space": inst["space"],
-                "read": inst["load"],
-                "write": inst["store"],
-            }
-            pattern = patterns[key][cta, tid]
-            if pattern and pattern[-1][:2] == [pred, mask]:
-                pattern[-1][2] += 1
-            else:
-                pattern.append([pred, mask, 1])
-            if t in prev:
-                edge(prev[t], key, "thread_sequence", {"predicate_executed": bool(pred)})
-            prev[t] = key
-            # No membership/contains edge: all-instruction launch adjacency would
-            # turn a local neighborhood into a whole-kernel comparison.
-            n["attrs"]["launch_configuration"] = {k: launch[k] for k in ("grid", "block", "dynamic_shared")}
-            writes, reads, known = contracts[iid]
-            if not known:
-                node_gaps[key].add("unsupported_register_semantics")
-                gaps.add("unsupported_register_semantics")
-                # Unknown destinations can invalidate any last-writer fact.
-                if pred:
-                    last_reg[t].clear()
-            else:
-                for r, port in reads:
-                    if not pred and port != "predicate":
-                        continue
-                    source = last_reg[t].get(r)
-                    if source:
-                        edge(source, key, "predicate" if port == "predicate" else "register", {"port": port})
-                    else:
-                        node_gaps[key].add("register_live_in:" + r)
-                if pred:
-                    for r in writes:
-                        last_reg[t][r] = key
-            if pred and any(o["type"] == "CBANK" for o in inst["operands"]):
-                if inst.get("captured_constant_bytes", 0):
-                    binding = allocation_at(const, allocations)
-                    if binding:
-                        constants[key].add(canonical({"buffer": binding[0], "offset": binding[1]}))
-                    else:
-                        node_gaps[key].add("unclassified_constant_role")
-                        gaps.add("unclassified_constant_role")
-                        constants[key].add(canonical({"unclassified_bits": 8 * inst["captured_constant_bytes"]}))
-                        n["evidence"].setdefault("unclassified_constant_examples", [])
-                        if len(n["evidence"]["unclassified_constant_examples"]) < 2:
-                            n["evidence"]["unclassified_constant_examples"].append(const)
-                else:
-                    node_gaps[key].add("constant_value_unobserved")
-                    gaps.add("constant_value_unobserved")
-            if pred and baseop == "BAR":
-                # Only full CTA BAR.SYNC with immediate barrier ID is modeled.
-                if (
-                    inst["opcode"] in ("BAR.SYNC", "BAR.SYNC.DEFER_BLOCKING")
-                    and len(inst["operands"]) == 1
-                    and inst["operands"][0]["type"] == "IMM_UINT64"
-                ):
-                    barrier_counts[lid, cta][tid] += 1
-                    barrier_ids[lid, cta][tid].append(inst["operands"][0]["text"])
-                    barrier_nodes[lid, cta][tid, epoch] = key
-                    thread_epoch[t] += 1
-                else:
-                    node_gaps[key].add("unsupported_barrier")
-                    gaps.add("unsupported_barrier")
-            if pred and (inst["load"] or inst["store"]) and inst["space"] not in ("CONSTANT", "NONE"):
-                if (
-                    inst["mrefs"] != 1
-                    or inst["space"] not in ("GLOBAL", "SHARED", "LOCAL")
-                    or inst["size"] not in (1, 2, 4, 8, 16)
-                ):
-                    node_gaps[key].add("unsupported_memory_semantics")
-                    gaps.add("unsupported_memory_semantics")
-                    unsafe_memory_launches.add(lid)
-                    continue
-                if inst["space"] == "GLOBAL":
-                    binding = allocation_at(addr, allocations)
-                    if (
-                        binding
-                        and allocation_at(addr + inst["size"] - 1, allocations)
-                        and allocation_at(addr + inst["size"] - 1, allocations)[0] == binding[0]
-                    ):
-                        e["region"] = binding[0]
-                        e["offset"] = binding[1]
-                        e["address_key"] = ("GLOBAL", binding[0])
-                    else:
-                        node_gaps[key].add("unresolved_allocation")
-                        gaps.add("unresolved_allocation")
-                        continue
-                else:
-                    e["region"] = inst["space"]
-                    e["offset"] = addr
-                    e["address_key"] = (inst["space"], lid, cta, tid if inst["space"] == "LOCAL" else 0)
-                if inst["load"] and inst["store"]:
-                    node_gaps[key].add("atomic_read_modify_write")
-                    gaps.add("atomic_read_modify_write")
-                    unsafe_memory_launches.add(lid)
-                    continue
-                mem.append(e)
-    valid_barriers = set()
-    for (lid, cta), counts in barrier_counts.items():
-        expected = math.prod(launches[lid]["block"])
-        if (
-            launch_complete[lid]
-            and len(counts) == expected
-            and len(set(counts.values())) == 1
-            and len({tuple(v) for v in barrier_ids[lid, cta].values()}) == 1
-        ):
-            valid_barriers.add((lid, cta))
-        else:
-            gaps.add("unverified_barrier_participation")
-
-    def happens_before(a, b):
-        if a["launch"] != b["launch"]:
-            lo, hi = a["launch"], b["launch"]
-            return (
-                lo < hi
-                and launches[lo]["stream"] == launches[hi]["stream"]
-                and all(launch_complete.get(i, False) and i not in unsafe_memory_launches for i in range(lo, hi + 1))
-                and not any(lo < i <= hi for i in memory_boundaries)
-            )
-        if a["cta"] == b["cta"] and a["thread"] == b["thread"]:
-            return a["seq"] < b["seq"]
-        return a["cta"] == b["cta"] and (a["launch"], a["cta"]) in valid_barriers and a["epoch"] < b["epoch"]
-
-    byte_writes = defaultdict(list)
-    read_events = []
-    memory_patterns = defaultdict(list)
-    for e in mem:
-        memory_patterns[e["node"]].append((e["cta"], e["thread"], e["region"], e["offset"], e["size"]))
-        if e["write"]:
-            for byte in range(e["offset"], e["offset"] + e["size"]):
-                byte_writes[e["address_key"], byte].append(e)
-        if e["read"]:
-            read_events.append(e)
-    if sum(len(v) for v in byte_writes.values()) > 4000000:
-        raise ValueError("memory dependency budget exceeded; reduce diagnostic capture")
-    for read in read_events:
-        if (
-            read["launch"] in unsafe_memory_launches
-            or read["space"] == "GLOBAL"
-            and (
-                not launch_complete[read["launch"]]
-                or len({launch_record["stream"] for launch_record in launches.values()}) > 1
-            )
-        ):
-            node_gaps[read["node"]].add("memory_scope_incomplete")
-            gaps.add("memory_scope_incomplete")
+        if r["type"] in ("copy", "fill") and current_parent is not None:
             continue
-        sources = Counter()
-        unknown = False
-        for byte in range(read["offset"], read["offset"] + read["size"]):
-            writes = byte_writes.get((read["address_key"], byte), [])
-            if len(writes) > 512:
-                unknown = True
-                gaps.add("memory_history_budget")
-                continue
-            prior = [w for w in writes if happens_before(w, read)]
-            unordered = [w for w in writes if not happens_before(w, read) and not happens_before(read, w)]
-            # A later launch is not unordered just because its stream differs:
-            # without original synchronization, its access may race this read.
-            if unordered:
-                unknown = True
-                continue
-            latest = [w for w in prior if not any(w is not x and happens_before(w, x) for x in prior)]
-            if len(latest) == 1:
-                sources[latest[0]["node"]] += 1
-            elif len(latest) > 1:
-                unknown = True
-            elif (
-                read["space"] == "GLOBAL"
-                and read["region"].startswith("input:")
-                and not any(0 < i <= read["launch"] for i in memory_boundaries)
-                and not any(i <= read["launch"] for i in unsafe_memory_launches)
-                and not any(i <= read["launch"] and not launch_complete.get(i, False) for i in launches)
-            ):
-                sources["buffer:" + read["region"]] += 1
-            else:
-                unknown = True
-        for producer, nbytes in sources.items():
-            edge(
-                producer,
-                read["node"],
-                "memory",
-                {"bytes_per_observed_read": nbytes},
-                {"read_launch": read["launch"], "read_event": read["seq"], "offset": read["offset"]},
-            )
-        if unknown:
-            node_gaps[read["node"]].add("memory_producer_unknown_or_racing")
-            gaps.add("memory_producer_unknown_or_racing")
-    # Export observed final writes to declared output regions. Racing stores do
-    # not acquire a unique producer merely because their log records came last.
-    for allocation in allocations:
-        output_roles = [r for r in [allocation["role"], *allocation.get("aliases", [])] if r.startswith("output:")]
-        if not output_roles:
-            continue
-        output_key = "result:" + sorted(set(output_roles))[0]
-        node(output_key, "output", {"roles": sorted(set(output_roles)), "bytes": allocation["bytes"]})
-        if (
-            not all(launch_complete.values())
-            or unsafe_memory_launches
-            or len({launch_record["stream"] for launch_record in launches.values()}) > 1
-        ):
-            node_gaps[output_key].add("output_scope_incomplete")
-            gaps.add("output_scope_incomplete")
-            continue
-        sources = Counter()
-        unknown = False
-        for byte in range(allocation["bytes"]):
-            writes = byte_writes.get((("GLOBAL", allocation["role"]), byte), [])
-            if len(writes) > 512:
-                unknown = True
-                gaps.add("memory_history_budget")
-                continue
-            latest = [w for w in writes if not any(w is not x and happens_before(w, x) for x in writes)]
-            if len(latest) == 1:
-                sources[latest[0]["node"]] += 1
-            else:
-                unknown = True
-        for producer, nbytes in sources.items():
-            edge(producer, output_key, "output_memory", {"bytes": nbytes})
-        if unknown:
-            node_gaps[output_key].add("output_producer_unknown_or_racing")
-            gaps.add("output_producer_unknown_or_racing")
-    for key, n in nodes.items():
-        if key in patterns:
-            ranges = []
-            for (cta, tid), pattern in sorted(patterns[key].items()):
-                if ranges and ranges[-1][0] == cta and ranges[-1][2] + 1 == tid and ranges[-1][3] == pattern:
-                    ranges[-1][2] = tid
-                else:
-                    ranges.append([cta, tid, tid, pattern])
-            n["attrs"]["execution_pattern"] = {
-                "encoding": "cta_thread_ranges_of_predicate_mask_runs",
-                "ranges": ranges,
-            }
-        if key in constants:
-            n["attrs"]["constant_values"] = [json.loads(x) for x in sorted(constants[key])]
-        if key in memory_patterns:
-            # Sort threads, retaining within-thread address order including loop
-            # revisits. Never sort away a transpose or a changed loop traversal.
-            bythread = defaultdict(list)
-            for cta, tid, region, offset, size in memory_patterns[key]:
-                bythread[cta, tid].append([region, offset, size])
-            n["attrs"]["memory_pattern"] = {
-                "sha256": digest(sorted((list(k), v) for k, v in bythread.items())),
-                "access_count": len(memory_patterns[key]),
-            }
-            n["evidence"]["memory_examples"] = memory_patterns[key][:8]
-        if n["kind"] == "instruction":
-            lid = n["evidence"]["launch"]
-            if not launch_complete.get(lid, False):
-                node_gaps[key].add("instruction_capture_incomplete")
-        n["unknowns"] = sorted(node_gaps[key])
-    edges = [
-        {
-            "source": a,
-            "target": b,
+        kind = {"launch": "kernel", "library_begin": "library", "copy": "copy", "fill": "fill"}[r["type"]]
+        node = {
+            "id": f"{kind}:{r['seq']}",
             "kind": kind,
-            "attrs": {**json.loads(attrs), "observed_count": count},
+            "seq": r["seq"],
+            "stream": r["stream"],
+            "reads": [],
+            "writes": [],
             "unknowns": [],
-            "evidence": edge_examples.get((a, b, kind, attrs), {}),
+            "evidence": {},
+            "configuration": {},
+            "footprint_complete": True,
         }
-        for (a, b, kind, attrs), count in sorted(edge_counts.items())
-    ]
-    for path, h in before.items():
-        if sha(path) != h:
-            raise RuntimeError("trace changed while analyzing: " + path)
+        binding = Bindings(allocations, r["seq"])
+        if kind == "kernel":
+            node["evidence"] = {"name": r["name"], "launch_id": r["id"]}
+            node["implementation"] = r["implementation"]
+            node["configuration"] = {k: r[k] for k in ("grid", "block", "shared")}
+            attrs, unknowns = launch_configuration(r)
+            node["configuration"].update(attrs)
+            node["unknowns"].extend(unknowns)
+            args = []
+            for arg in r["arguments"]:
+                match = binding.find(arg["bits"]) if arg["bytes"] == 8 else None
+                if match:
+                    a, offset = match
+                    args.append(
+                        {"index": arg["index"], "kind": "address_binding", "buffer": a["id"], "offset": offset}
+                    )
+                elif arg["bytes"] <= 8:
+                    args.append(
+                        {"index": arg["index"], "kind": "argument_bits", "bytes": arg["bytes"], "bits": arg["bits"]}
+                    )
+                else:
+                    args.append({"index": arg["index"], "kind": "opaque_argument", "bytes": arg["bytes"]})
+                    node["unknowns"].append("opaque_argument_configuration")
+            node["configuration"]["arguments"] = args
+            if r.get("arguments_present") is False:
+                node["unknowns"].append("opaque_argument_configuration")
+            done = completions.get(r["id"])
+            if done is None:
+                node["unknowns"].append("launch_completion_missing")
+                node["footprint_complete"] = False
+                nodes.append(node)
+                continue
+            node["end_seq"] = done["seq"]
+            full_ctas = config["cta_limit"] < 0 or config["cta_limit"] >= math.prod(r["grid"])
+            if done["dropped"] or not full_ctas or r["unsupported_memory_instructions"]:
+                node["footprint_complete"] = False
+                node["unknowns"].extend(
+                    key
+                    for key, present in [
+                        ("memory_runs_dropped", done["dropped"]),
+                        ("cta_sampling", not full_ctas),
+                        ("unsupported_memory_instruction", r["unsupported_memory_instructions"]),
+                    ]
+                    if present
+                )
+            data = Path(f"{prefix}.launch{r['id']}.bin").read_bytes()
+            if len(data) != done["runs"] * RUN.size:
+                raise ValueError("memory run length does not match completed capture")
+            per_buffer = defaultdict(lambda: {"reads": [], "writes": [], "atomic": False})
+            unmapped = 0
+            for seq, (address, owner, length, width, mode, _) in enumerate(RUN.iter_unpack(data)):
+                a = binding.find(address, length)
+                if a is None:
+                    unmapped += length
+                    continue
+                storage, offset = a
+                access = (offset, offset + length, owner, width, seq)
+                if mode & 1:
+                    per_buffer[storage["id"]]["reads"].append(access)
+                if mode & 2:
+                    per_buffer[storage["id"]]["writes"].append(access)
+                if mode == 3:
+                    per_buffer[storage["id"]]["atomic"] = True
+            node["evidence"].update(
+                raw_runs=done["runs"], dropped_runs=done["dropped"], unmapped_access_bytes=unmapped
+            )
+            if unmapped:
+                node["unknowns"].append("unmapped_storage_access")
+                node["footprint_complete"] = False
+            for storage, accesses in per_buffer.items():
+                reads, writes = accesses["reads"], accesses["writes"]
+                entry, ambiguous = entry_read_regions(reads, writes)
+                conflict = conflicting_writes(writes)
+                if reads:
+                    node["reads"].append(
+                        {
+                            "buffer": storage,
+                            "regions": union(x[:2] for x in reads),
+                            "entry_regions": entry,
+                            "internal_or_unordered_regions": ambiguous,
+                            "port": None,
+                            "evidence": "observed_global_memory_runs",
+                        }
+                    )
+                if writes:
+                    node["writes"].append(
+                        {
+                            "buffer": storage,
+                            "regions": union(x[:2] for x in writes),
+                            "conflicting_regions": conflict,
+                            "atomic_unknown": accesses["atomic"],
+                            "port": None,
+                            "evidence": "observed_global_memory_runs",
+                        }
+                    )
+                if ambiguous:
+                    node["unknowns"].append("internal_or_unordered_read_version")
+                if conflict or accesses["atomic"]:
+                    node["unknowns"].append("write_version_ambiguous")
+        else:
+            node["evidence"] = {"api": r.get("api", "cuMemcpyDtoDAsync_v2")}
+            if kind == "library":
+                node["configuration"] = {k: v for k, v in r["attrs"].items() if k not in ("a", "b", "c")}
+                children = [x for x in launches.values() if x["parent"] == r["seq"]]
+                node["configuration"]["child_launch_num_attrs"] = [x.get("launch_num_attrs") for x in children]
+                for child in children:
+                    node["unknowns"].extend(launch_configuration(child)[1])
+                if r["attrs"].get("workspace_mode", "unknown") == "unknown":
+                    node["unknowns"].append("opaque_workspace_configuration")
+                node["evidence"]["kernel_launches"] = [x["id"] for x in children]
+                node["implementation"] = digest(
+                    [r["api"], [(x["name"], x["grid"], x["block"], x["shared"]) for x in children]]
+                )
+                node["operation"] = "gemm"
+                end = endings.get(r["seq"])
+                node["end_seq"] = end["seq"] if end else r["seq"]
+                try:
+                    if end is None or end["status"] != 0:
+                        raise ValueError("library call unsuccessful or incomplete")
+                    requested = gemm_accesses(r["attrs"])
+                except ValueError as exc:
+                    requested = []
+                    node["unknowns"].append(str(exc))
+                    node["footprint_complete"] = False
+                node["evidence"]["private_library_memory"] = "opaque; public GEMM operand contract only"
+            elif kind == "copy":
+                node["implementation"] = "cuda_device_copy"
+                node["end_seq"] = r["seq"]
+                node["configuration"] = {"bytes": r["bytes"]}
+                requested = [
+                    ("source", "read", [(r["source"], r["source"] + r["bytes"])]),
+                    ("target", "write", [(r["target"], r["target"] + r["bytes"])]),
+                ]
+            else:
+                node["implementation"] = "cuda_memset"
+                node["end_seq"] = r["seq"]
+                node["configuration"] = {k: r[k] for k in ("value", "bytes", "element_bytes")}
+                node["evidence"]["api"] = "cuMemsetAsync"
+                requested = [("target", "write", [(r["target"], r["target"] + r["bytes"])])]
+            for port, mode, intervals in requested:
+                groups = defaultdict(list)
+                for lo, hi in intervals:
+                    found = binding.find(lo, hi - lo)
+                    if not found:
+                        node["unknowns"].append("unmapped_contract_operand")
+                        node["footprint_complete"] = False
+                        continue
+                    storage, offset = found
+                    groups[storage["id"]].append((offset, offset + hi - lo))
+                for storage, regions in groups.items():
+                    access = {
+                        "buffer": storage,
+                        "regions": union(regions),
+                        "port": port,
+                        "evidence": "successful_library_api_contract" if kind == "library" else "cuda_memory_api",
+                    }
+                    if mode == "read":
+                        access.update(entry_regions=access["regions"], internal_or_unordered_regions=[])
+                        node["reads"].append(access)
+                    else:
+                        access.update(conflicting_regions=[], atomic_unknown=False)
+                        node["writes"].append(access)
+        node["unknowns"] = sorted(set(node["unknowns"]))
+        nodes.append(node)
+    nodes.sort(key=lambda n: n["seq"])
+    stream_slots = {}
+    for node in nodes:
+        stream_slots.setdefault(node["stream"], len(stream_slots))
+        node["configuration"]["stream_slot"] = stream_slots[node["stream"]]
+    output_node = {
+        "id": "forward_output",
+        "kind": "output",
+        "seq": max(r.get("seq", 0) for r in records) + 1,
+        "stream": -1,
+        "reads": [],
+        "writes": [],
+        "footprint_complete": True,
+    }
+    output_unknowns = []
+    for allocation in allocations:
+        for role in allocation["roles"]:
+            if not role.startswith("output:"):
+                continue
+            try:
+                view = allocation.get("role_views", {}).get(role)
+                regions = view_regions(view) if view else [[0, allocation["bytes"]]]
+                output_node["reads"].append(
+                    {
+                        "buffer": allocation["id"],
+                        "port": role,
+                        "regions": regions,
+                        "entry_regions": regions,
+                        "evidence": "returned_tensor_view",
+                    }
+                )
+            except ValueError as exc:
+                output_unknowns.append(str(exc))
+    edges, versions = version_dependencies(
+        nodes + [output_node], allocations, memory_unknown, [r for r in records if r["type"] == "order"]
+    )
+    outputs = [edge for edge in edges if edge["target"] == "forward_output"]
+    edges = [edge for edge in edges if edge["target"] != "forward_output"]
+    for node in nodes:
+        for access in node["reads"] + node["writes"]:
+            a = by_buffer[access["buffer"]]
+            access["buffer_roles"] = a["roles"]
+            access["buffer_bytes"] = a["bytes"]
     return {
-        "schema_version": SCHEMA,
-        "id": identity or prefix.name,
-        "context": context,
-        "nodes": list(nodes.values()),
+        "schema": "coarse-component-graph/v1",
+        "context": context or {},
+        "nodes": nodes,
         "edges": edges,
+        "buffers": allocations,
+        "versions": versions,
+        "outputs": outputs,
+        "output_unknowns": output_unknowns,
         "coverage": {
-            "complete": False,
-            "scope": "predicated SASS instruction occurrences compressed by instruction; bounded observed inputs",
-            "unknowns": sorted(gaps),
-            "capture_complete": all(launch_complete.values()) and bool(launch_complete),
-            "register_contract": "conservative SASS opcode subset",
-            "memory_contract": "byte overlap with same-thread/same-stream or verified full CTA barrier ordering",
-        },
-        "unknowns": [],
-        "provenance": {
-            "files": before,
-            "extractor_sha256": sha(__file__),
+            "kernel_launches": len(launches),
+            "completed_kernel_launches": len(completions),
+            "memory_traced_kernels": sum(x["memory_traced"] for x in launches.values()),
+            "contract_covered_kernels": sum(x["parent"] >= 0 for x in launches.values()),
+            "complete_node_footprints": sum(n["footprint_complete"] for n in nodes),
+            "node_count": len(nodes),
+            "memory_unknown_events": memory_unknown,
+            "trace_process_complete": records[-1]["type"] == "end",
             "config": config,
-            "event_count": event_count,
-            "memory_events": len(mem),
-            "elapsed_seconds": time.monotonic() - started,
+        },
+        "provenance": {
+            "extractor_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "metadata_sha256": hashlib.sha256(Path(str(prefix) + ".jsonl").read_bytes()).hexdigest(),
+            "parse_seconds": time.monotonic() - started,
         },
     }
+
+
+def version_dependencies(nodes, allocations, memory_unknown=(), orders=()):
+    """Region versions require original stream order, never capture serialization."""
+    # Only user/program synchronization is recorded. The collector's diagnostic
+    # cuCtxSynchronize calls are excluded at the native reentrancy guard.
+    ancestors, tails, events, pending = {}, {}, {}, defaultdict(set)
+    global_barrier = set()
+    unknown_memory_nodes = [
+        {
+            "id": f"unknown_memory:{e['seq']}",
+            "seq": e["seq"],
+            "stream": e.get("stream", -1000 - e["seq"]),
+            "footprint_complete": False,
+        }
+        for e in memory_unknown
+    ]
+    timeline = sorted(
+        [("node", n) for n in nodes + unknown_memory_nodes] + [("order", e) for e in orders], key=lambda x: x[1]["seq"]
+    )
+    for kind, item in timeline:
+        if kind == "node":
+            parents = set(global_barrier) | pending[item["stream"]]
+            if item["stream"] in tails:
+                parents.add(tails[item["stream"]])
+            ancestors[item["id"]] = parents | {a for parent in parents for a in ancestors.get(parent, ())}
+            tails[item["stream"]] = item["id"]
+        elif item["action"] == "record":
+            events[item["event"]] = tails.get(item["stream"])
+        elif item["action"] == "wait" and events.get(item["event"]) is not None:
+            pending[item["stream"]].add(events[item["event"]])
+        elif item["action"] == "destroy":
+            events.pop(item["event"], None)
+        elif item["action"] == "device_sync":
+            global_barrier.update(tails.values())
+    writers = defaultdict(list)
+    versions = []
+    for n in nodes:
+        for access in n["writes"]:
+            version = {
+                "id": f"{access['buffer']}@{n['id']}",
+                "buffer": access["buffer"],
+                "producer": n["id"],
+                "regions": access["regions"],
+                "seq": n["seq"],
+                "stream": n["stream"],
+                "complete": n["footprint_complete"],
+                "conflicts": access["conflicting_regions"],
+                "atomic_unknown": access["atomic_unknown"],
+            }
+            versions.append(version)
+            writers[access["buffer"]].append(version)
+    initial = {a["id"]: a for a in allocations}
+    unknown_calls = [n for n in nodes if not n["footprint_complete"]] + unknown_memory_nodes
+    edges = []
+    for node in nodes:
+        for read in node["reads"]:
+            candidates = [w for w in writers[read["buffer"]] if w["producer"] != node["id"]]
+            grouped = defaultdict(list)
+            for lo, hi in read["entry_regions"]:
+                relevant = [w for w in candidates if any(overlap((lo, hi), region) for region in w["regions"])]
+                cuts = sorted(
+                    {
+                        lo,
+                        hi,
+                        *[
+                            v
+                            for w in relevant
+                            for r in w["regions"]
+                            if overlap((lo, hi), r)
+                            for v in overlap((lo, hi), r)
+                        ],
+                    }
+                )
+                for start, end in zip(cuts, cuts[1:], strict=False):
+                    ws = [w for w in relevant if any(overlap((start, end), r) for r in w["regions"])]
+                    before = [w for w in ws if w["producer"] in ancestors[node["id"]]]
+                    unordered = [
+                        w
+                        for w in ws
+                        if w["producer"] not in ancestors[node["id"]] and node["id"] not in ancestors[w["producer"]]
+                    ]
+                    latest_versions = [
+                        w
+                        for w in before
+                        if not any(w["producer"] in ancestors[other["producer"]] for other in before if other is not w)
+                    ]
+                    latest = latest_versions[0] if len(latest_versions) == 1 else None
+                    possible_hidden_writer = any(
+                        unknown["id"] != node["id"]
+                        and node["id"] not in ancestors[unknown["id"]]
+                        and not (latest and unknown["id"] in ancestors[latest["producer"]])
+                        for unknown in unknown_calls
+                    )
+                    unknown_between = possible_hidden_writer
+                    if unordered or len(latest_versions) > 1:
+                        source, version, certainty = None, None, "unordered_stream_writers"
+                    elif latest:
+                        conflict = any(overlap((start, end), r) for r in latest["conflicts"])
+                        source, version = latest["producer"], latest["id"]
+                        certainty = (
+                            "proven_region_dependency"
+                            if latest["complete"]
+                            and node["footprint_complete"]
+                            and not conflict
+                            and not latest["atomic_unknown"]
+                            and not unknown_between
+                            else "partial_or_ambiguous_dependency"
+                        )
+                    elif (
+                        initial[read["buffer"]]["roles"]
+                        and any(
+                            r.startswith(("input:", "parameter:", "state:")) for r in initial[read["buffer"]]["roles"]
+                        )
+                        and not unknown_between
+                    ):
+                        source, version, certainty = (
+                            "initial:" + read["buffer"],
+                            read["buffer"] + "@entry",
+                            "initial_value_read" if node["footprint_complete"] else "possible_initial_value_read",
+                        )
+                    else:
+                        source, version, certainty = None, None, "entry_value_unobserved"
+                    grouped[source, version, certainty].append((start, end))
+            for (source, version, certainty), regions in grouped.items():
+                edges.append(
+                    {
+                        "source": source,
+                        "target": node["id"],
+                        "buffer": read["buffer"],
+                        "version": version,
+                        "regions": union(regions),
+                        "port": read["port"],
+                        "certainty": certainty,
+                        "evidence": read["evidence"],
+                    }
+                )
+    return edges, versions
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--trace", required=True, type=Path)
-    p.add_argument("--context", required=True, type=Path)
-    p.add_argument("--allocations", type=Path)
-    p.add_argument("--output", required=True, type=Path)
-    a = p.parse_args()
-    allocations = json.loads(a.allocations.read_text())["allocations"] if a.allocations else []
-    graph = build_graph(a.trace, json.loads(a.context.read_text()), allocations)
-    a.output.parent.mkdir(parents=True, exist_ok=True)
-    with a.output.open("x") as f:
-        json.dump(graph, f, indent=2)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--allocations", type=Path, required=True)
+    parser.add_argument("--context", type=Path)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    graph = build_graph(
+        args.trace,
+        json.loads(args.allocations.read_text())["allocations"],
+        json.loads(args.context.read_text()) if args.context else {},
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with args.output.open("x") as handle:
+        json.dump(graph, handle, indent=2)
     print(
         json.dumps(
             {
-                "graph": str(a.output),
-                "nodes": len(graph["nodes"]),
-                "edges": len(graph["edges"]),
                 "coverage": graph["coverage"],
-                "seconds": graph["provenance"]["elapsed_seconds"],
+                "edges": len(graph["edges"]),
+                "seconds": graph["provenance"]["parse_seconds"],
             }
         )
     )

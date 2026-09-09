@@ -1,121 +1,65 @@
-# Runtime component candidates
+# Runtime 调用组件追踪
 
-This workflow independently captures NVBit SASS instruction events, recovers a
-conservative subset of dependencies, and backtracks **candidate** neighborhoods
-to a caller-selected best answer. It does not use source similarity, task-specific
-signatures, or the state-matching implementation. It does not certify component
-retention or change training rewards. The report and measured limits are in
-[the component-tracking handoff](../../../handoffs/paper/runtime_component_tracking.md).
+离线捕获整次 forward 的 kernel、受支持 cuBLAS GEMM、CUDA copy/fill 调用，以实际 global-memory 访问或成功 API 契约建立 buffer 区域与版本依赖，再做跨轮组件对应
 
-## Build and capture
+自定义 kernel 保持 opaque；不构建指令/寄存器图，不使用源码相似度或节点数发 reward。调用参数中的指针只用于身份绑定，读写证据来自 memory-only NVBit 或明确 API 契约
 
-Install `requirements.txt` for CPU matching. Download the public NVBit 1.8 x86_64
-release to `local_artifacts/component_tracking/nvbit_release_x86_64`; its binary
-core remains an external dependency. CUDA 12.9 / H20 is the tested configuration.
+## 捕获与提取
+
+需要外部 NVBit 1.8、CUDA toolkit 与 H20；构建产物默认进入 ignored `local_artifacts/component_tracking/coarse/build`
 
 ```bash
-make -C tools/data/runtime_trace
+make -C tools/data/runtime_trace NVBIT_ROOT=/absolute/path/to/nvbit_release_x86_64
 python -m tools.data.runtime_trace.check_runtime_trace
 ```
 
-The native library and build products go to
-`local_artifacts/component_tracking/build/`. Run only trusted workloads in an
-isolated process. Check GPU occupancy and verify synchronized source/binary hashes
-before node-local execution. Use a fresh trace prefix and a wall-time limit:
+GPU 执行前检查占用，把源码、二进制、payload、配置同步到独立 node-local 目录并写 `manifest.json`，格式为相对路径到 SHA256 的映射。`replay` 启动时逐文件核对；不要在共享部署目录构建或覆盖服务
+
+在 node-local bundle 根目录运行，每次使用新的输出目录与 trace prefix；同一 payload 必须先做不设置 `LD_PRELOAD`、不传 `--tracer` 的控制
 
 ```bash
-timeout 180 env CUDA_VISIBLE_DEVICES=0 \
-  PATH=/usr/local/cuda/bin:$PATH \
-  LD_PRELOAD="$PWD/local_artifacts/component_tracking/build/runtime_trace.so" \
-  RUNTIME_TRACE_OUTPUT="$PWD/local_artifacts/component_tracking/new_capture" \
-  RUNTIME_TRACE_START_ENABLED=0 RUNTIME_TRACE_CTAS=1 \
-  RUNTIME_TRACE_LAUNCHES=4 RUNTIME_TRACE_CAPACITY=500000 \
-  python -m tools.data.runtime_trace.reference_replay /path/to/reference.json \
-    --tracer "$PWD/local_artifacts/component_tracking/build/runtime_trace.so" \
-    --output local_artifacts/component_tracking/new_result
-```
+CUDA_VISIBLE_DEVICES=0 LD_PRELOAD="$PWD/runtime_trace.so" \
+  RUNTIME_TRACE_START_ENABLED=0 RUNTIME_TRACE_OUTPUT="$PWD/traces/sample" \
+  RUNTIME_TRACE_CTAS=-1 RUNTIME_TRACE_CAPACITY=1048576 \
+  python -m tools.data.runtime_trace.replay \
+    --payload inputs/sample.json --manifest manifest.json \
+    --tracer "$PWD/runtime_trace.so" --output results/sample
 
-`reference_replay` consumes `{id, reference_code, source_sha256}` and runs the
-original shapes/dtypes with initialization seed 42 and input seed 17, default
-training mode and `no_grad`. `replay.py` instead consumes a saved TVM-FFI
-submission and requires a KernelGym checkout whose `source_manifest.json` matches
-all sources. It uses the normal compiler/precheck, evaluation mode and the
-existing TF32 diagnostic policy. Neither runner starts an evaluator service.
-
-With `RUNTIME_TRACE_START_ENABLED=0`, synchronize, call
-`ctypes.CDLL(None).runtime_trace_set_enabled(1)`, execute the measured forward,
-synchronize, then disable it. This API affects only capture; it is not a model
-feedback channel. Clear `LD_PRELOAD` from subprocess environments after startup
-so compilers/children do not inherit the capture destination.
-
-Native defaults capture one CTA from at most four kernels. Set CTAS and LAUNCHES
-to `-1` for all, subject to the event buffer limit. A kernel-name filter can select
-a diagnostic region. Sampling, skipped launches and dropped events are explicit
-coverage gaps; they are not full-program evidence. The tool serializes launches,
-rejects active CUDA Graphs and multiple active contexts/host launch threads, and
-is unsuitable for scored latency. Unhandled APIs are recorded as unknown.
-
-The JSONL stores static SASS/operands, launch/configuration events and completion
-counts. Each selected launch has a 40-byte-per-event binary file (address,
-constant bits, instruction, CTA, thread, evaluated guard and active mask). A
-missing completion/end or a count mismatch cannot be treated as successful full
-capture. Subword/unaligned constant-bank operands are not read by the 32-bit
-NVBit constant helper; their value remains unknown.
-
-## Graphs and backtracking
-
-```bash
 python -m tools.data.runtime_trace.extract \
-  --trace local_artifacts/component_tracking/new_capture \
-  --allocations local_artifacts/component_tracking/new_result/allocations.json \
-  --context /path/to/context.json \
-  --output local_artifacts/component_tracking/new_graph.json
-python -m tools.data.runtime_trace.lineage \
-  --snapshots /path/to/snapshots.json \
-  --output local_artifacts/component_tracking/new_candidates
+  --trace traces/sample --allocations results/sample/allocations.json \
+  --context context.json --output graphs/sample.json
 ```
 
-A comparison context contains `task`, `model`, `input_signature`,
-`environment_signature`, `decision_turn` and `horizon`; incompatible task/model/
-input/environment values cannot produce candidates. Snapshots are a JSON list of
-`{turn, correct, score, graph}`, with graph paths relative to that JSON file. The
-score must be supplied explicitly. Earliest maximum wins; a missing winning graph
-never silently selects an inferior version. All-failed trajectories produce no
-candidate labels.
+Reference payload 包含 `reference_code`，可带校验用 `source_sha256`；candidate 另含 `custom_code`，需传 `--kernelgym-root` 指向既有隔离 backend 与其 source manifest。默认初始化 seed42、输入 seed17，保留原始 shape/dtype；reference 使用 train/no_grad，并在 forward 前重置 seed23，candidate 使用 eval/no_grad 且沿用输入初始化后的 RNG 状态
 
-The graph separates comparable attributes from evidence such as function names,
-PCs, raw pointers and SASS locators. Buffer byte regions use declared storage
-identities. Registers use supported explicit operand contracts, including vector
-widths and uniform carry predicates. Memory edges require byte overlap plus
-same-thread, same-stream or verified full-CTA barrier order. Log arrival order
-never establishes cross-thread dependence. Output values have distinct nodes,
-including aliases of an input storage. Unsupported instructions, opaque CBANK
-roles, missing allocations and incomplete observations remain unknown.
+两条路径显式启用 matmul/cudnn TF32。`result.json` 记录 forward 前读取到的实际 backend 字段、seed、配置 hash 和输入/输出指纹；reference 另记所有 named parameter/buffer 的初始内容 hash。跨实现比较先核对这些字段，不能仅凭输入 hash 相同就比较输出或耗时
 
-Repeated instruction execution is encoded losslessly as per-thread
-predicate/mask runs and adjacent-thread ranges. Memory access sequences are
-fingerprinted per instruction/thread, preserving offsets and iteration order.
-The resulting compressed graph is **not** an isomorphism proof about the fully
-expanded dynamic dependence graph.
+`context.json` 必须包含同一题目源码的 `task`、实际输入指纹 `input_signature`、运行配置 `environment_signature`。采集的 SASS 实现标识只在区域接口对应成立后用于区分实现；它不证明数学语义或创作来源
 
-`match.py` uses independently written candidate indexing plus bounded NetworkX
-VF2 checks of rooted attributed multigraph neighborhoods. Unknown alternatives,
-ambiguous repeated fragments and inconsistent partial mappings are retained as
-uncertainty. Candidate records explicitly set `certifies_retention=false`.
-`lineage.py` records earliest *observed candidate* correspondence and whether a
-center lies on an observed output-dependency path. `eligible_for_credit` is false;
-ABI/prologue similarity, local candidates and node counts are not reward labels.
+## 匹配与回溯
 
-## Evidence boundaries
+```python
+from tools.data.runtime_trace.match import compare
+result = compare(previous_graph, best_graph)
+```
 
-The retained artifacts distinguish early joint-prototype results from final
-independent analysis. The final collector, dependency recovery, matcher and
-backtracker live entirely in this directory; no peer implementation is imported.
-The same target binaries/input sources may be used to cross-check independently
-collected facts. This agreement does not certify graph semantics or state merges.
+`lineage` 接受带 `turn/correct/score/graph` 的 JSON 列表，graph 可为相对文件路径；由调用方提供历史正确性与分数，最佳图缺失时不换成较差答案
 
-CPU checks live beside this offline workflow, outside slime CI. Real CUDA
-calibrations include rename/helper extraction, changed scalar, transpose errors,
-shared-memory GEMM, split computation, overlapping writes, races and predication.
-The report records exact output controls, failed instrumentation, fixes, code
-provenance, costs and unresolved scalability/retention gaps.
+```bash
+python -m tools.data.runtime_trace.lineage --snapshots snapshots.json --output lineage.json
+```
+
+结果区分留存观测、配置变化、实现变化、局部对应、配置未知、重复调用歧义和无法一对一对应。完整但没有已观测数据效果的调用单列；结构候选不等于训练可用状态，不自动接 GRPO
+
+## 边界与证据
+
+- 全 forward、默认所有 CTA；每 kernel 最多 1,048,576 条压缩 memory runs，截断和未知不会被视为完整足迹
+- Warp 内仅对精确连续地址做无损区域压缩；保留读写、覆盖范围、alias 生命周期、输出 view 和版本
+- 同 stream 与成功 event/device sync 建立顺序；诊断插桩自带的强制同步不进入程序依赖图
+- 未知中间调用会使旧版本失效；后续完整覆盖可按区域恢复。无序写入、原子冲突、无法绑定的私有 storage 保留未知
+- cuBLAS Sgemm/GemmEx 以公开逻辑矩阵契约覆盖，不宣称测到库内部每次物理访问；cuDNN/cuBLASLt 没有专门契约
+- 扩展 launch 属性只记录数量；缺失或非零时配置未知。workspace 模式区分默认池、自定义区和显式禁用默认池；默认池模式的 `workspace_bytes=0` 仅表示未绑定自定义容量
+- 多活跃 CUDA context、多个 launch 主机线程、CUDA graph capture 当前拒绝；未支持 launch/内存 API 显式记 unknown
+- 采集会串行化执行，冷 forward 成本只用于诊断，不能作为训练性能分数
+
+实际案例、成本、冻结批次和复现 manifest 见 [组件追踪报告](../../../handoffs/paper/runtime_component_tracking.md)

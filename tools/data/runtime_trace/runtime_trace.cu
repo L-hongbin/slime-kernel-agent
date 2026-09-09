@@ -1,155 +1,122 @@
-// Bounded diagnostic tracer. Serializes ordinary kernel launches; rejects graph
-// capture and multiple host threads/contexts. Never use for scored timing.
+// Whole-forward coarse capture: global-memory runs, opaque kernel versions,
+// runtime launch parameters and library parent scopes. No register graph.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
-#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include "nvbit_tool.h"
 #include "nvbit.h"
 #include "common.h"
-
-static TraceBuffer* buffer = nullptr;
-static FILE* metadata = nullptr;
-static std::string output, filter;
-static std::set<CUfunction> seen;
-static std::recursive_mutex mutex;
-static thread_local bool internal = false;
-static uint32_t next_instruction = 0;
-static uint64_t launch = 0, selected_count = 0;
-static int cta_limit = 1, max_launches = 4;
-static uint64_t capacity = 500000;
-static CUcontext first_context = nullptr;
-static std::thread::id host_thread;
-static bool selected = false;
-static bool capture_active = true;
-extern "C" void runtime_trace_set_enabled(int enabled){
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    capture_active=enabled!=0;
-    if(metadata){fprintf(metadata,"{\"type\":\"scope\",\"enabled\":%s,\"launch\":%lu}\n",capture_active?"true":"false",launch);fflush(metadata);}
+static TraceBuffer* buffer=nullptr;
+static FILE* log_file=nullptr;
+static std::recursive_mutex lock;
+static thread_local bool internal=false;
+static thread_local long long library_parent=-1;
+static CUcontext first_context=nullptr;
+static std::thread::id launch_thread;
+static std::string prefix;
+static bool active=true,selected=false;
+static uint64_t position=0,launch_id=0,capacity=1048576;
+static int cta_limit=-1;
+struct FunctionInfo {uint64_t hash=1469598103934665603ULL;int unsupported=0;};
+static std::unordered_map<CUfunction,FunctionInfo> info;
+static void fail(const char* message){fprintf(stderr,"COARSE_TRACE_ERROR %s\n",message);abort();}
+static void check_result(CUresult status,const char* expr){if(status!=CUDA_SUCCESS){const char *name=nullptr,*msg=nullptr;cuGetErrorName(status,&name);cuGetErrorString(status,&msg);fprintf(stderr,"COARSE_CUDA %s %s %s\n",expr,name,msg);fail("CUDA operation failed");}}
+#define CHECK(call) check_result((call),#call)
+static std::string quote(const char* s){std::string out="\"";for(;*s;++s){if(*s=='"'||*s=='\\')out+='\\';if(*s=='\n')out+="\\n";else out+=*s;}return out+'"';}
+static void flush(){if(fflush(log_file)||ferror(log_file))fail("metadata write failed");}
+static int env_int(const char* key,int fallback){const char* p=getenv(key);return p?atoi(p):fallback;}
+extern "C" uint64_t coarse_position(){return position;}
+extern "C" int coarse_active(){return active;}
+extern "C" void runtime_trace_set_enabled(int value){std::lock_guard<std::recursive_mutex> guard(lock);active=value!=0;if(log_file){fprintf(log_file,"{\"type\":\"scope\",\"seq\":%lu,\"enabled\":%s}\n",position++,active?"true":"false");flush();}}
+extern "C" long long coarse_library_begin(const char* api,const char* attributes,uint64_t stream){
+    std::lock_guard<std::recursive_mutex> guard(lock);if(!active||library_parent>=0)return -1;long long id=position++;
+    fprintf(log_file,"{\"type\":\"library_begin\",\"seq\":%lld,\"api\":%s,\"stream\":%lu,\"attrs\":%s}\n",id,quote(api).c_str(),stream,attributes);library_parent=id;flush();return id;
 }
-static void fail(const char* text) { fprintf(stderr, "RUNTIME_TRACE_ERROR %s\n", text); fflush(stderr); abort(); }
-static void check_result(CUresult r,const char* call,int line) {
-    if(r!=CUDA_SUCCESS){const char *name="unknown",*description="unknown";cuGetErrorName(r,&name);cuGetErrorString(r,&description);
-        fprintf(stderr,"RUNTIME_TRACE_CUDA line=%d call=%s code=%d name=%s description=%s launch=%lu\n",line,call,(int)r,name,description,launch);fail("CUDA driver operation failed");}
+extern "C" void coarse_library_end(long long id,int status){std::lock_guard<std::recursive_mutex> guard(lock);if(id<0)return;fprintf(log_file,"{\"type\":\"library_end\",\"seq\":%lu,\"parent\":%lld,\"status\":%d}\n",position++,id,status);library_parent=-1;flush();}
+void nvbit_at_init(){
+    const char* p=getenv("RUNTIME_TRACE_OUTPUT");if(!p)fail("RUNTIME_TRACE_OUTPUT required");prefix=p;
+    active=env_int("RUNTIME_TRACE_START_ENABLED",1);cta_limit=env_int("RUNTIME_TRACE_CTAS",-1);capacity=env_int("RUNTIME_TRACE_CAPACITY",1048576);
+    if(capacity<1||capacity>16777216)fail("memory run capacity out of range");
+    log_file=fopen((prefix+".jsonl").c_str(),"wx");if(!log_file)fail("trace output must be new");
+    fprintf(log_file,"{\"type\":\"config\",\"schema\":\"coarse-memory-runs/v1\",\"nvbit\":\"%s\",\"cta_limit\":%d,\"capacity\":%lu,\"serialized_diagnostic\":true}\n",NVBIT_VERSION,cta_limit,capacity);flush();
 }
-#define check(call) check_result((call),#call,__LINE__)
-static std::string quote(const char* s) {
-    std::string out = "\"";
-    for (; *s; ++s) { if (*s == '"' || *s == '\\') out += '\\'; if (*s == '\n') out += "\\n"; else out += *s; }
-    return out + "\"";
+void nvbit_tool_init(CUcontext ctx){std::lock_guard<std::recursive_mutex> guard(lock);bool old=internal;internal=true;
+    if(first_context&&first_context!=ctx)fail("multiple contexts unsupported");first_context=ctx;
+    if(!buffer){CHECK(cuMemAllocManaged((CUdeviceptr*)&buffer,sizeof(TraceBuffer)+capacity*sizeof(MemoryRun),CU_MEM_ATTACH_GLOBAL));buffer->capacity=capacity;buffer->count=0;}internal=old;
 }
-static int env_int(const char* key, int fallback) { const char* v = getenv(key); return v ? atoi(v) : fallback; }
-void nvbit_at_init() {
-    const char* path = getenv("RUNTIME_TRACE_OUTPUT");
-    if (!path) fail("RUNTIME_TRACE_OUTPUT required");
-    output = path; filter = getenv("RUNTIME_TRACE_KERNEL") ? getenv("RUNTIME_TRACE_KERNEL") : "";
-    cta_limit = env_int("RUNTIME_TRACE_CTAS", 1);
-    capture_active = env_int("RUNTIME_TRACE_START_ENABLED", 1);
-    max_launches = env_int("RUNTIME_TRACE_LAUNCHES", 4);
-    capacity = env_int("RUNTIME_TRACE_CAPACITY", 500000);
-    if (!capacity || capacity > 10000000) fail("capacity outside 1..10000000");
-    metadata = fopen((output + ".jsonl").c_str(), "wx");
-    if (!metadata) fail("metadata output must be new");
-    fprintf(metadata, "{\"type\":\"config\",\"nvbit\":\"%s\",\"cta_limit\":%d,\"capacity\":%lu,\"max_launches\":%d,\"serialized\":true,\"filter\":%s}\n", NVBIT_VERSION, cta_limit, capacity, max_launches, quote(filter.c_str()).c_str());
-    fflush(metadata);
-}
-void nvbit_tool_init(CUcontext ctx) {
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    bool previous_internal = internal;
-    internal = true;
-    if (first_context && first_context != ctx) fail("multiple contexts unsupported");
-    if (buffer) { internal=previous_internal; return; }
-    first_context = ctx;
-    check(cuMemAllocManaged((CUdeviceptr*)&buffer, sizeof(TraceBuffer) + capacity*sizeof(TraceEvent), CU_MEM_ATTACH_GLOBAL));
-    buffer->count = 0; buffer->capacity = capacity;
-    internal = previous_internal;
-}
-static void instrument(CUcontext ctx, CUfunction f) {
-    auto functions = nvbit_get_related_functions(ctx, f); functions.push_back(f);
-    for (auto function : functions) {
-        if (!seen.insert(function).second) continue;
-        for (auto instr : nvbit_get_instrs(ctx, function)) {
-            uint32_t id = next_instruction++;
-            int mrefs = 0; const InstrType::operand_t* cbank = nullptr;
-            for(int i=0;i<instr->getNumOperands();++i){const auto* op=instr->getOperand(i);if(op->type==InstrType::OperandType::CBANK && !op->u.cbank.has_reg_offset && op->u.cbank.has_imm_offset && op->nbytes>=4 && op->u.cbank.imm_offset%4==0) cbank=op;}
-            for (int i=0;i<instr->getNumOperands();++i) if (instr->getOperand(i)->type == InstrType::OperandType::MREF) ++mrefs;
-            fprintf(metadata, "{\"type\":\"instruction\",\"id\":%u,\"function\":%s,\"offset\":%u,\"sass\":%s,\"opcode\":%s,\"space\":%s,\"load\":%s,\"store\":%s,\"size\":%d,\"mrefs\":%d,\"predicate\":%d,\"predicate_uniform\":%s,\"operands\":[", id, quote(nvbit_get_func_name(ctx,function)).c_str(), instr->getOffset(), quote(instr->getSass()).c_str(), quote(instr->getOpcode()).c_str(), quote(InstrType::MemorySpaceStr[(int)instr->getMemorySpace()]).c_str(), instr->isLoad()?"true":"false", instr->isStore()?"true":"false", instr->getSize(), mrefs, instr->hasPred()?instr->getPredNum():-1, instr->hasPred()&&instr->isPredUniform()?"true":"false");
-            for (int i=0;i<instr->getNumOperands();++i) {
-                const auto* op = instr->getOperand(i);
-                fprintf(metadata,"%s{\"type\":%s,\"text\":%s,\"bytes\":%d}", i?",":"",quote(InstrType::OperandTypeStr[(int)op->type]).c_str(),quote(op->str).c_str(),op->nbytes);
-            }
-            fprintf(metadata,"],\"captured_constant_bytes\":%d}\n",cbank?std::min(cbank->nbytes,8):0);
-            nvbit_insert_call(instr,"trace_instruction",IPOINT_BEFORE);
-            nvbit_add_call_arg_guard_pred_val(instr);
-            nvbit_add_call_arg_const_val32(instr,id);
-            if (mrefs == 1) nvbit_add_call_arg_mref_addr64(instr,0); else nvbit_add_call_arg_const_val64(instr,0);
-            if(cbank){
-                nvbit_add_call_arg_cbank_val(instr,cbank->u.cbank.id,cbank->u.cbank.imm_offset);
-                if(cbank->nbytes>=8)nvbit_add_call_arg_cbank_val(instr,cbank->u.cbank.id,cbank->u.cbank.imm_offset+4);else nvbit_add_call_arg_const_val32(instr,0);
-            }else{nvbit_add_call_arg_const_val32(instr,0);nvbit_add_call_arg_const_val32(instr,0);}
-            nvbit_add_call_arg_const_val64(instr,(uint64_t)buffer);
-            nvbit_add_call_arg_const_val32(instr,(uint32_t)cta_limit);
-        }
+static void instrument(CUcontext ctx,CUfunction function){
+    auto funcs=nvbit_get_related_functions(ctx,function);funcs.push_back(function);
+    for(auto f:funcs){if(info.count(f))continue;FunctionInfo fi;
+        for(auto ins:nvbit_get_instrs(ctx,f)){
+            for(const char* p=ins->getSass();*p;++p){fi.hash^=(unsigned char)*p;fi.hash*=1099511628211ULL;}
+            auto space=ins->getMemorySpace();
+            if(space==InstrType::MemorySpace::NONE||space==InstrType::MemorySpace::CONSTANT||space==InstrType::MemorySpace::SHARED||space==InstrType::MemorySpace::LOCAL)continue;
+            int refs=0;for(int i=0;i<ins->getNumOperands();++i)refs+=ins->getOperand(i)->type==InstrType::OperandType::MREF;
+            if(space!=InstrType::MemorySpace::GLOBAL||refs!=1||ins->getSize()<=0||(!ins->isLoad()&&!ins->isStore())){++fi.unsupported;continue;}
+            nvbit_insert_call(ins,"trace_memory",IPOINT_BEFORE);nvbit_add_call_arg_guard_pred_val(ins);nvbit_add_call_arg_mref_addr64(ins,0);
+            int mode=(ins->isLoad()?1:0)|(ins->isStore()?2:0);
+            if(strstr(ins->getOpcode(),"ATOM")||strncmp(ins->getOpcode(),"RED",3)==0)mode=3;
+            nvbit_add_call_arg_const_val32(ins,ins->getSize());nvbit_add_call_arg_const_val32(ins,mode);
+            nvbit_add_call_arg_const_val64(ins,(uint64_t)buffer);nvbit_add_call_arg_const_val32(ins,(uint32_t)cta_limit);
+        }info[f]=fi;
     }
-    fflush(metadata);
 }
-void nvbit_at_cuda_event(CUcontext ctx,int is_exit,nvbit_api_cuda_t cbid,const char* name,void* params,CUresult* status) {
-    if (internal) return;
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    internal=true;
-    if (!capture_active) {
-        if(!is_exit && (cbid==API_CUDA_cuLaunchKernel || cbid==API_CUDA_cuLaunchKernel_ptsz))nvbit_enable_instrumented(ctx,((cuLaunchKernel_params*)params)->f,false);
-        if(!is_exit && (cbid==API_CUDA_cuLaunchKernelEx || cbid==API_CUDA_cuLaunchKernelEx_ptsz))nvbit_enable_instrumented(ctx,((cuLaunchKernelEx_params*)params)->f,false);
-        internal=false; return;
-    }
-    if (strstr(name,"cuGraphLaunch") || strstr(name,"cuStreamBeginCapture")) fail("CUDA Graph capture/launch unsupported");
-    bool ordinary = cbid==API_CUDA_cuLaunchKernel || cbid==API_CUDA_cuLaunchKernel_ptsz;
-    bool extended = cbid==API_CUDA_cuLaunchKernelEx || cbid==API_CUDA_cuLaunchKernelEx_ptsz;
-    if (!ordinary && !extended) {
-        if (!is_exit && (strstr(name,"cuMemcpy") || strstr(name,"cuMemset") || strstr(name,"cuMemFree") || strstr(name,"cuMemAlloc"))) {
-            fprintf(metadata,"{\"type\":\"memory_api\",\"before_launch\":%lu,\"name\":%s}\n",launch,quote(name).c_str());fflush(metadata);
+static FunctionInfo combined_info(CUcontext ctx,CUfunction function){
+    auto functions=nvbit_get_related_functions(ctx,function);functions.push_back(function);
+    std::vector<uint64_t> hashes;FunctionInfo result;
+    for(auto f:functions){hashes.push_back(info[f].hash);result.unsupported+=info[f].unsupported;}
+    std::sort(hashes.begin(),hashes.end());
+    for(auto hash:hashes)for(int i=0;i<8;++i){result.hash^=(hash>>(i*8))&255;result.hash*=1099511628211ULL;}
+    return result;
+}
+void nvbit_at_cuda_event(CUcontext ctx,int exiting,nvbit_api_cuda_t cbid,const char* name,void* params,CUresult* status){
+    if(internal)return;std::lock_guard<std::recursive_mutex> guard(lock);internal=true;
+    bool ordinary=cbid==API_CUDA_cuLaunchKernel||cbid==API_CUDA_cuLaunchKernel_ptsz;
+    bool extended=cbid==API_CUDA_cuLaunchKernelEx||cbid==API_CUDA_cuLaunchKernelEx_ptsz;
+    if(!ordinary&&!extended){
+        if(active&&!exiting){
+            if(strstr(name,"cuGraphLaunch")||strstr(name,"cuStreamBeginCapture"))fail("CUDA Graph capture unsupported");
+            if(strstr(name,"cuLaunch")){fprintf(log_file,"{\"type\":\"unsupported_launch\",\"seq\":%lu,\"name\":%s}\n",position++,quote(name).c_str());flush();}
         }
-        if (!is_exit && (strstr(name,"cuLaunch") || strstr(name,"cuGraph"))) {
-            fprintf(metadata,"{\"type\":\"unsupported_api\",\"name\":%s}\n",quote(name).c_str());fflush(metadata);
+        if(active&&exiting&&(strstr(name,"cuMemcpy")||strstr(name,"cuMemset"))){
+            if(*status==CUDA_SUCCESS&&(cbid==API_CUDA_cuMemcpyDtoDAsync_v2||cbid==API_CUDA_cuMemcpyDtoDAsync_v2_ptsz)){auto* p=(cuMemcpyDtoDAsync_v2_params*)params;fprintf(log_file,"{\"type\":\"copy\",\"seq\":%lu,\"source\":%lu,\"target\":%lu,\"bytes\":%lu,\"stream\":%lu}\n",position++,(uint64_t)p->srcDevice,(uint64_t)p->dstDevice,p->ByteCount,(uint64_t)p->hStream);}
+            else if(*status==CUDA_SUCCESS&&(cbid==API_CUDA_cuMemcpyAsync||cbid==API_CUDA_cuMemcpyAsync_ptsz)){auto* p=(cuMemcpyAsync_params*)params;fprintf(log_file,"{\"type\":\"copy\",\"seq\":%lu,\"source\":%lu,\"target\":%lu,\"bytes\":%lu,\"stream\":%lu}\n",position++,(uint64_t)p->src,(uint64_t)p->dst,p->ByteCount,(uint64_t)p->hStream);}
+            else if(*status==CUDA_SUCCESS&&(cbid==API_CUDA_cuMemsetD8Async||cbid==API_CUDA_cuMemsetD8Async_ptsz)){auto* p=(cuMemsetD8Async_params*)params;fprintf(log_file,"{\"type\":\"fill\",\"seq\":%lu,\"target\":%lu,\"bytes\":%lu,\"value\":%u,\"element_bytes\":1,\"stream\":%lu}\n",position++,(uint64_t)p->dstDevice,p->N,(unsigned)p->uc,(uint64_t)p->hStream);}
+            else if(*status==CUDA_SUCCESS&&(cbid==API_CUDA_cuMemsetD32Async||cbid==API_CUDA_cuMemsetD32Async_ptsz)){auto* p=(cuMemsetD32Async_params*)params;fprintf(log_file,"{\"type\":\"fill\",\"seq\":%lu,\"target\":%lu,\"bytes\":%lu,\"value\":%u,\"element_bytes\":4,\"stream\":%lu}\n",position++,(uint64_t)p->dstDevice,p->N*4,(unsigned)p->ui,(uint64_t)p->hStream);}
+            else fprintf(log_file,"{\"type\":\"memory_api_unknown\",\"seq\":%lu,\"name\":%s,\"status\":%d}\n",position++,quote(name).c_str(),(int)*status);flush();
+        }
+        if(active&&exiting&&library_parent<0&&*status==CUDA_SUCCESS){
+            if(cbid==API_CUDA_cuEventRecord||cbid==API_CUDA_cuEventRecord_ptsz){auto* p=(cuEventRecord_params*)params;fprintf(log_file,"{\"type\":\"order\",\"action\":\"record\",\"seq\":%lu,\"event\":%lu,\"stream\":%lu}\n",position++,(uint64_t)p->hEvent,(uint64_t)p->hStream);flush();}
+            else if(cbid==API_CUDA_cuStreamWaitEvent||cbid==API_CUDA_cuStreamWaitEvent_ptsz){auto* p=(cuStreamWaitEvent_params*)params;fprintf(log_file,"{\"type\":\"order\",\"action\":\"wait\",\"seq\":%lu,\"event\":%lu,\"stream\":%lu}\n",position++,(uint64_t)p->hEvent,(uint64_t)p->hStream);flush();}
+            else if(cbid==API_CUDA_cuEventDestroy_v2){auto* p=(cuEventDestroy_v2_params*)params;fprintf(log_file,"{\"type\":\"order\",\"action\":\"destroy\",\"seq\":%lu,\"event\":%lu}\n",position++,(uint64_t)p->hEvent);flush();}
+            else if(cbid==API_CUDA_cuCtxSynchronize){fprintf(log_file,"{\"type\":\"order\",\"action\":\"device_sync\",\"seq\":%lu}\n",position++);flush();}
         }
         internal=false;return;
     }
-    if (host_thread==std::thread::id()) host_thread=std::this_thread::get_id();
-    if (host_thread!=std::this_thread::get_id()) fail("multiple launch host threads unsupported");
-    CUfunction function; CUstream stream; unsigned gx,gy,gz,bx,by,bz,shared;
-    if (ordinary) {
-        auto* p=(cuLaunchKernel_params*)params;function=p->f;stream=p->hStream;
-        gx=p->gridDimX;gy=p->gridDimY;gz=p->gridDimZ;bx=p->blockDimX;by=p->blockDimY;bz=p->blockDimZ;shared=p->sharedMemBytes;
-    } else {
-        auto* p=(cuLaunchKernelEx_params*)params;function=p->f;auto* c=p->config;stream=c->hStream;
-        gx=c->gridDimX;gy=c->gridDimY;gz=c->gridDimZ;bx=c->blockDimX;by=c->blockDimY;bz=c->blockDimZ;shared=c->sharedMemBytes;
-    }
-    if (first_context && first_context != ctx) fail("multiple active contexts unsupported");
-    if (!is_exit) {
-        if (!buffer) { nvbit_tool_init(ctx); internal=true; }
-        check(cuCtxSynchronize());
-        const char* fname=nvbit_get_func_name(ctx,function);
-        selected=(max_launches<0 || selected_count<(uint64_t)max_launches) && strstr(fname,filter.c_str());
-        fprintf(metadata,"{\"type\":\"launch\",\"id\":%lu,\"name\":%s,\"stream\":%lu,\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"dynamic_shared\":%u,\"selected\":%s}\n",launch,quote(fname).c_str(),(uint64_t)stream,gx,gy,gz,bx,by,bz,shared,selected?"true":"false");
-        if(selected){instrument(ctx,function);buffer->count=0;++selected_count;}
-        nvbit_enable_instrumented(ctx,function,selected);
-    } else {
-        check(*status);check(cuCtxSynchronize());
-        if(selected){
-            uint64_t count=std::min((uint64_t)buffer->count,capacity);
-            std::string path=output+".launch"+std::to_string(launch)+".bin";
-            FILE* f=fopen(path.c_str(),"wbx");if(!f)fail("binary output must be new");
-            if(fwrite(buffer->events,sizeof(TraceEvent),count,f)!=count)fail("trace write failed");
-            if(fclose(f))fail("trace close failed");
-            fprintf(metadata,"{\"type\":\"complete\",\"launch\":%lu,\"events\":%lu,\"attempted\":%llu,\"dropped\":%llu}\n",launch,count,buffer->count,buffer->count-count);
-        }
-        ++launch;
-    }
-    fflush(metadata);internal=false;
+    CUfunction f;CUstream stream;void** arguments;unsigned gx,gy,gz,bx,by,bz,shared;
+    if(ordinary){auto* p=(cuLaunchKernel_params*)params;f=p->f;stream=p->hStream;arguments=p->kernelParams;gx=p->gridDimX;gy=p->gridDimY;gz=p->gridDimZ;bx=p->blockDimX;by=p->blockDimY;bz=p->blockDimZ;shared=p->sharedMemBytes;}
+    else{auto* p=(cuLaunchKernelEx_params*)params;f=p->f;arguments=p->kernelParams;auto* c=p->config;stream=c->hStream;gx=c->gridDimX;gy=c->gridDimY;gz=c->gridDimZ;bx=c->blockDimX;by=c->blockDimY;bz=c->blockDimZ;shared=c->sharedMemBytes;}
+    if(!active){if(!exiting)nvbit_enable_instrumented(ctx,f,false);internal=false;return;}
+    if(first_context&&first_context!=ctx)fail("multiple active CUDA contexts unsupported");
+    if(launch_thread==std::thread::id())launch_thread=std::this_thread::get_id();if(launch_thread!=std::this_thread::get_id())fail("multiple host launch threads unsupported");
+    if(!exiting){
+        if(!buffer)nvbit_tool_init(ctx);internal=true;CHECK(cuCtxSynchronize());selected=library_parent<0;
+        if(selected){instrument(ctx,f);buffer->count=0;}
+        FunctionInfo aggregate=selected?combined_info(ctx,f):FunctionInfo{};
+        fprintf(log_file,"{\"type\":\"launch\",\"seq\":%lu,\"id\":%lu,\"parent\":%lld,\"name\":%s,\"stream\":%lu,\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"shared\":%u,\"memory_traced\":%s,\"implementation\":\"%016lx\",\"unsupported_memory_instructions\":%d,\"arguments\":[",position++,launch_id,library_parent,quote(nvbit_get_func_name(ctx,f)).c_str(),(uint64_t)stream,gx,gy,gz,bx,by,bz,shared,selected?"true":"false",selected?aggregate.hash:0,selected?aggregate.unsupported:0);
+        auto sizes=nvbit_get_kernel_argument_sizes(ctx,f);
+        if(arguments)for(size_t i=0;i<sizes.size();++i){uint64_t value=0;if(sizes[i]<=8)memcpy(&value,arguments[i],sizes[i]);fprintf(log_file,"%s{\"index\":%lu,\"bytes\":%d,\"bits\":%lu}",i?",":"",i,sizes[i],value);}
+        unsigned num_attrs=ordinary?0:((cuLaunchKernelEx_params*)params)->config->numAttrs;
+        fprintf(log_file,"],\"arguments_present\":%s,\"launch_api\":\"%s\",\"launch_num_attrs\":%u}\n",arguments||sizes.empty()?"true":"false",ordinary?"cuLaunchKernel":"cuLaunchKernelEx",num_attrs);nvbit_enable_instrumented(ctx,f,selected);flush();
+    }else{
+        CHECK(*status);CHECK(cuCtxSynchronize());uint64_t kept=selected?std::min((uint64_t)buffer->count,capacity):0;
+        if(selected){std::string path=prefix+".launch"+std::to_string(launch_id)+".bin";FILE* f=fopen(path.c_str(),"wbx");if(!f)fail("binary must be new");if(fwrite(buffer->runs,sizeof(MemoryRun),kept,f)!=kept||fclose(f))fail("binary write failed");}
+        fprintf(log_file,"{\"type\":\"complete\",\"seq\":%lu,\"id\":%lu,\"runs\":%lu,\"dropped\":%lu}\n",position++,launch_id,kept,selected?(uint64_t)buffer->count-kept:0);++launch_id;flush();
+    }internal=false;
 }
-void nvbit_at_term(){if(metadata){fprintf(metadata,"{\"type\":\"end\",\"launches\":%lu}\n",launch);fclose(metadata);}}
+void nvbit_at_term(){if(log_file){fprintf(log_file,"{\"type\":\"end\",\"seq\":%lu,\"launches\":%lu}\n",position++,launch_id);flush();fclose(log_file);}}

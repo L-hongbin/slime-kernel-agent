@@ -1,366 +1,347 @@
-"""Focused CPU contracts for the offline NVBit graph and lineage workflow."""
+"""Executable CPU contracts for coarse memory regions and component lineage."""
 
 import copy
-import json
-import tempfile
 import unittest
-from pathlib import Path
 
-from .extract import EVENT, build_graph
+from .extract import (
+    conflicting_writes,
+    entry_read_regions,
+    gemm_accesses,
+    launch_configuration,
+    normalize_leases,
+    union,
+    version_dependencies,
+    view_regions,
+)
 from .lineage import trace_best
+from .match import compare
 
 
-def instruction(i, opcode, space="GLOBAL", read=False, write=False):
+def node(identity, seq, reads=(), writes=(), stream=0, **extra):
     return {
-        "type": "instruction",
-        "id": i,
-        "function": "test",
-        "offset": 16 * i,
-        "sass": opcode,
-        "opcode": opcode,
-        "space": space,
-        "load": read,
-        "store": write,
-        "size": 4,
-        "mrefs": int(read or write),
-        "predicate": -1,
-        "predicate_uniform": False,
-        "operands": [],
-        "captured_constant_bytes": 0,
+        "id": identity,
+        "seq": seq,
+        "stream": stream,
+        "kind": "kernel",
+        "implementation": "body",
+        "configuration": {"block": [32, 1, 1]},
+        "evidence": {"name": identity},
+        "unknowns": [],
+        "footprint_complete": True,
+        "reads": [
+            {
+                "buffer": b,
+                "regions": [[lo, hi]],
+                "entry_regions": [[lo, hi]],
+                "port": None,
+                "evidence": "observed_global_memory_runs",
+            }
+            for b, lo, hi in reads
+        ],
+        "writes": [
+            {
+                "buffer": b,
+                "regions": [[lo, hi]],
+                "conflicting_regions": [],
+                "atomic_unknown": False,
+                "port": None,
+                "evidence": "observed_global_memory_runs",
+            }
+            for b, lo, hi in writes
+        ],
+        **extra,
     }
 
 
-def capture(root, launch_events, instructions, *, block=1, grid=1, ctas=-1, dropped=0, extra=()):
-    p = root / "trace"
-    records = [{"type": "config", "cta_limit": ctas, "capacity": 100, "max_launches": 10}] + instructions
-    for lid, events in enumerate(launch_events):
-        records.extend(r for r in extra if r.get("before_launch") == lid)
-        records += [
-            {
-                "type": "launch",
-                "id": lid,
-                "name": "k",
-                "stream": 0,
-                "grid": [grid, 1, 1],
-                "block": [block, 1, 1],
-                "dynamic_shared": 0,
-                "selected": True,
-            },
-            {"type": "complete", "launch": lid, "events": len(events), "dropped": dropped},
+def buffers():
+    return [
+        {"id": name, "base": i * 128 + 1024, "bytes": 64, "roles": roles, "first_seq": 0, "last_seq": None}
+        for i, (name, roles) in enumerate([("a", ["input:0"]), ("b", []), ("c", ["output:0"])])
+    ]
+
+
+def graph(nodes):
+    allocations = buffers()
+    edges, versions = version_dependencies(nodes, allocations)
+    return {
+        "schema": "coarse-component-graph/v1",
+        "context": {"task": "task", "input_signature": "input", "environment_signature": "env"},
+        "nodes": nodes,
+        "buffers": allocations,
+        "edges": edges,
+        "versions": versions,
+    }
+
+
+class Regions(unittest.TestCase):
+    def test_union_keeps_holes(self):
+        self.assertEqual(union([(0, 4), (4, 8), (12, 16)]), [[0, 8], [12, 16]])
+
+    def test_read_then_own_write_uses_entry(self):
+        entry, unknown = entry_read_regions([(0, 128, 0, 4, 0)], [(0, 128, 0, 4, 1)])
+        self.assertEqual(entry, [[0, 128]])
+        self.assertFalse(unknown)
+
+    def test_own_write_then_read_is_internal(self):
+        entry, unknown = entry_read_regions([(0, 128, 0, 4, 2)], [(0, 128, 0, 4, 1)])
+        self.assertFalse(entry)
+        self.assertEqual(unknown, [[0, 128]])
+
+    def test_other_thread_order_never_from_log(self):
+        entry, unknown = entry_read_regions([(0, 4, 0, 4, 0)], [(0, 4, 1, 4, 100)])
+        self.assertFalse(entry)
+        self.assertEqual(unknown, [[0, 4]])
+
+    def test_partial_internal_write_preserves_other_entry_bytes(self):
+        entry, unknown = entry_read_regions([(0, 8, 0, 8, 2)], [(4, 8, 0, 4, 1)])
+        self.assertEqual(entry, [[0, 4]])
+        self.assertEqual(unknown, [[4, 8]])
+
+    def test_racing_writers(self):
+        self.assertEqual(conflicting_writes([(0, 4, 0, 4, 0), (0, 4, 1, 4, 1)]), [[0, 4]])
+
+    def test_same_thread_overwrite_not_race(self):
+        self.assertFalse(conflicting_writes([(0, 4, 0, 4, 0), (0, 4, 0, 4, 1)]))
+
+    def test_view_stride(self):
+        self.assertEqual(
+            view_regions({"shape": [3], "stride": [2], "offset_bytes": 4, "element_size": 4}),
+            [[4, 8], [12, 16], [20, 24]],
+        )
+
+    def test_transposed_dense_view(self):
+        self.assertEqual(
+            view_regions({"shape": [4, 3], "stride": [1, 4], "offset_bytes": 0, "element_size": 4}), [[0, 48]]
+        )
+
+    def test_live_wrappers_alias(self):
+        a = {"id": "a", "base": 100, "bytes": 16, "first_seq": 0, "last_seq": 5, "roles": ["input:0"]}
+        b = {"id": "b", "base": 104, "bytes": 8, "first_seq": 1, "last_seq": 6, "roles": ["output:0"]}
+        self.assertEqual(len(normalize_leases([a, b])), 1)
+
+    def test_address_reuse_is_new_generation(self):
+        a = {"id": "a", "base": 100, "bytes": 16, "first_seq": 0, "last_seq": 5, "roles": []}
+        b = {"id": "b", "base": 100, "bytes": 16, "first_seq": 5, "last_seq": None, "roles": []}
+        self.assertEqual(len(normalize_leases([a, b])), 2)
+
+
+class Versions(unittest.TestCase):
+    def test_unknown_stream_mutation_needs_observed_sync(self):
+        ns = [node("w", 2, writes=[("b", 0, 64)]), node("r", 3, reads=[("b", 0, 64)])]
+        self.assertEqual(
+            version_dependencies(ns, buffers(), [{"seq": 0}])[0][0]["certainty"], "partial_or_ambiguous_dependency"
+        )
+        self.assertEqual(
+            version_dependencies(ns, buffers(), [{"seq": 0}], [{"seq": 1, "action": "device_sync"}])[0][0][
+                "certainty"
+            ],
+            "proven_region_dependency",
+        )
+
+    def test_incomplete_consumer_does_not_prove_initial_version(self):
+        ns = [node("r", 1, reads=[("a", 0, 64)], footprint_complete=False)]
+        self.assertEqual(version_dependencies(ns, buffers())[0][0]["certainty"], "possible_initial_value_read")
+
+    def test_unknown_intervening_call_can_overwrite(self):
+        ns = [
+            node("w", 0, writes=[("b", 0, 64)]),
+            node("unknown", 1, footprint_complete=False),
+            node("r", 2, reads=[("b", 0, 64)]),
         ]
-        Path(f"{p}.launch{lid}.bin").write_bytes(
-            b"".join(EVENT.pack(addr, 0, i, cta, tid, pred, 1, 0) for i, addr, cta, tid, pred in events)
+        self.assertEqual(version_dependencies(ns, buffers())[0][0]["certainty"], "partial_or_ambiguous_dependency")
+
+    def test_unknown_intervening_call_invalidates_initial_value(self):
+        ns = [
+            node("unknown", 1, footprint_complete=False, unknowns=["unsupported_memory_instruction"]),
+            node("r", 2, reads=[("a", 0, 64)]),
+        ]
+        edge = version_dependencies(ns, buffers())[0][0]
+        self.assertEqual(edge["certainty"], "entry_value_unobserved")
+        self.assertIsNone(edge["source"])
+        self.assertIsNone(edge["version"])
+
+    def test_complete_overwrite_recovers_after_unknown(self):
+        ns = [
+            node("unknown", 0, footprint_complete=False),
+            node("w", 1, writes=[("b", 0, 64)]),
+            node("r", 2, reads=[("b", 0, 64)]),
+        ]
+        self.assertEqual(version_dependencies(ns, buffers())[0][0]["certainty"], "proven_region_dependency")
+
+    def test_partial_overwrite_recovers_only_written_region(self):
+        ns = [
+            node("old", 0, writes=[("b", 0, 64)]),
+            node("unknown", 1, footprint_complete=False),
+            node("w", 2, writes=[("b", 16, 32)]),
+            node("r", 3, reads=[("b", 0, 64)]),
+        ]
+        edges, _ = version_dependencies(ns, buffers())
+        self.assertEqual(
+            {e["source"]: e["certainty"] for e in edges},
+            {"old": "partial_or_ambiguous_dependency", "w": "proven_region_dependency"},
         )
-    records.append({"type": "end"})
-    Path(str(p) + ".jsonl").write_text("\n".join(json.dumps(r) for r in records))
-    return build_graph(
-        p, {}, [{"role": "input:0", "base": 100, "bytes": 4}, {"role": "output:0", "base": 200, "bytes": 4}]
-    )
 
+    def test_partial_overwrite_has_two_producers(self):
+        ns = [
+            node("w0", 0, writes=[("b", 0, 64)]),
+            node("w1", 1, writes=[("b", 16, 32)]),
+            node("r", 2, reads=[("b", 0, 64)]),
+        ]
+        edges, _ = version_dependencies(ns, buffers())
+        self.assertEqual({e["source"]: e["regions"] for e in edges}, {"w0": [[0, 16], [32, 64]], "w1": [[16, 32]]})
 
-class MemoryContracts(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self.tmp.name)
+    def test_unordered_streams_remain_unknown(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)], stream=1), node("r", 3, reads=[("b", 0, 64)], stream=2)]
+        edges, _ = version_dependencies(ns, buffers())
+        self.assertEqual(edges[0]["certainty"], "unordered_stream_writers")
 
-    def tearDown(self):
-        self.tmp.cleanup()
+    def test_event_orders_streams(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)], stream=1), node("r", 3, reads=[("b", 0, 64)], stream=2)]
+        orders = [
+            {"seq": 1, "action": "record", "event": 8, "stream": 1},
+            {"seq": 2, "action": "wait", "event": 8, "stream": 2},
+        ]
+        edges, _ = version_dependencies(ns, buffers(), orders=orders)
+        self.assertEqual(edges[0]["certainty"], "proven_region_dependency")
 
-    def test_same_stream_producer(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1)], [(1, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "LDG", read=True)],
+    def test_destroyed_event_not_reused_as_order(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)], stream=1), node("r", 4, reads=[("b", 0, 64)], stream=2)]
+        orders = [
+            {"seq": 1, "action": "record", "event": 8, "stream": 1},
+            {"seq": 2, "action": "destroy", "event": 8},
+            {"seq": 3, "action": "wait", "event": 8, "stream": 2},
+        ]
+        self.assertEqual(
+            version_dependencies(ns, buffers(), orders=orders)[0][0]["certainty"], "unordered_stream_writers"
         )
-        self.assertTrue(
-            any(e["kind"] == "memory" and e["source"] == "l0:i0" and e["target"] == "l1:i1" for e in g["edges"])
+
+    def test_device_sync_orders_following_read(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)], stream=1), node("r", 2, reads=[("b", 0, 64)], stream=2)]
+        self.assertEqual(
+            version_dependencies(ns, buffers(), orders=[{"seq": 1, "action": "device_sync"}])[0][0]["source"], "w"
         )
 
-    def test_racing_writer_is_not_log_order(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1), (0, 200, 0, 1, 1), (1, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "LDG", read=True)],
-            block=2,
+    def test_truncation_never_proves_dependency(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)], footprint_complete=False), node("r", 2, reads=[("b", 0, 64)])]
+        self.assertEqual(version_dependencies(ns, buffers())[0][0]["certainty"], "partial_or_ambiguous_dependency")
+
+    def test_unknown_memory_operation_degrades_edge(self):
+        ns = [node("w", 0, writes=[("b", 0, 64)]), node("r", 2, reads=[("b", 0, 64)])]
+        self.assertEqual(
+            version_dependencies(ns, buffers(), [{"seq": 1}])[0][0]["certainty"], "partial_or_ambiguous_dependency"
         )
-        self.assertFalse(any(e["kind"] == "memory" for e in g["edges"]))
-        self.assertIn("memory_producer_unknown_or_racing", g["coverage"]["unknowns"])
 
-    def test_unordered_output_not_assigned(self):
-        g = capture(self.root, [[(0, 200, 0, 0, 1), (0, 200, 0, 1, 1)]], [instruction(0, "STG", write=True)], block=2)
-        self.assertFalse(any(e["kind"] == "output_memory" for e in g["edges"]))
 
-    def test_same_thread_overwrite_selects_latest(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1), (1, 200, 0, 0, 1), (2, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "STG", write=True), instruction(2, "LDG", read=True)],
+class LibraryContracts(unittest.TestCase):
+    def parameters(self, **changes):
+        return {
+            "state_query_ok": True,
+            "alpha": 1,
+            "beta": 0,
+            "ta": 0,
+            "tb": 1,
+            "m": 2,
+            "n": 4,
+            "k": 3,
+            "a": 100,
+            "b": 200,
+            "c": 300,
+            "lda": 2,
+            "ldb": 4,
+            "ldc": 2,
+            "at": 0,
+            "bt": 0,
+            "ct": 0,
+            **changes,
+        }
+
+    def test_column_major_regions(self):
+        self.assertEqual(
+            gemm_accesses(self.parameters()),
+            [("a", "read", [(100, 124)]), ("b", "read", [(200, 248)]), ("c", "write", [(300, 332)])],
         )
-        mem = [e for e in g["edges"] if e["kind"] == "memory"]
-        self.assertEqual([(e["source"], e["target"]) for e in mem], [("l0:i1", "l0:i2")])
 
-    def test_predicate_false_does_not_write(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1), (1, 200, 0, 0, 0), (2, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "STG", write=True), instruction(2, "LDG", read=True)],
-        )
-        self.assertEqual([e["source"] for e in g["edges"] if e["kind"] == "memory"], ["l0:i0"])
+    def test_padding_not_falsely_read(self):
+        self.assertEqual(gemm_accesses(self.parameters(lda=4))[0][2], [(100, 108), (116, 124), (132, 140)])
 
-    def test_captured_prefix_not_complete_output(self):
-        g = capture(self.root, [[(0, 200, 0, 0, 1)]], [instruction(0, "STG", write=True)], dropped=2)
-        self.assertFalse(any(e["kind"] == "output_memory" for e in g["edges"]))
-        self.assertFalse(g["coverage"]["capture_complete"])
+    def test_zero_alpha_does_not_read_ab(self):
+        self.assertEqual(gemm_accesses(self.parameters(alpha=0)), [("c", "write", [(300, 332)])])
 
-    def test_unseen_ctas_cannot_prove_unique_memory(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1), (1, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "LDG", read=True)],
-            grid=2,
-            ctas=1,
-        )
-        self.assertFalse(any(e["kind"] == "memory" for e in g["edges"]))
+    def test_beta_reads_prior_c(self):
+        self.assertIn(("c", "read", [(300, 332)]), gemm_accesses(self.parameters(beta=1)))
 
-    def test_host_memory_mutation_invalidates_prior(self):
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1)], [(1, 200, 0, 0, 1)]],
-            [instruction(0, "STG", write=True), instruction(1, "LDG", read=True)],
-            extra=[{"type": "memory_api", "before_launch": 1, "name": "cuMemcpyHtoD"}],
-        )
-        self.assertFalse(any(e["kind"] == "memory" for e in g["edges"]))
-
-    def test_truncated_binary_rejected(self):
-        capture(self.root, [[(0, 200, 0, 0, 1)]], [instruction(0, "STG", write=True)])
-        (self.root / "trace.launch0.bin").write_bytes(b"x")
+    def test_unknown_device_scalar_not_assumed(self):
         with self.assertRaises(ValueError):
-            build_graph(self.root / "trace", {})
+            gemm_accesses(self.parameters(alpha=None))
 
-    def test_byte_overlap_retains_both_writers(self):
-        a = instruction(0, "STG", write=True)
-        b = instruction(1, "STG", write=True)
-        b["size"] = 2
-        g = capture(
-            self.root,
-            [[(0, 200, 0, 0, 1), (1, 202, 0, 0, 1), (2, 200, 0, 0, 1)]],
-            [a, b, instruction(2, "LDG", read=True)],
-        )
+
+class Correspondence(unittest.TestCase):
+    def test_extended_launch_configuration_missing_is_unknown(self):
+        self.assertTrue(launch_configuration({})[1])
+        self.assertTrue(launch_configuration({"launch_num_attrs": 1})[1])
+        self.assertFalse(launch_configuration({"launch_num_attrs": 0})[1])
+
+    def test_unknown_config_preserves_structure_not_retention(self):
+        for unknown in ["opaque_launch_configuration", "opaque_workspace_configuration"]:
+            other = copy.deepcopy(self.g)
+            other["nodes"][0]["unknowns"].append(unknown)
+            self.assertEqual(
+                compare(self.g, other)["matches"][0]["relation"], "same_regional_structure_configuration_unknown"
+            )
+
+    def test_no_data_effect_call_is_separate(self):
+        empty = graph([node("empty", 1)])
         self.assertEqual(
-            {(e["source"], e["attrs"]["bytes_per_observed_read"]) for e in g["edges"] if e["kind"] == "memory"},
-            {("l0:i0", 2), ("l0:i1", 2)},
+            compare(empty, empty)["matches"][0]["relation"], "no_observed_data_effect_call_correspondence"
         )
+        result = trace_best([{"turn": 1, "correct": True, "score": 1, "graph": empty}])
+        self.assertEqual(result["components"], [])
+        self.assertEqual(result["no_observed_data_effect_calls"], ["empty"])
 
-    def test_shared_barrier_orders_cross_thread(self):
-        barrier = instruction(1, "BAR.SYNC.DEFER_BLOCKING", space="NONE")
-        barrier["operands"] = [{"type": "IMM_UINT64", "text": "0x0", "bytes": 8}]
-        g = capture(
-            self.root,
-            [[(0, 0, 0, 0, 1), (0, 4, 0, 1, 1), (1, 0, 0, 0, 1), (1, 0, 0, 1, 1), (2, 4, 0, 0, 1), (2, 0, 0, 1, 1)]],
+    def setUp(self):
+        self.g = graph([node("first", 1, reads=[("a", 0, 64)], writes=[("c", 0, 64)])])
+
+    def test_names_and_trace_ids_do_not_align_calls(self):
+        other = graph([node("renamed", 12, reads=[("a", 0, 64)], writes=[("c", 0, 64)])])
+        self.assertEqual(compare(self.g, other)["matches"][0]["relation"], "retained_observed_component")
+
+    def test_implementation_change_after_interface_alignment(self):
+        other = copy.deepcopy(self.g)
+        other["nodes"][0]["implementation"] = "tiled-body"
+        self.assertEqual(compare(self.g, other)["matches"][0]["relation"], "implementation_changed")
+
+    def test_runtime_configuration_change(self):
+        other = copy.deepcopy(self.g)
+        other["nodes"][0]["configuration"]["alpha"] = 2
+        self.assertEqual(compare(self.g, other)["matches"][0]["relation"], "configuration_changed")
+
+    def test_repeated_calls_keep_ambiguity(self):
+        other = graph(
             [
-                instruction(0, "STS", space="SHARED", write=True),
-                barrier,
-                instruction(2, "LDS", space="SHARED", read=True),
-            ],
-            block=2,
-        )
-        self.assertEqual(
-            [(e["source"], e["target"]) for e in g["edges"] if e["kind"] == "memory"], [("l0:i0", "l0:i2")]
-        )
-
-    def test_missing_barrier_participant_blocks_edge(self):
-        barrier = instruction(1, "BAR.SYNC", space="NONE")
-        barrier["operands"] = [{"type": "IMM_UINT64", "text": "0x0", "bytes": 8}]
-        g = capture(
-            self.root,
-            [[(0, 0, 0, 0, 1), (1, 0, 0, 0, 1), (2, 0, 0, 1, 1)]],
-            [
-                instruction(0, "STS", space="SHARED", write=True),
-                barrier,
-                instruction(2, "LDS", space="SHARED", read=True),
-            ],
-            block=2,
-        )
-        self.assertFalse(any(e["kind"] == "memory" for e in g["edges"]))
-
-    def test_vector_load_replaces_all_four_registers(self):
-        from .extract import register_contract
-
-        inst = instruction(1, "LDS.128", space="SHARED", read=True)
-        inst["size"] = 16
-        inst["operands"] = [{"type": "REG", "text": "R8", "bytes": 16}, {"type": "MREF", "text": "[R4]", "bytes": 16}]
-        writes, reads, known = register_contract(inst)
-        self.assertEqual(writes, ["R8", "R9", "R10", "R11"])
-        self.assertTrue(known)
-        self.assertEqual(reads, [("R4", 1)])
-
-    def test_alias_has_separate_output_value(self):
-        capture(self.root, [[(0, 100, 0, 0, 1)]], [instruction(0, "STG", write=True)])
-        g = build_graph(
-            self.root / "trace", {}, [{"role": "input:0", "aliases": ["output:0"], "base": 100, "bytes": 4}]
-        )
-        self.assertTrue(any(n["kind"] == "output" for n in g["nodes"]))
-        self.assertTrue(any(e["target"] == "result:output:0" and e["kind"] == "output_memory" for e in g["edges"]))
-
-    def test_partial_capture_never_certifies_retention(self):
-        from . import match
-
-        g = capture(self.root, [[(0, 200, 0, 0, 1)]], [instruction(0, "STG", write=True)], dropped=1)
-        g["context"] = {"task": "t", "model": "m", "input_signature": "i", "environment_signature": "e"}
-        r = match.align_graphs(g, g)
-        self.assertFalse(r["certifies_retention"])
-        self.assertNotIn("l0:i0", [p["left"] for p in r["local_candidates"]])
-
-    def test_uniform_carry_input_is_not_destination(self):
-        from .extract import register_contract
-
-        inst = instruction(0, "UIADD3.X", space="NONE")
-        inst["operands"] = [
-            {"type": kind, "text": text, "bytes": 4 if kind == "UREG" else 1}
-            for kind, text in [
-                ("UREG", "UR9"),
-                ("UREG", "URZ"),
-                ("UREG", "UR9"),
-                ("UREG", "URZ"),
-                ("UPRED", "UP0"),
-                ("UPRED", "!UPT"),
+                node("x", 1, reads=[("a", 0, 64)], writes=[("c", 0, 64)]),
+                node("y", 2, reads=[("a", 0, 64)], writes=[("c", 0, 64)]),
             ]
-        ]
-        writes, reads, known = register_contract(inst)
-        self.assertTrue(known)
-        self.assertEqual(writes, ["UR9"])
-        self.assertIn(("UP0", 4), reads)
-
-    def test_uniform_carry_output_is_written(self):
-        from .extract import register_contract
-
-        inst = instruction(0, "UIADD3", space="NONE")
-        inst["operands"] = [
-            {"type": kind, "text": text, "bytes": 4 if kind == "UREG" else 1}
-            for kind, text in [
-                ("UREG", "UR8"),
-                ("UPRED", "UP0"),
-                ("UREG", "UR8"),
-                ("IMM_UINT64", "0x40"),
-                ("UREG", "URZ"),
-            ]
-        ]
-        writes, reads, known = register_contract(inst)
-        self.assertTrue(known)
-        self.assertEqual(writes, ["UR8", "UP0"])
-
-
-class WinnerContracts(unittest.TestCase):
-    def test_no_correct_has_no_membership(self):
-        r = trace_best([{"turn": 1, "correct": False, "score": 0}], None)
-        self.assertEqual(r["status"], "no_correct_answer")
+        )
+        self.assertFalse(compare(self.g, other)["matches"])
+        self.assertTrue(compare(self.g, other)["ambiguous"])
 
     def test_best_missing_not_replaced(self):
         r = trace_best(
-            [{"turn": 1, "correct": True, "score": 1, "graph": {}}, {"turn": 2, "correct": True, "score": 2}], None
+            [{"turn": 1, "correct": True, "score": 1, "graph": self.g}, {"turn": 2, "correct": True, "score": 2}]
         )
-        self.assertEqual(r["status"], "best_runtime_unavailable")
-        self.assertEqual(r["best_turn"], 2)
+        self.assertEqual(r["status"], "best_graph_missing")
 
-    def test_tie_earliest(self):
-        r = trace_best([{"turn": 2, "correct": True, "score": 1}, {"turn": 1, "correct": True, "score": 1}], None)
-        self.assertEqual(r["best_turn"], 1)
-
-    def test_invalid_score_rejected(self):
-        with self.assertRaises(ValueError):
-            trace_best([{"turn": 1, "correct": True, "score": float("nan")}], None)
-
-    def test_duplicate_turns_rejected(self):
-        with self.assertRaises(ValueError):
-            trace_best([{"turn": 1}, {"turn": 1}], None)
-
-
-class IndependentMatchingContracts(unittest.TestCase):
-    def setUp(self):
-        from . import match
-
-        self.matcher = match
-
-    def graph(self, labels, edges, unknown=()):
-        return {
-            "schema_version": "runtime_program_graph/v1",
-            "id": "check",
-            "context": {"task": "t", "model": "m", "input_signature": "i", "environment_signature": "e"},
-            "nodes": [
-                {
-                    "id": str(i),
-                    "kind": "instruction",
-                    "attrs": {"op": op},
-                    "unknowns": ["gap"] if i in unknown else [],
-                    "evidence": {},
-                }
-                for i, op in enumerate(labels)
-            ],
-            "edges": [
-                {"source": str(a), "target": str(b), "kind": "register", "attrs": {"port": p}, "unknowns": []}
-                for a, b, p in edges
-            ],
-            "coverage": {"complete": False, "scope": "check", "unknowns": ["limited"]},
-        }
-
-    def test_renamed_ids_preserve_correspondence(self):
-        a = self.graph(["load", "add", "store"], [(0, 1, 0), (1, 2, 0)])
-        b = copy.deepcopy(a)
-        for n in b["nodes"]:
-            n["id"] = "other" + n["id"]
-            n["evidence"] = {"source_name": "entirely different"}
-        for e in b["edges"]:
-            e["source"] = "other" + e["source"]
-            e["target"] = "other" + e["target"]
-        self.assertEqual(len(self.matcher.align_graphs(a, b)["local_candidates"]), 3)
-
-    def test_changed_port_breaks_affected_match(self):
-        a = self.graph(["load", "add", "store"], [(0, 1, 0), (1, 2, 0)])
-        b = copy.deepcopy(a)
-        b["edges"][0]["attrs"]["port"] = 1
-        self.assertNotIn("1", [p["left"] for p in self.matcher.align_graphs(a, b)["local_candidates"]])
-
-    def test_repeated_fragments_are_ambiguous(self):
-        a = self.graph(["load", "add", "load", "add"], [(0, 1, 0), (2, 3, 0)])
-        r = self.matcher.align_graphs(a, copy.deepcopy(a))
-        self.assertFalse(r["local_candidates"])
-        self.assertTrue(r["ambiguous"])
-
-    def test_unknown_alternative_blocks_uniqueness(self):
-        a = self.graph(["load", "add"], [(0, 1, 0)])
-        b = self.graph(["load", "add", "load", "add"], [(0, 1, 0), (2, 3, 0)], unknown=(3,))
-        self.assertFalse(self.matcher.align_graphs(a, b)["local_candidates"])
-
-    def test_wrong_input_cannot_match(self):
-        a = self.graph(["a", "b"], [(0, 1, 0)])
-        b = copy.deepcopy(a)
-        b["context"]["input_signature"] = "other"
-        self.assertFalse(self.matcher.align_graphs(a, b)["local_candidates"])
-
-    def test_budget_never_returns_unverified_match(self):
-        a = self.graph(["a", "b"], [(0, 1, 0)])
-        self.assertFalse(self.matcher.align_graphs(a, a, max_pairs=0)["local_candidates"])
-
-    def test_earliest_copy_and_rollback(self):
-        a = self.graph(["load", "add", "store"], [(0, 1, 0), (1, 2, 0)])
-        b = self.graph(["load", "mul", "store"], [(0, 1, 0), (1, 2, 0)])
+    def test_copy_returns_original_observed_match(self):
         r = trace_best(
             [
-                {"turn": 1, "correct": True, "score": 1, "graph": a},
-                {"turn": 2, "correct": True, "score": 1, "graph": b},
-                {"turn": 3, "correct": True, "score": 2, "graph": a},
-            ],
-            self.matcher,
+                {"turn": 1, "correct": True, "score": 1, "graph": self.g},
+                {"turn": 2, "correct": True, "score": 2, "graph": self.g},
+            ]
         )
-        self.assertEqual({n["earliest_observed_correspondence_turn"] for n in r["candidates"]}, {1})
+        self.assertEqual(r["components"][0]["earliest_observed_retained_match"]["turn"], 1)
 
-    def test_runtime_missing_does_not_mean_novel(self):
-        a = self.graph(["load", "add", "store"], [(0, 1, 0), (1, 2, 0)])
-        r = trace_best(
-            [{"turn": 1, "correct": False}, {"turn": 2, "correct": True, "score": 1, "graph": a}], self.matcher
-        )
-        self.assertEqual({n["status"] for n in r["candidates"]}, {"origin_unknown"})
-        self.assertEqual(r["missing_snapshots"], [{"turn": 1, "reason": "runtime_unavailable"}])
+    def test_failed_trajectory_has_no_membership(self):
+        self.assertEqual(trace_best([{"turn": 1, "correct": False}])["components"], [])
 
 
 if __name__ == "__main__":

@@ -1,166 +1,195 @@
-"""Replay one trusted saved TVM-FFI submission under an optional NVBit scope.
-
-Run in a disposable GPU process with a matching KernelGym source manifest. No
-services, feedback, precheck overrides, or scored timing are involved.
-"""
+"""Whole-forward replay of trusted reference or TVM-FFI candidate payloads."""
 
 import argparse
 import ctypes
 import hashlib
 import json
 import os
+import random
 import sys
 import time
 from pathlib import Path
 
 
-def sha(p):
-    return hashlib.sha256(Path(p).read_bytes()).hexdigest()
+def sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--kernelgym-root", type=Path, required=True)
-    p.add_argument("--submission", type=Path, required=True)
+    p.add_argument("--payload", type=Path, required=True)
+    p.add_argument("--kernelgym-root", type=Path)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--trace", action="store_true")
     p.add_argument("--tracer", type=Path)
-    a = p.parse_args()
-    if a.trace and os.environ.get("RUNTIME_TRACE_START_ENABLED") != "0":
-        raise ValueError("TVM-FFI replay requires RUNTIME_TRACE_START_ENABLED=0 before process start")
-    a.output.mkdir(parents=True, exist_ok=False)
-    manifest = a.kernelgym_root / "source_manifest.json"
-    m = json.loads(manifest.read_text())
-    for f, h in m.items():
-        if sha(a.kernelgym_root / f) != h:
-            raise RuntimeError("KernelGym source synchronization mismatch: " + f)
-    preload = os.environ.pop("LD_PRELOAD", "")
-    if a.trace and (a.tracer is None or str(a.tracer.resolve()) not in Path("/proc/self/maps").read_text()):
-        raise RuntimeError("expected tracer is not mapped into this process")
-    sys.path.insert(0, str(a.kernelgym_root))
+    p.add_argument("--manifest", type=Path, required=True)
+    args = p.parse_args()
+    for filename, expected in json.loads(args.manifest.read_text()).items():
+        if sha(args.manifest.parent / filename) != expected:
+            raise RuntimeError("node-local synchronization mismatch: " + filename)
+    if args.tracer and os.environ.get("RUNTIME_TRACE_START_ENABLED") != "0":
+        raise ValueError("forward replay requires RUNTIME_TRACE_START_ENABLED=0")
+    os.environ.pop("LD_PRELOAD", None)
+    args.output.mkdir(parents=True, exist_ok=False)
+    import numpy as np
     import torch
-    from kernelgym.backend.kernelbench.tvm_ffi_backend import KernelBenchTvmFfiBackend
-    from kernelgym.toolkit.kernelbench.component_trace import ComponentObserver
-    from kernelgym.toolkit.kernelbench.exec_types import set_seed
-    from kernelgym.toolkit.kernelbench.execution_policy import tf32_execution_context
-    from kernelgym.toolkit.kernelbench.loading import load_original_model_and_inputs
+    from tools.data.runtime_trace.observer import StorageObserver
 
-    payload = json.loads(a.submission.read_text())
-    backend = KernelBenchTvmFfiBackend()
-    result = {
-        "identity": payload["identity"],
-        "payload_sha256": sha(a.submission),
+    def seed(value):
+        random.seed(value)
+        np.random.seed(value)
+        torch.manual_seed(value)
+        torch.cuda.manual_seed_all(value)
+
+    def move(value):
+        if isinstance(value, torch.Tensor):
+            return value.cuda()
+        if isinstance(value, (tuple, list)):
+            return type(value)(move(x) for x in value)
+        if isinstance(value, dict):
+            return {k: move(v) for k, v in value.items()}
+        return value
+
+    def fingerprint(value):
+        if isinstance(value, torch.Tensor):
+            cpu = value.detach().contiguous().cpu()
+            return {
+                "shape": list(value.shape),
+                "stride": list(value.stride()),
+                "dtype": str(value.dtype),
+                "sha256": hashlib.sha256(cpu.reshape(-1).view(torch.uint8).numpy().tobytes()).hexdigest(),
+                "first_values": cpu.flatten()[:8].tolist(),
+            }
+        if isinstance(value, (list, tuple)):
+            return [fingerprint(x) for x in value]
+        if isinstance(value, dict):
+            return {k: fingerprint(v) for k, v in value.items()}
+        return value
+
+    payload = json.loads(args.payload.read_text())
+    reference_sha = hashlib.sha256(payload["reference_code"].encode()).hexdigest()
+    if payload.get("source_sha256", reference_sha) != reference_sha:
+        raise ValueError("reference source hash mismatch")
+    namespace = {}
+    exec(compile(payload["reference_code"], "<frozen-reference>", "exec"), namespace)
+    seed(42)
+    init = namespace["get_init_inputs"]() if "get_init_inputs" in namespace else []
+    provenance = {
+        "payload_sha256": sha(args.payload),
         "runner_sha256": sha(__file__),
-        "kernelgym_manifest_sha256": sha(manifest),
-        "verified_source_files": len(m),
-        "torch": torch.__version__,
-        "cuda": torch.version.cuda,
-        "device": torch.cuda.get_device_name(),
-        "trace": a.trace,
-        "preload_hashes": {f: sha(f) for f in preload.split(":") if f and Path(f).is_file()},
+        "manifest_sha256": sha(args.manifest),
+        "source_sha256": hashlib.sha256(payload["reference_code"].encode()).hexdigest(),
     }
-    artifact = backend.compile(
-        payload["custom_code"],
-        device="cuda:0",
-        precision="fp32",
-        entry_point="ModelNew",
-        enable_compile_artifact_cache=True,
-    )
-    if not artifact.get("compiled"):
-        (a.output / "result.json").write_text(
-            json.dumps({**result, "status": "compile_rejected", "artifact": artifact}, indent=2, default=str)
+    if "custom_code" in payload:
+        if args.kernelgym_root is None:
+            raise ValueError("candidate requires isolated KernelGym backend")
+        manifest = args.kernelgym_root / "source_manifest.json"
+        for filename, expected in json.loads(manifest.read_text()).items():
+            if sha(args.kernelgym_root / filename) != expected:
+                raise RuntimeError("KernelGym source mismatch: " + filename)
+        provenance["kernelgym_manifest_sha256"] = sha(manifest)
+        sys.path.insert(0, str(args.kernelgym_root))
+        from kernelgym.backend.kernelbench.tvm_ffi_backend import KernelBenchTvmFfiBackend
+
+        backend = KernelBenchTvmFfiBackend()
+        artifact = backend.compile(
+            payload["custom_code"],
+            device="cuda:0",
+            precision="fp32",
+            entry_point="ModelNew",
+            enable_compile_artifact_cache=True,
         )
-        return 2
-    result["tracer_sha256"] = sha(a.tracer) if a.trace else None
-    result["so_sha256"] = sha(artifact["so_path"])
-    handle = backend.load(artifact, device="cuda:0")
-    _, get_init, get_inputs = load_original_model_and_inputs(payload["reference_code"], {})
-    set_seed(42)
-    init = get_init()
-    model = backend.create_model(handle, init, device="cuda:0").eval()
-    set_seed(17)
-    inputs = backend._move_to_device(get_inputs(), torch.device("cuda:0"))
-    allocations = []
-    objects = []
-
-    def capture(value, role):
-        if isinstance(value, torch.Tensor) and value.is_cuda:
-            storage = value.untyped_storage()
-            base = storage.data_ptr()
-            size = storage.nbytes()
-            existing = next((x for x in allocations if x["base"] == base), None)
-            if existing and role.startswith("output:"):
-                existing.setdefault("aliases", []).append(role)
-                if not existing["role"].startswith("input:"):
-                    existing["role"] = role
-            if not existing:
-                allocations.append(
-                    {
-                        "role": role,
-                        "base": base,
-                        "bytes": size,
-                        "shape": list(value.shape),
-                        "stride": list(value.stride()),
-                        "dtype": str(value.dtype),
-                    }
+        if not artifact.get("compiled"):
+            (args.output / "result.json").write_text(
+                json.dumps(
+                    {"status": "compile_or_precheck_failed", "artifact": artifact, "provenance": provenance},
+                    default=str,
+                    indent=2,
                 )
-            objects.append(value)
-        elif isinstance(value, (tuple, list)):
-            for i, x in enumerate(value):
-                capture(x, f"{role}:{i}")
-        elif isinstance(value, dict):
-            for i, x in enumerate(value.values()):
-                capture(x, f"{role}:{i}")
-
-    capture(inputs, "input")
-    for i, x in enumerate(model.parameters()):
-        capture(x, f"parameter:{i}")
-    for i, x in enumerate(model.buffers()):
-        capture(x, f"state:{i}")
-    observer = ComponentObserver()
-    # The existing observer records actual FFI arguments, including scratch
-    # tensor storage. Presence supplies allocation identity, never access mode.
-    original = observer.invoke
-
-    def invoke(name, func, args, kwargs):
-        capture(args, "ffi_argument")
-        capture(kwargs, "ffi_keyword")
-        return original(name, func, args, kwargs)
-
-    observer.invoke = invoke
+            )
+            return 2
+        handle = backend.load(artifact, device="cuda:0")
+        seed(42)
+        model = backend.create_model(handle, init, device="cuda:0").eval()
+        provenance["candidate_so_sha256"] = sha(artifact["so_path"])
+    else:
+        model = (namespace["Model"](**init) if isinstance(init, dict) else namespace["Model"](*init)).cuda()
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    seed(17)
+    inputs = move(namespace["get_inputs"]())
+    input_fingerprint = fingerprint(inputs)
+    reference = "custom_code" not in payload
+    initial_state = (
+        {
+            "parameters": {name: fingerprint(value) for name, value in model.named_parameters()},
+            "buffers": {name: fingerprint(value) for name, value in model.named_buffers()},
+        }
+        if reference
+        else None
+    )
+    recorder = StorageObserver(traced=bool(args.tracer))
+    recorder.observe(inputs, "input")
+    for i, value in enumerate(model.parameters()):
+        recorder.observe(value, f"parameter:{i}")
+    for i, value in enumerate(model.buffers()):
+        recorder.observe(value, f"state:{i}")
+    enable = None
+    if args.tracer:
+        if str(args.tracer.resolve()) not in Path("/proc/self/maps").read_text():
+            raise RuntimeError("requested native library is not mapped")
+        provenance["tracer_sha256"] = sha(args.tracer)
+        enable = ctypes.CDLL(None).runtime_trace_set_enabled
+        enable.argtypes = [ctypes.c_int]
+        enable.restype = None
+    if reference:
+        seed(23)
+    execution_config = {
+        "tf32_matmul": torch.backends.cuda.matmul.allow_tf32,
+        "tf32_cudnn": torch.backends.cudnn.allow_tf32,
+        "init_seed": 42,
+        "input_seed": 17,
+        "forward_seed": 23 if reference else None,
+        "training": model.training,
+        "grad_enabled_during_forward": False,
+        "cudnn_benchmark": torch.backends.cudnn.benchmark,
+        "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+    }
+    provenance["execution_config_sha256"] = hashlib.sha256(
+        json.dumps(execution_config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     torch.cuda.synchronize()
-    start = time.monotonic()
-    enable = ctypes.CDLL(None).runtime_trace_set_enabled if a.trace else None
-    with torch.no_grad(), tf32_execution_context(result, stage="diagnostic"), observer.activate():
+    started = time.monotonic()
+    with torch.no_grad():
         if enable:
             enable(1)
-        output = model(**inputs) if isinstance(inputs, dict) else model(*inputs)
+            with recorder:
+                output = model(**inputs) if isinstance(inputs, dict) else model(*inputs)
+        else:
+            output = model(**inputs) if isinstance(inputs, dict) else model(*inputs)
         torch.cuda.synchronize()
         if enable:
             enable(0)
-    result["forward_wall_seconds"] = time.monotonic() - start
-    capture(output, "output:0")
-
-    def fingerprint(v):
-        if isinstance(v, torch.Tensor):
-            value = v.detach().contiguous().cpu()
-            return {
-                "shape": list(value.shape),
-                "dtype": str(value.dtype),
-                "sha256": hashlib.sha256(value.view(torch.uint8).numpy().tobytes()).hexdigest(),
-                "first_values": value.flatten()[:8].tolist(),
-            }
-        if isinstance(v, (tuple, list)):
-            return [fingerprint(x) for x in v]
-        if isinstance(v, dict):
-            return {k: fingerprint(x) for k, x in v.items()}
-        return v
-
-    result["output"] = fingerprint(output)
-    result["status"] = "completed"
-    (a.output / "allocations.json").write_text(json.dumps({"allocations": allocations}, indent=2))
-    (a.output / "observation.json").write_text(json.dumps(observer.as_dict(), indent=2))
-    (a.output / "result.json").write_text(json.dumps(result, indent=2))
+    wall = time.monotonic() - started
+    recorder.observe(output, "output:0")
+    result = {
+        "schema": "coarse-replay/v1",
+        "status": "completed",
+        "identity": payload.get("identity", payload.get("id")),
+        "input": input_fingerprint,
+        "initial_state": initial_state,
+        "execution_config": execution_config,
+        "output": fingerprint(output),
+        "forward_wall_seconds": wall,
+        "training": model.training,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "device": torch.cuda.get_device_name(),
+        "seeds": [42, 17, 23] if reference else [42, 17],
+        "provenance": provenance,
+    }
+    (args.output / "allocations.json").write_text(json.dumps(recorder.as_dict(), indent=2))
+    (args.output / "result.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result))
     return 0
 
