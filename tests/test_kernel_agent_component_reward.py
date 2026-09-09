@@ -275,7 +275,7 @@ def test_dead_and_no_data_effect_units_do_not_inflate_budget():
     assert result["credits"] == [1.0, 0.0]
 
 
-@pytest.mark.parametrize("field", ["input_signature", "state_signature", "collector_sha256"])
+@pytest.mark.parametrize("field", ["input_signature", "environment_signature", "collector_sha256"])
 def test_valid_context_difference_is_unresolved_not_transport_error(field):
     samples = trajectory([["a"], ["a"]], [0.0, 1.0])
     samples[0].metadata["runtime_graph"]["identity"][field] = "different"
@@ -290,6 +290,24 @@ def test_wrong_request_binding_is_hard_error():
     samples[0].metadata["runtime_graph_expected_identity"] = {"candidate_source_sha256": "other-request"}
     with pytest.raises(ComponentRewardContractError, match="transport identity mismatch"):
         attribute_best_components(samples, [1.0])
+
+
+def test_unrelated_candidate_state_change_preserves_observed_kernel_membership():
+    samples = trajectory([["a"], ["a"]], [0, 1])
+    payload = samples[0].metadata["runtime_graph"]
+    payload["identity"]["state_signature"] = "different_candidate_state"
+    payload["graph"]["buffers"].append({"id": "unrelated_state", "roles": ["parameter:extra"], "bytes": 4})
+    result = attribute_best_components(samples, [0, 1])
+    assert result["credits"] == [1, 0]
+    assert result["resolved_cross_turn_units"] == 1
+    assert result["cross_turn_state_changes"] == [0]
+
+
+def test_state_identity_remains_required_for_same_turn_diagnostic():
+    samples = trajectory([["a"]], [1])
+    samples[0].metadata["runtime_graph"]["identity"].pop("state_signature")
+    with pytest.raises(ComponentRewardContractError, match="identity missing state_signature"):
+        attribute_best_components(samples, [1])
 
 
 def test_schema_mismatch_is_not_empty_success():
@@ -547,7 +565,25 @@ def test_metrics_deduplicate_allocations_and_count_costs_per_turn():
     assert metrics["component_reward/resolved_cross_turn_fraction"] == 0.5
     assert metrics["component_reward/soft_finalize_protected_turns"] == 1
     assert metrics["component_reward/runtime_graph/wall_seconds_sum"] == 2.5
+    assert metrics["component_reward/best_turn/2/count"] == 1
+    assert metrics["component_reward/best_turn/1/count"] == 1
+    assert metrics["component_reward/best_unit_count/observations"] == 1
+    assert metrics["component_reward/best_unit_count/mean"] == 1
+    assert metrics["component_reward/best_unit_count/max"] == 1
     assert compute_component_reward_metrics(args(component_reward=False), a) == {}
+
+
+def test_best_unit_metrics_measure_counts_without_counting_allocation_copies():
+    a = trajectory([["a"]], [1], index=0)
+    b = trajectory([["a", "b", "c"]], [1], index=1)
+    for group in (a, b):
+        postprocess_turn_samples(args(), group, "max_turns")
+    metrics = compute_component_reward_metrics(args(), a + b + a)
+    assert metrics["component_reward/best_turn/0/count"] == 2
+    assert metrics["component_reward/positive_best_turn/0/count"] == 2
+    assert metrics["component_reward/best_unit_count/observations"] == 2
+    assert metrics["component_reward/best_unit_count/mean"] == 2
+    assert metrics["component_reward/best_unit_count/max"] == 3
 
 
 @pytest.mark.parametrize("cp_size", [1, 2])

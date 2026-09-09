@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 METHOD = "best-observed-components/v1"
 WIRE_SCHEMA = "kernelgym-runtime-graph/v1"
 GRAPH_SCHEMA = "coarse-component-graph/v1"
-MATCH_CONTEXT = ("task_sha256", "input_signature", "state_signature", "environment_signature", "collector_sha256")
+MATCH_CONTEXT = ("task_sha256", "input_signature", "environment_signature", "collector_sha256")
 PROVEN = {"proven_region_dependency", "initial_value_read"}
 SEMANTIC_ONLY = {"kernel_body_opaque", "opaque_kernel_semantics"}
 UNIT_KINDS = {"kernel", "library", "copy", "fill", "clone", "memcpy", "memset"}
@@ -80,7 +80,7 @@ def _graph_payload(sample):
         return None, list(payload.get("unknowns", [])) or ["runtime_graph_unavailable"]
     if not isinstance(identity, dict):
         raise ComponentRewardContractError("runtime_graph identity is missing")
-    for key in (*MATCH_CONTEXT, "candidate_source_sha256"):
+    for key in (*MATCH_CONTEXT, "candidate_source_sha256", "state_signature"):
         if not isinstance(identity.get(key), str) or not identity[key]:
             raise ComponentRewardContractError(f"runtime_graph identity missing {key}")
     graph = payload.get("graph")
@@ -296,10 +296,15 @@ def attribute_best_components(samples, base_scores):
         result["credits"][best] = budget
         return result
     identity = observations[best]["identity"]
+    # State changes are same-turn audit facts, not a global membership veto.
+    # Each unit still needs matching implementation, config and buffer interface.
+    result["cross_turn_state_changes"] = [
+        turn for turn, obs in observations.items() if obs["identity"]["state_signature"] != identity["state_signature"]
+    ]
     for turn, obs in list(observations.items()):
         mismatches = [key for key in MATCH_CONTEXT if obs["identity"][key] != identity[key]]
         if mismatches:
-            # Valid requests may change input/state layouts or collection context.
+            # Valid requests may change inputs or collection context.
             # This is incomparability, unlike a graph bound to the wrong request.
             gaps[turn].extend(f"incomparable_context:{key}" for key in mismatches)
             del observations[turn]
@@ -525,6 +530,17 @@ def compute_component_reward_metrics(args, samples):
     count = len(records)
     prefix = "component_reward/"
     metrics = {"trajectories": count, "observed_turns": len(turns)}
+    best_turns = Counter(r["best_turn"] for r in records)
+    positive_best_turns = Counter(r["best_turn"] for r in records if r["quality_budget"] > 0)
+    for turn, n in best_turns.items():
+        label = "none" if turn is None else str(turn)
+        metrics[f"best_turn/{label}/count"] = n
+        metrics[f"positive_best_turn/{label}/count"] = positive_best_turns[turn]
+    # Missing graph fallback has an unknown unit count, not a measured zero.
+    unit_counts = [len(r["units"]) for r in records if r["status"] in {"attributed", "partial"} and r["units"]]
+    metrics["best_unit_count/observations"] = len(unit_counts)
+    metrics["best_unit_count/mean"] = math.fsum(unit_counts) / len(unit_counts) if unit_counts else 0.0
+    metrics["best_unit_count/max"] = max(unit_counts, default=0)
     for status in ("attributed", "partial", "unavailable_best_turn_fallback", "no_positive_budget"):
         n = sum(r["status"] == status for r in records)
         metrics[f"status/{status}/count"] = n
