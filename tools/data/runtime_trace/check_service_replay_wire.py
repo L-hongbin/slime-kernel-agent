@@ -13,6 +13,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import jsonschema
 
@@ -25,6 +26,7 @@ from tools.data.runtime_trace.service_replay import (
     _prepare_precompiled_artifact,
     canonical,
     report,
+    write,
 )
 
 DEFAULT_FIXTURE = (
@@ -131,7 +133,30 @@ def _assert_h20_compression(fixture, schema):
     assert units[0]["signature"] is None and "output_membership_unresolved" in units[0]["unknowns"]
 
 
+def _assert_atomic_artifact_write():
+    with tempfile.TemporaryDirectory(prefix="runtime-graph-atomic-") as temporary:
+        path = Path(temporary) / "graph.json"
+        write(path, {"complete": True})
+        original = path.read_bytes()
+        real_write = Path.write_text
+
+        def interrupted(target, value, **kwargs):
+            real_write(target, value[:5], **kwargs)
+            raise OSError("simulated interrupted write")
+
+        with patch.object(Path, "write_text", interrupted):
+            try:
+                write(path, {"complete": False, "replacement": "not published"})
+            except OSError:
+                pass
+            else:
+                raise AssertionError("interrupted writer unexpectedly succeeded")
+        assert path.read_bytes() == original
+        assert json.loads(path.read_text()) == {"complete": True}
+
+
 def main():
+    _assert_atomic_artifact_write()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--schema", type=Path, default=WIRE)

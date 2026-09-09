@@ -15,8 +15,12 @@ from pathlib import Path
 from .extract import build_graph
 
 
-def write(path, value):
-    path.write_text(json.dumps(value, indent=2))
+def write(path, value, *, compact=False):
+    # A killed reporter must not leave a partial file presented as a complete
+    # graph artifact. Temporary files remain in this task's owned directory.
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(canonical(value) if compact else json.dumps(value, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def sha(path):
@@ -524,6 +528,13 @@ def report(root):
             and _complete_call_enumeration(full_coverage)
             and len(full_graph.get("nodes", ())) <= request["options"]["max_summary_nodes"]
         )
+        write(root / "graph.json", full_graph)
+        result["graph_artifact"] = {
+            "path": str(root / "graph.json"),
+            "sha256": sha(root / "graph.json"),
+            "bytes": (root / "graph.json").stat().st_size,
+            "content": "full_graph_before_inline_footprint_compression",
+        }
         graph, graph_reason = _full_graph_summary(
             full_graph,
             max_nodes=request["options"]["max_summary_nodes"],
@@ -537,13 +548,6 @@ def report(root):
         # Keep the unabridged graph for audit/publishing.  The HTTP graph may
         # be an explicitly incomplete-footprint summary; its separate hash
         # prevents an auditor from mistaking this artifact for the response.
-        write(root / "graph.json", full_graph)
-        result["graph_artifact"] = {
-            "path": str(root / "graph.json"),
-            "sha256": sha(root / "graph.json"),
-            "bytes": (root / "graph.json").stat().st_size,
-            "content": "full_graph_before_inline_footprint_compression",
-        }
         if canonical(full_graph) != canonical(graph):
             result["inline_graph_sha256"] = hashlib.sha256(canonical(graph).encode("utf-8")).hexdigest()
             result["inline_graph_bytes"] = len(canonical(graph).encode("utf-8"))
@@ -589,7 +593,7 @@ def report(root):
         result["status"] = "unavailable"
         result["unknowns"].append("inline_graph_byte_budget_exceeded")
     # Budget and persist the same bytes; indentation can more than double it.
-    (root / "summary.json").write_text(canonical(result), encoding="utf-8")
+    write(root / "summary.json", result, compact=True)
 
 
 def main():

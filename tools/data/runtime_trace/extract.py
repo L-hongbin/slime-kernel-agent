@@ -142,6 +142,11 @@ def entry_read_regions(reads, writes):
     Atomic log order is used ONLY when affine ownership proves the same thread.
     The remaining overlap is explicit unknown, not automatically an input edge.
     """
+    if not writes:
+        # With no in-kernel writers every read observes the entry version.
+        # This is exactly the loop below with an empty writer index, without
+        # repeated bisection/cut construction for every memory run.
+        return union(read[:2] for read in reads), []
     index = writer_index(writes)
     entry, unknown = [], []
     for read in reads:
@@ -158,7 +163,21 @@ def entry_read_regions(reads, writes):
 
 
 def conflicting_writes(writes):
-    index = writer_index(writes)
+    if len(writes) < 2:
+        return []
+    ordered = sorted(writes)
+    previous_hi = ordered[0][1]
+    disjoint = True
+    for write in ordered[1:]:
+        if write[0] < previous_hi:
+            disjoint = False
+            break
+        previous_hi = write[1]
+    if disjoint:
+        # The slow path can only append an overlap of two write intervals.
+        # Half-open, pairwise-disjoint intervals have none.
+        return []
+    index = writer_index(ordered)
     conflicts = []
     for write in writes:
         candidates = related(index, write[0], write[1])
@@ -374,10 +393,13 @@ def build_graph(prefix, allocations, context=None):
                 entry, ambiguous = entry_read_regions(reads, writes)
                 conflict = conflicting_writes(writes)
                 if reads:
+                    # The no-writer fast path already returned this exact
+                    # canonical union for entry regions; do not recompute it.
+                    read_regions = entry if not writes else union(x[:2] for x in reads)
                     node["reads"].append(
                         {
                             "buffer": storage,
-                            "regions": union(x[:2] for x in reads),
+                            "regions": read_regions,
                             "entry_regions": entry,
                             "internal_or_unordered_regions": ambiguous,
                             "port": None,
