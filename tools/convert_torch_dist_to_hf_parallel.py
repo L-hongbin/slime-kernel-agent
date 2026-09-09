@@ -17,6 +17,7 @@ from transformers import AutoConfig
 from typing_extensions import override
 
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
+from slime.backends.megatron_utils.qwen_gdn_layout import group_gdn_factory_keys, merge_gdn_factory_tensors
 
 
 class DummyClass:
@@ -381,6 +382,13 @@ def conversion_worker(
         planner=planner,
         no_dist=True,
     )
+    merged_gdn_keys = merge_gdn_factory_tensors(
+        state_dict,
+        megatron_args.tensor_model_parallel_size,
+        args.qwen_gdn_implementation,
+    )
+    if merged_gdn_keys:
+        print(f"Worker {worker_id}: Restored {len(merged_gdn_keys)} distributed Qwen GDN tensors")
     print(f"Worker {worker_id}: State dict loaded in {time.time()-t:.2f} sec.")
 
     save_tensors(
@@ -440,6 +448,15 @@ if __name__ == "__main__":
         default=16,
         help="Number of worker threads for parallel tensor conversion and saving. Default is 16.",
     )
+    parser.add_argument(
+        "--qwen-gdn-implementation",
+        choices=("auto", "replicated", "distributed"),
+        default="auto",
+        help=(
+            "Qwen GDN checkpoint layout. 'auto' uses the value saved in common.pt and detects "
+            "factory-split distributed tensors when the value is unavailable."
+        ),
+    )
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and not args.force:
@@ -455,6 +472,8 @@ if __name__ == "__main__":
         args.model_name = type(hf_config).__name__.lower()
 
     megatron_args = torch.load(os.path.join(args.input_dir, "common.pt"), weights_only=False)["args"]
+    if args.qwen_gdn_implementation == "auto":
+        args.qwen_gdn_implementation = getattr(megatron_args, "qwen_gdn_implementation", "auto")
 
     load_max_workers = args.load_max_workers
     save_max_workers = args.save_max_workers
@@ -463,13 +482,13 @@ if __name__ == "__main__":
     metadata = reader.read_metadata()
     all_keys = [k for k in metadata.state_dict_metadata.keys() if "optimizer" not in k and "_state" not in k]
 
-    # Group paired keys (linear_q_down_proj and linear_kv_down_proj) together
-    # These will be converted to q_a_proj and kv_a_proj_with_mqa later
-    paired_keys = set()
-    key_groups = []  # Each element is either a single key or a pair of keys
+    # Keep all raw entries needed to reconstruct one parameter in the same worker.
+    grouped_keys = set()
+    key_groups = group_gdn_factory_keys(all_keys)
+    grouped_keys.update(key for key_group in key_groups for key in key_group)
 
     for key in all_keys:
-        if key in paired_keys:
+        if key in grouped_keys:
             continue
 
         # Check if this is a linear_q_down_proj or linear_kv_down_proj key
@@ -483,8 +502,8 @@ if __name__ == "__main__":
             # If pair exists in all_keys, group them together
             if pair_key in all_keys:
                 key_groups.append([key, pair_key])
-                paired_keys.add(key)
-                paired_keys.add(pair_key)
+                grouped_keys.add(key)
+                grouped_keys.add(pair_key)
             else:
                 key_groups.append([key])
         else:
@@ -503,7 +522,8 @@ if __name__ == "__main__":
     num_workers = len(key_chunks)
 
     print(
-        f"Total keys: {len(all_keys)}, Paired groups: {len([g for g in key_groups if len(g) > 1])}, Workers: {num_workers}"
+        f"Total keys: {len(all_keys)}, Grouped parameters: {len([g for g in key_groups if len(g) > 1])}, "
+        f"Workers: {num_workers}"
     )
 
     state_dict_metadata_dict = metadata.state_dict_metadata if hasattr(metadata, "state_dict_metadata") else {}

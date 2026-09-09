@@ -14,6 +14,7 @@ from transformers import AutoConfig
 from typing_extensions import override
 
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
+from slime.backends.megatron_utils.qwen_gdn_layout import merge_gdn_factory_tensors
 
 
 class UnpicklerWrapper(pickle.Unpickler):
@@ -204,6 +205,15 @@ if __name__ == "__main__":
         default=None,
         help="Vocab size for removing padding, if applicable. If not provided, no padding will be removed.",
     )
+    parser.add_argument(
+        "--qwen-gdn-implementation",
+        choices=("auto", "replicated", "distributed"),
+        default="auto",
+        help=(
+            "Qwen GDN checkpoint layout. 'auto' uses the value saved in common.pt and detects "
+            "factory-split distributed tensors when the value is unavailable."
+        ),
+    )
     args = parser.parse_args()
 
     if os.path.exists(args.output_dir) and not args.force:
@@ -228,6 +238,16 @@ if __name__ == "__main__":
         planner=EmptyStateDictLoadPlanner(),
         no_dist=True,
     )
+    gdn_implementation = args.qwen_gdn_implementation
+    if gdn_implementation == "auto":
+        gdn_implementation = getattr(megatron_args, "qwen_gdn_implementation", "auto")
+    merged_gdn_keys = merge_gdn_factory_tensors(
+        state_dict,
+        megatron_args.tensor_model_parallel_size,
+        gdn_implementation,
+    )
+    if merged_gdn_keys:
+        print(f"restored {len(merged_gdn_keys)} distributed Qwen GDN tensors")
     print(f"model loaded in {time.time()-t:.2f} sec.")
 
     save_tensors(
