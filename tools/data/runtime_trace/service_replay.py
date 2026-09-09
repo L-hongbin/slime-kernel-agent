@@ -108,26 +108,123 @@ def _environment_material(configuration):
     return {key: configuration[key] for key in sorted(allowed & set(configuration))}
 
 
+def _complete_call_enumeration(coverage):
+    """Whether the trace retained every launch as well as every completion."""
+    counts = [
+        coverage.get("total_launches_reported"),
+        coverage.get("kernel_launches"),
+        coverage.get("completed_kernel_launches"),
+    ]
+    if any(type(value) is not int or value < 0 for value in counts) or len(set(counts)) != 1:
+        return False
+    # These calls are not represented as graph nodes.  Until the producer
+    # supplies explicit residual placeholder units, any such event would make
+    # the denominator omit a real copy/fill/launch call.
+    return not coverage.get("memory_unknown_events", [])
+
+
 def _full_graph_summary(graph, *, max_nodes, max_bytes):
     """Return an inline graph only when the complete call summary fits.
 
-    There is no prefix mode: a truncated graph is unavailable to the reward
-    consumer so a short header can never absorb omitted component mass.
+    A byte-bound summary may omit interfaces only from call nodes already
+    known to have incomplete footprints.  The node itself remains, is marked
+    unknown, and makes output closure unknown.  Thus compression cannot turn
+    omitted dataflow into a smaller, falsely complete reward denominator.
     """
-    graph = json.loads(json.dumps(graph))
+    graph = _inline_schema_graph(graph)
     coverage = graph.setdefault("coverage", {})
     coverage["summary_complete"] = bool(
         coverage.get("trace_process_complete")
-        and coverage.get("kernel_launches") == coverage.get("completed_kernel_launches")
+        and _complete_call_enumeration(coverage)
         and len(graph.get("nodes", ())) <= max_nodes
     )
-    encoded = canonical(graph).encode("utf-8")
-    if len(encoded) > max_bytes:
-        coverage["summary_complete"] = False
-        return None, "inline_graph_byte_budget_exceeded"
+    if not coverage.get("trace_process_complete"):
+        return None, "incomplete_launch_enumeration"
+    if not _complete_call_enumeration(coverage):
+        return None, "missing_call_units"
     if not coverage["summary_complete"]:
         return None, "graph_summary_incomplete"
-    return graph, None
+    if len(canonical(graph).encode("utf-8")) <= max_bytes:
+        return graph, None
+
+    # Largest incomplete interfaces first minimizes the number of residual
+    # units.  Complete footprints are never altered, even when this means the
+    # response remains too large and must fall back.
+    candidates = sorted(
+        (node for node in graph["nodes"] if node.get("footprint_complete") is not True),
+        key=lambda node: len(canonical({"reads": node.get("reads", []), "writes": node.get("writes", [])})),
+        reverse=True,
+    )
+    omitted = []
+    for node in candidates:
+        omitted.append(node["id"])
+        inline = _omit_incomplete_footprints(graph, omitted)
+        if len(canonical(inline).encode("utf-8")) <= max_bytes:
+            return inline, None
+    return None, "inline_graph_byte_budget_exceeded_no_safe_footprint_compression"
+
+
+def _inline_schema_graph(graph):
+    """Make unknown output producers explicit rather than serializing null IDs.
+
+    The raw audit graph retains the extractor's unknown entry-value record.
+    The HTTP graph has a strict node-ID schema, so this conversion records the
+    same uncertainty in ``output_unknowns`` and omits only the invalid edge.
+    """
+    graph = json.loads(json.dumps(graph))
+    valid, unknowns = [], set(graph.get("output_unknowns", []))
+    for edge in graph.get("outputs", []):
+        if isinstance(edge.get("source"), str) and isinstance(edge.get("target"), str):
+            valid.append(edge)
+            continue
+        unknowns.add("output_producer_unresolved:" + str(edge.get("buffer", "unknown_buffer")))
+    graph["outputs"] = valid
+    graph["output_unknowns"] = sorted(unknowns)
+    return graph
+
+
+def _omit_incomplete_footprints(graph, node_ids):
+    """Remove only known-incomplete footprint detail from an inline copy.
+
+    ``output_unknowns`` forces the consumer to retain every call unit in its
+    denominator.  The removed node has no signature, hence its mass stays at
+    BEST as residual rather than being redistributed to observed nodes.
+    """
+    graph = json.loads(json.dumps(graph))
+    omitted = set(node_ids)
+    removed_edges = 0
+    for node in graph["nodes"]:
+        if node["id"] not in omitted:
+            continue
+        if node.get("footprint_complete") is True:
+            raise ValueError("complete_footprint_must_not_be_inline_compressed")
+        removed_edges += len(node.get("reads", [])) + len(node.get("writes", []))
+        node["reads"] = []
+        node["writes"] = []
+        node["unknowns"] = sorted(set(node.get("unknowns", [])) | {"inline_footprint_omitted_byte_budget"})
+        node["inline_footprint_omitted"] = True
+    graph["edges"] = [
+        edge
+        for edge in graph["edges"]
+        if not (
+            (edge.get("source") in omitted or edge.get("target") in omitted)
+            and edge.get("buffer")
+            and edge.get("regions")
+        )
+    ]
+    graph["outputs"] = [
+        edge
+        for edge in graph["outputs"]
+        if not (edge.get("source") in omitted and edge.get("buffer") and edge.get("regions"))
+    ]
+    graph["output_unknowns"] = sorted(
+        set(graph.get("output_unknowns", []))
+        | {"inline_footprint_omitted_output_closure:" + node_id for node_id in omitted}
+    )
+    coverage = graph.setdefault("coverage", {})
+    coverage["inline_footprint_omitted_nodes"] = sorted(omitted)
+    coverage["inline_footprint_omitted_effect_count"] = removed_edges
+    return graph
 
 
 def _prepare_precompiled_artifact(request, device):
@@ -420,9 +517,15 @@ def report(root):
             "input_signature": result["identity"]["input_signature"],
             "environment_signature": result["identity"]["environment_signature"],
         }
-        graph = build_graph(root / "trace", allocations, context)
+        full_graph = build_graph(root / "trace", allocations, context)
+        full_coverage = full_graph.setdefault("coverage", {})
+        full_coverage["summary_complete"] = bool(
+            full_coverage.get("trace_process_complete")
+            and _complete_call_enumeration(full_coverage)
+            and len(full_graph.get("nodes", ())) <= request["options"]["max_summary_nodes"]
+        )
         graph, graph_reason = _full_graph_summary(
-            graph,
+            full_graph,
             max_nodes=request["options"]["max_summary_nodes"],
             max_bytes=120 * 1024,
         )
@@ -431,12 +534,19 @@ def report(root):
             graph = None
         if graph is None:
             raise ValueError("runtime_graph_not_self_contained")
-        write(root / "graph.json", graph)
+        # Keep the unabridged graph for audit/publishing.  The HTTP graph may
+        # be an explicitly incomplete-footprint summary; its separate hash
+        # prevents an auditor from mistaking this artifact for the response.
+        write(root / "graph.json", full_graph)
         result["graph_artifact"] = {
             "path": str(root / "graph.json"),
             "sha256": sha(root / "graph.json"),
             "bytes": (root / "graph.json").stat().st_size,
+            "content": "full_graph_before_inline_footprint_compression",
         }
+        if canonical(full_graph) != canonical(graph):
+            result["inline_graph_sha256"] = hashlib.sha256(canonical(graph).encode("utf-8")).hexdigest()
+            result["inline_graph_bytes"] = len(canonical(graph).encode("utf-8"))
         result["graph"] = graph
         # Valid complete graphs may still be partial attribution evidence when
         # any alignment check is false/null or a node carries an unknown.
@@ -478,7 +588,8 @@ def report(root):
         result.pop("graph_artifact", None)
         result["status"] = "unavailable"
         result["unknowns"].append("inline_graph_byte_budget_exceeded")
-    write(root / "summary.json", result)
+    # Budget and persist the same bytes; indentation can more than double it.
+    (root / "summary.json").write_text(canonical(result), encoding="utf-8")
 
 
 def main():
