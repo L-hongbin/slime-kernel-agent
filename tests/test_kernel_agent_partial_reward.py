@@ -154,6 +154,7 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
     reward_config = CUDA_AGENT_CONFIGS["reward"]
 
     assert reward_config["failed_score"] == 0.0
+    assert isinstance(reward_config["apply_penalty_score"], bool)
     assert isinstance(reward_config["apply_failed_group_reward"], bool)
     assert reward_config["penalty_score"] == {
         "precheck": -1.0,
@@ -176,6 +177,7 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
 @pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
 def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expected):
     env_name = "CUDA_AGENT_APPLY_FAILED_GROUP_REWARD"
+    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
     if env_value is None:
         monkeypatch.delenv(env_name, raising=False)
     else:
@@ -188,6 +190,91 @@ def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expe
     spec.loader.exec_module(config_module)
 
     assert config_module.CUDA_AGENT_CONFIGS["reward"]["apply_failed_group_reward"] is expected
+
+
+@pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
+def test_apply_penalty_score_flag_reads_environment(monkeypatch, env_value, expected):
+    env_name = "CUDA_AGENT_APPLY_PENALTY_SCORE"
+    monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
+    if env_value is None:
+        monkeypatch.delenv(env_name, raising=False)
+    else:
+        monkeypatch.setenv(env_name, env_value)
+
+    config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_apply_penalty_env_test", config_path)
+    assert spec is not None and spec.loader is not None
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+
+    assert config_module.CUDA_AGENT_CONFIGS["reward"]["apply_penalty_score"] is expected
+
+
+def test_penalty_reward_modes_are_mutually_exclusive(monkeypatch):
+    monkeypatch.setenv("CUDA_AGENT_APPLY_PENALTY_SCORE", "1")
+    monkeypatch.setenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", "1")
+
+    config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_penalty_conflict_test", config_path)
+    assert spec is not None and spec.loader is not None
+    config_module = importlib.util.module_from_spec(spec)
+
+    with pytest.raises(ValueError, match="cannot both be enabled"):
+        spec.loader.exec_module(config_module)
+
+
+@pytest.mark.parametrize(
+    ("env_state", "expected_reward"),
+    [
+        (
+            {
+                "status": "failed",
+                "compiled": None,
+                "correctness": None,
+                "error": "PRECHECK_ERROR",
+                "metadata": {},
+            },
+            -1.0,
+        ),
+        (_completed_env(compiled=False), -0.75),
+        (_completed_env(runtime_error="CUDA illegal memory access"), -0.5),
+        (_completed_env(compiled=True, correctness=False), -0.25),
+        (_completed_env(compiled=True, decoy_kernel=True), -1.0),
+    ],
+)
+def test_apply_penalty_score_directly_rewards_each_failed_sample(env_state, expected_reward):
+    config = {
+        **_reward_config(),
+        "apply_penalty_score": True,
+        "apply_failed_group_reward": False,
+    }
+
+    details = calculate_reward_speedup(env_state, config)
+
+    assert details["reward"] == pytest.approx(expected_reward)
+
+
+def test_apply_penalty_score_keeps_successful_reward():
+    config = {
+        **_reward_config(),
+        "apply_penalty_score": True,
+        "apply_failed_group_reward": False,
+    }
+
+    details = calculate_reward_speedup(_completed_env(correctness=True), config)
+
+    assert details["reward"] == pytest.approx(0.5)
+
+
+def test_calculate_reward_rejects_conflicting_penalty_modes():
+    config = {
+        **_reward_config(),
+        "apply_penalty_score": True,
+        "apply_failed_group_reward": True,
+    }
+
+    with pytest.raises(ValueError, match="cannot both be enabled"):
+        calculate_reward_speedup(_completed_env(compiled=False), config)
 
 
 def test_failed_score_is_the_base_reward_for_failed_sample():

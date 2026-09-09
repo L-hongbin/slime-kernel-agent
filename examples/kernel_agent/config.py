@@ -53,6 +53,9 @@ performance_reward_requires_correctness = bool(
     int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
 )
 apply_failed_group_reward = bool(int(os.environ.get("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", "0")))
+apply_penalty_score = bool(int(os.environ.get("CUDA_AGENT_APPLY_PENALTY_SCORE", "0")))
+if apply_penalty_score and apply_failed_group_reward:
+    raise ValueError("CUDA_AGENT_APPLY_PENALTY_SCORE and CUDA_AGENT_APPLY_FAILED_GROUP_REWARD cannot both be enabled")
 # KernelGYM diagnostics and validation features controlled by each request.
 # NCU, Compute Sanitizer, correctness input perturbations, and adaptive perf
 # trials are opt-in because they add latency or change the evaluated inputs.
@@ -147,6 +150,7 @@ CUDA_AGENT_CONFIGS = {
         "speedup_reward_upper_bound": 2.0,
         "speedup_reward_lower_bound": 0.0,
         "failed_score": 0.0,
+        "apply_penalty_score": apply_penalty_score,
         "apply_failed_group_reward": apply_failed_group_reward,
         # These scores are only used when every valid sample in a reward group
         # has task reward equal to failed_score and apply_failed_group_reward is

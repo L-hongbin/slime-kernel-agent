@@ -296,9 +296,12 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
     partial_reward, partial_applied, partial_reason = _resolve_output_mismatch_partial_credit(env_state, config)
     penalty_score = _resolve_penalty_score(env_state, config)
     failed_score = float(config["failed_score"])
+    apply_penalty_score = bool(config.get("apply_penalty_score", False))
+    if apply_penalty_score and bool(config.get("apply_failed_group_reward", False)):
+        raise ValueError("apply_penalty_score and apply_failed_group_reward cannot both be enabled")
 
     if env_state.get("status") != "completed":
-        reward = failed_score
+        reward = penalty_score if apply_penalty_score else failed_score
         return {
             **env_state,
             "reward": reward,
@@ -313,7 +316,7 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
         }
 
     if env_state.get("decoy_kernel", False):
-        reward = failed_score
+        reward = penalty_score if apply_penalty_score else failed_score
         return {
             **env_state,
             "reward": reward,
@@ -334,7 +337,9 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
     if reward_speedup < float(config["speedup_reward_lower_bound"]):
         reward_speedup = 0.0
 
-    if not compiled:
+    if apply_penalty_score and not (compiled and correctness):
+        reward = penalty_score
+    elif not compiled:
         reward = failed_score
     elif partial_applied:
         reward = partial_reward
