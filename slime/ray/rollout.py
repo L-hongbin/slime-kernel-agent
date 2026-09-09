@@ -705,6 +705,19 @@ class RolloutManager:
                 (s.metadata.get("gen_weight_version") if isinstance(getattr(s, "metadata", None), dict) else None)
                 for s in samples
             ]
+        if any(s.metadata and "gen_submit_time" in s.metadata for s in samples):
+            train_data["gen_submit_times"] = [
+                (s.metadata.get("gen_submit_time") if isinstance(getattr(s, "metadata", None), dict) else None)
+                for s in samples
+            ]
+        if any(s.metadata and "engine_weight_version_span" in s.metadata for s in samples):
+            train_data["engine_weight_version_spans"] = [
+                bool(s.metadata.get("engine_weight_version_span", False)) if s.metadata else False for s in samples
+            ]
+        if any(s.metadata and "engine_weight_version_mismatch" in s.metadata for s in samples):
+            train_data["engine_weight_version_mismatches"] = [
+                bool(s.metadata.get("engine_weight_version_mismatch", False)) if s.metadata else False for s in samples
+            ]
 
         if getattr(self.args, "use_rollout_routing_replay", False):
             missing_routing = [
@@ -838,6 +851,9 @@ class RolloutManager:
                 "rollout_topk_log_probs",
                 "rollout_topk_valid_mask",
                 "gen_weight_versions",
+                "gen_submit_times",
+                "engine_weight_version_spans",
+                "engine_weight_version_mismatches",
                 "rollout_routed_experts",
                 "source_names",
                 "prompt",

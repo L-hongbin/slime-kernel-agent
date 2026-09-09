@@ -24,6 +24,7 @@ import _cp_dist_helpers  # noqa: F401
 import pytest
 import torch
 
+from slime.backends.megatron_utils import loss as loss_module  # noqa: E402
 from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
@@ -34,6 +35,49 @@ from slime.observability.train_metric_utils import (  # noqa: E402
 )
 
 NUM_GPUS = 0
+
+
+@pytest.mark.unit
+def test_loss_function_packs_metric_scalars_without_python_scalarization(monkeypatch):
+    def fake_custom_loss(args, batch, logits, reducer):
+        return torch.tensor(1.0), {"metric_tensor": torch.tensor(2.0), "metric_float": 3.0}
+
+    monkeypatch.setattr(loss_module, "load_function", lambda _path: fake_custom_loss)
+    monkeypatch.setattr(
+        loss_module.mpu,
+        "get_data_parallel_world_size",
+        lambda with_context_parallel=True: 1,
+        raising=False,
+    )
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_world_size", lambda: 1)
+    args = type(
+        "Args",
+        (),
+        {
+            "calculate_per_token_loss": False,
+            "loss_type": "custom_loss",
+            "custom_loss_function_path": "unused",
+            "recompute_loss_function": False,
+            "allgather_cp": False,
+        },
+    )()
+    batch = {
+        "loss_masks": [torch.ones(2)],
+        "total_lengths": [3],
+        "response_lengths": [2],
+        "rollout_mask_sums": [torch.tensor(2.0)],
+    }
+
+    _, _, logging_payload = loss_module.loss_function(
+        args,
+        batch,
+        num_microbatches=1,
+        step_global_batch_size=1,
+        logits=torch.zeros((1, 3, 4)),
+    )
+
+    assert logging_payload["keys"] == ["metric_tensor", "metric_float"]
+    torch.testing.assert_close(logging_payload["values"], torch.tensor([0.0, 2.0, 3.0]))
 
 
 @pytest.fixture

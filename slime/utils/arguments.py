@@ -1453,6 +1453,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Tail approximation for the predictive Top-K KL directional derivative.",
             )
             parser.add_argument(
+                "--log-exp-metrics",
+                action="store_true",
+                help=(
+                    "Log low-overhead Binary-DPPO/reward/async diagnostics under the exp/ namespace. "
+                    "Experimental metrics are emitted in a separate text-log record."
+                ),
+            )
+            parser.add_argument(
                 "--ripo-delta",
                 type=float,
                 default=0.05,

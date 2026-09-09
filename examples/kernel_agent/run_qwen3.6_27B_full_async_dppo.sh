@@ -121,6 +121,7 @@ EXP_ARGS=(
    --advantage-estimator trloo
    --multi-turn-gamma 1.0
    --entropy-coef 0.00
+   --log-exp-metrics
 )
 
 MIS_ARGS=(

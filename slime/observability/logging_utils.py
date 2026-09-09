@@ -9,6 +9,7 @@ from slime.observability.tensorboard_utils import _TensorboardAdapter
 _LOGGER_CONFIGURED = False
 _TRACKING_ACTOR = None
 _OWNS_TRACKING_ACTOR = False
+logger = logging.getLogger(__name__)
 
 # Metrics intentionally omitted from W&B.  They are either
 # duplicates of a retained metric, configuration constants, or low-information
@@ -166,6 +167,18 @@ def log(args, metrics, step_key: str):
     if args.use_tensorboard:
         metrics_except_step = {k: v for k, v in metrics.items() if k != step_key}
         _TensorboardAdapter(args).log(data=metrics_except_step, step=metrics[step_key])
+
+
+def log_exp_metrics(args, metrics: dict, *, step_key: str, step: int, context: str) -> None:
+    """Print and track ``exp/`` metrics separately from the regular payload."""
+
+    if not metrics:
+        return
+    unexpected = [key for key in metrics if not key.startswith("exp/")]
+    if unexpected:
+        raise ValueError(f"experimental metric payload contains non-exp keys: {unexpected[:5]}")
+    logger.info("exp %s: %s", context, metrics)
+    log(args, {**metrics, step_key: step}, step_key=step_key)
 
 
 def _use_centralized_tracking(args) -> bool:

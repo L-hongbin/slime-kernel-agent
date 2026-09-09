@@ -21,6 +21,9 @@ def test_dppo_metrics_keep_a_top_level_tracking_namespace():
         "entropy/first_order_unmasked"
     )
     assert train_metric_utils.format_train_metric_key("entropy_loss") == "entropy/train"
+    assert train_metric_utils.format_train_metric_key("exp/train/dppo/binary_tv/mean") == (
+        "exp/train/dppo/binary_tv/mean"
+    )
 
 
 def test_wandb_dppo_group_uses_the_train_step(monkeypatch):
@@ -31,6 +34,8 @@ def test_wandb_dppo_group_uses_the_train_step(monkeypatch):
     wandb_utils._init_wandb_common()
 
     assert (("dppo/*",), {"step_metric": "train/step"}) in calls
+    assert (("exp/train/*",), {"step_metric": "train/step"}) in calls
+    assert (("exp/rollout/*",), {"step_metric": "rollout/step"}) in calls
 
 
 def test_dppo_ratios_are_derived_only_after_reduced_sufficient_statistics():

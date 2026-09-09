@@ -58,6 +58,8 @@ def add_entropy_common_probe_metric(metrics: dict[str, float], *, required: bool
 
 def format_train_metric_key(key: str, role_tag: str = "") -> str:
     """Map reduced train metrics to their tracking namespace."""
+    if key.startswith("exp/"):
+        return key
     if key == "entropy_loss":
         return f"entropy/{role_tag}train"
     if key == ENTROPY_COMMON_PROBE_METRIC_KEY:
@@ -283,6 +285,116 @@ def log_rollout_data(
 
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
+        if getattr(args, "log_exp_metrics", False):
+            sample_exp_metrics: dict[str, tuple[float, float]] = {}
+
+            def add_sample_mean(name: str, values: list[float]) -> None:
+                if values:
+                    sample_exp_metrics[name] = (float(sum(values)), float(len(values)))
+
+            sample_advantages = []
+            if rollout_data.get("advantages"):
+                advantage_scalars = []
+                for advantage, loss_mask in zip(rollout_data["advantages"], rollout_data["loss_masks"], strict=True):
+                    advantage = torch.as_tensor(advantage)
+                    loss_mask = torch.as_tensor(loss_mask, device=advantage.device, dtype=advantage.dtype)
+                    advantage_scalars.append((advantage * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1))
+                sample_advantages = torch.stack(advantage_scalars).detach().float().cpu().tolist()
+            response_lengths_for_exp = [float(value) for value in rollout_data.get("response_lengths", [])]
+            if sample_advantages:
+                positive = [float(value > 0) for value in sample_advantages]
+                negative = [float(value < 0) for value in sample_advantages]
+                zero = [float(value == 0) for value in sample_advantages]
+                add_sample_mean("advantage/positive_sample_fraction", positive)
+                add_sample_mean("advantage/negative_sample_fraction", negative)
+                add_sample_mean("advantage/zero_sample_fraction", zero)
+                add_sample_mean(
+                    "advantage/positive_abs_mass",
+                    [abs(value) if value > 0 else 0.0 for value in sample_advantages],
+                )
+                add_sample_mean(
+                    "advantage/negative_abs_mass",
+                    [abs(value) if value < 0 else 0.0 for value in sample_advantages],
+                )
+                add_sample_mean(
+                    "sequence/positive_response_length",
+                    [
+                        length
+                        for length, value in zip(response_lengths_for_exp, sample_advantages, strict=True)
+                        if value > 0
+                    ],
+                )
+                add_sample_mean(
+                    "sequence/negative_response_length",
+                    [
+                        length
+                        for length, value in zip(response_lengths_for_exp, sample_advantages, strict=True)
+                        if value < 0
+                    ],
+                )
+
+                turn_indices = rollout_data.get("turn_indices")
+                if turn_indices is not None:
+                    for turn in sorted({int(value) for value in turn_indices if value is not None}):
+                        turn_advantages = [
+                            advantage
+                            for advantage, turn_index in zip(sample_advantages, turn_indices, strict=True)
+                            if turn_index is not None and int(turn_index) == turn
+                        ]
+                        add_sample_mean(
+                            f"turn/{turn}/advantage_positive_sample_fraction",
+                            [float(value > 0) for value in turn_advantages],
+                        )
+                        add_sample_mean(
+                            f"turn/{turn}/advantage_negative_sample_fraction",
+                            [float(value < 0) for value in turn_advantages],
+                        )
+
+            gen_versions = rollout_data.get("gen_weight_versions")
+            train_versions = rollout_data.get("train_weight_versions")
+            if gen_versions is not None or train_versions is not None:
+                num_samples = len(rollout_data["response_lengths"])
+                gen_versions = gen_versions if gen_versions is not None else [None] * num_samples
+                train_versions = train_versions if train_versions is not None else [None] * num_samples
+                lags = [
+                    float(train) - float(gen)
+                    for gen, train in zip(gen_versions, train_versions, strict=True)
+                    if gen is not None and train is not None
+                ]
+                add_sample_mean("async/policy_lag", lags)
+                add_sample_mean("async/fresh_fraction", [float(value == 1) for value in lags])
+                add_sample_mean("async/carryover_fraction", [float(value > 1) for value in lags])
+                add_sample_mean(
+                    "async/missing_version_fraction",
+                    [
+                        float(gen is None or train is None)
+                        for gen, train in zip(gen_versions, train_versions, strict=True)
+                    ],
+                )
+                for label, predicate in (
+                    ("0", lambda value: value == 0),
+                    ("1", lambda value: value == 1),
+                    ("2", lambda value: value == 2),
+                    ("3", lambda value: value == 3),
+                    ("ge4", lambda value: value >= 4),
+                ):
+                    add_sample_mean(f"async/lag/{label}_sample_fraction", [float(predicate(value)) for value in lags])
+
+            add_sample_mean(
+                "async/sample_age_seconds",
+                [float(value) for value in rollout_data.get("sample_ages_seconds", []) if value is not None],
+            )
+            add_sample_mean(
+                "async/engine_version_span_fraction",
+                [float(value) for value in rollout_data.get("engine_weight_version_spans", [])],
+            )
+            add_sample_mean(
+                "async/engine_version_mismatch_fraction",
+                [float(value) for value in rollout_data.get("engine_weight_version_mismatches", [])],
+            )
+            if sample_exp_metrics:
+                gather_log_data("exp/rollout/train_batch", args, rollout_id, sample_exp_metrics)
+
         log_dict = {}
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
@@ -312,6 +424,12 @@ def log_rollout_data(
             "micro_batch_indices",
             "source_names",
             "local_raw_reward",
+            "gen_weight_versions",
+            "gen_submit_times",
+            "train_weight_versions",
+            "sample_ages_seconds",
+            "engine_weight_version_spans",
+            "engine_weight_version_mismatches",
         }
         per_rollout_mean_keys = {
             "log_probs",

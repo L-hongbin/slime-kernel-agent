@@ -213,6 +213,7 @@ def _init_wandb_common():
     wandb.define_metric("train/*", step_metric="train/step")
     wandb.define_metric("dppo/*", step_metric="train/step")
     wandb.define_metric("entropy/*", step_metric="train/step")
+    wandb.define_metric("exp/train/*", step_metric="train/step")
     wandb.define_metric("entropy/rollout*", step_metric="rollout/step")
     wandb.define_metric("rollout/step")
     wandb.define_metric("rollout/*", step_metric="rollout/step")
@@ -221,3 +222,4 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("exp/rollout/*", step_metric="rollout/step")

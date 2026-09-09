@@ -1,10 +1,12 @@
 import logging
+import time
 from typing import Any
 
 import numpy as np
 import torch
 
 from slime.observability import logging_utils
+from slime.observability.exp_metrics import split_exp_metrics
 from slime.observability.metric_utils import (
     compute_pass_rate,
     compute_rollout_step,
@@ -116,6 +118,153 @@ def _compute_response_diversity(args, samples) -> dict[str, float]:
 
 
 _KERNEL_FAST_THRESHOLDS = (1.0, 1.2, 1.5, 2.0, 3.0)
+_KERNEL_OUTCOMES = (
+    "decoy",
+    "timeout",
+    "precheck_fail",
+    "compile_fail",
+    "output_mismatch",
+    "runtime_or_wrong",
+    "correct_slow",
+    "correct_fast",
+)
+
+
+def _kernel_outcome_class(sample: Sample) -> str:
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    env_extra_info = metadata.get("env_extra_info")
+    env_extra_info = env_extra_info if isinstance(env_extra_info, dict) else {}
+    if bool(env_extra_info.get("decoy_kernel")):
+        return "decoy"
+    env_result = metadata.get("env_result")
+    env_state = env_result.get("env_state") if isinstance(env_result, dict) else {}
+    env_state = env_state if isinstance(env_state, dict) else {}
+    if env_state.get("status") == "timeout":
+        return "timeout"
+    if env_extra_info.get("precheck") == "failed":
+        return "precheck_fail"
+    if not bool(env_extra_info.get("compilation")):
+        return "compile_fail"
+    if bool(env_extra_info.get("correctness_output_mismatch")):
+        return "output_mismatch"
+    if not bool(env_extra_info.get("correctness")):
+        return "runtime_or_wrong"
+    speedup = env_extra_info.get("speedup")
+    return "correct_fast" if isinstance(speedup, (int, float)) and speedup >= 1.0 else "correct_slow"
+
+
+def _compute_exp_rollout_metrics(args, samples: list[Sample]) -> dict[str, float]:
+    if not getattr(args, "log_exp_metrics", False) or not samples:
+        return {}
+
+    metrics: dict[str, float] = {}
+    prefix = "exp/rollout"
+    non_pad_samples = [
+        sample for sample in samples if not (isinstance(sample.metadata, dict) and sample.metadata.get("is_pad_turn"))
+    ]
+    if not non_pad_samples:
+        return metrics
+
+    def finite_values(values) -> list[float]:
+        return [
+            float(value)
+            for value in values
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+        ]
+
+    def add_stats(name: str, values) -> None:
+        values = finite_values(values)
+        if not values:
+            return
+        metrics[f"{prefix}/{name}/mean"] = float(np.mean(values))
+        metrics[f"{prefix}/{name}/min"] = float(np.min(values))
+        metrics[f"{prefix}/{name}/max"] = float(np.max(values))
+
+    add_stats("reward/final", [sample.reward for sample in non_pad_samples])
+    add_stats(
+        "reward/task",
+        [(sample.metadata or {}).get("task_reward") for sample in non_pad_samples],
+    )
+    add_stats(
+        "reward/multi_turn",
+        [(sample.metadata or {}).get("multi_turn_reward") for sample in non_pad_samples],
+    )
+    add_stats(
+        "reward/overlong_penalty",
+        [(sample.metadata or {}).get("overlong_penalty", 0.0) for sample in non_pad_samples],
+    )
+    component_keys = (
+        "reward_correctness_component",
+        "reward_performance_component",
+        "reward_coverage_component",
+        "reward_partial_component",
+        "reward_penalty_component",
+    )
+    for component in component_keys:
+        add_stats(
+            f"reward/component/{component.removeprefix('reward_').removesuffix('_component')}",
+            [
+                (
+                    (sample.metadata or {}).get("reward_components", {}).get(component)
+                    if isinstance((sample.metadata or {}).get("reward_components"), dict)
+                    else None
+                )
+                for sample in non_pad_samples
+            ],
+        )
+
+    outcomes = [_kernel_outcome_class(sample) for sample in non_pad_samples]
+    for outcome in _KERNEL_OUTCOMES:
+        metrics[f"{prefix}/reward/outcome/{outcome}_fraction"] = outcomes.count(outcome) / len(outcomes)
+    metrics[f"{prefix}/sample/removed_fraction"] = float(
+        np.mean([float(sample.remove_sample) for sample in non_pad_samples])
+    )
+
+    grouped: dict[tuple[object, object], list[float]] = {}
+    for sample in non_pad_samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        grouped.setdefault((sample.group_index, metadata.get("turn_idx")), []).append(float(sample.reward or 0.0))
+    group_stds = [float(np.std(values)) for values in grouped.values()]
+    group_ranges = [max(values) - min(values) for values in grouped.values()]
+    group_unique = [len(set(values)) for values in grouped.values()]
+    add_stats("group/reward_std", group_stds)
+    add_stats("group/reward_range", group_ranges)
+    add_stats("group/reward_n_unique", group_unique)
+    metrics[f"{prefix}/group/all_equal_fraction"] = float(np.mean([value == 0.0 for value in group_ranges]))
+
+    turns = sorted(
+        {
+            int(sample.metadata["turn_idx"])
+            for sample in non_pad_samples
+            if isinstance(sample.metadata, dict) and sample.metadata.get("turn_idx") is not None
+        }
+    )
+    for turn in turns:
+        turn_samples = [
+            sample for sample in non_pad_samples if int((sample.metadata or {}).get("turn_idx", -1)) == turn
+        ]
+        add_stats(f"turn/{turn}/reward", [sample.reward for sample in turn_samples])
+        add_stats(f"turn/{turn}/response_length", [sample.response_length for sample in turn_samples])
+        metrics[f"{prefix}/turn/{turn}/removed_fraction"] = float(
+            np.mean([float(sample.remove_sample) for sample in turn_samples])
+        )
+
+    add_stats(
+        "async/gen_weight_version", [(sample.metadata or {}).get("gen_weight_version") for sample in non_pad_samples]
+    )
+    submit_times = finite_values([(sample.metadata or {}).get("gen_submit_time") for sample in non_pad_samples])
+    if submit_times:
+        now = time.time()
+        add_stats("async/age_at_rollout_log_seconds", [max(0.0, now - submitted) for submitted in submit_times])
+    metrics[f"{prefix}/async/engine_version_span_fraction"] = float(
+        np.mean([float(bool((sample.metadata or {}).get("engine_weight_version_span"))) for sample in non_pad_samples])
+    )
+    metrics[f"{prefix}/async/engine_version_mismatch_fraction"] = float(
+        np.mean(
+            [float(bool((sample.metadata or {}).get("engine_weight_version_mismatch"))) for sample in non_pad_samples]
+        )
+    )
+    return metrics
 
 
 def _compute_kernel_multi_turn_metrics(args, samples):
@@ -634,9 +783,18 @@ def log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_t
     log_dict = {**(rollout_extra_metrics or {})}
     log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), "rollout/")
     log_dict |= dict_add_prefix(compute_perf_metrics_from_samples(args, samples, rollout_time), "perf/")
-    logger.info(f"perf {rollout_id}: {log_dict}")
+    log_dict |= _compute_exp_rollout_metrics(args, samples)
+    regular_log_dict, exp_log_dict = split_exp_metrics(log_dict)
+    logger.info(f"perf {rollout_id}: {regular_log_dict}")
     step = compute_rollout_step(args, rollout_id)
-    log_dict["rollout/step"] = step
+    regular_log_dict["rollout/step"] = step
     if args.wandb_always_use_train_step:
-        log_dict["train/step"] = step
-    logging_utils.log(args, log_dict, step_key="rollout/step")
+        regular_log_dict["train/step"] = step
+    logging_utils.log(args, regular_log_dict, step_key="rollout/step")
+    logging_utils.log_exp_metrics(
+        args,
+        exp_log_dict,
+        step_key="rollout/step",
+        step=step,
+        context=f"rollout {rollout_id}",
+    )

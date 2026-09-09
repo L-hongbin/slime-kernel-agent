@@ -86,7 +86,7 @@ def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch
     )
     for gid in range(10):
         worker.output_queue.put((gid, _make_group(gid)))
-    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: worker)
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
 
     args = _make_rollout_args(
         rollout_global_dataset=True,
@@ -330,10 +330,12 @@ def test_kernel_agent_worker_prefers_engine_generation_weight_version(monkeypatc
     sample = completed[0][1][0]
     assert sample.metadata["rollout_step"] == 4
     assert sample.metadata["gen_weight_version"] == 8
+    assert sample.metadata["engine_weight_version_span"] is False
+    assert sample.metadata["engine_weight_version_mismatch"] is True
 
 
 def test_kernel_agent_worker_restamps_a_fresh_retry_after_abort():
-    args = _make_rollout_args(gen_weight_version=7)
+    args = _make_rollout_args(gen_weight_version=7, log_exp_metrics=True)
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker
     )
@@ -347,6 +349,7 @@ def test_kernel_agent_worker_restamps_a_fresh_retry_after_abort():
     worker._stamp_group_for_submission([sample])
     assert sample.metadata["rollout_step"] == 4
     assert sample.metadata["gen_weight_version"] == 7
+    first_submit_time = sample.metadata["gen_submit_time"]
 
     # The aborted input is regenerated from its prompt, rather than resumed.
     # Its next attempt must describe the new generation policy, not retain v7.
@@ -355,6 +358,7 @@ def test_kernel_agent_worker_restamps_a_fresh_retry_after_abort():
     worker._stamp_group_for_submission([sample])
     assert sample.metadata["rollout_step"] == 5
     assert sample.metadata["gen_weight_version"] == 8
+    assert sample.metadata["gen_submit_time"] >= first_submit_time
 
 
 def test_kernel_agent_turn_preserves_engine_weight_version():

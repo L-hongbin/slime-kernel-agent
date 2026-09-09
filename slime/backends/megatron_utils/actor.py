@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from contextlib import contextmanager, nullcontext
 from datetime import timedelta
@@ -809,6 +810,17 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+        if getattr(self.args, "log_exp_metrics", False):
+            num_samples = len(rollout_data["response_lengths"])
+            train_weight_version = int(self.weight_updater.weight_version)
+            rollout_data["train_weight_versions"] = [train_weight_version] * num_samples
+            gen_submit_times = rollout_data.get("gen_submit_times")
+            if gen_submit_times is not None:
+                train_start_time = time.time()
+                rollout_data["sample_ages_seconds"] = [
+                    None if submitted is None else max(0.0, train_start_time - float(submitted))
+                    for submitted in gen_submit_times
+                ]
         _snapshot_entropy_common_probe_masks(
             rollout_data,
             enabled=getattr(self.args, "entropy_common_probe", False),

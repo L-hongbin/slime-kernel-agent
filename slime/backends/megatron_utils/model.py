@@ -30,6 +30,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.observability import logging_utils, train_metric_utils
+from slime.observability.exp_metrics import finalize_exp_metrics, split_exp_metrics
 from slime.observability.train_metric_utils import (
     ENTROPY_COMMON_PROBE_MASK_KEY,
     add_derived_dppo_metrics,
@@ -835,6 +836,12 @@ def train_one_step(
                     "max_seq_lens",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    "gen_weight_versions",
+                    "train_weight_versions",
+                    "sample_ages_seconds",
+                    "turn_indices",
+                    "engine_weight_version_spans",
+                    "engine_weight_version_mismatches",
                     # Only present when dumping train debug data; lets the loss
                     # snapshot each sample's log_probs keyed by rollout position.
                     *(["partition"] if args.save_debug_train_data is not None else []),
@@ -1135,6 +1142,7 @@ def train(
             )
             add_derived_dppo_metrics(loss_dict)
             add_derived_entropy_metrics(loss_dict)
+            finalize_exp_metrics(loss_dict)
             log_dict = {
                 format_train_metric_key(key, role_tag): val.mean().item() if isinstance(val, torch.Tensor) else val
                 for key, val in loss_dict.items()
@@ -1152,7 +1160,15 @@ def train(
             log_dict["train/step"] = accumulated_step_id
             if args.wandb_always_use_train_step:
                 log_dict["rollout/step"] = accumulated_step_id
-            logging_utils.log(args, log_dict, step_key="train/step")
+            regular_log_dict, exp_log_dict = split_exp_metrics(log_dict)
+            logging_utils.log(args, regular_log_dict, step_key="train/step")
+            logging_utils.log_exp_metrics(
+                args,
+                exp_log_dict,
+                step_key="train/step",
+                step=accumulated_step_id,
+                context=f"train {accumulated_step_id}",
+            )
 
             if args.ci_test and "train/train_rollout_logprob_abs_diff" in log_dict:
                 threshold = args.ci_train_rollout_logprob_abs_diff_threshold

@@ -184,6 +184,8 @@ class KernelAgentAsyncRolloutWorker:
                 # An aborted fully-async request is regenerated from scratch,
                 # so a requeued prompt must be restamped for the new attempt.
                 metadata["gen_weight_version"] = gen_weight_version
+            if getattr(self.args, "log_exp_metrics", False):
+                metadata["gen_submit_time"] = time.time()
             sample.metadata = metadata
 
     @staticmethod
@@ -197,6 +199,9 @@ class KernelAgentAsyncRolloutWorker:
         that do not preserve that field.
         """
         for sample in _iter_samples(task_group):
+            sample.metadata = dict(sample.metadata or {})
+            sample.metadata["engine_weight_version_span"] = False
+            sample.metadata["engine_weight_version_mismatch"] = False
             if not sample.weight_versions:
                 continue
             try:
@@ -204,14 +209,19 @@ class KernelAgentAsyncRolloutWorker:
             except (TypeError, ValueError):
                 continue
             if len(versions) != 1:
+                sample.metadata["engine_weight_version_span"] = True
                 logger.warning(
                     "kernel-agent fully-async sample %s spans engine weight versions %s; " "keeping submission stamp",
                     sample.index,
                     sorted(versions),
                 )
                 continue
-            sample.metadata = dict(sample.metadata or {})
-            sample.metadata["gen_weight_version"] = versions.pop()
+            engine_version = versions.pop()
+            submitted_version = sample.metadata.get("gen_weight_version")
+            sample.metadata["engine_weight_version_mismatch"] = (
+                submitted_version is not None and int(submitted_version) != engine_version
+            )
+            sample.metadata["gen_weight_version"] = engine_version
 
     def start(self) -> None:
         if self.worker_thread is None or not self.worker_thread.is_alive():
@@ -244,11 +254,11 @@ class KernelAgentAsyncRolloutWorker:
 
     def stats(self) -> dict[str, int]:
         return {
-            "active_groups": self.active_count,
-            "submitted_groups": self.submitted_count,
-            "completed_groups": self.completed_count,
-            "aborted_groups": self.aborted_count,
-            "exception_groups": self.exception_count,
+            "active_groups": getattr(self, "active_count", 0),
+            "submitted_groups": getattr(self, "submitted_count", 0),
+            "completed_groups": getattr(self, "completed_count", 0),
+            "aborted_groups": getattr(self, "aborted_count", 0),
+            "exception_groups": getattr(self, "exception_count", 0),
             "queued_groups": self.queue_size(),
         }
 
@@ -380,6 +390,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     filter_by_last_turn = use_multi_turn and getattr(args, "filter_by_last_turn", False)
 
     worker = _get_global_worker(args, data_buffer, rollout_id)
+    worker_stats_start = worker.stats()
     target = args.rollout_batch_size
     logger.info(
         "kernel-agent fully-async rollout %d: target=%d queue_warm=%d",
@@ -395,6 +406,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     log_sample_bodies = not bool(CUDA_AGENT_CONFIGS.get("log_rollout_stats_only", True))
     do_print = log_sample_bodies
     drop_reason_counts: Counter[str] = Counter()
+    examined_task_groups = 0
 
     def _record_dynamic_filter_drop(reason: str | None, count: int = 1) -> None:
         metric_gatherer.on_dynamic_filter_drop(reason=reason)
@@ -408,6 +420,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         # work stays warm for the next rollout.
         for gid, task_group in worker.get_completed_groups(limit=target - len(collected)):
             drained += 1
+            examined_task_groups += 1
             groups = _as_sample_groups(task_group)
             if not groups:
                 continue
@@ -479,6 +492,19 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         )
     metrics = metric_gatherer.collect()
     metrics["fully_async_collect_time"] = collect_time
+    if getattr(args, "log_exp_metrics", False):
+        worker_stats_end = worker.stats()
+        metrics["exp/rollout/async/collect_time_seconds"] = collect_time
+        metrics["exp/rollout/async/active_groups"] = worker_stats_end["active_groups"]
+        metrics["exp/rollout/async/queued_groups"] = worker_stats_end["queued_groups"]
+        for key in ("submitted_groups", "completed_groups", "aborted_groups", "exception_groups"):
+            metrics[f"exp/rollout/async/{key}_delta"] = worker_stats_end[key] - worker_stats_start[key]
+        metrics["exp/rollout/async/accepted_groups"] = len(collected)
+        metrics["exp/rollout/async/examined_task_groups"] = examined_task_groups
+        metrics["exp/rollout/async/dropped_group_candidates"] = sum(drop_reason_counts.values())
+        metrics["exp/rollout/async/acceptance_per_examined"] = (
+            len(collected) / examined_task_groups if examined_task_groups > 0 else 0.0
+        )
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 

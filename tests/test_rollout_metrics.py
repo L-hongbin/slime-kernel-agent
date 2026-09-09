@@ -5,7 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from slime.observability.rollout_metrics import _compute_top_p_kept_vocab_metrics, _iter_response_diversity_groups
+from slime.observability.rollout_metrics import (
+    _compute_exp_rollout_metrics,
+    _compute_top_p_kept_vocab_metrics,
+    _iter_response_diversity_groups,
+)
 from slime.utils.misc import decode_int32_meta_array
 from slime.utils.types import Sample
 
@@ -65,6 +69,55 @@ def test_response_diversity_groups_multi_turn_samples_by_prompt_and_turn():
         [(10, 0), (11, 0)],
         [(10, 1), (11, 1)],
     ]
+
+
+@pytest.mark.unit
+def test_exp_rollout_metrics_cover_reward_groups_turns_and_async_state():
+    samples = [
+        Sample(
+            group_index=7,
+            reward=0.5,
+            response_length=10,
+            metadata={
+                "turn_idx": 0,
+                "task_reward": 0.5,
+                "reward_components": {"reward_correctness_component": 0.5},
+                "gen_weight_version": 3,
+                "gen_submit_time": 1.0,
+                "engine_weight_version_span": False,
+                "engine_weight_version_mismatch": False,
+                "env_extra_info": {"compilation": True, "correctness": True, "speedup": 1.2},
+            },
+        ),
+        Sample(
+            group_index=7,
+            reward=-0.25,
+            response_length=20,
+            remove_sample=True,
+            metadata={
+                "turn_idx": 0,
+                "task_reward": -0.25,
+                "reward_components": {"reward_penalty_component": -0.25},
+                "gen_weight_version": 2,
+                "gen_submit_time": 2.0,
+                "engine_weight_version_span": True,
+                "engine_weight_version_mismatch": True,
+                "env_extra_info": {"compilation": True, "correctness": False},
+            },
+        ),
+    ]
+
+    metrics = _compute_exp_rollout_metrics(Namespace(log_exp_metrics=True), samples)
+
+    assert metrics["exp/rollout/reward/final/mean"] == pytest.approx(0.125)
+    assert metrics["exp/rollout/group/reward_range/mean"] == pytest.approx(0.75)
+    assert metrics["exp/rollout/group/all_equal_fraction"] == 0.0
+    assert metrics["exp/rollout/turn/0/response_length/mean"] == pytest.approx(15.0)
+    assert metrics["exp/rollout/sample/removed_fraction"] == pytest.approx(0.5)
+    assert metrics["exp/rollout/async/engine_version_span_fraction"] == pytest.approx(0.5)
+    assert metrics["exp/rollout/async/engine_version_mismatch_fraction"] == pytest.approx(0.5)
+    assert metrics["exp/rollout/reward/component/correctness/mean"] == pytest.approx(0.5)
+    assert metrics["exp/rollout/reward/component/penalty/mean"] == pytest.approx(-0.25)
 
 
 def _b64_int32(values: list[int]) -> str:

@@ -9,6 +9,12 @@ import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
 
+from slime.observability.exp_metrics import compute_binary_dppo_exp_metrics
+from slime.observability.train_metric_utils import (
+    ENTROPY_COMMON_PROBE_DENOMINATOR_KEY,
+    ENTROPY_COMMON_PROBE_MASK_KEY,
+    ENTROPY_COMMON_PROBE_NUMERATOR_KEY,
+)
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
@@ -32,11 +38,6 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
-from slime.observability.train_metric_utils import (
-    ENTROPY_COMMON_PROBE_DENOMINATOR_KEY,
-    ENTROPY_COMMON_PROBE_MASK_KEY,
-    ENTROPY_COMMON_PROBE_NUMERATOR_KEY,
-)
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -50,6 +51,25 @@ ROLLOUT_TOP_P_TOKEN_KEYS = (
     "rollout_top_p_token_ids",
     "rollout_top_p_token_offsets",
 )
+
+
+def _expand_sample_scalars_to_local_tokens(
+    values: list | None,
+    per_sample_tensors: list[torch.Tensor],
+    *,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Broadcast optional per-sample scalars over each local CP token slice."""
+
+    if values is None:
+        return None
+    if len(values) != len(per_sample_tensors):
+        raise ValueError(f"sample scalar count {len(values)} does not match tensor count {len(per_sample_tensors)}")
+    chunks = []
+    for value, tensor in zip(values, per_sample_tensors, strict=True):
+        scalar = float("nan") if value is None else float(value)
+        chunks.append(torch.full((tensor.numel(),), scalar, dtype=torch.float32, device=device))
+    return torch.cat(chunks, dim=0) if chunks else torch.empty(0, dtype=torch.float32, device=device)
 
 
 # Optional capture of per-sample policy log-probs computed during the training
@@ -1808,6 +1828,52 @@ def policy_loss_function(
     policy_loss_metrics = {key: value for key, value in policy_loss_output.items() if key != "pg_losses"}
     pg_clipfrac = policy_loss_metrics["pg_clipfrac"]
     dppo_extra_metrics = policy_loss_metrics if _dppo is not None else {}
+    binary_exp_metrics = {}
+    if getattr(args, "log_exp_metrics", False) and policy_loss_mode in {"dppo_binary_tv", "dppo_binary_kl"}:
+        sample_policy_lags = None
+        gen_weight_versions = batch.get("gen_weight_versions")
+        train_weight_versions = batch.get("train_weight_versions")
+        if gen_weight_versions is not None and train_weight_versions is not None:
+            sample_policy_lags = [
+                None if gen is None or train is None else float(train) - float(gen)
+                for gen, train in zip(gen_weight_versions, train_weight_versions, strict=True)
+            ]
+
+        binary_exp_metrics = compute_binary_dppo_exp_metrics(
+            log_probs=log_probs,
+            old_log_probs=old_log_probs,
+            advantages=advantages,
+            loss_mode=policy_loss_mode,
+            eps_clip=args.eps_clip,
+            eps_clip_high=args.eps_clip_high,
+            ratio_clip_c=args.eps_clip_c,
+            metric_reducer=sum_of_sample_mean_for_dppo_metrics,
+            policy_lags=_expand_sample_scalars_to_local_tokens(
+                sample_policy_lags,
+                batch["advantages"],
+                device=log_probs.device,
+            ),
+            sample_ages_seconds=_expand_sample_scalars_to_local_tokens(
+                batch.get("sample_ages_seconds"),
+                batch["advantages"],
+                device=log_probs.device,
+            ),
+            turn_indices=_expand_sample_scalars_to_local_tokens(
+                batch.get("turn_indices"),
+                batch["advantages"],
+                device=log_probs.device,
+            ),
+            engine_version_spans=_expand_sample_scalars_to_local_tokens(
+                batch.get("engine_weight_version_spans"),
+                batch["advantages"],
+                device=log_probs.device,
+            ),
+            engine_version_mismatches=_expand_sample_scalars_to_local_tokens(
+                batch.get("engine_weight_version_mismatches"),
+                batch["advantages"],
+                device=log_probs.device,
+            ),
+        )
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -1989,6 +2055,7 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
     }
     reported_loss.update(entropy_common_probe_stats)
+    reported_loss.update(binary_exp_metrics)
     for _k, _v in policy_loss_metrics.items():
         if _k == "pg_clipfrac":
             continue
@@ -2227,6 +2294,17 @@ def loss_function(
     else:
         loss = loss * mpu.get_context_parallel_world_size()
 
+    metric_values = [
+        value.reshape(()) if isinstance(value, torch.Tensor) else torch.as_tensor(value, device=logits.device)
+        for value in log.values()
+    ]
+    metric_dtype = metric_values[0].dtype
+    reporting_denominator = num_tokens if args.calculate_per_token_loss else torch.tensor(0, device=logits.device)
+    packed_metric_values = torch.stack(
+        [reporting_denominator.to(dtype=metric_dtype)]
+        + [value.to(device=logits.device, dtype=metric_dtype) for value in metric_values]
+    )
+
     return (
         loss,
         (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
@@ -2239,12 +2317,9 @@ def loss_function(
             # so we leave a 0 placeholder here and let ``train_one_step``
             # substitute the constant directly, instead of routing it through
             # per-mb fractions.
-            "values": torch.tensor(
-                [
-                    num_tokens if args.calculate_per_token_loss else 0,
-                ]
-                + list(log.values()),
-                device=logits.device,
-            ),
+            # Stack device scalars directly: constructing a tensor from a list
+            # of CUDA tensors would scalarize each entry and synchronize once
+            # per metric, which is especially expensive for the exp payload.
+            "values": packed_metric_values,
         },
     )

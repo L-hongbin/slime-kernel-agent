@@ -224,6 +224,46 @@ def test_redundant_wandb_filter_does_not_change_tensorboard_payload(monkeypatch,
 
 
 @pytest.mark.unit
+def test_exp_metrics_are_printed_and_sent_as_a_separate_tensorboard_payload(
+    monkeypatch, reset_tracking_globals, caplog
+):
+    tensorboard_logs = []
+
+    class _FakeTensorboardAdapter:
+        def __init__(self, args):
+            pass
+
+        def log(self, data, step):
+            tensorboard_logs.append((data, step))
+
+    monkeypatch.setattr(logging_utils, "_TensorboardAdapter", _FakeTensorboardAdapter)
+    caplog.set_level("INFO", logger=logging_utils.logger.name)
+
+    logging_utils.log_exp_metrics(
+        _args(use_wandb=False, use_tensorboard=True, wandb_centralized=False),
+        {"exp/train/dppo/binary_tv/mean": 0.2},
+        step_key="train/step",
+        step=7,
+        context="train 7",
+    )
+
+    assert tensorboard_logs == [({"exp/train/dppo/binary_tv/mean": 0.2}, 7)]
+    assert "exp train 7" in caplog.text
+
+
+@pytest.mark.unit
+def test_exp_logger_rejects_regular_metrics(reset_tracking_globals):
+    with pytest.raises(ValueError, match="non-exp keys"):
+        logging_utils.log_exp_metrics(
+            _args(use_wandb=False, use_tensorboard=False),
+            {"train/loss": 1.0},
+            step_key="train/step",
+            step=1,
+            context="train 1",
+        )
+
+
+@pytest.mark.unit
 def test_redundant_tracking_metric_inventory_is_exact():
     assert logging_utils._REDUNDANT_WANDB_METRICS == {
         "lora/lora_adapter/bytes",
