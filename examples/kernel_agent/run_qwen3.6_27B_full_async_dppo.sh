@@ -49,6 +49,10 @@ ACTOR_NUM_NODES=4
 ACTOR_NUM_GPUS_PER_NODE=8
 ACTOR_GPUS=$((ACTOR_NUM_NODES*ACTOR_NUM_GPUS_PER_NODE))
 ROLLOUT_GPUS=$((NUM_GPUS-ACTOR_GPUS))
+if (( ROLLOUT_GPUS <= 0 )); then
+   echo "ROLLOUT_GPUS must be greater than 0, got ${ROLLOUT_GPUS} (NUM_GPUS=${NUM_GPUS}, ACTOR_GPUS=${ACTOR_GPUS})." >&2
+   exit 1
+fi
 echo "ACTOR_GPUS ${ACTOR_GPUS} ROLLOUT_GPUS ${ROLLOUT_GPUS}"
 # EXP CONFIG
 CONTEXT_LEN=38000
@@ -91,6 +95,10 @@ case "${DATASET}" in
       ;;
 esac
 TURN_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_gepa_kimi_v1.jinja"
+if [[ ! -f "${TURN_PROMPT_PATH}" ]]; then
+   echo "TURN_PROMPT_PATH does not exist or is not a regular file: ${TURN_PROMPT_PATH}" >&2
+   exit 1
+fi
 
 case "${LOSS_MODE}" in
     cispo)
