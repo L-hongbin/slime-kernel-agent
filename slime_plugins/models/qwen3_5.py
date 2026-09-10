@@ -10,6 +10,7 @@ from megatron.core.transformer.transformer_layer import get_transformer_layer_of
 from transformers.activations import ACT2FN
 
 from slime.utils import accelerator
+from slime.utils.arguments import validate_qwen_gdn_distributed_options
 
 try:
     from fla.modules import FusedRMSNormGated, ShortConvolution
@@ -227,6 +228,7 @@ def get_qwen3_5_spec(args, config, vp_stage):
     text_config = _get_text_config(hf_config)
 
     use_distributed_gdn = getattr(args, "qwen_gdn_implementation", "replicated") == "distributed"
+    validate_qwen_gdn_distributed_options(args)
     _validate_qwen_gdn_recompute_norm_out(args, config, use_distributed_gdn)
     if use_distributed_gdn:
         requires_rank_ordered_p2p = (
