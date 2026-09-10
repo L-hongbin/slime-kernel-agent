@@ -32,7 +32,7 @@ except ImportError:
 
 def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
     env_state = env_result.get("env_state") if isinstance(env_result, dict) else {}
-    return calculate_reward_speedup(env_state, config)["reward"]
+    return calculate_kernel_reward(env_state, config)["reward"]
 
 
 def _timing_cv_and_trials(metadata: dict[str, Any], prefix: str) -> tuple[float, int]:
@@ -79,7 +79,7 @@ def _compute_speedup_log_standard_error(metadata: dict[str, Any] | None, config:
     return math.sqrt(kernel_cv**2 / kernel_trials + reference_cv**2 / reference_trials + log_std_floor**2)
 
 
-def _compute_speedup_reward_value(
+def _calculate_performance_score(
     speedup: float,
     mode: str,
     metadata: dict[str, Any] | None,
@@ -90,13 +90,13 @@ def _compute_speedup_reward_value(
     mode = str(mode).strip().lower()
     allowed_modes = {"legacy", "improvement", "lcb_improvement"}
     if mode not in allowed_modes:
-        raise ValueError(f"speedup_reward_mode must be one of {sorted(allowed_modes)}, got {mode!r}")
+        raise ValueError(f"speedup_score_mode must be one of {sorted(allowed_modes)}, got {mode!r}")
 
     upper_bound = float(config["speedup_reward_upper_bound"])
     lower_bound = float(config["speedup_reward_lower_bound"])
     if mode == "legacy":
-        speedup_reward = min(speedup, upper_bound)
-        return 0.0 if speedup_reward < lower_bound else speedup_reward
+        performance_score = min(speedup, upper_bound)
+        return 0.0 if performance_score < lower_bound else performance_score
 
     if not math.isfinite(speedup) or speedup <= 0.0:
         return 0.0
@@ -116,12 +116,13 @@ def _compute_speedup_reward_value(
 
 
 _REWARD_COMPONENT_KEYS = (
-    "reward_correctness_component",
-    "reward_performance_component",
-    "reward_coverage_component",
-    "reward_partial_component",
-    "reward_penalty_component",
+    "correctness",
+    "performance",
+    "coverage",
+    "failed",
+    "overlong_penalty",
 )
+_KERNEL_SCORE_KEYS = ("correctness", "performance", "coverage")
 
 
 def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int) -> float:
@@ -138,8 +139,12 @@ def _sample_is_correct(sample) -> bool:
     if isinstance(env_extra_info, dict) and "correctness" in env_extra_info:
         return bool(env_extra_info["correctness"]) and not bool(env_extra_info.get("decoy_kernel", False))
 
-    components = metadata.get("reward_components")
-    return isinstance(components, dict) and float(components.get("reward_correctness_component", 0.0)) > 0.0
+    kernel_score = metadata.get("kernel_score")
+    if isinstance(kernel_score, dict) and "correctness" in kernel_score:
+        return float(kernel_score["correctness"]) > 0.0
+
+    components = metadata.get("reward_component")
+    return isinstance(components, dict) and float(components.get("correctness", 0.0)) > 0.0
 
 
 def _apply_dynamic_group_reward_weights(
@@ -147,12 +152,7 @@ def _apply_dynamic_group_reward_weights(
     rewards,
     config: dict[str, Any],
 ) -> list[float]:
-    """Rescale speedup and coverage components with one gate shared by the group.
-
-    ``rewards`` may already contain additive shaping such as an overlong
-    penalty. The residual relative to the recorded task components is kept
-    unchanged, so only speedup and coverage are dynamically reweighted.
-    """
+    """Rebuild rewards from their components with a group auxiliary gate."""
 
     rewards = [float(reward) for reward in rewards]
     if not config.get("enable_dynamic_reward_weight", False):
@@ -166,18 +166,39 @@ def _apply_dynamic_group_reward_weights(
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
-        components = metadata.get("reward_components")
-        if not isinstance(components, dict) or any(key not in components for key in _REWARD_COMPONENT_KEYS):
+        components = metadata.get("reward_component")
+        kernel_score = metadata.get("kernel_score")
+        if (
+            not isinstance(components, dict)
+            or any(key not in components for key in _REWARD_COMPONENT_KEYS)
+            or not isinstance(kernel_score, dict)
+            or any(key not in kernel_score for key in _KERNEL_SCORE_KEYS)
+        ):
             dynamic_rewards.append(reward)
             continue
 
-        correctness, performance, coverage, partial, penalty = (
-            float(components[key]) for key in _REWARD_COMPONENT_KEYS
-        )
-        static_task_reward = correctness + performance + coverage + partial + penalty
-        additive_residual = reward - static_task_reward
-        dynamic_task_reward = correctness + gate * (performance + coverage) + partial + penalty
-        dynamic_rewards.append(dynamic_task_reward + additive_residual)
+        correctness_score, performance_score, coverage_score = (float(kernel_score[key]) for key in _KERNEL_SCORE_KEYS)
+        correctness_reward = float(components["correctness"])
+        failed_reward = components["failed"]
+        overlong_penalty_score = components["overlong_penalty"]
+        failed_reward = None if failed_reward is None else float(failed_reward)
+        overlong_penalty_score = float(overlong_penalty_score)
+
+        dynamic_reward = failed_reward
+        if dynamic_reward is None:
+            weight_performance = float(config["init_performance_weight"]) * gate
+            if config.get("performance_reward_requires_correctness", False):
+                weight_performance *= correctness_score
+            weight_coverage = float(config["coverage_reward_weight"]) * gate
+            if not config["coverage_reward_enable"]:
+                weight_coverage = 0.0
+            performance_reward = weight_performance * performance_score
+            coverage_reward = weight_coverage * coverage_score
+            components["performance"] = performance_reward
+            components["coverage"] = coverage_reward
+            dynamic_reward = correctness_reward + performance_reward + coverage_reward
+        metadata["task_reward"] = dynamic_reward
+        dynamic_rewards.append(dynamic_reward + overlong_penalty_score)
     return dynamic_rewards
 
 
@@ -319,7 +340,12 @@ def reward_post_process_by_group(args, samples):
         group_samples = [samples[idx] for idx in group_indices]
         group_reward_values = [raw_rewards[idx] for idx in group_indices]
         if apply_failed_group_reward:
-            group_reward_values = _apply_failed_group_reward(group_samples, group_reward_values, failed_score)
+            group_reward_values = _apply_failed_group_reward(
+                group_samples,
+                group_reward_values,
+                failed_score,
+                float(reward_config["init_correct_weight"]),
+            )
         for idx, reward in zip(group_indices, group_reward_values, strict=True):
             raw_rewards[idx] = reward
         group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
@@ -358,31 +384,61 @@ def reward_post_process_by_group(args, samples):
     return raw_rewards, rewards
 
 
-def _apply_failed_group_reward(samples, rewards, failed_score: float) -> list[float]:
-    """Use saved penalty scores when every group reward equals the failure score."""
+def _apply_failed_group_reward(
+    samples,
+    rewards,
+    failed_score: float,
+    init_correct_weight: float,
+) -> list[float]:
+    """Use saved kernel failure scores when every group reward equals the failure score."""
     rewards = [float(reward) for reward in rewards]
-    if not rewards or any(reward != failed_score for reward in rewards):
+    default_failed_reward = failed_score * init_correct_weight
+    if not rewards or any(reward != default_failed_reward for reward in rewards):
         return rewards
 
     metadata = [sample.metadata if isinstance(sample.metadata, dict) else {} for sample in samples]
-    if any("penalty_score" not in item for item in metadata):
+    if any("kernel_failed_score" not in item for item in metadata):
         return rewards
 
-    return [float(item["penalty_score"]) for item in metadata]
+    failed_rewards = [float(item["kernel_failed_score"]) * init_correct_weight for item in metadata]
+    for item, failed_reward in zip(metadata, failed_rewards, strict=True):
+        components = item.get("reward_component")
+        if isinstance(components, dict):
+            components["failed"] = failed_reward
+        item["task_reward"] = failed_reward
+    return failed_rewards
 
 
-def _resolve_penalty_score(env_state: dict[str, Any], config: dict[str, Any]) -> float:
-    """Classify evaluation progress and return its failed-group penalty."""
+def _resolve_kernel_failed_score(env_state: dict[str, Any], config: dict[str, Any]) -> tuple[float, str]:
+    """Classify a failed kernel and return its configured score and reason."""
     correctness = bool(env_state.get("correctness", False))
     compiled = env_state.get("compiled")
-    if compiled is True and correctness and not bool(env_state.get("decoy_kernel", False)):
-        return 0.0
-
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     error = env_state.get("error")
     error_message = str(env_state.get("error_message") or "")
     lower_error_message = error_message.lower()
+    kernel_failed_score = config["kernel_failed_score"]
+
+    output_mismatch_score = float(kernel_failed_score.get("output_mismatch", 0.0))
+    if output_mismatch_score < 0.0:
+        raise ValueError("kernel_failed_score['output_mismatch'] must be non-negative")
+    if output_mismatch_score >= 1.0:
+        raise ValueError("kernel_failed_score['output_mismatch'] must be lower than correctness_score (1.0)")
+
     precheck_error_codes = {PRECHECK_ERROR, VALIDATION_ERROR, SYNTAX_ERROR, IMPORT_ERROR}
+    output_mismatch = (
+        env_state.get("status") == "completed"
+        and not bool(env_state.get("decoy_kernel", False))
+        and not correctness
+        and error != RUNTIME_ERROR
+        and bool(metadata.get("correctness_output_mismatch", False))
+    )
+    if output_mismatch and compiled is not True:
+        if output_mismatch_score > 0.0:
+            raise AssertionError(
+                "KernelGym contract violation: correctness_output_mismatch=true requires compiled=true"
+            )
+        output_mismatch = False
 
     if bool(env_state.get("decoy_kernel", False)):
         stage = "decoy"
@@ -392,9 +448,10 @@ def _resolve_penalty_score(env_state: dict[str, Any], config: dict[str, Any]) ->
         stage = "runtime"
     elif error == KERNEL_EVAL_TIMEOUT and compiled is True:
         stage = "runtime"
+    elif output_mismatch:
+        stage = "output_mismatch"
     elif (
         error == CORRECTNESS_ERROR
-        or metadata.get("correctness_output_mismatch")
         or metadata.get("correctness_candidate_forward_completed")
         or (env_state.get("status") == "completed" and compiled is True)
     ):
@@ -406,7 +463,7 @@ def _resolve_penalty_score(env_state: dict[str, Any], config: dict[str, Any]) ->
     else:
         stage = "other"
 
-    return float(config["penalty_score"].get(stage, config["failed_score"]))
+    return float(kernel_failed_score.get(stage, config["failed_score"])), stage
 
 
 def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
@@ -440,140 +497,59 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
     }
 
 
-def _resolve_output_mismatch_partial_credit(
+def calculate_kernel_reward(
     env_state: dict[str, Any],
     config: dict[str, Any],
-) -> tuple[float, bool, str]:
-    """Return the reviewed output-mismatch partial reward and audit reason.
+    *,
+    args=None,
+    sample=None,
+) -> dict[str, Any]:
+    """Calculate kernel reward and optionally apply rollout-length shaping."""
+    response_len = int(getattr(sample, "response_length", 0) or 0) if sample is not None else 0
+    tokens = getattr(sample, "tokens", None) if sample is not None else None
+    overlong_prompt_len = max(0, len(tokens) - response_len) if isinstance(tokens, (list, tuple)) else 0
+    response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0) if args is not None else 0
+    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0) if args is not None else 0
+    overlong_effective_response_cap = response_cap
+    if args is not None and getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
+        overlong_effective_response_cap = min(response_cap, max(1, context_cap - overlong_prompt_len))
 
-    KernelGym sets ``correctness_output_mismatch`` only after the candidate
-    forward returns, CUDA synchronization completes, and shape/value comparison
-    fails. Compilation is therefore a consistency assertion, not the rewarded
-    event. Runtime failures, timeouts, decoys, and generic compiled-but-wrong
-    results remain zero-reward failures.
-    """
+    overlong_penalty = 0.0
+    if (
+        args is not None
+        and sample is not None
+        and getattr(args, "overlong_penalty", False)
+        and not getattr(sample, "remove_sample", False)
+    ):
+        buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
+        factor = float(getattr(args, "overlong_penalty_factor", 1.0))
+        if buffer_len > 0 and factor > 0 and overlong_effective_response_cap > 0:
+            effective_buffer_len = min(buffer_len, overlong_effective_response_cap)
+            threshold = overlong_effective_response_cap - effective_buffer_len
+            exceed = response_len - threshold
+            overlong_penalty = factor * min(1.0, max(0, exceed) / effective_buffer_len)
 
-    partial_reward = float(config.get("output_mismatch_partial_reward", 0.0))
-    if partial_reward < 0.0:
-        raise ValueError("output_mismatch_partial_reward must be non-negative")
-    if partial_reward == 0.0:
-        return 0.0, False, "disabled"
+    default_failed_score = float(config["failed_score"])
+    apply_kernel_failed_score = bool(config.get("apply_kernel_failed_score", False))
+    if apply_kernel_failed_score and bool(config.get("apply_failed_group_reward", False)):
+        raise ValueError("apply_kernel_failed_score and apply_failed_group_reward cannot both be enabled")
 
-    correct_reward_floor = float(config["init_correct_weight"])
-    if partial_reward >= correct_reward_floor:
-        raise ValueError(
-            "output_mismatch_partial_reward must be lower than init_correct_weight "
-            f"({partial_reward} >= {correct_reward_floor})"
-        )
-
-    status = env_state.get("status")
-    if status != "completed":
-        return 0.0, False, "timeout" if status == "timeout" else "env_not_completed"
-    if bool(env_state.get("decoy_kernel", False)):
-        return 0.0, False, "decoy"
-    if bool(env_state.get("correctness", False)):
-        return 0.0, False, "already_correct"
-
-    metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
-    if env_state.get("error") == RUNTIME_ERROR:
-        return 0.0, False, "runtime_error"
-    if not bool(metadata.get("correctness_output_mismatch", False)):
-        if not bool(env_state.get("compiled", False)):
-            return 0.0, False, "not_compiled"
-        if not bool(metadata.get("correctness_candidate_forward_completed", False)):
-            return 0.0, False, "candidate_forward_not_completed"
-        return 0.0, False, "no_output_mismatch"
-
-    if env_state.get("compiled") is not True:
-        raise AssertionError("KernelGym contract violation: correctness_output_mismatch=true requires compiled=true")
-    return partial_reward, True, "applied"
-
-
-def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    partial_reward, partial_applied, partial_reason = _resolve_output_mismatch_partial_credit(env_state, config)
-    penalty_score = _resolve_penalty_score(env_state, config)
-    failed_score = float(config["failed_score"])
-    apply_penalty_score = bool(config.get("apply_penalty_score", False))
-    if apply_penalty_score and bool(config.get("apply_failed_group_reward", False)):
-        raise ValueError("apply_penalty_score and apply_failed_group_reward cannot both be enabled")
-
-    if env_state.get("status") != "completed":
-        reward = penalty_score if apply_penalty_score else failed_score
-        return {
-            **env_state,
-            "reward": reward,
-            "score": reward,
-            "speedup": 0.0,
-            "success": False,
-            "correctness": False,
-            "compiled": False,
-            "partial_credit_output_mismatch": partial_applied,
-            "partial_credit_output_mismatch_reason": partial_reason,
-            "penalty_score": penalty_score,
-            "reward_correctness_component": 0.0,
-            "reward_performance_component": 0.0,
-            "reward_coverage_component": 0.0,
-            "reward_partial_component": 0.0,
-            "reward_penalty_component": reward,
-            "speedup_log_standard_error": None,
-        }
-
-    if env_state.get("decoy_kernel", False):
-        reward = penalty_score if apply_penalty_score else failed_score
-        return {
-            **env_state,
-            "reward": reward,
-            "score": reward,
-            "decoy_kernel": True,
-            "success": False,
-            "partial_credit_output_mismatch": partial_applied,
-            "partial_credit_output_mismatch_reason": partial_reason,
-            "penalty_score": penalty_score,
-            "reward_correctness_component": 0.0,
-            "reward_performance_component": 0.0,
-            "reward_coverage_component": 0.0,
-            "reward_partial_component": 0.0,
-            "reward_penalty_component": reward,
-            "speedup_log_standard_error": None,
-        }
-
-    correctness = bool(env_state.get("correctness", False))
-    compiled = bool(env_state.get("compiled", False))
-    speedup = env_state.get("speedup", 0.0)
-    speedup = 0.0 if speedup is None else float(speedup)
-    speedup_reward_mode = str(config.get("speedup_reward_mode", "legacy")).strip().lower()
+    completed = env_state.get("status") == "completed"
+    decoy_kernel = bool(env_state.get("decoy_kernel", False))
+    correctness = bool(env_state.get("correctness", False)) if completed else False
+    compiled = bool(env_state.get("compiled", False)) if completed else False
+    kernel_failed = not (completed and compiled and correctness and not decoy_kernel)
+    speedup = float(env_state.get("speedup") or 0.0) if completed else 0.0
     speedup_log_standard_error = None
-    if speedup_reward_mode == "lcb_improvement" and math.isfinite(speedup) and speedup > 0.0:
-        speedup_log_standard_error = _compute_speedup_log_standard_error(env_state.get("metadata"), config)
-
-    speedup_reward = _compute_speedup_reward_value(
-        speedup,
-        speedup_reward_mode,
-        env_state.get("metadata"),
-        config,
-    )
-
+    correctness_score = float(correctness)
+    performance_score = 0.0
+    coverage_score = 0.0
     correctness_reward = 0.0
     performance_reward = 0.0
     coverage_reward = 0.0
-    partial_component = 0.0
-    penalty_component = 0.0
-    if apply_penalty_score and not (compiled and correctness):
-        reward = penalty_score
-        penalty_component = reward
-    elif not compiled:
-        reward = failed_score
-        penalty_component = reward
-    elif partial_applied:
-        reward = partial_reward
-        partial_component = reward
-    else:
-        correctness_reward = float(config["init_correct_weight"]) if correctness else failed_score
-        performance_reward = float(config["init_performance_weight"]) * speedup_reward
-        if config.get("performance_reward_requires_correctness", False):
-            performance_reward *= float(correctness)
-        reward = correctness_reward + performance_reward
-
+    failed_reward = None
+    kernel_failed_score = None
+    kernel_failed_score_tag = None
     coverage_info = {
         "coverage": 0.0,
         "num_custom_kernel": 0,
@@ -581,30 +557,69 @@ def calculate_reward_speedup(env_state: dict[str, Any], config: dict[str, Any]) 
         "custom_kernel_cuda_time_in_profiling_us": 0,
         "total_kernel_run_time_in_profiling_us": 0,
     }
-    if correctness:
-        coverage_info = _compute_coverage(env_state, config)
-        if config["coverage_reward_enable"]:
-            coverage_reward = float(config["coverage_reward_weight"]) * coverage_info["coverage"]
-            reward += coverage_reward
 
+    if kernel_failed:
+        if apply_kernel_failed_score or config.get("apply_failed_group_reward", False):
+            kernel_failed_score, kernel_failed_score_tag = _resolve_kernel_failed_score(env_state, config)
+        else:
+            kernel_failed_score = default_failed_score
+            kernel_failed_score_tag = "disabled"
+        failed_score = kernel_failed_score if apply_kernel_failed_score else default_failed_score
+        task_reward = failed_score * float(config["init_correct_weight"])
+        failed_reward = task_reward
+    else:
+        speedup_score_mode = str(config.get("speedup_score_mode", "legacy")).strip().lower()
+        if speedup_score_mode == "lcb_improvement" and math.isfinite(speedup) and speedup > 0.0:
+            speedup_log_standard_error = _compute_speedup_log_standard_error(env_state.get("metadata"), config)
+        performance_score = _calculate_performance_score(
+            speedup,
+            speedup_score_mode,
+            env_state.get("metadata"),
+            config,
+        )
+
+        correctness_reward = float(config["init_correct_weight"])
+        weight_performance = float(config["init_performance_weight"])
+        if config.get("performance_reward_requires_correctness", False):
+            weight_performance *= correctness_score
+        performance_reward = weight_performance * performance_score
+        task_reward = correctness_reward + performance_reward
+
+        coverage_info = _compute_coverage(env_state, config)
+        coverage_score = coverage_info["coverage"]
+        weight_coverage = float(config["coverage_reward_weight"]) if config["coverage_reward_enable"] else 0.0
+        coverage_reward = weight_coverage * coverage_score
+        task_reward += coverage_reward
+
+    reward = task_reward - overlong_penalty
+    overlong_penalty_score = -overlong_penalty
     return {
         **env_state,
         "reward": reward,
-        "score": reward,
+        "task_reward": task_reward,
         "speedup": speedup,
-        "success": compiled and correctness,
+        "success": not kernel_failed,
         "correctness": correctness,
         "compiled": compiled,
+        "decoy_kernel": decoy_kernel,
         "profiling": env_state.get("profiling"),
-        "partial_credit_output_mismatch": partial_applied,
-        "partial_credit_output_mismatch_reason": partial_reason,
-        "penalty_score": penalty_score,
-        "reward_correctness_component": correctness_reward,
-        "reward_performance_component": performance_reward,
-        "reward_coverage_component": coverage_reward,
-        "reward_partial_component": partial_component,
-        "reward_penalty_component": penalty_component,
-        "speedup_reward": speedup_reward,
+        "kernel_failed_score": kernel_failed_score,
+        "kernel_failed_score_tag": kernel_failed_score_tag,
+        "overlong_penalty": overlong_penalty,
+        "overlong_prompt_len": overlong_prompt_len,
+        "overlong_effective_response_cap": overlong_effective_response_cap,
+        "kernel_score": {
+            "correctness": correctness_score,
+            "performance": performance_score,
+            "coverage": coverage_score,
+        },
+        "reward_component": {
+            "correctness": correctness_reward,
+            "performance": performance_reward,
+            "coverage": coverage_reward,
+            "failed": failed_reward,
+            "overlong_penalty": overlong_penalty_score,
+        },
         "speedup_log_standard_error": speedup_log_standard_error,
         **coverage_info,
     }

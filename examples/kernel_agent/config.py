@@ -48,9 +48,9 @@ correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 # speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].
 # ``lcb_improvement`` applies a lower confidence bound to speedup first, using
 # timing statistics returned by KernelGYM, and then uses the same mapping.
-speedup_reward_mode = os.environ.get("CUDA_AGENT_SPEEDUP_REWARD_MODE", "legacy").strip().lower()
-if speedup_reward_mode not in {"legacy", "improvement", "lcb_improvement"}:
-    raise ValueError("CUDA_AGENT_SPEEDUP_REWARD_MODE must be one of: legacy, improvement, lcb_improvement")
+speedup_score_mode = os.environ.get("CUDA_AGENT_SPEEDUP_SCORE_MODE", "legacy").strip().lower()
+if speedup_score_mode not in {"legacy", "improvement", "lcb_improvement"}:
+    raise ValueError("CUDA_AGENT_SPEEDUP_SCORE_MODE must be one of: legacy, improvement, lcb_improvement")
 speedup_uncertainty_z_score = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE", 1.96))
 speedup_uncertainty_log_std_floor = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR", 0.0))
 enable_dynamic_reward_weight = bool(int(os.environ.get("CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT", "0")))
@@ -61,15 +61,14 @@ if speedup_uncertainty_log_std_floor < 0.0:
 # Optional reward for a candidate that compiled, completed its forward pass,
 # and reached KernelGym's shape/value comparison but produced a wrong output.
 # Default off so launchers keep their historical reward policy. Set a positive
-# value explicitly to enable the reviewed output-mismatch partial reward.
-output_mismatch_partial_reward = float(os.environ.get("CUDA_AGENT_OUTPUT_MISMATCH_PARTIAL_REWARD", 0.0))
-performance_reward_requires_correctness = bool(
-    int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "0"))
-)
+# value explicitly to configure the output-mismatch failure score.
+output_mismatch_score = float(os.environ.get("CUDA_AGENT_OUTPUT_MISMATCH_FAILED_SCORE", 0.0))
 apply_failed_group_reward = bool(int(os.environ.get("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", "0")))
-apply_penalty_score = bool(int(os.environ.get("CUDA_AGENT_APPLY_PENALTY_SCORE", "0")))
-if apply_penalty_score and apply_failed_group_reward:
-    raise ValueError("CUDA_AGENT_APPLY_PENALTY_SCORE and CUDA_AGENT_APPLY_FAILED_GROUP_REWARD cannot both be enabled")
+apply_kernel_failed_score = bool(int(os.environ.get("CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE", "0")))
+if apply_kernel_failed_score and apply_failed_group_reward:
+    raise ValueError(
+        "CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE and CUDA_AGENT_APPLY_FAILED_GROUP_REWARD cannot both be enabled"
+    )
 # KernelGYM diagnostics and validation features controlled by each request.
 # NCU, Compute Sanitizer, correctness input perturbations, and adaptive perf
 # trials are opt-in because they add latency or change the evaluated inputs.
@@ -161,7 +160,7 @@ CUDA_AGENT_CONFIGS = {
     "reward": {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
-        "speedup_reward_mode": speedup_reward_mode,
+        "speedup_score_mode": speedup_score_mode,
         "speedup_reward_upper_bound": 2.0,
         "speedup_reward_lower_bound": 0.0,
         "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
@@ -170,23 +169,25 @@ CUDA_AGENT_CONFIGS = {
         # sqrt(max((num_correct - 1) / (group_size - 1), 0)).
         "enable_dynamic_reward_weight": enable_dynamic_reward_weight,
         "failed_score": 0.0,
-        "apply_penalty_score": apply_penalty_score,
+        "apply_kernel_failed_score": apply_kernel_failed_score,
         "apply_failed_group_reward": apply_failed_group_reward,
         # These scores are only used when every valid sample in a reward group
         # has task reward equal to failed_score and apply_failed_group_reward is
-        # enabled. They rank progress without changing non-failure groups.
-        "penalty_score": {
+        # enabled, or directly when apply_kernel_failed_score is enabled.
+        "kernel_failed_score": {
             "precheck": -1.0,
             "compilation": -0.75,
             "runtime": -0.5,
             "correctness": -0.25,
+            "output_mismatch": output_mismatch_score,
             "decoy": -1.0,
             "other": -1.0,
         },
         "coverage_reward_enable": True,
         "coverage_reward_type": "time_coverage",
         "coverage_reward_weight": 0.5,
-        "output_mismatch_partial_reward": output_mismatch_partial_reward,
-        "performance_reward_requires_correctness": performance_reward_requires_correctness,
+        "performance_reward_requires_correctness": bool(
+            int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "1"))
+        ),
     },
 }

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+repo_root = Path(__file__).resolve().parents[1]
+repo_root_path = str(repo_root)
+if repo_root_path in sys.path:
+    sys.path.remove(repo_root_path)
+sys.path.insert(0, repo_root_path)
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_reward import _compute_dynamic_auxiliary_gate, reward_post_process_by_group
@@ -42,24 +50,29 @@ def _make_sample(index: int, group_index: int, reward: float, turn_idx: int | No
     return Sample(index=index, group_index=group_index, reward=reward, metadata=metadata)
 
 
-def _set_reward_components(
+def _set_reward_component(
     sample: Sample,
     *,
-    correctness: float = 0.0,
-    speedup: float = 0.0,
-    coverage: float = 0.0,
-    partial: float = 0.0,
-    penalty: float = 0.0,
+    correctness_score: float = 0.0,
+    performance_score: float = 0.0,
+    coverage_score: float = 0.0,
+    failed: float | None = None,
+    overlong_penalty: float = 0.0,
 ) -> None:
-    sample.metadata["reward_components"] = {
-        "reward_correctness_component": correctness,
-        "reward_performance_component": speedup,
-        "reward_coverage_component": coverage,
-        "reward_partial_component": partial,
-        "reward_penalty_component": penalty,
+    sample.metadata["kernel_score"] = {
+        "correctness": correctness_score,
+        "performance": performance_score,
+        "coverage": coverage_score,
+    }
+    sample.metadata["reward_component"] = {
+        "correctness": 0.5 * correctness_score,
+        "performance": 0.5 * performance_score,
+        "coverage": 0.5 * coverage_score,
+        "failed": failed,
+        "overlong_penalty": overlong_penalty,
     }
     sample.metadata["env_extra_info"] = {
-        "correctness": correctness > 0.0,
+        "correctness": correctness_score > 0.0,
         "decoy_kernel": False,
     }
 
@@ -87,10 +100,10 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypat
         _make_sample(2, 0, 1.2),
         _make_sample(3, 0, 0.0),
     ]
-    _set_reward_components(samples[0])
-    _set_reward_components(samples[1], correctness=0.5, speedup=0.1, coverage=0.2)
-    _set_reward_components(samples[2], correctness=0.5, speedup=0.3, coverage=0.4)
-    _set_reward_components(samples[3])
+    _set_reward_component(samples[0])
+    _set_reward_component(samples[1], correctness_score=1.0, performance_score=0.2, coverage_score=0.4)
+    _set_reward_component(samples[2], correctness_score=1.0, performance_score=0.6, coverage_score=0.8)
+    _set_reward_component(samples[3])
 
     raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
 
@@ -100,34 +113,71 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypat
     expected_advantages = [(reward - mean) * 4.0 / 3.0 for reward in expected_raw]
     assert raw_rewards == pytest.approx(expected_raw)
     assert advantages == pytest.approx(expected_advantages)
+    assert samples[1].metadata["kernel_score"] == {
+        "correctness": 1.0,
+        "performance": 0.2,
+        "coverage": 0.4,
+    }
+    assert samples[1].metadata["reward_component"]["performance"] == pytest.approx(gate * 0.1)
+    assert samples[1].metadata["reward_component"]["coverage"] == pytest.approx(gate * 0.2)
 
 
 def test_dynamic_reward_all_correct_matches_fixed_half_weights(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
     samples = [_make_sample(index, 0, reward) for index, reward in enumerate([0.6, 0.8, 1.0])]
-    for sample, speedup in zip(samples, [0.1, 0.2, 0.3], strict=True):
-        _set_reward_components(sample, correctness=0.5, speedup=speedup, coverage=sample.reward - 0.5 - speedup)
+    for sample, performance_reward in zip(samples, [0.1, 0.2, 0.3], strict=True):
+        _set_reward_component(
+            sample,
+            correctness_score=1.0,
+            performance_score=2.0 * performance_reward,
+            coverage_score=2.0 * (sample.reward - 0.5 - performance_reward),
+        )
 
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == pytest.approx([0.6, 0.8, 1.0])
 
 
-def test_dynamic_reward_keeps_overlong_penalty_additive(monkeypatch):
+def test_dynamic_reward_rebuilds_overlong_penalty_from_components(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    correct = _make_sample(0, 0, 0.8)
+    correct = _make_sample(0, 0, 99.0)
     incorrect = _make_sample(1, 0, 0.0)
-    _set_reward_components(correct, correctness=0.5, speedup=0.5)
-    _set_reward_components(incorrect)
+    _set_reward_component(correct, correctness_score=1.0, performance_score=1.0, overlong_penalty=-0.2)
+    _set_reward_component(incorrect)
     correct.metadata["task_reward"] = 1.0
     correct.metadata["overlong_penalty"] = 0.2
 
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, [correct, incorrect])
 
-    # C=1 makes the auxiliary gate zero: 0.5 correctness - 0.2 penalty.
+    # C=1 makes the auxiliary gate zero; the penalty is rebuilt from components.
     assert raw_rewards == pytest.approx([0.3, 0.0])
+
+
+def test_dynamic_reward_uses_failed_component_as_branch_sentinel(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+    manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    kernel_failure = _make_sample(0, 0, 99.0)
+    output_mismatch = _make_sample(1, 0, 99.0)
+    _set_reward_component(
+        kernel_failure,
+        correctness_score=1.0,
+        performance_score=1.0,
+        failed=0.0,
+        overlong_penalty=-0.1,
+    )
+    _set_reward_component(
+        output_mismatch,
+        correctness_score=1.0,
+        performance_score=1.0,
+        failed=0.25,
+        overlong_penalty=-0.1,
+    )
+
+    raw_rewards, _advantages = reward_post_process_by_group(manager.args, [kernel_failure, output_mismatch])
+
+    assert raw_rewards == pytest.approx([-0.1, 0.15])
 
 
 def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting(monkeypatch):
@@ -140,10 +190,10 @@ def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting(monkeypa
         _make_sample(0, 0, 0.9, turn_idx=1),
         _make_sample(1, 0, 0.0, turn_idx=1),
     ]
-    _set_reward_components(samples[0], correctness=0.5, speedup=0.1)
-    _set_reward_components(samples[1], correctness=0.5, speedup=0.2)
-    _set_reward_components(samples[2], correctness=0.5, speedup=0.4)
-    _set_reward_components(samples[3])
+    _set_reward_component(samples[0], correctness_score=1.0, performance_score=0.2)
+    _set_reward_component(samples[1], correctness_score=1.0, performance_score=0.4)
+    _set_reward_component(samples[2], correctness_score=1.0, performance_score=0.8)
+    _set_reward_component(samples[3])
     for sample in samples:
         sample.metadata["multi_turn_reward"] = -999.0
 
@@ -233,7 +283,7 @@ def test_reward_post_process_by_group_handles_single_valid_sample_after_pad_mask
     assert rewards == pytest.approx([0.0, 0.0])
 
 
-def test_trloo_uses_penalty_scores_only_for_all_failed_group(monkeypatch):
+def test_trloo_uses_kernel_failed_scores_only_for_all_failed_group(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [
@@ -241,37 +291,49 @@ def test_trloo_uses_penalty_scores_only_for_all_failed_group(monkeypatch):
         _make_sample(1, 0, 0.0),
         _make_sample(2, 0, 0.0),
     ]
-    penalty_scores = [-1.0, -0.75, -0.25]
-    for sample, penalty_score in zip(samples, penalty_scores, strict=True):
-        sample.metadata.update({"multi_turn_reward": 0.0, "penalty_score": penalty_score})
+    kernel_failed_scores = [-1.0, -0.75, -0.25]
+    for sample, kernel_failed_score in zip(samples, kernel_failed_scores, strict=True):
+        sample.metadata.update(
+            {
+                "multi_turn_reward": 0.0,
+                "kernel_failed_score": kernel_failed_score,
+                "task_reward": 0.0,
+                "reward_component": {"failed": 0.0},
+            }
+        )
+
+    assert [sample.metadata["reward_component"]["failed"] for sample in samples] == [0.0, 0.0, 0.0]
 
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
-    assert raw_rewards == penalty_scores
-    assert rewards == pytest.approx([-0.5, -0.125, 0.625])
+    expected_raw_rewards = [-0.5, -0.375, -0.125]
+    assert raw_rewards == expected_raw_rewards
+    assert rewards == pytest.approx([-0.25, -0.0625, 0.3125])
+    assert [sample.metadata["task_reward"] for sample in samples] == expected_raw_rewards
+    assert [sample.metadata["reward_component"]["failed"] for sample in samples] == expected_raw_rewards
 
 
 def test_failed_group_reward_uses_configured_nonzero_failed_score(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", -2.0)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
-    samples = [_make_sample(index, 0, -2.0) for index in range(3)]
-    penalty_scores = [-1.0, -0.75, -0.25]
-    for sample, penalty_score in zip(samples, penalty_scores, strict=True):
-        sample.metadata.update({"multi_turn_reward": -2.0, "penalty_score": penalty_score})
+    samples = [_make_sample(index, 0, -1.0) for index in range(3)]
+    kernel_failed_scores = [-1.0, -0.75, -0.25]
+    for sample, kernel_failed_score in zip(samples, kernel_failed_scores, strict=True):
+        sample.metadata.update({"multi_turn_reward": -1.0, "kernel_failed_score": kernel_failed_score})
 
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
-    assert raw_rewards == penalty_scores
-    assert rewards == pytest.approx([-0.5, -0.125, 0.625])
+    assert raw_rewards == pytest.approx([-0.5, -0.375, -0.125])
+    assert rewards == pytest.approx([-0.25, -0.0625, 0.3125])
 
 
 def test_failed_group_reward_can_be_disabled(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [_make_sample(index, 0, 0.0) for index in range(3)]
-    for sample, penalty_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
-        sample.metadata.update({"multi_turn_reward": 0.0, "penalty_score": penalty_score})
+    for sample, kernel_failed_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
+        sample.metadata.update({"multi_turn_reward": 0.0, "kernel_failed_score": kernel_failed_score})
 
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
@@ -279,7 +341,7 @@ def test_failed_group_reward_can_be_disabled(monkeypatch):
     assert rewards == pytest.approx([0.0, 0.0, 0.0])
 
 
-def test_penalty_scores_do_not_change_group_with_nonzero_reward(monkeypatch):
+def test_kernel_failed_scores_do_not_change_group_with_nonzero_reward(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [
@@ -287,15 +349,15 @@ def test_penalty_scores_do_not_change_group_with_nonzero_reward(monkeypatch):
         _make_sample(1, 0, 0.0),
         _make_sample(2, 0, 0.5),
     ]
-    for sample, penalty_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
-        sample.metadata.update({"multi_turn_reward": sample.reward, "penalty_score": penalty_score})
+    for sample, kernel_failed_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
+        sample.metadata.update({"multi_turn_reward": sample.reward, "kernel_failed_score": kernel_failed_score})
 
     raw_rewards, _ = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == [0.0, 0.0, 0.5]
 
 
-def test_all_failed_reward_from_old_dump_without_penalties_is_unchanged(monkeypatch):
+def test_all_failed_reward_from_old_dump_without_kernel_failed_scores_is_unchanged(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=False)
     samples = [_make_sample(index, 0, 0.0) for index in range(3)]

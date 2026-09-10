@@ -1081,49 +1081,6 @@ def _set_multi_turn_rewards(args, output_samples: list[Sample], finish_reason: s
         )
 
 
-def _apply_overlong_penalty(args, output_samples: list[Sample]) -> None:
-    """DAPO-style soft overlong penalty: linear ramp over the last
-    ``overlong_buffer_len`` tokens of each sample's effective response budget,
-    capped at ``-factor`` at that budget. The effective budget is the smaller
-    of ``rollout_max_response_len`` and ``rollout_max_context_len-prompt_len``;
-    this matters when context and response are both configured to 24K. Applied
-    to per-turn ``sample.reward`` before multi-turn accumulation, so TRLOO
-    trains on the penalized reward. The PRE-penalty reward is recorded in
-    ``metadata["task_reward"]``: the group low-variance filter judges on it, so
-    lengthy-but-task-uniform (e.g. all-fail) groups are discarded exactly as
-    without the penalty — the penalty only shapes advantages of groups that
-    survive the filter (user directive 2026-07-18)."""
-    if not getattr(args, "overlong_penalty", False):
-        return
-    buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
-    factor = float(getattr(args, "overlong_penalty_factor", 1.0))
-    response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
-    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0)
-    if buffer_len <= 0 or factor <= 0 or response_cap <= 0:
-        return
-
-    for sample in output_samples:
-        if sample.remove_sample:
-            continue
-        sample.metadata = dict(sample.metadata or {})
-        task_reward = float(sample.reward)
-        sample.metadata["task_reward"] = task_reward
-        resp_len = int(getattr(sample, "response_length", 0) or 0)
-        tokens = getattr(sample, "tokens", None)
-        prompt_len = max(0, len(tokens) - resp_len) if isinstance(tokens, (list, tuple)) else 0
-        effective_cap = response_cap
-        if getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
-            effective_cap = min(effective_cap, max(1, context_cap - prompt_len))
-        effective_buffer_len = min(buffer_len, effective_cap)
-        threshold = effective_cap - effective_buffer_len
-        exceed = resp_len - threshold
-        penalty = factor * min(1.0, max(0, exceed) / effective_buffer_len)
-        sample.reward = task_reward - penalty
-        sample.metadata["overlong_penalty"] = penalty
-        sample.metadata["overlong_prompt_len"] = prompt_len
-        sample.metadata["overlong_effective_response_cap"] = effective_cap
-
-
 def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
     if not getattr(args, "use_coverage_rs", False):
         return
@@ -1239,7 +1196,6 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
         return output_samples
 
     _apply_coverage_rs(args, output_samples)
-    _apply_overlong_penalty(args, output_samples)
 
     finalize_mode = getattr(args, "finalize_mode", "positive")
     if finalize_mode == "none":

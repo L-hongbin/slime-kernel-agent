@@ -23,18 +23,22 @@ from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
 from examples.kernel_agent.kernel_reward import (
+    _calculate_performance_score,
     _compute_speedup_log_standard_error,
-    _compute_speedup_reward_value,
-    calculate_reward_speedup,
+    calculate_kernel_reward,
 )
-from examples.kernel_agent.utils import _apply_overlong_penalty, normalize_env_feedback
+from examples.kernel_agent.utils import normalize_env_feedback, postprocess_turn_samples
+
 from slime.utils.types import Sample
 
 
-def _reward_config(partial_reward: float = 0.25) -> dict:
+def _reward_config(output_mismatch_score: float = 0.25) -> dict:
     return {
         **CUDA_AGENT_CONFIGS["reward"],
-        "output_mismatch_partial_reward": partial_reward,
+        "kernel_failed_score": {
+            **CUDA_AGENT_CONFIGS["reward"]["kernel_failed_score"],
+            "output_mismatch": output_mismatch_score,
+        },
         "performance_reward_requires_correctness": True,
     }
 
@@ -70,28 +74,29 @@ def _completed_env(
 
 
 def test_output_mismatch_receives_reviewed_partial_reward():
-    details = calculate_reward_speedup(
+    config = {**_reward_config(), "apply_kernel_failed_score": True}
+    details = calculate_kernel_reward(
         _completed_env(output_mismatch=True, candidate_forward_completed=True),
-        _reward_config(),
+        config,
     )
 
-    assert details["reward"] == pytest.approx(0.25)
-    assert details["partial_credit_output_mismatch"] is True
-    assert details["partial_credit_output_mismatch_reason"] == "applied"
+    assert details["kernel_failed_score"] == pytest.approx(0.25)
+    assert details["reward"] == pytest.approx(0.125)
+    assert details["kernel_failed_score_tag"] == "output_mismatch"
 
 
 @pytest.mark.parametrize(
     ("env_state", "reason"),
     [
-        (_completed_env(compiled=False), "not_compiled"),
-        (_completed_env(compiled=True), "candidate_forward_not_completed"),
+        (_completed_env(compiled=False), "compilation"),
+        (_completed_env(compiled=True), "correctness"),
         (
             _completed_env(compiled=True, candidate_forward_completed=True),
-            "no_output_mismatch",
+            "correctness",
         ),
         (
             _completed_env(compiled=True, runtime_error="CUDA illegal memory access"),
-            "runtime_error",
+            "runtime",
         ),
         (
             _completed_env(
@@ -105,26 +110,34 @@ def test_output_mismatch_receives_reviewed_partial_reward():
     ],
 )
 def test_partial_reward_rejects_non_mismatch_runtime_and_decoy_failures(env_state, reason):
-    details = calculate_reward_speedup(env_state, _reward_config())
+    config = {**_reward_config(), "apply_failed_group_reward": True}
+    details = calculate_kernel_reward(env_state, config)
 
     assert details["reward"] == 0.0
-    assert details["partial_credit_output_mismatch"] is False
-    assert details["partial_credit_output_mismatch_reason"] == reason
+    assert details["kernel_failed_score_tag"] == reason
 
 
 def test_correct_reward_remains_strictly_above_partial_reward():
-    details = calculate_reward_speedup(
+    details = calculate_kernel_reward(
         _completed_env(compiled=True, correctness=True, candidate_forward_completed=True),
         _reward_config(),
     )
 
     assert details["reward"] == pytest.approx(0.5)
-    assert details["partial_credit_output_mismatch"] is False
-    assert details["partial_credit_output_mismatch_reason"] == "already_correct"
+    assert details["kernel_failed_score"] is None
+    assert details["kernel_failed_score_tag"] is None
+
+
+def test_failed_score_tag_is_disabled_when_no_fine_grained_mode_is_enabled():
+    details = calculate_kernel_reward(_completed_env(compiled=False), _reward_config())
+
+    assert details["reward"] == 0.0
+    assert details["kernel_failed_score"] == 0.0
+    assert details["kernel_failed_score_tag"] == "disabled"
 
 
 @pytest.mark.parametrize(
-    ("env_state", "penalty_score"),
+    ("env_state", "expected_score", "expected_tag"),
     [
         (
             {
@@ -135,9 +148,10 @@ def test_correct_reward_remains_strictly_above_partial_reward():
                 "metadata": {},
             },
             -1.0,
+            "precheck",
         ),
-        (_completed_env(compiled=False), -0.75),
-        (_completed_env(runtime_error="CUDA illegal memory access"), -0.5),
+        (_completed_env(compiled=False), -0.75, "compilation"),
+        (_completed_env(runtime_error="CUDA illegal memory access"), -0.5, "runtime"),
         (
             {
                 **_completed_env(compiled=True),
@@ -145,29 +159,33 @@ def test_correct_reward_remains_strictly_above_partial_reward():
                 "error": "KERNEL_EVAL_TIMEOUT",
             },
             -0.5,
+            "runtime",
         ),
-        (_completed_env(compiled=True, correctness=False), -0.25),
-        (_completed_env(compiled=True, decoy_kernel=True), -1.0),
-        (_completed_env(compiled=True, correctness=True), 0.0),
+        (_completed_env(compiled=True, correctness=False), -0.25, "correctness"),
+        (_completed_env(compiled=True, decoy_kernel=True), -1.0, "decoy"),
     ],
 )
-def test_penalty_score_tracks_evaluation_progress(env_state, penalty_score):
-    details = calculate_reward_speedup(env_state, _reward_config(partial_reward=0.0))
+def test_fail_score_tracks_evaluation_progress(env_state, expected_score, expected_tag):
+    config = {**_reward_config(output_mismatch_score=0.0), "apply_failed_group_reward": True}
+    details = calculate_kernel_reward(env_state, config)
 
-    assert details["penalty_score"] == pytest.approx(penalty_score)
+    assert details["kernel_failed_score"] == pytest.approx(expected_score)
+    assert details["kernel_failed_score_tag"] == expected_tag
+    assert details["reward_component"]["failed"] == 0.0
 
 
-def test_failed_group_reward_config_separates_flag_and_penalty_scores():
+def test_failed_group_reward_config_separates_flag_and_failure_scores():
     reward_config = CUDA_AGENT_CONFIGS["reward"]
 
     assert reward_config["failed_score"] == 0.0
-    assert isinstance(reward_config["apply_penalty_score"], bool)
+    assert isinstance(reward_config["apply_kernel_failed_score"], bool)
     assert isinstance(reward_config["apply_failed_group_reward"], bool)
-    assert reward_config["penalty_score"] == {
+    assert reward_config["kernel_failed_score"] == {
         "precheck": -1.0,
         "compilation": -0.75,
         "runtime": -0.5,
         "correctness": -0.25,
+        "output_mismatch": 0.0,
         "decoy": -1.0,
         "other": -1.0,
     }
@@ -177,6 +195,11 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
         "compilation_fail_penalty",
         "apply_precheck_fail_penalty",
         "apply_compilation_fail_penalty",
+        "apply_penalty_score",
+        "penalty_score",
+        "kernel_penalty",
+        "apply_kernel_penalty",
+        "output_mismatch_partial_reward",
     }
     assert legacy_keys.isdisjoint(reward_config)
 
@@ -185,9 +208,9 @@ def test_failed_group_reward_config_separates_flag_and_penalty_scores():
     ("env_value", "expected"),
     [(None, "legacy"), ("improvement", "improvement"), ("lcb_improvement", "lcb_improvement")],
 )
-def test_speedup_reward_mode_reads_environment(monkeypatch, env_value, expected):
-    env_name = "CUDA_AGENT_SPEEDUP_REWARD_MODE"
-    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
+def test_speedup_score_mode_reads_environment(monkeypatch, env_value, expected):
+    env_name = "CUDA_AGENT_SPEEDUP_SCORE_MODE"
+    monkeypatch.delenv("CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE", raising=False)
     monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
     if env_value is None:
         monkeypatch.delenv(env_name, raising=False)
@@ -195,32 +218,32 @@ def test_speedup_reward_mode_reads_environment(monkeypatch, env_value, expected)
         monkeypatch.setenv(env_name, env_value)
 
     config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
-    spec = importlib.util.spec_from_file_location("_kernel_agent_speedup_reward_mode_env_test", config_path)
+    spec = importlib.util.spec_from_file_location("_kernel_agent_speedup_score_mode_env_test", config_path)
     assert spec is not None and spec.loader is not None
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
 
-    assert config_module.CUDA_AGENT_CONFIGS["reward"]["speedup_reward_mode"] == expected
+    assert config_module.CUDA_AGENT_CONFIGS["reward"]["speedup_score_mode"] == expected
 
 
-def test_speedup_reward_mode_rejects_unknown_environment_value(monkeypatch):
-    monkeypatch.setenv("CUDA_AGENT_SPEEDUP_REWARD_MODE", "unknown")
-    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
+def test_speedup_score_mode_rejects_unknown_environment_value(monkeypatch):
+    monkeypatch.setenv("CUDA_AGENT_SPEEDUP_SCORE_MODE", "unknown")
+    monkeypatch.delenv("CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE", raising=False)
     monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
 
     config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
-    spec = importlib.util.spec_from_file_location("_kernel_agent_invalid_speedup_reward_mode_env_test", config_path)
+    spec = importlib.util.spec_from_file_location("_kernel_agent_invalid_speedup_score_mode_env_test", config_path)
     assert spec is not None and spec.loader is not None
     config_module = importlib.util.module_from_spec(spec)
 
-    with pytest.raises(ValueError, match="CUDA_AGENT_SPEEDUP_REWARD_MODE"):
+    with pytest.raises(ValueError, match="CUDA_AGENT_SPEEDUP_SCORE_MODE"):
         spec.loader.exec_module(config_module)
 
 
 @pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
 def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expected):
     env_name = "CUDA_AGENT_APPLY_FAILED_GROUP_REWARD"
-    monkeypatch.delenv("CUDA_AGENT_APPLY_PENALTY_SCORE", raising=False)
+    monkeypatch.delenv("CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE", raising=False)
     if env_value is None:
         monkeypatch.delenv(env_name, raising=False)
     else:
@@ -236,8 +259,8 @@ def test_failed_group_reward_flag_reads_environment(monkeypatch, env_value, expe
 
 
 @pytest.mark.parametrize(("env_value", "expected"), [(None, False), ("0", False), ("1", True)])
-def test_apply_penalty_score_flag_reads_environment(monkeypatch, env_value, expected):
-    env_name = "CUDA_AGENT_APPLY_PENALTY_SCORE"
+def test_apply_kernel_failed_score_flag_reads_environment(monkeypatch, env_value, expected):
+    env_name = "CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE"
     monkeypatch.delenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", raising=False)
     if env_value is None:
         monkeypatch.delenv(env_name, raising=False)
@@ -245,16 +268,16 @@ def test_apply_penalty_score_flag_reads_environment(monkeypatch, env_value, expe
         monkeypatch.setenv(env_name, env_value)
 
     config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
-    spec = importlib.util.spec_from_file_location("_kernel_agent_apply_penalty_env_test", config_path)
+    spec = importlib.util.spec_from_file_location("_kernel_agent_apply_kernel_failed_score_env_test", config_path)
     assert spec is not None and spec.loader is not None
     config_module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(config_module)
 
-    assert config_module.CUDA_AGENT_CONFIGS["reward"]["apply_penalty_score"] is expected
+    assert config_module.CUDA_AGENT_CONFIGS["reward"]["apply_kernel_failed_score"] is expected
 
 
-def test_penalty_reward_modes_are_mutually_exclusive(monkeypatch):
-    monkeypatch.setenv("CUDA_AGENT_APPLY_PENALTY_SCORE", "1")
+def test_failed_score_reward_modes_are_mutually_exclusive(monkeypatch):
+    monkeypatch.setenv("CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE", "1")
     monkeypatch.setenv("CUDA_AGENT_APPLY_FAILED_GROUP_REWARD", "1")
 
     config_path = REPO_ROOT / "examples" / "kernel_agent" / "config.py"
@@ -285,49 +308,78 @@ def test_penalty_reward_modes_are_mutually_exclusive(monkeypatch):
         (_completed_env(compiled=True, decoy_kernel=True), -1.0),
     ],
 )
-def test_apply_penalty_score_directly_rewards_each_failed_sample(env_state, expected_reward):
+def test_apply_kernel_failed_score_directly_rewards_each_failed_sample(env_state, expected_reward):
     config = {
         **_reward_config(),
-        "apply_penalty_score": True,
+        "apply_kernel_failed_score": True,
         "apply_failed_group_reward": False,
     }
 
-    details = calculate_reward_speedup(env_state, config)
+    details = calculate_kernel_reward(env_state, config)
 
-    assert details["reward"] == pytest.approx(expected_reward)
+    assert details["kernel_failed_score"] == pytest.approx(expected_reward)
+    assert details["reward"] == pytest.approx(expected_reward * 0.5)
+    assert details["reward_component"]["failed"] == pytest.approx(expected_reward * 0.5)
 
 
-def test_apply_penalty_score_keeps_successful_reward():
+def test_apply_kernel_failed_score_keeps_successful_reward():
     config = {
         **_reward_config(),
-        "apply_penalty_score": True,
+        "apply_kernel_failed_score": True,
         "apply_failed_group_reward": False,
     }
 
-    details = calculate_reward_speedup(_completed_env(correctness=True), config)
+    details = calculate_kernel_reward(_completed_env(correctness=True), config)
 
     assert details["reward"] == pytest.approx(0.5)
+    assert details["reward_component"]["failed"] is None
+
+
+def test_kernel_and_overlong_penalties_are_recorded_separately():
+    config = {
+        **_reward_config(),
+        "apply_kernel_failed_score": True,
+        "apply_failed_group_reward": False,
+    }
+    args = SimpleNamespace(
+        overlong_penalty=True,
+        overlong_buffer_len=100,
+        overlong_penalty_factor=1.0,
+        rollout_max_response_len=100,
+        rollout_max_context_len=100,
+        overlong_use_effective_response_cap=False,
+    )
+    sample = SimpleNamespace(response_length=100, tokens=[0] * 100, remove_sample=False)
+
+    details = calculate_kernel_reward(_completed_env(compiled=False), config, args=args, sample=sample)
+
+    assert details["task_reward"] == pytest.approx(-0.375)
+    assert details["reward"] == pytest.approx(-1.375)
+    assert details["reward_component"]["failed"] == pytest.approx(-0.375)
+    assert details["reward_component"]["overlong_penalty"] == pytest.approx(-1.0)
 
 
 def test_calculate_reward_rejects_conflicting_penalty_modes():
     config = {
         **_reward_config(),
-        "apply_penalty_score": True,
+        "apply_kernel_failed_score": True,
         "apply_failed_group_reward": True,
     }
 
     with pytest.raises(ValueError, match="cannot both be enabled"):
-        calculate_reward_speedup(_completed_env(compiled=False), config)
+        calculate_kernel_reward(_completed_env(compiled=False), config)
 
 
 def test_failed_score_is_the_base_reward_for_failed_sample():
-    config = {**_reward_config(partial_reward=0.0), "failed_score": -2.0}
+    config = {**_reward_config(output_mismatch_score=0.0), "failed_score": -2.0}
 
-    details = calculate_reward_speedup(_completed_env(compiled=True, correctness=False), config)
+    details = calculate_kernel_reward(_completed_env(compiled=True, correctness=False), config)
 
-    assert details["reward"] == -2.0
-    assert details["penalty_score"] == -0.25
-    assert details["reward_correctness_component"] == -2.0
+    assert details["reward"] == -1.0
+    assert details["kernel_failed_score"] == -2.0
+    assert details["kernel_failed_score_tag"] == "disabled"
+    assert details["reward_component"]["correctness"] == 0.0
+    assert details["reward_component"]["failed"] == -1.0
 
 
 @pytest.mark.parametrize(
@@ -339,75 +391,82 @@ def test_failed_score_is_the_base_reward_for_failed_sample():
         {"status": "failed", "compiled": None, "correctness": None, "metadata": {}},
     ],
 )
-def test_reward_components_sum_to_reward(env_state):
-    details = calculate_reward_speedup(env_state, _reward_config())
+def test_reward_component_sums_to_reward(env_state):
+    details = calculate_kernel_reward(env_state, _reward_config())
 
-    component_sum = sum(
-        details[key]
-        for key in (
-            "reward_correctness_component",
-            "reward_performance_component",
-            "reward_coverage_component",
-            "reward_partial_component",
-            "reward_penalty_component",
-        )
-    )
+    component_sum = sum(value for value in details["reward_component"].values() if value is not None)
     assert component_sum == pytest.approx(details["reward"])
+    assert details["task_reward"] == pytest.approx(details["reward"])
+    assert details["overlong_penalty"] == 0.0
+    assert details["overlong_prompt_len"] == 0
+    assert details["overlong_effective_response_cap"] == 0
+    assert "score" not in details
 
 
 def test_output_mismatch_requires_compilation_contract():
+    config = {**_reward_config(), "apply_failed_group_reward": True}
     with pytest.raises(AssertionError, match="correctness_output_mismatch=true requires compiled=true"):
-        calculate_reward_speedup(
+        calculate_kernel_reward(
             _completed_env(
                 compiled=False,
                 output_mismatch=True,
                 candidate_forward_completed=True,
             ),
-            _reward_config(),
+            config,
         )
 
 
-def test_partial_reward_must_stay_below_correctness_floor():
-    with pytest.raises(ValueError, match="lower than init_correct_weight"):
-        calculate_reward_speedup(
+def test_output_mismatch_score_must_stay_below_correctness_score():
+    config = {
+        **_reward_config(output_mismatch_score=1.0),
+        "apply_kernel_failed_score": True,
+    }
+    with pytest.raises(ValueError, match=r"lower than correctness_score \(1.0\)"):
+        calculate_kernel_reward(
             _completed_env(output_mismatch=True, candidate_forward_completed=True),
-            _reward_config(partial_reward=0.5),
+            config,
         )
 
 
-def test_qwen_policy_gates_performance_reward_on_correctness_without_changing_global_default():
+def test_failed_sample_does_not_receive_performance_reward_from_malformed_env_state():
     incorrect = _completed_env(compiled=True, candidate_forward_completed=True, speedup=2.0)
 
-    qwen_details = calculate_reward_speedup(incorrect, _reward_config())
-    legacy_details = calculate_reward_speedup(
+    gated_details = calculate_kernel_reward(incorrect, _reward_config())
+    ungated_details = calculate_kernel_reward(
         incorrect,
         {
-            **_reward_config(partial_reward=0.0),
+            **_reward_config(output_mismatch_score=0.0),
             "performance_reward_requires_correctness": False,
         },
     )
 
-    assert CUDA_AGENT_CONFIGS["reward"]["performance_reward_requires_correctness"] is False
-    assert qwen_details["reward"] == 0.0
-    assert legacy_details["reward"] == pytest.approx(1.0)
+    assert CUDA_AGENT_CONFIGS["reward"]["performance_reward_requires_correctness"] is True
+    assert gated_details["kernel_score"]["performance"] == 0.0
+    assert gated_details["reward_component"]["performance"] == 0.0
+    assert gated_details["reward_component"]["failed"] == 0.0
+    assert gated_details["reward"] == 0.0
+    assert ungated_details["reward"] == 0.0
 
 
-def test_improvement_speedup_reward_only_rewards_gain_over_reference():
+def test_improvement_performance_score_only_rewards_gain_over_reference():
     config = {
         **_reward_config(),
         "coverage_reward_enable": False,
-        "speedup_reward_mode": "improvement",
+        "speedup_score_mode": "improvement",
         "speedup_reward_upper_bound": 2.0,
     }
 
-    baseline = calculate_reward_speedup(_completed_env(correctness=True, speedup=1.0), config)
-    improved = calculate_reward_speedup(_completed_env(correctness=True, speedup=1.5), config)
+    baseline = calculate_kernel_reward(_completed_env(correctness=True, speedup=1.0), config)
+    improved = calculate_kernel_reward(_completed_env(correctness=True, speedup=1.5), config)
 
-    assert baseline["speedup_reward"] == 0.0
     assert baseline["speedup_log_standard_error"] is None
     assert baseline["reward"] == pytest.approx(0.5)
-    assert improved["speedup_reward"] == pytest.approx(0.5)
-    assert improved["reward_performance_component"] == pytest.approx(0.25)
+    assert improved["kernel_score"] == {
+        "correctness": 1.0,
+        "performance": pytest.approx(0.5),
+        "coverage": 0.0,
+    }
+    assert improved["reward_component"]["performance"] == pytest.approx(0.25)
     assert improved["reward"] == pytest.approx(0.75)
 
 
@@ -415,7 +474,7 @@ def test_lcb_improvement_uses_timing_uncertainty_before_reward_mapping():
     config = {
         **_reward_config(),
         "coverage_reward_enable": False,
-        "speedup_reward_mode": "lcb_improvement",
+        "speedup_score_mode": "lcb_improvement",
         "speedup_reward_upper_bound": 2.0,
         "speedup_uncertainty_z_score": 2.0,
         "speedup_uncertainty_log_std_floor": 0.01,
@@ -431,14 +490,14 @@ def test_lcb_improvement_uses_timing_uncertainty_before_reward_mapping():
 
     expected_log_se = (0.2**2 / 100 + 0.1**2 / 25 + 0.01**2) ** 0.5
     actual_log_se = _compute_speedup_log_standard_error(timing_metadata, config)
-    speedup_reward = _compute_speedup_reward_value(2.0, "lcb_improvement", timing_metadata, config)
+    performance_score = _calculate_performance_score(2.0, "lcb_improvement", timing_metadata, config)
     expected_lcb = 2.0 * math.exp(-2.0 * expected_log_se)
     assert actual_log_se == pytest.approx(expected_log_se)
-    assert speedup_reward == pytest.approx(expected_lcb - 1.0)
+    assert performance_score == pytest.approx(expected_lcb - 1.0)
 
 
 def test_lcb_improvement_rejects_missing_timing_metadata():
-    config = {**_reward_config(), "speedup_reward_mode": "lcb_improvement"}
+    config = {**_reward_config(), "speedup_score_mode": "lcb_improvement"}
 
     with pytest.raises(ValueError, match="timing metadata"):
         _compute_speedup_log_standard_error(None, config)
@@ -448,7 +507,7 @@ def test_lcb_improvement_supports_cached_reference_with_noise_floor():
     config = {
         **_reward_config(),
         "coverage_reward_enable": False,
-        "speedup_reward_mode": "lcb_improvement",
+        "speedup_score_mode": "lcb_improvement",
         "speedup_uncertainty_z_score": 1.0,
         "speedup_uncertainty_log_std_floor": 0.02,
     }
@@ -461,13 +520,13 @@ def test_lcb_improvement_supports_cached_reference_with_noise_floor():
 
     expected_log_se = (0.1**2 / 100 + 0.02**2) ** 0.5
     actual_log_se = _compute_speedup_log_standard_error(timing_metadata, config)
-    speedup_reward = _compute_speedup_reward_value(1.5, "lcb_improvement", timing_metadata, config)
+    performance_score = _calculate_performance_score(1.5, "lcb_improvement", timing_metadata, config)
     expected_lcb = 1.5 * math.exp(-expected_log_se)
     assert actual_log_se == pytest.approx(expected_log_se)
-    assert speedup_reward == pytest.approx(expected_lcb - 1.0)
+    assert performance_score == pytest.approx(expected_lcb - 1.0)
 
 
-def test_normalization_uses_runtime_error_code_for_partial_reward():
+def test_normalization_uses_runtime_error_code_for_kernel_failed_score_tag():
     env_state, _ = normalize_env_feedback(
         {
             **_completed_env(output_mismatch=True, candidate_forward_completed=True),
@@ -484,13 +543,15 @@ def test_normalization_uses_runtime_error_code_for_partial_reward():
     assert "runtime_error" not in env_state["metadata"]
     assert "correctness_runtime_error" not in env_state["metadata"]
     assert env_state["error"] == "RUNTIME_ERROR"
-    details = calculate_reward_speedup(env_state, _reward_config())
+    config = {**_reward_config(), "apply_failed_group_reward": True}
+    details = calculate_kernel_reward(env_state, config)
     assert details["reward"] == 0.0
-    assert details["partial_credit_output_mismatch_reason"] == "runtime_error"
+    assert details["kernel_failed_score_tag"] == "runtime"
 
 
-def test_reward_func_records_partial_audit_metadata(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "output_mismatch_partial_reward", 0.25)
+def test_reward_func_records_fail_score_metadata(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"]["kernel_failed_score"], "output_mismatch", 0.25)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_kernel_failed_score", True)
     env_state = _completed_env(output_mismatch=True, candidate_forward_completed=True)
     env_extra_info = {
         "correctness": False,
@@ -510,20 +571,24 @@ def test_reward_func_records_partial_audit_metadata(monkeypatch):
 
     reward = asyncio.run(generate_with_cuda_agent.reward_func(SimpleNamespace(), sample))
 
-    assert reward == pytest.approx(0.25)
-    assert sample.metadata["partial_credit_output_mismatch"] is True
-    assert sample.metadata["partial_credit_output_mismatch_reason"] == "applied"
-    assert sample.metadata["reward_components"] == {
-        "reward_correctness_component": 0.0,
-        "reward_performance_component": 0.0,
-        "reward_coverage_component": 0.0,
-        "reward_partial_component": 0.25,
-        "reward_penalty_component": 0.0,
+    assert reward == pytest.approx(0.125)
+    assert sample.metadata["kernel_failed_score_tag"] == "output_mismatch"
+    assert sample.metadata["kernel_score"] == {
+        "correctness": 0.0,
+        "performance": 0.0,
+        "coverage": 0.0,
     }
-    assert sample.metadata["env_extra_info"]["partial_credit_output_mismatch"] is True
+    assert sample.metadata["reward_component"] == {
+        "correctness": 0.0,
+        "performance": 0.0,
+        "coverage": 0.0,
+        "failed": 0.125,
+        "overlong_penalty": 0.0,
+    }
+    assert sample.metadata["env_extra_info"]["kernel_failed_score_tag"] == "output_mismatch"
     assert "failure_stage" not in sample.metadata
-    assert sample.metadata["penalty_score"] == pytest.approx(-0.25)
-    assert "penalty_score" not in sample.metadata["env_extra_info"]
+    assert sample.metadata["kernel_failed_score"] == pytest.approx(0.25)
+    assert "kernel_failed_score" not in sample.metadata["env_extra_info"]
 
 
 def test_normalization_preserves_mismatch_and_summarizes_backend_probe():
@@ -562,15 +627,14 @@ def test_normalization_preserves_mismatch_and_summarizes_backend_probe():
     }
 
 
-def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
+def test_kernel_failed_score_tag_metrics_count_each_failure_category():
     from slime.observability.rollout_metrics import _compute_kernel_agent_metrics
 
     sample = Sample(
         prompt="prompt",
         reward=0.25,
         metadata={
-            "partial_credit_output_mismatch": True,
-            "partial_credit_output_mismatch_reason": "applied",
+            "kernel_failed_score_tag": "output_mismatch",
             "overlong_penalty": 0.1,
             "env_extra_info": {
                 "correctness": False,
@@ -580,7 +644,7 @@ def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
                 "decoy_kernel": False,
                 "correctness_candidate_forward_completed": True,
                 "correctness_output_mismatch": True,
-                "partial_credit_output_mismatch": True,
+                "kernel_failed_score_tag": "output_mismatch",
                 "incorrect_backend_probe_attempted": True,
                 "incorrect_backend_probe_valid": True,
                 "incorrect_backend_probe_custom_kernel_observed": True,
@@ -589,26 +653,23 @@ def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
             },
         },
     )
-    rejected_samples = [
+    failed_samples = [
         Sample(
             prompt="prompt",
             reward=0.0,
-            metadata={
-                "partial_credit_output_mismatch": False,
-                "partial_credit_output_mismatch_reason": reason,
-            },
+            metadata={"kernel_failed_score_tag": reason},
         )
-        for reason in ("decoy", "runtime_error", "timeout")
+        for reason in ("decoy", "runtime", "compilation")
     ]
 
-    metrics = _compute_kernel_agent_metrics([sample, *rejected_samples])
+    metrics = _compute_kernel_agent_metrics([sample, *failed_samples])
 
-    assert metrics["kernel/partial_credit/applied_rate"] == pytest.approx(0.25)
-    assert metrics["kernel/partial_credit/rejected_decoy_count"] == 1
-    assert metrics["kernel/partial_credit/rejected_runtime_error_count"] == 1
-    assert metrics["kernel/partial_credit/rejected_timeout_count"] == 1
+    assert metrics["kernel/failed_score_tag/output_mismatch_count"] == 1
+    assert metrics["kernel/failed_score_tag/decoy_count"] == 1
+    assert metrics["kernel/failed_score_tag/runtime_count"] == 1
+    assert metrics["kernel/failed_score_tag/compilation_count"] == 1
     assert metrics["kernel/overlong_penalty/mean"] == pytest.approx(0.1)
-    assert "env_extra_info/partial_credit_output_mismatch/mean" not in metrics
+    assert "env_extra_info/kernel_failed_score_tag/mean" not in metrics
     assert metrics["env_extra_info/speedup_log_standard_error/mean"] == pytest.approx(0.0125)
     assert not any("reward_component" in key for key in metrics)
     assert metrics["kernel/incorrect_backend_probe/attempted_ratio"] == pytest.approx(0.25)
@@ -617,7 +678,8 @@ def test_partial_reward_metrics_keep_only_applied_rate_and_key_rejections():
 
 
 def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_coverage(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "output_mismatch_partial_reward", 0.25)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"]["kernel_failed_score"], "output_mismatch", 0.25)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_kernel_failed_score", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "performance_reward_requires_correctness", True)
     args = SimpleNamespace(
         overlong_penalty=True,
@@ -631,6 +693,9 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
         min_group_size=2,
         reward_std_threshold=0.001,
         reward_key=None,
+        use_coverage_rs=False,
+        finalize_mode="none",
+        advantage_estimator="grpo",
     )
 
     async def make_sample(raw_env: dict, response_length: int, prompt_length: int) -> Sample:
@@ -681,13 +746,22 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
         return [hard_failure, mismatch, correct]
 
     samples = asyncio.run(build_group())
-    _apply_overlong_penalty(args, samples)
+    rewards_before_postprocess = [sample.reward for sample in samples]
+    postprocess_turn_samples(args, samples, finish_reason="env_done")
     filter_result = filter_cuda_kernel_group(args, samples)
 
-    assert [sample.metadata["task_reward"] for sample in samples] == pytest.approx([0.0, 0.25, 0.625])
-    assert samples[1].reward == pytest.approx(0.05)
+    assert [sample.reward for sample in samples] == rewards_before_postprocess
+    assert [sample.metadata["task_reward"] for sample in samples] == pytest.approx([-0.375, 0.125, 0.625])
+    assert samples[1].reward == pytest.approx(-0.075)
+    assert samples[1].metadata["reward_component"]["failed"] == pytest.approx(0.125)
+    assert samples[1].metadata["reward_component"]["overlong_penalty"] == pytest.approx(-0.2)
+    assert sum(
+        value for value in samples[1].metadata["reward_component"].values() if value is not None
+    ) == pytest.approx(samples[1].reward)
     assert samples[1].metadata["overlong_effective_response_cap"] == 20480
     assert samples[2].reward == pytest.approx(0.625)
+    assert samples[2].metadata["kernel_score"]["coverage"] == pytest.approx(0.25)
+    assert samples[2].metadata["reward_component"]["coverage"] == pytest.approx(0.125)
     assert filter_result.keep is True
 
     # Different post-penalty lengths must not rescue a task-uniform 0.25 group.
@@ -701,14 +775,13 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
             )
         )
         uniform_partial.append(clone)
-    _apply_overlong_penalty(args, uniform_partial[1:])
     uniform_result = filter_cuda_kernel_group(args, uniform_partial)
     assert uniform_result.keep is False
     assert uniform_result.reason == "reward_std_lt_0.001"
 
 
 @pytest.mark.parametrize("failed_score", [0.0, -2.0])
-def test_low_variance_filter_uses_penalties_for_all_failed_group(monkeypatch, failed_score):
+def test_low_variance_filter_uses_scores_for_all_failed_group(monkeypatch, failed_score):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", failed_score)
     args = SimpleNamespace(
@@ -719,8 +792,13 @@ def test_low_variance_filter_uses_penalties_for_all_failed_group(monkeypatch, fa
         reward_key=None,
     )
     samples = [
-        Sample(index=index, group_index=0, reward=failed_score, metadata={"penalty_score": penalty_score})
-        for index, penalty_score in enumerate((-1.0, -0.75, -0.25))
+        Sample(
+            index=index,
+            group_index=0,
+            reward=failed_score * CUDA_AGENT_CONFIGS["reward"]["init_correct_weight"],
+            metadata={"kernel_failed_score": kernel_failed_score},
+        )
+        for index, kernel_failed_score in enumerate((-1.0, -0.75, -0.25))
     ]
 
     result = filter_cuda_kernel_group(args, samples)
@@ -728,7 +806,7 @@ def test_low_variance_filter_uses_penalties_for_all_failed_group(monkeypatch, fa
     assert result.keep is True
 
 
-def test_low_variance_filter_ignores_penalties_when_failed_group_reward_is_disabled(monkeypatch):
+def test_low_variance_filter_ignores_scores_when_failed_group_reward_is_disabled(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
     args = SimpleNamespace(
         n_samples_per_prompt=3,
@@ -738,8 +816,8 @@ def test_low_variance_filter_ignores_penalties_when_failed_group_reward_is_disab
         reward_key=None,
     )
     samples = [
-        Sample(index=index, group_index=0, reward=0.0, metadata={"penalty_score": penalty_score})
-        for index, penalty_score in enumerate((-1.0, -0.75, -0.25))
+        Sample(index=index, group_index=0, reward=0.0, metadata={"kernel_failed_score": kernel_failed_score})
+        for index, kernel_failed_score in enumerate((-1.0, -0.75, -0.25))
     ]
 
     result = filter_cuda_kernel_group(args, samples)

@@ -113,7 +113,7 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
 
     if reject_low_variance_groups:
         # Variance normally uses the PRE-PENALTY task reward recorded by the
-        # overlong policy. An all-failed group instead uses failure-stage penalties
+        # overlong policy. An all-failed group instead uses weighted failure-stage scores
         # so a group with different evaluation progress can reach TRLOO.
         rewards = [
             (
@@ -127,7 +127,12 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         rewards = _apply_dynamic_group_reward_weights(valid_samples, rewards, reward_config)
         if bool(reward_config["apply_failed_group_reward"]):
             failed_score = float(reward_config["failed_score"])
-            rewards = _apply_failed_group_reward(valid_samples, rewards, failed_score)
+            rewards = _apply_failed_group_reward(
+                valid_samples,
+                rewards,
+                failed_score,
+                float(reward_config["init_correct_weight"]),
+            )
         reward_std = torch.tensor(rewards, dtype=torch.float64).std(unbiased=False).item()
         if reward_std < reward_std_threshold:
             audit_record = _low_variance_audit_record(args, valid_samples, rewards)

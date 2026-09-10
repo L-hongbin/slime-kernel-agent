@@ -1,9 +1,16 @@
 import base64
+import sys
 from argparse import Namespace
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+
+repo_root = Path(__file__).resolve().parents[1]
+repo_root_path = str(repo_root)
+if repo_root_path not in sys.path:
+    sys.path.insert(0, repo_root_path)
 
 from slime.observability.rollout_metrics import (
     _compute_exp_rollout_metrics,
@@ -81,7 +88,7 @@ def test_exp_rollout_metrics_cover_reward_groups_turns_and_async_state():
             metadata={
                 "turn_idx": 0,
                 "task_reward": 0.5,
-                "reward_components": {"reward_correctness_component": 0.5},
+                "reward_component": {"correctness": 0.5},
                 "gen_weight_version": 3,
                 "gen_submit_time": 1.0,
                 "engine_weight_version_span": False,
@@ -97,7 +104,7 @@ def test_exp_rollout_metrics_cover_reward_groups_turns_and_async_state():
             metadata={
                 "turn_idx": 0,
                 "task_reward": -0.25,
-                "reward_components": {"reward_penalty_component": -0.25},
+                "reward_component": {"failed": -0.25},
                 "gen_weight_version": 2,
                 "gen_submit_time": 2.0,
                 "engine_weight_version_span": True,
@@ -117,7 +124,7 @@ def test_exp_rollout_metrics_cover_reward_groups_turns_and_async_state():
     assert metrics["exp/rollout/async/engine_version_span_fraction"] == pytest.approx(0.5)
     assert metrics["exp/rollout/async/engine_version_mismatch_fraction"] == pytest.approx(0.5)
     assert metrics["exp/rollout/reward/component/correctness/mean"] == pytest.approx(0.5)
-    assert metrics["exp/rollout/reward/component/penalty/mean"] == pytest.approx(-0.25)
+    assert metrics["exp/rollout/reward/component/failed/mean"] == pytest.approx(-0.25)
 
 
 def _b64_int32(values: list[int]) -> str:

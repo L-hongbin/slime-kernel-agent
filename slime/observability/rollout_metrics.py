@@ -194,19 +194,19 @@ def _compute_exp_rollout_metrics(args, samples: list[Sample]) -> dict[str, float
         [(sample.metadata or {}).get("overlong_penalty", 0.0) for sample in non_pad_samples],
     )
     component_keys = (
-        "reward_correctness_component",
-        "reward_performance_component",
-        "reward_coverage_component",
-        "reward_partial_component",
-        "reward_penalty_component",
+        "correctness",
+        "performance",
+        "coverage",
+        "failed",
+        "overlong_penalty",
     )
     for component in component_keys:
         add_stats(
-            f"reward/component/{component.removeprefix('reward_').removesuffix('_component')}",
+            f"reward/component/{component}",
             [
                 (
-                    (sample.metadata or {}).get("reward_components", {}).get(component)
-                    if isinstance((sample.metadata or {}).get("reward_components"), dict)
+                    (sample.metadata or {}).get("reward_component", {}).get(component)
+                    if isinstance((sample.metadata or {}).get("reward_component"), dict)
                     else None
                 )
                 for sample in non_pad_samples
@@ -405,10 +405,7 @@ def _compute_kernel_agent_metrics(samples):
     incorrect_backend_probe_valid_count = 0
     incorrect_backend_probe_custom_kernel_observed_count = 0
     incorrect_backend_probe_decoy_detected_count = 0
-    partial_credit_applied_count = 0
-    partial_credit_rejected_decoy_count = 0
-    partial_credit_rejected_runtime_error_count = 0
-    partial_credit_rejected_timeout_count = 0
+    kernel_failed_score_tag_count: dict[str, int] = {}
 
     def record_reason(counter: dict[str, int], value) -> None:
         if isinstance(value, str) and value:
@@ -418,15 +415,7 @@ def _compute_kernel_agent_metrics(samples):
 
     for sample in samples:
         metadata = sample.metadata or {}
-        partial_reason = metadata.get("partial_credit_output_mismatch_reason")
-        if metadata.get("partial_credit_output_mismatch") is True:
-            partial_credit_applied_count += 1
-        elif partial_reason == "decoy":
-            partial_credit_rejected_decoy_count += 1
-        elif partial_reason == "runtime_error":
-            partial_credit_rejected_runtime_error_count += 1
-        elif partial_reason == "timeout":
-            partial_credit_rejected_timeout_count += 1
+        record_reason(kernel_failed_score_tag_count, metadata.get("kernel_failed_score_tag"))
         overlong_penalty = metadata.get("overlong_penalty")
         if isinstance(overlong_penalty, (int, float)) and not isinstance(overlong_penalty, bool):
             overlong_penalty_values.append(float(overlong_penalty))
@@ -532,10 +521,8 @@ def _compute_kernel_agent_metrics(samples):
     if non_pad_count:
         metrics["kernel/generate_guard_timeout_count"] = generate_guard_timeout_count
         metrics["kernel/generate_guard_timeout_ratio"] = generate_guard_timeout_count / non_pad_count
-        metrics["kernel/partial_credit/applied_rate"] = partial_credit_applied_count / non_pad_count
-        metrics["kernel/partial_credit/rejected_decoy_count"] = partial_credit_rejected_decoy_count
-        metrics["kernel/partial_credit/rejected_runtime_error_count"] = partial_credit_rejected_runtime_error_count
-        metrics["kernel/partial_credit/rejected_timeout_count"] = partial_credit_rejected_timeout_count
+        for tag, count in kernel_failed_score_tag_count.items():
+            metrics[f"kernel/failed_score_tag/{tag}_count"] = count
         for reason, count in decoy_reason_count.items():
             metrics[f"kernel/decoy_reason/{reason}_count"] = count
         for reason, count in incorrect_backend_probe_skip_reason_count.items():
