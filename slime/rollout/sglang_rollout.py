@@ -369,7 +369,6 @@ class GenerateState(metaclass=SingletonMeta):
         )
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
         self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
-        logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)
         self._warn_history_thinking_template()
         self.multi_turn_template = PromptTemplate.from_path(getattr(args, "multi_turn_prompt_config_path", None))
 
