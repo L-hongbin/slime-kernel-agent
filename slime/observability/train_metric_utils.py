@@ -273,6 +273,43 @@ def gather_log_data(
     return reduced_log_dict
 
 
+def _compute_sample_advantage_scalars(args: Namespace, rollout_data: RolloutBatch) -> torch.Tensor:
+    """Reduce CP-sharded token advantages to one masked mean per sample."""
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils.cp_utils import get_sum_of_sample_mean
+
+    advantages = rollout_data["advantages"]
+    loss_masks = rollout_data["loss_masks"]
+    total_lengths = rollout_data["total_lengths"]
+    response_lengths = rollout_data["response_lengths"]
+    max_seq_lens = rollout_data.get("max_seq_lens")
+    if not (len(advantages) == len(loss_masks) == len(total_lengths) == len(response_lengths)):
+        raise ValueError("advantages, loss_masks, total_lengths, and response_lengths must have the same sample count")
+    if max_seq_lens is not None and len(max_seq_lens) != len(advantages):
+        raise ValueError("max_seq_lens must have the same sample count as advantages")
+
+    contributions = []
+    for index, (advantage, loss_mask, total_length, response_length) in enumerate(
+        zip(advantages, loss_masks, total_lengths, response_lengths, strict=True)
+    ):
+        reducer = get_sum_of_sample_mean(
+            [total_length],
+            [response_length],
+            [loss_mask],
+            qkv_format=args.qkv_format,
+            max_seq_lens=None if max_seq_lens is None else [max_seq_lens[index]],
+        )
+        contributions.append(reducer(torch.as_tensor(advantage).reshape(-1)))
+
+    if not contributions:
+        return torch.empty(0, dtype=torch.float32)
+    sample_advantages = torch.stack(contributions)
+    if mpu.get_context_parallel_world_size() > 1:
+        dist.all_reduce(sample_advantages, group=mpu.get_context_parallel_group())
+    return sample_advantages
+
+
 def log_rollout_data(
     rollout_id: int,
     args: Namespace,
@@ -294,12 +331,9 @@ def log_rollout_data(
 
             sample_advantages = []
             if rollout_data.get("advantages"):
-                advantage_scalars = []
-                for advantage, loss_mask in zip(rollout_data["advantages"], rollout_data["loss_masks"], strict=True):
-                    advantage = torch.as_tensor(advantage)
-                    loss_mask = torch.as_tensor(loss_mask, device=advantage.device, dtype=advantage.dtype)
-                    advantage_scalars.append((advantage * loss_mask).sum() / torch.clamp_min(loss_mask.sum(), 1))
-                sample_advantages = torch.stack(advantage_scalars).detach().float().cpu().tolist()
+                sample_advantages = (
+                    _compute_sample_advantage_scalars(args, rollout_data).detach().float().cpu().tolist()
+                )
             response_lengths_for_exp = [float(value) for value in rollout_data.get("response_lengths", [])]
             if sample_advantages:
                 positive = [float(value > 0) for value in sample_advantages]

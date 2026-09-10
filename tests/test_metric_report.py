@@ -30,11 +30,45 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_sum_of_sample_mean,
 )
 from slime.observability.train_metric_utils import (  # noqa: E402
+    _compute_sample_advantage_scalars,
     reduce_train_step_metrics,
     rollout_log_metric_contribution,
 )
 
 NUM_GPUS = 0
+
+
+@pytest.mark.unit
+def test_exp_sample_advantage_scalar_aligns_context_parallel_mask(monkeypatch):
+    from megatron.core import mpu as _mpu
+
+    total_length = 12
+    response_length = 8
+    prompt_length = total_length - response_length
+    monkeypatch.setattr(_mpu, "get_context_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(_mpu, "get_context_parallel_rank", lambda: 0)
+    monkeypatch.setattr(_mpu, "get_context_parallel_group", lambda: object(), raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, group=None: None)
+
+    _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_length, response_length)
+    local_mask = torch.cat(
+        [
+            torch.ones(response_length)[token_offsets[0][0] - prompt_length : token_offsets[0][1] - prompt_length],
+            torch.ones(response_length)[token_offsets[1][0] - prompt_length : token_offsets[1][1] - prompt_length],
+        ]
+    )
+    assert local_mask.numel() < response_length
+    local_advantage = torch.arange(1, local_mask.numel() + 1, dtype=torch.float32)
+    rollout_data = {
+        "advantages": [local_advantage],
+        "loss_masks": [torch.ones(response_length)],
+        "total_lengths": [total_length],
+        "response_lengths": [response_length],
+    }
+
+    result = _compute_sample_advantage_scalars(type("Args", (), {"qkv_format": "thd"})(), rollout_data)
+
+    assert result.item() == pytest.approx(local_advantage.sum().item() / response_length)
 
 
 @pytest.mark.unit
