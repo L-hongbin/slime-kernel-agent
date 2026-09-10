@@ -15,18 +15,31 @@ from slime.backends.megatron_utils.qwen_gdn_layout import (
     interleave_gdn_tp_sections,
     merge_gdn_factory_tensors,
 )
-from slime.utils.arguments import add_qwen_gdn_arguments
+from slime.utils.arguments import add_qwen_gdn_arguments, validate_qwen_gdn_distributed_options
 from slime_plugins.models import distributed_gdn as distributed_gdn_module
+from slime_plugins.models import gdn_a2a as gdn_a2a_module
 from slime_plugins.models import qwen3_5 as qwen3_5_model
 from slime_plugins.models.distributed_gdn import (
-    _a2a_cp2hp_ragged,
+    _a2a_cp2hp_fused,
     _a2a_hp2cp_ragged,
     _build_gdn_head_shards,
     _build_head_perm_for_split_sections,
+    _build_nonpacked_zigzag_perm,
     _build_thd_cp_a2a_perm,
     _get_parameter_local_cp,
+    _get_thd_cp_a2a_perm,
     _reorder_nonpacked_zigzag,
     _resolve_cu_seqlens,
+    a2a_cp_to_hp_packed,
+    a2a_hp_to_cp_packed,
+)
+from slime_plugins.models.gdn_a2a import (
+    _pack_rank_major,
+    _pack_sequence,
+    _unpack_equal,
+    _unpack_rank_major,
+    _unpack_sequence,
+    clear_communication_workspaces,
 )
 from slime_plugins.models.qwen3_5 import _validate_qwen_gdn_recompute_norm_out
 
@@ -41,6 +54,9 @@ def test_shared_qwen_gdn_arguments_support_distributed_flashqla():
             "distributed",
             "--qwen-gdn-backend",
             "flashqla",
+            "--qwen-gdn-a2a-implementation",
+            "native",
+            "--qwen-gdn-cache-thd-permutation",
             "--qwen-gdn-sp-disable-batch-p2p-comm",
             "--qwen-gdn-recompute-norm-out",
         ]
@@ -48,6 +64,8 @@ def test_shared_qwen_gdn_arguments_support_distributed_flashqla():
 
     assert args.qwen_gdn_implementation == "distributed"
     assert args.qwen_gdn_backend == "flashqla"
+    assert args.qwen_gdn_a2a_implementation == "native"
+    assert args.qwen_gdn_cache_thd_permutation is True
     assert args.qwen_gdn_sp_disable_batch_p2p_comm is True
     assert args.qwen_gdn_recompute_norm_out is True
 
@@ -56,6 +74,37 @@ def test_qwen_gdn_recompute_norm_out_defaults_to_disabled():
     args = add_qwen_gdn_arguments(ArgumentParser()).parse_args([])
 
     assert args.qwen_gdn_recompute_norm_out is False
+    assert args.qwen_gdn_a2a_implementation is None
+    assert args.qwen_gdn_cache_thd_permutation is False
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        SimpleNamespace(
+            qwen_gdn_implementation="replicated",
+            qwen_gdn_a2a_implementation="native",
+            qwen_gdn_cache_thd_permutation=False,
+        ),
+        SimpleNamespace(
+            qwen_gdn_implementation="replicated",
+            qwen_gdn_a2a_implementation=None,
+            qwen_gdn_cache_thd_permutation=True,
+        ),
+    ],
+)
+def test_qwen_gdn_distributed_options_reject_replicated_gdn(args):
+    with pytest.raises(ValueError, match="require --qwen-gdn-implementation distributed"):
+        validate_qwen_gdn_distributed_options(args)
+
+
+def test_qwen_gdn_distributed_options_accept_distributed_gdn():
+    args = SimpleNamespace(
+        qwen_gdn_implementation="distributed",
+        qwen_gdn_a2a_implementation="fused",
+        qwen_gdn_cache_thd_permutation=True,
+    )
+    validate_qwen_gdn_distributed_options(args)
 
 
 def test_qwen_gdn_recompute_norm_out_rejects_replicated_and_full_recompute():
@@ -621,6 +670,8 @@ def test_distributed_gdn_builds_rank_local_shapes_for_ragged_cp(monkeypatch):
     module = distributed_gdn_module.DistributedQwenGatedDeltaNet(args=SimpleNamespace(qwen_gdn_backend="fla"))
 
     assert module.ragged_cp is True
+    assert module.a2a_implementation == "fused"
+    assert module.cache_thd_permutation is False
     assert module.num_key_heads_local_cp == 1
     assert module.num_value_heads_local_cp == 2
     assert module.in_proj_rank_split_sections == (
@@ -663,6 +714,86 @@ def test_thd_cp_permutation_restores_natural_order_with_odd_cp():
 
     assert rank_major_zigzag.index_select(0, permutation).tolist() == list(range(12))
     assert torch.equal(permutation.index_select(0, inverse), torch.arange(12))
+
+
+def test_thd_cp_permutation_is_cached_per_packed_batch():
+    packed_seq_params = SimpleNamespace()
+    cu_seqlens = torch.tensor([0, 8, 20], dtype=torch.int32)
+
+    first = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size=2, total_seq_len=20)
+    cached = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size=2, total_seq_len=20)
+
+    assert cached[0] is first[0]
+    assert cached[1] is first[1]
+
+    cu_seqlens[1] = 12
+    after_mutation = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size=2, total_seq_len=20)
+    assert after_mutation[0] is not first[0]
+
+    replacement = cu_seqlens.clone()
+    after_replacement = _get_thd_cp_a2a_perm(packed_seq_params, replacement, cp_size=2, total_seq_len=20)
+    assert after_replacement[0] is not after_mutation[0]
+
+
+def test_thd_cp_permutation_cache_is_opt_in(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    projected = torch.arange(16).reshape(2, 1, 8)
+    exchanged = torch.arange(16).reshape(4, 1, 4)
+    monkeypatch.setattr(distributed_gdn_module, "_a2a_cp2hp_fused", lambda *args, **kwargs: exchanged)
+    cu_seqlens = torch.tensor([0, 4], dtype=torch.int32)
+
+    cached_params = SimpleNamespace(qkv_format="thd")
+    _, first_cached_inverse = a2a_cp_to_hp_packed(
+        projected,
+        (4, 4),
+        2,
+        FakeGroup(),
+        cu_seqlens,
+        4,
+        cached_params,
+        cache_thd_permutation=True,
+    )
+    _, second_cached_inverse = a2a_cp_to_hp_packed(
+        projected,
+        (4, 4),
+        2,
+        FakeGroup(),
+        cu_seqlens,
+        4,
+        cached_params,
+        cache_thd_permutation=True,
+    )
+    assert second_cached_inverse is first_cached_inverse
+
+    uncached_params = SimpleNamespace(qkv_format="thd")
+    _, first_uncached_inverse = a2a_cp_to_hp_packed(
+        projected,
+        (4, 4),
+        2,
+        FakeGroup(),
+        cu_seqlens,
+        4,
+        uncached_params,
+        cache_thd_permutation=False,
+    )
+    _, second_uncached_inverse = a2a_cp_to_hp_packed(
+        projected,
+        (4, 4),
+        2,
+        FakeGroup(),
+        cu_seqlens,
+        4,
+        uncached_params,
+        cache_thd_permutation=False,
+    )
+    assert second_uncached_inverse is not first_uncached_inverse
+    assert not hasattr(uncached_params, "_slime_gdn_cp_permutation_cache")
 
 
 def test_packed_boundaries_must_match_total_and_cp():
@@ -747,10 +878,11 @@ def test_ragged_a2a_round_trip_layout(monkeypatch):
         )
 
         def fake_cp2hp(
-            group,
+            output,
             tensor,
             output_split_sizes,
             input_split_sizes,
+            group,
             expected_rank=rank,
             expected_input=expected_packed,
             expected_output=expected_exchanged,
@@ -759,10 +891,10 @@ def test_ragged_a2a_round_trip_layout(monkeypatch):
             assert torch.equal(tensor, expected_input)
             assert input_split_sizes == [8, 4, 4]
             assert output_split_sizes == [2 * rank_widths[expected_rank]] * 3
-            return expected_output
+            output.copy_(expected_output)
 
-        monkeypatch.setattr(distributed_gdn_module, "all_to_all", fake_cp2hp)
-        actual_head_shard = _a2a_cp2hp_ragged(local_input, rank_widths, FakeGroup(rank))
+        monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_cp2hp)
+        actual_head_shard = _a2a_cp2hp_fused(local_input, rank_widths, FakeGroup(rank))
         assert torch.equal(actual_head_shard, head_shards[rank])
 
         expected_reverse_packed = torch.cat(
@@ -773,10 +905,11 @@ def test_ragged_a2a_round_trip_layout(monkeypatch):
         )
 
         def fake_hp2cp(
-            group,
+            output,
             tensor,
             output_split_sizes,
             input_split_sizes,
+            group,
             expected_rank=rank,
             expected_input=expected_reverse_packed,
             expected_output=expected_reverse_exchanged,
@@ -785,11 +918,335 @@ def test_ragged_a2a_round_trip_layout(monkeypatch):
             assert torch.equal(tensor, expected_input)
             assert input_split_sizes == [2 * rank_widths[expected_rank]] * 3
             assert output_split_sizes == [8, 4, 4]
-            return expected_output
+            output.copy_(expected_output)
 
-        monkeypatch.setattr(distributed_gdn_module, "all_to_all", fake_hp2cp)
+        monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_hp2cp)
         restored = _a2a_hp2cp_ragged(head_shards[rank], rank_widths, FakeGroup(rank))
         assert torch.equal(restored, local_input)
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("packed", [False, True])
+def test_equal_cp_uses_fused_pack_and_matches_reference(monkeypatch, cp_size, packed):
+    class FakeGroup:
+        def size(self):
+            return cp_size
+
+        def rank(self):
+            return cp_size - 1
+
+    group = FakeGroup()
+    split_sections = (2 * cp_size, 4 * cp_size)
+    total_width = sum(split_sections)
+    local_inputs = [
+        torch.arange(2 * total_width).reshape(2, 1, total_width) + source_rank * 1000 for source_rank in range(cp_size)
+    ]
+    permutation = _build_head_perm_for_split_sections(split_sections, cp_size=cp_size, device=torch.device("cpu"))
+    reordered_inputs = [source.index_select(-1, permutation) for source in local_inputs]
+    rank_width = total_width // cp_size
+    expected_send = torch.cat(
+        [chunk.contiguous().view(-1) for chunk in torch.split(reordered_inputs[group.rank()], rank_width, dim=-1)]
+    )
+    expected_exchanged = torch.cat(
+        [torch.split(source, rank_width, dim=-1)[group.rank()] for source in reordered_inputs], dim=0
+    )
+
+    def fake_all_to_all(output, input_, output_split_sizes, input_split_sizes, actual_group):
+        assert actual_group is group
+        assert torch.equal(input_, expected_send)
+        assert input_split_sizes == [2 * rank_width] * cp_size
+        assert output_split_sizes == [2 * rank_width] * cp_size
+        output.copy_(expected_exchanged.view(-1))
+
+    monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_all_to_all)
+    cu_seqlens = torch.tensor([0, 2 * cp_size], dtype=torch.int32)
+    packed_seq_params = SimpleNamespace(qkv_format="thd") if packed else None
+
+    actual, inverse = a2a_cp_to_hp_packed(
+        local_inputs[group.rank()],
+        split_sections,
+        cp_size,
+        group,
+        cu_seqlens,
+        total_seq_len=2 * cp_size,
+        packed_seq_params=packed_seq_params,
+    )
+
+    if packed:
+        index, expected_inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len=2 * cp_size)
+        assert torch.equal(actual, expected_exchanged.index_select(0, index))
+        assert torch.equal(inverse, expected_inverse)
+    else:
+        assert torch.equal(actual, _reorder_nonpacked_zigzag(expected_exchanged, cp_size, undo=True))
+        assert inverse is None
+
+
+def test_native_equal_cp_preserves_megatron_paths(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 2
+
+        def rank(self):
+            return 0
+
+    group = FakeGroup()
+    projected = torch.arange(32).reshape(2, 1, 16)
+    split_sections = (8, 8)
+    head_permutation = _build_head_perm_for_split_sections(split_sections, 2, torch.device("cpu"))
+    expected_projected = projected.index_select(-1, head_permutation)
+    cp_to_hp_result = torch.full((4, 1, 8), 7)
+
+    def fake_cp_to_hp(tensor, seq_dim, head_dim, cp_group, undo_attention_load_balancing=True):
+        assert torch.equal(tensor, expected_projected)
+        assert (seq_dim, head_dim, cp_group, undo_attention_load_balancing) == (0, -1, group, True)
+        return cp_to_hp_result
+
+    monkeypatch.setattr(distributed_gdn_module, "tensor_a2a_cp2hp", fake_cp_to_hp)
+    monkeypatch.setattr(
+        distributed_gdn_module,
+        "_a2a_cp2hp_fused",
+        lambda *args, **kwargs: pytest.fail("native path called fused CP-to-HP"),
+    )
+    actual, inverse = a2a_cp_to_hp_packed(
+        projected,
+        split_sections,
+        cp_size=2,
+        cp_group=group,
+        cu_seqlens=None,
+        total_seq_len=4,
+        packed_seq_params=None,
+        a2a_implementation="native",
+    )
+    assert actual is cp_to_hp_result
+    assert inverse is None
+
+    natural = torch.arange(16).reshape(4, 1, 4)
+    sequence_inverse = torch.tensor([0, 3, 1, 2])
+    expected_rank_major = natural.index_select(0, sequence_inverse)
+    hp_to_cp_result = torch.full((2, 1, 8), 9)
+
+    def fake_hp_to_cp(tensor, seq_dim, head_dim, cp_group, redo_attention_load_balancing):
+        assert torch.equal(tensor, expected_rank_major)
+        assert (seq_dim, head_dim, cp_group, redo_attention_load_balancing) == (0, -1, group, False)
+        return hp_to_cp_result
+
+    monkeypatch.setattr(distributed_gdn_module, "tensor_a2a_hp2cp", fake_hp_to_cp)
+    monkeypatch.setattr(
+        distributed_gdn_module,
+        "fused_hp_to_cp",
+        lambda *args, **kwargs: pytest.fail("native path called fused HP-to-CP"),
+    )
+    actual = a2a_hp_to_cp_packed(
+        natural,
+        cp_size=2,
+        cp_group=group,
+        packed_seq_params=SimpleNamespace(qkv_format="thd"),
+        inverse=sequence_inverse,
+        a2a_implementation="native",
+    )
+    assert actual is hp_to_cp_result
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("packed", [False, True])
+def test_equal_hp_to_cp_fused_matches_reference_and_backward(monkeypatch, cp_size, packed):
+    class FakeGroup:
+        def size(self):
+            return cp_size
+
+        def rank(self):
+            return cp_size - 1
+
+    group = FakeGroup()
+    total_seq_len = 2 * cp_size
+    local_width = 3
+    head_inputs = [
+        torch.arange(total_seq_len * local_width, dtype=torch.float32).reshape(total_seq_len, 1, local_width)
+        + head_rank * 100
+        for head_rank in range(cp_size)
+    ]
+    if packed:
+        cu_seqlens = torch.tensor([0, total_seq_len], dtype=torch.int32)
+        _, sequence_permutation = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
+        packed_seq_params = SimpleNamespace(qkv_format="thd")
+    else:
+        sequence_permutation = _build_nonpacked_zigzag_perm(total_seq_len, cp_size, torch.device("cpu"))
+        packed_seq_params = None
+    rank_major_inputs = [head.index_select(0, sequence_permutation) for head in head_inputs]
+    expected_send = rank_major_inputs[group.rank()].reshape(-1)
+    expected_chunks = [torch.chunk(head, cp_size, dim=0)[group.rank()] for head in rank_major_inputs]
+    expected_receive = torch.cat([chunk.reshape(-1) for chunk in expected_chunks])
+    expected_output = torch.cat(expected_chunks, dim=-1)
+    calls = 0
+    workspace_pointers = []
+
+    def fake_all_to_all(output, input_, output_split_sizes, input_split_sizes, actual_group):
+        nonlocal calls
+        assert actual_group is group
+        workspace_pointers.append((input_.data_ptr(), output.data_ptr()))
+        chunk_size = 2 * local_width
+        assert input_split_sizes == [chunk_size] * cp_size
+        assert output_split_sizes == [chunk_size] * cp_size
+        if calls == 0:
+            assert torch.equal(input_, expected_send)
+            output.copy_(expected_receive)
+        else:
+            assert torch.equal(input_, torch.ones_like(input_))
+            output.fill_(1)
+        calls += 1
+
+    monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_all_to_all)
+    head_input = head_inputs[group.rank()].requires_grad_()
+    actual = a2a_hp_to_cp_packed(
+        head_input,
+        cp_size,
+        group,
+        packed_seq_params,
+        sequence_permutation if packed else None,
+        a2a_implementation="fused",
+    )
+    actual.sum().backward()
+
+    assert calls == 2
+    assert workspace_pointers[0] == workspace_pointers[1]
+    assert workspace_pointers[0][0] != workspace_pointers[0][1]
+    assert torch.equal(actual, expected_output)
+    assert torch.equal(head_input.grad, torch.ones_like(head_input))
+
+
+def test_ragged_pack_fuses_head_permutation_and_reuses_workspace():
+    rank_widths = (6, 3, 3)
+    permutation = torch.tensor([0, 1, 4, 5, 8, 9, 2, 6, 10, 3, 7, 11])
+    source = torch.arange(48).reshape(2, 2, 12)
+    expected_reordered = source.index_select(-1, permutation)
+    expected_packed = torch.cat(
+        [chunk.contiguous().view(-1) for chunk in torch.split(expected_reordered, rank_widths, dim=-1)]
+    )
+
+    clear_communication_workspaces()
+    packed = _pack_rank_major(source, rank_widths, permutation)
+    first_pointer = packed.data_ptr()
+    actual_packed = packed.clone()
+    second_packed = _pack_rank_major(source + 100, rank_widths, permutation)
+
+    assert torch.equal(actual_packed, expected_packed)
+    assert second_packed.data_ptr() == first_pointer
+
+    restored = torch.empty_like(source)
+    _unpack_rank_major(actual_packed, restored, rank_widths, permutation)
+    assert torch.equal(restored, source)
+
+
+def test_ragged_a2a_custom_backward_restores_input_layout(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 3
+
+        def rank(self):
+            return 0
+
+    rank_widths = (4, 2, 2)
+    source = torch.arange(16, dtype=torch.float32).reshape(2, 1, 8).requires_grad_()
+    expected_packed = torch.cat(
+        [chunk.contiguous().view(-1) for chunk in torch.split(source.detach(), rank_widths, dim=-1)]
+    )
+    calls = 0
+
+    def fake_all_to_all(output, input_, output_split_sizes, input_split_sizes, group):
+        nonlocal calls
+        assert group.rank() == 0
+        if calls == 0:
+            assert torch.equal(input_, expected_packed)
+            assert output_split_sizes == [8, 8, 8]
+            assert input_split_sizes == [8, 4, 4]
+            output.copy_(torch.arange(output.numel(), dtype=output.dtype))
+        else:
+            assert output_split_sizes == [8, 4, 4]
+            assert input_split_sizes == [8, 8, 8]
+            output.fill_(1)
+        calls += 1
+
+    monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_all_to_all)
+    _a2a_cp2hp_fused(source, rank_widths, FakeGroup()).sum().backward()
+
+    assert calls == 2
+    assert torch.equal(source.grad, torch.ones_like(source))
+
+
+def test_ragged_reverse_a2a_custom_backward_restores_head_layout(monkeypatch):
+    class FakeGroup:
+        def size(self):
+            return 3
+
+        def rank(self):
+            return 0
+
+    rank_widths = (4, 2, 2)
+    head_shard = torch.arange(24, dtype=torch.float32).reshape(6, 1, 4).requires_grad_()
+    received = torch.arange(16, dtype=torch.float32)
+    expected_output = torch.tensor([[[0, 1, 2, 3, 8, 9, 12, 13]], [[4, 5, 6, 7, 10, 11, 14, 15]]], dtype=torch.float32)
+    calls = 0
+
+    def fake_all_to_all(output, input_, output_split_sizes, input_split_sizes, group):
+        nonlocal calls
+        assert group.rank() == 0
+        if calls == 0:
+            assert torch.equal(input_, head_shard.detach().view(-1))
+            assert output_split_sizes == [8, 4, 4]
+            assert input_split_sizes == [8, 8, 8]
+            output.copy_(received)
+        else:
+            assert torch.equal(input_, torch.ones(16))
+            assert output_split_sizes == [8, 8, 8]
+            assert input_split_sizes == [8, 4, 4]
+            output.fill_(1)
+        calls += 1
+
+    monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", fake_all_to_all)
+    output = _a2a_hp2cp_ragged(head_shard, rank_widths, FakeGroup())
+    output.sum().backward()
+
+    assert calls == 2
+    assert torch.equal(output, expected_output)
+    assert torch.equal(head_shard.grad, torch.ones_like(head_shard))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for the fused Triton kernel")
+def test_ragged_fused_pack_matches_reference_on_cuda():
+    # Keep the number of blocks above CUDA's grid-Y limit to cover long-context launches.
+    rank_widths = (8192, 4096, 4096)
+    permutation = torch.randperm(sum(rank_widths), device="cuda")
+    source = torch.randn(1, 2049, sum(rank_widths), device="cuda", dtype=torch.bfloat16).transpose(0, 1)
+    expected_reordered = source.index_select(-1, permutation)
+    expected_packed = torch.cat(
+        [chunk.contiguous().view(-1) for chunk in torch.split(expected_reordered, rank_widths, dim=-1)]
+    )
+
+    clear_communication_workspaces()
+    packed = _pack_rank_major(source, rank_widths, permutation)
+    workspace_pointer = packed.data_ptr()
+    actual_packed = packed.clone()
+    reused_workspace = _pack_rank_major(source + 1, rank_widths, permutation)
+    restored = torch.empty_like(source.contiguous())
+    _unpack_rank_major(actual_packed, restored, rank_widths, permutation)
+    torch.cuda.synchronize()
+
+    assert reused_workspace.data_ptr() == workspace_pointer
+    assert torch.equal(actual_packed, expected_packed)
+    assert torch.equal(restored, source)
+
+    sequence_permutation = torch.randperm(source.size(0), device="cuda")
+    sequence_packed = _pack_sequence(source, sequence_permutation).clone()
+    sequence_restored = torch.empty_like(restored)
+    _unpack_sequence(sequence_packed, sequence_restored, sequence_permutation)
+    assert torch.equal(sequence_packed.view_as(source), source.index_select(0, sequence_permutation))
+    assert torch.equal(sequence_restored, source)
+
+    equal_widths = (source.size(-1) // 4,) * 4
+    equal_packed = _pack_rank_major(source, equal_widths, None).clone()
+    equal_restored = torch.empty_like(restored)
+    _unpack_equal(equal_packed, equal_restored, cp_size=4)
+    assert torch.equal(equal_restored, source)
 
 
 def test_nonpacked_zigzag_reorder_round_trip_with_odd_cp():

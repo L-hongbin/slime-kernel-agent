@@ -287,6 +287,22 @@ def add_qwen_gdn_arguments(parser):
         ),
     )
     parser.add_argument(
+        "--qwen-gdn-a2a-implementation",
+        type=str,
+        choices=["native", "fused"],
+        default=None,
+        help=(
+            "All-to-all layout implementation for distributed Qwen GDN with evenly sharded CP heads. "
+            "'native' preserves Megatron's split/cat path; 'fused' uses fused packing and reusable buffers. "
+            "Distributed GDN defaults to 'fused' when this option is omitted."
+        ),
+    )
+    parser.add_argument(
+        "--qwen-gdn-cache-thd-permutation",
+        action="store_true",
+        help="Cache the packed THD context-parallel permutation across distributed Qwen GDN layers.",
+    )
+    parser.add_argument(
         "--qwen-gdn-sp-disable-batch-p2p-comm",
         action="store_true",
         help=(
@@ -302,6 +318,18 @@ def add_qwen_gdn_arguments(parser):
         ),
     )
     return parser
+
+
+def validate_qwen_gdn_distributed_options(args):
+    """Reject distributed-only Qwen GDN options on the replicated implementation."""
+    distributed_options = []
+    if getattr(args, "qwen_gdn_a2a_implementation", None) is not None:
+        distributed_options.append("--qwen-gdn-a2a-implementation")
+    if getattr(args, "qwen_gdn_cache_thd_permutation", False):
+        distributed_options.append("--qwen-gdn-cache-thd-permutation")
+    if distributed_options and getattr(args, "qwen_gdn_implementation", "replicated") != "distributed":
+        options = ", ".join(distributed_options)
+        raise ValueError(f"{options} require --qwen-gdn-implementation distributed.")
 
 
 def get_slime_extra_args_provider(add_custom_arguments=None):
@@ -2578,6 +2606,7 @@ def _resolve_checkpoint_load_args(args) -> None:
 
 
 def slime_validate_args(args):
+    validate_qwen_gdn_distributed_options(args)
     if getattr(args, "enable_fp32_lm_head", False):
         args.fp32_lm_head = True
     if getattr(args, "fp32_lm_head", False):

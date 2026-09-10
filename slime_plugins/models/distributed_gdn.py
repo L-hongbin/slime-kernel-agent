@@ -15,9 +15,9 @@ from megatron.core import tensor_parallel
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, causal_conv1d, tensor_a2a_cp2hp, tensor_a2a_hp2cp
-from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
+from .gdn_a2a import fused_cp_to_hp, fused_hp_to_cp, ragged_hp_to_cp
 from .qwen_gdn_backend import get_chunk_gated_delta_rule
 
 
@@ -167,6 +167,36 @@ def _build_thd_cp_a2a_perm(
     return index, inverse
 
 
+def _get_thd_cp_a2a_perm(
+    packed_seq_params: PackedSeqParams,
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    total_seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reuse a packed batch's CP permutation across all GDN layers."""
+    cache = getattr(packed_seq_params, "_slime_gdn_cp_permutation_cache", None)
+    if cache is not None:
+        source, source_version, cached_cp_size, cached_total_seq_len, index, inverse = cache
+        if (
+            source is cu_seqlens
+            and source_version == cu_seqlens._version
+            and cached_cp_size == cp_size
+            and cached_total_seq_len == total_seq_len
+        ):
+            return index, inverse
+
+    index, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
+    packed_seq_params._slime_gdn_cp_permutation_cache = (
+        cu_seqlens,
+        cu_seqlens._version,
+        cp_size,
+        total_seq_len,
+        index,
+        inverse,
+    )
+    return index, inverse
+
+
 @lru_cache(maxsize=8)
 def _build_head_perm_for_split_sections(
     split_sections: tuple[int, ...],
@@ -190,30 +220,25 @@ def _build_head_perm_for_split_sections(
     return torch.cat(indices)
 
 
-def _a2a_cp2hp_ragged(
+def _a2a_cp2hp_fused(
     tensor: torch.Tensor,
     rank_widths: tuple[int, ...],
     cp_group: torch.distributed.ProcessGroup,
+    permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Convert sequence shards to uneven head shards with all-to-all-v."""
+    """Convert sequence shards to equal or uneven head shards with fused packing."""
     cp_size = cp_group.size()
     if cp_size == 1:
         return tensor
     if tensor.dim() != 3:
-        raise ValueError(f"Ragged CP-to-HP all-to-all requires a 3-D tensor, got {tensor.dim()} dimensions.")
+        raise ValueError(f"Fused CP-to-HP all-to-all requires a 3-D tensor, got {tensor.dim()} dimensions.")
     if len(rank_widths) != cp_size or sum(rank_widths) != tensor.size(-1):
         raise ValueError(
-            f"Ragged CP-to-HP widths {rank_widths} must contain {cp_size} entries and sum to "
+            f"Fused CP-to-HP widths {rank_widths} must contain {cp_size} entries and sum to "
             f"hidden size {tensor.size(-1)}."
         )
 
-    local_seq_len, batch, _ = tensor.shape
-    packed = torch.cat([chunk.contiguous().view(-1) for chunk in torch.split(tensor, rank_widths, dim=-1)])
-    input_split_sizes = [local_seq_len * batch * width for width in rank_widths]
-    local_width = rank_widths[cp_group.rank()]
-    output_split_sizes = [local_seq_len * batch * local_width] * cp_size
-    exchanged = all_to_all(cp_group, packed, output_split_sizes, input_split_sizes)
-    return exchanged.view(local_seq_len * cp_size, batch, local_width)
+    return fused_cp_to_hp(tensor, rank_widths, cp_group, permutation)
 
 
 def _a2a_hp2cp_ragged(
@@ -233,21 +258,12 @@ def _a2a_hp2cp_ragged(
     if len(rank_widths) != cp_size:
         raise ValueError(f"Expected {cp_size} ragged head widths, got {rank_widths}.")
 
-    total_seq_len, batch, local_width = tensor.shape
+    total_seq_len, _, local_width = tensor.shape
     cp_rank = cp_group.rank()
     if local_width != rank_widths[cp_rank]:
         raise ValueError(f"CP rank {cp_rank} owns head width {rank_widths[cp_rank]}, got tensor width {local_width}.")
 
-    local_seq_len = total_seq_len // cp_size
-    packed = torch.cat([chunk.contiguous().view(-1) for chunk in torch.chunk(tensor, cp_size, dim=0)])
-    input_split_sizes = [local_seq_len * batch * local_width] * cp_size
-    output_split_sizes = [local_seq_len * batch * width for width in rank_widths]
-    exchanged = all_to_all(cp_group, packed, output_split_sizes, input_split_sizes)
-    received = torch.split(exchanged, output_split_sizes)
-    return torch.cat(
-        [chunk.view(local_seq_len, batch, width) for chunk, width in zip(received, rank_widths, strict=True)],
-        dim=-1,
-    )
+    return ragged_hp_to_cp(tensor, rank_widths, cp_group)
 
 
 def _reorder_nonpacked_zigzag(tensor: torch.Tensor, cp_size: int, *, undo: bool) -> torch.Tensor:
@@ -265,6 +281,12 @@ def _reorder_nonpacked_zigzag(tensor: torch.Tensor, cp_size: int, *, undo: bool)
     return torch.cat([chunks[index] for index in order], dim=0)
 
 
+@lru_cache(maxsize=16)
+def _build_nonpacked_zigzag_perm(total_seq_len: int, cp_size: int, device: torch.device) -> torch.Tensor:
+    positions = torch.arange(total_seq_len, device=device)
+    return _reorder_nonpacked_zigzag(positions, cp_size, undo=False)
+
+
 def a2a_cp_to_hp_packed(
     projected: torch.Tensor,
     split_sections: tuple[int, ...],
@@ -274,43 +296,54 @@ def a2a_cp_to_hp_packed(
     total_seq_len: int,
     packed_seq_params: PackedSeqParams | None,
     rank_split_sections: tuple[tuple[int, ...], ...] | None = None,
+    a2a_implementation: str = "fused",
+    cache_thd_permutation: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Convert CP sequence shards to head shards, including packed THD ordering."""
-    rank_widths = None
+    if a2a_implementation not in ("native", "fused"):
+        raise ValueError(f"Unknown Qwen GDN all-to-all implementation {a2a_implementation!r}.")
+    a2a_rank_widths = None
+    head_perm = None
+    use_fused_a2a = rank_split_sections is not None or a2a_implementation == "fused"
     if cp_size > 1:
         head_perm = _build_head_perm_for_split_sections(split_sections, cp_size, projected.device, rank_split_sections)
-        projected = projected.index_select(-1, head_perm)
         if rank_split_sections is not None:
-            rank_widths = tuple(sum(rank_sections) for rank_sections in rank_split_sections)
+            a2a_rank_widths = tuple(sum(rank_sections) for rank_sections in rank_split_sections)
+        elif use_fused_a2a:
+            rank_width, remainder = divmod(projected.size(-1), cp_size)
+            if remainder:
+                raise ValueError(f"GDN projection width {projected.size(-1)} must be divisible by cp_size={cp_size}.")
+            a2a_rank_widths = (rank_width,) * cp_size
+        else:
+            projected = projected.index_select(-1, head_perm)
 
     inverse = None
     if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
-        if rank_widths is None:
-            projected = tensor_a2a_cp2hp(
-                projected,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group,
-                undo_attention_load_balancing=False,
-            )
-        else:
-            projected = _a2a_cp2hp_ragged(projected, rank_widths, cp_group)
         if cp_size > 1:
+            if use_fused_a2a:
+                projected = _a2a_cp2hp_fused(projected, a2a_rank_widths, cp_group, head_perm)
+            else:
+                projected = tensor_a2a_cp2hp(
+                    projected,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=cp_group,
+                    undo_attention_load_balancing=False,
+                )
             if cu_seqlens is None:
                 raise ValueError("Packed THD GDN requires cu_seqlens.")
-            index, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
+            if cache_thd_permutation:
+                index, inverse = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size, total_seq_len)
+            else:
+                index, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
             projected = projected.index_select(0, index)
     else:
-        if rank_widths is None:
-            projected = tensor_a2a_cp2hp(
-                projected,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=cp_group,
-            )
-        else:
-            projected = _a2a_cp2hp_ragged(projected, rank_widths, cp_group)
-            projected = _reorder_nonpacked_zigzag(projected, cp_size, undo=True)
+        if cp_size > 1:
+            if use_fused_a2a:
+                projected = _a2a_cp2hp_fused(projected, a2a_rank_widths, cp_group, head_perm)
+                projected = _reorder_nonpacked_zigzag(projected, cp_size, undo=True)
+            else:
+                projected = tensor_a2a_cp2hp(projected, seq_dim=0, head_dim=-1, cp_group=cp_group)
     return projected, inverse
 
 
@@ -321,15 +354,22 @@ def a2a_hp_to_cp_packed(
     packed_seq_params: PackedSeqParams | None,
     inverse: torch.Tensor | None,
     rank_widths: tuple[int, ...] | None = None,
+    a2a_implementation: str = "fused",
 ) -> torch.Tensor:
     """Restore the context-parallel layout after head-sharded GDN compute."""
+    if a2a_implementation not in ("native", "fused"):
+        raise ValueError(f"Unknown Qwen GDN all-to-all implementation {a2a_implementation!r}.")
     if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
         if cp_size > 1:
             if inverse is None:
                 raise ValueError("Packed THD GDN requires the inverse CP permutation.")
-            output = output.index_select(0, inverse)
         if rank_widths is not None:
+            output = output.index_select(0, inverse)
             return _a2a_hp2cp_ragged(output, rank_widths, cp_group)
+        if cp_size > 1 and a2a_implementation == "fused":
+            return fused_hp_to_cp(output, cp_group, inverse)
+        if cp_size > 1:
+            output = output.index_select(0, inverse)
         return tensor_a2a_hp2cp(
             output,
             seq_dim=0,
@@ -340,6 +380,9 @@ def a2a_hp_to_cp_packed(
     if rank_widths is not None:
         output = _reorder_nonpacked_zigzag(output, cp_size, undo=False)
         return _a2a_hp2cp_ragged(output, rank_widths, cp_group)
+    if cp_size > 1 and a2a_implementation == "fused":
+        sequence_permutation = _build_nonpacked_zigzag_perm(output.size(0), cp_size, output.device)
+        return fused_hp_to_cp(output, cp_group, sequence_permutation)
     return tensor_a2a_hp2cp(output, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
 
@@ -352,6 +395,8 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
         if not self.config.deterministic_mode:
             self.gated_delta_rule = get_chunk_gated_delta_rule(backend)
         self.gdn_backend = backend
+        self.a2a_implementation = getattr(args, "qwen_gdn_a2a_implementation", None) or "fused"
+        self.cache_thd_permutation = getattr(args, "qwen_gdn_cache_thd_permutation", False)
         self.recompute_norm_out = bool(
             getattr(self, "recompute_norm_out", False) or getattr(args, "qwen_gdn_recompute_norm_out", False)
         )
@@ -441,6 +486,7 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
             packed_seq_params,
             inverse,
             self.output_rank_widths,
+            self.a2a_implementation,
         )
 
     def forward(
@@ -503,6 +549,8 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
             total_seq_len,
             packed_seq_params,
             self.in_proj_rank_split_sections,
+            self.a2a_implementation,
+            self.cache_thd_permutation,
         )
         projected = projected.transpose(0, 1)
         qkv, gate, beta, alpha = torch.split(projected, self.feat_dim_split, dim=-1)
