@@ -1091,13 +1091,15 @@ def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
     factor = None if factor is None else float(factor)
 
     for sample in output_samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         if (
             sample.remove_sample
             or sample.status == Sample.Status.ABORTED
             or (sample.loss_mask is not None and sum(sample.loss_mask) == 0)
+            or metadata.get("role", "kernel") == "verify"
         ):
             continue
-        env_extra_info = sample.metadata.get("env_extra_info") if isinstance(sample.metadata, dict) else None
+        env_extra_info = metadata.get("env_extra_info")
         if not isinstance(env_extra_info, dict):
             raise ValueError("--use-coverage-rs requires sample.metadata['env_extra_info'].")
         if coverage_key not in env_extra_info:

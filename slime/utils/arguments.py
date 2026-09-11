@@ -16,6 +16,108 @@ from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_config
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_ROLLOUT_DATA_SOURCE_PATH = "slime.rollout.data_source.RolloutDataSourceWithBuffer"
+_KERNEL_AGENT_DATA_SOURCE_PATH = "examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource"
+_DEFAULT_ROLLOUT_FUNCTION_PATH = "slime.rollout.sglang_rollout.generate_rollout"
+_KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH = "examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async"
+_KERNEL_AGENT_VERIFY_CAPTURE_HOOK_PATH = "examples.kernel_agent.kernel_agent_data_source.capture_verify_candidates"
+
+
+def _parse_verify_data_limit(value: str) -> int | float:
+    if value.lower() in {"inf", "infinity"}:
+        return math.inf
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("verify data limit must be a non-negative integer or 'inf'") from exc
+    if limit < 0:
+        raise argparse.ArgumentTypeError("verify data limit must be non-negative")
+    return limit
+
+
+def _validate_verify_capture_args(args) -> None:
+    verify_rollout_ratio = float(getattr(args, "verify_rollout_ratio", 0.0))
+    capture_verify_data = bool(getattr(args, "capture_verify_data", False))
+    save_verify_data = getattr(args, "save_verify_data", None)
+    load_verify_data = getattr(args, "load_verify_data", None) or []
+    if isinstance(load_verify_data, str):
+        load_verify_data = [load_verify_data]
+        args.load_verify_data = load_verify_data
+    fixed_verify_data = bool(load_verify_data)
+    online_capture_enabled = capture_verify_data or (verify_rollout_ratio > 0.0 and not fixed_verify_data)
+    verify_data_enabled = fixed_verify_data or online_capture_enabled
+
+    if not 0.0 <= verify_rollout_ratio <= 1.0:
+        raise ValueError(f"--verify-rollout-ratio must be in [0, 1], got {verify_rollout_ratio}")
+    max_samples_per_group = int(getattr(args, "verify_max_samples_per_source_group", 1))
+    if max_samples_per_group <= 0:
+        raise ValueError(f"--verify-max-samples-per-source-group must be positive, got {max_samples_per_group}")
+    max_version_lag = int(getattr(args, "verify_max_source_version_lag", 2))
+    if max_version_lag < 0:
+        raise ValueError(f"--verify-max-source-version-lag must be non-negative, got {max_version_lag}")
+    verify_data_limit = getattr(args, "verify_data_limit", math.inf)
+    if not math.isinf(verify_data_limit) and (verify_data_limit < 0 or int(verify_data_limit) != verify_data_limit):
+        raise ValueError(f"--verify-data-limit must be a non-negative integer or inf, got {verify_data_limit}")
+
+    if fixed_verify_data and verify_rollout_ratio <= 0.0:
+        raise ValueError("--load-verify-data requires a positive --verify-rollout-ratio")
+    if save_verify_data is not None and not online_capture_enabled:
+        raise ValueError(
+            "--save-verify-data requires online capture; add --capture-verify-data when using fixed verify data"
+        )
+    if not verify_data_enabled:
+        return
+
+    data_source_path = getattr(args, "data_source_path", _DEFAULT_ROLLOUT_DATA_SOURCE_PATH)
+    if data_source_path == _DEFAULT_ROLLOUT_DATA_SOURCE_PATH:
+        logger.info("Verify capture is enabled; using %s", _KERNEL_AGENT_DATA_SOURCE_PATH)
+        args.data_source_path = _KERNEL_AGENT_DATA_SOURCE_PATH
+    elif data_source_path != _KERNEL_AGENT_DATA_SOURCE_PATH:
+        raise ValueError(
+            f"Verify capture requires --data-source-path {_KERNEL_AGENT_DATA_SOURCE_PATH}, got {data_source_path!r}"
+        )
+
+    verify_prompt_config_path = getattr(args, "verify_prompt_config_path", None)
+    if verify_rollout_ratio > 0.0:
+        if verify_prompt_config_path is None:
+            raise ValueError("A positive --verify-rollout-ratio requires --verify-prompt-config-path")
+        if not os.path.isfile(verify_prompt_config_path):
+            raise FileNotFoundError(f"verify prompt template does not exist: {verify_prompt_config_path}")
+
+    if save_verify_data is not None:
+        if "{rollout_id}" not in save_verify_data:
+            raise ValueError("--save-verify-data must contain the {rollout_id} placeholder")
+        try:
+            save_verify_data.format(rollout_id=0)
+        except (IndexError, KeyError, ValueError) as exc:
+            raise ValueError(f"Invalid --save-verify-data path template: {save_verify_data!r}") from exc
+        if save_verify_data == getattr(args, "save_debug_rollout_data", None):
+            raise ValueError("--save-verify-data must not be equal to --save-debug-rollout-data")
+
+    rollout_function_path = getattr(args, "rollout_function_path", _DEFAULT_ROLLOUT_FUNCTION_PATH)
+    if rollout_function_path == _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH:
+        return
+    if verify_rollout_ratio > 0.0:
+        raise ValueError(
+            "A positive --verify-rollout-ratio currently requires --rollout-function-path "
+            f"{_KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}"
+        )
+    if rollout_function_path != _DEFAULT_ROLLOUT_FUNCTION_PATH:
+        raise ValueError(
+            "Verify capture is supported by the default rollout and kernel-agent fully-async rollout; "
+            f"custom rollout function {rollout_function_path!r} must implement capture explicitly"
+        )
+
+    all_samples_process_path = getattr(args, "rollout_all_samples_process_path", None)
+    if all_samples_process_path is None:
+        args.rollout_all_samples_process_path = _KERNEL_AGENT_VERIFY_CAPTURE_HOOK_PATH
+    elif all_samples_process_path != _KERNEL_AGENT_VERIFY_CAPTURE_HOOK_PATH:
+        raise ValueError(
+            "Verify capture needs --rollout-all-samples-process-path "
+            f"{_KERNEL_AGENT_VERIFY_CAPTURE_HOOK_PATH}; the configured hook {all_samples_process_path!r} "
+            "would otherwise be overwritten"
+        )
+
 
 def _validate_lora_args(args) -> None:
     dim = int(getattr(args, "lora_dim", 0) or 0)
@@ -2085,6 +2187,74 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_kernel_agent_arguments(parser):
             parser.add_argument(
+                "--verify-prompt-config-path",
+                type=str,
+                default=None,
+                help=(
+                    "Path to the Jinja template used for verify rollouts. YAML files with a named "
+                    "'verify_response' template are also supported."
+                ),
+            )
+            parser.add_argument(
+                "--verify-rollout-ratio",
+                type=float,
+                default=0.0,
+                help=(
+                    "Probability of drawing the next prompt group from the kernel-agent verify buffer. "
+                    "The default disables verify rollout and preserves the ordinary prompt data flow."
+                ),
+            )
+            parser.add_argument(
+                "--capture-verify-data",
+                action="store_true",
+                default=False,
+                help=(
+                    "Capture failed kernel samples in the verify buffer even when verify rollout is disabled. "
+                    "No verify data is recorded when this flag is absent and --verify-rollout-ratio is zero."
+                ),
+            )
+            parser.add_argument(
+                "--save-verify-data",
+                type=str,
+                default=None,
+                help=(
+                    "Optional path template for per-rollout verify capture files. It must contain "
+                    "'{rollout_id}', for example /path/verify_{rollout_id}.pt."
+                ),
+            )
+            parser.add_argument(
+                "--load-verify-data",
+                type=str,
+                nargs="+",
+                default=None,
+                help=(
+                    "Initialize the verify candidate pool from one or more saved .pt files, directories, "
+                    "or glob patterns. Fixed candidates are replayed once per generation weight version; "
+                    "online capture stays disabled unless --capture-verify-data is also set."
+                ),
+            )
+            parser.add_argument(
+                "--verify-max-samples-per-source-group",
+                type=int,
+                default=1,
+                help="Maximum failed kernel candidates drawn from one source group per generation weight version.",
+            )
+            parser.add_argument(
+                "--verify-max-source-version-lag",
+                type=int,
+                default=2,
+                help="Discard verify candidates whose source kernel policy version is older by more than this value.",
+            )
+            parser.add_argument(
+                "--verify-data-limit",
+                type=_parse_verify_data_limit,
+                default=math.inf,
+                help=(
+                    "Maximum retained verify candidates. When full, older policy versions are evicted first, "
+                    "then easier samples within a version. The default is inf."
+                ),
+            )
+            parser.add_argument(
                 "--kernel-env-url",
                 dest="kernel_env_url",
                 type=str,
@@ -2843,6 +3013,8 @@ def slime_validate_args(args):
     if args.dump_details is not None:
         args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}.pt"
+
+    _validate_verify_capture_args(args)
 
     if args.save_debug_train_data is not None and args.save_debug_train_data == args.save_debug_rollout_data:
         raise ValueError("--save-debug-train-data must not be equal to --save-debug-rollout-data.")

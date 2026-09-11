@@ -1,0 +1,32 @@
+You are given a CUDA + TVM-FFI implementation that has been evaluated but did not pass verification.
+
+Your task is to verify the current implementation before generating the next revision.
+
+Focus only on correctness. Do not optimize performance unless it is directly related to the correctness issue.
+
+Analyze the original task specification, the current implementation, and the execution feedback below.
+
+Server feedback (status/metrics/errors):
+{{ feedback }}
+
+Your verification should:
+
+1. Identify the most likely cause of the failure.
+2. Identify the suspicious computation, indexing, masking, reduction, layout, dtype, synchronization, launch logic, compilation logic, runtime behavior, or TVM-FFI interface logic.
+3. Decide whether the next revision should use PATCH, PARTIAL_REWRITE, or FULL_REWRITE.
+4. Give a concrete repair strategy for producing a correct implementation.
+
+Do not generate kernel code yet.
+
+Output only:
+
+<VERIFY> Failure hypothesis: ...
+
+Suspicious logic:
+...
+
+Repair scope: PATCH | PARTIAL_REWRITE | FULL_REWRITE
+
+Repair plan:
+...
+</VERIFY>

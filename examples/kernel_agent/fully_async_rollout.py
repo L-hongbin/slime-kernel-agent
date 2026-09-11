@@ -18,6 +18,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+from examples.kernel_agent.kernel_reward import annotate_group_difficulty
 
 from slime.observability.metric_utils import compute_rollout_step
 from slime.rollout.base_types import RolloutFnTrainOutput
@@ -32,6 +33,7 @@ logger = logging.getLogger("examples.kernel_agent.fully_async_rollout")
 
 _global_worker: KernelAgentAsyncRolloutWorker | None = None
 _worker_lock = threading.Lock()
+_config_logged = False
 
 
 RolloutGroup = list[Sample]
@@ -90,6 +92,12 @@ def _get_last_non_pad_turn_group(groups: list[RolloutGroup]) -> RolloutGroup:
     return [sample if sample is not None else groups[-1][i] for i, sample in enumerate(last_turn_group)]
 
 
+def _is_verify_group(group: RolloutGroup) -> bool:
+    return bool(group) and all(
+        isinstance(sample.metadata, dict) and sample.metadata.get("role") == "verify" for sample in group
+    )
+
+
 def _get_group_concurrency(args, client_concurrency: int) -> int:
     n_samples_per_prompt = max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1))
     client_concurrency = max(1, int(client_concurrency))
@@ -97,8 +105,11 @@ def _get_group_concurrency(args, client_concurrency: int) -> int:
 
 
 def _get_global_worker(args, data_buffer, rollout_id: int) -> KernelAgentAsyncRolloutWorker:
-    global _global_worker
+    global _config_logged, _global_worker
     with _worker_lock:
+        if not _config_logged:
+            logger.info("CUDA_AGENT_CONFIGS=%s", CUDA_AGENT_CONFIGS)
+            _config_logged = True
         if (
             _global_worker is None
             or _global_worker.worker_thread is None
@@ -377,6 +388,26 @@ class KernelAgentAsyncRolloutWorker:
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
 
+    verify_rollout_ratio = float(getattr(args, "verify_rollout_ratio", 0.0))
+    fixed_verify_data = bool(getattr(args, "load_verify_data", None))
+    verify_capture_enabled = bool(getattr(args, "capture_verify_data", False)) or (
+        verify_rollout_ratio > 0.0 and not fixed_verify_data
+    )
+    if verify_capture_enabled and not callable(getattr(data_buffer, "add_verify_candidates", None)):
+        raise TypeError(
+            "Verify capture requires a data source that implements add_verify_candidates; "
+            "set --data-source-path to examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource"
+        )
+    if getattr(args, "save_verify_data", None) is not None and not callable(
+        getattr(data_buffer, "save_captured_verify_data", None)
+    ):
+        raise TypeError("--save-verify-data requires KernelAgentDataSource.save_captured_verify_data")
+    if getattr(args, "save_verify_data", None) is not None:
+        begin_verify_capture = getattr(data_buffer, "begin_verify_capture", None)
+        if not callable(begin_verify_capture):
+            raise TypeError("--save-verify-data requires KernelAgentDataSource.begin_verify_capture")
+        begin_verify_capture(rollout_id)
+
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
     )
@@ -407,6 +438,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     do_print = log_sample_bodies
     drop_reason_counts: Counter[str] = Counter()
     examined_task_groups = 0
+    verify_candidates_added = 0
 
     def _record_dynamic_filter_drop(reason: str | None, count: int = 1) -> None:
         metric_gatherer.on_dynamic_filter_drop(reason=reason)
@@ -424,6 +456,10 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             groups = _as_sample_groups(task_group)
             if not groups:
                 continue
+            for group in groups:
+                annotate_group_difficulty(group)
+                if verify_capture_enabled:
+                    verify_candidates_added += data_buffer.add_verify_candidates(group, rollout_id=rollout_id)
 
             if do_print:
                 sample = groups[0][0]
@@ -436,13 +472,20 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
                 do_print = False
 
             if filter_by_last_turn:
-                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, _get_last_non_pad_turn_group(groups))
+                last_turn_group = _get_last_non_pad_turn_group(groups)
+                if _is_verify_group(last_turn_group):
+                    collected[gid] = groups
+                    continue
+                dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, last_turn_group)
                 if dynamic_filter_output.keep:
                     collected[gid] = groups
                 else:
                     _record_dynamic_filter_drop(dynamic_filter_output.reason)
             else:
                 for group in groups:
+                    if _is_verify_group(group):
+                        collected.setdefault(gid, []).append(group)
+                        continue
                     dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
                     if dynamic_filter_output.keep:
                         collected.setdefault(gid, []).append(group)
@@ -471,6 +514,9 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     data = [
         group for _gid, groups in sorted(collected.items(), key=lambda item: _sort_key(item[1])) for group in groups
     ]
+    verify_candidates_saved = (
+        data_buffer.save_captured_verify_data(rollout_id) if getattr(args, "save_verify_data", None) is not None else 0
+    )
     if log_sample_bodies:
         sample = data[-1][0]
         logger.info(
@@ -492,6 +538,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         )
     metrics = metric_gatherer.collect()
     metrics["fully_async_collect_time"] = collect_time
+    metrics["verify_candidates_added"] = verify_candidates_added
+    metrics["verify_candidates_saved"] = verify_candidates_saved
     if getattr(args, "log_exp_metrics", False):
         worker_stats_end = worker.stats()
         metrics["exp/rollout/async/collect_time_seconds"] = collect_time

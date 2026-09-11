@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from examples.kernel_agent import generate_with_cuda_agent
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_reward import calculate_reward
+from examples.kernel_agent.kernel_reward import calculate_kernel_reward
 from slime.utils.data import read_file
 from slime.utils.http_utils import init_http_client
 from slime.utils.types import Sample
@@ -496,7 +496,12 @@ async def _run(args) -> None:
         for idx, output_sample in enumerate(output_samples):
             env_result = (output_sample.metadata or {}).get("env_result", {})
             env_state = env_result.get("env_state", env_result)
-            reward = calculate_reward(env_result, CUDA_AGENT_CONFIGS["reward"])
+            reward = calculate_kernel_reward(
+                env_state,
+                CUDA_AGENT_CONFIGS["reward"],
+                args=rollout_args,
+                sample=output_sample,
+            )["reward"]
             format_feedback = generate_with_cuda_agent._apply_feedback_template(
                 env_result,
                 tool_response_template,

@@ -3,15 +3,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import queue
+import random
 import sys
 import threading
 import time
 from argparse import Namespace
+from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
+import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 repo_root_path = str(REPO_ROOT)
@@ -28,7 +31,8 @@ if (examples_package := sys.modules.get("examples")) is not None and hasattr(exa
         *(path for path in examples_package.__path__ if path != repo_examples_path),
     ]
 
-from examples.kernel_agent import fully_async_rollout, generate_with_cuda_agent
+from examples.kernel_agent import fully_async_rollout, generate_with_cuda_agent, kernel_agent_data_source
+from slime.utils import arguments as slime_arguments
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
@@ -63,6 +67,626 @@ def _make_group(index: int) -> list[Sample]:
     return [sample]
 
 
+def _make_verify_candidate(index: int, source_group: int, failed_count: int, difficulty: float) -> Sample:
+    assert failed_count > 0
+    return Sample(
+        index=index,
+        group_index=source_group,
+        response="### CUDA_KERNELS\n```cpp\nkernel code\n```",
+        metadata={
+            "role": "kernel",
+            "source_group_index": source_group,
+            "trajectory_states": ["failed"] * failed_count,
+            "group_difficulty": difficulty,
+        },
+    )
+
+
+def _make_schedulable_verify_candidate(
+    index: int, source_group: int, version: int = 7, difficulty: float = 1.0
+) -> Sample:
+    sample = _make_verify_candidate(index, source_group=source_group, failed_count=1, difficulty=difficulty)
+    sample.prompt = [{"role": "user", "content": "Implement the requested operator."}]
+    sample.status = Sample.Status.COMPLETED
+    sample.metadata.update(
+        {
+            "gen_weight_version": version,
+            "env_result": {
+                "env_state": {
+                    "status": "completed",
+                    "correctness": False,
+                    "error": "output mismatch",
+                }
+            },
+        }
+    )
+    return sample
+
+
+def _make_verify_data_source_args(**overrides):
+    values = dict(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        gen_weight_version=8,
+        verify_prompt_config_path=str(
+            REPO_ROOT / "examples/kernel_agent/prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"
+        ),
+        verify_rollout_ratio=1.0,
+        verify_max_samples_per_source_group=1,
+        verify_max_source_version_lag=2,
+        verify_data_limit=float("inf"),
+        load_verify_data=None,
+    )
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_verify_sampling_weight_combines_version_gap_failure_count_and_group_difficulty():
+    candidate = _make_verify_candidate(0, source_group=3, failed_count=2, difficulty=0.75)
+    entry = kernel_agent_data_source.VerifyCandidateEntry(
+        sample=candidate,
+        source_weight_version=5,
+        group_difficulty=0.75,
+        difficulty_weight=2.25,
+        insertion_sequence=0,
+        capture_rollout_id=None,
+        loaded=False,
+    )
+
+    assert entry.sampling_weight(current_weight_version=7) == pytest.approx(0.75)
+
+
+def test_verify_capture_validation_enables_default_data_source_and_capture_hook():
+    args = Namespace(
+        capture_verify_data=True,
+        verify_rollout_ratio=0.0,
+        save_verify_data="/tmp/verify_{rollout_id}.pt",
+        save_debug_rollout_data=None,
+        data_source_path="slime.rollout.data_source.RolloutDataSourceWithBuffer",
+        rollout_function_path="slime.rollout.sglang_rollout.generate_rollout",
+        rollout_all_samples_process_path=None,
+    )
+
+    slime_arguments._validate_verify_capture_args(args)
+
+    assert args.data_source_path == "examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource"
+    assert (
+        args.rollout_all_samples_process_path
+        == "examples.kernel_agent.kernel_agent_data_source.capture_verify_candidates"
+    )
+
+
+def test_verify_capture_validation_rejects_save_path_when_capture_is_disabled():
+    args = Namespace(
+        capture_verify_data=False,
+        verify_rollout_ratio=0.0,
+        save_verify_data="/tmp/verify_{rollout_id}.pt",
+    )
+
+    with pytest.raises(ValueError, match="requires online capture"):
+        slime_arguments._validate_verify_capture_args(args)
+
+
+def test_verify_capture_validation_requires_rollout_id_in_save_path():
+    args = Namespace(
+        capture_verify_data=True,
+        verify_rollout_ratio=0.0,
+        save_verify_data="/tmp/verify.pt",
+        save_debug_rollout_data=None,
+        data_source_path="examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource",
+    )
+
+    with pytest.raises(ValueError, match=r"must contain the \{rollout_id\} placeholder"):
+        slime_arguments._validate_verify_capture_args(args)
+
+
+def test_verify_capture_validation_requires_positive_ratio_for_fixed_data():
+    args = Namespace(
+        capture_verify_data=False,
+        verify_rollout_ratio=0.0,
+        load_verify_data=["/tmp/fixed_verify.pt"],
+        save_verify_data=None,
+    )
+
+    with pytest.raises(ValueError, match="--load-verify-data requires a positive"):
+        slime_arguments._validate_verify_capture_args(args)
+
+
+@pytest.mark.parametrize("limit", [-1, 1.5])
+def test_verify_capture_validation_rejects_invalid_data_limit(limit):
+    args = Namespace(
+        capture_verify_data=False,
+        verify_rollout_ratio=0.0,
+        save_verify_data=None,
+        verify_data_limit=limit,
+    )
+
+    with pytest.raises(ValueError, match="--verify-data-limit must be a non-negative integer or inf"):
+        slime_arguments._validate_verify_capture_args(args)
+
+
+def test_verify_data_paths_support_files_directories_and_globs(tmp_path):
+    first = tmp_path / "verify_1.pt"
+    second = tmp_path / "verify_2.pt"
+    first.touch()
+    second.touch()
+    (tmp_path / "ignore.json").touch()
+
+    from_directory = kernel_agent_data_source._resolve_verify_data_paths([str(tmp_path)])
+    from_glob = kernel_agent_data_source._resolve_verify_data_paths([str(tmp_path / "verify_*.pt")])
+    deduplicated = kernel_agent_data_source._resolve_verify_data_paths([str(first), str(tmp_path)])
+
+    assert from_directory == [first.resolve(), second.resolve()]
+    assert from_glob == from_directory
+    assert deduplicated == from_directory
+
+
+def test_select_verify_entries_is_without_replacement_and_caps_each_source_group():
+    candidates = [
+        _make_verify_candidate(index, source_group=0, failed_count=index + 1, difficulty=1.0) for index in range(4)
+    ] + [
+        _make_verify_candidate(index + 4, source_group=1, failed_count=index + 1, difficulty=0.5) for index in range(4)
+    ]
+    entries = []
+    for sequence, candidate in enumerate(candidates):
+        difficulty, difficulty_weight = kernel_agent_data_source._verify_difficulty_weight(candidate)
+        entries.append(
+            kernel_agent_data_source.VerifyCandidateEntry(
+                sample=candidate,
+                source_weight_version=7,
+                group_difficulty=difficulty,
+                difficulty_weight=difficulty_weight,
+                insertion_sequence=sequence,
+                capture_rollout_id=None,
+                loaded=False,
+            )
+        )
+
+    selected = kernel_agent_data_source.select_verify_entries(
+        entries,
+        target_size=5,
+        max_samples_per_group=2,
+        current_weight_version=8,
+        rng=random.Random(7),
+    )
+
+    assert len(selected) == 4
+    assert len({entry.sample.index for entry in selected}) == 4
+    selected_per_group = Counter(entry.sample.metadata["source_group_index"] for entry in selected)
+    assert selected_per_group == {0: 2, 1: 2}
+
+
+def test_kernel_agent_data_source_versions_prunes_and_pops_verify_candidates():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        capture_verify_data=True,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    candidates = [
+        _make_verify_candidate(0, source_group=0, failed_count=2, difficulty=1.0),
+        _make_verify_candidate(1, source_group=0, failed_count=1, difficulty=0.5),
+        _make_verify_candidate(2, source_group=1, failed_count=3, difficulty=0.75),
+    ]
+    for candidate, version in zip(candidates, [7, 8, 9], strict=True):
+        candidate.metadata["gen_weight_version"] = version
+
+    assert data_source.add_verify_candidates(candidates) == 3
+    assert data_source.get_verify_buffer_length() == 3
+    assert "source_kernel_weight_version" not in candidates[0].metadata
+    assert [sample.metadata["source_kernel_weight_version"] for sample in data_source.verify_buffer] == [7, 8, 9]
+
+    assert data_source.prune_verify_candidates(current_weight_version=10, max_version_lag=2) == 1
+    selected = data_source.pop_verify_candidates(
+        target_size=2,
+        max_samples_per_group=1,
+        current_weight_version=10,
+        max_version_lag=2,
+    )
+
+    assert len(selected) == 2
+    assert {sample.metadata["source_group_index"] for sample in selected} == {0, 1}
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_data_source_keeps_retry_and_verify_buffers_independent():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        capture_verify_data=True,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    retry_group = [Sample(index=0), Sample(index=1)]
+    candidate = _make_verify_candidate(2, source_group=1, failed_count=1, difficulty=1.0)
+    candidate.metadata["gen_weight_version"] = 7
+
+    data_source.add_samples([retry_group])
+    data_source.add_verify_candidates([candidate])
+
+    assert data_source.get_buffer_length() == 1
+    assert data_source.get_verify_buffer_length() == 1
+
+
+def test_kernel_agent_data_source_without_verify_preserves_normal_data_flow():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+
+    groups = data_source.get_samples(2)
+
+    assert len(groups) == 2
+    assert [len(group) for group in groups] == [2, 2]
+    assert [[sample.group_index for sample in group] for group in groups] == [[0, 0], [1, 1]]
+    assert [[sample.index for sample in group] for group in groups] == [[0, 1], [2, 3]]
+    assert data_source.get_verify_buffer_length() == 0
+
+    retry_group = [Sample(index=10), Sample(index=11)]
+    data_source.add_samples([retry_group])
+
+    assert data_source.get_samples(1) == [retry_group]
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_data_source_mixes_verify_group_when_enabled():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
+    source = _make_schedulable_verify_candidate(index=42, source_group=9)
+    assert data_source.add_verify_candidates([source]) == 1
+
+    groups = data_source.get_samples(1)
+
+    assert len(groups) == 1
+    assert {sample.metadata["role"] for sample in groups[0]} == {"verify"}
+    assert {sample.metadata["source_kernel_index"] for sample in groups[0]} == {42}
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_data_source_falls_back_to_kernel_prompt_when_verify_buffer_is_empty():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
+
+    groups = data_source.get_samples(1)
+
+    assert len(groups) == 1
+    assert len(groups[0]) == 2
+    assert all(sample.metadata.get("role") is None for sample in groups[0])
+
+
+def test_kernel_agent_data_source_does_not_record_verify_buffer_when_disabled():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(verify_rollout_ratio=0.0)
+    )
+    source = _make_schedulable_verify_candidate(index=42, source_group=9)
+    assert data_source.add_verify_candidates([source]) == 0
+
+    groups = data_source.get_samples(1)
+
+    assert all(sample.metadata.get("role") is None for sample in groups[0])
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_verify_source_group_cap_persists_until_weight_version_changes():
+    args = _make_verify_data_source_args()
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    candidates = [
+        _make_schedulable_verify_candidate(index=40, source_group=9),
+        _make_schedulable_verify_candidate(index=41, source_group=9),
+    ]
+    assert data_source.add_verify_candidates(candidates) == 2
+
+    first = data_source.get_samples(1)
+    capped_fallback = data_source.get_samples(1)
+
+    assert first[0][0].metadata["role"] == "verify"
+    assert capped_fallback[0][0].metadata.get("role") is None
+    assert data_source.get_verify_buffer_length() == 1
+
+    args.gen_weight_version = 9
+    after_version_change = data_source.get_samples(1)
+
+    assert after_version_change[0][0].metadata["role"] == "verify"
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_verify_capture_is_saved_even_after_candidate_is_consumed(tmp_path):
+    save_path = str(tmp_path / "verify_{rollout_id}.pt")
+    args = _make_verify_data_source_args(
+        verify_rollout_ratio=0.0,
+        capture_verify_data=True,
+        save_verify_data=save_path,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    source = _make_schedulable_verify_candidate(index=42, source_group=9)
+
+    assert data_source.add_verify_candidates([source], rollout_id=3) == 1
+    consumed = data_source.pop_verify_candidates(
+        target_size=1,
+        max_samples_per_group=1,
+        current_weight_version=8,
+        max_version_lag=2,
+    )
+    assert [sample.index for sample in consumed] == [42]
+    assert data_source.get_verify_buffer_length() == 0
+    assert len(data_source.verify_data) == 1
+    assert data_source.verify_data[0].sample is consumed[0]
+    assert not data_source.verify_data[0].available
+
+    assert data_source.save_captured_verify_data(3) == 1
+
+    saved = torch.load(tmp_path / "verify_3.pt", weights_only=False)
+    assert saved["rollout_id"] == 3
+    assert len(saved["samples"]) == 1
+    assert saved["samples"][0]["index"] == 42
+    assert saved["samples"][0]["metadata"]["source_kernel_weight_version"] == 7
+    assert saved["samples"][0]["metadata"]["verify_capture_rollout_id"] == 3
+    assert data_source.save_captured_verify_data(3) == 0
+    assert len(torch.load(tmp_path / "verify_3.pt", weights_only=False)["samples"]) == 1
+
+    data_source.begin_verify_capture(4)
+    assert data_source.save_captured_verify_data(4) == 0
+    assert torch.load(tmp_path / "verify_4.pt", weights_only=False)["samples"] == []
+
+
+def test_kernel_agent_verify_data_limit_keeps_newer_and_harder_candidates_in_buffer_and_saved_data(tmp_path):
+    save_path = str(tmp_path / "verify_{rollout_id}.pt")
+    args = _make_verify_data_source_args(
+        verify_rollout_ratio=0.0,
+        capture_verify_data=True,
+        save_verify_data=save_path,
+        verify_data_limit=2,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+
+    data_source.begin_verify_capture(3)
+    assert (
+        data_source.add_verify_candidates(
+            [
+                _make_schedulable_verify_candidate(index=40, source_group=9, difficulty=0.2),
+                _make_schedulable_verify_candidate(index=41, source_group=10, difficulty=0.8),
+            ],
+            rollout_id=3,
+        )
+        == 2
+    )
+    assert data_source.save_captured_verify_data(3) == 2
+
+    data_source.begin_verify_capture(4)
+    assert (
+        data_source.add_verify_candidates(
+            [_make_schedulable_verify_candidate(index=42, source_group=11, difficulty=0.5)], rollout_id=4
+        )
+        == 1
+    )
+    assert data_source.save_captured_verify_data(4) == 1
+
+    data_source.begin_verify_capture(5)
+    assert (
+        data_source.add_verify_candidates(
+            [_make_schedulable_verify_candidate(index=43, source_group=12, version=8, difficulty=0.1)], rollout_id=5
+        )
+        == 1
+    )
+    assert data_source.save_captured_verify_data(5) == 1
+
+    assert data_source.get_verify_buffer_length() == 2
+    assert {sample.index for sample in data_source.verify_buffer} == {41, 43}
+    assert [sample["index"] for sample in torch.load(tmp_path / "verify_3.pt", weights_only=False)["samples"]] == [41]
+    assert torch.load(tmp_path / "verify_4.pt", weights_only=False)["samples"] == []
+    assert [sample["index"] for sample in torch.load(tmp_path / "verify_5.pt", weights_only=False)["samples"]] == [43]
+
+
+def test_kernel_agent_verify_data_is_ordered_by_version_difficulty_and_insertion_time():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(verify_rollout_ratio=0.0, capture_verify_data=True)
+    )
+
+    data_source.add_verify_candidates(
+        [
+            _make_schedulable_verify_candidate(index=40, source_group=9, version=7, difficulty=0.5),
+            _make_schedulable_verify_candidate(index=41, source_group=10, version=8, difficulty=0.1),
+            _make_schedulable_verify_candidate(index=42, source_group=11, version=7, difficulty=0.5),
+        ]
+    )
+
+    assert [entry.sample.index for entry in data_source.verify_data] == [40, 42, 41]
+
+
+def test_kernel_agent_fixed_verify_data_replays_each_weight_version_without_online_capture(tmp_path):
+    fixed_path = tmp_path / "verify_3.pt"
+    source = _make_schedulable_verify_candidate(index=42, source_group=9, version=0)
+    torch.save({"rollout_id": 3, "samples": [source.to_dict()]}, fixed_path)
+    args = _make_verify_data_source_args(
+        capture_verify_data=False,
+        load_verify_data=[str(fixed_path)],
+        gen_weight_version=100,
+        verify_max_source_version_lag=1,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+
+    first = data_source.get_samples(1)
+
+    assert first[0][0].metadata["role"] == "verify"
+    assert first[0][0].metadata["source_kernel_index"] == 42
+    assert first[0][0].metadata["source_kernel_weight_version"] == 0
+    assert first[0][0].metadata["verify_data_origin"] == "loaded"
+    assert first[0][0].metadata["verify_data_path"] == str(fixed_path.resolve())
+    assert data_source.get_verify_buffer_length() == 0
+
+    online = _make_schedulable_verify_candidate(index=43, source_group=10, version=100)
+    assert data_source.add_verify_candidates([online], rollout_id=4) == 0
+
+    args.gen_weight_version = 101
+    replayed = data_source.get_samples(1)
+
+    assert replayed[0][0].metadata["role"] == "verify"
+    assert replayed[0][0].metadata["source_kernel_index"] == 42
+
+
+def test_ordinary_rollout_capture_hook_annotates_and_buffers_failed_kernel():
+    args = _make_verify_data_source_args(
+        verify_rollout_ratio=0.0,
+        capture_verify_data=True,
+        save_verify_data=None,
+        gen_weight_version=None,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    failed = _make_schedulable_verify_candidate(index=40, source_group=9)
+    failed.metadata.pop("gen_weight_version")
+    failed.metadata["env_extra_info"] = {"correctness": False}
+    correct = _make_schedulable_verify_candidate(index=41, source_group=9)
+    correct.metadata.pop("gen_weight_version")
+    correct.metadata["trajectory_states"] = ["successed"]
+    correct.metadata["env_extra_info"] = {"correctness": True}
+
+    kernel_agent_data_source.capture_verify_candidates(
+        args,
+        [[failed, correct]],
+        data_source,
+        rollout_id=4,
+    )
+
+    assert failed.metadata["group_correct_rate"] == 0.5
+    assert failed.metadata["group_difficulty"] == 0.5
+    assert data_source.get_verify_buffer_length() == 1
+    assert data_source.verify_buffer[0].index == 40
+    assert data_source.verify_buffer[0].metadata["source_kernel_weight_version"] == 4
+
+
+def test_kernel_agent_data_source_builds_fresh_verify_group_from_failed_kernel():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        capture_verify_data=True,
+        verify_prompt_config_path=str(
+            REPO_ROOT / "examples/kernel_agent/prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"
+        ),
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    source = Sample(
+        index=42,
+        group_index=9,
+        prompt=[
+            {"role": "system", "content": "Write CUDA kernels."},
+            {"role": "user", "content": "Implement vector addition."},
+        ],
+        tokens=[1, 2, 3],
+        response=(
+            "<think>guess that indexing is wrong</think>\n"
+            "Here is an attempted implementation.\n"
+            "### CUDA_KERNELS\n```cpp\ninvalid kernel\n```\n"
+            "This probably needs more work."
+        ),
+        response_length=3,
+        label="reference",
+        reward=-1.0,
+        weight_versions=["7"],
+        status=Sample.Status.COMPLETED,
+        metadata={
+            "role": "kernel",
+            "turn_idx": 2,
+            "gen_weight_version": 7,
+            "trajectory_states": ["failed", "failed", "failed"],
+            "group_num_correct": 1,
+            "group_num_valid": 4,
+            "group_correct_rate": 0.25,
+            "group_difficulty": 0.75,
+            "env_result": {
+                "env_state": {
+                    "status": "runtime_error",
+                    "error": "illegal memory access",
+                    "correctness": False,
+                }
+            },
+        },
+    )
+
+    assert data_source.add_verify_candidates([source]) == 1
+    groups = data_source.get_verify_samples(
+        1,
+        max_samples_per_group=1,
+        current_weight_version=8,
+        max_version_lag=1,
+    )
+
+    assert len(groups) == 1
+    assert len(groups[0]) == 2
+    assert [sample.index for sample in groups[0]] == [0, 1]
+    assert {sample.group_index for sample in groups[0]} == {0}
+    for verify_sample in groups[0]:
+        assert [message["role"] for message in verify_sample.prompt] == ["system", "user", "assistant", "user"]
+        assert verify_sample.prompt[-2]["content"] == "### CUDA_KERNELS\n```cpp\ninvalid kernel\n```"
+        assert "guess that indexing is wrong" not in verify_sample.prompt[-2]["content"]
+        assert "attempted implementation" not in verify_sample.prompt[-2]["content"]
+        assert "illegal memory access" in verify_sample.prompt[-1]["content"]
+        assert "Do not generate kernel code yet." in verify_sample.prompt[-1]["content"]
+        assert "TVM-FFI interface logic" in verify_sample.prompt[-1]["content"]
+        assert verify_sample.response == ""
+        assert verify_sample.tokens == []
+        assert verify_sample.reward is None
+        assert verify_sample.weight_versions == []
+        assert verify_sample.status == Sample.Status.PENDING
+        assert verify_sample.metadata == {
+            "role": "verify",
+            "source_kernel_index": 42,
+            "source_group_index": 9,
+            "source_turn_idx": 2,
+            "source_kernel_weight_version": 7,
+            "trajectory_states": ["failed", "failed", "failed"],
+            "group_num_correct": 1,
+            "group_num_valid": 4,
+            "group_correct_rate": 0.25,
+            "group_difficulty": 0.75,
+        }
+    assert groups[0][0].prompt is not groups[0][1].prompt
+    assert source.metadata["gen_weight_version"] == 7
+    assert "source_kernel_weight_version" not in source.metadata
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_data_source_does_not_buffer_successful_kernel_for_verify():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        capture_verify_data=True,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    source = _make_verify_candidate(1, source_group=0, failed_count=1, difficulty=0.5)
+    source.metadata["trajectory_states"] = ["failed", "successed"]
+    source.metadata["gen_weight_version"] = 7
+
+    assert data_source.add_verify_candidates([source]) == 0
+    assert data_source.get_verify_buffer_length() == 0
+
+
+def test_kernel_agent_data_source_does_not_buffer_failed_response_without_kernel_sections():
+    args = Namespace(
+        rollout_global_dataset=False,
+        buffer_filter_path=None,
+        n_samples_per_prompt=2,
+        rollout_seed=7,
+        capture_verify_data=True,
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    source = _make_verify_candidate(1, source_group=0, failed_count=1, difficulty=0.5)
+    source.response = "<think>I could not produce a kernel.</think> Sorry."
+    source.metadata["gen_weight_version"] = 7
+
+    assert data_source.add_verify_candidates([source]) == 0
+    assert data_source.get_verify_buffer_length() == 0
+
+
 def test_kernel_agent_group_concurrency_matches_client_capacity():
     args = _make_rollout_args()
 
@@ -71,6 +695,35 @@ def test_kernel_agent_group_concurrency_matches_client_capacity():
 
     assert client_concurrency == 64
     assert group_concurrency == 4
+
+
+def test_kernel_agent_logs_cuda_agent_config_once_per_process(monkeypatch, caplog):
+    class FakeThread:
+        @staticmethod
+        def is_alive():
+            return True
+
+    class FakeWorker:
+        def __init__(self, args, data_buffer, concurrency):
+            self.worker_thread = None
+
+        def set_generation_context(self, rollout_id):
+            pass
+
+        def start(self):
+            self.worker_thread = FakeThread()
+
+    monkeypatch.setattr(fully_async_rollout, "_global_worker", None)
+    monkeypatch.setattr(fully_async_rollout, "_config_logged", False)
+    monkeypatch.setattr(fully_async_rollout, "KernelAgentAsyncRolloutWorker", FakeWorker)
+    monkeypatch.setattr(fully_async_rollout, "get_sglang_client_concurrency", lambda args: 4)
+    caplog.set_level(logging.INFO, logger=fully_async_rollout.logger.name)
+
+    args = _make_rollout_args()
+    fully_async_rollout._get_global_worker(args, data_buffer=None, rollout_id=0)
+    fully_async_rollout._get_global_worker(args, data_buffer=None, rollout_id=1)
+
+    assert caplog.text.count("CUDA_AGENT_CONFIGS=") == 1
 
 
 def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch):
@@ -99,6 +752,87 @@ def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch
     assert [group[0].index for group in output.samples] == [0, 1, 2, 3]
     assert worker.queue_size() == 6
     assert [gid for gid, _ in worker.get_completed_groups()] == [4, 5, 6, 7, 8, 9]
+
+
+def test_kernel_agent_collector_adds_failed_candidates_after_difficulty_annotation(monkeypatch):
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    failed = _make_schedulable_verify_candidate(index=42, source_group=9)
+    failed.metadata["env_extra_info"] = {"correctness": False}
+    failed.reward = 0.0
+    failed.response_length = 1
+    worker.output_queue.put((0, [failed]))
+
+    class VerifyBufferSpy:
+        def __init__(self):
+            self.candidates = []
+            self.events = []
+
+        def add_verify_candidates(self, samples, *, rollout_id=None):
+            self.events.append(("add", rollout_id))
+            self.candidates.extend(samples)
+            return len(samples)
+
+        def begin_verify_capture(self, rollout_id):
+            self.events.append(("begin", rollout_id))
+
+        def save_captured_verify_data(self, rollout_id):
+            self.events.append(("save", rollout_id))
+            return len(self.candidates)
+
+    data_buffer = VerifyBufferSpy()
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
+    args = _make_rollout_args(
+        rollout_global_dataset=True,
+        rollout_batch_size=1,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+        verify_rollout_ratio=0.0,
+        capture_verify_data=True,
+        save_verify_data="/tmp/verify_{rollout_id}.pt",
+    )
+
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=0, data_buffer=data_buffer))
+
+    assert output.samples == [[failed]]
+    assert data_buffer.candidates == [failed]
+    assert failed.metadata["group_num_valid"] == 1
+    assert failed.metadata["group_correct_rate"] == 0.0
+    assert failed.metadata["group_difficulty"] == 1.0
+    assert output.metrics["verify_candidates_added"] == 1
+    assert output.metrics["verify_candidates_saved"] == 1
+    assert data_buffer.events == [("begin", 0), ("add", 0), ("save", 0)]
+
+
+def test_kernel_agent_collector_does_not_apply_kernel_filter_to_verify_group(monkeypatch):
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    verify_group = _make_group(42)
+    verify_group[0].metadata = {"role": "verify", "turn_idx": 0}
+    worker.output_queue.put((0, verify_group))
+
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
+    monkeypatch.setattr(fully_async_rollout, "load_function", lambda path: object())
+
+    def reject_filter_call(*args, **kwargs):
+        raise AssertionError("kernel dynamic filter must not receive verify groups")
+
+    monkeypatch.setattr(fully_async_rollout, "call_dynamic_filter", reject_filter_call)
+    args = _make_rollout_args(
+        rollout_global_dataset=True,
+        rollout_batch_size=1,
+        dynamic_sampling_filter_path="fake.kernel.filter",
+        use_multi_turn=False,
+        verify_rollout_ratio=0.0,
+    )
+
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=0, data_buffer=None))
+
+    assert output.samples == [verify_group]
 
 
 def test_kernel_agent_done_callback_never_blocks_on_full_queue(monkeypatch):
@@ -436,10 +1170,11 @@ def test_kernel_agent_top_p_request_is_forced_for_each_turn():
 
 def test_kernel_agent_synthetic_samples_have_singleton_top_p_replay():
     base_sample = Sample(index=1)
+    real_turn = Sample(metadata={"turn_idx": 0, "trajectory_states": ["failed", "failed"]})
     padded = generate_with_cuda_agent._pad_turn_samples(
-        [],
+        [real_turn],
         base_sample,
-        max_turns=1,
+        max_turns=2,
         pad_token_id=42,
         pad_token="<pad>",
         use_top_p_replay=True,
@@ -456,8 +1191,12 @@ def test_kernel_agent_synthetic_samples_have_singleton_top_p_replay():
         1.0,
     )
 
-    assert padded[0].rollout_top_p_token_ids == [42]
-    assert padded[0].rollout_top_p_token_offsets == [0, 1]
+    assert padded[1].rollout_top_p_token_ids == [42]
+    assert padded[1].rollout_top_p_token_offsets == [0, 1]
+    assert type(padded[1]) is Sample
+    assert padded[1].metadata["role"] == "pad"
+    assert padded[1].metadata["is_pad_turn"] is True
+    assert padded[1].metadata["trajectory_states"] == ["failed", "failed"]
     assert aborted.rollout_top_p_token_ids == [0]
     assert aborted.rollout_top_p_token_offsets == [0, 1]
 

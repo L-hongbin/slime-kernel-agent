@@ -359,7 +359,7 @@ def test_kernel_and_overlong_penalties_are_recorded_separately():
     assert details["reward_component"]["overlong_penalty"] == pytest.approx(-1.0)
 
 
-def test_calculate_reward_rejects_conflicting_penalty_modes():
+def test_calculate_kernel_reward_rejects_conflicting_penalty_modes():
     config = {
         **_reward_config(),
         "apply_kernel_failed_score": True,

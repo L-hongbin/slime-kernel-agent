@@ -99,6 +99,22 @@ if [[ ! -f "${TURN_PROMPT_PATH}" ]]; then
    echo "TURN_PROMPT_PATH does not exist or is not a regular file: ${TURN_PROMPT_PATH}" >&2
    exit 1
 fi
+VERIFY_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"
+VERIFY_ROLLOUT_RATIO="${VERIFY_ROLLOUT_RATIO:-0}"
+CAPTURE_VERIFY_DATA="${CAPTURE_VERIFY_DATA:-false}"
+SAVE_VERIFY_DATA="${SAVE_VERIFY_DATA:-}"
+LOAD_VERIFY_DATA="${LOAD_VERIFY_DATA:-}"
+VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP="${VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP:-1}"
+VERIFY_MAX_SOURCE_VERSION_LAG="${VERIFY_MAX_SOURCE_VERSION_LAG:-2}"
+VERIFY_DATA_LIMIT="${VERIFY_DATA_LIMIT:-inf}"
+if [[ "${VERIFY_ROLLOUT_RATIO}" != "0" && ! -f "${VERIFY_PROMPT_PATH}" ]]; then
+   echo "VERIFY_PROMPT_PATH does not exist or is not a regular file: ${VERIFY_PROMPT_PATH}" >&2
+   exit 1
+fi
+if [[ "${CAPTURE_VERIFY_DATA}" != "true" && "${CAPTURE_VERIFY_DATA}" != "false" ]]; then
+   echo "CAPTURE_VERIFY_DATA must be true or false, got: ${CAPTURE_VERIFY_DATA}" >&2
+   exit 1
+fi
 
 case "${LOSS_MODE}" in
     cispo)
@@ -172,6 +188,11 @@ echo "HF_MODEL_PATH: ${HF_MODEL_PATH}"
 echo "MEGATRON_MODEL_PATH: ${MEGATRON_MODEL_PATH}"
 echo "RL_DATA: ${RL_DATA}"
 echo "Turn prompt path: ${TURN_PROMPT_PATH}"
+echo "Verify rollout ratio: ${VERIFY_ROLLOUT_RATIO}"
+echo "Capture verify data: ${CAPTURE_VERIFY_DATA}"
+echo "Save verify data: ${SAVE_VERIFY_DATA:-disabled}"
+echo "Load verify data: ${LOAD_VERIFY_DATA:-disabled}"
+echo "Verify data limit: ${VERIFY_DATA_LIMIT}"
 echo "EXP_NAME: ${EXP_NAME}"
 
 TENSORBOARD_DIR="/ms/FM/lihongbin/kernel_rl/tensorboard_log/${EXP_NAME}"
@@ -396,15 +417,30 @@ MISC_ARGS=(
 )
 
 CUSTOM_ARGS=(
+   --data-source-path examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
    --multi-turn-prompt-config-path $TURN_PROMPT_PATH
+   --verify-prompt-config-path $VERIFY_PROMPT_PATH
+   --verify-rollout-ratio $VERIFY_ROLLOUT_RATIO
+   --verify-max-samples-per-source-group $VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP
+   --verify-max-source-version-lag $VERIFY_MAX_SOURCE_VERSION_LAG
+   --verify-data-limit $VERIFY_DATA_LIMIT
    # TIS-related args, recommended to enable when using TIS
    # --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
    # --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp
 )
+if [[ "${CAPTURE_VERIFY_DATA}" == "true" ]]; then
+   CUSTOM_ARGS+=(--capture-verify-data)
+fi
+if [[ -n "${SAVE_VERIFY_DATA}" ]]; then
+   CUSTOM_ARGS+=(--save-verify-data "${SAVE_VERIFY_DATA}")
+fi
+if [[ -n "${LOAD_VERIFY_DATA}" ]]; then
+   CUSTOM_ARGS+=(--load-verify-data "${LOAD_VERIFY_DATA}")
+fi
 
 KERNEL_AGENT_ARGS=(
    --kernel-env-url ${KERNEL_ENV_URL}

@@ -30,7 +30,9 @@ from slime.utils.types import Sample, _extract_rollout_top_p_token_data
 try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from .kernel_reward import calculate_kernel_reward, calculate_reward
+    from .kernel_reward import calculate_kernel_reward
+    from .prompt_utils import as_messages as _as_messages
+    from .prompt_utils import format_feedback as _apply_feedback_template
     from .utils import (
         _extract_env_extra_info,
         _truncate_middle,
@@ -43,7 +45,9 @@ try:
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from kernel_reward import calculate_kernel_reward, calculate_reward
+    from kernel_reward import calculate_kernel_reward
+    from prompt_utils import as_messages as _as_messages
+    from prompt_utils import format_feedback as _apply_feedback_template
 
     from utils import (
         _extract_env_extra_info,
@@ -107,31 +111,12 @@ Let's think step by step.
 """
 
 
-def _as_messages(prompt: str | list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if isinstance(prompt, list):
-        return deepcopy(prompt)
-    return [{"role": "user", "content": str(prompt)}]
-
-
 def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     response_template = getattr(state, "multi_turn_template", None)
     if response_template is None:
         logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
         return PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
     return response_template
-
-
-def _apply_feedback_template(env_result: dict[str, Any], response_template: PromptTemplate) -> str:
-    feedback_dict = env_result.get("env_state") or env_result
-    try:
-        feedback = json.dumps(feedback_dict, ensure_ascii=False, indent=2)
-    except TypeError:
-        feedback = str(feedback_dict)
-
-    max_chars = int(CUDA_AGENT_CONFIGS["max_feedback_chars"])
-    # max_chars <= 0 means no truncation
-    feedback = _truncate_middle(feedback, max_chars)
-    return response_template.format(feedback=feedback, feedback_dict=feedback_dict)
 
 
 def _format_log_value(value: Any, max_chars: int) -> str:
@@ -321,8 +306,6 @@ def _log_rollout_info(
         env_result = item.get("env_result") if isinstance(item.get("env_result"), dict) else {}
         env_state = env_result.get("env_state") if isinstance(env_result.get("env_state"), dict) else {}
         reward = item.get("reward")
-        if reward is None:
-            reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
         env_extra_info = env_result.get("env_extra_info") if isinstance(env_result.get("env_extra_info"), dict) else {}
         detail_env_time = (
             env_extra_info.get("detail_env_time") if isinstance(env_extra_info.get("detail_env_time"), dict) else {}
@@ -764,6 +747,15 @@ def _pad_turn_samples(
         for sample in output_samples
         if isinstance(sample.metadata, dict) and "turn_idx" in sample.metadata
     }
+    trajectory_states = max(
+        (
+            sample.metadata.get("trajectory_states", [])
+            for sample in output_samples
+            if isinstance(sample.metadata, dict) and isinstance(sample.metadata.get("trajectory_states"), list)
+        ),
+        key=len,
+        default=[],
+    )
     padded_samples = list(output_samples)
     for turn_idx in range(max_turns):
         if turn_idx in samples_by_turn:
@@ -805,9 +797,11 @@ def _pad_turn_samples(
         fake_sample.metadata = dict(fake_sample.metadata or {})
         fake_sample.metadata.update(
             {
+                "role": "pad",
                 "turn_idx": turn_idx,
                 "is_pad_turn": True,
                 "remove_reason": "pad_turn",
+                "trajectory_states": list(trajectory_states),
             }
         )
         padded_samples.append(fake_sample)
@@ -908,10 +902,11 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
     started_at = time.monotonic()
     try:
         async with asyncio.timeout(KERNEL_AGENT_GENERATE_GUARD_SEC):
-            return await _generate_impl(args, sample, sampling_params)
+            return await _generate_with_verify_impl(args, sample, sampling_params)
     except asyncio.TimeoutError:
         elapsed_sec = time.monotonic() - started_at
-        task_id = (sample.metadata or {}).get("task_id")
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        task_id = None if metadata.get("role", "kernel") == "verify" else metadata.get("task_id")
         cancel_sent = False
         if task_id:
             try:
@@ -934,14 +929,30 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         return _abort_result(args, sample, f"exception:{type(exc).__name__}", elapsed_sec)
 
 
-async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
-    """Generate CUDA-kernel multi-turn rollouts.
+async def _generate_with_verify_impl(
+    args,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+) -> Sample | list[Sample]:
+    """Generate a verify response or a normal CUDA-kernel trajectory.
 
-    This follows the drkernel-style structure: each assistant turn becomes one
-    training Sample. Environment feedback is appended to the conversation
-    messages and therefore becomes part of the next turn prompt, not part of the
-    current turn response.
+    Samples with ``metadata["role"] == "verify"`` retain the normal generated-token
+    and log-prob contract, but are not executable kernels, so they bypass
+    KernelGym and the kernel reward function. Samples without a role remain
+    kernel samples for backward compatibility.
+
+    Each generated assistant turn becomes one training Sample. Kernel environment
+    feedback is appended to the conversation before the next kernel turn; verify
+    samples stop after their single model response.
     """
+
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    role = metadata.get("role", "kernel")
+    if role not in {"kernel", "verify", "pad"}:
+        raise ValueError(f"Kernel sample role must be 'kernel', 'verify', or 'pad', got {role!r}")
+    if role == "pad":
+        raise ValueError("A sample with metadata role 'pad' is synthetic and cannot be generated")
+    evaluate_kernel = role == "kernel"
 
     state = GenerateState(args)
     messages = _as_messages(sample.prompt)
@@ -949,7 +960,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     if max_turns is None:
         raise ValueError("--max-turns must be set for CUDA kernel agent rollout")
     max_turns = int(max_turns)
-    padding_turns = bool(getattr(args, "use_multi_turn", False) and getattr(args, "padding_turns", False))
+    if not evaluate_kernel:
+        max_turns = 1
+    padding_turns = bool(
+        evaluate_kernel and getattr(args, "use_multi_turn", False) and getattr(args, "padding_turns", False)
+    )
     pad_token_id = None
     pad_token = None
     if padding_turns:
@@ -961,9 +976,10 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         pad_token = state.tokenizer.pad_token or state.tokenizer.eos_token
         if pad_token is None:
             pad_token = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
-    template = _get_tool_response_template(state)
+    template = _get_tool_response_template(state) if evaluate_kernel else None
     output_samples: list[Sample] = []
     turn_logs: list[dict[str, Any]] = []
+    trajectory_states: list[str] = []
 
     rollout_request_max_retries = int(CUDA_AGENT_CONFIGS.get("rollout_request_max_retries", 60))
     log_rollout_info = bool(CUDA_AGENT_CONFIGS.get("log_rollout_info", True))
@@ -1085,14 +1101,18 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             log_probs = [0.0] * len(response_ids)
 
         status = Sample.Status.TRUNCATED if finish_type == "length" else Sample.Status.COMPLETED
-        env_started_at = time.monotonic()
-        env_result = await cuda_kernel_env(
-            args,
-            sample,
-            response,
-            turn_idx,
-        )
-        env_time = time.monotonic() - env_started_at
+        if evaluate_kernel:
+            env_started_at = time.monotonic()
+            env_result = await cuda_kernel_env(
+                args,
+                sample,
+                response,
+                turn_idx,
+            )
+            env_time = time.monotonic() - env_started_at
+        else:
+            env_result = {"env_extra_info": {}}
+            env_time = 0.0
         turn_sample = _sample_for_turn(
             sample,
             prompt_ids=prompt_ids,
@@ -1109,8 +1129,19 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         )
         turn_sample.metadata["model_time"] = model_time
         turn_sample.metadata["env_time"] = env_time
-        turn_reward = await reward_func(args, turn_sample)
+        if not evaluate_kernel:
+            turn_sample.metadata.pop("task_id", None)
+        turn_reward = await reward_func(args, turn_sample) if evaluate_kernel else 0.0
         turn_sample.reward = turn_reward
+        if evaluate_kernel:
+            env_extra_info = turn_sample.metadata.get("env_extra_info")
+            is_correct = (
+                isinstance(env_extra_info, dict)
+                and bool(env_extra_info.get("correctness"))
+                and not bool(env_extra_info.get("decoy_kernel", False))
+            )
+            trajectory_states.append("successed" if is_correct else "failed")
+            turn_sample.metadata["trajectory_states"] = list(trajectory_states)
         turn_log = {
             "turn_idx": turn_idx,
             "task_id": turn_sample.metadata.get("task_id"),
@@ -1137,6 +1168,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             }
         )
 
+        if not evaluate_kernel:
+            finish_reason = "verify_complete"
+            break
+
+        assert template is not None
         format_feedback = _apply_feedback_template(env_result, template)
         turn_log["format_feedback"] = format_feedback
 

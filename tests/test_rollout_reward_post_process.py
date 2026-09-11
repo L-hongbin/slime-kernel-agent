@@ -13,7 +13,11 @@ if repo_root_path in sys.path:
 sys.path.insert(0, repo_root_path)
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_reward import _compute_dynamic_auxiliary_gate, reward_post_process_by_group
+from examples.kernel_agent.kernel_reward import (
+    _compute_dynamic_auxiliary_gate,
+    annotate_group_difficulty,
+    reward_post_process_by_group,
+)
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
 
@@ -91,6 +95,40 @@ def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: flo
     assert _compute_dynamic_auxiliary_gate(num_correct, group_size) == pytest.approx(expected)
 
 
+def test_annotate_group_difficulty_records_shared_group_statistics():
+    correct = _make_sample(0, 0, 1.0, turn_idx=1)
+    incorrect = _make_sample(1, 0, 0.0, turn_idx=1)
+    removed = _make_sample(2, 0, 0.0, turn_idx=1)
+    padded = _make_sample(3, 0, 0.0, turn_idx=1)
+    aborted = _make_sample(4, 0, 0.0, turn_idx=1)
+    _set_reward_component(correct, correctness_score=1.0)
+    _set_reward_component(incorrect)
+    _set_reward_component(removed)
+    _set_reward_component(padded)
+    _set_reward_component(aborted)
+    removed.remove_sample = True
+    padded.metadata["is_pad_turn"] = True
+    aborted.status = Sample.Status.ABORTED
+
+    samples = [correct, incorrect, removed, padded, aborted]
+    assert annotate_group_difficulty(samples) == (1, 2)
+
+    for sample in samples:
+        assert sample.metadata["group_num_correct"] == 1
+        assert sample.metadata["group_num_valid"] == 2
+        assert sample.metadata["group_correct_rate"] == pytest.approx(0.5)
+        assert sample.metadata["group_difficulty"] == pytest.approx(0.5)
+
+
+def test_annotate_group_difficulty_does_not_mark_empty_group_as_hard():
+    removed = _make_sample(0, 0, 0.0)
+    removed.remove_sample = True
+
+    assert annotate_group_difficulty([removed]) == (0, 0)
+    assert removed.metadata["group_correct_rate"] == 0.0
+    assert removed.metadata["group_difficulty"] == 0.0
+
+
 def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
@@ -120,6 +158,11 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypat
     }
     assert samples[1].metadata["reward_component"]["performance"] == pytest.approx(gate * 0.1)
     assert samples[1].metadata["reward_component"]["coverage"] == pytest.approx(gate * 0.2)
+    for sample in samples:
+        assert sample.metadata["group_num_correct"] == 2
+        assert sample.metadata["group_num_valid"] == 4
+        assert sample.metadata["group_correct_rate"] == pytest.approx(0.5)
+        assert sample.metadata["group_difficulty"] == pytest.approx(0.5)
 
 
 def test_dynamic_reward_all_correct_matches_fixed_half_weights(monkeypatch):
@@ -236,6 +279,11 @@ def test_post_process_rewards_by_group_matches_original_last_turn(
 
     assert raw_rewards_by_group == raw_rewards
     assert rewards_by_group == pytest.approx(rewards)
+    for sample in samples:
+        assert sample.metadata["group_num_correct"] == 0
+        assert sample.metadata["group_num_valid"] == 3
+        assert sample.metadata["group_correct_rate"] == 0.0
+        assert sample.metadata["group_difficulty"] == 1.0
 
 
 @pytest.mark.parametrize(

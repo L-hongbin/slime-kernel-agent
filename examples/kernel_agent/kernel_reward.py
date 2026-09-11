@@ -30,11 +30,6 @@ except ImportError:
     )
 
 
-def calculate_reward(env_result: dict[str, Any], config: dict[str, Any]) -> float:
-    env_state = env_result.get("env_state") if isinstance(env_result, dict) else {}
-    return calculate_kernel_reward(env_state, config)["reward"]
-
-
 def _timing_cv_and_trials(metadata: dict[str, Any], prefix: str) -> tuple[float, int]:
     mean = metadata.get(f"{prefix}_mean_ms")
     std = metadata.get(f"{prefix}_std_ms")
@@ -147,6 +142,45 @@ def _sample_is_correct(sample) -> bool:
     return isinstance(components, dict) and float(components.get("correctness", 0.0)) > 0.0
 
 
+def annotate_group_difficulty(samples) -> tuple[int, int]:
+    """Annotate one reward group with shared correctness/difficulty statistics.
+
+    Multi-turn callers pass one ``(group_index, turn_idx)`` group at a time, so
+    the resulting metadata describes the difficulty of that specific turn.
+    Removed, padded, and aborted samples do not contribute to the denominator.
+    Every kernel or pad sample receives the annotation for logging and
+    downstream replay; verify samples keep their source-kernel annotations.
+    """
+
+    kernel_samples = []
+    valid_samples = []
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if metadata.get("role", "kernel") not in {"kernel", "pad"}:
+            continue
+        kernel_samples.append(sample)
+        if sample.remove_sample or sample.status == sample.Status.ABORTED or metadata.get("is_pad_turn"):
+            continue
+        valid_samples.append(sample)
+
+    num_valid = len(valid_samples)
+    num_correct = sum(_sample_is_correct(sample) for sample in valid_samples)
+    correct_rate = num_correct / num_valid if num_valid else 0.0
+    difficulty = 1.0 - correct_rate if num_valid else 0.0
+
+    annotation = {
+        "group_num_correct": num_correct,
+        "group_num_valid": num_valid,
+        "group_correct_rate": correct_rate,
+        "group_difficulty": difficulty,
+    }
+    for sample in kernel_samples:
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata.update(annotation)
+
+    return num_correct, num_valid
+
+
 def _apply_dynamic_group_reward_weights(
     samples,
     rewards,
@@ -155,13 +189,13 @@ def _apply_dynamic_group_reward_weights(
     """Rebuild rewards from their components with a group auxiliary gate."""
 
     rewards = [float(reward) for reward in rewards]
-    if not config.get("enable_dynamic_reward_weight", False):
-        return rewards
     if len(samples) != len(rewards):
         raise ValueError("samples and rewards must have the same length")
 
-    group_size = len(samples)
-    num_correct = sum(_sample_is_correct(sample) for sample in samples)
+    num_correct, group_size = annotate_group_difficulty(samples)
+    if not config.get("enable_dynamic_reward_weight", False):
+        return rewards
+
     gate = _compute_dynamic_auxiliary_gate(num_correct, group_size)
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
@@ -338,6 +372,7 @@ def reward_post_process_by_group(args, samples):
     failed_score = float(reward_config["failed_score"])
     for group_index, group_indices in reward_groups.items():
         group_samples = [samples[idx] for idx in group_indices]
+        annotate_group_difficulty(group_samples)
         group_reward_values = [raw_rewards[idx] for idx in group_indices]
         if apply_failed_group_reward:
             group_reward_values = _apply_failed_group_reward(

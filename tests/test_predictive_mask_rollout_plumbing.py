@@ -194,14 +194,155 @@ def test_cuda_agent_generate_requests_and_captures_top_logprobs(monkeypatch):
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
     )
-    result = asyncio.run(cuda_agent._generate_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
+    result = asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
 
     assert captured["top_logprobs_num"] == 2
     assert len(result) == 1
     turn = result[0]
+    assert type(turn) is Sample
     assert turn.rollout_topk_token_ids.shape == (2, 3)
     assert turn.rollout_topk_token_ids.dtype == np.int32
     assert turn.rollout_topk_valid_mask[1].all()
+    assert turn.metadata["trajectory_states"] == ["failed"]
+
+
+@pytest.mark.unit
+def test_cuda_agent_generate_records_cumulative_trajectory_failures(monkeypatch):
+    env_results = iter(
+        [
+            {
+                "env_state": {"done": False, "error": "COMPILATION_ERROR"},
+                "env_extra_info": {"correctness": False, "decoy_kernel": False},
+            },
+            {
+                "env_state": {"done": False, "error": "DECOY_KERNEL_DETECTED"},
+                "env_extra_info": {"correctness": True, "decoy_kernel": True},
+            },
+            {
+                "env_state": {"done": True},
+                "env_extra_info": {"correctness": True, "decoy_kernel": False},
+            },
+        ]
+    )
+
+    async def fake_post(url, payload, max_retries=None):
+        return {"text": "answer", "meta_info": _meta_info()}
+
+    async def fake_env(*args, **kwargs):
+        return next(env_results)
+
+    async def fake_reward(*args, **kwargs):
+        return 1.0
+
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
+    monkeypatch.setattr(cuda_agent, "post", fake_post)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", fake_env)
+    monkeypatch.setattr(cuda_agent, "reward_func", fake_reward)
+    monkeypatch.setattr(cuda_agent, "postprocess_turn_samples", lambda args, samples, finish_reason: samples)
+
+    args = SimpleNamespace(
+        max_turns=3,
+        use_multi_turn=True,
+        padding_turns=False,
+        rollout_max_context_len=None,
+        sglang_speculative_algorithm=None,
+        dppo_predictive_top_k=2,
+        use_rollout_routing_replay=False,
+        use_lora_weight_sync=False,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+    )
+    result = asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
+
+    assert [sample.metadata["trajectory_states"] for sample in result] == [
+        ["failed"],
+        ["failed", "failed"],
+        ["failed", "failed", "successed"],
+    ]
+
+
+@pytest.mark.unit
+def test_cuda_agent_verify_sample_skips_kernel_env_and_reward(monkeypatch):
+    captured = {}
+
+    async def fake_post(url, payload, max_retries=None):
+        captured.update(payload)
+        return {"text": "<VERIFY>diagnosis</VERIFY>", "meta_info": _meta_info()}
+
+    async def unexpected_kernel_env(*args, **kwargs):
+        raise AssertionError("verify samples must not call KernelGym")
+
+    async def unexpected_reward(*args, **kwargs):
+        raise AssertionError("verify samples must not call the kernel reward")
+
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
+    monkeypatch.setattr(cuda_agent, "post", fake_post)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", unexpected_kernel_env)
+    monkeypatch.setattr(cuda_agent, "reward_func", unexpected_reward)
+    monkeypatch.setattr(cuda_agent, "postprocess_turn_samples", lambda args, samples, finish_reason: samples)
+
+    args = SimpleNamespace(
+        max_turns=3,
+        use_multi_turn=True,
+        padding_turns=True,
+        rollout_max_context_len=None,
+        sglang_speculative_algorithm=None,
+        dppo_predictive_top_k=2,
+        use_rollout_routing_replay=False,
+        use_lora_weight_sync=False,
+        sglang_router_ip="127.0.0.1",
+        sglang_router_port=30000,
+    )
+    sample = Sample(prompt="diagnose this kernel", metadata={"role": "verify", "task_id": "old-kernel-task"})
+    result = asyncio.run(cuda_agent._generate_with_verify_impl(args, sample, {"max_new_tokens": 2}))
+
+    assert captured["return_logprob"] is True
+    assert len(result) == 1
+    verify_sample = result[0]
+    assert verify_sample.response == "<VERIFY>diagnosis</VERIFY>"
+    assert verify_sample.reward == 0.0
+    assert type(verify_sample) is Sample
+    assert verify_sample.metadata["role"] == "verify"
+    assert verify_sample.metadata["env_result"] == {"env_extra_info": {}}
+    assert verify_sample.metadata["env_extra_info"] == {}
+    assert verify_sample.metadata["env_time"] == 0.0
+    assert "task_id" not in verify_sample.metadata
+
+
+@pytest.mark.unit
+def test_cuda_agent_verify_sample_skips_kernel_coverage_rejection():
+    verify_sample = Sample(
+        reward=0.0,
+        response="<VERIFY>diagnosis</VERIFY>",
+        response_length=1,
+        loss_mask=[1],
+        status=Sample.Status.COMPLETED,
+        metadata={"role": "verify", "turn_idx": 0, "env_extra_info": {}},
+    )
+    args = SimpleNamespace(
+        advantage_estimator="trloo",
+        multi_turn_gamma=1.0,
+        use_coverage_rs=True,
+        coverage_rs_key="time_coverage",
+        coverage_rs_threshold=0.3,
+        coverage_rs_factor=0.1,
+        finalize_mode="none",
+    )
+
+    result = cuda_agent.postprocess_turn_samples(args, [verify_sample], finish_reason="verify_complete")
+
+    assert result == [verify_sample]
+    assert verify_sample.remove_sample is False
+    assert verify_sample.metadata["multi_turn_reward"] == 0.0
+    assert verify_sample.metadata["trajectory_finish_reason"] == "verify_complete"
+
+
+@pytest.mark.unit
+def test_cuda_agent_rejects_pad_sample_generation():
+    args = SimpleNamespace()
+
+    with pytest.raises(ValueError, match="synthetic and cannot be generated"):
+        asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(metadata={"role": "pad"}), {}))
 
 
 def _make_manager(top_k: int = 2):

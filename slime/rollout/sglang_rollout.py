@@ -1012,7 +1012,14 @@ async def generate_rollout_async(
     # There can be circumstances where users want to process all samples including filtered ones.
     if args.rollout_all_samples_process_path is not None:
         process_func = load_function(args.rollout_all_samples_process_path)
-        process_func(args, all_samples, data_source)
+        process_signature = inspect.signature(process_func)
+        accepts_rollout_id = "rollout_id" in process_signature.parameters or any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in process_signature.parameters.values()
+        )
+        if accepts_rollout_id:
+            process_func(args, all_samples, data_source, rollout_id=rollout_id)
+        else:
+            process_func(args, all_samples, data_source)
 
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect()), aborted_samples
 
