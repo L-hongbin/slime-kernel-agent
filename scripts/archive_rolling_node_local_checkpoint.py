@@ -11,6 +11,10 @@ then removes the exact remote ``iter_XXXXXXX`` directories; ``--retain-source``
 keeps every node-local source checkpoint intact for non-destructive archival.
 Production launchers may instead use ``--source-only`` to keep a bounded number
 of finalized node-local generations without creating a second archive copy.
+In source-only mode, atomically replacing ``<status-dir>/retention.json`` with
+``{"keep_sources": N}`` changes retention at the next poll without a restart.
+The CLI value is the startup default; an absent file retains the current value,
+and an invalid file aborts the poll before any checkpoint can be removed.
 """
 
 from __future__ import annotations
@@ -522,7 +526,23 @@ class RollingSourcePruner:
         temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temporary, self.status_dir / "watcher_status.json")
 
+    def _reload_retention(self) -> None:
+        path = self.status_dir / "retention.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        if not isinstance(payload, dict) or set(payload) != {"keep_sources"}:
+            raise ValueError(f"invalid retention configuration: {path}")
+        value = payload["keep_sources"]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"keep_sources must be a positive integer: {path}")
+        if value != self.keep_sources:
+            LOG.info("retention changed: keep_sources=%s -> %s", self.keep_sources, value)
+        self.keep_sources = value
+
     def poll_once(self) -> int:
+        self._reload_retention()
         trackers = self._parallel(lambda host: self.transport.read_tracker(host, self.checkpoint_dir), self.hosts)
         iterations = self._parallel(lambda host: self.transport.list_iterations(host, self.checkpoint_dir), self.hosts)
         layouts = self._parallel(lambda host: self.transport.inspect_iterations(host, self.checkpoint_dir), self.hosts)
@@ -593,7 +613,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="prune superseded node-local checkpoints without copying them to an archive",
     )
-    parser.add_argument("--keep-sources", type=int, default=2)
+    parser.add_argument(
+        "--keep-sources",
+        type=int,
+        default=2,
+        help="source-only startup retention; status-dir/retention.json can override it at each poll",
+    )
     parser.add_argument("--status-dir", type=Path)
     parser.add_argument(
         "--retain-source",

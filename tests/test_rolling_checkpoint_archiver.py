@@ -330,6 +330,78 @@ def test_source_pruner_handles_rank0_only_metadata_and_tracker(tmp_path: Path):
         assert (root / "iter_0000059").is_dir()
 
 
+def test_source_pruner_reloads_retention_between_polls_and_keeps_inflight(tmp_path: Path):
+    roots = {"node70": tmp_path / "remote70", "node69": tmp_path / "remote69"}
+    for root in roots.values():
+        root.mkdir()
+        make_checkpoint(root, 19, b"first")
+    transport = LocalTransport(roots)
+    status_dir = tmp_path / "status"
+    pruner = RollingSourcePruner(
+        hosts=[HostSpec(label, label) for label in roots],
+        checkpoint_dir="/nfs/FM/x/experiments/qwen38/checkpoints",
+        status_dir=status_dir,
+        transport=transport,
+        keep_sources=1,
+    )
+    assert pruner.poll_once() == 0
+    for root in roots.values():
+        make_checkpoint(root, 39, b"second")
+    temporary = status_dir / "retention.tmp"
+    temporary.write_text('{"keep_sources": 2}', encoding="utf-8")
+    temporary.replace(status_dir / "retention.json")
+    assert pruner.poll_once() == 0
+    assert transport.removed == []
+    assert json.loads((status_dir / "watcher_status.json").read_text())["keep_sources"] == 2
+    for root in roots.values():
+        make_checkpoint(root, 59, b"third")
+        inflight = root / "iter_0000079"
+        inflight.mkdir()
+        (inflight / "rank.distcp").write_bytes(b"partial")
+    assert pruner.poll_once() == 2
+    assert set(transport.removed) == {("node70", 19), ("node69", 19)}
+    assert all((root / "iter_0000079").is_dir() for root in roots.values())
+    (status_dir / "retention.json").unlink()
+    assert pruner.poll_once() == 0
+    assert pruner.keep_sources == 2  # Removing the override does not reset a live watcher to keep=1.
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "{",
+        "[]",
+        "{}",
+        '{"keep_sources": 0}',
+        '{"keep_sources": -1}',
+        '{"keep_sources": true}',
+        '{"keep_sources": 2.0}',
+        '{"keep_sources": "2"}',
+        '{"keep_sources": 2, "typo": 1}',
+    ],
+)
+def test_source_pruner_invalid_override_prevents_deletion(tmp_path: Path, payload: str):
+    roots = {"node70": tmp_path / "remote70", "node69": tmp_path / "remote69"}
+    for root in roots.values():
+        root.mkdir()
+        for iteration in (19, 39, 59):
+            make_checkpoint(root, iteration, b"complete")
+    transport = LocalTransport(roots)
+    status_dir = tmp_path / "status"
+    pruner = RollingSourcePruner(
+        hosts=[HostSpec(label, label) for label in roots],
+        checkpoint_dir="/nfs/FM/x/experiments/qwen38/checkpoints",
+        status_dir=status_dir,
+        transport=transport,
+        keep_sources=1,
+    )
+    (status_dir / "retention.json").write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError):
+        pruner.poll_once()
+    assert transport.removed == []
+    assert all((root / "iter_0000019").is_dir() for root in roots.values())
+
+
 def test_archives_hashes_then_prunes_exact_node_local_iteration(tmp_path: Path):
     roots = {"node70": tmp_path / "remote70", "node69": tmp_path / "remote69"}
     for root in roots.values():
