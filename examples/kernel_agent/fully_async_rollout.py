@@ -10,9 +10,11 @@ import asyncio
 import atexit
 import copy
 import logging
+import math
 import queue
 import threading
 import time
+import uuid
 from collections import Counter
 from collections.abc import Iterable
 from typing import Any
@@ -23,7 +25,12 @@ from examples.kernel_agent.kernel_reward import annotate_group_difficulty
 from slime.observability.metric_utils import compute_rollout_step
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
-from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
+from slime.rollout.sglang_rollout import (
+    GenerateState,
+    _split_turns_as_sample_groups,
+    generate_and_rm,
+    generate_and_rm_group,
+)
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_sglang_client_concurrency
 from slime.utils.misc import load_function
@@ -92,14 +99,18 @@ def _get_last_non_pad_turn_group(groups: list[RolloutGroup]) -> RolloutGroup:
     return [sample if sample is not None else groups[-1][i] for i, sample in enumerate(last_turn_group)]
 
 
-def _is_verify_group(group: RolloutGroup) -> bool:
+def _is_verify_trajectory_group(group: RolloutGroup) -> bool:
     return bool(group) and all(
-        isinstance(sample.metadata, dict) and sample.metadata.get("role") == "verify" for sample in group
+        isinstance(sample.metadata, dict)
+        and (sample.metadata.get("role") == "verify" or sample.metadata.get("verify_trajectory", False))
+        for sample in group
     )
 
 
 def _get_group_concurrency(args, client_concurrency: int) -> int:
     n_samples_per_prompt = max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1))
+    if getattr(args, "verify_advantage_baseline", "group") == "anchor":
+        n_samples_per_prompt += 1
     client_concurrency = max(1, int(client_concurrency))
     return max(1, client_concurrency // n_samples_per_prompt)
 
@@ -198,6 +209,122 @@ class KernelAgentAsyncRolloutWorker:
             if getattr(self.args, "log_exp_metrics", False):
                 metadata["gen_submit_time"] = time.time()
             sample.metadata = metadata
+
+    async def _generate_group(self, group: RolloutGroup, sampling_params: dict[str, Any]) -> RolloutTaskResult:
+        if not (group[0].metadata or {}).get("verify_anchor_key"):
+            return await generate_and_rm_group(self.args, group, sampling_params, evaluation=False)
+
+        key = self.data_buffer.prepare_anchor(group)
+        anchor = self.data_buffer.claim_anchor(key)
+        if anchor is None:
+            raise ValueError("shared anchor has already been claimed")
+        anchor.metadata["verify_anchor_key"] = key
+        for name in ("gen_weight_version", "rollout_step", "gen_submit_time"):
+            if name in group[0].metadata:
+                anchor.metadata[name] = group[0].metadata[name]
+        tasks = []
+        try:
+            # Anchor has its own index/seed and consumes no slot in the N candidate seed array.
+            for idx, sample in enumerate([anchor, *group]):
+                if sample.session_id is None:
+                    sample.session_id = str(uuid.uuid4())
+                params = sampling_params.copy()
+                if getattr(self.args, "sglang_enable_deterministic_inference", False):
+                    params["sampling_seed"] = (
+                        self.args.rollout_seed + len(group) if idx == 0 else self.state.group_sampling_seeds[idx - 1]
+                    )
+                tasks.append(asyncio.create_task(generate_and_rm(self.args, sample, params, evaluation=False)))
+            anchor_task, *candidate_tasks = tasks
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    outputs = task.result()
+                    if not isinstance(outputs, list) or not outputs or _has_aborted_sample(outputs):
+                        raise ValueError("shared-anchor group rollout did not finish")
+                    if task is anchor_task:
+                        if len(outputs) != 1 or outputs[0].remove_sample:
+                            raise ValueError("shared anchor requires one valid evaluated kernel")
+                        turn = outputs[0]
+                        reward = float(turn.reward)
+                        if not math.isfinite(reward):
+                            raise ValueError("shared anchor reward must be finite")
+                        self.data_buffer.complete_anchor(
+                            key,
+                            {
+                                "response": turn.response,
+                                "reward": reward,
+                                "env_result": copy.deepcopy(turn.metadata.get("env_result")),
+                                "weight_versions": list(turn.weight_versions),
+                            },
+                        )
+                if all(task.done() for task in candidate_tasks):
+                    trajectories = [task.result() for task in candidate_tasks]
+                    if not any(
+                        turn.metadata.get("role") == "verify" and not turn.remove_sample
+                        for trajectory in trajectories
+                        for turn in trajectory
+                    ):
+                        return _split_turns_as_sample_groups(trajectories)
+
+            trajectories = [task.result() for task in candidate_tasks]
+            for trajectory in trajectories:
+                # Reads are non-consuming: every candidate and every turn uses the same fixed baseline.
+                baseline = self.data_buffer.get_anchor_result(key)
+                by_turn = {turn.metadata["turn_idx"]: turn for turn in trajectory}
+                for verify in trajectory:
+                    if verify.metadata.get("role") != "verify":
+                        continue
+                    verify.metadata.update(
+                        verify_anchor_key=key,
+                        verify_anchor_rollout=[copy.deepcopy(baseline)],
+                        verify_anchor_reward=baseline["reward"],
+                        verify_reward_mode="anchor",
+                        verify_anchor_baseline="fixed_source",
+                    )
+                    if verify.remove_sample:
+                        continue
+                    kernel = by_turn[verify.metadata["turn_idx"] + 1]
+                    versions = set(verify.metadata["verify_scoring_weight_versions"])
+                    versions.update(str(version) for version in baseline["weight_versions"])
+                    verify.metadata.update(
+                        verify_scoring_weight_versions=sorted(versions),
+                        verify_scoring_versions_complete=bool(
+                            verify.metadata["verify_scoring_versions_complete"] and baseline["weight_versions"]
+                        ),
+                        verify_scoring_version_mismatch=len(versions) > 1,
+                    )
+                    if len(versions) > 1:
+                        for turn in (verify, kernel):
+                            turn.remove_sample = True
+                            turn.loss_mask = [0] * turn.response_length
+                            turn.reward = 0.0
+                            turn.metadata.update(
+                                multi_turn_reward=0.0, remove_reason="verify_scoring_version_mismatch"
+                            )
+                    else:
+                        verify.reward = verify.metadata["verify_kernel_reward"] - baseline["reward"]
+                        verify.metadata["multi_turn_reward"] = verify.reward
+            return _split_turns_as_sample_groups(trajectories)
+        except Exception:
+            logger.exception("Shared anchor group %s failed; returning aborted candidates for retry", key)
+            from examples.kernel_agent.generate_with_cuda_agent import _abort_result
+
+            abort_args = copy.copy(self.args)
+            abort_args.max_turns = 1
+            abort_args.use_multi_turn = True
+            abort_args.padding_turns = False
+            return _split_turns_as_sample_groups(
+                [_abort_result(abort_args, sample, "shared_anchor_group_failed", 0.0) for sample in group]
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                self.data_buffer.release_anchor(key)
 
     @staticmethod
     def _reconcile_engine_weight_versions(task_group: RolloutTaskResult) -> None:
@@ -315,11 +442,9 @@ class KernelAgentAsyncRolloutWorker:
                         self._stamp_group_for_submission(group)
                         original_group = copy.deepcopy(group)
                         task = asyncio.create_task(
-                            generate_and_rm_group(
-                                self.args,
+                            self._generate_group(
                                 group,
                                 sampling_params=self.state.sampling_params.copy(),
-                                evaluation=False,
                             )
                         )
                         task.add_done_callback(self._make_done_cb(gid, original_group))
@@ -388,11 +513,7 @@ class KernelAgentAsyncRolloutWorker:
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
 
-    verify_rollout_ratio = float(getattr(args, "verify_rollout_ratio", 0.0))
-    fixed_verify_data = bool(getattr(args, "load_verify_data", None))
-    verify_capture_enabled = bool(getattr(args, "capture_verify_data", False)) or (
-        verify_rollout_ratio > 0.0 and not fixed_verify_data
-    )
+    verify_capture_enabled = bool(getattr(args, "capture_verify_data", False))
     if verify_capture_enabled and not callable(getattr(data_buffer, "add_verify_candidates", None)):
         raise TypeError(
             "Verify capture requires a data source that implements add_verify_candidates; "
@@ -473,7 +594,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
 
             if filter_by_last_turn:
                 last_turn_group = _get_last_non_pad_turn_group(groups)
-                if _is_verify_group(last_turn_group):
+                if _is_verify_trajectory_group(last_turn_group):
                     collected[gid] = groups
                     continue
                 dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, last_turn_group)
@@ -483,7 +604,7 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
                     _record_dynamic_filter_drop(dynamic_filter_output.reason)
             else:
                 for group in groups:
-                    if _is_verify_group(group):
+                    if _is_verify_trajectory_group(group):
                         collected.setdefault(gid, []).append(group)
                         continue
                     dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)

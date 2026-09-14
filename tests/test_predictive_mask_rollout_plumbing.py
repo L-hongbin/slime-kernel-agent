@@ -194,7 +194,7 @@ def test_cuda_agent_generate_requests_and_captures_top_logprobs(monkeypatch):
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
     )
-    result = asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
+    result = asyncio.run(cuda_agent._generate_kernel_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
 
     assert captured["top_logprobs_num"] == 2
     assert len(result) == 1
@@ -252,7 +252,7 @@ def test_cuda_agent_generate_records_cumulative_trajectory_failures(monkeypatch)
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
     )
-    result = asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
+    result = asyncio.run(cuda_agent._generate_kernel_impl(args, Sample(prompt="hello"), {"max_new_tokens": 2}))
 
     assert [sample.metadata["trajectory_states"] for sample in result] == [
         ["failed"],
@@ -262,24 +262,60 @@ def test_cuda_agent_generate_records_cumulative_trajectory_failures(monkeypatch)
 
 
 @pytest.mark.unit
-def test_cuda_agent_verify_sample_skips_kernel_env_and_reward(monkeypatch):
-    captured = {}
+@pytest.mark.parametrize("baseline", ["group", "history", "anchor"])
+@pytest.mark.parametrize("pairs", [1, 2, 3])
+@pytest.mark.parametrize("version_mismatch", [False, True])
+@pytest.mark.parametrize("env_done", [False, True])
+@pytest.mark.parametrize("gamma", [0.0, 0.5])
+def test_cuda_agent_verify_trains_diagnosis_and_kernel_with_paired_rewards(
+    monkeypatch, baseline, pairs, version_mismatch, env_done, gamma
+):
+    use_anchor = baseline == "anchor"
+    captured = []
+    messages_seen = []
+    env_samples = []
+    state = _GenerateState()
+    raw_verification = (
+        "<think>private reasoning <VERIFY>draft</VERIFY></think>\n"
+        "Unrelated preamble\n<VERIFY>diagnosis</VERIFY>\nUnrelated trailing prose"
+    )
+
+    def chat_template(messages, **kwargs):
+        messages_seen.append(messages.copy())
+        return "prompt"
+
+    monkeypatch.setattr(state.tokenizer, "apply_chat_template", chat_template)
 
     async def fake_post(url, payload, max_retries=None):
-        captured.update(payload)
-        return {"text": "<VERIFY>diagnosis</VERIFY>", "meta_info": _meta_info()}
+        captured.append(payload)
+        meta = _meta_info()
+        is_diagnosis = (len(captured) - 1) % 2 == 0
+        meta["weight_version"] = "8" if version_mismatch and not is_diagnosis else "7"
+        return {
+            "text": raw_verification if is_diagnosis else "kernel revision",
+            "meta_info": meta,
+        }
 
-    async def unexpected_kernel_env(*args, **kwargs):
-        raise AssertionError("verify samples must not call KernelGym")
+    async def fake_kernel_env(args, sample, response, turn_idx):
+        assert sample.metadata["role"] == "kernel"
+        assert response == "kernel revision"
+        assert sample.label == {"ground_truth": "reference"}
+        env_samples.append(sample)
+        return {
+            "env_state": {"done": env_done, "correctness": True},
+            "env_extra_info": {"correctness": True, "decoy_kernel": False},
+        }
 
-    async def unexpected_reward(*args, **kwargs):
-        raise AssertionError("verify samples must not call the kernel reward")
+    async def fake_reward(args, sample):
+        assert sample.metadata["role"] == "kernel"
+        assert sample.metadata["turn_idx"] == 0  # Exactly one evaluated kernel per branch.
+        return 0.8 if sample.metadata["verify_scoring_branch"] == "verified" else 0.3
 
-    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: state)
     monkeypatch.setattr(cuda_agent, "post", fake_post)
-    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", unexpected_kernel_env)
-    monkeypatch.setattr(cuda_agent, "reward_func", unexpected_reward)
-    monkeypatch.setattr(cuda_agent, "postprocess_turn_samples", lambda args, samples, finish_reason: samples)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", fake_kernel_env)
+    monkeypatch.setattr(cuda_agent, "reward_func", fake_reward)
+    monkeypatch.setitem(cuda_agent.CUDA_AGENT_CONFIGS, "log_rollout_info", False)
 
     args = SimpleNamespace(
         max_turns=3,
@@ -292,21 +328,185 @@ def test_cuda_agent_verify_sample_skips_kernel_env_and_reward(monkeypatch):
         use_lora_weight_sync=False,
         sglang_router_ip="127.0.0.1",
         sglang_router_port=30000,
+        advantage_estimator="trloo",
+        multi_turn_gamma=gamma,
+        verify_advantage_baseline=baseline,
+        kernel_verify_max_turns=2 * pairs,
+        verify_prompt_config_path=str(KERNEL_AGENT_ROOT / "prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"),
     )
-    sample = Sample(prompt="diagnose this kernel", metadata={"role": "verify", "task_id": "old-kernel-task"})
+    sample = Sample(
+        prompt=[
+            {"role": "user", "content": "original operator task"},
+            {"role": "assistant", "content": "source kernel"},
+            {"role": "user", "content": "source feedback and verify request"},
+        ],
+        index=11,
+        group_index=5,
+        rollout_id=17,
+        label={"ground_truth": "reference"},
+        metadata={
+            "role": "verify",
+            "task_id": "old-kernel-task",
+            "verify_source_env_result": {"env_state": {"error": "output mismatch"}},
+            "verify_source_reward": 0.3,
+        },
+    )
+    if use_anchor:
+        sample.metadata["verify_anchor_key"] = "shared-group-attempt"
     result = asyncio.run(cuda_agent._generate_with_verify_impl(args, sample, {"max_new_tokens": 2}))
 
-    assert captured["return_logprob"] is True
-    assert len(result) == 1
+    assert all(payload["return_logprob"] for payload in captured)
+    expected_pairs = 1 if version_mismatch or env_done else pairs
+    calls_per_pair = 2  # Shared anchor generation belongs to the group worker, never a candidate.
+    diagnosis_offset = 0
+    kernel_offset = diagnosis_offset + 1
+    assert len(captured) == expected_pairs * calls_per_pair
+    assert len(env_samples) == expected_pairs * (calls_per_pair - 1)
+    assert len(result) == 2 * expected_pairs
+    assert [turn.metadata["turn_idx"] for turn in result] == list(range(2 * expected_pairs))
+    assert [turn.metadata["role"] for turn in result] == ["verify", "kernel"] * expected_pairs
+    assert all(turn.metadata["verify_trajectory"] for turn in result)
+    assert all((turn.index, turn.group_index, turn.rollout_id) == (11, 5, 17) for turn in result)
+    turn_groups = sglang_rollout._split_turns_as_sample_groups([result, result])
+    assert len(turn_groups) == 2 * expected_pairs
+    for turn_idx, group in enumerate(turn_groups):
+        assert len(group) == 2
+        assert all(turn.metadata["turn_idx"] == turn_idx for turn in group)
+    for pair_idx, turn in enumerate(result[::2]):
+        assert turn.metadata["verify_source_reward"] == 0.3  # Fixed across all later pairs.
+        kernel = result[2 * pair_idx + 1]
+        assert kernel.response == "kernel revision"
+        assert kernel.prompt == messages_seen[pair_idx * calls_per_pair + kernel_offset]
+        assert kernel.reward == pytest.approx(0.0 if version_mismatch else 0.8)
+        assert kernel.metadata["multi_turn_reward"] == kernel.reward
+        assert kernel.metadata["verify_scoring_branch"] == "verified"
+        assert kernel.metadata["env_extra_info"]["correctness"] is True
+        assert kernel.remove_sample is version_mismatch
+        assert kernel.loss_mask == ([0, 0] if version_mismatch else [1, 1])
+        assert kernel.rollout_log_probs == [-0.25, -1.5]
+        assert kernel.rollout_topk_token_ids.shape == (2, 3)
+        assert kernel.weight_versions == (["8"] if version_mismatch else ["7"])
+        assert turn.metadata["verify_turn_idx"] == 2 * pair_idx
+        assert turn.metadata["kernel_turn_idx"] == 2 * pair_idx + 1
+        assert turn.reward == pytest.approx(0.0 if version_mismatch else 0.8)
+        assert turn.metadata["verify_reward_mode"] == ("pending_anchor" if use_anchor else "baseline")
+        if use_anchor:
+            assert turn.metadata["verify_anchor_key"] == "shared-group-attempt"
+            assert kernel.metadata["verify_anchor_key"] == "shared-group-attempt"
+        prefix = messages_seen[pair_idx * calls_per_pair + diagnosis_offset]
+        verified_prompt = messages_seen[pair_idx * calls_per_pair + kernel_offset]
+        assert verified_prompt[:-2] == prefix == turn.prompt
+        assert verified_prompt[-2] == {"role": "assistant", "content": raw_verification}
+        assert verified_prompt[-3]["role"] == verified_prompt[-1]["role"] == "user"
+        assert "<VERIFY>diagnosis</VERIFY>" in verified_prompt[-1]["content"]
+        assert "private reasoning" not in verified_prompt[-1]["content"]
+        assert "Unrelated" not in verified_prompt[-1]["content"]
+        assert "<VERIFY>draft</VERIFY>" not in verified_prompt[-1]["content"]
+        assert turn.response == raw_verification
+        assert turn.tokens == [10, 11, 7, 99]
+        assert turn.metadata["verify_extracted_response"] == "<VERIFY>diagnosis</VERIFY>"
+        if pair_idx:
+            assert prefix[:-2] == messages_seen[(pair_idx - 1) * calls_per_pair + kernel_offset]
+            assert "<VERIFY>diagnosis</VERIFY>" in prefix[-3]["content"]
+            assert prefix[-2]["content"] == "kernel revision"
+            assert "VERIFY" in prefix[-1]["content"]
+            assert turn.metadata["verify_source_env_result"] == result[2 * pair_idx - 1].metadata["env_result"]
     verify_sample = result[0]
-    assert verify_sample.response == "<VERIFY>diagnosis</VERIFY>"
-    assert verify_sample.reward == 0.0
+    assert verify_sample.response == raw_verification
+    expected_reward = 0.8 if not version_mismatch else 0.0
+    assert verify_sample.reward == pytest.approx(expected_reward)
+    assert verify_sample.metadata["multi_turn_reward"] == pytest.approx(expected_reward)
+    assert verify_sample.metadata["verify_kernel_reward"] == pytest.approx(0.8)
+    assert verify_sample.remove_sample is version_mismatch
+    assert verify_sample.loss_mask == ([0, 0] if version_mismatch else [1, 1])
+    assert verify_sample.weight_versions == ["7"]
+    assert verify_sample.rollout_log_probs == [-0.25, -1.5]
+    assert verify_sample.rollout_topk_token_ids.shape == (2, 3)
+    assert len(verify_sample.metadata["verify_kernel_rollout"]) == 1
+    assert "verify_anchor_rollout" not in verify_sample.metadata
     assert type(verify_sample) is Sample
     assert verify_sample.metadata["role"] == "verify"
     assert verify_sample.metadata["env_result"] == {"env_extra_info": {}}
     assert verify_sample.metadata["env_extra_info"] == {}
     assert verify_sample.metadata["env_time"] == 0.0
     assert "task_id" not in verify_sample.metadata
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "response,expected",
+    [
+        ("prefix <VERIFY>first\nsecond</VERIFY> suffix", "<VERIFY>first\nsecond</VERIFY>"),
+        ("thinking <VERIFY>draft</VERIFY></think><VERIFY>final</VERIFY>", "<VERIFY>final</VERIFY>"),
+        ("<think><VERIFY>draft</VERIFY></think><VERIFY>final</VERIFY>", "<VERIFY>final</VERIFY>"),
+        ("no verification", None),
+        ("<VERIFY>unfinished", None),
+        ("<VERIFY> \n </VERIFY>", None),
+        ("</VERIFY>reversed<VERIFY>", None),
+        ("<VERIFY>one</VERIFY><VERIFY>two</VERIFY>", None),
+        ("<VERIFY>outer<VERIFY>inner</VERIFY></VERIFY>", None),
+        ("<think><VERIFY>unfinished reasoning</VERIFY>", None),
+        ("<think><VERIFY>reasoning only</VERIFY></think>", None),
+    ],
+)
+def test_extract_verify_block_without_reasoning_or_surrounding_text(response, expected):
+    assert cuda_agent.extract_verify_response(response) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("render_mode", ["jinja", "format"])
+def test_verify_feedback_uses_existing_templates_without_mutating_environment(render_mode):
+    feedback_template = "{{ feedback }}" if render_mode == "jinja" else "{feedback}"
+    dict_template = (
+        '{{ feedback_dict["verification"] }}' if render_mode == "jinja" else "{feedback_dict[verification]}"
+    )
+    source_env = {"env_state": {"correctness": False, "error": "mismatch"}}
+    verification = "<VERIFY>repair indexing</VERIFY>"
+    template = cuda_agent.PromptTemplate(feedback_template, render_mode)
+    ordinary_feedback = cuda_agent._apply_feedback_template(source_env, template)
+    verified_feedback = cuda_agent._apply_feedback_template(source_env, template, verification=verification)
+    assert verified_feedback == ordinary_feedback + "\n\nVerification analysis for the next revision:\n" + verification
+    assert (
+        cuda_agent._apply_feedback_template(
+            source_env, cuda_agent.PromptTemplate(dict_template, render_mode), verification=verification
+        )
+        == verification
+    )
+    assert source_env == {"env_state": {"correctness": False, "error": "mismatch"}}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("response", ["no tags", "<VERIFY>unfinished", "<VERIFY> </VERIFY>"])
+def test_invalid_verify_format_preserves_generated_data_and_skips_kernel(monkeypatch, response):
+    verify = Sample(
+        response=response,
+        tokens=[10, 11, 7, 99],
+        response_length=2,
+        rollout_log_probs=[-0.25, -1.5],
+        loss_mask=[1, 1],
+        status=Sample.Status.COMPLETED,
+        metadata={"role": "verify"},
+    )
+    calls = []
+
+    async def generate_diagnosis(args, sample, sampling_params):
+        calls.append(sample)
+        assert (sample.metadata or {}).get("role") == "verify", "Invalid verify must not launch a kernel"
+        return [verify]
+
+    monkeypatch.setattr(cuda_agent, "_generate_kernel_impl", generate_diagnosis)
+    source = Sample(prompt="verify request", metadata={"role": "verify", "verify_source_env_result": {}})
+    result = asyncio.run(cuda_agent._generate_with_verify_impl(SimpleNamespace(use_multi_turn=True), source, {}))
+    assert result == [verify]
+    assert len(calls) == 1
+    assert verify.response == response
+    assert verify.tokens == [10, 11, 7, 99]
+    assert verify.rollout_log_probs == [-0.25, -1.5]
+    assert verify.response_length == 2
+    assert verify.remove_sample
+    assert verify.loss_mask == [0, 0]
+    assert verify.reward == 0.0
+    assert verify.metadata["remove_reason"] == "invalid_verify_format"
 
 
 @pytest.mark.unit
@@ -338,11 +538,146 @@ def test_cuda_agent_verify_sample_skips_kernel_coverage_rejection():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypatch, cancelled):
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
+
+    async def run():
+        started = asyncio.Event()
+        cancelled_tasks = []
+        source_env = {"env_state": {"error": "source failure"}}
+        history = [{"role": "user", "content": "task"}, {"role": "assistant", "content": "source kernel"}]
+        sample = Sample(prompt=history.copy(), metadata={"role": "kernel", "verify_source_env_result": source_env})
+        args = SimpleNamespace(max_turns=6, use_multi_turn=True)
+
+        async def fake_trajectory(scoring_args, anchor, params):
+            assert scoring_args.max_turns == 1
+            assert scoring_args.padding_turns is False
+            assert anchor.prompt[:-1] == history
+            assert anchor.prompt[-1]["content"] == cuda_agent._apply_feedback_template(
+                source_env, cuda_agent._get_tool_response_template(_GenerateState())
+            )
+            anchor.metadata["task_id"] = "shared-anchor-task"
+            started.set()
+            if cancelled:
+                await asyncio.Event().wait()
+            return [Sample(reward=0.3, status=Sample.Status.COMPLETED)]
+
+        async def cancel_eval(args, task_id, config):
+            cancelled_tasks.append(task_id)
+
+        monkeypatch.setattr(cuda_agent, "_generate_kernel_impl", fake_trajectory)
+        monkeypatch.setattr(cuda_agent, "cancel_kernel_eval", cancel_eval)
+        task = asyncio.create_task(cuda_agent.generate_anchor(args, sample, {}))
+        await started.wait()
+        if cancelled:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert cancelled_tasks == ["shared-anchor-task"]
+        else:
+            result = await task
+            assert len(result) == 1
+            assert result[0].reward == 0.3
+            assert not cancelled_tasks
+        assert args.max_turns == 6
+
+    asyncio.run(run())
+
+
+@pytest.mark.unit
+def test_verify_scoring_transport_failure_aborts_one_training_sample(monkeypatch):
+    requests = 0
+
+    async def fake_post(url, payload, max_retries=None):
+        nonlocal requests
+        requests += 1
+        return {"text": "<VERIFY>diagnosis</VERIFY>" if requests == 1 else "kernel", "meta_info": _meta_info()}
+
+    async def broken_env(args, sample, response, turn_idx):
+        raise RuntimeError("evaluation transport failed")
+
+    monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
+    monkeypatch.setattr(cuda_agent, "post", fake_post)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", broken_env)
+    monkeypatch.setitem(cuda_agent.CUDA_AGENT_CONFIGS, "log_rollout_info", False)
+    args = SimpleNamespace(
+        **vars(_default_generate_args()),
+        max_turns=4,
+        use_multi_turn=True,
+        padding_turns=True,
+        rollout_max_context_len=None,
+        advantage_estimator="trloo",
+        multi_turn_gamma=1.0,
+    )
+    sample = Sample(
+        index=12,
+        prompt="task and verification request",
+        metadata={"role": "verify", "verify_source_env_result": {"env_state": {"error": "compile"}}},
+    )
+    result = asyncio.run(cuda_agent.generate(args, sample, {"max_new_tokens": 2}))
+    assert len(result) == 1
+    assert result[0].status == Sample.Status.ABORTED
+    assert result[0].remove_sample
+    assert result[0].loss_mask == [0]
+    assert result[0].metadata["turn_idx"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role", [None, "kernel", "verify", "anchor"])
+def test_generate_dispatches_to_role_specific_entry(monkeypatch, role):
+    calls = []
+    args = SimpleNamespace(max_turns=3, padding_turns=True)
+    metadata = {} if role is None else {"role": "kernel" if role == "anchor" else role}
+    if role == "anchor":
+        metadata["verify_scoring_branch"] = "anchor"
+    sample = Sample(metadata=metadata)
+    params = {"max_new_tokens": 2}
+    expected = [sample]
+
+    async def kernel_entry(received_args, received_sample, received_params):
+        assert received_args is args and received_sample is sample and received_params is params
+        calls.append("kernel")
+        return expected
+
+    async def verify_entry(received_args, received_sample, received_params):
+        assert received_args is args and received_sample is sample and received_params is params
+        calls.append("verify")
+        return expected
+
+    monkeypatch.setattr(cuda_agent, "_generate_kernel_impl", kernel_entry)
+    monkeypatch.setattr(cuda_agent, "_generate_with_verify_impl", verify_entry)
+    assert asyncio.run(cuda_agent.generate(args, sample, params)) is expected
+    assert calls == ["verify" if role == "verify" else "kernel"]
+    assert args.max_turns == 3 and args.padding_turns
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "entry,role,match",
+    [
+        ("_generate_kernel_impl", "unknown", "Kernel sample role must be"),
+        ("_generate_with_verify_impl", "kernel", "requires a verify sample"),
+        ("_generate_with_verify_impl", None, "requires a verify sample"),
+    ],
+)
+def test_role_specific_entries_reject_wrong_sample_before_generation(monkeypatch, entry, role, match):
+    async def unexpected_generation(*args, **kwargs):
+        raise AssertionError("Wrong role must not reach model generation or KernelEnv")
+
+    monkeypatch.setattr(cuda_agent, "post", unexpected_generation)
+    monkeypatch.setattr(cuda_agent, "cuda_kernel_env", unexpected_generation)
+    metadata = {} if role is None else {"role": role}
+    with pytest.raises(ValueError, match=match):
+        asyncio.run(getattr(cuda_agent, entry)(SimpleNamespace(), Sample(metadata=metadata), {}))
+
+
+@pytest.mark.unit
 def test_cuda_agent_rejects_pad_sample_generation():
     args = SimpleNamespace()
 
     with pytest.raises(ValueError, match="synthetic and cannot be generated"):
-        asyncio.run(cuda_agent._generate_with_verify_impl(args, Sample(metadata={"role": "pad"}), {}))
+        asyncio.run(cuda_agent._generate_kernel_impl(args, Sample(metadata={"role": "pad"}), {}))
 
 
 def _make_manager(top_k: int = 2):

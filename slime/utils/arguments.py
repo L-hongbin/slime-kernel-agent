@@ -44,29 +44,45 @@ def _validate_verify_capture_args(args) -> None:
         load_verify_data = [load_verify_data]
         args.load_verify_data = load_verify_data
     fixed_verify_data = bool(load_verify_data)
-    online_capture_enabled = capture_verify_data or (verify_rollout_ratio > 0.0 and not fixed_verify_data)
-    verify_data_enabled = fixed_verify_data or online_capture_enabled
+    verify_data_enabled = fixed_verify_data or capture_verify_data or verify_rollout_ratio > 0.0
+
+    kernel_verify_max_turns = getattr(args, "kernel_verify_max_turns", 2)
+    if kernel_verify_max_turns <= 0 or kernel_verify_max_turns % 2:
+        raise ValueError("--kernel-verify-max-turns must be a positive multiple of 2")
+    if verify_rollout_ratio > 0 and not getattr(args, "use_multi_turn", False):
+        raise ValueError("verify/kernel training requires --use-multi-turn")
+    verify_baseline = getattr(args, "verify_advantage_baseline", "group")
+    if verify_baseline not in {"group", "history", "anchor"}:
+        raise ValueError("--verify-advantage-baseline must be group, history, or anchor")
+    if verify_baseline != "group" and verify_rollout_ratio <= 0.0:
+        raise ValueError("--verify-advantage-baseline history/anchor requires a positive --verify-rollout-ratio")
+    if verify_baseline == "anchor" and getattr(args, "group_rm", False):
+        raise ValueError("--verify-advantage-baseline anchor does not support --group-rm")
 
     if not 0.0 <= verify_rollout_ratio <= 1.0:
         raise ValueError(f"--verify-rollout-ratio must be in [0, 1], got {verify_rollout_ratio}")
-    max_samples_per_group = int(getattr(args, "verify_max_samples_per_source_group", 1))
+    max_samples_per_group = int(getattr(args, "verify_samples_per_group", 1))
     if max_samples_per_group <= 0:
-        raise ValueError(f"--verify-max-samples-per-source-group must be positive, got {max_samples_per_group}")
-    max_version_lag = int(getattr(args, "verify_max_source_version_lag", 2))
+        raise ValueError(f"--verify-samples-per-group must be positive, got {max_samples_per_group}")
+    max_version_lag = int(getattr(args, "verify_version_lag", 2))
     if max_version_lag < 0:
-        raise ValueError(f"--verify-max-source-version-lag must be non-negative, got {max_version_lag}")
+        raise ValueError(f"--verify-version-lag must be non-negative, got {max_version_lag}")
     verify_data_limit = getattr(args, "verify_data_limit", math.inf)
     if not math.isinf(verify_data_limit) and (verify_data_limit < 0 or int(verify_data_limit) != verify_data_limit):
         raise ValueError(f"--verify-data-limit must be a non-negative integer or inf, got {verify_data_limit}")
 
     if fixed_verify_data and verify_rollout_ratio <= 0.0:
         raise ValueError("--load-verify-data requires a positive --verify-rollout-ratio")
-    if save_verify_data is not None and not online_capture_enabled:
-        raise ValueError(
-            "--save-verify-data requires online capture; add --capture-verify-data when using fixed verify data"
-        )
+    if save_verify_data is not None and not capture_verify_data:
+        raise ValueError("--save-verify-data requires online capture; add --capture-verify-data")
     if not verify_data_enabled:
         return
+    if verify_rollout_ratio > 0.0 and not capture_verify_data:
+        logger.warning(
+            "--verify-rollout-ratio > 0 but --capture-verify-data is not enabled: "
+            "online failed-kernel capture is disabled. Use --load-verify-data for fixed-data training; "
+            "when no verify candidates are available, sampling falls back to ordinary kernel prompts."
+        )
 
     data_source_path = getattr(args, "data_source_path", _DEFAULT_ROLLOUT_DATA_SOURCE_PATH)
     if data_source_path == _DEFAULT_ROLLOUT_DATA_SOURCE_PATH:
@@ -2187,6 +2203,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
 
         def add_kernel_agent_arguments(parser):
             parser.add_argument(
+                "--verify-advantage-baseline",
+                choices=["group", "history", "anchor"],
+                default="group",
+                help=(
+                    "Verify advantage baseline: group uses the configured group estimator; history uses "
+                    "new minus initial kernel reward; anchor generates one shared direct repair and uses "
+                    "new minus anchor kernel reward. History/anchor skip group centering."
+                ),
+            )
+            parser.add_argument(
+                "--kernel-verify-max-turns",
+                type=int,
+                default=2,
+                help="Positive even generation-turn budget: each pair is one verify turn followed by one kernel turn.",
+            )
+            parser.add_argument(
                 "--verify-prompt-config-path",
                 type=str,
                 default=None,
@@ -2209,8 +2241,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help=(
-                    "Capture failed kernel samples in the verify buffer even when verify rollout is disabled. "
-                    "No verify data is recorded when this flag is absent and --verify-rollout-ratio is zero."
+                    "Enable online capture of failed kernel samples in the verify buffer. "
+                    "Without this flag, no new verify data is captured, regardless of --verify-rollout-ratio."
                 ),
             )
             parser.add_argument(
@@ -2234,13 +2266,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
-                "--verify-max-samples-per-source-group",
+                "--verify-samples-per-group",
                 type=int,
                 default=1,
                 help="Maximum failed kernel candidates drawn from one source group per generation weight version.",
             )
             parser.add_argument(
-                "--verify-max-source-version-lag",
+                "--verify-version-lag",
                 type=int,
                 default=2,
                 help="Discard verify candidates whose source kernel policy version is older by more than this value.",

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import queue
 import random
 import sys
 import threading
 import time
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -106,6 +107,7 @@ def _make_schedulable_verify_candidate(
 def _make_verify_data_source_args(**overrides):
     values = dict(
         rollout_global_dataset=False,
+        use_multi_turn=True,
         buffer_filter_path=None,
         n_samples_per_prompt=2,
         rollout_seed=7,
@@ -114,8 +116,9 @@ def _make_verify_data_source_args(**overrides):
             REPO_ROOT / "examples/kernel_agent/prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"
         ),
         verify_rollout_ratio=1.0,
-        verify_max_samples_per_source_group=1,
-        verify_max_source_version_lag=2,
+        capture_verify_data=True,
+        verify_samples_per_group=1,
+        verify_version_lag=2,
         verify_data_limit=float("inf"),
         load_verify_data=None,
     )
@@ -158,15 +161,31 @@ def test_verify_capture_validation_enables_default_data_source_and_capture_hook(
     )
 
 
-def test_verify_capture_validation_rejects_save_path_when_capture_is_disabled():
+@pytest.mark.parametrize("ratio", [0.0, 1.0])
+def test_verify_capture_validation_rejects_save_path_when_capture_is_disabled(ratio):
     args = Namespace(
         capture_verify_data=False,
-        verify_rollout_ratio=0.0,
+        verify_rollout_ratio=ratio,
+        use_multi_turn=True,
         save_verify_data="/tmp/verify_{rollout_id}.pt",
     )
 
     with pytest.raises(ValueError, match="requires online capture"):
         slime_arguments._validate_verify_capture_args(args)
+
+
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("fixed", [False, True])
+def test_verify_rollout_without_capture_warns_and_keeps_data_source_wiring(caplog, capture, fixed):
+    args = _make_verify_data_source_args(
+        capture_verify_data=capture,
+        load_verify_data=["/tmp/fixed_verify.pt"] if fixed else None,
+        rollout_function_path="examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async",
+    )
+    with caplog.at_level(logging.WARNING, logger=slime_arguments.logger.name):
+        slime_arguments._validate_verify_capture_args(args)
+    assert ("online failed-kernel capture is disabled" in caplog.text) is (not capture)
+    assert args.data_source_path == "examples.kernel_agent.kernel_agent_data_source.KernelAgentDataSource"
 
 
 def test_verify_capture_validation_requires_rollout_id_in_save_path():
@@ -192,6 +211,52 @@ def test_verify_capture_validation_requires_positive_ratio_for_fixed_data():
 
     with pytest.raises(ValueError, match="--load-verify-data requires a positive"):
         slime_arguments._validate_verify_capture_args(args)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"kernel_verify_max_turns": 0}, "kernel-verify-max-turns"),
+        ({"kernel_verify_max_turns": -2}, "kernel-verify-max-turns"),
+        ({"kernel_verify_max_turns": 1}, "kernel-verify-max-turns"),
+        ({"kernel_verify_max_turns": 3}, "kernel-verify-max-turns"),
+        ({"kernel_verify_max_turns": 4, "use_multi_turn": False}, "requires --use-multi-turn"),
+        ({"kernel_verify_max_turns": 2, "use_multi_turn": False}, "requires --use-multi-turn"),
+        ({"verify_advantage_baseline": "anchor", "verify_rollout_ratio": 0.0}, "verify-advantage-baseline"),
+        ({"verify_advantage_baseline": "anchor", "group_rm": True}, "does not support --group-rm"),
+        ({"verify_advantage_baseline": "history", "verify_rollout_ratio": 0.0}, "requires a positive"),
+        ({"verify_advantage_baseline": "invalid"}, "must be group, history, or anchor"),
+    ],
+)
+def test_verify_training_argument_validation(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        slime_arguments._validate_verify_capture_args(_make_verify_data_source_args(**overrides))
+
+
+def test_verify_advantage_baseline_cli_replaces_anchor_flag():
+    parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    assert defaults.verify_advantage_baseline == "group"
+    assert not hasattr(defaults, "verify_use_anchor")
+    for mode in ("group", "history", "anchor"):
+        args = parser.parse_args(["--rollout-batch-size", "1", "--verify-advantage-baseline", mode])
+        assert args.verify_advantage_baseline == mode
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--verify-use-anchor"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--verify-advantage-baseline", "source"])
+
+
+def test_verify_sampling_cli_uses_short_names():
+    parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
+    defaults = parser.parse_args(["--rollout-batch-size", "1"])
+    assert defaults.verify_samples_per_group == 1
+    assert defaults.verify_version_lag == 2
+    args = parser.parse_args(
+        ["--rollout-batch-size", "1", "--verify-samples-per-group", "3", "--verify-version-lag", "4"]
+    )
+    assert args.verify_samples_per_group == 3
+    assert args.verify_version_lag == 4
 
 
 @pytest.mark.parametrize("limit", [-1, 1.5])
@@ -350,6 +415,82 @@ def test_kernel_agent_data_source_mixes_verify_group_when_enabled():
     assert data_source.get_verify_buffer_length() == 0
 
 
+def test_verify_anchor_configuration_and_reference_metadata_are_copied_per_sample():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(verify_advantage_baseline="anchor")
+    )
+    source = _make_schedulable_verify_candidate(index=42, source_group=9)
+    source.metadata.update(ground_truth="reference", entry_point="CustomModel", precision="bf16")
+    data_source.add_verify_candidates([source])
+    first, second = data_source.get_samples(1)[0]
+    assert first.prompt == second.prompt
+    key = first.metadata["verify_anchor_key"]
+    assert key == second.metadata["verify_anchor_key"]
+    assert len(data_source.anchor_kv) == 1
+    anchor = data_source.anchor_kv[key]["sample"]
+    assert anchor.index not in {first.index, second.index}
+    assert anchor.group_index == first.group_index == second.group_index
+    assert anchor.prompt == first.prompt[:-1]
+    assert anchor.metadata["verify_source_env_result"] == source.metadata["env_result"]
+    assert anchor.metadata["verify_source_env_result"] is not first.metadata["verify_source_env_result"]
+    assert first.metadata["verify_source_env_result"] == source.metadata["env_result"]
+    assert first.metadata["verify_source_env_result"] is not source.metadata["env_result"]
+    assert first.metadata["ground_truth"] == "reference"
+    assert first.metadata["entry_point"] == "CustomModel"
+    assert first.metadata["precision"] == "bf16"
+    assert "verify_anchor_key" not in source.metadata
+
+
+@pytest.mark.parametrize("baseline", ["group", "history"])
+def test_source_reward_is_carried_without_creating_anchor(baseline):
+    args = _make_verify_data_source_args(verify_advantage_baseline=baseline)
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    source = _make_schedulable_verify_candidate(42, 9)
+    source.reward = -0.25
+    source.metadata["multi_turn_reward"] = 7.0
+    data_source.add_verify_candidates([source])
+    group = data_source.get_samples(1)[0]
+    assert not data_source.anchor_kv
+    assert data_source.sample_index == args.n_samples_per_prompt
+    for sample in group:
+        assert sample.reward is None
+        assert "verify_anchor_key" not in sample.metadata
+        if baseline == "history":
+            assert sample.metadata["verify_source_reward"] == -0.25
+        else:
+            assert "verify_source_reward" not in sample.metadata
+    assert "verify_source_reward" not in source.metadata
+
+
+@pytest.mark.parametrize("reward", [None, float("nan"), float("inf"), {}, "invalid"])
+def test_history_baseline_rejects_missing_or_invalid_source_reward(reward):
+    data_source = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(verify_advantage_baseline="history")
+    )
+    source = _make_schedulable_verify_candidate(42, 9)
+    source.reward = reward
+    with pytest.raises(ValueError, match="finite source kernel reward"):
+        data_source.add_verify_candidates([source])
+
+
+@pytest.mark.parametrize("reward", [None, -0.25])
+def test_history_baseline_loads_single_turn_reward_from_fixed_data(tmp_path, reward):
+    source = _make_schedulable_verify_candidate(42, 9)
+    source.reward = reward
+    source.metadata["multi_turn_reward"] = 7.0
+    fixed_path = tmp_path / "source.pt"
+    torch.save({"rollout_id": 3, "samples": [source.to_dict()]}, fixed_path)
+    args = _make_verify_data_source_args(verify_advantage_baseline="history", load_verify_data=[str(fixed_path)])
+    if reward is None:
+        with pytest.raises(ValueError, match="finite source kernel reward"):
+            kernel_agent_data_source.KernelAgentDataSource(args)
+    else:
+        data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+        group = data_source.get_samples(1)[0]
+        assert all(sample.metadata["verify_source_reward"] == reward for sample in group)
+        assert not data_source.anchor_kv
+
+
 def test_kernel_agent_data_source_falls_back_to_kernel_prompt_when_verify_buffer_is_empty():
     data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
 
@@ -360,9 +501,189 @@ def test_kernel_agent_data_source_falls_back_to_kernel_prompt_when_verify_buffer
     assert all(sample.metadata.get("role") is None for sample in groups[0])
 
 
-def test_kernel_agent_data_source_does_not_record_verify_buffer_when_disabled():
+def test_shared_anchor_claim_read_and_retry_lifecycle():
     data_source = kernel_agent_data_source.KernelAgentDataSource(
-        _make_verify_data_source_args(verify_rollout_ratio=0.0)
+        _make_verify_data_source_args(verify_advantage_baseline="anchor")
+    )
+    data_source.add_verify_candidates([_make_schedulable_verify_candidate(42, 9)])
+    group = data_source.get_samples(1)[0]
+    key = group[0].metadata["verify_anchor_key"]
+    claims = []
+    threads = [threading.Thread(target=lambda: claims.append(data_source.claim_anchor(key))) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert sum(claim is not None for claim in claims) == 1
+    with pytest.raises(ValueError, match="not ready"):
+        data_source.get_anchor_result(key)
+    data_source.complete_anchor(key, {"reward": 0.3, "weight_versions": [8]})
+    for _ in range(4):
+        result = data_source.get_anchor_result(key)
+        assert result == {"reward": 0.3, "weight_versions": [8]}
+        result["weight_versions"].append(99)
+    data_source.release_anchor(key)
+    data_source.add_samples([copy.deepcopy(group)])
+    retry = data_source.get_samples(1)[0]  # Even a verify-only mixture must drain retries.
+    assert [sample.index for sample in retry] == [sample.index for sample in group]
+    new_key = data_source.prepare_anchor(retry)
+    assert new_key != key
+    assert {sample.metadata["verify_anchor_key"] for sample in retry} == {new_key}
+    assert data_source.claim_anchor(new_key).index == group[0].metadata["verify_anchor_index"]
+    data_source.release_anchor(new_key)
+    assert not data_source.anchor_kv
+
+
+@pytest.mark.parametrize("anchor_version", [8, 9])
+@pytest.mark.parametrize("capacity", [1, 3])
+@pytest.mark.parametrize("invalid_first", [False, True])
+def test_shared_anchor_once_for_all_candidates_and_turns(monkeypatch, anchor_version, capacity, invalid_first):
+    args = _make_verify_data_source_args(
+        verify_advantage_baseline="anchor", sglang_enable_deterministic_inference=True
+    )
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    data_source.add_verify_candidates([_make_schedulable_verify_candidate(42, 9)])
+    group = data_source.get_samples(1)[0]
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.args, worker.data_buffer = args, data_source
+    worker.state = Namespace(group_sampling_seeds=[7, 8])
+    calls = []
+
+    async def run():
+        gate = asyncio.Semaphore(capacity)
+        candidates_started = asyncio.Event()
+
+        async def fake_generate(args, sample, params, evaluation):
+            async with gate:
+                is_anchor = sample.metadata.get("verify_scoring_branch") == "anchor"
+                calls.append((sample.index, params["sampling_seed"], is_anchor))
+                if is_anchor:
+                    if capacity > 1:
+                        await candidates_started.wait()  # Candidates must not await the anchor.
+                    return [Sample(response="direct", reward=0.3, weight_versions=[anchor_version], metadata={})]
+                candidates_started.set()
+                if invalid_first and sample.index == group[0].index:
+                    sample.remove_sample = True
+                    sample.reward = 0.0
+                    sample.loss_mask = [0]
+                    sample.metadata["turn_idx"] = 0
+                    return [sample]
+                turns = []
+                for turn_idx in range(4):
+                    turn = copy.deepcopy(sample)
+                    turn.status = Sample.Status.COMPLETED
+                    turn.reward = 0.8
+                    turn.response_length = 1
+                    turn.loss_mask = [1]
+                    turn.weight_versions = [8]
+                    turn.metadata.update(
+                        role="verify" if turn_idx % 2 == 0 else "kernel",
+                        turn_idx=turn_idx,
+                        verify_reward_mode="pending_anchor",
+                        verify_kernel_reward=0.8,
+                        verify_scoring_weight_versions=["8"],
+                        verify_scoring_versions_complete=True,
+                        multi_turn_reward=0.8,
+                    )
+                    turns.append(turn)
+                return turns
+
+        monkeypatch.setattr(fully_async_rollout, "generate_and_rm", fake_generate)
+        return await asyncio.wait_for(worker._generate_group(group, {}), timeout=2)
+
+    output = asyncio.run(run())
+    assert [call[2] for call in calls] == [True, False, False]
+    assert [call[1] for call in calls] == [9, 7, 8]
+    assert len({call[0] for call in calls}) == 3
+    assert len(output) == 4
+    assert [len(turn_group) for turn_group in output] == ([2, 1, 1, 1] if invalid_first else [2, 2, 2, 2])
+    for turn_idx, turn_group in enumerate(output):
+        for sample in turn_group:
+            assert sample.index in {candidate.index for candidate in group}
+            if invalid_first and sample.index == group[0].index:
+                assert sample.remove_sample and sample.reward == 0.0
+                continue
+            if anchor_version != 8:
+                assert sample.remove_sample and sample.loss_mask == [0]
+                assert sample.reward == 0.0
+            else:
+                assert sample.reward == pytest.approx(0.5 if turn_idx % 2 == 0 else 0.8)
+                assert sample.metadata["multi_turn_reward"] == sample.reward
+            if turn_idx % 2 == 0:
+                assert sample.metadata["verify_reward_mode"] == "anchor"
+                assert sample.metadata["verify_anchor_reward"] == 0.3
+                assert sample.metadata["verify_anchor_baseline"] == "fixed_source"
+    assert not data_source.anchor_kv
+
+
+@pytest.mark.parametrize("failure", ["anchor_error", "anchor_aborted", "anchor_nonfinite", "cancel", "all_invalid"])
+def test_shared_anchor_group_failure_and_cancellation_cleanup(monkeypatch, failure):
+    args = _make_verify_data_source_args(verify_advantage_baseline="anchor", advantage_estimator="trloo")
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    data_source.add_verify_candidates([_make_schedulable_verify_candidate(42, 9)])
+    group = data_source.get_samples(1)[0]
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.args, worker.data_buffer = args, data_source
+    finished = []
+
+    async def run():
+        all_started = asyncio.Event()
+        started = []
+
+        async def fake_generate(args, sample, params, evaluation):
+            started.append(sample.index)
+            if len(started) == 3:
+                all_started.set()
+            try:
+                await all_started.wait()
+                if sample.metadata.get("verify_scoring_branch") == "anchor":
+                    if failure == "anchor_error":
+                        raise RuntimeError("anchor transport failed")
+                    if failure == "anchor_aborted":
+                        return [Sample(status=Sample.Status.ABORTED)]
+                    if failure == "anchor_nonfinite":
+                        return [Sample(reward=float("nan"))]
+                elif failure == "all_invalid":
+                    sample.remove_sample = True
+                    sample.metadata["turn_idx"] = 0
+                    return [sample]
+                await asyncio.Future()
+            finally:
+                finished.append(sample.index)
+
+        monkeypatch.setattr(fully_async_rollout, "generate_and_rm", fake_generate)
+        task = asyncio.create_task(worker._generate_group(group, {}))
+        await asyncio.wait_for(all_started.wait(), timeout=2)
+        if failure == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return None
+        return await asyncio.wait_for(task, timeout=2)
+
+    output = asyncio.run(run())
+    assert len(set(finished)) == 3
+    assert not data_source.anchor_kv
+    if failure not in {"cancel", "all_invalid"}:
+        assert all(sample.status == Sample.Status.ABORTED for turn_group in output for sample in turn_group)
+    elif failure == "all_invalid":
+        assert all(sample.remove_sample for turn_group in output for sample in turn_group)
+
+
+def test_shared_anchor_counts_toward_client_capacity():
+    args = _make_rollout_args(verify_advantage_baseline="anchor", n_samples_per_prompt=2)
+    assert fully_async_rollout._get_group_concurrency(args, 12) == 4
+    assert fully_async_rollout._get_group_concurrency(args, 1) == 1
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_kernel_agent_data_source_does_not_record_verify_buffer_when_disabled(ratio):
+    data_source = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(verify_rollout_ratio=ratio, capture_verify_data=False)
     )
     source = _make_schedulable_verify_candidate(index=42, source_group=9)
     assert data_source.add_verify_candidates([source]) == 0
@@ -507,7 +828,7 @@ def test_kernel_agent_fixed_verify_data_replays_each_weight_version_without_onli
         capture_verify_data=False,
         load_verify_data=[str(fixed_path)],
         gen_weight_version=100,
-        verify_max_source_version_lag=1,
+        verify_version_lag=1,
     )
     data_source = kernel_agent_data_source.KernelAgentDataSource(args)
 
@@ -528,6 +849,16 @@ def test_kernel_agent_fixed_verify_data_replays_each_weight_version_without_onli
 
     assert replayed[0][0].metadata["role"] == "verify"
     assert replayed[0][0].metadata["source_kernel_index"] == 42
+
+
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_ordinary_rollout_capture_hook_does_nothing_without_explicit_flag(ratio):
+    args = Namespace(verify_rollout_ratio=ratio)
+    failed = _make_schedulable_verify_candidate(42, 9)
+    before = copy.deepcopy(failed.metadata)
+    # Without capture enabled, the hook must not even require capture APIs or a rollout id.
+    kernel_agent_data_source.capture_verify_candidates(args, [[failed]], object())
+    assert failed.metadata == before
 
 
 def test_ordinary_rollout_capture_hook_annotates_and_buffers_failed_kernel():
@@ -641,6 +972,7 @@ def test_kernel_agent_data_source_builds_fresh_verify_group_from_failed_kernel()
             "source_group_index": 9,
             "source_turn_idx": 2,
             "source_kernel_weight_version": 7,
+            "verify_source_env_result": source.metadata["env_result"],
             "trajectory_states": ["failed", "failed", "failed"],
             "group_num_correct": 1,
             "group_num_valid": 4,
@@ -754,7 +1086,9 @@ def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch
     assert [gid for gid, _ in worker.get_completed_groups()] == [4, 5, 6, 7, 8, 9]
 
 
-def test_kernel_agent_collector_adds_failed_candidates_after_difficulty_annotation(monkeypatch):
+@pytest.mark.parametrize("capture", [False, True])
+@pytest.mark.parametrize("ratio", [0.0, 0.5, 1.0])
+def test_kernel_agent_collector_adds_failed_candidates_after_difficulty_annotation(monkeypatch, capture, ratio):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker
     )
@@ -789,31 +1123,40 @@ def test_kernel_agent_collector_adds_failed_candidates_after_difficulty_annotati
         rollout_batch_size=1,
         dynamic_sampling_filter_path=None,
         use_multi_turn=False,
-        verify_rollout_ratio=0.0,
-        capture_verify_data=True,
-        save_verify_data="/tmp/verify_{rollout_id}.pt",
+        verify_rollout_ratio=ratio,
+        capture_verify_data=capture,
+        save_verify_data="/tmp/verify_{rollout_id}.pt" if capture else None,
     )
 
     output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=0, data_buffer=data_buffer))
 
     assert output.samples == [[failed]]
-    assert data_buffer.candidates == [failed]
+    assert data_buffer.candidates == ([failed] if capture else [])
     assert failed.metadata["group_num_valid"] == 1
     assert failed.metadata["group_correct_rate"] == 0.0
     assert failed.metadata["group_difficulty"] == 1.0
-    assert output.metrics["verify_candidates_added"] == 1
-    assert output.metrics["verify_candidates_saved"] == 1
-    assert data_buffer.events == [("begin", 0), ("add", 0), ("save", 0)]
+    assert output.metrics["verify_candidates_added"] == int(capture)
+    assert output.metrics["verify_candidates_saved"] == int(capture)
+    assert data_buffer.events == ([("begin", 0), ("add", 0), ("save", 0)] if capture else [])
 
 
-def test_kernel_agent_collector_does_not_apply_kernel_filter_to_verify_group(monkeypatch):
+@pytest.mark.parametrize("joint_training", [False, True])
+@pytest.mark.parametrize("filter_by_last_turn", [False, True])
+def test_kernel_agent_collector_does_not_apply_kernel_filter_to_verify_group(
+    monkeypatch, joint_training, filter_by_last_turn
+):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker
     )
     worker.output_queue = queue.Queue()
     verify_group = _make_group(42)
     verify_group[0].metadata = {"role": "verify", "turn_idx": 0}
-    worker.output_queue.put((0, verify_group))
+    groups = [verify_group]
+    if joint_training:
+        kernel_group = _make_group(42)
+        kernel_group[0].metadata = {"role": "kernel", "turn_idx": 1, "verify_trajectory": True}
+        groups.append(kernel_group)
+    worker.output_queue.put((0, groups))
 
     monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer, rollout_id: worker)
     monkeypatch.setattr(fully_async_rollout, "load_function", lambda path: object())
@@ -826,13 +1169,24 @@ def test_kernel_agent_collector_does_not_apply_kernel_filter_to_verify_group(mon
         rollout_global_dataset=True,
         rollout_batch_size=1,
         dynamic_sampling_filter_path="fake.kernel.filter",
-        use_multi_turn=False,
+        use_multi_turn=True,
+        max_turns=2,
+        filter_by_last_turn=filter_by_last_turn,
         verify_rollout_ratio=0.0,
     )
 
     output = asyncio.run(fully_async_rollout._generate_rollout_async(args, rollout_id=0, data_buffer=None))
 
-    assert output.samples == [verify_group]
+    assert output.samples == groups
+
+
+def test_verify_trajectory_kernels_do_not_recursively_enter_capture_buffer():
+    data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
+    candidate = _make_schedulable_verify_candidate(1, source_group=3)
+    candidate.metadata["verify_trajectory"] = True
+    assert data_source.add_verify_candidates([candidate], rollout_id=7) == 0
+    candidate.metadata.pop("verify_trajectory")
+    assert data_source.add_verify_candidates([candidate], rollout_id=7) == 1
 
 
 def test_kernel_agent_done_callback_never_blocks_on_full_queue(monkeypatch):

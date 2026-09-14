@@ -200,6 +200,10 @@ def _apply_dynamic_group_reward_weights(
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if metadata.get("role") == "verify" or metadata.get("verify_trajectory", False):
+            # Preserve the utility already assigned to both sides of a scored pair.
+            dynamic_rewards.append(reward)
+            continue
         components = metadata.get("reward_component")
         kernel_score = metadata.get("kernel_score")
         if (
@@ -267,10 +271,14 @@ def _dynamic_raw_rewards(args, samples, config: dict[str, Any]) -> list[float]:
     gamma = float(getattr(args, "multi_turn_gamma", 1.0))
     trajectory_groups: dict[tuple[object, object], list[int]] = {}
     for idx, sample in enumerate(samples):
+        metadata = sample.metadata or {}
+        if metadata.get("role") == "verify" or metadata.get("verify_trajectory", False):
+            # Paired verify/kernel turns keep their assigned utility, not future returns.
+            continue
         trajectory_id = sample.rollout_id if sample.rollout_id is not None else sample.index
         trajectory_groups.setdefault((sample.group_index, trajectory_id), []).append(idx)
 
-    raw_rewards = [0.0] * len(samples)
+    raw_rewards = list(turn_rewards)
     for trajectory_indices in trajectory_groups.values():
         trajectory_indices.sort(
             key=lambda idx: int(samples[idx].metadata.get("turn_idx", 0)),
@@ -342,6 +350,11 @@ def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
 
 
 def reward_post_process_by_group(args, samples):
+    if any(
+        not sample.remove_sample and (sample.metadata or {}).get("verify_reward_mode") == "pending_anchor"
+        for sample in samples
+    ):
+        raise ValueError("shared anchor rewards must be settled by the group rollout before training")
     reward_config = CUDA_AGENT_CONFIGS["reward"]
     if reward_config.get("enable_dynamic_reward_weight", False):
         raw_rewards = _dynamic_raw_rewards(args, samples, reward_config)
@@ -359,6 +372,29 @@ def reward_post_process_by_group(args, samples):
             rewards[idx] = raw_rewards[idx]
             continue
 
+        metadata = sample.metadata or {}
+        history_baseline = getattr(args, "verify_advantage_baseline", "group") == "history"
+        anchor_baseline = metadata.get("verify_reward_mode") == "anchor"
+        if metadata.get("role") == "verify" and (anchor_baseline or history_baseline):
+            if anchor_baseline and history_baseline:
+                raise ValueError("history advantage baseline cannot be applied to anchor-scored samples")
+            # Preserve the absolute improvement signal; centering would cancel a shared baseline.
+            reward = raw_rewards[idx]
+            if history_baseline:
+                try:
+                    source_reward = float(metadata.get("verify_source_reward"))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        "verify history baseline requires a finite metadata['verify_source_reward']"
+                    ) from exc
+                if not math.isfinite(source_reward):
+                    raise ValueError("verify history baseline requires a finite metadata['verify_source_reward']")
+                reward -= source_reward
+            if use_conditional_truncation_mask:
+                reward = _apply_conditional_truncation_mask(args, sample, reward)
+            rewards[idx] = reward
+            continue
+
         group_index = sample.group_index
         if getattr(args, "use_multi_turn", False):
             turn_idx = sample.metadata.get("turn_idx") if sample.metadata is not None else None
@@ -374,7 +410,10 @@ def reward_post_process_by_group(args, samples):
         group_samples = [samples[idx] for idx in group_indices]
         annotate_group_difficulty(group_samples)
         group_reward_values = [raw_rewards[idx] for idx in group_indices]
-        if apply_failed_group_reward:
+        if apply_failed_group_reward and not any(
+            (sample.metadata or {}).get("role") == "verify" or (sample.metadata or {}).get("verify_trajectory", False)
+            for sample in group_samples
+        ):
             group_reward_values = _apply_failed_group_reward(
                 group_samples,
                 group_reward_values,

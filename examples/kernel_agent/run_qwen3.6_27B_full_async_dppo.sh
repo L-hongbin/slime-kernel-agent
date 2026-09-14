@@ -104,9 +104,18 @@ VERIFY_ROLLOUT_RATIO="${VERIFY_ROLLOUT_RATIO:-0}"
 CAPTURE_VERIFY_DATA="${CAPTURE_VERIFY_DATA:-false}"
 SAVE_VERIFY_DATA="${SAVE_VERIFY_DATA:-}"
 LOAD_VERIFY_DATA="${LOAD_VERIFY_DATA:-}"
-VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP="${VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP:-1}"
-VERIFY_MAX_SOURCE_VERSION_LAG="${VERIFY_MAX_SOURCE_VERSION_LAG:-2}"
+VERIFY_SAMPLES_PER_GROUP="${VERIFY_SAMPLES_PER_GROUP:-1}"
+VERIFY_VERSION_LAG="${VERIFY_VERSION_LAG:-2}"
 VERIFY_DATA_LIMIT="${VERIFY_DATA_LIMIT:-inf}"
+VERIFY_ADVANTAGE_BASELINE="${VERIFY_ADVANTAGE_BASELINE:-group}"
+KERNEL_VERIFY_MAX_TURNS="${KERNEL_VERIFY_MAX_TURNS:-2}"
+case "${VERIFY_ADVANTAGE_BASELINE}" in
+   group|history|anchor) ;;
+   *)
+      echo "VERIFY_ADVANTAGE_BASELINE must be group, history, or anchor, got: ${VERIFY_ADVANTAGE_BASELINE}" >&2
+      exit 1
+      ;;
+esac
 if [[ "${VERIFY_ROLLOUT_RATIO}" != "0" && ! -f "${VERIFY_PROMPT_PATH}" ]]; then
    echo "VERIFY_PROMPT_PATH does not exist or is not a regular file: ${VERIFY_PROMPT_PATH}" >&2
    exit 1
@@ -193,6 +202,7 @@ echo "Capture verify data: ${CAPTURE_VERIFY_DATA}"
 echo "Save verify data: ${SAVE_VERIFY_DATA:-disabled}"
 echo "Load verify data: ${LOAD_VERIFY_DATA:-disabled}"
 echo "Verify data limit: ${VERIFY_DATA_LIMIT}"
+echo "Verify advantage baseline: ${VERIFY_ADVANTAGE_BASELINE}"
 echo "EXP_NAME: ${EXP_NAME}"
 
 TENSORBOARD_DIR="/ms/FM/lihongbin/kernel_rl/tensorboard_log/${EXP_NAME}"
@@ -425,9 +435,11 @@ CUSTOM_ARGS=(
    --multi-turn-prompt-config-path $TURN_PROMPT_PATH
    --verify-prompt-config-path $VERIFY_PROMPT_PATH
    --verify-rollout-ratio $VERIFY_ROLLOUT_RATIO
-   --verify-max-samples-per-source-group $VERIFY_MAX_SAMPLES_PER_SOURCE_GROUP
-   --verify-max-source-version-lag $VERIFY_MAX_SOURCE_VERSION_LAG
+   --verify-samples-per-group $VERIFY_SAMPLES_PER_GROUP
+   --verify-version-lag $VERIFY_VERSION_LAG
    --verify-data-limit $VERIFY_DATA_LIMIT
+   --kernel-verify-max-turns $KERNEL_VERIFY_MAX_TURNS
+   --verify-advantage-baseline $VERIFY_ADVANTAGE_BASELINE
    # TIS-related args, recommended to enable when using TIS
    # --custom-config-path examples/train_infer_mismatch_helper/mis.yaml
    # --custom-tis-function-path examples.train_infer_mismatch_helper.mis.compute_mis_weights_with_cp

@@ -6,6 +6,7 @@ import logging
 import math
 import random
 import threading
+import uuid
 from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from slime.utils.types import Sample
 logger = logging.getLogger("examples.kernel_agent.kernel_agent_data_source")
 
 _VERIFY_SOURCE_METADATA_KEYS = (
+    "verify_source_reward",
     "trajectory_states",
     "verify_capture_rollout_id",
     "verify_data_origin",
@@ -151,24 +153,16 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
         self.load_verify_data = getattr(args, "load_verify_data", None) or []
         if isinstance(self.load_verify_data, str):
             self.load_verify_data = [self.load_verify_data]
-        self.fixed_verify_data = bool(self.load_verify_data)
-        self.verify_capture_enabled = self.capture_verify_data or (
-            self.verify_rollout_ratio > 0.0 and not self.fixed_verify_data
-        )
-        self.verify_max_samples_per_source_group = int(getattr(args, "verify_max_samples_per_source_group", 1))
-        self.verify_max_source_version_lag = int(getattr(args, "verify_max_source_version_lag", 2))
+        self.verify_capture_enabled = self.capture_verify_data
+        self.verify_samples_per_group = int(getattr(args, "verify_samples_per_group", 1))
+        self.verify_version_lag = int(getattr(args, "verify_version_lag", 2))
         self.verify_data_limit = getattr(args, "verify_data_limit", math.inf)
         if not 0.0 <= self.verify_rollout_ratio <= 1.0:
             raise ValueError(f"verify_rollout_ratio must be in [0, 1], got {self.verify_rollout_ratio}")
-        if self.verify_max_samples_per_source_group <= 0:
-            raise ValueError(
-                "verify_max_samples_per_source_group must be positive, "
-                f"got {self.verify_max_samples_per_source_group}"
-            )
-        if self.verify_max_source_version_lag < 0:
-            raise ValueError(
-                f"verify_max_source_version_lag must be non-negative, got {self.verify_max_source_version_lag}"
-            )
+        if self.verify_samples_per_group <= 0:
+            raise ValueError(f"verify_samples_per_group must be positive, got {self.verify_samples_per_group}")
+        if self.verify_version_lag < 0:
+            raise ValueError(f"verify_version_lag must be non-negative, got {self.verify_version_lag}")
         if not math.isinf(self.verify_data_limit) and (
             self.verify_data_limit < 0 or int(self.verify_data_limit) != self.verify_data_limit
         ):
@@ -183,6 +177,8 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
         self._dirty_capture_rollout_ids: set[int] = set()
         self._verify_buffer_lock = threading.Lock()
         self._sample_allocation_lock = threading.Lock()
+        self.anchor_kv: dict[str, dict] = {}
+        self._anchor_lock = threading.Lock()
         self._verify_rng = random.Random(args.rollout_seed)
         self._verify_mix_rng = random.Random(args.rollout_seed + 1)
         self._verify_selection_weight_version: int | None = None
@@ -216,19 +212,19 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
             if current_weight_version is not None:
                 self.prune_verify_candidates(
                     current_weight_version=int(current_weight_version),
-                    max_version_lag=self.verify_max_source_version_lag,
+                    max_version_lag=self.verify_version_lag,
                 )
 
-            groups = []
-            for _ in range(num_samples):
+            groups = self._get_samples_from_buffer(num_samples)
+            for _ in range(num_samples - len(groups)):
                 verify_groups = []
                 if self._verify_mix_rng.random() < self.verify_rollout_ratio:
                     if current_weight_version is not None:
                         verify_groups = self._get_verify_samples_locked(
                             1,
-                            max_samples_per_group=self.verify_max_samples_per_source_group,
+                            max_samples_per_group=self.verify_samples_per_group,
                             current_weight_version=int(current_weight_version),
-                            max_version_lag=self.verify_max_source_version_lag,
+                            max_version_lag=self.verify_version_lag,
                         )
                 if verify_groups:
                     groups.extend(verify_groups)
@@ -254,6 +250,7 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
         trajectory_states = metadata.get("trajectory_states")
         if (
             metadata.get("role", "kernel") != "kernel"
+            or metadata.get("verify_trajectory", False)
             or sample.status == Sample.Status.ABORTED
             or not isinstance(trajectory_states, list)
             or not trajectory_states
@@ -266,6 +263,15 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
 
         candidate = copy.deepcopy(sample)
         candidate.metadata = dict(candidate.metadata or {})
+        if getattr(self.args, "verify_advantage_baseline", "group") == "history":
+            try:
+                source_reward = float(sample.reward)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("--verify-advantage-baseline requires a finite source kernel reward") from exc
+            if not math.isfinite(source_reward):
+                raise ValueError("--verify-advantage-baseline requires a finite source kernel reward")
+            # Capture the single-turn execution reward, never its accumulated trajectory return.
+            candidate.metadata["verify_source_reward"] = source_reward
         candidate.metadata["source_kernel_weight_version"] = self._source_kernel_weight_version(
             candidate,
             fallback_version=rollout_id,
@@ -371,7 +377,7 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
             if current_weight_version is not None:
                 self._prune_verify_candidates_locked(
                     int(current_weight_version),
-                    self.verify_max_source_version_lag,
+                    self.verify_version_lag,
                 )
             if self.save_verify_data is not None:
                 assert rollout_id is not None
@@ -444,8 +450,12 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
                 "source_group_index": source_metadata.get("source_group_index", source.group_index),
                 "source_turn_idx": source_metadata.get("turn_idx"),
                 "source_kernel_weight_version": self._source_kernel_weight_version(source),
+                "verify_source_env_result": copy.deepcopy(env_result),
             }
         )
+        for key in ("precision", "augmentation", "ground_truth", "entry_point"):
+            if key in source_metadata:
+                metadata[key] = copy.deepcopy(source_metadata[key])
         return Sample(
             group_index=group_index,
             index=sample_index,
@@ -552,9 +562,71 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
                     )
                 )
                 self.sample_index += 1
+            if getattr(self.args, "verify_advantage_baseline", "group") == "anchor":
+                for sample in group:
+                    sample.metadata["verify_anchor_index"] = self.sample_index
+                self.sample_index += 1
+                self.prepare_anchor(group)
             self.sample_group_index += 1
             groups.append(group)
         return groups
+
+    def prepare_anchor(self, group: list[Sample]) -> str:
+        """Register one direct prompt per group attempt, or reuse its unclaimed record."""
+        first = group[0]
+        with self._anchor_lock:
+            key = first.metadata.get("verify_anchor_key")
+            if any(sample.metadata.get("verify_anchor_key") != key for sample in group):
+                raise ValueError("verify candidates must share one anchor key")
+            if key in self.anchor_kv:
+                if self.anchor_kv[key]["state"] != "pending":
+                    raise ValueError("anchor attempt is already claimed")
+                return key
+            key = f"{first.group_index}:{uuid.uuid4().hex}"
+            anchor = Sample(
+                index=first.metadata["verify_anchor_index"],
+                group_index=first.group_index,
+                prompt=as_messages(first.prompt)[:-1],
+                label=copy.deepcopy(first.label),
+                apply_chat_template_kwargs=copy.deepcopy(first.apply_chat_template_kwargs),
+                generate_function_path="examples.kernel_agent.generate_with_cuda_agent.generate_anchor",
+                metadata={
+                    name: copy.deepcopy(value)
+                    for name, value in first.metadata.items()
+                    if name in {"precision", "augmentation", "ground_truth", "entry_point", "verify_source_env_result"}
+                },
+            )
+            anchor.metadata.update(role="kernel", verify_trajectory=True, verify_scoring_branch="anchor")
+            self.anchor_kv[key] = {"state": "pending", "sample": anchor, "result": None}
+            for sample in group:
+                sample.metadata["verify_anchor_key"] = key
+            return key
+
+    def claim_anchor(self, key: str) -> Sample | None:
+        with self._anchor_lock:
+            record = self.anchor_kv[key]
+            if record["state"] != "pending":
+                return None
+            record["state"] = "running"
+            return record.pop("sample")
+
+    def complete_anchor(self, key: str, result: dict) -> None:
+        with self._anchor_lock:
+            record = self.anchor_kv[key]
+            if record["state"] != "running":
+                raise ValueError("only a running anchor can publish its result")
+            record.update(state="ready", result=copy.deepcopy(result))
+
+    def get_anchor_result(self, key: str) -> dict:
+        with self._anchor_lock:
+            record = self.anchor_kv[key]
+            if record["state"] != "ready":
+                raise ValueError("anchor result is not ready")
+            return copy.deepcopy(record["result"])
+
+    def release_anchor(self, key: str) -> None:
+        with self._anchor_lock:
+            self.anchor_kv.pop(key, None)
 
     def get_verify_buffer_length(self) -> int:
         with self._verify_buffer_lock:
@@ -566,10 +638,7 @@ def capture_verify_candidates(
 ) -> None:
     """Capture all generated kernel failures at the ordinary rollout boundary."""
 
-    fixed_verify_data = bool(getattr(args, "load_verify_data", None))
-    capture_enabled = bool(getattr(args, "capture_verify_data", False)) or (
-        float(getattr(args, "verify_rollout_ratio", 0.0)) > 0.0 and not fixed_verify_data
-    )
+    capture_enabled = bool(getattr(args, "capture_verify_data", False))
     if not capture_enabled:
         return
     if rollout_id is None:

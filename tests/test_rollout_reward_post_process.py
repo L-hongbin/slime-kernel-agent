@@ -21,6 +21,154 @@ from examples.kernel_agent.kernel_reward import (
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
 
+NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("mode", ["baseline", "anchor"])
+@pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
+def test_verify_utility_reaches_training_advantage(monkeypatch, dynamic, mode, estimator):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+    args = _make_manager(advantage_estimator=estimator, use_multi_turn=True).args
+    samples = [
+        Sample(
+            index=index,
+            group_index=0,
+            reward=reward,
+            metadata={"role": "verify", "turn_idx": 0, "multi_turn_reward": reward, "verify_reward_mode": mode},
+        )
+        for index, reward in enumerate([0.3, 0.7])
+    ]
+    raw, advantages = reward_post_process_by_group(args, samples)
+    assert raw == pytest.approx([0.3, 0.7])
+    expected = [0.3, 0.7] if mode == "anchor" else ([-0.2, 0.2] if estimator == "grpo" else [-0.4, 0.4])
+    assert advantages == pytest.approx(expected)
+
+
+def test_singleton_verify_anchor_keeps_absolute_improvement():
+    args = _make_manager(advantage_estimator="rloo", use_multi_turn=False).args
+    sample = Sample(reward=-0.2, metadata={"role": "verify", "verify_reward_mode": "anchor"})
+    assert reward_post_process_by_group(args, [sample])[1] == pytest.approx([-0.2])
+
+
+def test_pending_shared_anchor_cannot_enter_training():
+    args = _make_manager(advantage_estimator="rloo", use_multi_turn=True).args
+    sample = Sample(reward=0.8, metadata={"role": "verify", "verify_reward_mode": "pending_anchor"})
+    with pytest.raises(ValueError, match="settled by the group rollout"):
+        reward_post_process_by_group(args, [sample])
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
+@pytest.mark.parametrize("group_size", [1, 2])
+def test_verify_history_advantage_preserves_signed_improvement_and_raw_reward(
+    monkeypatch, dynamic, estimator, group_size
+):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+    args = _make_manager(advantage_estimator=estimator, use_multi_turn=True, grpo_std_normalization=True).args
+    args.verify_advantage_baseline = "history"
+    samples = []
+    for index in range(group_size):
+        for turn_idx, reward in enumerate([0.75, 0.75, 0.125, 0.125]):
+            samples.append(
+                Sample(
+                    index=index,
+                    group_index=0,
+                    reward=reward,
+                    metadata={
+                        "role": "verify" if turn_idx % 2 == 0 else "kernel",
+                        "turn_idx": turn_idx,
+                        "verify_trajectory": True,
+                        "verify_reward_mode": "baseline",
+                        "verify_source_reward": 0.25,
+                        "multi_turn_reward": reward,
+                    },
+                )
+            )
+    raw, advantages = reward_post_process_by_group(args, samples)
+    assert raw == pytest.approx([0.75, 0.75, 0.125, 0.125] * group_size)
+    assert advantages == pytest.approx([0.5, 0.0, -0.125, 0.0] * group_size)
+    assert [sample.reward for sample in samples] == raw
+
+
+@pytest.mark.parametrize("source_reward", [None, float("nan"), float("inf")])
+def test_verify_history_advantage_requires_finite_baseline(source_reward):
+    args = _make_manager(advantage_estimator="rloo", use_multi_turn=True).args
+    args.verify_advantage_baseline = "history"
+    sample = Sample(reward=0.7, metadata={"role": "verify", "verify_source_reward": source_reward})
+    with pytest.raises(ValueError, match="finite metadata"):
+        reward_post_process_by_group(args, [sample])
+
+
+def test_verify_history_advantage_does_not_subtract_from_anchor_difference():
+    args = _make_manager(advantage_estimator="rloo", use_multi_turn=True).args
+    args.verify_advantage_baseline = "history"
+    sample = Sample(reward=0.4, metadata={"role": "verify", "verify_reward_mode": "anchor"})
+    with pytest.raises(ValueError, match="cannot be applied to anchor-scored"):
+        reward_post_process_by_group(args, [sample])
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("mode", ["baseline", "anchor"])
+def test_verify_pairs_keep_own_kernel_reward_without_future_pair_returns(monkeypatch, dynamic, mode):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+    args = _make_manager(advantage_estimator="trloo", use_multi_turn=True).args
+    samples = [
+        Sample(
+            index=index,
+            group_index=0,
+            reward=reward,
+            metadata={"role": "verify", "turn_idx": turn, "multi_turn_reward": reward, "verify_reward_mode": mode},
+        )
+        for index, turn, reward in [(0, 0, 0.3), (0, 1, 0.9), (1, 0, 0.7), (1, 1, 0.1)]
+    ]
+    raw, advantages = reward_post_process_by_group(args, samples)
+    assert raw == pytest.approx([0.3, 0.9, 0.7, 0.1])
+    expected = raw if mode == "anchor" else [-0.4, 0.8, 0.4, -0.8]
+    assert advantages == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+@pytest.mark.parametrize("mode", ["baseline", "anchor"])
+@pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
+def test_joint_verify_kernel_training_preserves_per_turn_rewards(monkeypatch, dynamic, mode, estimator):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _make_manager(advantage_estimator=estimator, use_multi_turn=True).args
+    samples = []
+    expected_raw = []
+    expected_advantages = []
+    for index, kernel_rewards in enumerate([(0.5, 1.1), (0.9, 0.3)]):
+        for pair_idx, kernel_reward in enumerate(kernel_rewards):
+            group_advantage = [-0.2, 0.4][pair_idx] * (1 if index == 0 else -1)
+            if estimator != "grpo":
+                group_advantage *= 2
+            for offset, role in enumerate(["verify", "kernel"]):
+                is_anchor_verify = mode == "anchor" and role == "verify"
+                reward = kernel_reward - 0.2 if is_anchor_verify else kernel_reward
+                sample = Sample(
+                    index=index,
+                    group_index=0,
+                    reward=reward,
+                    metadata={
+                        "role": role,
+                        "turn_idx": 2 * pair_idx + offset,
+                        "verify_trajectory": True,
+                        "multi_turn_reward": reward,
+                        "verify_reward_mode": mode,
+                    },
+                )
+                if role == "kernel":
+                    # Dynamic/failed-group rewriting would desynchronize the pair's assigned utility.
+                    _set_reward_component(sample, correctness_score=0.0, performance_score=9.0, failed=-1.0)
+                samples.append(sample)
+                expected_raw.append(reward)
+                expected_advantages.append(reward if is_anchor_verify else group_advantage)
+
+    raw, advantages = reward_post_process_by_group(args, samples)
+    assert raw == pytest.approx(expected_raw)
+    assert advantages == pytest.approx(expected_advantages)
+
 
 def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_normalization: bool = False):
     manager_cls = RolloutManager.__ray_metadata__.modified_class

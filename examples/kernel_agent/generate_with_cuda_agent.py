@@ -3,10 +3,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
-from copy import deepcopy
+from copy import copy, deepcopy
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,7 @@ try:
     from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
     from .kernel_reward import calculate_kernel_reward
     from .prompt_utils import as_messages as _as_messages
+    from .prompt_utils import extract_verify_response
     from .prompt_utils import format_feedback as _apply_feedback_template
     from .utils import (
         _extract_env_extra_info,
@@ -47,6 +49,7 @@ except ImportError:
     from kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
     from kernel_reward import calculate_kernel_reward
     from prompt_utils import as_messages as _as_messages
+    from prompt_utils import extract_verify_response
     from prompt_utils import format_feedback as _apply_feedback_template
 
     from utils import (
@@ -900,9 +903,16 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
 
 async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     started_at = time.monotonic()
+    abort_args = args
+    if (sample.metadata or {}).get("role") == "verify":
+        abort_args = copy(args)
+        abort_args.max_turns = 1
+        abort_args.padding_turns = False
     try:
         async with asyncio.timeout(KERNEL_AGENT_GENERATE_GUARD_SEC):
-            return await _generate_with_verify_impl(args, sample, sampling_params)
+            if (sample.metadata or {}).get("role", "kernel") == "verify":
+                return await _generate_with_verify_impl(args, sample, sampling_params)
+            return await _generate_kernel_impl(args, sample, sampling_params)
     except asyncio.TimeoutError:
         elapsed_sec = time.monotonic() - started_at
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -922,19 +932,225 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
             task_id,
             cancel_sent,
         )
-        return _abort_result(args, sample, "wall_clock_timeout", elapsed_sec)
+        return _abort_result(abort_args, sample, "wall_clock_timeout", elapsed_sec)
     except Exception as exc:  # noqa: BLE001
         elapsed_sec = time.monotonic() - started_at
         logger.exception("CUDA agent generate failed after %.1fs: %s", elapsed_sec, exc)
-        return _abort_result(args, sample, f"exception:{type(exc).__name__}", elapsed_sec)
+        return _abort_result(abort_args, sample, f"exception:{type(exc).__name__}", elapsed_sec)
 
 
-async def _generate_with_verify_impl(
+async def _generate_with_verify_impl(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
+    """Alternate diagnosis and evaluated kernel generation within an even turn budget."""
+    if (sample.metadata or {}).get("role") != "verify":
+        raise ValueError("_generate_with_verify_impl requires a verify sample")
+    max_turns = getattr(args, "kernel_verify_max_turns", 2)
+    if max_turns <= 0 or max_turns % 2:
+        raise ValueError("kernel_verify_max_turns must be a positive multiple of 2")
+    if not getattr(args, "use_multi_turn", False):
+        raise ValueError("verify/kernel training requires --use-multi-turn")
+    verify_template = None
+    if max_turns > 2:
+        verify_template = PromptTemplate.from_path(
+            getattr(args, "verify_prompt_config_path", None), prompt_name="verify_response"
+        )
+        if verify_template is None:
+            raise ValueError("multiple verify/kernel pairs require --verify-prompt-config-path")
+
+    output_samples = []
+    current = deepcopy(sample)
+    for pair_idx in range(max_turns // 2):
+        pair = await _generate_verify_pair(args, current, sampling_params.copy())
+        for offset, turn in enumerate(pair):
+            turn.metadata.update(
+                turn_idx=2 * pair_idx + offset,
+                verify_turn_idx=2 * pair_idx,
+                kernel_turn_idx=2 * pair_idx + 1,
+                verify_trajectory=True,
+                multi_turn_reward=float(turn.reward),
+            )
+        output_samples.extend(pair)
+        if any(turn.remove_sample for turn in pair):
+            break
+        kernel = pair[1]
+        source_env = kernel.metadata["env_result"]
+        if _is_done(source_env, 2 * pair_idx + 1, max_turns):
+            break
+        current = deepcopy(sample)
+        current.prompt = _as_messages(kernel.prompt) + [
+            {"role": "assistant", "content": kernel.response},
+            {"role": "user", "content": _apply_feedback_template(source_env, verify_template)},
+        ]
+        current.metadata["verify_source_env_result"] = deepcopy(source_env)
+
+    return output_samples
+
+
+async def generate_anchor(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
+    """Generate one direct kernel; the group owns its lifecycle and shared reward."""
+    anchor_args = copy(args)
+    anchor_args.max_turns = 1
+    anchor_args.use_multi_turn = True
+    anchor_args.padding_turns = False
+    anchor_args.finalize_mode = "none"
+    anchor_args.use_coverage_rs = False
+    sample.prompt = _as_messages(sample.prompt) + [
+        {
+            "role": "user",
+            "content": _apply_feedback_template(
+                sample.metadata["verify_source_env_result"], _get_tool_response_template(GenerateState(args))
+            ),
+        }
+    ]
+    try:
+        return await generate(anchor_args, sample, sampling_params)
+    except asyncio.CancelledError:
+        task_id = (sample.metadata or {}).get("task_id")
+        if task_id:
+            try:
+                await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
+            except Exception:
+                logger.exception("Failed to cancel shared anchor task %s", task_id)
+        raise
+
+
+async def _generate_verify_pair(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
+    """Train a diagnosis and its kernel with per-turn utility; anchors only score."""
+
+    source_env = (sample.metadata or {}).get("verify_source_env_result")
+    if not isinstance(source_env, dict):
+        raise ValueError("verify training requires metadata['verify_source_env_result']")
+    scoring_args = copy(args)
+    scoring_args.max_turns = 1
+    scoring_args.use_multi_turn = True
+    scoring_args.padding_turns = False
+    scoring_args.finalize_mode = "none"
+    scoring_args.use_coverage_rs = False
+
+    anchor_key = (sample.metadata or {}).get("verify_anchor_key")
+    if getattr(args, "verify_advantage_baseline", "group") == "anchor" and not anchor_key:
+        raise ValueError("anchor mode requires a shared metadata['verify_anchor_key']")
+
+    context = _as_messages(sample.prompt)
+    if not context or context[-1].get("role") != "user":
+        raise ValueError("verify prompt must end with a user verification request")
+
+    async def score_revision(verify: Sample) -> list[Sample]:
+        response_template = _get_tool_response_template(GenerateState(args))
+        revision_context = deepcopy(context)
+        revision_context.append({"role": "assistant", "content": verify.response})
+        repair_request = _apply_feedback_template(
+            source_env, response_template, verification=verify.metadata["verify_extracted_response"]
+        )
+        # Construct fresh runtime state while preserving the original task and reference label.
+        revision = Sample(
+            prompt=revision_context
+            + [
+                {
+                    "role": "user",
+                    "content": repair_request,
+                },
+            ],
+            index=sample.index,
+            group_index=sample.group_index,
+            rollout_id=sample.rollout_id,
+            label=deepcopy(sample.label),
+            apply_chat_template_kwargs=deepcopy(sample.apply_chat_template_kwargs),
+            metadata={
+                key: deepcopy(value)
+                for key, value in (sample.metadata or {}).items()
+                if key in {"precision", "augmentation", "ground_truth", "entry_point", "gen_weight_version"}
+            },
+        )
+        revision.metadata.update(role="kernel", verify_scoring_branch="verified")
+        if anchor_key:
+            revision.metadata["verify_anchor_key"] = anchor_key
+        try:
+            turns = await _generate_kernel_impl(scoring_args, revision, sampling_params.copy())
+        except BaseException:
+            task_id = (revision.metadata or {}).get("task_id")
+            if task_id:
+                try:
+                    await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
+                except Exception:
+                    logger.exception("Failed to cancel verify scoring task %s", task_id)
+            raise
+        if (
+            not isinstance(turns, list)
+            or not turns
+            or revision.status in {Sample.Status.ABORTED, Sample.Status.TRUNCATED}
+            or any(turn.status == Sample.Status.ABORTED or turn.remove_sample for turn in turns)
+        ):
+            raise ValueError("verified kernel rollout did not finish")
+        final_reward = float(turns[-1].reward)
+        if not math.isfinite(final_reward):
+            raise ValueError("verified kernel reward must be finite")
+        return turns
+
+    async def generate_verified() -> tuple[Sample, list[Sample]]:
+        diagnostics = await _generate_kernel_impl(scoring_args, sample, sampling_params.copy())
+        if not isinstance(diagnostics, list) or len(diagnostics) != 1:
+            raise ValueError("verify diagnosis did not finish")
+        verify = diagnostics[0]
+        if verify.status != Sample.Status.COMPLETED or not verify.response_length or verify.remove_sample:
+            remove_reason = "verify_diagnosis_incomplete"
+        else:
+            verification = extract_verify_response(verify.response)
+            remove_reason = "invalid_verify_format" if verification is None else None
+        if remove_reason is not None:
+            verify.remove_sample = True
+            verify.loss_mask = [0] * verify.response_length
+            verify.reward = 0.0
+            verify.metadata.update(multi_turn_reward=0.0, remove_reason=remove_reason)
+            return verify, []
+        verify.metadata["verify_extracted_response"] = verification
+        kernel_turns = await score_revision(verify)
+        return verify, kernel_turns
+
+    verify, kernel_turns = await generate_verified()
+    if not kernel_turns:
+        return [verify]
+
+    reward = float(kernel_turns[-1].reward)
+
+    # Retain lightweight scoring traces alongside the trainable verified kernel.
+    def scoring_trace(turns: list[Sample]) -> list[dict[str, Any]]:
+        return [
+            {
+                "response": turn.response,
+                "reward": turn.reward,
+                "env_result": deepcopy(turn.metadata.get("env_result")),
+                "weight_versions": list(turn.weight_versions),
+            }
+            for turn in turns
+        ]
+
+    verify.metadata["verify_kernel_rollout"] = scoring_trace(kernel_turns)
+    verify.metadata["verify_kernel_reward"] = reward
+    verify.metadata["verify_reward_mode"] = "pending_anchor" if anchor_key else "baseline"
+    versions = {str(version) for turn in [verify, *kernel_turns] for version in turn.weight_versions}
+    verify.metadata["verify_scoring_weight_versions"] = sorted(versions)
+    verify.metadata["verify_scoring_versions_complete"] = all(turn.weight_versions for turn in [verify, *kernel_turns])
+    verify.metadata["verify_scoring_version_mismatch"] = len(versions) > 1
+    if len(versions) > 1:
+        for turn in [verify, *kernel_turns]:
+            turn.remove_sample = True
+            turn.loss_mask = [0] * turn.response_length
+            turn.metadata["remove_reason"] = "verify_scoring_version_mismatch"
+            turn.reward = 0.0
+            turn.metadata["multi_turn_reward"] = 0.0
+        reward = 0.0
+    verify.reward = reward
+    verify.metadata["multi_turn_reward"] = reward
+    verify.metadata["trajectory_finish_reason"] = "verify_scored"
+    return [verify, *kernel_turns]
+
+
+async def _generate_kernel_impl(
     args,
     sample: Sample,
     sampling_params: dict[str, Any],
 ) -> Sample | list[Sample]:
-    """Generate a verify response or a normal CUDA-kernel trajectory.
+    """Generate a kernel trajectory or a diagnosis-only response for the verify controller.
 
     Samples with ``metadata["role"] == "verify"`` retain the normal generated-token
     and log-prob contract, but are not executable kernels, so they bypass
