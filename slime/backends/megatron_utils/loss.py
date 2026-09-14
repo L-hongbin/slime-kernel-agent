@@ -1923,8 +1923,23 @@ def policy_loss_function(
             args.calculate_per_token_loss,
         )
 
-    # Determine pg_loss reducer: use custom if specified, otherwise default
-    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+    # MiniRL, Eq. (7): https://arxiv.org/html/2512.01374v1#S4.SS1
+    # Sum valid token losses within each response, then average responses;
+    # here a multi-turn rollout is one response unit (sum across its turns).
+    # This changes only PG aggregation, not advantages or clipping. Keep the non-per-token outer
+    # contract: loss_function / Megatron divide by rollout count, not tokens.
+    # Use post-rejection masks when present; never divide by kept-token count.
+    if getattr(args, "calculate_token_sum_loss", False):
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            calculate_per_token_loss=True,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
+    elif getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
         pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]

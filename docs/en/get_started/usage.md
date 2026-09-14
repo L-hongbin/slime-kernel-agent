@@ -205,6 +205,12 @@ The recommended contract is to put the source identifier in `metadata["source_na
 - `--calculate-per-token-loss`: By default, slime calculates loss on a per-sample basis, i.e., `mean(sum(sample_i) / len(sample_i))`. Enable this flag to calculate loss on a per-token basis, i.e., `sum(sum(sample_i)) / sum(len(sample_i))`.
 - `--use-tis`: Enable this setting to use TIS (Truncated Importance Sampling) (https://fengyao.notion.site/off-policy-rl).
 
+`--calculate-token-sum-loss` uses the PG reduction from [MiniRL Eq. (7)](https://arxiv.org/html/2512.01374v1#S4.SS1): `sum(valid token PG losses) / rollouts in the training step`, without dividing by actual response length. For multi-turn rollouts, all turns contribute to one trajectory sum and the outer average counts trajectories. Padding and masked tokens contribute no loss.
+
+This flag defaults to off, requires `--loss-type policy_loss`, and is incompatible with `--calculate-per-token-loss` and `--custom-pg-loss-reducer-function-path`. It does not change advantages, importance sampling, clipping, entropy/KL reductions, or other diagnostic reductions. For GRPO with mean-only reward centering, separately pass `--disable-grpo-std-normalization`. This is not a switch for the complete MiniRL algorithm.
+
+Removing length division substantially increases the PG gradient scale: recheck learning rate, gradient norms and gradient clipping when switching. KernelAgent's `run_qwen3.6_27B_full_async_dppo.sh` accepts `CALC_LOSS_MODE=TokenSum`; its default remains `PerToken`.
+
 #### GRPO Algorithm
 
 GRPO (Group Relative Policy Optimization) is an RL algorithm proposed in DeepSeek-Math. Its core idea is to compute advantage through intra-group relative comparisons, eliminating the need for a separate critic model.

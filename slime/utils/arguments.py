@@ -1896,6 +1896,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Path to the custom TIS/RS function (e.g., examples/train_infer_mismatch_helper/mis.py:compute_mis_weights_with_cp).",
             )
             parser.add_argument(
+                "--calculate-token-sum-loss",
+                action="store_true",
+                default=False,
+                help="Sum valid policy-gradient token losses and use the outer rollout-count average "
+                "(MiniRL reduction, without length division). "
+                "Does not change the policy objective, advantages, entropy or KL reduction. "
+                "Incompatible with --calculate-per-token-loss and custom PG reducers.",
+            )
+            parser.add_argument(
                 "--custom-pg-loss-reducer-function-path",
                 type=str,
                 default=None,
@@ -2849,6 +2858,18 @@ def _resolve_checkpoint_load_args(args) -> None:
 
 
 def slime_validate_args(args):
+    if getattr(args, "calculate_token_sum_loss", False):
+        if getattr(args, "calculate_per_token_loss", False):
+            raise ValueError("--calculate-token-sum-loss requires --calculate-per-token-loss to be disabled")
+        if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+            raise ValueError("--calculate-token-sum-loss cannot be combined with a custom PG loss reducer")
+        if getattr(args, "loss_type", "policy_loss") != "policy_loss":
+            raise ValueError("--calculate-token-sum-loss requires --loss-type policy_loss")
+        logger.info(
+            "MiniRL PG reduction: token sum / rollout count; no length division. "
+            "Policy objective, advantage normalization and auxiliary loss reductions are unchanged. "
+            "PG gradient scale can be much larger than token-mean reduction; recheck learning rate and grad clipping."
+        )
     _validate_rollout_no_progress_args(args)
     validate_qwen_gdn_distributed_options(args)
     if getattr(args, "enable_fp32_lm_head", False):

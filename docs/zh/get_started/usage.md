@@ -209,6 +209,12 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 - `--calculate-per-token-loss`：slime 中默认的方案是 per sample loss，即 `mean(sum(sample_i) / len(sample_i))`，如果需要计算 per token loss，即 `sum(sum(sample_i)) / sum(len(sample_i))`，可以开启 `--calculate-per-token-loss`；
 - `--use-tis`：如果需要开启 tis（https://fengyao.notion.site/off-policy-rl），可以开启这一设置；
 
+`--calculate-token-sum-loss` 使用 [MiniRL 公式 (7)](https://arxiv.org/html/2512.01374v1#S4.SS1) 的 PG 聚合方式：`sum(有效 token 的 PG loss) / 本训练步的 rollout 数`，不除以实际回复长度。多轮时同一轨迹的所有 turn 累加，外层仍按轨迹数平均；padding 和被 mask 的 token 不贡献 loss。
+
+该开关默认关闭，不能与 `--calculate-per-token-loss` 或 `--custom-pg-loss-reducer-function-path` 同时启用，仅支持 `--loss-type policy_loss`。它不改变 advantage、重要性采样和 clipping，也不改变 entropy/KL 项及其他诊断指标的归约。若使用 GRPO 并希望只减组内 reward 均值，还需单独传入 `--disable-grpo-std-normalization`。因此这不是完整 MiniRL 算法开关。
+
+去掉长度分母会明显增大 PG 梯度尺度，切换时应检查学习率、梯度范数及梯度裁剪比例。KernelAgent 的 `run_qwen3.6_27B_full_async_dppo.sh` 可用 `CALC_LOSS_MODE=TokenSum` 启用；脚本默认仍是 `PerToken`。
+
 #### GRPO 算法
 
 GRPO（Group Relative Policy Optimization）是 DeepSeek-Math 中提出的一种 RL 算法，其核心思想是通过组内相对比较来计算 advantage，而不需要额外的 critic 模型。

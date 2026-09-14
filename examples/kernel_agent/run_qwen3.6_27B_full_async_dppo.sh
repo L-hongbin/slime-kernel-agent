@@ -186,11 +186,15 @@ if [ "$USE_CTM" != "false" ]; then
 fi
 
 EXP_PARAM+="Calc$CALC_LOSS_MODE"
-if [[ "$CALC_LOSS_MODE" == "PerToken" ]]; then
-   EXP_ARGS+=(
-      --calculate-per-token-loss
-   )
-fi
+case "$CALC_LOSS_MODE" in
+   PerToken) EXP_ARGS+=(--calculate-per-token-loss) ;;
+   PerSample) ;;
+   TokenSum) EXP_ARGS+=(--calculate-token-sum-loss) ;;
+   *)
+      echo "Unknown CALC_LOSS_MODE: ${CALC_LOSS_MODE}; expected PerToken, PerSample or TokenSum." >&2
+      exit 1
+      ;;
+esac
 EXP_ARGS+=("${MIS_ARGS[@]}")
 EXP_NAME="Kernel-FullAsync-${KERNEL_BACKEND^^}"
 EXP_NAME="${EXP_NAME//_/-}-$MODEL_NAME-$DATASET-TurnPromptGEPAKimi-$EXP_PARAM"

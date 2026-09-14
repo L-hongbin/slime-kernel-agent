@@ -72,7 +72,6 @@ from _cp_dist_helpers import (
     stub_megatron_in_worker,
 )
 
-
 NUM_GPUS = 0
 
 
@@ -84,6 +83,7 @@ def _grad_norm_worker(
     seed: int,
     master_port: int,
     result_path: str,
+    token_sum: bool = False,
 ) -> None:
     """One spawned rank.
 
@@ -151,7 +151,9 @@ def _grad_norm_worker(
         x_input = x_for_rank.unsqueeze(-1)  # shape [T, 1]
         output = model(x_input).squeeze(-1)  # shape [T]
 
-        reducer = get_sum_of_sample_mean(my_tl, my_rl, my_masks, my_denoms)
+        # MiniRL uses the token-sum reducer but keeps the outer non-token
+        # normalizer below, i.e. sums / rollout count, not sums / token count.
+        reducer = get_sum_of_sample_mean(my_tl, my_rl, my_masks, my_denoms, calculate_per_token_loss=token_sum)
         loss = reducer(output)
 
         # === Step 1: slime's per-rollout-mean prescaling ======================
@@ -196,7 +198,7 @@ def _grad_norm_worker(
         _dist.destroy_process_group()
 
 
-def _run_grad_norm_worker(dp_size: int, cp_size: int, tmp_path) -> float:
+def _run_grad_norm_worker(dp_size: int, cp_size: int, tmp_path, *, token_sum: bool = False) -> float:
     """Spawn ``dp_size * cp_size`` workers and return rank-0's final grad."""
     import torch.multiprocessing as mp
 
@@ -204,7 +206,7 @@ def _run_grad_norm_worker(dp_size: int, cp_size: int, tmp_path) -> float:
     result_path = str(tmp_path / f"grad_dp{dp_size}_cp{cp_size}.txt")
     mp.spawn(
         _grad_norm_worker,
-        args=(world_size, cp_size, dp_size, 0, free_port(), result_path),
+        args=(world_size, cp_size, dp_size, 0, free_port(), result_path, token_sum),
         nprocs=world_size,
         join=True,
     )
@@ -246,6 +248,14 @@ def test_backward_grad_is_cp_invariant(dp_size, cp_size, tmp_path):
     # or factor regression in the prescaling math will fail the whole
     # matrix uniformly — easy to spot in CI logs.
     assert grad == pytest.approx(FOUR_ROLLOUT_EXPECTED_REPORT, rel=1e-4)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (1, 2), (2, 2)])
+def test_minirl_backward_grad_is_cp_invariant(dp_size, cp_size, tmp_path):
+    grad = _run_grad_norm_worker(dp_size, cp_size, tmp_path, token_sum=True)
+    expected = sum(sum(values) for values in FOUR_ROLLOUT_X_VALUES) / 4
+    assert grad == pytest.approx(expected, rel=1e-4)
 
 
 # Keep the helpers import load-bearing (it installs the megatron stub).
