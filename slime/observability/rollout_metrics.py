@@ -49,6 +49,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_kernel_agent_metrics(samples)
+    log_dict |= _compute_verify_rl_metrics(args, samples)
     if getattr(args, "use_multi_turn", False):
         log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
@@ -61,6 +62,110 @@ def compute_metrics_from_samples(args, samples):
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_verify_rl_metrics(args, samples):
+    """Role-separated metrics on the collected batch, before reward postprocessing."""
+    buckets = {"verify": [], "verify/kernel": [], "kernel/ordinary": []}
+    groups, verify_groups = set(), set()
+    for sample in samples:
+        metadata = sample.metadata or {}
+        role = metadata.get("role", "kernel")
+        if metadata.get("is_pad_turn") or role == "pad" or metadata.get("verify_scoring_branch") == "anchor":
+            continue
+        is_verify = role == "verify" or metadata.get("verify_trajectory", False)
+        bucket = "verify" if role == "verify" else "verify/kernel" if is_verify else "kernel/ordinary"
+        buckets[bucket].append(sample)
+        if sample.group_index is not None:
+            groups.add(sample.group_index)
+            if is_verify:
+                verify_groups.add(sample.group_index)
+
+    if not (buckets["verify"] or buckets["verify/kernel"] or getattr(args, "verify_rollout_ratio", 0) > 0):
+        return {}
+
+    metrics = {
+        "verify/group_count": len(verify_groups),
+        "verify/total_group_count": len(groups),
+        "verify/group_fraction": len(verify_groups) / len(groups) if groups else 0.0,
+    }
+
+    def finite(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+
+    def add_stats(key, values):
+        values = [float(value) for value in values if finite(value)]
+        metrics[f"{key}/count"] = len(values)
+        if values:
+            metrics.update(dict_add_prefix(compute_statistics(values), f"{key}/"))
+
+    valid_buckets = {}
+    for name, items in buckets.items():
+        valid = [sample for sample in items if not sample.remove_sample and sample.status != Sample.Status.ABORTED]
+        valid_buckets[name] = valid
+        metrics[f"{name}/sample_count"] = len(items)
+        metrics[f"{name}/valid_sample_count"] = len(valid)
+        metrics[f"{name}/removed_fraction"] = sum(s.remove_sample for s in items) / len(items) if items else 0.0
+        metrics[f"{name}/aborted_fraction"] = (
+            sum(s.status == Sample.Status.ABORTED for s in items) / len(items) if items else 0.0
+        )
+        metrics[f"{name}/truncated_fraction"] = (
+            sum(s.status == Sample.Status.TRUNCATED for s in items) / len(items) if items else 0.0
+        )
+        # Raw lengths include discarded responses, while masked lengths reflect training cost.
+        add_stats(f"{name}/response_len", [s.response_length for s in items])
+        add_stats(f"{name}/trainable_response_len", [float(s.effective_response_length) for s in valid])
+        reward_key = getattr(args, "reward_key", None)
+        rewards = [s.reward.get(reward_key) if isinstance(s.reward, dict) else s.reward for s in valid]
+        add_stats(f"{name}/reward", rewards)
+        if name != "verify":
+            correctness = []
+            for sample in valid:
+                metadata = sample.metadata or {}
+                info = metadata.get("env_extra_info") or (metadata.get("env_result") or {}).get("env_extra_info") or {}
+                if info.get("correctness") is not None:
+                    correctness.append(float(bool(info["correctness"]) and not bool(info.get("decoy_kernel"))))
+            metrics[f"{name}/correctness_count"] = len(correctness)
+            if correctness:
+                metrics[f"{name}/correctness_rate"] = float(np.mean(correctness))
+
+    diagnoses = buckets["verify"]
+    metrics["verify/format_valid_fraction"] = (
+        sum(bool((s.metadata or {}).get("verify_extracted_response")) for s in diagnoses) / len(diagnoses)
+        if diagnoses
+        else 0.0
+    )
+    for reason in ("invalid_verify_format", "verify_diagnosis_incomplete", "verify_scoring_version_mismatch"):
+        count = sum((s.metadata or {}).get("remove_reason") == reason for s in diagnoses)
+        metrics[f"verify/{reason}/count"] = count
+        metrics[f"verify/{reason}/fraction"] = count / len(diagnoses) if diagnoses else 0.0
+
+    scored = [s.metadata for s in valid_buckets["verify"] if finite((s.metadata or {}).get("verify_kernel_reward"))]
+    add_stats("verify/kernel_reward", [m["verify_kernel_reward"] for m in scored])
+    metrics["verify/scored_fraction"] = len(scored) / len(diagnoses) if diagnoses else 0.0
+    baseline_mode = getattr(args, "verify_advantage_baseline", "group")
+    if baseline_mode in {"history", "anchor"}:
+        baseline_key = "verify_source_reward" if baseline_mode == "history" else "verify_anchor_reward"
+        paired = [m for m in scored if finite(m.get(baseline_key))]
+        add_stats("verify/baseline_reward", [m[baseline_key] for m in paired])
+        # History samples still contain raw R2 here; anchor samples already contain R2 - Ra.
+        improvements = [m["verify_kernel_reward"] - m[baseline_key] for m in paired]
+        add_stats("verify/improvement", improvements)
+        metrics["verify/missing_baseline_count"] = len(scored) - len(paired)
+        if improvements:
+            metrics["verify/improvement/win_rate"] = sum(v > 0 for v in improvements) / len(improvements)
+            metrics["verify/improvement/tie_rate"] = sum(v == 0 for v in improvements) / len(improvements)
+            metrics["verify/improvement/loss_rate"] = sum(v < 0 for v in improvements) / len(improvements)
+
+    # One fixed anchor is shared by N candidates and all their verify/kernel pairs.
+    anchors = {}
+    for sample in diagnoses:
+        metadata = sample.metadata or {}
+        key, reward = metadata.get("verify_anchor_key"), metadata.get("verify_anchor_reward")
+        if key is not None and finite(reward):
+            anchors[key] = reward
+    add_stats("verify/anchor/reward", anchors.values())
+    return metrics
 
 
 def _iter_response_diversity_groups(args, samples):

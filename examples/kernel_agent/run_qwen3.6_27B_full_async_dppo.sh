@@ -101,6 +101,8 @@ if [[ ! -f "${TURN_PROMPT_PATH}" ]]; then
 fi
 VERIFY_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/verify_prompt/tvm_ffi_correctness_v1.jinja"
 VERIFY_ROLLOUT_RATIO="${VERIFY_ROLLOUT_RATIO:-0}"
+ROLLOUT_NO_PROGRESS_WARN_SECONDS="${ROLLOUT_NO_PROGRESS_WARN_SECONDS:-900}"
+ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS="${ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS:-7200}"
 CAPTURE_VERIFY_DATA="${CAPTURE_VERIFY_DATA:-false}"
 SAVE_VERIFY_DATA="${SAVE_VERIFY_DATA:-}"
 LOAD_VERIFY_DATA="${LOAD_VERIFY_DATA:-}"
@@ -350,6 +352,8 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --num-rollout 3000
    --rollout-batch-size 16
+   --rollout-no-progress-warn-seconds "$ROLLOUT_NO_PROGRESS_WARN_SECONDS"
+   --rollout-no-progress-timeout-seconds "$ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS"
    --n-samples-per-prompt 16
    --rollout-max-response-len $MAX_RESPONSE_LEN
    --rollout-max-context-len $CONTEXT_LEN

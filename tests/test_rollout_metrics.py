@@ -1,6 +1,7 @@
 import base64
 import sys
 from argparse import Namespace
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +16,9 @@ if repo_root_path not in sys.path:
 from slime.observability.rollout_metrics import (
     _compute_exp_rollout_metrics,
     _compute_top_p_kept_vocab_metrics,
+    _compute_verify_rl_metrics,
     _iter_response_diversity_groups,
+    compute_metrics_from_samples,
 )
 from slime.utils.misc import decode_int32_meta_array
 from slime.utils.types import Sample
@@ -25,6 +28,161 @@ NUM_GPUS = 0
 
 def _make_args():
     return Namespace(sglang_speculative_algorithm=False, num_layers=2, moe_router_topk=2)
+
+
+@pytest.mark.unit
+def test_verify_metrics_separate_roles_and_exclude_padding():
+    samples = [
+        Sample(group_index=1, reward=1.0, response_length=100, metadata={"turn_idx": 0}),
+        Sample(
+            group_index=2,
+            reward=3.0,
+            response_length=20,
+            loss_mask=torch.tensor([1, 0] * 10),
+            metadata={
+                "role": "verify",
+                "turn_idx": 0,
+                "verify_extracted_response": "fix",
+                "verify_kernel_reward": 3.0,
+            },
+        ),
+        Sample(
+            group_index=2,
+            reward=3.0,
+            response_length=60,
+            metadata={"role": "kernel", "verify_trajectory": True, "env_extra_info": {"correctness": True}},
+        ),
+        Sample(group_index=3, reward=999.0, response_length=999, metadata={"is_pad_turn": True}),
+        Sample(group_index=4, reward=999.0, response_length=999, metadata={"role": "pad"}),
+        Sample(group_index=2, reward=999.0, metadata={"verify_scoring_branch": "anchor"}),
+    ]
+    metrics = _compute_verify_rl_metrics(Namespace(), samples)
+
+    assert metrics["verify/group_fraction"] == 0.5
+    assert metrics["verify/group_count"] == 1
+    assert metrics["verify/total_group_count"] == 2
+    for prefix, reward, length in [("kernel/ordinary", 1.0, 100), ("verify", 3.0, 20), ("verify/kernel", 3.0, 60)]:
+        assert metrics[f"{prefix}/sample_count"] == 1
+        assert metrics[f"{prefix}/reward/mean"] == reward
+        assert metrics[f"{prefix}/response_len/mean"] == length
+    assert metrics["verify/trainable_response_len/mean"] == 10
+    assert metrics["verify/format_valid_fraction"] == 1
+    assert metrics["verify/kernel/correctness_rate"] == 1
+    assert metrics["verify/scored_fraction"] == 1
+    assert "verify/improvement/mean" not in metrics
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "mode,baseline_key", [("history", "verify_source_reward"), ("anchor", "verify_anchor_reward")]
+)
+def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline_key):
+    samples = [
+        Sample(
+            group_index=5,
+            reward=reward if mode == "history" else reward - 2.0,
+            response_length=10,
+            metadata={
+                "role": "verify",
+                "turn_idx": 2 * turn,
+                "verify_source_reward": -100.0,
+                "verify_kernel_reward": reward,
+                "verify_anchor_key": "shared" if mode == "anchor" else None,
+                baseline_key: 2.0,
+            },
+        )
+        for turn, reward in enumerate([1.0, 2.0, 6.0])
+    ]
+    original = deepcopy([s.to_dict() for s in samples])
+    metrics = _compute_verify_rl_metrics(Namespace(verify_advantage_baseline=mode), samples)
+
+    assert metrics["verify/reward/mean"] == (3.0 if mode == "history" else 1.0)
+    assert metrics["verify/kernel_reward/mean"] == 3.0
+    assert metrics["verify/baseline_reward/mean"] == 2.0
+    assert metrics["verify/improvement/mean"] == 1.0
+    assert metrics["verify/improvement/count"] == 3
+    assert metrics["verify/improvement/min"] == -1.0
+    for outcome in ("win", "tie", "loss"):
+        assert metrics[f"verify/improvement/{outcome}_rate"] == pytest.approx(1 / 3)
+    assert metrics["verify/anchor/reward/count"] == (1 if mode == "anchor" else 0)
+    if mode == "anchor":
+        assert metrics["verify/anchor/reward/mean"] == 2.0
+    assert [s.to_dict() for s in samples] == original
+
+
+@pytest.mark.unit
+def test_verify_metrics_masked_outputs_count_tokens_but_not_rewards():
+    samples = [
+        Sample(
+            reward=0.0,
+            response_length=length,
+            remove_sample=True,
+            metadata={"role": "verify", "remove_reason": reason, "verify_kernel_reward": 99.0},
+        )
+        for length, reason in enumerate(
+            ["invalid_verify_format", "verify_diagnosis_incomplete", "verify_scoring_version_mismatch"], start=1
+        )
+    ]
+    samples[-1].metadata["verify_extracted_response"] = "valid format but wrong version"
+    samples.append(Sample(reward=99.0, response_length=4, status=Sample.Status.ABORTED, metadata={"role": "verify"}))
+    metrics = _compute_verify_rl_metrics(Namespace(), samples)
+
+    assert metrics["verify/sample_count"] == 4
+    assert metrics["verify/valid_sample_count"] == 0
+    assert metrics["verify/reward/count"] == 0
+    assert metrics["verify/kernel_reward/count"] == 0
+    assert metrics["verify/response_len/mean"] == 2.5
+    assert metrics["verify/format_valid_fraction"] == 0.25
+    assert metrics["verify/removed_fraction"] == 0.75
+    assert metrics["verify/aborted_fraction"] == 0.25
+    for reason in ("invalid_verify_format", "verify_diagnosis_incomplete", "verify_scoring_version_mismatch"):
+        assert metrics[f"verify/{reason}/fraction"] == 0.25
+    assert "verify/reward/mean" not in metrics
+    assert all(np.isfinite(value) for value in metrics.values())
+
+
+@pytest.mark.unit
+def test_verify_metrics_missing_nonfinite_values_and_correctness_coverage():
+    samples = [
+        Sample(reward=float("nan"), metadata={"role": "verify", "verify_kernel_reward": float("inf")}),
+        Sample(reward=2.0, metadata={"role": "verify", "verify_kernel_reward": 2.0}),
+        Sample(metadata={"verify_trajectory": True, "env_extra_info": {"correctness": None}}),
+        Sample(metadata={"verify_trajectory": True, "env_result": {"env_extra_info": {"correctness": False}}}),
+        Sample(metadata={"verify_trajectory": True, "env_extra_info": {"correctness": True, "decoy_kernel": True}}),
+    ]
+    metrics = _compute_verify_rl_metrics(Namespace(verify_advantage_baseline="history"), samples)
+
+    assert metrics["verify/reward/count"] == 1
+    assert metrics["verify/kernel_reward/count"] == 1
+    assert metrics["verify/missing_baseline_count"] == 1
+    assert metrics["verify/improvement/count"] == 0
+    assert "verify/improvement/mean" not in metrics
+    assert metrics["verify/kernel/correctness_count"] == 2
+    assert metrics["verify/kernel/correctness_rate"] == 0
+    assert all(np.isfinite(value) for value in metrics.values())
+
+
+@pytest.mark.unit
+def test_verify_metrics_disabled_and_empty_buffer_fallback():
+    samples = [Sample(group_index=1, reward=1.0)]
+    assert _compute_verify_rl_metrics(Namespace(), samples) == {}
+    for batch in (samples, []):
+        metrics = _compute_verify_rl_metrics(Namespace(verify_rollout_ratio=0.5), batch)
+        assert metrics["verify/group_fraction"] == 0
+        assert metrics["verify/sample_count"] == 0
+        assert metrics["verify/response_len/count"] == 0
+        assert "verify/response_len/mean" not in metrics
+
+
+@pytest.mark.unit
+def test_verify_metrics_integrate_with_regular_rollout_metrics_without_exp_flag():
+    args = Namespace(advantage_estimator="ppo", log_reward_category=None, log_exp_metrics=False)
+    samples = [Sample(reward=2.0, response_length=5, metadata={"role": "verify"})]
+
+    metrics = compute_metrics_from_samples(args, samples)
+
+    assert metrics["verify/reward/mean"] == 2.0
+    assert metrics["verify/response_len/mean"] == 5
 
 
 @pytest.mark.unit
