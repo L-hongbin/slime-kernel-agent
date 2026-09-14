@@ -296,7 +296,7 @@ def a2a_cp_to_hp_packed(
     total_seq_len: int,
     packed_seq_params: PackedSeqParams | None,
     rank_split_sections: tuple[tuple[int, ...], ...] | None = None,
-    a2a_implementation: str = "fused",
+    a2a_implementation: str = "native",
     cache_thd_permutation: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Convert CP sequence shards to head shards, including packed THD ordering."""
@@ -354,7 +354,7 @@ def a2a_hp_to_cp_packed(
     packed_seq_params: PackedSeqParams | None,
     inverse: torch.Tensor | None,
     rank_widths: tuple[int, ...] | None = None,
-    a2a_implementation: str = "fused",
+    a2a_implementation: str = "native",
 ) -> torch.Tensor:
     """Restore the context-parallel layout after head-sharded GDN compute."""
     if a2a_implementation not in ("native", "fused"):
@@ -395,7 +395,7 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
         if not self.config.deterministic_mode:
             self.gated_delta_rule = get_chunk_gated_delta_rule(backend)
         self.gdn_backend = backend
-        self.a2a_implementation = getattr(args, "qwen_gdn_a2a_implementation", None) or "fused"
+        self.a2a_implementation = getattr(args, "qwen_gdn_a2a_implementation", None) or "native"
         self.cache_thd_permutation = getattr(args, "qwen_gdn_cache_thd_permutation", False)
         self.recompute_norm_out = bool(
             getattr(self, "recompute_norm_out", False) or getattr(args, "qwen_gdn_recompute_norm_out", False)

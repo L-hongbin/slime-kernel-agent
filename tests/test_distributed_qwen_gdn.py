@@ -670,7 +670,7 @@ def test_distributed_gdn_builds_rank_local_shapes_for_ragged_cp(monkeypatch):
     module = distributed_gdn_module.DistributedQwenGatedDeltaNet(args=SimpleNamespace(qwen_gdn_backend="fla"))
 
     assert module.ragged_cp is True
-    assert module.a2a_implementation == "fused"
+    assert module.a2a_implementation == "native"
     assert module.cache_thd_permutation is False
     assert module.num_key_heads_local_cp == 1
     assert module.num_value_heads_local_cp == 2
@@ -757,6 +757,7 @@ def test_thd_cp_permutation_cache_is_opt_in(monkeypatch):
         cu_seqlens,
         4,
         cached_params,
+        a2a_implementation="fused",
         cache_thd_permutation=True,
     )
     _, second_cached_inverse = a2a_cp_to_hp_packed(
@@ -767,6 +768,7 @@ def test_thd_cp_permutation_cache_is_opt_in(monkeypatch):
         cu_seqlens,
         4,
         cached_params,
+        a2a_implementation="fused",
         cache_thd_permutation=True,
     )
     assert second_cached_inverse is first_cached_inverse
@@ -780,6 +782,7 @@ def test_thd_cp_permutation_cache_is_opt_in(monkeypatch):
         cu_seqlens,
         4,
         uncached_params,
+        a2a_implementation="fused",
         cache_thd_permutation=False,
     )
     _, second_uncached_inverse = a2a_cp_to_hp_packed(
@@ -790,6 +793,7 @@ def test_thd_cp_permutation_cache_is_opt_in(monkeypatch):
         cu_seqlens,
         4,
         uncached_params,
+        a2a_implementation="fused",
         cache_thd_permutation=False,
     )
     assert second_uncached_inverse is not first_uncached_inverse
@@ -970,6 +974,7 @@ def test_equal_cp_uses_fused_pack_and_matches_reference(monkeypatch, cp_size, pa
         cu_seqlens,
         total_seq_len=2 * cp_size,
         packed_seq_params=packed_seq_params,
+        a2a_implementation="fused",
     )
 
     if packed:

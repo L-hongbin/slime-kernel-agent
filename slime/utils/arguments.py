@@ -424,7 +424,7 @@ def add_qwen_gdn_arguments(parser):
         help=(
             "All-to-all layout implementation for distributed Qwen GDN with evenly sharded CP heads. "
             "'native' preserves Megatron's split/cat path; 'fused' uses fused packing and reusable buffers. "
-            "Distributed GDN defaults to 'fused' when this option is omitted."
+            "Distributed GDN defaults to 'native' when this option is omitted."
         ),
     )
     parser.add_argument(
