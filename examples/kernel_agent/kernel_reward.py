@@ -292,40 +292,91 @@ def _dynamic_raw_rewards(args, samples, config: dict[str, Any]) -> list[float]:
     return raw_rewards
 
 
-def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
-    """Apply the MicroCoder-GRPO Conditional Truncation Mask (CTM).
+def _annotate_conditional_truncation_mask(args, sample) -> None:
+    """Select a sample for the MicroCoder-GRPO Conditional Truncation Mask (CTM).
 
     Implements CTM from Breaking Training Bottlenecks: Effective and Stable
     Reinforcement Learning for Coding Models (arXiv:2603.07777). Eligible
     responses reach the maximum length, are non-incorrect (correct or
     incomplete), and do not repeat the preceding 128-token window at the tail;
-    their post-processed advantages are randomly zeroed with probability rho.
+    they are randomly selected with probability rho for final advantage masking.
     The paper compares rho=0.1, 0.2, and 0.3; slime defaults to rho=0.1. This
-    hook runs after group reward normalization so masked samples do not alter
-    other samples' advantages.
+    hook only records the selection. The training backend zeros advantages
+    after OPD and advantage normalization, without changing their statistics.
+
+    Kernel-specific restriction: runtime and later-stage failures remain
+    learnable even when generation was truncated. Precheck/compile failures
+    can still qualify as incomplete responses under the conditions below.
     """
+    sample.metadata = dict(sample.metadata or {})
+    for key in (
+        "conditional_truncation_masking_eligible",
+        "conditional_truncation_masked",
+        "conditional_truncation_mask_prob",
+        "conditional_truncation_repeat_window",
+    ):
+        sample.metadata.pop(key, None)
     if sample.remove_sample:
-        return advantage
+        return
     if sample.loss_mask is not None and sum(sample.loss_mask) == 0:
-        return advantage
+        return
 
     # Paper CTM eligibility: max length, non-incorrect (correct or truncated),
     # no repeated tail, then Bernoulli masking.
     max_response_len = int(getattr(args, "rollout_max_response_len", getattr(args, "max_new_tokens", 0)) or 0)
     response_length = int(sample.response_length or 0)
     if max_response_len <= 0 or response_length != max_response_len:
-        return advantage
+        return
 
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     env_extra_info = metadata.get("env_extra_info")
+    env_result = metadata.get("env_result")
+    env_state = env_result.get("env_state", env_result) if isinstance(env_result, dict) else {}
+    env_state = env_state if isinstance(env_state, dict) else {}
+    env_metadata = env_state.get("metadata")
+    env_metadata = env_metadata if isinstance(env_metadata, dict) else {}
+    extra = env_extra_info if isinstance(env_extra_info, dict) else {}
+
+    # Error evidence takes precedence over both TRUNCATED and correctness=True:
+    # a correct kernel may still fail during performance/profiling. Read the
+    # original result as well as compact feedback; reward-stage scores may be
+    # disabled and must not control CTM eligibility.
+    error = env_state.get("error") or env_state.get("error_code")
+    if error in {RUNTIME_ERROR, CORRECTNESS_ERROR} or env_state.get("error_code") in {
+        RUNTIME_ERROR,
+        CORRECTNESS_ERROR,
+    }:
+        return
+    if any(
+        info.get(key)
+        for info in (env_state, env_metadata, extra)
+        for key in (
+            "runtime_error",
+            "correctness_runtime_error",
+            "correctness_output_mismatch",
+            "performance_error",
+            "profiling_error",
+        )
+    ):
+        return
+    compiled = env_state.get("compiled", extra.get("compilation"))
+    if compiled is True and (
+        error
+        or env_state.get("error_message")
+        or env_metadata.get("error")
+        or env_state.get("status") in {"failed", "timeout"}
+        or env_state.get("success") is False
+        or env_state.get("correctness", extra.get("correctness")) is False
+    ):
+        return
     if isinstance(env_extra_info, dict):
         if bool(env_extra_info.get("decoy_kernel")):
-            return advantage
+            return
         is_mask_candidate = env_extra_info.get("correctness") is True or sample.status == sample.Status.TRUNCATED
     else:
         is_mask_candidate = sample.status == sample.Status.TRUNCATED
     if not is_mask_candidate:
-        return advantage
+        return
 
     repeat_window = int(getattr(args, "conditional_truncation_repeat_window", 128))
     response_tokens = sample.tokens[-response_length:] if response_length > 0 else []
@@ -335,18 +386,16 @@ def _apply_conditional_truncation_mask(args, sample, advantage: float) -> float:
         and response_tokens[-repeat_window:] == response_tokens[-2 * repeat_window : -repeat_window]
     )
     if has_repeated_tail:
-        return advantage
+        return
 
     mask_prob = float(getattr(args, "conditional_truncation_mask_prob", 0.1))
-    sample.metadata = dict(sample.metadata or {})
     sample.metadata["conditional_truncation_masking_eligible"] = True
     if random.random() >= mask_prob:
-        return advantage
+        return
 
     sample.metadata["conditional_truncation_masked"] = True
     sample.metadata["conditional_truncation_mask_prob"] = mask_prob
     sample.metadata["conditional_truncation_repeat_window"] = repeat_window
-    return 0.0
 
 
 def reward_post_process_by_group(args, samples):
@@ -368,6 +417,8 @@ def reward_post_process_by_group(args, samples):
     idx_to_group_index: dict[int, object] = {}
     reward_groups: dict[object, list[int]] = {}
     for idx, sample in enumerate(samples):
+        if use_conditional_truncation_mask:
+            _annotate_conditional_truncation_mask(args, sample)
         if sample.remove_sample:
             rewards[idx] = raw_rewards[idx]
             continue
@@ -390,8 +441,6 @@ def reward_post_process_by_group(args, samples):
                 if not math.isfinite(source_reward):
                     raise ValueError("verify history baseline requires a finite metadata['verify_source_reward']")
                 reward -= source_reward
-            if use_conditional_truncation_mask:
-                reward = _apply_conditional_truncation_mask(args, sample, reward)
             rewards[idx] = reward
             continue
 
@@ -451,8 +500,6 @@ def reward_post_process_by_group(args, samples):
             else:
                 reward = reward * group_len / (group_len - 1)
 
-        if use_conditional_truncation_mask:
-            reward = _apply_conditional_truncation_mask(args, samples[idx], reward)
         rewards[idx] = reward
 
     return raw_rewards, rewards

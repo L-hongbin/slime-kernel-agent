@@ -623,6 +623,13 @@ class RolloutManager:
             train_data["turn_indices"] = [
                 sample.metadata.get("turn_idx") if sample.metadata else None for sample in samples
             ]
+        if getattr(self.args, "use_conditional_truncation_mask", False):
+            # One rollout-side Bernoulli decision, replayed on every TP/CP
+            # shard after training-side advantage normalization.
+            train_data["conditional_truncation_masked"] = [
+                bool((sample.metadata or {}).get("conditional_truncation_masked", False)) and not sample.remove_sample
+                for sample in samples
+            ]
 
         # loss mask
         # TODO: compress the loss mask
@@ -838,6 +845,7 @@ class RolloutManager:
                 "response_lengths",
                 "rewards",
                 "truncated",
+                "conditional_truncation_masked",
                 "loss_masks",
                 "round_number",
                 "sample_indices",

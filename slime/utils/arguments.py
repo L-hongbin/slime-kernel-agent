@@ -2435,7 +2435,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Enable Conditional Truncation Masking from MicroCoder-GRPO (arXiv:2603.07777), which "
-                    "probabilistically zeros post-processed advantages for eligible max-length responses."
+                    "selects eligible max-length responses during rollout and zeros their final advantages "
+                    "after OPD and advantage normalization on the training backend."
                 ),
             )
             parser.add_argument(
@@ -2910,9 +2911,9 @@ def slime_validate_args(args):
         expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
         if reward_post_process_path != expected_path:
             logger.warning(
-                "--use-conditional-truncation-mask is applied by %s, but "
+                "--use-conditional-truncation-mask selects samples through %s, but "
                 "--custom-reward-post-process-path is %r. CTM will not be applied unless the configured hook "
-                "implements equivalent post-normalization masking.",
+                "sets equivalent conditional_truncation_masked sample metadata for training-side masking.",
                 expected_path,
                 reward_post_process_path,
             )

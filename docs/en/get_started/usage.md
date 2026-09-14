@@ -231,6 +231,7 @@ Related parameters:
 
 - `--n-samples-per-prompt`: Number of responses sampled per prompt for intra-group comparison.
 - `--normalize-advantages`: Whether to normalize advantages.
+- `--use-conditional-truncation-mask`: Kernel Agent reward post-processing records only the CTM selection. The Megatron backend zeros selected advantages after OPD and advantage normalization, or at the end of advantage computation when normalization is disabled. Rewards, returns, loss masks, and normalization statistics are unchanged. Runtime and later execution-stage failures are excluded from CTM masking.
 - `--eps-clip`: PPO-style clip range.
 
 #### PPO Algorithm

@@ -587,7 +587,7 @@ def _make_ctm_candidate(
     return sample
 
 
-def test_ctm_masks_advantage_after_full_group_normalization():
+def test_ctm_annotates_without_changing_group_advantages():
     manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
     _enable_ctm(manager.args)
     samples = [
@@ -599,10 +599,62 @@ def test_ctm_masks_advantage_after_full_group_normalization():
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == [1.0, 2.0, 4.0]
-    assert rewards == pytest.approx([-4.0 / 3.0, 0.0, 5.0 / 3.0])
+    assert rewards == pytest.approx([-4.0 / 3.0, -1.0 / 3.0, 5.0 / 3.0])
     assert samples[1].reward == 2.0
     assert samples[1].remove_sample is False
     assert samples[1].metadata["conditional_truncation_masked"] is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ctm_flags_reach_train_data_without_masking_rewards(enabled):
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
+    _enable_ctm(manager.args)
+    manager.args.use_conditional_truncation_mask = enabled
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    samples = [
+        _make_ctm_candidate(i, float(i + 1), correctness=False, status=Sample.Status.TRUNCATED) for i in range(3)
+    ]
+    # Inherited annotations must not mask removed/padded or newly ineligible samples.
+    for sample in samples:
+        sample.metadata["conditional_truncation_masked"] = True
+    samples[1].metadata["env_result"] = {"error": "RUNTIME_ERROR"}
+    samples[2].remove_sample = True
+
+    data = manager._convert_samples_to_train_data(samples)
+
+    assert data["rewards"][:2] == pytest.approx([-0.5, 0.5])
+    assert data["loss_masks"] == [[1] * 4, [1] * 4, [0] * 4]
+    if enabled:
+        assert data["conditional_truncation_masked"] == [True, False, False]
+        assert "conditional_truncation_masked" not in samples[1].metadata
+    else:
+        assert "conditional_truncation_masked" not in data
+
+
+def test_ctm_flags_follow_dp_partition_order(monkeypatch):
+    import slime.ray.rollout as rollout_module
+
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
+    manager.args.global_batch_size = 4
+    manager.train_parallel_config = {"dp_size": 2}
+    monkeypatch.setattr(
+        rollout_module, "build_dp_schedule", lambda *a, **kw: ([[2, 0], [3, 1]], [[[0, 1]], [[0, 1]]], [1], [4])
+    )
+    monkeypatch.setattr(rollout_module.ray, "put", lambda data: data)
+    data = {
+        "tokens": [[0, 1]] * 4,
+        "response_lengths": [1] * 4,
+        "loss_masks": [[1]] * 4,
+        "rewards": [1.0, 2.0, 3.0, 4.0],
+        "rollout_ids": [0, 1, 2, 3],
+        "conditional_truncation_masked": [True, False, False, True],
+    }
+    shards = [box.inner for box in manager._split_train_data_by_dp(data)]
+    assert shards[0]["rollout_ids"] == [2, 0]
+    assert shards[0]["conditional_truncation_masked"] == [False, True]
+    assert shards[1]["rollout_ids"] == [3, 1]
+    assert shards[1]["conditional_truncation_masked"] == [True, False]
 
 
 @pytest.mark.parametrize(
@@ -625,6 +677,81 @@ def test_ctm_requires_non_incorrect_response(correctness, status, decoy_kernel, 
     assert candidate.metadata.get("conditional_truncation_masked", False) is expected_masked
     assert candidate.metadata.get("conditional_truncation_masking_eligible", False) is expected_masked
     assert rewards == pytest.approx([0.0])
+
+
+@pytest.mark.parametrize(
+    "env_state",
+    [
+        {"error": "RUNTIME_ERROR"},
+        {"error_code": "RUNTIME_ERROR"},
+        {"error": "CORRECTNESS_ERROR"},
+        {"error": "KERNEL_EVAL_FAILED", "error_code": "CORRECTNESS_ERROR"},
+        {"metadata": {"runtime_error": "illegal memory access"}},
+        {"metadata": {"correctness_runtime_error": "launch failed"}},
+        {"metadata": {"correctness_output_mismatch": True}},
+        {"compiled": True, "correctness": False, "status": "completed"},
+        {"compiled": True, "status": "timeout", "error": "KERNEL_EVAL_TIMEOUT"},
+        {"compiled": True, "correctness": True, "status": "failed", "error": "KERNEL_EVAL_FAILED"},
+        {"compiled": True, "correctness": True, "error_message": "reference timing failed"},
+        {"compiled": True, "correctness": True, "metadata": {"error": "profiling failed"}},
+        {"metadata": {"performance_error": "timing failed"}},
+        {"metadata": {"profiling_error": "profiler failed"}},
+    ],
+)
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_ctm_keeps_runtime_and_later_errors_even_when_truncated(env_state, wrapped):
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
+    _enable_ctm(manager.args)  # rho=1: eligibility alone decides masking.
+    candidate = _make_ctm_candidate(
+        0, 1.0, correctness=env_state.get("correctness", False), status=Sample.Status.TRUNCATED
+    )
+    candidate.metadata["env_result"] = {"env_state": env_state} if wrapped else env_state
+    other = _make_ctm_candidate(1, 3.0, correctness=False, status=Sample.Status.COMPLETED)
+
+    raw_rewards, advantages = reward_post_process_by_group(manager.args, [candidate, other])
+
+    assert raw_rewards == [1.0, 3.0]
+    assert advantages == pytest.approx([-1.0, 1.0])
+    assert not candidate.metadata.get("conditional_truncation_masking_eligible", False)
+    assert not candidate.metadata.get("conditional_truncation_masked", False)
+
+
+@pytest.mark.parametrize(
+    "feedback",
+    [
+        {"compilation": True, "correctness": False},
+        {"correctness_output_mismatch": True},
+        {"correctness_runtime_error": "launch failed"},
+    ],
+)
+def test_ctm_keeps_execution_errors_in_compact_feedback(feedback):
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
+    _enable_ctm(manager.args)
+    candidate = _make_ctm_candidate(0, 1.0, correctness=False, status=Sample.Status.TRUNCATED)
+    candidate.metadata["env_extra_info"].update(feedback)
+    other = _make_ctm_candidate(1, 3.0, correctness=False, status=Sample.Status.COMPLETED)
+    assert reward_post_process_by_group(manager.args, [candidate, other])[1] == pytest.approx([-1.0, 1.0])
+    assert not candidate.metadata.get("conditional_truncation_masked", False)
+
+
+@pytest.mark.parametrize(
+    "env_state,correctness",
+    [
+        ({"compiled": False, "error": "COMPILATION_ERROR", "status": "failed"}, False),
+        ({"compiled": None, "error": "PRECHECK_ERROR", "status": "failed"}, False),
+        ({"compiled": False, "error": "SYNTAX_ERROR", "status": "failed"}, False),
+        ({"compiled": None, "error": "KERNEL_EVAL_TIMEOUT", "status": "timeout"}, False),
+        ({"compiled": True, "correctness": True, "status": "completed"}, True),
+    ],
+)
+def test_ctm_still_masks_truncated_pre_execution_failures_and_success(env_state, correctness):
+    manager = _make_manager(advantage_estimator="grpo", use_multi_turn=True)
+    _enable_ctm(manager.args)
+    candidate = _make_ctm_candidate(0, 1.0, correctness=correctness, status=Sample.Status.TRUNCATED)
+    candidate.metadata["env_result"] = {"env_state": env_state}
+    other = _make_ctm_candidate(1, 3.0, correctness=False, status=Sample.Status.COMPLETED)
+    assert reward_post_process_by_group(manager.args, [candidate, other])[1] == pytest.approx([-1.0, 1.0])
+    assert candidate.metadata["conditional_truncation_masked"] is True
 
 
 @pytest.mark.parametrize(

@@ -235,6 +235,7 @@ GRPO 的主要特点：
 
 - `--n-samples-per-prompt`：每个 prompt 采样的 response 数量，用于组内比较；
 - `--normalize-advantages`：是否对 advantage 进行归一化；
+- `--use-conditional-truncation-mask`：Kernel Agent 在 rollout reward 后处理时只记录 CTM 抽样标记；Megatron 训练端在 OPD 和 advantage 归一化之后，才将选中样本的 advantage 置零。未启用归一化时仍在 advantage 计算末尾置零。原 reward、returns、loss mask 和归一化统计保持不变；runtime error 及之后的执行阶段错误不参与 CTM 屏蔽。
 - `--eps-clip`：PPO 风格的 clip 范围。
 
 #### PPO 算法
