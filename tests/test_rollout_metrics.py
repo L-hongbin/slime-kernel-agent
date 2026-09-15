@@ -75,7 +75,7 @@ def test_verify_metrics_separate_roles_and_exclude_padding():
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "mode,baseline_key",
-    [("history", "history_baseline"), ("anchor", "verify_anchor_reward")],
+    [("history", "history_baseline"), ("anchor", "verify_anchor_reward"), ("greedy-anchor", "verify_anchor_reward")],
 )
 def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline_key):
     samples = [
@@ -88,7 +88,7 @@ def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline
                 "turn_idx": 2 * turn,
                 "verify_source_reward": -100.0,
                 "verify_kernel_reward": reward,
-                "verify_anchor_key": "shared" if mode == "anchor" else None,
+                "verify_anchor_key": "shared" if mode != "history" else None,
                 baseline_key: 2.0,
             },
         )
@@ -105,8 +105,8 @@ def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline
     assert metrics["verify/improvement/min"] == -1.0
     for outcome in ("win", "tie", "loss"):
         assert metrics[f"verify/improvement/{outcome}_rate"] == pytest.approx(1 / 3)
-    assert metrics["verify/anchor/reward/count"] == (1 if mode == "anchor" else 0)
-    if mode == "anchor":
+    assert metrics["verify/anchor/reward/count"] == (1 if mode != "history" else 0)
+    if mode != "history":
         assert metrics["verify/anchor/reward/mean"] == 2.0
     assert [s.to_dict() for s in samples] == original
 

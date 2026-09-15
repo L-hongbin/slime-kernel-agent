@@ -197,7 +197,7 @@ def _compute_verify_rl_metrics(args, samples):
     add_stats("verify/kernel_reward", [m["verify_kernel_reward"] for m in scored])
     metrics["verify/scored_fraction"] = len(scored) / len(diagnoses) if diagnoses else 0.0
     baseline_mode = getattr(args, "verify_advantage_baseline", "group")
-    if baseline_mode in {"history", "anchor"}:
+    if baseline_mode in {"history", "anchor", "greedy-anchor"}:
         # The data source materializes legacy history fallbacks before rollout.
         baseline_key = "history_baseline" if baseline_mode == "history" else "verify_anchor_reward"
         paired = [(metadata, metadata[baseline_key]) for metadata in scored if finite(metadata.get(baseline_key))]

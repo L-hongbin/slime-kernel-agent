@@ -59,8 +59,8 @@ The launcher exposes these as `VERIFY_SAMPLES_PER_GROUP` and `VERIFY_VERSION_LAG
 
 ## Advantage baseline selection
 
-Use `--verify-advantage-baseline {group,history,anchor}` (default `group`). Only
-`anchor` creates an extra direct-repair sample. The launcher exposes the same
+Use `--verify-advantage-baseline {group,history,anchor,greedy-anchor}` (default `group`). Only
+`anchor` and `greedy-anchor` create an extra direct-repair sample. The launcher exposes the same
 selection as `VERIFY_ADVANTAGE_BASELINE`; no separate anchor-enable flag is needed.
 
 | Mode | Verify advantage before token-level processing | Extra rollout |
@@ -68,6 +68,7 @@ selection as `VERIFY_ADVANTAGE_BASELINE`; no separate anchor-enable flag is need
 | `group` | Configured GRPO/RLOO/TRLOO group-relative estimator on R2 | None |
 | `history` | R2 - history_baseline, without group centering or group standardization | None |
 | `anchor` | R2 - Ra, without group centering or group standardization | One direct kernel per group |
+| `greedy-anchor` | Same as anchor, but Ra comes from greedy decoding | One greedy direct kernel per group |
 
 Here history_baseline is the source group/turn's mean raw task reward, R2 is the kernel reward
 following this diagnosis, and Ra is the fixed shared direct-repair reward. Kernel
@@ -110,7 +111,7 @@ Additional `rollout/verify/` metrics:
   removal reasons. Their denominator is all collected non-pad diagnosis turns.
 - `kernel_reward/...` and `scored_fraction`: finite R2 and scoring coverage among
   non-removed, non-aborted diagnoses (coverage denominator: all diagnosis turns).
-- `baseline_reward/...` and `improvement/...`: available in history/anchor mode,
+- `baseline_reward/...` and `improvement/...`: available in history and both anchor modes,
   computed directly as R2 - history_baseline / R2 - Ra. Both baselines remain fixed across rounds.
   Improvement also reports `win_rate`, `tie_rate`, and `loss_rate` according to
   whether the difference is positive, zero, or negative. `missing_baseline_count`
@@ -201,6 +202,18 @@ The corresponding CLI flags are `--verify-rollout-ratio`,
 Use the kernel-agent full-async rollout and
 `--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group`
 as configured in the launcher.
+
+Select `--verify-advantage-baseline greedy-anchor` (launcher:
+`VERIFY_ADVANTAGE_BASELINE=greedy-anchor`) to use a ReMax-style greedy decoding
+baseline. The `anchor` choice preserves the existing stochastic anchor behavior;
+there is no separate greedy-anchor flag.
+Only anchor decoding changes: `temperature=0`, `top_k=1`, `top_p=1`, `min_p=0`.
+Verify and kernel candidates retain their original sampling parameters; the
+anchor's token budget, prompt, evaluation and reward remain unchanged. Each group
+still generates one non-trainable anchor and reuses its reward across all pairs.
+This does not enable KL loss or change advantage normalization, and it is not a
+full ReMax implementation. Greedy decoding removes token-sampling randomness,
+but does not guarantee deterministic GPU execution or runtime measurements.
 
 Every new verify group receives one `metadata.verify_anchor_key`, shared by its
 N candidate samples. `KernelAgentDataSource.anchor_kv` holds the separate anchor

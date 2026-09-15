@@ -262,7 +262,7 @@ def test_cuda_agent_generate_records_cumulative_trajectory_failures(monkeypatch)
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("baseline", ["group", "history", "anchor"])
+@pytest.mark.parametrize("baseline", ["group", "history", "anchor", "greedy-anchor"])
 @pytest.mark.parametrize("pairs", [1, 2, 3])
 @pytest.mark.parametrize("version_mismatch", [False, True])
 @pytest.mark.parametrize("env_done", [False, True])
@@ -270,7 +270,7 @@ def test_cuda_agent_generate_records_cumulative_trajectory_failures(monkeypatch)
 def test_cuda_agent_verify_trains_diagnosis_and_kernel_with_paired_rewards(
     monkeypatch, baseline, pairs, version_mismatch, env_done, gamma
 ):
-    use_anchor = baseline == "anchor"
+    use_anchor = baseline in {"anchor", "greedy-anchor"}
     captured = []
     messages_seen = []
     env_samples = []
@@ -539,7 +539,8 @@ def test_cuda_agent_verify_sample_skips_kernel_coverage_rejection():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypatch, cancelled):
+@pytest.mark.parametrize("baseline", [None, "anchor", "greedy-anchor"])
+def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypatch, cancelled, baseline):
     monkeypatch.setattr(cuda_agent, "GenerateState", lambda args: _GenerateState())
 
     async def run():
@@ -549,8 +550,19 @@ def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypa
         history = [{"role": "user", "content": "task"}, {"role": "assistant", "content": "source kernel"}]
         sample = Sample(prompt=history.copy(), metadata={"role": "kernel", "verify_source_env_result": source_env})
         args = SimpleNamespace(max_turns=6, use_multi_turn=True)
+        if baseline is not None:
+            args.verify_advantage_baseline = baseline
+        sampling_params = {"temperature": 0.8, "top_p": 0.9, "top_k": 50, "min_p": 0.1, "max_new_tokens": 64}
+        original_params = sampling_params.copy()
 
         async def fake_trajectory(scoring_args, anchor, params):
+            expected = (
+                {**original_params, "temperature": 0.0, "top_k": 1, "top_p": 1.0, "min_p": 0.0}
+                if baseline == "greedy-anchor"
+                else original_params
+            )
+            assert params == expected
+            assert sampling_params == original_params
             assert scoring_args.max_turns == 1
             assert scoring_args.padding_turns is False
             assert anchor.prompt[:-1] == history
@@ -568,7 +580,7 @@ def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypa
 
         monkeypatch.setattr(cuda_agent, "_generate_kernel_impl", fake_trajectory)
         monkeypatch.setattr(cuda_agent, "cancel_kernel_eval", cancel_eval)
-        task = asyncio.create_task(cuda_agent.generate_anchor(args, sample, {}))
+        task = asyncio.create_task(cuda_agent.generate_anchor(args, sample, sampling_params))
         await started.wait()
         if cancelled:
             task.cancel()
@@ -580,6 +592,7 @@ def test_shared_anchor_generates_one_direct_turn_and_cancels_evaluation(monkeypa
             assert len(result) == 1
             assert result[0].reward == 0.3
             assert not cancelled_tasks
+        assert sampling_params == original_params
         assert args.max_turns == 6
 
     asyncio.run(run())

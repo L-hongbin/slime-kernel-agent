@@ -105,12 +105,14 @@ def _validate_verify_capture_args(args) -> None:
     if verify_rollout_ratio > 0 and not getattr(args, "use_multi_turn", False):
         raise ValueError("verify/kernel training requires --use-multi-turn")
     verify_baseline = getattr(args, "verify_advantage_baseline", "group")
-    if verify_baseline not in {"group", "history", "anchor"}:
-        raise ValueError("--verify-advantage-baseline must be group, history, or anchor")
+    if verify_baseline not in {"group", "history", "anchor", "greedy-anchor"}:
+        raise ValueError("--verify-advantage-baseline must be group, history, anchor, or greedy-anchor")
     if verify_baseline != "group" and verify_rollout_ratio <= 0.0:
-        raise ValueError("--verify-advantage-baseline history/anchor requires a positive --verify-rollout-ratio")
-    if verify_baseline == "anchor" and getattr(args, "group_rm", False):
-        raise ValueError("--verify-advantage-baseline anchor does not support --group-rm")
+        raise ValueError(
+            "--verify-advantage-baseline history/anchor/greedy-anchor requires a positive --verify-rollout-ratio"
+        )
+    if verify_baseline in {"anchor", "greedy-anchor"} and getattr(args, "group_rm", False):
+        raise ValueError("--verify-advantage-baseline anchor/greedy-anchor does not support --group-rm")
 
     if not 0.0 <= verify_rollout_ratio <= 1.0:
         raise ValueError(f"--verify-rollout-ratio must be in [0, 1], got {verify_rollout_ratio}")
@@ -2287,14 +2289,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         def add_kernel_agent_arguments(parser):
             parser.add_argument(
                 "--verify-advantage-baseline",
-                choices=["group", "history", "anchor"],
+                choices=["group", "history", "anchor", "greedy-anchor"],
                 default="group",
                 help=(
                     "Verify advantage baseline: group uses the configured group estimator; history uses "
                     "new kernel reward minus the source group/turn mean raw task reward "
                     "(legacy fallback: source correctness rate times correctness weight); "
                     "anchor generates one shared direct repair and uses "
-                    "new minus anchor kernel reward. History/anchor skip group centering."
+                    "new minus anchor kernel reward; greedy-anchor uses the same shared anchor with greedy decoding. "
+                    "History and both anchor modes skip group centering."
                 ),
             )
             parser.add_argument(

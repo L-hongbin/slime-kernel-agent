@@ -111,9 +111,9 @@ VERIFY_DATA_LIMIT="${VERIFY_DATA_LIMIT:-inf}"
 VERIFY_ADVANTAGE_BASELINE="${VERIFY_ADVANTAGE_BASELINE:-group}"
 KERNEL_VERIFY_MAX_TURNS="${KERNEL_VERIFY_MAX_TURNS:-2}"
 case "${VERIFY_ADVANTAGE_BASELINE}" in
-   group|history|anchor) ;;
+   group|history|anchor|greedy-anchor) ;;
    *)
-      echo "VERIFY_ADVANTAGE_BASELINE must be group, history, or anchor, got: ${VERIFY_ADVANTAGE_BASELINE}" >&2
+      echo "VERIFY_ADVANTAGE_BASELINE must be group, history, anchor, or greedy-anchor, got: ${VERIFY_ADVANTAGE_BASELINE}" >&2
       exit 1
       ;;
 esac

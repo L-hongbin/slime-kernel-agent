@@ -110,7 +110,7 @@ def _is_verify_trajectory_group(group: RolloutGroup) -> bool:
 
 def _get_group_concurrency(args, client_concurrency: int) -> int:
     n_samples_per_prompt = max(1, int(getattr(args, "n_samples_per_prompt", 1) or 1))
-    if getattr(args, "verify_advantage_baseline", "group") == "anchor":
+    if getattr(args, "verify_advantage_baseline", "group") in {"anchor", "greedy-anchor"}:
         n_samples_per_prompt += 1
     client_concurrency = max(1, int(client_concurrency))
     return max(1, client_concurrency // n_samples_per_prompt)

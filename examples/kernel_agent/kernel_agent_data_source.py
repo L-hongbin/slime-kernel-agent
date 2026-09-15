@@ -585,7 +585,7 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
                     )
                 )
                 self.sample_index += 1
-            if getattr(self.args, "verify_advantage_baseline", "group") == "anchor":
+            if getattr(self.args, "verify_advantage_baseline", "group") in {"anchor", "greedy-anchor"}:
                 for sample in group:
                     sample.metadata["verify_anchor_index"] = self.sample_index
                 self.sample_index += 1

@@ -995,6 +995,10 @@ async def _generate_with_verify_impl(args, sample: Sample, sampling_params: dict
 
 async def generate_anchor(args, sample: Sample, sampling_params: dict[str, Any]) -> list[Sample]:
     """Generate one direct kernel; the group owns its lifecycle and shared reward."""
+    if getattr(args, "verify_advantage_baseline", "group") == "greedy-anchor":
+        # ReMax-style decoding baseline; the direct-repair prompt and reward stay unchanged.
+        # Never mutate the parameters shared with verify/kernel candidates.
+        sampling_params = {**sampling_params, "temperature": 0.0, "top_k": 1, "top_p": 1.0, "min_p": 0.0}
     anchor_args = copy(args)
     anchor_args.max_turns = 1
     anchor_args.use_multi_turn = True
@@ -1035,7 +1039,7 @@ async def _generate_verify_pair(args, sample: Sample, sampling_params: dict[str,
     scoring_args.use_coverage_rs = False
 
     anchor_key = (sample.metadata or {}).get("verify_anchor_key")
-    if getattr(args, "verify_advantage_baseline", "group") == "anchor" and not anchor_key:
+    if getattr(args, "verify_advantage_baseline", "group") in {"anchor", "greedy-anchor"} and not anchor_key:
         raise ValueError("anchor mode requires a shared metadata['verify_anchor_key']")
 
     context = _as_messages(sample.prompt)

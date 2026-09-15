@@ -226,7 +226,9 @@ def test_verify_capture_validation_requires_positive_ratio_for_fixed_data():
         ({"verify_advantage_baseline": "anchor", "verify_rollout_ratio": 0.0}, "verify-advantage-baseline"),
         ({"verify_advantage_baseline": "anchor", "group_rm": True}, "does not support --group-rm"),
         ({"verify_advantage_baseline": "history", "verify_rollout_ratio": 0.0}, "requires a positive"),
-        ({"verify_advantage_baseline": "invalid"}, "must be group, history, or anchor"),
+        ({"verify_advantage_baseline": "invalid"}, "must be group, history, anchor, or greedy-anchor"),
+        ({"verify_advantage_baseline": "greedy-anchor", "verify_rollout_ratio": 0.0}, "requires a positive"),
+        ({"verify_advantage_baseline": "greedy-anchor", "group_rm": True}, "does not support --group-rm"),
     ],
 )
 def test_verify_training_argument_validation(overrides, match):
@@ -238,12 +240,21 @@ def test_verify_advantage_baseline_cli_replaces_anchor_flag():
     parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
     defaults = parser.parse_args(["--rollout-batch-size", "1"])
     assert defaults.verify_advantage_baseline == "group"
+    assert not hasattr(defaults, "greedy_anchor")
     assert not hasattr(defaults, "verify_use_anchor")
-    for mode in ("group", "history", "anchor"):
+    for mode in ("group", "history", "anchor", "greedy-anchor"):
         args = parser.parse_args(["--rollout-batch-size", "1", "--verify-advantage-baseline", mode])
         assert args.verify_advantage_baseline == mode
+    slime_arguments._validate_verify_capture_args(
+        _make_verify_data_source_args(
+            verify_advantage_baseline="greedy-anchor",
+            rollout_function_path="examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async",
+        )
+    )
     with pytest.raises(SystemExit):
         parser.parse_args(["--rollout-batch-size", "1", "--verify-use-anchor"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--greedy-anchor"])
     with pytest.raises(SystemExit):
         parser.parse_args(["--rollout-batch-size", "1", "--verify-advantage-baseline", "source"])
 
@@ -758,9 +769,12 @@ def test_shared_anchor_claim_read_and_retry_lifecycle():
 @pytest.mark.parametrize("anchor_version", [8, 9])
 @pytest.mark.parametrize("capacity", [1, 3])
 @pytest.mark.parametrize("invalid_first", [False, True])
-def test_shared_anchor_once_for_all_candidates_and_turns(monkeypatch, anchor_version, capacity, invalid_first):
+@pytest.mark.parametrize("baseline", ["anchor", "greedy-anchor"])
+def test_shared_anchor_once_for_all_candidates_and_turns(
+    monkeypatch, anchor_version, capacity, invalid_first, baseline
+):
     args = _make_verify_data_source_args(
-        verify_advantage_baseline="anchor", sglang_enable_deterministic_inference=True
+        verify_advantage_baseline=baseline, sglang_enable_deterministic_inference=True
     )
     data_source = kernel_agent_data_source.KernelAgentDataSource(args)
     data_source.add_verify_candidates([_make_schedulable_verify_candidate(42, 9)])
@@ -895,8 +909,9 @@ def test_shared_anchor_group_failure_and_cancellation_cleanup(monkeypatch, failu
         assert all(sample.remove_sample for turn_group in output for sample in turn_group)
 
 
-def test_shared_anchor_counts_toward_client_capacity():
-    args = _make_rollout_args(verify_advantage_baseline="anchor", n_samples_per_prompt=2)
+@pytest.mark.parametrize("baseline", ["anchor", "greedy-anchor"])
+def test_shared_anchor_counts_toward_client_capacity(baseline):
+    args = _make_rollout_args(verify_advantage_baseline=baseline, n_samples_per_prompt=2)
     assert fully_async_rollout._get_group_concurrency(args, 12) == 4
     assert fully_async_rollout._get_group_concurrency(args, 1) == 1
 
