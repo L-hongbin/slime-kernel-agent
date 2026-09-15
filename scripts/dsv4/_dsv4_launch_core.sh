@@ -5,7 +5,7 @@
 # configured training recipe. Public wrappers own topology and experiment values.
 set -euo pipefail
 
-OVERLONG_PENALTY=0
+OVERLONG_PENALTY=None
 OVERLONG_BUFFER_LEN=2048
 OVERLONG_PENALTY_FACTOR=1.0
 ENTROPY_COMMON_PROBE=0
@@ -25,8 +25,12 @@ USE_LORA_WEIGHT_SYNC=0
 while (( "$#" > 0 )); do
   case "$1" in
     --overlong-penalty)
-      OVERLONG_PENALTY=1
-      shift
+      [[ "$#" -ge 2 ]] || { echo "FATAL: --overlong-penalty requires None or dapo" >&2; exit 2; }
+      case "$2" in
+        None|dapo) OVERLONG_PENALTY=$2 ;;
+        *) echo "FATAL: --overlong-penalty must be None or dapo" >&2; exit 2 ;;
+      esac
+      shift 2
       ;;
     --overlong-buffer-len)
       [[ "$#" -ge 2 ]] || { echo "FATAL: --overlong-buffer-len requires a value" >&2; exit 2; }

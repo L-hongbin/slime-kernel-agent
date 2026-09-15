@@ -223,19 +223,19 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 
 ```bash
 --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
---rollout-reward-post-processors dynamic-weight overlong-penalty \
+--dynamic-reward-gate sqrt \
+--overlong-penalty dapo \
 --overlong-buffer-len 2048 \
 --overlong-penalty-factor 0.2
 ```
 
-策略可选 `dynamic-weight`、`overlong-penalty` 或两者；总是先动态加权、再应用长度惩罚，与参数排列顺序无关。`none` 必须单独使用，表示禁用这两项。显式列表覆盖 `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` 和旧的 `--overlong-penalty`；不传列表则兼容原开关。新增接口返回单个 reward 列表，不能直接替换要求返回 `(raw_rewards, rewards)` 的 `--custom-reward-post-process-path`。
+两个参数独立选择方法：`--dynamic-reward-gate` 选择动态调权，`--overlong-penalty` 选择长度惩罚。两者均默认为 Python `None`（关闭），也支持在命令行显式传入 `None`。`--overlong-penalty dapo` 启用现有的线性超长惩罚，不再接受不带值的 `--overlong-penalty`；缓冲长度和惩罚系数的含义不变。同时启用时总是先动态加权、再应用长度惩罚。不再保留处理器列表选择参数或独立的动态调权配置、环境变量开关。DPPO 示例脚本设置 `--dynamic-reward-gate None`，默认也不启用动态调权。新增接口返回单个 reward 列表，不能直接替换要求返回 `(raw_rewards, rewards)` 的 `--custom-reward-post-process-path`。
 
 ##### 动态 gate 计算方式
 
-`--dynamic-reward-gate` 可选 `sqrt`（默认）、`piecewise`（分段线性）、`piecewise-sqrt`（分段开方）。动态调权仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
+`--dynamic-reward-gate` 默认为 `None`（关闭），指定 `sqrt`、`piecewise`（分段线性）或 `piecewise-sqrt`（分段开方）即启用对应模式。动态调权仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
 
 ```bash
---rollout-reward-post-processors dynamic-weight \
 --dynamic-reward-gate piecewise-sqrt \
 --dynamic-reward-gate-range 0.8 1.2
 ```
@@ -263,7 +263,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。仅选择 gate 或阈值不会自行开启动态调权。过滤预计算与最终 reward 后处理使用相同计算。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
+`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤预计算与最终 reward 后处理使用相同计算。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
 
 对走常规分量评分路径的样本，奖励按以下方式组合：
 
@@ -306,7 +306,7 @@ sample.reward      = task_reward - overlong_penalty  # 开启长度惩罚时。
 
 `kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，其中 `overlong_penalty` 为负数。`task_reward` 不含长度惩罚，`sample.reward` 包含长度惩罚。再次执行从评分/分量重建，避免重复扣分；TRLOO 在这之后累计 return，不覆盖单 turn reward。
 
-`calculate_kernel_reward()` 只计算基础评分。评分后，`reward_func` 调用 `post_process_rollout_rewards(..., stage="sample")` 应用长度惩罚，保证 verify、anchor 和历史 baseline 的奖励口径不变；动态加权留到默认的 `stage="rollout"` 执行。rollout 后处理跳过已经结算的 verify 轨迹和移除样本，不对 verify 动态加权。此次没有移动过滤、verify 数据捕捉、日志或落盘时机，因此在训练后处理之前产生的记录不包含后续动态加权结果。`none` 不会关闭独立的失败评分或 CTM。
+`calculate_kernel_reward()` 只计算基础评分。评分后，`reward_func` 调用 `post_process_rollout_rewards(..., stage="sample")` 应用长度惩罚，保证 verify、anchor 和历史 baseline 的奖励口径不变；动态加权留到默认的 `stage="rollout"` 执行。rollout 后处理跳过已经结算的 verify 轨迹和移除样本，不对 verify 动态加权。此次没有移动过滤、verify 数据捕捉、日志或落盘时机，因此在训练后处理之前产生的记录不包含后续动态加权结果。两项均未启用时也不影响独立的失败评分或 CTM。
 
 开启动态调权时，训练数据转换在最终 reward 后处理结束后，单独输出 `reward post-process` 日志，并通过现有 TensorBoard/W&B 通道记录 `rollout/dynamic_reward/*` scalar；不需要额外开启 `--log-exp-metrics`。关闭动态调权，或本批没有符合条件的样本时，不输出这些指标：
 

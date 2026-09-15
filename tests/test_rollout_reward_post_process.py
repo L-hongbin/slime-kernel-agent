@@ -19,7 +19,6 @@ from examples.kernel_agent.kernel_reward import (
     annotate_group_difficulty,
     calculate_kernel_reward,
     post_process_rollout_rewards,
-    resolve_rollout_reward_processors,
     reward_post_process_by_group,
 )
 from slime.observability.rollout_metrics import compute_reward_post_process_metrics
@@ -32,9 +31,9 @@ NUM_GPUS = 0
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("mode", ["baseline", "anchor"])
 @pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
-def test_verify_utility_reaches_training_advantage(monkeypatch, dynamic, mode, estimator):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+def test_verify_utility_reaches_training_advantage(dynamic, mode, estimator):
     args = _make_manager(advantage_estimator=estimator, use_multi_turn=True).args
+    args.dynamic_reward_gate = "sqrt" if dynamic else None
     samples = [
         Sample(
             index=index,
@@ -66,11 +65,9 @@ def test_pending_shared_anchor_cannot_enter_training():
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
 @pytest.mark.parametrize("group_size", [1, 2])
-def test_verify_history_advantage_preserves_signed_improvement_and_raw_reward(
-    monkeypatch, dynamic, estimator, group_size
-):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+def test_verify_history_advantage_preserves_signed_improvement_and_raw_reward(dynamic, estimator, group_size):
     args = _make_manager(advantage_estimator=estimator, use_multi_turn=True, grpo_std_normalization=True).args
+    args.dynamic_reward_gate = "sqrt" if dynamic else None
     args.verify_advantage_baseline = "history"
     samples = []
     for index in range(group_size):
@@ -115,9 +112,9 @@ def test_verify_history_advantage_does_not_subtract_from_anchor_difference():
 
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("mode", ["baseline", "anchor"])
-def test_verify_pairs_keep_own_kernel_reward_without_future_pair_returns(monkeypatch, dynamic, mode):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
+def test_verify_pairs_keep_own_kernel_reward_without_future_pair_returns(dynamic, mode):
     args = _make_manager(advantage_estimator="trloo", use_multi_turn=True).args
+    args.dynamic_reward_gate = "sqrt" if dynamic else None
     samples = [
         Sample(
             index=index,
@@ -137,9 +134,9 @@ def test_verify_pairs_keep_own_kernel_reward_without_future_pair_returns(monkeyp
 @pytest.mark.parametrize("mode", ["baseline", "anchor"])
 @pytest.mark.parametrize("estimator", ["rloo", "trloo", "grpo"])
 def test_joint_verify_kernel_training_preserves_per_turn_rewards(monkeypatch, dynamic, mode, estimator):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", dynamic)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     args = _make_manager(advantage_estimator=estimator, use_multi_turn=True).args
+    args.dynamic_reward_gate = "sqrt" if dynamic else None
     samples = []
     expected_raw = []
     expected_advantages = []
@@ -250,7 +247,8 @@ def _set_reward_component(
     ],
 )
 def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: float):
-    assert _compute_dynamic_auxiliary_gate(num_correct, group_size) == pytest.approx(expected)
+    args = SimpleNamespace(dynamic_reward_gate="sqrt")
+    assert _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -360,7 +358,6 @@ def test_piecewise_gate_modes_preserve_bounds_neutral_region_and_continuity(mode
 def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, num_correct, expected_gate):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.rollout_reward_post_processors = ["dynamic-weight"]
     args.dynamic_reward_gate = "piecewise-sqrt"
     samples = [_make_sample(i, 0, float(i < num_correct)) for i in range(16)]
     for i, sample in enumerate(samples):
@@ -370,7 +367,7 @@ def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, 
     preview = _apply_dynamic_group_reward_weights(
         samples,
         [s.reward for s in samples],
-        {**CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight": True},
+        CUDA_AGENT_CONFIGS["reward"],
         args=args,
     )
     assert all("dynamic_reward" not in s.metadata for s in samples)
@@ -391,7 +388,7 @@ def test_piecewise_gate_boosts_auxiliary_components_and_records_positive_delta(m
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_weight", 0.5)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_enable", True)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.rollout_reward_post_processors = ["dynamic-weight", "overlong-penalty"]
+    args.overlong_penalty = "dapo"
     args.dynamic_reward_gate = "piecewise"
     args.dynamic_reward_gate_range = [0.8, 2.0]
     args.rollout_max_response_len = 100
@@ -447,9 +444,9 @@ def test_annotate_group_difficulty_does_not_mark_empty_group_as_hard():
     assert removed.metadata["group_difficulty"] == 0.0
 
 
-def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     samples = [
         _make_sample(0, 0, 0.0),
         _make_sample(1, 0, 0.8),
@@ -484,9 +481,9 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo(monkeypat
         assert sample.metadata["group_difficulty"] == pytest.approx(0.5)
 
 
-def test_dynamic_reward_all_correct_matches_fixed_half_weights(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_all_correct_matches_fixed_half_weights():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     samples = [_make_sample(index, 0, reward) for index, reward in enumerate([0.6, 0.8, 1.0])]
     for sample, performance_reward in zip(samples, [0.1, 0.2, 0.3], strict=True):
         _set_reward_component(
@@ -501,9 +498,9 @@ def test_dynamic_reward_all_correct_matches_fixed_half_weights(monkeypatch):
     assert raw_rewards == pytest.approx([0.6, 0.8, 1.0])
 
 
-def test_dynamic_reward_rebuilds_overlong_penalty_from_components(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_rebuilds_overlong_penalty_from_components():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     correct = _make_sample(0, 0, 99.0)
     incorrect = _make_sample(1, 0, 0.0)
     _set_reward_component(correct, correctness_score=1.0, performance_score=1.0, overlong_penalty=-0.2)
@@ -524,9 +521,9 @@ def test_dynamic_reward_rebuilds_overlong_penalty_from_components(monkeypatch):
     assert correct.reward == pytest.approx(0.3)
 
 
-def test_dynamic_reward_writeback_preserves_other_reward_keys(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_writeback_preserves_other_reward_keys():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     manager.args.reward_key = "kernel"
     sample = _make_sample(0, 0, 99.0)
     original_reward = {"kernel": 99.0, "other": 7.0}
@@ -543,8 +540,8 @@ def test_dynamic_reward_writeback_preserves_other_reward_keys(monkeypatch):
 def test_dynamic_reward_writeback_preserves_captured_verify_history(monkeypatch):
     from examples.kernel_agent import kernel_agent_data_source as source_module
 
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     manager.args.verify_advantage_baseline = "history"
     source = source_module.KernelAgentDataSource.__new__(source_module.KernelAgentDataSource)
     source.args = manager.args
@@ -564,9 +561,9 @@ def test_dynamic_reward_writeback_preserves_captured_verify_history(monkeypatch)
     assert candidate.metadata["verify_source_reward"] == 0.25
 
 
-def test_dynamic_reward_uses_failed_component_as_branch_sentinel(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_uses_failed_component_as_branch_sentinel():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
+    manager.args.dynamic_reward_gate = "sqrt"
     kernel_failure = _make_sample(0, 0, 99.0)
     output_mismatch = _make_sample(1, 0, 99.0)
     _set_reward_component(
@@ -590,9 +587,9 @@ def test_dynamic_reward_uses_failed_component_as_branch_sentinel(monkeypatch):
     assert [kernel_failure.reward, output_mismatch.reward] == pytest.approx(raw_rewards)
 
 
-def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting(monkeypatch):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting():
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=True)
+    manager.args.dynamic_reward_gate = "sqrt"
     manager.args.multi_turn_gamma = 0.5
     samples = [
         _make_sample(0, 0, 0.6, turn_idx=0),
@@ -618,21 +615,12 @@ def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting(monkeypa
     assert repeated_advantages == pytest.approx(advantages)
 
 
-@pytest.mark.parametrize(
-    "processors",
-    [
-        ["none"],
-        ["dynamic-weight"],
-        ["overlong-penalty"],
-        ["dynamic-weight", "overlong-penalty"],
-        ["overlong-penalty", "dynamic-weight"],
-    ],
-)
-def test_rollout_reward_processors_override_legacy_and_keep_components_consistent(monkeypatch, processors):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", True)
+@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("overlong", [False, True])
+def test_reward_switches_are_independent_and_keep_components_consistent(gate, overlong):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.rollout_reward_post_processors = processors
-    args.overlong_penalty = True
+    args.dynamic_reward_gate = gate
+    args.overlong_penalty = "dapo" if overlong else None
     args.overlong_buffer_len = 100
     args.overlong_penalty_factor = 0.2
     args.rollout_max_response_len = 100
@@ -647,13 +635,13 @@ def test_rollout_reward_processors_override_legacy_and_keep_components_consisten
         sample.metadata.update(details)
         samples.append(sample)
     base_scores = [dict(s.metadata["kernel_score"]) for s in samples]
-    penalty = 0.2 if "overlong-penalty" in processors else 0.0
+    penalty = 0.2 if overlong else 0.0
     # Scoring cannot use incomplete group statistics. Length shaping settles
     # first, through the same interface that owns final rollout processing.
     assert post_process_rollout_rewards(args, samples, stage="sample") == pytest.approx(
         [1.0 - penalty, 1.0 - penalty, -penalty]
     )
-    task_reward = 0.5 + 0.5 * ((0.5**0.5) if "dynamic-weight" in processors else 1.0)
+    task_reward = 0.5 + 0.5 * ((0.5**0.5) if gate == "sqrt" else 1.0)
     expected = [task_reward - penalty, task_reward - penalty, -penalty]
 
     for _ in range(2):
@@ -678,7 +666,7 @@ def test_rollout_reward_processors_override_legacy_and_keep_components_consisten
 def test_rollout_length_processor_does_not_require_group_or_advantage_args():
     args = SimpleNamespace(
         reward_key=None,
-        rollout_reward_post_processors=["overlong-penalty"],
+        overlong_penalty="dapo",
         rollout_max_response_len=100,
         overlong_buffer_len=20,
         overlong_penalty_factor=0.2,
@@ -705,7 +693,8 @@ def test_rollout_reward_processors_leave_settled_verify_and_pad_untouched(metada
     import copy
 
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
-    args.rollout_reward_post_processors = ["dynamic-weight", "overlong-penalty"]
+    args.dynamic_reward_gate = "sqrt"
+    args.overlong_penalty = "dapo"
     sample = Sample(reward=0.7, metadata=metadata, remove_sample=removed)
     before = copy.deepcopy(sample.to_dict())
     assert post_process_rollout_rewards(args, [sample]) == [0.7]
@@ -714,7 +703,8 @@ def test_rollout_reward_processors_leave_settled_verify_and_pad_untouched(metada
 
 def test_sample_reward_stage_shapes_verify_kernel_before_utility_settlement():
     args = SimpleNamespace(
-        rollout_reward_post_processors=["dynamic-weight", "overlong-penalty"],
+        dynamic_reward_gate="sqrt",
+        overlong_penalty="dapo",
         use_multi_turn=True,
         rollout_max_response_len=100,
         overlong_buffer_len=20,
@@ -750,7 +740,7 @@ def test_rollout_reward_processors_reject_unknown_stage():
 def test_dynamic_reward_metrics_use_group_gates_and_ungated_performance(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
-    args.rollout_reward_post_processors = ["dynamic-weight"]
+    args.dynamic_reward_gate = "sqrt"
     samples = []
     groups = []
     for group_idx, turn, correct_flags in [(0, 0, [True, True, False]), (0, 1, [True, True]), (1, 0, [True, False])]:
@@ -770,9 +760,7 @@ def test_dynamic_reward_metrics_use_group_gates_and_ungated_performance(monkeypa
     # The dynamic-filter preview must not produce final metrics, and it must
     # not erase the baseline used to measure the final performance delta.
     for group in groups:
-        _apply_dynamic_group_reward_weights(
-            group, [s.reward for s in group], {**CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight": True}
-        )
+        _apply_dynamic_group_reward_weights(group, [s.reward for s in group], CUDA_AGENT_CONFIGS["reward"], args=args)
     assert compute_reward_post_process_metrics(samples) == {}
     partial_gate = 0.5**0.5
     for _ in range(2):
@@ -816,11 +804,11 @@ def test_dynamic_reward_metrics_exclude_non_training_samples(metadata, removed, 
     assert compute_reward_post_process_metrics([sample]) == {}
 
 
-@pytest.mark.parametrize("processors,legacy", [(["none"], True), (None, False)])
-def test_disabled_dynamic_reward_clears_stale_metric_records(monkeypatch, processors, legacy):
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", legacy)
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_disabled_dynamic_reward_clears_stale_metric_records(explicit_none):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.rollout_reward_post_processors = processors
+    if explicit_none:
+        args.dynamic_reward_gate = None
     sample = Sample(reward=1.0, metadata={"dynamic_reward": {"gate": 0.0, "performance_reward_delta": -1.0}})
     assert post_process_rollout_rewards(args, [sample]) == [1.0]
     assert "dynamic_reward" not in sample.metadata
@@ -840,7 +828,7 @@ def test_dynamic_reward_metrics_logged_after_final_processing(monkeypatch, caplo
     manager.rollout_id = 4
     manager.args.wandb_always_use_train_step = train_step_axis
     manager.args.global_batch_size = 3
-    manager.args.rollout_reward_post_processors = ["dynamic-weight"] if dynamic else ["none"]
+    manager.args.dynamic_reward_gate = "sqrt" if dynamic else None
     samples = [_make_sample(i, 0, float(i < 2)) for i in range(3)]
     for i, sample in enumerate(samples):
         sample.tokens = [1, 2]
@@ -878,7 +866,7 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     from slime.observability.tensorboard_utils import _TensorboardAdapter
 
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.rollout_reward_post_processors = ["dynamic-weight"]
+    args.dynamic_reward_gate = "sqrt"
     args.use_tensorboard = True
     samples = [_make_sample(i, 0, 1.0) for i in range(2)]
     for sample in samples:
@@ -901,25 +889,13 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     assert flushes == [True]
 
 
-@pytest.mark.parametrize("dynamic,overlong", [(False, False), (True, False), (False, True), (True, True)])
-def test_rollout_reward_processor_legacy_selection(dynamic, overlong):
-    args = SimpleNamespace(overlong_penalty=overlong)
-    expected = ({"dynamic-weight"} if dynamic else set()) | ({"overlong-penalty"} if overlong else set())
-    assert resolve_rollout_reward_processors(args, {"enable_dynamic_reward_weight": dynamic}) == expected
+@pytest.mark.parametrize("args", [SimpleNamespace(), SimpleNamespace(dynamic_reward_gate=None)])
+def test_disabled_dynamic_gate_is_neutral(args):
+    assert _compute_dynamic_auxiliary_gate(1, 16, args=args) == 1.0
+    assert _compute_dynamic_auxiliary_gate(16, 16, args=args) == 1.0
 
 
-@pytest.mark.parametrize(
-    "processors", [["none", "dynamic-weight"], ["dynamic-weight", "dynamic-weight"], ["unknown"], [], "none"]
-)
-def test_rollout_reward_processor_rejects_invalid_selection(processors):
-    with pytest.raises(ValueError):
-        resolve_rollout_reward_processors(SimpleNamespace(rollout_reward_post_processors=processors), {})
-
-
-@pytest.mark.parametrize(
-    "processors", [["none"], ["dynamic-weight"], ["overlong-penalty"], ["dynamic-weight", "overlong-penalty"]]
-)
-def test_rollout_reward_processor_args_parse_and_validate(processors):
+def test_thresholds_and_range_do_not_enable_dynamic_weight():
     import argparse
 
     from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
@@ -929,14 +905,98 @@ def test_rollout_reward_processor_args_parse_and_validate(processors):
         [
             "--rollout-batch-size",
             "1",
-            "--rollout-reward-post-processors",
-            *processors,
+            "--difficulty-thresholds",
+            "0.2",
+            "0.8",
+            "--dynamic-reward-gate-range",
+            "0.4",
+            "2",
+        ]
+    )
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_gate is None
+    sample = Sample(reward=0.7, metadata={})
+    assert post_process_rollout_rewards(args, [sample]) == [0.7]
+    assert sample.metadata == {}
+
+
+def test_dppo_script_disables_dynamic_weight_by_default():
+    script = repo_root / "examples/kernel_agent/run_qwen3.6_27B_full_async_dppo.sh"
+    assert "--dynamic-reward-gate None" in script.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("gate", ["None", "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("penalty", ["None", "dapo"])
+def test_explicit_reward_method_choices(gate, penalty):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        ["--rollout-batch-size", "1", "--dynamic-reward-gate", gate, "--overlong-penalty", penalty]
+    )
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_gate == (None if gate == "None" else gate)
+    assert args.overlong_penalty == (None if penalty == "None" else penalty)
+    if gate == "None" and penalty == "None":
+        sample = Sample(reward=0.7, metadata={})
+        assert post_process_rollout_rewards(args, [sample]) == [0.7]
+        assert sample.metadata == {}
+
+
+@pytest.mark.parametrize("values", [[], ["True"], ["False"], ["unknown"]])
+def test_overlong_penalty_rejects_bare_flag_and_unknown_methods(values):
+    import argparse
+
+    from slime.utils.arguments import get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["--rollout-batch-size", "1", "--overlong-penalty", *values])
+    assert exc.value.code == 2
+
+
+@pytest.mark.parametrize("method", [True, False, "None", "unknown"])
+def test_reward_runtime_rejects_unparsed_penalty_methods(method):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(overlong_penalty=method)
+    with pytest.raises(ValueError, match="--overlong-penalty"):
+        _validate_rollout_reward_post_process_args(args)
+    with pytest.raises(ValueError, match="--overlong-penalty"):
+        post_process_rollout_rewards(args, [])
+
+
+@pytest.mark.parametrize("gate", ["none", "unknown", ""])
+def test_dynamic_gate_rejects_invalid_selection(gate):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    with pytest.raises(ValueError, match="--dynamic-reward-gate"):
+        _validate_rollout_reward_post_process_args(SimpleNamespace(dynamic_reward_gate=gate))
+
+
+@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("overlong", [False, True])
+def test_rollout_reward_switch_args_parse_and_validate(gate, overlong):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            *(["--dynamic-reward-gate", gate] if gate is not None else []),
+            *(["--overlong-penalty", "dapo"] if overlong else []),
             "--custom-reward-post-process-path",
             "examples.kernel_agent.kernel_reward.reward_post_process_by_group",
         ]
     )
-    assert args.rollout_reward_post_processors == processors
-    assert args.dynamic_reward_gate == "sqrt"
+    assert not hasattr(args, "rollout_reward_post_processors")
+    assert args.dynamic_reward_gate == gate
+    assert args.overlong_penalty == ("dapo" if overlong else None)
     assert args.difficulty_thresholds == [1 / 3, 2 / 3]
     assert args.dynamic_reward_gate_range == [0.8, 1.2]
     assert not hasattr(args, "dynamic_reward_gate_power")
@@ -973,19 +1033,22 @@ def test_piecewise_dynamic_gate_args_parse_and_validate(mode, power):
     assert args.difficulty_thresholds == [0.2, 0.8]
     assert args.dynamic_reward_gate_range == [0.4, 2.0]
     assert args.dynamic_reward_gate == mode
-    assert args.rollout_reward_post_processors is None  # Gate selection does not enable shaping.
+    assert args.overlong_penalty is None  # Enabling a gate does not enable length shaping.
     assert _compute_dynamic_auxiliary_gate(1, 10, args=args) == pytest.approx(1 - 0.6 * 0.5**power)
     assert _compute_dynamic_auxiliary_gate(9, 10, args=args) == pytest.approx(1 + 0.5**power)
 
 
-def test_dynamic_gate_args_reject_removed_power_option():
+@pytest.mark.parametrize(
+    "option,value", [("--dynamic-reward-gate-power", "0.5"), ("--rollout-reward-post-processors", "dynamic-weight")]
+)
+def test_reward_args_reject_removed_options(option, value):
     import argparse
 
     from slime.utils.arguments import get_slime_extra_args_provider
 
     parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
     with pytest.raises(SystemExit) as exc:
-        parser.parse_args(["--rollout-batch-size", "1", "--dynamic-reward-gate-power", "0.5"])
+        parser.parse_args(["--rollout-batch-size", "1", option, value])
     assert exc.value.code == 2
 
 
@@ -997,7 +1060,8 @@ def test_legacy_sqrt_gate_ignores_piecewise_thresholds_and_range():
     )
     _validate_rollout_reward_post_process_args(args)
     for correct in range(17):
-        assert _compute_dynamic_auxiliary_gate(correct, 16, args=args) == _compute_dynamic_auxiliary_gate(correct, 16)
+        expected = ((correct - 1) / 15) ** 0.5 if correct > 1 else 0.0
+        assert _compute_dynamic_auxiliary_gate(correct, 16, args=args) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -1018,9 +1082,7 @@ def test_legacy_sqrt_gate_ignores_piecewise_thresholds_and_range():
 def test_piecewise_dynamic_gate_args_reject_invalid_values(gate_range, mode):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
-    args = SimpleNamespace(
-        dynamic_reward_gate=mode, rollout_reward_post_processors=None, dynamic_reward_gate_range=gate_range
-    )
+    args = SimpleNamespace(dynamic_reward_gate=mode, dynamic_reward_gate_range=gate_range)
     with pytest.raises(ValueError, match="Piecewise"):
         _validate_rollout_reward_post_process_args(args)
 
@@ -1071,23 +1133,21 @@ def test_shared_difficulty_thresholds_allow_more_buckets_but_piecewise_requires_
 
 
 @pytest.mark.parametrize(
-    "processors,buffer_len,factor",
+    "buffer_len,factor",
     [
-        (["none", "dynamic-weight"], 100, 1.0),
-        (["dynamic-weight", "dynamic-weight"], 100, 1.0),
-        (["overlong-penalty"], 0, 1.0),
-        (["overlong-penalty"], 100, -1.0),
-        (["overlong-penalty"], 100, float("nan")),
-        (["overlong-penalty"], 100, float("inf")),
+        (0, 1.0),
+        (100, -1.0),
+        (100, float("nan")),
+        (100, float("inf")),
     ],
 )
-def test_rollout_reward_processor_args_reject_invalid_values(processors, buffer_len, factor):
+def test_overlong_penalty_args_reject_invalid_values(buffer_len, factor):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
     with pytest.raises(ValueError):
         _validate_rollout_reward_post_process_args(
             SimpleNamespace(
-                rollout_reward_post_processors=processors,
+                overlong_penalty="dapo",
                 overlong_buffer_len=buffer_len,
                 overlong_penalty_factor=factor,
             )

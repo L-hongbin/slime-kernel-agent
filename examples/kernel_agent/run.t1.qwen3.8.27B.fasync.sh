@@ -1006,7 +1006,7 @@ RL_ARGS=(
    --entropy-coef 0.00
 
    # DAPO-style linear reward subtraction over the final response-token window.
-   --overlong-penalty
+   --overlong-penalty dapo
    --overlong-use-effective-response-cap
    --overlong-buffer-len ${OVERLONG_BUFFER_LEN}
    --overlong-penalty-factor ${OVERLONG_PENALTY_FACTOR}

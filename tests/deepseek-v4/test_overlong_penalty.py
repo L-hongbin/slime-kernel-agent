@@ -46,7 +46,7 @@ def _args(
     return SimpleNamespace(
         rollout_max_response_len=response_cap,
         rollout_max_context_len=context_cap if context_cap is not None else response_cap,
-        overlong_penalty=penalty_on,
+        overlong_penalty="dapo" if penalty_on else None,
         overlong_buffer_len=buffer_len,
         overlong_penalty_factor=factor,
         overlong_use_effective_response_cap=effective_response_cap,

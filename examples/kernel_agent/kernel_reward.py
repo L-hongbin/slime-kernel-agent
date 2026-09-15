@@ -123,7 +123,9 @@ _KERNEL_SCORE_KEYS = ("correctness", "performance", "coverage")
 def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=None) -> float:
     """Return the shared speedup/coverage gate for one valid reward group."""
 
-    mode = getattr(args, "dynamic_reward_gate", "sqrt")
+    mode = getattr(args, "dynamic_reward_gate", None)
+    if mode is None:
+        return 1.0
     if mode == "sqrt":
         if group_size <= 1 or num_correct <= 1:
             return 0.0
@@ -219,9 +221,6 @@ def _apply_dynamic_group_reward_weights(
         raise ValueError("samples and rewards must have the same length")
 
     num_correct, group_size = annotate_group_difficulty(samples)
-    if not config.get("enable_dynamic_reward_weight", False):
-        return rewards
-
     gate = _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args)
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
@@ -276,26 +275,6 @@ def _apply_dynamic_group_reward_weights(
     return dynamic_rewards
 
 
-def resolve_rollout_reward_processors(args, config: dict[str, Any]) -> set[str]:
-    """Explicit processor selection overrides the legacy reward switches."""
-    processors = getattr(args, "rollout_reward_post_processors", None)
-    if processors is not None:
-        if isinstance(processors, str) or not processors:
-            raise ValueError("rollout_reward_post_processors must be a non-empty list")
-        selected = set(processors)
-        if selected - {"none", "dynamic-weight", "overlong-penalty"}:
-            raise ValueError("Unknown rollout reward post-processor")
-        if len(selected) != len(processors) or ("none" in selected and len(selected) > 1):
-            raise ValueError("Rollout reward post-processors must be unique; none cannot be combined")
-        return selected - {"none"}
-    selected = set()
-    if config.get("enable_dynamic_reward_weight", False):
-        selected.add("dynamic-weight")
-    if getattr(args, "overlong_penalty", False):
-        selected.add("overlong-penalty")
-    return selected
-
-
 def _apply_overlong_penalty(args, sample, metadata: dict[str, Any]) -> float:
     """Replace the length component, never subtract repeatedly from a shaped reward."""
     response_len = int(getattr(sample, "response_length", 0) or 0)
@@ -337,12 +316,13 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             if isinstance(sample.metadata, dict):
                 sample.metadata.pop("dynamic_reward", None)
     config = CUDA_AGENT_CONFIGS["reward"]
-    processors = resolve_rollout_reward_processors(args, config)
-    if stage == "sample":
-        processors.discard("dynamic-weight")
+    dynamic_weight = stage == "rollout" and getattr(args, "dynamic_reward_gate", None) is not None
+    overlong_penalty = getattr(args, "overlong_penalty", None)
+    if overlong_penalty not in {None, "dapo"}:
+        raise ValueError("--overlong-penalty must be None or dapo")
     reward_key = getattr(args, "reward_key", None)
     rewards = [float(sample.reward[reward_key] if reward_key else sample.reward) for sample in samples]
-    if not processors:
+    if not dynamic_weight and overlong_penalty is None:
         return rewards
 
     reward_groups: dict[object, list[int]] = {}
@@ -354,7 +334,7 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             or (stage == "rollout" and metadata.get("verify_trajectory", False))
         ):
             continue
-        if "dynamic-weight" in processors:
+        if dynamic_weight:
             group_key: object = sample.group_index
             if getattr(args, "use_multi_turn", False):
                 turn_idx = metadata.get("turn_idx")
@@ -367,7 +347,7 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
         group_values = _apply_dynamic_group_reward_weights(
             group_samples,
             [rewards[idx] for idx in group_indices],
-            {**config, "enable_dynamic_reward_weight": True},
+            config,
             args=args,
             record_metrics=True,
         )
@@ -382,7 +362,7 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             or (stage == "rollout" and metadata.get("verify_trajectory", False))
         ):
             continue
-        if "overlong-penalty" in processors:
+        if overlong_penalty == "dapo":
             if "reward_component" not in metadata or "task_reward" not in metadata:
                 raise ValueError("overlong-penalty requires kernel task_reward and reward_component metadata")
             rewards[idx] = _apply_overlong_penalty(args, sample, metadata)
@@ -538,7 +518,10 @@ def reward_post_process_by_group(args, samples):
     reward_config = CUDA_AGENT_CONFIGS["reward"]
     raw_rewards = post_process_rollout_rewards(args, samples)
     if args.advantage_estimator == "trloo":
-        if resolve_rollout_reward_processors(args, reward_config):
+        if (
+            getattr(args, "dynamic_reward_gate", None) is not None
+            or getattr(args, "overlong_penalty", None) is not None
+        ):
             raw_rewards = _compute_trajectory_returns(args, samples, raw_rewards)
         else:
             raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]

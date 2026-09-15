@@ -219,19 +219,19 @@ The existing training hook calls this interface:
 
 ```bash
 --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
---rollout-reward-post-processors dynamic-weight overlong-penalty \
+--dynamic-reward-gate sqrt \
+--overlong-penalty dapo \
 --overlong-buffer-len 2048 \
 --overlong-penalty-factor 0.2
 ```
 
-Choose `dynamic-weight`, `overlong-penalty`, or both. Weights always precede the penalty regardless of argument order. Use `none` alone to disable both. An explicit list overrides `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` and the legacy `--overlong-penalty` flag; omitting the list preserves those switches. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
+The two method selectors are independent: `--dynamic-reward-gate` selects dynamic weighting, and `--overlong-penalty` selects length shaping. Both default to Python `None` (disabled), and both accept the explicit CLI value `None`. `--overlong-penalty dapo` enables the existing soft linear penalty; a bare `--overlong-penalty` is no longer accepted. Buffer length and penalty factor keep their existing meanings. When both methods are enabled, weights always precede the penalty. There is no processor-list selector or separate configuration/environment switch for dynamic weighting. The DPPO example script sets `--dynamic-reward-gate None`, so dynamic weighting is off by default there as well. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
 
 ##### Dynamic gate calculation
 
-`--dynamic-reward-gate` selects `sqrt` (default), `piecewise` (linear), or `piecewise-sqrt` (square-root tails). Dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
+`--dynamic-reward-gate` defaults to `None` (disabled); specifying `sqrt`, `piecewise` (linear), or `piecewise-sqrt` (square-root tails) enables the selected mode. Dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
 
 ```bash
---rollout-reward-post-processors dynamic-weight \
 --dynamic-reward-gate piecewise-sqrt \
 --dynamic-reward-gate-range 0.8 1.2
 ```
@@ -259,7 +259,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Neither gate selection nor threshold selection enables dynamic weighting by itself. Filter previews and final reward processing share the same calculation. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filter previews and final reward processing share the same calculation. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
 
 For samples on the normal component-scoring path, the resulting contributions are:
 
@@ -302,7 +302,7 @@ This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08
 
 `kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions, including a negative `overlong_penalty`. `task_reward` excludes that penalty and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties. TRLOO accumulates returns afterward without overwriting single-turn rewards.
 
-`calculate_kernel_reward()` only computes base scores. After scoring, `reward_func` calls `post_process_rollout_rewards(..., stage="sample")` to apply length shaping before verify/anchor utility assignment and history capture; dynamic weighting waits for the default `stage="rollout"`. Rollout post-processing skips settled verify trajectories and removed samples; verify is not dynamically reweighted. Filtering, verify capture, logging, and dump timing are unchanged: records produced before training reward post-processing do not contain subsequent dynamic weighting. `none` does not disable separate failure-scoring policies or CTM.
+`calculate_kernel_reward()` only computes base scores. After scoring, `reward_func` calls `post_process_rollout_rewards(..., stage="sample")` to apply length shaping before verify/anchor utility assignment and history capture; dynamic weighting waits for the default `stage="rollout"`. Rollout post-processing skips settled verify trajectories and removed samples; verify is not dynamically reweighted. Filtering, verify capture, logging, and dump timing are unchanged: records produced before training reward post-processing do not contain subsequent dynamic weighting. Leaving both shaping switches off does not disable separate failure-scoring policies or CTM.
 
 When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
 

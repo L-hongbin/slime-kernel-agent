@@ -68,20 +68,21 @@ def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
     }
 
 
-@pytest.mark.parametrize("legacy", [False, True])
-@pytest.mark.parametrize("processors,keep", [(["none"], True), (["dynamic-weight"], False)])
-def test_filter_respects_explicit_processors_without_writing_reward(monkeypatch, legacy, processors, keep):
+@pytest.mark.parametrize("gate,keep", [(None, True), ("sqrt", False), ("piecewise", True), ("piecewise-sqrt", True)])
+def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, keep):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", legacy)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    # Isolate the gate from the independent correctness prerequisite for speedup rewards.
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "performance_reward_requires_correctness", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = Namespace(
         min_group_size=2,
         n_samples_per_prompt=2,
         reward_key=None,
         reward_std_threshold=0.001,
         target_group_size=2,
-        rollout_reward_post_processors=processors,
+        dynamic_reward_gate=gate,
     )
     samples = []
     for i, performance in enumerate([0.0, 1.0]):
@@ -120,7 +121,6 @@ def test_filter_uses_selected_dynamic_gate_without_recording_final_metrics(monke
         target_group_size=2,
         reward_key=None,
         reward_std_threshold=0.27,
-        rollout_reward_post_processors=["dynamic-weight"],
         dynamic_reward_gate=mode,
     )
     samples = [

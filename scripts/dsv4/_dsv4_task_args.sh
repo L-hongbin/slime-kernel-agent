@@ -181,9 +181,13 @@ build_dsv4_task_args() {
         --coverage-rs-threshold 0.3
         --coverage-rs-factor 0.1
       )
-      if [[ "${OVERLONG_PENALTY:-0}" == "1" ]]; then
+      case "${OVERLONG_PENALTY:-None}" in
+        None|dapo) ;;
+        *) echo "FATAL: OVERLONG_PENALTY must be None or dapo" >&2; return 2 ;;
+      esac
+      if [[ "${OVERLONG_PENALTY:-None}" == "dapo" ]]; then
         reward_args+=(
-          --overlong-penalty
+          --overlong-penalty dapo
           --overlong-buffer-len "${OVERLONG_BUFFER_LEN:-2048}"
           --overlong-penalty-factor "${OVERLONG_PENALTY_FACTOR:-1.0}"
         )

@@ -53,7 +53,6 @@ if speedup_score_mode not in {"legacy", "improvement", "lcb_improvement"}:
     raise ValueError("CUDA_AGENT_SPEEDUP_SCORE_MODE must be one of: legacy, improvement, lcb_improvement")
 speedup_uncertainty_z_score = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE", 1.96))
 speedup_uncertainty_log_std_floor = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR", 0.0))
-enable_dynamic_reward_weight = bool(int(os.environ.get("CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT", "0")))
 if speedup_uncertainty_z_score < 0.0:
     raise ValueError("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE must be non-negative")
 if speedup_uncertainty_log_std_floor < 0.0:
@@ -165,9 +164,6 @@ CUDA_AGENT_CONFIGS = {
         "speedup_reward_lower_bound": 0.0,
         "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
         "speedup_uncertainty_log_std_floor": speedup_uncertainty_log_std_floor,
-        # Scale both auxiliary objectives. The default sqrt gate preserves the
-        # configured maxima; --dynamic-reward-gate piecewise can also boost them.
-        "enable_dynamic_reward_weight": enable_dynamic_reward_weight,
         "failed_score": 0.0,
         "apply_kernel_failed_score": apply_kernel_failed_score,
         "apply_failed_group_reward": apply_failed_group_reward,

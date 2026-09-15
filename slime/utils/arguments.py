@@ -44,7 +44,10 @@ def _validate_difficulty_thresholds_args(args) -> None:
 
 
 def _validate_rollout_reward_post_process_args(args) -> None:
-    if getattr(args, "dynamic_reward_gate", "sqrt") in {"piecewise", "piecewise-sqrt"}:
+    gate = getattr(args, "dynamic_reward_gate", None)
+    if gate not in {None, "sqrt", "piecewise", "piecewise-sqrt"}:
+        raise ValueError("--dynamic-reward-gate must be sqrt, piecewise, or piecewise-sqrt")
+    if gate in {"piecewise", "piecewise-sqrt"}:
         if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
             raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
         gate_range = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
@@ -55,21 +58,19 @@ def _validate_rollout_reward_post_process_args(args) -> None:
             raise ValueError("Piecewise dynamic reward gate parameters must be finite")
         if not 0.0 <= gate_min <= 1.0 <= gate_max:
             raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
-    processors = getattr(args, "rollout_reward_post_processors", None)
-    if processors is None:
-        return  # Legacy switches retain their existing behavior.
-    if len(set(processors)) != len(processors) or ("none" in processors and len(processors) != 1):
-        raise ValueError("--rollout-reward-post-processors must be unique; none cannot be combined")
-    if "overlong-penalty" in processors:
+    overlong_penalty = getattr(args, "overlong_penalty", None)
+    if overlong_penalty not in {None, "dapo"}:
+        raise ValueError("--overlong-penalty must be None or dapo")
+    if overlong_penalty == "dapo":
         if args.overlong_buffer_len <= 0:
             raise ValueError("overlong-penalty requires --overlong-buffer-len > 0")
         if not math.isfinite(args.overlong_penalty_factor) or args.overlong_penalty_factor < 0:
             raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
-    if processors != ["none"]:
+    if gate is not None or overlong_penalty is not None:
         expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
         if getattr(args, "custom_reward_post_process_path", None) != expected_path:
             logger.warning(
-                "--rollout-reward-post-processors requires %s or a custom hook calling "
+                "Rollout reward shaping requires %s or a custom hook calling "
                 "examples.kernel_agent.kernel_reward.post_process_rollout_rewards before advantage estimation.",
                 expected_path,
             )
@@ -2443,23 +2444,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
             )
             parser.add_argument(
-                "--rollout-reward-post-processors",
-                nargs="+",
-                choices=["none", "dynamic-weight", "overlong-penalty"],
+                "--dynamic-reward-gate",
+                type=lambda value: None if value == "None" else value,
+                choices=[None, "sqrt", "piecewise", "piecewise-sqrt"],
                 default=None,
                 help=(
-                    "Kernel rollout reward shaping, applied before returns and advantages. Select dynamic-weight, "
-                    "overlong-penalty, or both (weights always precede the penalty); none disables both. "
-                    "Explicit selection overrides --overlong-penalty and CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT. "
-                    "If omitted, those legacy switches are used. Scored verify trajectories are not reweighted."
-                ),
-            )
-            parser.add_argument(
-                "--dynamic-reward-gate",
-                choices=["sqrt", "piecewise", "piecewise-sqrt"],
-                default="sqrt",
-                help=(
-                    "Gate for dynamic performance/coverage weighting; does not enable dynamic-weight itself. "
+                    "Enable dynamic performance/coverage weighting with this gate; omitted (None) disables it. "
                     "sqrt preserves the legacy gate. piecewise uses correctness-rate thresholds to reduce "
                     "hard-group weights, keep middle groups unchanged, and boost easy-group weights linearly. "
                     "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
@@ -2492,9 +2482,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--overlong-penalty",
-                action="store_true",
-                default=False,
-                help="Apply a linear reward penalty near the response-length cap.",
+                type=lambda value: None if value == "None" else value,
+                choices=[None, "dapo"],
+                default=None,
+                help=(
+                    "Length penalty method; omitted or None disables it. "
+                    "dapo applies the existing soft linear penalty near the response-length cap."
+                ),
             )
             parser.add_argument(
                 "--overlong-buffer-len",

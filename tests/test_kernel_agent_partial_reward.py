@@ -343,7 +343,7 @@ def test_kernel_and_overlong_penalties_are_recorded_separately():
         "apply_failed_group_reward": False,
     }
     args = SimpleNamespace(
-        overlong_penalty=True,
+        overlong_penalty="dapo",
         overlong_buffer_len=100,
         overlong_penalty_factor=1.0,
         rollout_max_response_len=100,
@@ -688,7 +688,7 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_kernel_failed_score", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "performance_reward_requires_correctness", True)
     args = SimpleNamespace(
-        overlong_penalty=True,
+        overlong_penalty="dapo",
         overlong_use_effective_response_cap=True,
         overlong_buffer_len=4096,
         overlong_penalty_factor=0.2,
