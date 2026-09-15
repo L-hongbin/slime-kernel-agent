@@ -198,11 +198,12 @@ def _compute_verify_rl_metrics(args, samples):
     metrics["verify/scored_fraction"] = len(scored) / len(diagnoses) if diagnoses else 0.0
     baseline_mode = getattr(args, "verify_advantage_baseline", "group")
     if baseline_mode in {"history", "anchor"}:
-        baseline_key = "verify_source_reward" if baseline_mode == "history" else "verify_anchor_reward"
-        paired = [m for m in scored if finite(m.get(baseline_key))]
-        add_stats("verify/baseline_reward", [m[baseline_key] for m in paired])
+        # The data source materializes legacy history fallbacks before rollout.
+        baseline_key = "history_baseline" if baseline_mode == "history" else "verify_anchor_reward"
+        paired = [(metadata, metadata[baseline_key]) for metadata in scored if finite(metadata.get(baseline_key))]
+        add_stats("verify/baseline_reward", [baseline for _, baseline in paired])
         # History samples still contain raw R2 here; anchor samples already contain R2 - Ra.
-        improvements = [m["verify_kernel_reward"] - m[baseline_key] for m in paired]
+        improvements = [metadata["verify_kernel_reward"] - baseline for metadata, baseline in paired]
         add_stats("verify/improvement", improvements)
         metrics["verify/missing_baseline_count"] = len(scored) - len(paired)
         if improvements:

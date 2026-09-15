@@ -602,11 +602,12 @@ def test_verify_anchor_configuration_and_reference_metadata_are_copied_per_sampl
 
 
 @pytest.mark.parametrize("baseline", ["group", "history"])
-def test_source_reward_is_carried_without_creating_anchor(baseline):
+def test_history_baseline_is_carried_in_all_modes_without_creating_anchor(baseline):
     args = _make_verify_data_source_args(verify_advantage_baseline=baseline)
     data_source = kernel_agent_data_source.KernelAgentDataSource(args)
     source = _make_schedulable_verify_candidate(42, 9)
     source.reward = -0.25
+    source.metadata["history_baseline"] = 0.3
     source.metadata["multi_turn_reward"] = 7.0
     data_source.add_verify_candidates([source])
     group = data_source.get_samples(1)[0]
@@ -615,40 +616,38 @@ def test_source_reward_is_carried_without_creating_anchor(baseline):
     for sample in group:
         assert sample.reward is None
         assert "verify_anchor_key" not in sample.metadata
-        if baseline == "history":
-            assert sample.metadata["verify_source_reward"] == -0.25
-        else:
-            assert "verify_source_reward" not in sample.metadata
+        assert sample.metadata["history_baseline"] == 0.3
+        assert "verify_source_reward" not in sample.metadata
     assert "verify_source_reward" not in source.metadata
 
 
 @pytest.mark.parametrize("reward", [None, float("nan"), float("inf"), {}, "invalid"])
-def test_history_baseline_rejects_missing_or_invalid_source_reward(reward):
+def test_history_baseline_rejects_invalid_explicit_baseline(reward):
     data_source = kernel_agent_data_source.KernelAgentDataSource(
         _make_verify_data_source_args(verify_advantage_baseline="history")
     )
     source = _make_schedulable_verify_candidate(42, 9)
-    source.reward = reward
-    with pytest.raises(ValueError, match="finite source kernel reward"):
+    source.metadata["history_baseline"] = reward
+    with pytest.raises(ValueError, match="finite metadata"):
         data_source.add_verify_candidates([source])
 
 
 @pytest.mark.parametrize("reward", [None, -0.25])
-def test_history_baseline_loads_single_turn_reward_from_fixed_data(tmp_path, reward):
+def test_history_baseline_loads_legacy_correctness_instead_of_single_turn_reward(tmp_path, reward):
     source = _make_schedulable_verify_candidate(42, 9)
     source.reward = reward
+    source.metadata.update(group_correct_rate=0.5, raw_task_reward=-123.0, verify_source_reward=99.0)
     source.metadata["multi_turn_reward"] = 7.0
     fixed_path = tmp_path / "source.pt"
     torch.save({"rollout_id": 3, "samples": [source.to_dict()]}, fixed_path)
     args = _make_verify_data_source_args(verify_advantage_baseline="history", load_verify_data=[str(fixed_path)])
-    if reward is None:
-        with pytest.raises(ValueError, match="finite source kernel reward"):
-            kernel_agent_data_source.KernelAgentDataSource(args)
-    else:
-        data_source = kernel_agent_data_source.KernelAgentDataSource(args)
-        group = data_source.get_samples(1)[0]
-        assert all(sample.metadata["verify_source_reward"] == reward for sample in group)
-        assert not data_source.anchor_kv
+    data_source = kernel_agent_data_source.KernelAgentDataSource(args)
+    group = data_source.get_samples(1)[0]
+    from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+
+    expected = 0.5 * CUDA_AGENT_CONFIGS["reward"]["init_correct_weight"]
+    assert all(sample.metadata["history_baseline"] == expected for sample in group)
+    assert not data_source.anchor_kv
 
 
 def test_kernel_agent_data_source_falls_back_to_kernel_prompt_when_verify_buffer_is_empty():
@@ -659,6 +658,68 @@ def test_kernel_agent_data_source_falls_back_to_kernel_prompt_when_verify_buffer
     assert len(groups) == 1
     assert len(groups[0]) == 2
     assert all(sample.metadata.get("role") is None for sample in groups[0])
+
+
+def test_verify_capture_history_averages_full_raw_group_per_turn_and_persists(tmp_path):
+    data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
+    samples = []
+    for turn, raw_rewards in enumerate([[-0.2, 0.6, 0.8], [0.0, 0.4, 0.2]]):
+        for offset, raw_reward in enumerate(raw_rewards):
+            sample = _make_schedulable_verify_candidate(turn * 3 + offset, 9)
+            sample.reward = 99.0
+            sample.metadata.update(turn_idx=turn, raw_task_reward=raw_reward, task_reward=88.0)
+            if offset:
+                sample.metadata["trajectory_states"] = ["successed"]
+            samples.append(sample)
+    other = _make_schedulable_verify_candidate(6, 10)
+    other.metadata.update(turn_idx=0, raw_task_reward=-0.5)
+    samples.append(other)
+    for mode in ("removed", "aborted", "pad", "verify"):
+        invalid = copy.deepcopy(samples[1])
+        invalid.metadata["raw_task_reward"] = 1000.0
+        if mode == "removed":
+            invalid.remove_sample = True
+        elif mode == "aborted":
+            invalid.status = Sample.Status.ABORTED
+        elif mode == "pad":
+            invalid.metadata["is_pad_turn"] = True
+        else:
+            invalid.metadata["verify_trajectory"] = True
+        samples.append(invalid)
+
+    assert data_source.add_verify_candidates(samples) == 3
+    candidates = [entry.sample for entry in data_source.verify_data]
+    baselines = {(s.group_index, s.metadata["turn_idx"]): s.metadata["history_baseline"] for s in candidates}
+    assert baselines == pytest.approx({(9, 0): 0.4, (9, 1): 0.2, (10, 0): -0.5})
+    assert all("history_baseline" not in sample.metadata for sample in samples)
+
+    path = tmp_path / "captured.pt"
+    torch.save({"rollout_id": 3, "samples": [sample.to_dict() for sample in candidates]}, path)
+    restored = kernel_agent_data_source.KernelAgentDataSource(
+        _make_verify_data_source_args(load_verify_data=[str(path)], verify_advantage_baseline="history")
+    )
+    for entry in restored.verify_data:
+        sample = entry.sample
+        expected = baselines[sample.group_index, sample.metadata["turn_idx"]]
+        assert sample.metadata["history_baseline"] == expected
+        assert (
+            restored._build_verify_sample(sample, group_index=100, sample_index=200).metadata["history_baseline"]
+            == expected
+        )
+
+
+def test_verify_capture_partial_raw_group_uses_correctness_fallback():
+    from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+
+    data_source = kernel_agent_data_source.KernelAgentDataSource(_make_verify_data_source_args())
+    failed = _make_schedulable_verify_candidate(0, 9)
+    failed.metadata.update(raw_task_reward=-100.0, group_correct_rate=0.5)
+    success = _make_schedulable_verify_candidate(1, 9)
+    success.metadata["trajectory_states"] = ["successed"]
+    data_source.add_verify_candidates([failed, success])
+    assert data_source.verify_data[0].sample.metadata["history_baseline"] == (
+        0.5 * CUDA_AGENT_CONFIGS["reward"]["init_correct_weight"]
+    )
 
 
 def test_shared_anchor_claim_read_and_retry_lifecycle():
@@ -1128,6 +1189,8 @@ def test_kernel_agent_data_source_builds_fresh_verify_group_from_failed_kernel()
         assert verify_sample.status == Sample.Status.PENDING
         assert verify_sample.metadata == {
             "role": "verify",
+            "history_baseline": 0.25
+            * kernel_agent_data_source.get_verify_history_baseline({"group_correct_rate": 1.0}),
             "source_kernel_index": 42,
             "source_group_index": 9,
             "source_turn_idx": 2,

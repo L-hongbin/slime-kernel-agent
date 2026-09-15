@@ -82,7 +82,7 @@ def test_verify_history_advantage_preserves_signed_improvement_and_raw_reward(dy
                         "turn_idx": turn_idx,
                         "verify_trajectory": True,
                         "verify_reward_mode": "baseline",
-                        "verify_source_reward": 0.25,
+                        "history_baseline": 0.25,
                         "multi_turn_reward": reward,
                     },
                 )
@@ -97,7 +97,7 @@ def test_verify_history_advantage_preserves_signed_improvement_and_raw_reward(dy
 def test_verify_history_advantage_requires_finite_baseline(source_reward):
     args = _make_manager(advantage_estimator="rloo", use_multi_turn=True).args
     args.verify_advantage_baseline = "history"
-    sample = Sample(reward=0.7, metadata={"role": "verify", "verify_source_reward": source_reward})
+    sample = Sample(reward=0.7, metadata={"role": "verify", "history_baseline": source_reward})
     with pytest.raises(ValueError, match="finite metadata"):
         reward_post_process_by_group(args, [sample])
 
@@ -108,6 +108,26 @@ def test_verify_history_advantage_does_not_subtract_from_anchor_difference():
     sample = Sample(reward=0.4, metadata={"role": "verify", "verify_reward_mode": "anchor"})
     with pytest.raises(ValueError, match="cannot be applied to anchor-scored"):
         reward_post_process_by_group(args, [sample])
+
+
+@pytest.mark.parametrize(
+    "metadata,expected_baseline",
+    [
+        ({"history_baseline": 0.0, "group_correct_rate": 1.0}, 0.0),
+        ({"history_baseline": -0.2}, -0.2),
+        ({"group_correct_rate": 0.25, "verify_source_reward": 99.0}, 0.2),
+        ({"group_difficulty": 0.75}, 0.2),
+    ],
+)
+def test_verify_history_legacy_fallback_and_explicit_baseline_precedence(monkeypatch, metadata, expected_baseline):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_correct_weight", 0.8)
+    args = _make_manager(advantage_estimator="rloo", use_multi_turn=False).args
+    args.verify_advantage_baseline = "history"
+    sample = Sample(reward=0.7, metadata={"role": "verify", **metadata})
+    raw, advantage = reward_post_process_by_group(args, [sample])
+    assert raw == [0.7]
+    assert advantage == pytest.approx([0.7 - expected_baseline])
+    assert sample.reward == 0.7
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
@@ -546,6 +566,7 @@ def test_dynamic_reward_writeback_preserves_captured_verify_history(monkeypatch)
     source = source_module.KernelAgentDataSource.__new__(source_module.KernelAgentDataSource)
     source.args = manager.args
     sample = _make_sample(0, 0, 0.25)
+    sample.metadata["history_baseline"] = 0.4
     sample.metadata["trajectory_states"] = ["failed"]
     _set_reward_component(sample, failed=0.25, overlong_penalty=-0.1)
     monkeypatch.setattr(
@@ -558,7 +579,7 @@ def test_dynamic_reward_writeback_preserves_captured_verify_history(monkeypatch)
 
     assert sample.reward == pytest.approx(0.15)
     assert candidate.reward == 0.25
-    assert candidate.metadata["verify_source_reward"] == 0.25
+    assert candidate.metadata["history_baseline"] == 0.4
 
 
 def test_dynamic_reward_uses_failed_component_as_branch_sentinel():

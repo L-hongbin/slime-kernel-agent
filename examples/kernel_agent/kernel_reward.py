@@ -509,6 +509,29 @@ def _annotate_conditional_truncation_mask(args, sample) -> None:
     sample.metadata["conditional_truncation_repeat_window"] = repeat_window
 
 
+def get_verify_history_baseline(metadata: dict[str, Any]) -> float:
+    """Read the captured group mean, or approximate legacy data from correctness."""
+    try:
+        if "history_baseline" in metadata:
+            baseline = float(metadata["history_baseline"])
+        else:
+            rate = (
+                float(metadata["group_correct_rate"])
+                if "group_correct_rate" in metadata
+                else 1.0 - float(metadata["group_difficulty"])
+            )
+            if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+                raise ValueError("group correctness rate must be in [0, 1]")
+            baseline = rate * float(CUDA_AGENT_CONFIGS["reward"]["init_correct_weight"])
+        if not math.isfinite(baseline):
+            raise ValueError("baseline must be finite")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "verify history baseline requires finite metadata['history_baseline'] or a valid source group correctness rate"
+        ) from exc
+    return baseline
+
+
 def reward_post_process_by_group(args, samples):
     if any(
         not sample.remove_sample and (sample.metadata or {}).get("verify_reward_mode") == "pending_anchor"
@@ -546,15 +569,7 @@ def reward_post_process_by_group(args, samples):
             # Preserve the absolute improvement signal; centering would cancel a shared baseline.
             reward = raw_rewards[idx]
             if history_baseline:
-                try:
-                    source_reward = float(metadata.get("verify_source_reward"))
-                except (TypeError, ValueError) as exc:
-                    raise ValueError(
-                        "verify history baseline requires a finite metadata['verify_source_reward']"
-                    ) from exc
-                if not math.isfinite(source_reward):
-                    raise ValueError("verify history baseline requires a finite metadata['verify_source_reward']")
-                reward -= source_reward
+                reward -= get_verify_history_baseline(metadata)
             rewards[idx] = reward
             continue
 
@@ -802,6 +817,7 @@ def calculate_kernel_reward(
     details = {
         **env_state,
         "reward": task_reward,
+        "raw_task_reward": task_reward,
         "task_reward": task_reward,
         "overlong_penalty": 0.0,
         "overlong_prompt_len": 0,

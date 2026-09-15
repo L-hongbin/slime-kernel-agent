@@ -2291,7 +2291,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="group",
                 help=(
                     "Verify advantage baseline: group uses the configured group estimator; history uses "
-                    "new minus initial kernel reward; anchor generates one shared direct repair and uses "
+                    "new kernel reward minus the source group/turn mean raw task reward "
+                    "(legacy fallback: source correctness rate times correctness weight); "
+                    "anchor generates one shared direct repair and uses "
                     "new minus anchor kernel reward. History/anchor skip group centering."
                 ),
             )

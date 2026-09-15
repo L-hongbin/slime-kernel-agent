@@ -1466,6 +1466,8 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
         kernel_score = {key: float(value) for key, value in reward_details["kernel_score"].items()}
         metadata.update(
             {
+                # Freeze the base score before any length or group reward shaping.
+                "raw_task_reward": float(reward_details["raw_task_reward"]),
                 "task_reward": float(reward_details["task_reward"]),
                 "overlong_penalty": float(reward_details["overlong_penalty"]),
                 "overlong_prompt_len": int(reward_details["overlong_prompt_len"]),

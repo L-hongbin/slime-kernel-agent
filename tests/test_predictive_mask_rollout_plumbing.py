@@ -348,7 +348,7 @@ def test_cuda_agent_verify_trains_diagnosis_and_kernel_with_paired_rewards(
             "role": "verify",
             "task_id": "old-kernel-task",
             "verify_source_env_result": {"env_state": {"error": "output mismatch"}},
-            "verify_source_reward": 0.3,
+            "history_baseline": 0.3,
         },
     )
     if use_anchor:
@@ -373,7 +373,7 @@ def test_cuda_agent_verify_trains_diagnosis_and_kernel_with_paired_rewards(
         assert len(group) == 2
         assert all(turn.metadata["turn_idx"] == turn_idx for turn in group)
     for pair_idx, turn in enumerate(result[::2]):
-        assert turn.metadata["verify_source_reward"] == 0.3  # Fixed across all later pairs.
+        assert turn.metadata["history_baseline"] == 0.3  # Fixed across all later pairs.
         kernel = result[2 * pair_idx + 1]
         assert kernel.response == "kernel revision"
         assert kernel.prompt == messages_seen[pair_idx * calls_per_pair + kernel_offset]

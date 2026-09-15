@@ -12,7 +12,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
-from examples.kernel_agent.kernel_reward import annotate_group_difficulty
+from examples.kernel_agent.kernel_reward import annotate_group_difficulty, get_verify_history_baseline
 from examples.kernel_agent.prompt_utils import as_messages, format_feedback
 from examples.kernel_agent.utils import CUDA_SECTIONS, extract_cuda_agent_kernel_code
 
@@ -24,7 +24,7 @@ from slime.utils.types import Sample
 logger = logging.getLogger("examples.kernel_agent.kernel_agent_data_source")
 
 _VERIFY_SOURCE_METADATA_KEYS = (
-    "verify_source_reward",
+    "history_baseline",
     "trajectory_states",
     "verify_capture_rollout_id",
     "verify_data_origin",
@@ -263,15 +263,6 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
 
         candidate = copy.deepcopy(sample)
         candidate.metadata = dict(candidate.metadata or {})
-        if getattr(self.args, "verify_advantage_baseline", "group") == "history":
-            try:
-                source_reward = float(sample.reward)
-            except (TypeError, ValueError) as exc:
-                raise ValueError("--verify-advantage-baseline requires a finite source kernel reward") from exc
-            if not math.isfinite(source_reward):
-                raise ValueError("--verify-advantage-baseline requires a finite source kernel reward")
-            # Capture the single-turn execution reward, never its accumulated trajectory return.
-            candidate.metadata["verify_source_reward"] = source_reward
         candidate.metadata["source_kernel_weight_version"] = self._source_kernel_weight_version(
             candidate,
             fallback_version=rollout_id,
@@ -295,6 +286,9 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
                 candidate = self._prepare_verify_candidate(sample)
                 if candidate is None:
                     continue
+                # Saved verify files contain failures only: never reconstruct a
+                # group mean from that selected subset, even if raw scores exist.
+                candidate.metadata["history_baseline"] = get_verify_history_baseline(candidate.metadata)
                 num_eligible += 1
                 candidate.metadata["verify_data_origin"] = "loaded"
                 candidate.metadata["verify_data_path"] = str(path)
@@ -352,10 +346,38 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
         if self.save_verify_data is not None and rollout_id is None:
             raise ValueError("rollout_id is required when --save-verify-data is configured")
 
+        # Compute from full ordinary prompt/turn groups before selecting failures.
+        raw_group_rewards: dict[tuple[object, object], list[object]] = {}
+        for sample in samples:
+            metadata = sample.metadata or {}
+            if (
+                metadata.get("role", "kernel") != "kernel"
+                or metadata.get("verify_trajectory")
+                or metadata.get("is_pad_turn")
+                or sample.remove_sample
+                or sample.status == Sample.Status.ABORTED
+            ):
+                continue
+            key = sample.group_index, metadata.get("turn_idx")
+            raw_group_rewards.setdefault(key, []).append(metadata.get("raw_task_reward"))
+        group_baselines = {}
+        for key, values in raw_group_rewards.items():
+            if any(value is None for value in values):
+                # Legacy/mixed groups must not average only the available subset.
+                continue
+            rewards = [float(value) for value in values]
+            if not all(math.isfinite(reward) for reward in rewards):
+                raise ValueError("verify capture requires finite raw_task_reward values")
+            group_baselines[key] = math.fsum(reward / len(rewards) for reward in rewards)
+
         candidates = []
         for sample in samples:
             candidate = self._prepare_verify_candidate(sample, rollout_id=rollout_id)
             if candidate is not None:
+                key = sample.group_index, candidate.metadata.get("turn_idx")
+                if "history_baseline" not in candidate.metadata and key in group_baselines:
+                    candidate.metadata["history_baseline"] = group_baselines[key]
+                candidate.metadata["history_baseline"] = get_verify_history_baseline(candidate.metadata)
                 candidates.append(candidate)
 
         with self._verify_buffer_lock:
@@ -446,6 +468,7 @@ class KernelAgentDataSource(RolloutDataSourceWithBuffer):
         metadata.update(
             {
                 "role": "verify",
+                "history_baseline": get_verify_history_baseline(source_metadata),
                 "source_kernel_index": source.index,
                 "source_group_index": source_metadata.get("source_group_index", source.group_index),
                 "source_turn_idx": source_metadata.get("turn_idx"),

@@ -66,10 +66,10 @@ selection as `VERIFY_ADVANTAGE_BASELINE`; no separate anchor-enable flag is need
 | Mode | Verify advantage before token-level processing | Extra rollout |
 | --- | --- | --- |
 | `group` | Configured GRPO/RLOO/TRLOO group-relative estimator on R2 | None |
-| `history` | R2 - R1, without group centering or group standardization | None |
+| `history` | R2 - history_baseline, without group centering or group standardization | None |
 | `anchor` | R2 - Ra, without group centering or group standardization | One direct kernel per group |
 
-Here R1 is the initial source kernel's single-turn reward, R2 is the kernel reward
+Here history_baseline is the source group/turn's mean raw task reward, R2 is the kernel reward
 following this diagnosis, and Ra is the fixed shared direct-repair reward. Kernel
 turns retain their own execution rewards and existing per-turn group estimator in
 all modes. Existing loss masking and token-level training processing still apply.
@@ -111,7 +111,7 @@ Additional `rollout/verify/` metrics:
 - `kernel_reward/...` and `scored_fraction`: finite R2 and scoring coverage among
   non-removed, non-aborted diagnoses (coverage denominator: all diagnosis turns).
 - `baseline_reward/...` and `improvement/...`: available in history/anchor mode,
-  computed directly as R2 - R1 / R2 - Ra. R1 and Ra remain fixed across rounds.
+  computed directly as R2 - history_baseline / R2 - Ra. Both baselines remain fixed across rounds.
   Improvement also reports `win_rate`, `tie_rate`, and `loss_rate` according to
   whether the difference is positive, zero, or negative. `missing_baseline_count`
   counts scored diagnoses without a finite baseline. Group mode does not report
@@ -164,14 +164,23 @@ CAPTURE_VERIFY_DATA=true \
 bash examples/kernel_agent/run_qwen3.6_27B_full_async_dppo.sh
 ```
 
-Capture copies `source.reward` into `metadata.verify_source_reward` and carries it
-through all verify rounds. This is the fixed initial R1, not the previous round's
-reward, an accumulated trajectory return, or a group-normalized training reward.
-Missing/non-finite source rewards are rejected, including when loading fixed data.
+Capture stores `metadata.history_baseline = avg(raw_task_reward)` from all valid
+ordinary kernel samples in the same source group and turn, including successes,
+before selecting failures. Padding, removed and aborted samples are excluded.
+The value excludes dynamic weighting, failed-group replacement, length shaping,
+and future-turn returns. It is persisted with the captured data and remains fixed
+through all verify rounds, independently of the selected advantage mode.
+
+For legacy data without `history_baseline`, use
+`group_correct_rate * CUDA_AGENT_CONFIGS["reward"]["init_correct_weight"]`.
+If only difficulty is stored, correctness rate is `1 - group_difficulty`.
+Do not reconstruct a group mean from loaded failed-only data, even if it contains
+individual raw rewards. Online groups missing any raw rewards use the same fallback.
+An explicit zero baseline is preserved; invalid/non-finite baselines are rejected.
 Use the same reward configuration for data collection and training; stored scores
 are not automatically recalibrated when reward settings change.
 
-Verify samples keep raw reward R2; the reward postprocessor supplies R2 - R1 to
+Verify samples keep raw reward R2; the reward postprocessor supplies R2 - history_baseline to
 the actor without group centering/standardization. Negative improvements remain
 negative and singleton groups retain their signal. No extra kernel is generated.
 Version checks still compare the new diagnosis and its kernel; the historical

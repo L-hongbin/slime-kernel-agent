@@ -403,6 +403,8 @@ def test_reward_component_sums_to_reward(env_state):
     component_sum = sum(value for value in details["reward_component"].values() if value is not None)
     assert component_sum == pytest.approx(details["reward"])
     assert details["task_reward"] == pytest.approx(details["reward"])
+    assert details["raw_task_reward"] == pytest.approx(details["reward"])
+    assert "raw_task_reward" not in details["reward_component"]
     assert details["overlong_penalty"] == 0.0
     assert details["overlong_prompt_len"] == 0
     assert details["overlong_effective_response_cap"] == 0
@@ -758,6 +760,7 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
 
     assert [sample.reward for sample in samples] == rewards_before_postprocess
     assert [sample.metadata["task_reward"] for sample in samples] == pytest.approx([-0.375, 0.125, 0.625])
+    assert [sample.metadata["raw_task_reward"] for sample in samples] == pytest.approx([-0.375, 0.125, 0.625])
     assert samples[1].reward == pytest.approx(-0.075)
     assert samples[1].metadata["reward_component"]["failed"] == pytest.approx(0.125)
     assert samples[1].metadata["reward_component"]["overlong_penalty"] == pytest.approx(-0.2)

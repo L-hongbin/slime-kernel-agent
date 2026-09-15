@@ -74,7 +74,8 @@ def test_verify_metrics_separate_roles_and_exclude_padding():
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
-    "mode,baseline_key", [("history", "verify_source_reward"), ("anchor", "verify_anchor_reward")]
+    "mode,baseline_key",
+    [("history", "history_baseline"), ("anchor", "verify_anchor_reward")],
 )
 def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline_key):
     samples = [
@@ -108,6 +109,25 @@ def test_verify_metrics_compute_pair_improvement_without_mutation(mode, baseline
     if mode == "anchor":
         assert metrics["verify/anchor/reward/mean"] == 2.0
     assert [s.to_dict() for s in samples] == original
+
+
+@pytest.mark.unit
+def test_verify_history_metrics_preserve_zero_baseline():
+    sample = Sample(
+        reward=0.7,
+        metadata={
+            "role": "verify",
+            "verify_kernel_reward": 0.7,
+            "history_baseline": 0.0,
+            "verify_source_reward": 99.0,
+        },
+    )
+    original = deepcopy(sample.metadata)
+    metrics = _compute_verify_rl_metrics(Namespace(verify_advantage_baseline="history"), [sample])
+    assert metrics["verify/baseline_reward/mean"] == 0.0
+    assert metrics["verify/improvement/mean"] == pytest.approx(0.7)
+    assert metrics["verify/missing_baseline_count"] == 0
+    assert sample.metadata == original
 
 
 @pytest.mark.unit
