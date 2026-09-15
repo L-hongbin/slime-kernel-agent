@@ -759,6 +759,61 @@ def test_normalize_env_feedback_strips_compile_worker_routing_metadata():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "error_message,metadata_error,removed",
+    [
+        ("CUDA fault", "CUDA fault", True),
+        ("Task processing failed: CUDA fault\nadditional detail", "CUDA fault", True),
+        ("CUDA fault", "CUDA fault\nadditional detail", False),
+        ("CUDA fault", "different error", False),
+        (None, "CUDA fault", False),
+        ("", "CUDA fault", False),
+        ("CUDA fault", "", False),
+        ("CUDA fault", None, False),
+        ("CUDA fault", {"detail": "CUDA fault"}, False),
+    ],
+)
+def test_strip_env_feedback_drops_only_contained_metadata_error(error_message, metadata_error, removed):
+    raw = {"error_message": error_message, "metadata": {"error": metadata_error, "keep": "detail"}}
+
+    cleaned = kernel_agent_utils._strip_env_feedback_fields(raw)
+
+    assert cleaned["error_message"] == error_message
+    assert cleaned["metadata"]["keep"] == "detail"
+    assert ("error" not in cleaned["metadata"]) is removed
+    if not removed:
+        assert cleaned["metadata"]["error"] == metadata_error
+    assert raw["metadata"] == {"error": metadata_error, "keep": "detail"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("already_in_message", [False, True])
+def test_normalize_env_feedback_preserves_error_detail_once(already_in_message):
+    detail = (
+        "Task processing failed: CudaFinalSyncError: CUDA final synchronize failed: "
+        "CUDA error: an illegal memory access was encountered"
+    )
+    raw = {
+        "status": "failed",
+        "compiled": True,
+        "correctness": False,
+        "error_code": "RUNTIME_ERROR",
+        "error_message": detail if already_in_message else "Kernel execution failed",
+        "speedup": 0.0,
+        "metadata": {"error": detail},
+    }
+
+    normalized, _ = normalize_env_feedback(raw)
+
+    assert normalized["error"] == "RUNTIME_ERROR"
+    assert normalized["error_message"].count(detail) == 1
+    if not already_in_message:
+        assert normalized["error_message"].startswith("Kernel execution failed")
+    assert "error" not in normalized["metadata"]
+    assert raw["metadata"]["error"] == detail
+
+
+@pytest.mark.unit
 def test_log_multi_turn_info_uses_config_and_defaults_to_true(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", False)
     assert generate_with_cuda_agent._log_multi_turn_info() is False

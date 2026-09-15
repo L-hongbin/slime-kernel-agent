@@ -68,5 +68,83 @@ def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
     }
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("processors,keep", [(["none"], True), (["dynamic-weight"], False)])
+def test_filter_respects_explicit_processors_without_writing_reward(monkeypatch, legacy, processors, keep):
+    from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "enable_dynamic_reward_weight", legacy)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    args = Namespace(
+        min_group_size=2,
+        n_samples_per_prompt=2,
+        reward_key=None,
+        reward_std_threshold=0.001,
+        target_group_size=2,
+        rollout_reward_post_processors=processors,
+    )
+    samples = []
+    for i, performance in enumerate([0.0, 1.0]):
+        reward = performance * 0.5
+        samples.append(
+            Sample(
+                group_index=0,
+                index=i,
+                reward=reward,
+                metadata={
+                    "task_reward": reward,
+                    "kernel_score": {"correctness": 0.0, "performance": performance, "coverage": 0.0},
+                    "reward_component": {
+                        "correctness": 0.0,
+                        "performance": reward,
+                        "coverage": 0.0,
+                        "failed": None,
+                        "overlong_penalty": 0.0,
+                    },
+                },
+            )
+        )
+    result = filter_cuda_kernel_group(args, samples)
+    assert result.keep is keep
+    assert [sample.reward for sample in samples] == [0.0, 0.5]
+
+
+@pytest.mark.parametrize("mode,keep", [("sqrt", False), ("piecewise", True)])
+def test_filter_uses_selected_dynamic_gate_without_recording_final_metrics(monkeypatch, mode, keep):
+    from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = Namespace(
+        min_group_size=2,
+        n_samples_per_prompt=2,
+        target_group_size=2,
+        reward_key=None,
+        reward_std_threshold=0.27,
+        rollout_reward_post_processors=["dynamic-weight"],
+        dynamic_reward_gate=mode,
+    )
+    samples = [
+        Sample(
+            group_index=0,
+            reward=0.5 + 0.5 * performance,
+            metadata={
+                "task_reward": 0.5 + 0.5 * performance,
+                "kernel_score": {"correctness": 1.0, "performance": performance, "coverage": 0.0},
+                "reward_component": {
+                    "correctness": 0.5,
+                    "performance": 0.5 * performance,
+                    "coverage": 0.0,
+                    "failed": None,
+                    "overlong_penalty": 0.0,
+                },
+            },
+        )
+        for performance in (0.0, 1.0)
+    ]
+    assert filter_cuda_kernel_group(args, samples).keep is keep
+    assert [sample.reward for sample in samples] == [0.5, 1.0]
+    assert all("dynamic_reward" not in sample.metadata for sample in samples)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -26,6 +26,7 @@ from examples.kernel_agent.kernel_reward import (
     _calculate_performance_score,
     _compute_speedup_log_standard_error,
     calculate_kernel_reward,
+    post_process_rollout_rewards,
 )
 from examples.kernel_agent.utils import normalize_env_feedback, postprocess_turn_samples
 
@@ -349,12 +350,17 @@ def test_kernel_and_overlong_penalties_are_recorded_separately():
         rollout_max_context_len=100,
         overlong_use_effective_response_cap=False,
     )
-    sample = SimpleNamespace(response_length=100, tokens=[0] * 100, remove_sample=False)
+    sample = Sample(response_length=100, tokens=[0] * 100)
 
-    details = calculate_kernel_reward(_completed_env(compiled=False), config, args=args, sample=sample)
+    details = calculate_kernel_reward(_completed_env(compiled=False), config)
+    assert details["reward"] == pytest.approx(-0.375)
+    sample.reward = details.pop("reward")
+    sample.metadata = details
+    reward = post_process_rollout_rewards(args, [sample], stage="sample")[0]
 
     assert details["task_reward"] == pytest.approx(-0.375)
-    assert details["reward"] == pytest.approx(-1.375)
+    assert reward == pytest.approx(-1.375)
+    assert sample.reward == pytest.approx(reward)
     assert details["reward_component"]["failed"] == pytest.approx(-0.375)
     assert details["reward_component"]["overlong_penalty"] == pytest.approx(-1.0)
 

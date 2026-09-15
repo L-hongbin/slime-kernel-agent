@@ -165,8 +165,8 @@ CUDA_AGENT_CONFIGS = {
         "speedup_reward_lower_bound": 0.0,
         "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
         "speedup_uncertainty_log_std_floor": speedup_uncertainty_log_std_floor,
-        # Keep the configured 0.5 maxima, but gate both auxiliary objectives by
-        # sqrt(max((num_correct - 1) / (group_size - 1), 0)).
+        # Scale both auxiliary objectives. The default sqrt gate preserves the
+        # configured maxima; --dynamic-reward-gate piecewise can also boost them.
         "enable_dynamic_reward_weight": enable_dynamic_reward_weight,
         "failed_score": 0.0,
         "apply_kernel_failed_score": apply_kernel_failed_score,

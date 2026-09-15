@@ -15,9 +15,11 @@ sys.path.insert(0, str(REPO))
 
 NUM_GPUS = 0
 
+from slime.utils.types import Sample
+
 
 def _kernel_reward(args, sample):
-    from examples.kernel_agent.kernel_reward import calculate_kernel_reward
+    from examples.kernel_agent.kernel_reward import calculate_kernel_reward, post_process_rollout_rewards
 
     config = {
         "init_correct_weight": 0.5,
@@ -26,7 +28,11 @@ def _kernel_reward(args, sample):
         "apply_failed_group_reward": False,
         "kernel_failed_score": {"output_mismatch": 0.0, "other": -1.0},
     }
-    return calculate_kernel_reward({}, config, args=args, sample=sample)
+    details = calculate_kernel_reward({}, config)
+    sample.reward = details.pop("reward")
+    sample.metadata.update(details)
+    reward = post_process_rollout_rewards(args, [sample], stage="sample")[0]
+    return {**sample.metadata, "reward": reward}
 
 
 def _args(
@@ -48,7 +54,7 @@ def _args(
 
 
 def _sample(reward, response_length, removed=False, prompt_length=0):
-    return SimpleNamespace(
+    return Sample(
         reward=reward,
         response_length=response_length,
         tokens=[0] * (prompt_length + response_length),
@@ -62,7 +68,8 @@ def test_disabled_by_default():
     details = _kernel_reward(_args(False), sample)
     assert details["overlong_penalty"] == 0.0
     assert details["overlong_prompt_len"] == 0
-    assert details["overlong_effective_response_cap"] == 16384
+    # Disabled processors do not evaluate length diagnostics.
+    assert details["overlong_effective_response_cap"] == 0
 
 
 def test_no_penalty_below_threshold():

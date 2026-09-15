@@ -215,6 +215,49 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 
 去掉长度分母会明显增大 PG 梯度尺度，切换时应检查学习率、梯度范数及梯度裁剪比例。KernelAgent 的 `run_qwen3.6_27B_full_async_dppo.sh` 可用 `CALC_LOSS_MODE=TokenSum` 启用；脚本默认仍是 `PerToken`。
 
+#### Kernel rollout reward 后处理
+
+`examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。
+
+现有训练 hook 已调用此接口，启动时仍使用：
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--rollout-reward-post-processors dynamic-weight overlong-penalty \
+--overlong-buffer-len 2048 \
+--overlong-penalty-factor 0.2
+```
+
+策略可选 `dynamic-weight`、`overlong-penalty` 或两者；总是先动态加权、再应用长度惩罚，与参数排列顺序无关。`none` 必须单独使用，表示禁用这两项。显式列表覆盖 `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` 和旧的 `--overlong-penalty`；不传列表则兼容原开关。新增接口返回单个 reward 列表，不能直接替换要求返回 `(raw_rewards, rewards)` 的 `--custom-reward-post-process-path`。
+
+默认 `--dynamic-reward-gate sqrt` 保持原公式：`sqrt((num_correct - 1) / (num_valid - 1))`，有效样本数或正确样本数不超过 1 时为零。可选连续分段线性 gate，仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变：
+
+```bash
+--rollout-reward-post-processors dynamic-weight \
+--dynamic-reward-gate piecewise \
+--difficulty-thresholds 0.25 0.75 \
+--dynamic-reward-gate-range 0.8 1.2
+```
+
+`--difficulty-thresholds` 是通用的难度分界列表，默认 `[0.25, 0.75]`，数值口径为正确率（不是 `1 - 正确率` 的难度值）。列表非空、严格递增，每个值有限且在 `(0, 1)` 内；其校验不依赖动态调权是否开启。当前 piecewise gate 要求恰好两个分界点，依次为困难区间上界、简单区间下界；其他功能可复用更长的列表。
+
+按正确率 `s` 映射：从 `s=0` 到困难阈值，gate 从下限线性上升到 1；两阈值之间保持 1；从简单阈值到 `s=1`，线性上升到上限。有效样本不足 2 条时保持 1（证据不足）；与 sqrt 模式不同，只有一条正确样本不会再强制 gate 为零。gate 上下限必须有限且 `0 <= min <= 1 <= max`。sqrt gate 不使用该阈值列表及上下限，设置阈值也不会自行开启动态调权。过滤预计算与最终 reward 后处理使用相同 gate。
+
+这里借鉴 [Coda 的难度阈值 gate](https://arxiv.org/html/2603.08659v1#S3)，**不是其长度奖励**：困难 kernel group 降低 performance/coverage 激励，简单 group 提高激励。不引入 token 长度 bonus，verify 轨迹仍不参与动态调权。
+
+`kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，其中 `overlong_penalty` 为负数。`task_reward` 不含长度惩罚，`sample.reward` 包含长度惩罚。再次执行从评分/分量重建，避免重复扣分；TRLOO 在这之后累计 return，不覆盖单 turn reward。
+
+`calculate_kernel_reward()` 只计算基础评分。评分后，`reward_func` 调用 `post_process_rollout_rewards(..., stage="sample")` 应用长度惩罚，保证 verify、anchor 和历史 baseline 的奖励口径不变；动态加权留到默认的 `stage="rollout"` 执行。rollout 后处理跳过已经结算的 verify 轨迹和移除样本，不对 verify 动态加权。此次没有移动过滤、verify 数据捕捉、日志或落盘时机，因此在训练后处理之前产生的记录不包含后续动态加权结果。`none` 不会关闭独立的失败评分或 CTM。
+
+开启动态调权时，训练数据转换在最终 reward 后处理结束后，单独输出 `reward post-process` 日志，并通过现有 TensorBoard/W&B 通道记录 `rollout/dynamic_reward/*` scalar；不需要额外开启 `--log-exp-metrics`。关闭动态调权，或本批没有符合条件的样本时，不输出这些指标：
+
+- `gate_mean`、`gate_min`、`gate_max`、`gate_p25/p50/p75`：按 `(group_index, turn_idx)` 去重，每个 group 只计一次。
+- `gate_zero_fraction`、`gate_scaled_fraction`、`gate_one_fraction`、`gate_boosted_fraction`：gate 为零、在零和一之间、等于一、大于一的 group 占比。
+- `performance_reward_delta_mean/min/max/p25/p50/p75`：逐样本统计“调权后的 performance 贡献 − 未调权时的贡献”，不是实测 speedup 或总 reward 的差值；未发生变化的有效样本计为零。
+- `group_count`、`sample_count`：统计分母；排除 verify 轨迹、anchor、remove、aborted 和 pad 样本。
+
+最终逐样本记录保存在 `metadata.dynamic_reward`。过滤预计算不生成这些记录；重复后处理始终相对未调权基准计算差值。原有提前执行的 rollout 日志和落盘时机保持不变。
+
 #### GRPO 算法
 
 GRPO（Group Relative Policy Optimization）是 DeepSeek-Math 中提出的一种 RL 算法，其核心思想是通过组内相对比较来计算 advantage，而不需要额外的 critic 模型。

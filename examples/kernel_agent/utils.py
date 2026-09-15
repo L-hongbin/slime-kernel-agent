@@ -555,6 +555,15 @@ def _strip_env_feedback_fields(env_state: dict[str, Any]) -> dict[str, Any]:
     metadata = env_state.get("metadata")
     if isinstance(metadata, dict):
         metadata = dict(metadata)
+        metadata_error = metadata.get("error")
+        error_message = env_state.get("error_message")
+        if (
+            isinstance(metadata_error, str)
+            and metadata_error
+            and isinstance(error_message, str)
+            and metadata_error in error_message
+        ):
+            metadata.pop("error")
         runtime_error = metadata.get("runtime_error")
         for key in ("aten_detection_trials", "aten_ops"):
             metadata.pop(key, None)

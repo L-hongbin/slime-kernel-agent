@@ -35,6 +35,46 @@ def _validate_rollout_no_progress_args(args) -> None:
         raise ValueError("--rollout-no-progress-warn-seconds must be less than --rollout-no-progress-timeout-seconds")
 
 
+def _validate_difficulty_thresholds_args(args) -> None:
+    thresholds = getattr(args, "difficulty_thresholds", [0.25, 0.75])
+    if not thresholds or any(not math.isfinite(value) or not 0.0 < value < 1.0 for value in thresholds):
+        raise ValueError("--difficulty-thresholds must be a non-empty list of finite values strictly between 0 and 1")
+    if any(left >= right for left, right in zip(thresholds, thresholds[1:], strict=False)):
+        raise ValueError("--difficulty-thresholds must be strictly increasing")
+
+
+def _validate_rollout_reward_post_process_args(args) -> None:
+    if getattr(args, "dynamic_reward_gate", "sqrt") == "piecewise":
+        if len(getattr(args, "difficulty_thresholds", [0.25, 0.75])) != 2:
+            raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
+        gate_range = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
+        if len(gate_range) != 2:
+            raise ValueError("Piecewise --dynamic-reward-gate-range requires exactly two values: min max")
+        gate_min, gate_max = gate_range
+        if not all(math.isfinite(value) for value in (gate_min, gate_max)):
+            raise ValueError("Piecewise dynamic reward gate parameters must be finite")
+        if not 0.0 <= gate_min <= 1.0 <= gate_max:
+            raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
+    processors = getattr(args, "rollout_reward_post_processors", None)
+    if processors is None:
+        return  # Legacy switches retain their existing behavior.
+    if len(set(processors)) != len(processors) or ("none" in processors and len(processors) != 1):
+        raise ValueError("--rollout-reward-post-processors must be unique; none cannot be combined")
+    if "overlong-penalty" in processors:
+        if args.overlong_buffer_len <= 0:
+            raise ValueError("overlong-penalty requires --overlong-buffer-len > 0")
+        if not math.isfinite(args.overlong_penalty_factor) or args.overlong_penalty_factor < 0:
+            raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
+    if processors != ["none"]:
+        expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+        if getattr(args, "custom_reward_post_process_path", None) != expected_path:
+            logger.warning(
+                "--rollout-reward-post-processors requires %s or a custom hook calling "
+                "examples.kernel_agent.kernel_reward.post_process_rollout_rewards before advantage estimation.",
+                expected_path,
+            )
+
+
 def _parse_verify_data_limit(value: str) -> int | float:
     if value.lower() in {"inf", "infinity"}:
         return math.inf
@@ -2403,6 +2443,51 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
             )
             parser.add_argument(
+                "--rollout-reward-post-processors",
+                nargs="+",
+                choices=["none", "dynamic-weight", "overlong-penalty"],
+                default=None,
+                help=(
+                    "Kernel rollout reward shaping, applied before returns and advantages. Select dynamic-weight, "
+                    "overlong-penalty, or both (weights always precede the penalty); none disables both. "
+                    "Explicit selection overrides --overlong-penalty and CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT. "
+                    "If omitted, those legacy switches are used. Scored verify trajectories are not reweighted."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-reward-gate",
+                choices=["sqrt", "piecewise"],
+                default="sqrt",
+                help=(
+                    "Gate for dynamic performance/coverage weighting; does not enable dynamic-weight itself. "
+                    "sqrt preserves the legacy gate. piecewise uses correctness-rate thresholds to reduce "
+                    "hard-group weights, keep middle groups unchanged, and boost easy-group weights. "
+                    "Piecewise groups with fewer than two valid samples keep gate=1."
+                ),
+            )
+            parser.add_argument(
+                "--difficulty-thresholds",
+                type=float,
+                nargs="+",
+                default=[0.25, 0.75],
+                help=(
+                    "Shared difficulty-bucket boundaries expressed as group correctness rates (not 1 - correctness). "
+                    "Values must be strictly increasing and between 0 and 1. The piecewise dynamic reward gate "
+                    "requires exactly two values: the hard upper boundary and easy lower boundary."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-reward-gate-range",
+                type=float,
+                nargs=2,
+                metavar=("MIN", "MAX"),
+                default=[0.8, 1.2],
+                help=(
+                    "Piecewise gate bounds at correctness rates 0 and 1, respectively. "
+                    "Both must be finite with 0 <= MIN <= 1 <= MAX. Ignored by sqrt mode."
+                ),
+            )
+            parser.add_argument(
                 "--overlong-penalty",
                 action="store_true",
                 default=False,
@@ -2903,6 +2988,9 @@ def slime_validate_args(args):
         )
     _validate_sequence_mis_ratio_source(args)
     args.eval_datasets = _resolve_eval_datasets(args)
+
+    _validate_difficulty_thresholds_args(args)
+    _validate_rollout_reward_post_process_args(args)
 
     conditional_truncation_mask_prob = getattr(args, "conditional_truncation_mask_prob", 0.1)
     assert 0.0 <= conditional_truncation_mask_prob <= 1.0, "conditional_truncation_mask_prob must be in [0, 1]."

@@ -211,6 +211,49 @@ This flag defaults to off, requires `--loss-type policy_loss`, and is incompatib
 
 Removing length division substantially increases the PG gradient scale: recheck learning rate, gradient norms and gradient clipping when switching. KernelAgent's `run_qwen3.6_27B_full_async_dppo.sh` accepts `CALC_LOSS_MODE=TokenSum`; its default remains `PerToken`.
 
+#### Kernel rollout reward post-processing
+
+`examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.
+
+The existing training hook calls this interface:
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--rollout-reward-post-processors dynamic-weight overlong-penalty \
+--overlong-buffer-len 2048 \
+--overlong-penalty-factor 0.2
+```
+
+Choose `dynamic-weight`, `overlong-penalty`, or both. Weights always precede the penalty regardless of argument order. Use `none` alone to disable both. An explicit list overrides `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` and the legacy `--overlong-penalty` flag; omitting the list preserves those switches. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
+
+The default `--dynamic-reward-gate sqrt` preserves the original gate: `sqrt((num_correct - 1) / (num_valid - 1))`, or zero when either count is at most one. An optional continuous piecewise-linear gate scales **performance and coverage**, leaving correctness weights and failure scores unchanged:
+
+```bash
+--rollout-reward-post-processors dynamic-weight \
+--dynamic-reward-gate piecewise \
+--difficulty-thresholds 0.25 0.75 \
+--dynamic-reward-gate-range 0.8 1.2
+```
+
+`--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[0.25, 0.75]`. Its validation is independent of dynamic reward weighting. The piecewise gate requires exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
+
+For correctness rate `s`, the piecewise gate rises linearly from `gate_min` at `s=0` to 1 at the hard threshold, stays at 1 through the easy threshold, then rises linearly to `gate_max` at `s=1`. Groups with fewer than two valid samples use 1 (insufficient evidence). Unlike sqrt mode, a single correct response does not force the gate to zero. Gate bounds must be finite and satisfy `0 <= min <= 1 <= max`. The sqrt gate does not use these thresholds or bounds, and selecting thresholds does not enable dynamic weighting. Filter previews and final reward processing use the same gate.
+
+This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08659v1#S3), **not its length reward**: hard kernel groups receive weaker performance/coverage incentives, easy groups stronger ones. No token-length bonus is introduced, and verify trajectories remain excluded.
+
+`kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions, including a negative `overlong_penalty`. `task_reward` excludes that penalty and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties. TRLOO accumulates returns afterward without overwriting single-turn rewards.
+
+`calculate_kernel_reward()` only computes base scores. After scoring, `reward_func` calls `post_process_rollout_rewards(..., stage="sample")` to apply length shaping before verify/anchor utility assignment and history capture; dynamic weighting waits for the default `stage="rollout"`. Rollout post-processing skips settled verify trajectories and removed samples; verify is not dynamically reweighted. Filtering, verify capture, logging, and dump timing are unchanged: records produced before training reward post-processing do not contain subsequent dynamic weighting. `none` does not disable separate failure-scoring policies or CTM.
+
+When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
+
+- `gate_mean`, `gate_min`, `gate_max`, `gate_p25/p50/p75`: one vote per `(group_index, turn_idx)` group.
+- `gate_zero_fraction`, `gate_scaled_fraction`, `gate_one_fraction`, `gate_boosted_fraction`: fractions with gate equal to zero, strictly between zero and one, equal to one, and greater than one.
+- `performance_reward_delta_mean/min/max/p25/p50/p75`: per-sample performance contribution after gating minus its ungated contribution, not a change in measured speedup or total reward. Unchanged valid samples contribute zero.
+- `group_count`, `sample_count`: denominators; verify trajectories, anchors, removed, aborted, and padded samples are excluded.
+
+Final per-sample records live in `metadata.dynamic_reward`. Filter previews do not create these records; repeated reward processing recomputes deltas against the ungated baseline. Existing early rollout logs and dumps retain their original timing.
+
 #### GRPO Algorithm
 
 GRPO (Group Relative Policy Optimization) is an RL algorithm proposed in DeepSeek-Math. Its core idea is to compute advantage through intra-group relative comparisons, eliminating the need for a separate critic model.

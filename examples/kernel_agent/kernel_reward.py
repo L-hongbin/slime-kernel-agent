@@ -120,12 +120,29 @@ _REWARD_COMPONENT_KEYS = (
 _KERNEL_SCORE_KEYS = ("correctness", "performance", "coverage")
 
 
-def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int) -> float:
+def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=None) -> float:
     """Return the shared speedup/coverage gate for one valid reward group."""
 
-    if group_size <= 1 or num_correct <= 1:
-        return 0.0
-    return math.sqrt(max((num_correct - 1) / (group_size - 1), 0.0))
+    mode = getattr(args, "dynamic_reward_gate", "sqrt")
+    if mode == "sqrt":
+        if group_size <= 1 or num_correct <= 1:
+            return 0.0
+        return math.sqrt(max((num_correct - 1) / (group_size - 1), 0.0))
+    if mode == "piecewise":
+        # Adapt Coda's thresholded gates (arXiv:2603.08659, Eq. 4), not its
+        # length reward: downweight auxiliary objectives on hard groups and
+        # upweight them on easy groups, with a neutral middle region.
+        if group_size <= 1:
+            return 1.0  # Insufficient group evidence: preserve the base weights.
+        success_rate = num_correct / group_size
+        hard_threshold, easy_threshold = getattr(args, "difficulty_thresholds", [0.25, 0.75])
+        gate_min, gate_max = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
+        if success_rate < hard_threshold:
+            return gate_min + (1.0 - gate_min) * success_rate / hard_threshold
+        if success_rate > easy_threshold:
+            return 1.0 + (gate_max - 1.0) * (success_rate - easy_threshold) / (1.0 - easy_threshold)
+        return 1.0
+    raise ValueError(f"Unknown dynamic reward gate: {mode!r}")
 
 
 def _sample_is_correct(sample) -> bool:
@@ -185,6 +202,9 @@ def _apply_dynamic_group_reward_weights(
     samples,
     rewards,
     config: dict[str, Any],
+    *,
+    args=None,
+    record_metrics: bool = False,
 ) -> list[float]:
     """Rebuild rewards from their components with a group auxiliary gate."""
 
@@ -196,7 +216,7 @@ def _apply_dynamic_group_reward_weights(
     if not config.get("enable_dynamic_reward_weight", False):
         return rewards
 
-    gate = _compute_dynamic_auxiliary_gate(num_correct, group_size)
+    gate = _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args)
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -223,10 +243,13 @@ def _apply_dynamic_group_reward_weights(
         overlong_penalty_score = float(overlong_penalty_score)
 
         dynamic_reward = failed_reward
+        base_performance_reward = float(components["performance"])
         if dynamic_reward is None:
-            weight_performance = float(config["init_performance_weight"]) * gate
+            weight_performance = float(config["init_performance_weight"])
             if config.get("performance_reward_requires_correctness", False):
                 weight_performance *= correctness_score
+            base_performance_reward = weight_performance * performance_score
+            weight_performance *= gate
             weight_coverage = float(config["coverage_reward_weight"]) * gate
             if not config["coverage_reward_enable"]:
                 weight_coverage = 0.0
@@ -236,36 +259,138 @@ def _apply_dynamic_group_reward_weights(
             components["coverage"] = coverage_reward
             dynamic_reward = correctness_reward + performance_reward + coverage_reward
         metadata["task_reward"] = dynamic_reward
+        if record_metrics:
+            # Compare against the ungated contribution, not an earlier filter
+            # preview or a previous invocation of reward post-processing.
+            metadata["dynamic_reward"] = {
+                "gate": gate,
+                "performance_reward_delta": float(components["performance"]) - base_performance_reward,
+            }
         dynamic_rewards.append(dynamic_reward + overlong_penalty_score)
     return dynamic_rewards
 
 
-def _dynamic_raw_rewards(args, samples, config: dict[str, Any]) -> list[float]:
-    """Apply per-turn group weights and rebuild TRLOO trajectory returns."""
+def resolve_rollout_reward_processors(args, config: dict[str, Any]) -> set[str]:
+    """Explicit processor selection overrides the legacy reward switches."""
+    processors = getattr(args, "rollout_reward_post_processors", None)
+    if processors is not None:
+        if isinstance(processors, str) or not processors:
+            raise ValueError("rollout_reward_post_processors must be a non-empty list")
+        selected = set(processors)
+        if selected - {"none", "dynamic-weight", "overlong-penalty"}:
+            raise ValueError("Unknown rollout reward post-processor")
+        if len(selected) != len(processors) or ("none" in selected and len(selected) > 1):
+            raise ValueError("Rollout reward post-processors must be unique; none cannot be combined")
+        return selected - {"none"}
+    selected = set()
+    if config.get("enable_dynamic_reward_weight", False):
+        selected.add("dynamic-weight")
+    if getattr(args, "overlong_penalty", False):
+        selected.add("overlong-penalty")
+    return selected
 
-    turn_rewards = [0.0 if sample.remove_sample else float(sample.get_reward_value(args)) for sample in samples]
+
+def _apply_overlong_penalty(args, sample, metadata: dict[str, Any]) -> float:
+    """Replace the length component, never subtract repeatedly from a shaped reward."""
+    response_len = int(getattr(sample, "response_length", 0) or 0)
+    tokens = getattr(sample, "tokens", None)
+    prompt_len = max(0, len(tokens) - response_len) if isinstance(tokens, (list, tuple)) else 0
+    response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0)
+    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0)
+    effective_cap = response_cap
+    if getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
+        effective_cap = min(response_cap, max(1, context_cap - prompt_len))
+
+    penalty = 0.0
+    buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
+    factor = float(getattr(args, "overlong_penalty_factor", 1.0))
+    if buffer_len > 0 and factor > 0 and effective_cap > 0:
+        window = min(buffer_len, effective_cap)
+        exceed = response_len - (effective_cap - window)
+        penalty = factor * min(1.0, max(0, exceed) / window)
+
+    metadata["overlong_penalty"] = penalty
+    metadata["overlong_prompt_len"] = prompt_len
+    metadata["overlong_effective_response_cap"] = effective_cap
+    metadata["reward_component"]["overlong_penalty"] = -penalty
+    return float(metadata["task_reward"]) - penalty
+
+
+def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> list[float]:
+    """Shape and write back single-turn rewards; never compute returns or advantages.
+
+    The sample stage applies length shaping before verify utility assignment and
+    history capture. The rollout stage also applies dynamic weights using complete
+    same-prompt/same-turn statistics, skipping settled verify trajectories.
+    Reapplication is idempotent; removed samples are always untouched.
+    """
+    if stage not in {"sample", "rollout"}:
+        raise ValueError("Reward post-processing stage must be sample or rollout")
+    if stage == "rollout":
+        for sample in samples:
+            if isinstance(sample.metadata, dict):
+                sample.metadata.pop("dynamic_reward", None)
+    config = CUDA_AGENT_CONFIGS["reward"]
+    processors = resolve_rollout_reward_processors(args, config)
+    if stage == "sample":
+        processors.discard("dynamic-weight")
+    reward_key = getattr(args, "reward_key", None)
+    rewards = [float(sample.reward[reward_key] if reward_key else sample.reward) for sample in samples]
+    if not processors:
+        return rewards
+
     reward_groups: dict[object, list[int]] = {}
     for idx, sample in enumerate(samples):
-        if sample.remove_sample:
+        metadata = sample.metadata or {}
+        if (
+            sample.remove_sample
+            or metadata.get("role") == "verify"
+            or (stage == "rollout" and metadata.get("verify_trajectory", False))
+        ):
             continue
-        group_key: object = sample.group_index
-        if getattr(args, "use_multi_turn", False):
-            turn_idx = sample.metadata.get("turn_idx") if isinstance(sample.metadata, dict) else None
-            assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
-            group_key = group_key, int(turn_idx)
-        reward_groups.setdefault(group_key, []).append(idx)
+        if "dynamic-weight" in processors:
+            group_key: object = sample.group_index
+            if getattr(args, "use_multi_turn", False):
+                turn_idx = metadata.get("turn_idx")
+                assert turn_idx is not None, "--use-multi-turn requires sample.metadata['turn_idx']"
+                group_key = group_key, int(turn_idx)
+            reward_groups.setdefault(group_key, []).append(idx)
 
     for group_indices in reward_groups.values():
         group_samples = [samples[idx] for idx in group_indices]
         group_values = _apply_dynamic_group_reward_weights(
             group_samples,
-            [turn_rewards[idx] for idx in group_indices],
-            config,
+            [rewards[idx] for idx in group_indices],
+            {**config, "enable_dynamic_reward_weight": True},
+            args=args,
+            record_metrics=True,
         )
         for idx, reward in zip(group_indices, group_values, strict=True):
-            turn_rewards[idx] = reward
+            rewards[idx] = reward
 
-    if args.advantage_estimator != "trloo" or not getattr(args, "use_multi_turn", False):
+    for idx, sample in enumerate(samples):
+        metadata = sample.metadata or {}
+        if (
+            sample.remove_sample
+            or metadata.get("role") == "verify"
+            or (stage == "rollout" and metadata.get("verify_trajectory", False))
+        ):
+            continue
+        if "overlong-penalty" in processors:
+            if "reward_component" not in metadata or "task_reward" not in metadata:
+                raise ValueError("overlong-penalty requires kernel task_reward and reward_component metadata")
+            rewards[idx] = _apply_overlong_penalty(args, sample, metadata)
+        # Keep dictionary-valued rewards and their unrelated fields intact.
+        if reward_key:
+            sample.reward = {**sample.reward, reward_key: rewards[idx]}
+        else:
+            sample.reward = rewards[idx]
+    return rewards
+
+
+def _compute_trajectory_returns(args, samples, turn_rewards: list[float]) -> list[float]:
+    """Accumulate shaped turn rewards without overwriting sample.reward."""
+    if not getattr(args, "use_multi_turn", False):
         return turn_rewards
 
     gamma = float(getattr(args, "multi_turn_gamma", 1.0))
@@ -405,12 +530,12 @@ def reward_post_process_by_group(args, samples):
     ):
         raise ValueError("shared anchor rewards must be settled by the group rollout before training")
     reward_config = CUDA_AGENT_CONFIGS["reward"]
-    if reward_config.get("enable_dynamic_reward_weight", False):
-        raw_rewards = _dynamic_raw_rewards(args, samples, reward_config)
-    elif args.advantage_estimator == "trloo":
-        raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
-    else:
-        raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    raw_rewards = post_process_rollout_rewards(args, samples)
+    if args.advantage_estimator == "trloo":
+        if resolve_rollout_reward_processors(args, reward_config):
+            raw_rewards = _compute_trajectory_returns(args, samples, raw_rewards)
+        else:
+            raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     rewards = [None] * len(raw_rewards)
     use_conditional_truncation_mask = getattr(args, "use_conditional_truncation_mask", False)
 
@@ -621,35 +746,8 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
 def calculate_kernel_reward(
     env_state: dict[str, Any],
     config: dict[str, Any],
-    *,
-    args=None,
-    sample=None,
 ) -> dict[str, Any]:
-    """Calculate kernel reward and optionally apply rollout-length shaping."""
-    response_len = int(getattr(sample, "response_length", 0) or 0) if sample is not None else 0
-    tokens = getattr(sample, "tokens", None) if sample is not None else None
-    overlong_prompt_len = max(0, len(tokens) - response_len) if isinstance(tokens, (list, tuple)) else 0
-    response_cap = int(getattr(args, "rollout_max_response_len", 0) or 0) if args is not None else 0
-    context_cap = int(getattr(args, "rollout_max_context_len", 0) or 0) if args is not None else 0
-    overlong_effective_response_cap = response_cap
-    if args is not None and getattr(args, "overlong_use_effective_response_cap", False) and context_cap > 0:
-        overlong_effective_response_cap = min(response_cap, max(1, context_cap - overlong_prompt_len))
-
-    overlong_penalty = 0.0
-    if (
-        args is not None
-        and sample is not None
-        and getattr(args, "overlong_penalty", False)
-        and not getattr(sample, "remove_sample", False)
-    ):
-        buffer_len = int(getattr(args, "overlong_buffer_len", 2048))
-        factor = float(getattr(args, "overlong_penalty_factor", 1.0))
-        if buffer_len > 0 and factor > 0 and overlong_effective_response_cap > 0:
-            effective_buffer_len = min(buffer_len, overlong_effective_response_cap)
-            threshold = overlong_effective_response_cap - effective_buffer_len
-            exceed = response_len - threshold
-            overlong_penalty = factor * min(1.0, max(0, exceed) / effective_buffer_len)
-
+    """Calculate base kernel scores without rollout reward post-processing."""
     default_failed_score = float(config["failed_score"])
     apply_kernel_failed_score = bool(config.get("apply_kernel_failed_score", False))
     if apply_kernel_failed_score and bool(config.get("apply_failed_group_reward", False)):
@@ -712,12 +810,13 @@ def calculate_kernel_reward(
         coverage_reward = weight_coverage * coverage_score
         task_reward += coverage_reward
 
-    reward = task_reward - overlong_penalty
-    overlong_penalty_score = -overlong_penalty
-    return {
+    details = {
         **env_state,
-        "reward": reward,
+        "reward": task_reward,
         "task_reward": task_reward,
+        "overlong_penalty": 0.0,
+        "overlong_prompt_len": 0,
+        "overlong_effective_response_cap": 0,
         "speedup": speedup,
         "success": not kernel_failed,
         "correctness": correctness,
@@ -726,9 +825,6 @@ def calculate_kernel_reward(
         "profiling": env_state.get("profiling"),
         "kernel_failed_score": kernel_failed_score,
         "kernel_failed_score_tag": kernel_failed_score_tag,
-        "overlong_penalty": overlong_penalty,
-        "overlong_prompt_len": overlong_prompt_len,
-        "overlong_effective_response_cap": overlong_effective_response_cap,
         "kernel_score": {
             "correctness": correctness_score,
             "performance": performance_score,
@@ -739,8 +835,9 @@ def calculate_kernel_reward(
             "performance": performance_reward,
             "coverage": coverage_reward,
             "failed": failed_reward,
-            "overlong_penalty": overlong_penalty_score,
+            "overlong_penalty": 0.0,
         },
         "speedup_log_standard_error": speedup_log_standard_error,
         **coverage_info,
     }
+    return details
