@@ -230,18 +230,77 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 
 策略可选 `dynamic-weight`、`overlong-penalty` 或两者；总是先动态加权、再应用长度惩罚，与参数排列顺序无关。`none` 必须单独使用，表示禁用这两项。显式列表覆盖 `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` 和旧的 `--overlong-penalty`；不传列表则兼容原开关。新增接口返回单个 reward 列表，不能直接替换要求返回 `(raw_rewards, rewards)` 的 `--custom-reward-post-process-path`。
 
-默认 `--dynamic-reward-gate sqrt` 保持原公式：`sqrt((num_correct - 1) / (num_valid - 1))`，有效样本数或正确样本数不超过 1 时为零。可选连续分段线性 gate，仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变：
+##### 动态 gate 计算方式
+
+`--dynamic-reward-gate` 可选 `sqrt`（默认）、`piecewise`（分段线性）、`piecewise-sqrt`（分段开方）。动态调权仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
 
 ```bash
 --rollout-reward-post-processors dynamic-weight \
---dynamic-reward-gate piecewise \
---difficulty-thresholds 0.25 0.75 \
+--dynamic-reward-gate piecewise-sqrt \
 --dynamic-reward-gate-range 0.8 1.2
 ```
 
-`--difficulty-thresholds` 是通用的难度分界列表，默认 `[0.25, 0.75]`，数值口径为正确率（不是 `1 - 正确率` 的难度值）。列表非空、严格递增，每个值有限且在 `(0, 1)` 内；其校验不依赖动态调权是否开启。当前 piecewise gate 要求恰好两个分界点，依次为困难区间上界、简单区间下界；其他功能可复用更长的列表。
+`--difficulty-thresholds` 是通用的难度分界列表，默认 `[1/3, 2/3]`，将正确率范围三等分，不是让三个桶的样本数相等。数值口径为正确率（不是 `1 - 正确率` 的难度值）。上面的示例省略该参数以使用默认值；仍可显式传入小数覆盖，例如 `--difficulty-thresholds 0.25 0.75`。列表非空、严格递增，每个值有限且在 `(0, 1)` 内；其校验不依赖动态调权是否开启。两种分段模式都要求恰好两个分界点，依次为困难区间上界、简单区间下界；其他功能可复用更长的列表。
 
-按正确率 `s` 映射：从 `s=0` 到困难阈值，gate 从下限线性上升到 1；两阈值之间保持 1；从简单阈值到 `s=1`，线性上升到上限。有效样本不足 2 条时保持 1（证据不足）；与 sqrt 模式不同，只有一条正确样本不会再强制 gate 为零。gate 上下限必须有限且 `0 <= min <= 1 <= max`。sqrt gate 不使用该阈值列表及上下限，设置阈值也不会自行开启动态调权。过滤预计算与最终 reward 后处理使用相同 gate。
+记 `G` 为同题、同 turn 的有效样本数，`c` 为其中正确样本数，`s=c/G`。移除、pad 和 aborted 样本不计入 `G`，因此 `G` 不一定等于配置的 `--n-samples-per-prompt`。记录的 `group_difficulty` 为 `1-s`，但 gate 阈值使用正确率 `s`。记 `h, e = difficulty_thresholds`，`lo, hi = dynamic_reward_gate_range`（默认 `[0.8, 1.2]`）。
+
+旧 `sqrt` 模式忽略阈值和 gate 范围：
+
+```python
+gate = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+```
+
+两种分段模式共用下面的计算式：`piecewise` 使用 `f(d)=d`，`piecewise-sqrt` 使用 `f(d)=sqrt(d)`。
+
+```python
+if G <= 1:
+    gate = 1  # 有效样本不足，保持原权重。
+elif s < h:
+    gate = 1 - (1 - lo) * f((h - s) / h)
+elif s > e:
+    gate = 1 + (hi - 1) * f((s - e) / (1 - e))
+else:
+    gate = 1
+```
+
+`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。仅选择 gate 或阈值不会自行开启动态调权。过滤预计算与最终 reward 后处理使用相同计算。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
+
+对走常规分量评分路径的样本，奖励按以下方式组合：
+
+```text
+performance_reward = 未调权的 performance_reward * gate
+coverage_reward    = 未调权的 coverage_reward * gate
+task_reward        = correctness_reward + performance_reward + coverage_reward
+sample.reward      = task_reward - overlong_penalty  # 开启长度惩罚时。
+```
+
+原有 correctness 条件及 coverage 开关仍然生效；显式失败评分分支保持其失败 reward，不会因全错 group 的 gate 为正就获得正奖励。speedup 影响基础 performance 评分，不参与 gate 的计算。
+
+##### G=16 的 gate 实例分布
+
+假设 16 条样本均有效，阈值为 `[1/3, 2/3]`、gate 范围为 `[0.8, 1.2]`，数值保留四位小数：
+
+| 正确样本数 | 正确率 | `sqrt` | `piecewise` | `piecewise-sqrt` |
+|---|---:|---:|---:|---:|
+| 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
+| 1 | 6.25% | 0.0000 | 0.8375 | 0.8197 |
+| 2 | 12.5% | 0.2582 | 0.8750 | 0.8419 |
+| 3 | 18.75% | 0.3651 | 0.9125 | 0.8677 |
+| 4 | 25% | 0.4472 | 0.9500 | 0.9000 |
+| 5 | 31.25% | 0.5164 | 0.9875 | 0.9500 |
+| 6 | 37.5% | 0.5774 | 1.0000 | 1.0000 |
+| 7 | 43.75% | 0.6325 | 1.0000 | 1.0000 |
+| 8 | 50% | 0.6831 | 1.0000 | 1.0000 |
+| 9 | 56.25% | 0.7303 | 1.0000 | 1.0000 |
+| 10 | 62.5% | 0.7746 | 1.0000 | 1.0000 |
+| 11 | 68.75% | 0.8165 | 1.0125 | 1.0500 |
+| 12 | 75% | 0.8563 | 1.0500 | 1.1000 |
+| 13 | 81.25% | 0.8944 | 1.0875 | 1.1323 |
+| 14 | 87.5% | 0.9309 | 1.1250 | 1.1581 |
+| 15 | 93.75% | 0.9661 | 1.1625 | 1.1803 |
+| 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
+
+这是正确数到 gate 的映射，不是实测训练频率。两种分段模式在正确数 0～5 时降低权重，6～10 时保持原权重，11～16 时提高权重。训练中各 gate 出现的频率取决于实际 group 正确率分布，可通过下方指标观察。
 
 这里借鉴 [Coda 的难度阈值 gate](https://arxiv.org/html/2603.08659v1#S3)，**不是其长度奖励**：困难 kernel group 降低 performance/coverage 激励，简单 group 提高激励。不引入 token 长度 bonus，verify 轨迹仍不参与动态调权。
 

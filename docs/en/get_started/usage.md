@@ -226,18 +226,77 @@ The existing training hook calls this interface:
 
 Choose `dynamic-weight`, `overlong-penalty`, or both. Weights always precede the penalty regardless of argument order. Use `none` alone to disable both. An explicit list overrides `CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT` and the legacy `--overlong-penalty` flag; omitting the list preserves those switches. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
 
-The default `--dynamic-reward-gate sqrt` preserves the original gate: `sqrt((num_correct - 1) / (num_valid - 1))`, or zero when either count is at most one. An optional continuous piecewise-linear gate scales **performance and coverage**, leaving correctness weights and failure scores unchanged:
+##### Dynamic gate calculation
+
+`--dynamic-reward-gate` selects `sqrt` (default), `piecewise` (linear), or `piecewise-sqrt` (square-root tails). Dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
 
 ```bash
 --rollout-reward-post-processors dynamic-weight \
---dynamic-reward-gate piecewise \
---difficulty-thresholds 0.25 0.75 \
+--dynamic-reward-gate piecewise-sqrt \
 --dynamic-reward-gate-range 0.8 1.2
 ```
 
-`--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[0.25, 0.75]`. Its validation is independent of dynamic reward weighting. The piecewise gate requires exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
+`--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[1/3, 2/3]` to divide the correctness-rate range into three equal intervals, not equal-sized sample buckets. The example omits this flag to use those defaults; explicit decimal values override them (e.g. `--difficulty-thresholds 0.25 0.75`). Its validation is independent of dynamic reward weighting. Both piecewise modes require exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
 
-For correctness rate `s`, the piecewise gate rises linearly from `gate_min` at `s=0` to 1 at the hard threshold, stays at 1 through the easy threshold, then rises linearly to `gate_max` at `s=1`. Groups with fewer than two valid samples use 1 (insufficient evidence). Unlike sqrt mode, a single correct response does not force the gate to zero. Gate bounds must be finite and satisfy `0 <= min <= 1 <= max`. The sqrt gate does not use these thresholds or bounds, and selecting thresholds does not enable dynamic weighting. Filter previews and final reward processing use the same gate.
+Let `G` be the number of valid samples for the same prompt and turn, `c` the correct count, and `s=c/G`. Removed, padded, and aborted samples do not count toward `G`; it can therefore differ from `--n-samples-per-prompt`. The recorded `group_difficulty` is `1-s`, but gate thresholds use `s`. Define `h, e = difficulty_thresholds` and `lo, hi = dynamic_reward_gate_range` (default `[0.8, 1.2]`).
+
+The legacy `sqrt` mode ignores the thresholds and range:
+
+```python
+gate = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+```
+
+For `piecewise`, use `f(d)=d`; for `piecewise-sqrt`, use `f(d)=sqrt(d)`:
+
+```python
+if G <= 1:
+    gate = 1  # Insufficient group evidence.
+elif s < h:
+    gate = 1 - (1 - lo) * f((h - s) / h)
+elif s > e:
+    gate = 1 + (hi - 1) * f((s - e) / (1 - e))
+else:
+    gate = 1
+```
+
+`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Neither gate selection nor threshold selection enables dynamic weighting by itself. Filter previews and final reward processing share the same calculation. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+
+For samples on the normal component-scoring path, the resulting contributions are:
+
+```text
+performance_reward = ungated_performance_reward * gate
+coverage_reward    = ungated_coverage_reward * gate
+task_reward        = correctness_reward + performance_reward + coverage_reward
+sample.reward      = task_reward - overlong_penalty  # If length shaping is enabled.
+```
+
+Existing correctness requirements and the coverage enable switch still apply. An explicit failure-score branch keeps its failure reward; the gate does not turn an all-failed group into positive rewards. Speedup affects the base performance score, not the gate itself.
+
+##### Gate values for G=16
+
+Assume all 16 samples are valid, with thresholds `[1/3, 2/3]` and range `[0.8, 1.2]`. Values are rounded to four decimal places:
+
+| Correct count | Correctness rate | `sqrt` | `piecewise` | `piecewise-sqrt` |
+|---|---:|---:|---:|---:|
+| 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
+| 1 | 6.25% | 0.0000 | 0.8375 | 0.8197 |
+| 2 | 12.5% | 0.2582 | 0.8750 | 0.8419 |
+| 3 | 18.75% | 0.3651 | 0.9125 | 0.8677 |
+| 4 | 25% | 0.4472 | 0.9500 | 0.9000 |
+| 5 | 31.25% | 0.5164 | 0.9875 | 0.9500 |
+| 6 | 37.5% | 0.5774 | 1.0000 | 1.0000 |
+| 7 | 43.75% | 0.6325 | 1.0000 | 1.0000 |
+| 8 | 50% | 0.6831 | 1.0000 | 1.0000 |
+| 9 | 56.25% | 0.7303 | 1.0000 | 1.0000 |
+| 10 | 62.5% | 0.7746 | 1.0000 | 1.0000 |
+| 11 | 68.75% | 0.8165 | 1.0125 | 1.0500 |
+| 12 | 75% | 0.8563 | 1.0500 | 1.1000 |
+| 13 | 81.25% | 0.8944 | 1.0875 | 1.1323 |
+| 14 | 87.5% | 0.9309 | 1.1250 | 1.1581 |
+| 15 | 93.75% | 0.9661 | 1.1625 | 1.1803 |
+| 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
+
+These are mappings, not observed training frequencies. Both piecewise modes reduce weights for 0–5 correct samples, preserve them for 6–10, and increase them for 11–16. Actual gate frequencies depend on the observed group correctness distribution; see the metrics below.
 
 This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08659v1#S3), **not its length reward**: hard kernel groups receive weaker performance/coverage incentives, easy groups stronger ones. No token-length bonus is introduced, and verify trajectories remain excluded.
 

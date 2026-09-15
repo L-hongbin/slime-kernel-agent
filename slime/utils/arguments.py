@@ -36,7 +36,7 @@ def _validate_rollout_no_progress_args(args) -> None:
 
 
 def _validate_difficulty_thresholds_args(args) -> None:
-    thresholds = getattr(args, "difficulty_thresholds", [0.25, 0.75])
+    thresholds = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
     if not thresholds or any(not math.isfinite(value) or not 0.0 < value < 1.0 for value in thresholds):
         raise ValueError("--difficulty-thresholds must be a non-empty list of finite values strictly between 0 and 1")
     if any(left >= right for left, right in zip(thresholds, thresholds[1:], strict=False)):
@@ -44,8 +44,8 @@ def _validate_difficulty_thresholds_args(args) -> None:
 
 
 def _validate_rollout_reward_post_process_args(args) -> None:
-    if getattr(args, "dynamic_reward_gate", "sqrt") == "piecewise":
-        if len(getattr(args, "difficulty_thresholds", [0.25, 0.75])) != 2:
+    if getattr(args, "dynamic_reward_gate", "sqrt") in {"piecewise", "piecewise-sqrt"}:
+        if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
             raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
         gate_range = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
         if len(gate_range) != 2:
@@ -2456,12 +2456,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--dynamic-reward-gate",
-                choices=["sqrt", "piecewise"],
+                choices=["sqrt", "piecewise", "piecewise-sqrt"],
                 default="sqrt",
                 help=(
                     "Gate for dynamic performance/coverage weighting; does not enable dynamic-weight itself. "
                     "sqrt preserves the legacy gate. piecewise uses correctness-rate thresholds to reduce "
-                    "hard-group weights, keep middle groups unchanged, and boost easy-group weights. "
+                    "hard-group weights, keep middle groups unchanged, and boost easy-group weights linearly. "
+                    "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
+                    "to strengthen both tails without changing their bounds. "
                     "Piecewise groups with fewer than two valid samples keep gate=1."
                 ),
             )
@@ -2469,11 +2471,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--difficulty-thresholds",
                 type=float,
                 nargs="+",
-                default=[0.25, 0.75],
+                default=[1 / 3, 2 / 3],
                 help=(
                     "Shared difficulty-bucket boundaries expressed as group correctness rates (not 1 - correctness). "
-                    "Values must be strictly increasing and between 0 and 1. The piecewise dynamic reward gate "
-                    "requires exactly two values: the hard upper boundary and easy lower boundary."
+                    "Defaults to 1/3 and 2/3, dividing the correctness-rate range into three equal intervals. "
+                    "Values must be strictly increasing and between 0 and 1. Both piecewise dynamic reward gates "
+                    "require exactly two values: the hard upper boundary and easy lower boundary."
                 ),
             )
             parser.add_argument(

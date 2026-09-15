@@ -128,19 +128,25 @@ def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=N
         if group_size <= 1 or num_correct <= 1:
             return 0.0
         return math.sqrt(max((num_correct - 1) / (group_size - 1), 0.0))
-    if mode == "piecewise":
+    if mode in {"piecewise", "piecewise-sqrt"}:
         # Adapt Coda's thresholded gates (arXiv:2603.08659, Eq. 4), not its
         # length reward: downweight auxiliary objectives on hard groups and
         # upweight them on easy groups, with a neutral middle region.
         if group_size <= 1:
             return 1.0  # Insufficient group evidence: preserve the base weights.
         success_rate = num_correct / group_size
-        hard_threshold, easy_threshold = getattr(args, "difficulty_thresholds", [0.25, 0.75])
+        hard_threshold, easy_threshold = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
         gate_min, gate_max = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
+        # Curve the distance from the neutral region, not the final gate:
+        # piecewise-sqrt strengthens both tails while preserving their bounds.
         if success_rate < hard_threshold:
-            return gate_min + (1.0 - gate_min) * success_rate / hard_threshold
+            distance = (hard_threshold - success_rate) / hard_threshold
+            strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
+            return 1.0 - (1.0 - gate_min) * strength
         if success_rate > easy_threshold:
-            return 1.0 + (gate_max - 1.0) * (success_rate - easy_threshold) / (1.0 - easy_threshold)
+            distance = (success_rate - easy_threshold) / (1.0 - easy_threshold)
+            strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
+            return 1.0 + (gate_max - 1.0) * strength
         return 1.0
     raise ValueError(f"Unknown dynamic reward gate: {mode!r}")
 

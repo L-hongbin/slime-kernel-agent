@@ -109,7 +109,7 @@ def test_filter_respects_explicit_processors_without_writing_reward(monkeypatch,
     assert [sample.reward for sample in samples] == [0.0, 0.5]
 
 
-@pytest.mark.parametrize("mode,keep", [("sqrt", False), ("piecewise", True)])
+@pytest.mark.parametrize("mode,keep", [("sqrt", False), ("piecewise", True), ("piecewise-sqrt", True)])
 def test_filter_uses_selected_dynamic_gate_without_recording_final_metrics(monkeypatch, mode, keep):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 
