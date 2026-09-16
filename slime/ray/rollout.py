@@ -880,7 +880,15 @@ class RolloutManager:
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
         # TODO to be refactored (originally Buffer._set_data)
         if (path_template := self.args.save_debug_rollout_data) is not None:
-            path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
+            dump_id = ("eval_" if evaluation else "") + str(rollout_id)
+            if not evaluation and (maximum := os.environ.get("SLIME_SAVE_DEBUG_ROLLOUT_MAX_ID", "")):
+                if not maximum.isdecimal():
+                    raise ValueError("SLIME_SAVE_DEBUG_ROLLOUT_MAX_ID must be a non-negative integer")
+                if rollout_id > int(maximum):
+                    if os.environ.get("SLIME_SAVE_DEBUG_ROLLOUT_KEEP_LATEST", "0") != "1":
+                        return
+                    dump_id = "latest"
+            path = Path(path_template.format(rollout_id=dump_id))
             logger.info(f"Save debug rollout data to {path}")
             path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -894,7 +902,11 @@ class RolloutManager:
                     samples=[sample.to_dict() for sample in data],
                 )
 
-            torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+            # Readers can audit the latest complete batch while training writes
+            # its replacement. Never expose a partially overwritten .pt file.
+            temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            torch.save(dict(rollout_id=rollout_id, **dump_data), temporary)
+            os.replace(temporary, path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
@@ -1710,6 +1722,7 @@ def compute_metrics_from_samples(args, samples):
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
+    log_dict |= _compute_turn_generation_metrics(samples)
     log_dict |= _compute_kernel_agent_metrics(samples)
     # Kernel-agent samples keep a turn index even in true single-turn mode.  Emit
     # per-turn metrics whenever that provenance is present; only the trajectory
@@ -1732,6 +1745,26 @@ def compute_metrics_from_samples(args, samples):
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_turn_generation_metrics(samples):
+    """Generation denominators include failed/precheck/removed turns, like the global ratio."""
+    groups = {}
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        turn = metadata.get("turn_idx")
+        if type(turn) is int and turn >= 0:
+            groups.setdefault(turn, []).append(sample)
+    metrics = {}
+    for turn, turns in groups.items():
+        prefix = f"generation/turn{turn}/"
+        truncated = sum(sample.status == Sample.Status.TRUNCATED for sample in turns)
+        metrics[prefix + "samples"] = len(turns)
+        metrics[prefix + "pad_samples"] = sum(bool(sample.metadata.get("is_pad_turn")) for sample in turns)
+        metrics[prefix + "truncated_count"] = truncated
+        metrics[prefix + "truncated_ratio"] = truncated / len(turns)
+        metrics[prefix + "response_len_mean"] = sum(sample.effective_response_length for sample in turns) / len(turns)
+    return metrics
 
 
 def _iter_response_diversity_groups(args, samples):
