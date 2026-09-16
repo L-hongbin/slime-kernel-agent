@@ -285,12 +285,22 @@ def _units(observation, *, output_only=True):
         return key
 
     upstream = defaultdict(set)
+    possible_upstream = defaultdict(set)
     uncertain = set()
     for edge in graph["edges"]:
         source, target = edge.get("source"), edge.get("target")
         if target not in nodes:
             raise ComponentRewardContractError("dangling dependency target")
         if source not in nodes:
+            if source is None and edge.get("certainty") in {
+                "entry_value_unobserved",
+                "unordered_stream_writers",
+                "partial_or_ambiguous_dependency",
+            }:
+                if not edge.get("buffer") or not edge.get("regions"):
+                    raise ComponentRewardContractError("unknown dependency requires a region")
+                uncertain.add(parent(target))
+                continue
             if isinstance(source, str) and source.startswith("initial:"):
                 continue
             raise ComponentRewardContractError("dangling dependency source")
@@ -303,6 +313,45 @@ def _units(observation, *, output_only=True):
             uncertain.add(target)
         else:
             upstream[target].add(source)
+
+    def regions_overlap(left, right):
+        left, right = sorted(left), sorted(right)
+        i = j = 0
+        while i < len(left) and j < len(right):
+            if left[i][0] < right[j][1] and right[j][0] < left[i][1]:
+                return True
+            if left[i][1] <= right[j][0]:
+                i += 1
+            else:
+                j += 1
+        return False
+
+    # An uncertain in-place entry value can only add writers of the observed
+    # byte region to the possible output closure. It does not make unrelated
+    # scratch computations output members. Unknown write footprints still
+    # require the wider conservative fallback below.
+    incomplete_effects = any(n.get("footprint_complete") is not True for n in nodes.values())
+    for key, node in nodes.items() if output_only and not incomplete_effects else []:
+        for read in node.get("reads", []):
+            regions = read.get("internal_or_unordered_regions", [])
+            if not regions:
+                continue
+            for source, writer in nodes.items():
+                if parent(source) == parent(key):
+                    continue
+                if (
+                    type(node.get("seq")) is int
+                    and type(writer.get("seq")) is int
+                    and node.get("stream") is not None
+                    and node.get("stream") == writer.get("stream")
+                    and writer["seq"] > node["seq"]
+                ):
+                    continue
+                if any(
+                    w.get("buffer") == read.get("buffer") and regions_overlap(regions, w.get("regions", []))
+                    for w in writer.get("writes", [])
+                ):
+                    possible_upstream[parent(key)].add(parent(source))
     reached = set()
     closure_unknown = bool(graph.get("output_unknowns")) if output_only else False
     pending = []
@@ -321,10 +370,27 @@ def _units(observation, *, output_only=True):
         if key in reached:
             continue
         reached.add(key)
-        if output_only and key in uncertain:
+        if output_only and (key in uncertain or "input_provenance_unresolved" in nodes[key].get("unknowns", [])):
+            closure_unknown = True
+        if (
+            output_only
+            and incomplete_effects
+            and any(a.get("internal_or_unordered_regions") for a in nodes[key].get("reads", []))
+        ):
             closure_unknown = True
         # Only proven paths certify membership; uncertain paths retain budget.
         pending.extend(upstream[key])
+
+    possible = set()
+    pending = [source for key in reached for source in possible_upstream[key]]
+    while pending:
+        key = pending.pop()
+        if key in reached or key in possible:
+            continue
+        possible.add(key)
+        if key in uncertain or "input_provenance_unresolved" in nodes[key].get("unknowns", []):
+            closure_unknown = True
+        pending.extend(upstream[key] | possible_upstream[key])
 
     buffers = {}
     for buffer in graph["buffers"]:
@@ -332,7 +398,7 @@ def _units(observation, *, output_only=True):
             raise ComponentRewardContractError("component buffer IDs must be unique strings")
         buffers[buffer["id"]] = buffer
     units = []
-    candidates = {parent(key) for key in nodes} if closure_unknown else reached
+    candidates = {parent(key) for key in nodes} if closure_unknown else reached | possible
     for key in sorted(candidates):
         node = nodes[key]
         if node["kind"] not in UNIT_KINDS or parent(key) != key:
@@ -341,6 +407,8 @@ def _units(observation, *, output_only=True):
         if not reads and not writes and node.get("footprint_complete") is True:
             continue
         gaps = _node_gaps(node)
+        if key in uncertain:
+            gaps.append("input_provenance_unresolved")
         if key not in reached:
             gaps.append("output_membership_unresolved")
         units.append({"id": key, "signature": None if gaps else _signature(node, buffers), "unknowns": gaps})
@@ -350,6 +418,14 @@ def _units(observation, *, output_only=True):
 def _node_gaps(node):
     gaps = set(node.get("unknowns", [])) | set(node.get("configuration_unknowns", []))
     gaps -= SEMANTIC_ONLY
+    # Region summaries cannot order an in-place read against a write, nor
+    # choose a unique writer in a conflicting/atomic write.  These are
+    # structural facts, not optional producer wording: such a unit may remain
+    # in the best-turn denominator, but must never become a cross-turn origin.
+    if any(access.get("internal_or_unordered_regions") for access in node.get("reads", [])):
+        gaps.add("inplace_order_requires_detailed_capture")
+    if any(access.get("conflicting_regions") or access.get("atomic_unknown") for access in node.get("writes", [])):
+        gaps.add("write_version_ambiguous")
     if node.get("footprint_complete") is not True:
         gaps.add("incomplete_footprint")
     if not node.get("implementation") or set(str(node["implementation"])) == {"0"}:

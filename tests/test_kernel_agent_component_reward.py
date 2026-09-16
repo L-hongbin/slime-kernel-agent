@@ -551,6 +551,113 @@ def test_partial_data_edge_retains_unknown_producer_mass_without_erasing_known_p
     assert result["status"] == "partial"
 
 
+def test_unknown_null_source_preserves_unresolved_mass_without_crashing():
+    samples = trajectory([["a"], ["a"]], [0, 1])
+    graph = samples[1].metadata["runtime_graph"]["graph"]
+    graph["edges"].append(
+        {
+            "source": None,
+            "target": "call0",
+            "buffer": "input",
+            "regions": [[0, 4]],
+            "certainty": "entry_value_unobserved",
+        }
+    )
+    result = attribute_best_components(samples, [0, 1])
+    assert result["credits"] == [0, 1]
+    assert "input_provenance_unresolved" in result["units"][0]["unknowns"]
+
+
+def test_null_source_cannot_claim_proven_dependency():
+    samples = trajectory([["a"]], [1])
+    samples[0].metadata["runtime_graph"]["graph"]["edges"][0]["source"] = None
+    with pytest.raises(ComponentRewardContractError, match="dangling dependency source"):
+        attribute_best_components(samples, [1])
+
+
+def test_aggregate_inplace_does_not_shrink_output_denominator():
+    samples = trajectory([["a", "b"], ["a", "b"]], [0, 1])
+    graph = samples[1].metadata["runtime_graph"]["graph"]
+    graph["nodes"][0]["reads"][0]["internal_or_unordered_regions"] = [[0, 4]]
+    graph["nodes"][0]["unknowns"] = ["inplace_order_requires_detailed_capture"]
+    result = attribute_best_components(samples, [0, 1])
+    assert len(result["units"]) == 2
+    assert result["credits"] == [0.5, 0.5]
+
+
+@pytest.mark.parametrize("possible_writer", [False, True])
+def test_inplace_uncertainty_only_adds_possible_writers_not_unrelated_scratch(possible_writer):
+    samples = trajectory([["a", "b"], ["a", "b"]], [0, 1])
+    graph = samples[1].metadata["runtime_graph"]["graph"]
+    graph["nodes"][0]["reads"][0]["internal_or_unordered_regions"] = [[0, 4]]
+    graph["buffers"].append({"id": "scratch", "bytes": 4, "roles": []})
+    graph["nodes"].append(
+        {
+            "id": "unused",
+            "kind": "kernel",
+            "implementation": "scratch_impl",
+            "configuration": {"tile": 4},
+            "footprint_complete": True,
+            "unknowns": [],
+            "reads": [{"buffer": "input", "regions": [[0, 4]], "port": "in"}],
+            "writes": [{"buffer": "input" if possible_writer else "scratch", "regions": [[0, 4]], "port": "out"}],
+        }
+    )
+    for key in ["kernel_launches", "completed_kernel_launches"]:
+        graph["coverage"][key] += 1
+    result = attribute_best_components(samples, [0, 1])
+    units = {unit["best_unit"]: unit for unit in result["units"]}
+    assert ("unused" in units) is possible_writer
+    if possible_writer:
+        assert len(units) == 3
+        assert "output_membership_unresolved" in units["unused"]["unknowns"]
+        assert result["credits"] == pytest.approx([1 / 3, 2 / 3])
+    else:
+        assert len(units) == 2
+        assert result["credits"] == [0.5, 0.5]
+
+
+@pytest.mark.parametrize(
+    "field,value,expected_gap",
+    [
+        ("internal_or_unordered_regions", [[0, 4]], "inplace_order_requires_detailed_capture"),
+        ("conflicting_regions", [[0, 4]], "write_version_ambiguous"),
+        ("atomic_unknown", True, "write_version_ambiguous"),
+    ],
+)
+def test_structurally_ambiguous_best_unit_is_residual_without_producer_unknowns(field, value, expected_gap):
+    samples = trajectory([["a"], ["a"]], [0, 1])
+    node = samples[1].metadata["runtime_graph"]["graph"]["nodes"][0]
+    access = node["reads"][0] if field == "internal_or_unordered_regions" else node["writes"][0]
+    access[field] = value
+    # No producer-side unknown text is present: the consumer must fail closed
+    # on the observed effect structure itself.
+    result = attribute_best_components(samples, [0, 1])
+    assert result["credits"] == [0, 1]
+    assert result["residual_fraction"] == 1
+    assert expected_gap in result["units"][0]["unknowns"]
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("internal_or_unordered_regions", [[0, 4]]),
+        ("conflicting_regions", [[0, 4]]),
+        ("atomic_unknown", True),
+    ],
+)
+def test_structurally_ambiguous_earlier_unit_cannot_be_a_credit_origin(field, value):
+    samples = trajectory([["a"], ["a"]], [0, 1])
+    node = samples[0].metadata["runtime_graph"]["graph"]["nodes"][0]
+    access = node["reads"][0] if field == "internal_or_unordered_regions" else node["writes"][0]
+    access[field] = value
+    result = attribute_best_components(samples, [0, 1])
+    # An otherwise identical best unit cannot inherit an ambiguous earlier
+    # implementation; unresolved mass stays at the best turn.
+    assert result["credits"] == [0, 1]
+    assert result["residual_fraction"] == 1
+
+
 def test_metrics_deduplicate_allocations_and_count_costs_per_turn():
     a = trajectory([["x"], ["a"], ["a"]], [0.5, 0, 1], index=0)
     b = trajectory([None, None, None], [0, 1, 0], index=1)
