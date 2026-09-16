@@ -86,6 +86,11 @@ DISABLE_WANDB="${DISABLE_WANDB:-0}"
 ROLLING_CHECKPOINT_CLEANUP="${ROLLING_CHECKPOINT_CLEANUP:-1}"
 ROLLING_CHECKPOINT_KEEP="${ROLLING_CHECKPOINT_KEEP:-2}"
 ROLLING_CHECKPOINT_POLL_SEC="${ROLLING_CHECKPOINT_POLL_SEC:-60}"
+RAY_SUBMISSION_ID="${RAY_SUBMISSION_ID:-}"
+if [[ -n "${RAY_SUBMISSION_ID}" && ! "${RAY_SUBMISSION_ID}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+   echo "RAY_SUBMISSION_ID must be a safe nonempty identifier when set." >&2
+   exit 1
+fi
 if [[ "${FULL_LOOP_SMOKE}" != "0" && "${FULL_LOOP_SMOKE}" != "1" ]]; then
    echo "FULL_LOOP_SMOKE must be 0 or 1." >&2
    exit 1
@@ -675,7 +680,7 @@ if [[ "${SORT_TRAIN_MICROBATCHES_BY_PADDED_LENGTH_DESC}" == "1" ]]; then
    TRAIN_ORDER_LABEL=".LongestFirst"
 fi
 EXP_NAME="FAsync.${SGLANG_SPECULATIVE_LABEL}.${CUDA_GRAPH_LABEL}.${POLICY_OPTIMIZATION_LABEL}${TRAIN_ORDER_LABEL}.${TOPOLOGY_LABEL}.${SGLANG_SERVING_PROFILE}.${ROLLOUT_REASONING_EFFORT}.Temp${ROLLOUT_TEMPERATURE}.${TURN_POLICY_LABEL}.${PROMPT_POLICY_LABEL}.${ROLLOUT_SYNC_LABEL}.${REWARD_POLICY_LABEL}.${TRAIN_DATA_LABEL}.${KERNEL_BACKEND}.${MODEL_NAME}.BF16Train.FP8Rollout.CTX${MAX_CONTEXT_LEN}"
-EXP_ROOT="${REPO_ROOT}/experiments/${EXP_NAME}"
+EXP_ROOT="${EXP_ROOT:-${REPO_ROOT}/experiments/${EXP_NAME}}"
 CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH:-${EXP_ROOT}/checkpoints}"
 while [[ "${CHECKPOINT_SAVE_PATH}" != "/" && "${CHECKPOINT_SAVE_PATH}" == */ ]]; do
    CHECKPOINT_SAVE_PATH="${CHECKPOINT_SAVE_PATH%/}"
@@ -2081,9 +2086,16 @@ RAY_JOB_ID_ARGS=()
 SMOKE_SUBMISSION_ID=""
 if [[ "${FULL_LOOP_SMOKE}" == "1" ]]; then
    SMOKE_SUBMISSION_ID="qwen38-mtp${MTP_STEPS}-full-loop-smoke-${LOG_STAMP}"
+   if [[ -n "${RAY_SUBMISSION_ID}" && "${RAY_SUBMISSION_ID}" != "${SMOKE_SUBMISSION_ID}" ]]; then
+      echo "FULL_LOOP_SMOKE owns its submission ID; do not set a different RAY_SUBMISSION_ID." >&2
+      exit 1
+   fi
+   RAY_SUBMISSION_ID="${SMOKE_SUBMISSION_ID}"
    RAY_JOB_TIMEOUT_PREFIX=(timeout --signal=TERM --kill-after=30s "${FULL_LOOP_SMOKE_TIMEOUT_SEC}s")
-   RAY_JOB_ID_ARGS=(--submission-id="${SMOKE_SUBMISSION_ID}")
    echo "Full-loop smoke hard timeout: ${FULL_LOOP_SMOKE_TIMEOUT_SEC}s; submission_id=${SMOKE_SUBMISSION_ID}"
+fi
+if [[ -n "${RAY_SUBMISSION_ID}" ]]; then
+   RAY_JOB_ID_ARGS=(--submission-id="${RAY_SUBMISSION_ID}")
 fi
 
 set +e
@@ -2091,7 +2103,7 @@ set +e
    "${RAY_JOB_ID_ARGS[@]}" \
    --working-dir="${REPO_ROOT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
-   -- python3 train_async.py \
+   -- python3 "${TRAIN_ENTRYPOINT:-train_async.py}" \
    --actor-num-nodes ${ACTOR_NUM_NODES} \
    --actor-num-gpus-per-node ${ACTOR_GPUS_PER_NODE} \
    --rollout-num-gpus "${ROLLOUT_GPUS}" \
