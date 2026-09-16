@@ -342,3 +342,45 @@ hashes and their final stability checks. This is an offline retention heuristic:
 it neither establishes causal contribution nor modifies training rewards. The
 proposed retention-ratio return and current training method are discussed in
 [the component-reward report](../../../handoffs/paper/component_reward_training.md)
+
+## Component state observations
+
+`prepare_component_replays` exports twelve fixed, manually selected submissions
+as source-hashed JSON payloads for a separate KernelGym tracing process. These
+cases cover launch patterns, descriptor caches, workspace and interface repairs;
+they are a diagnostic validation set, not a random prevalence sample
+
+```bash
+python -m tools.data.trajectory_structure.prepare_component_replays \
+  --raw-root /path/to/extracted_trajectories \
+  --structure-root /path/to/trajectory_structure \
+  --output /path/to/new_replay_inputs
+python -m tools.data.trajectory_structure.component_state \
+  --structure-root /path/to/trajectory_structure \
+  --runtime-root /path/to/saved_runtime_observations \
+  --payload-root /path/to/replay_inputs \
+  --output /path/to/new_state_inventory
+python -m tools.data.trajectory_structure.native_state \
+  --runtime-root /path/to/saved_runtime_observations \
+  --output /path/to/new_native_state
+python -m tools.data.trajectory_structure.check_component_state
+python -m tools.data.trajectory_structure.check_native_state
+```
+
+All output directories must be new. The exporter checks raw response identity
+against the selected source. `component_state` verifies candidate-code and
+structural-source hashes before joining source declarations, FFI calls, CUDA
+activities and tensor snapshots. Shared storage establishes argument presence;
+read/write effects and output dependence remain unknown
+
+`native_state` interprets selected successful cuBLAS/cuDNN API events from
+`native_state.jsonl`, scoped by the observer ID in `observation.json` and probe
+loss/error counts in `result.json`. It records object generations and workspace
+resets. Missing hook coverage or dropped events cannot establish effective
+workspace state. API arguments record requested policy, not proof of particular
+hardware instructions; missing destroys do not establish memory leaks
+
+These commands process saved data without executing generated code or contacting
+a service. Collecting new observations requires a separate tracing adapter with
+a matching source manifest. Raw traces, argument snapshots and host API events
+remain separate from evaluator feedback and scored timing
