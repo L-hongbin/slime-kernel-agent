@@ -309,7 +309,7 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 | 项目 | 配置 |
 |---|---|
 | 模型／数据 | Qwen3.8-27B，v4_1，39636 题 |
-| 训练／rollout | node69+70 BF16 actor；node53+64 FP8 rollout，各节点 8 张 H20 |
+| 训练／rollout | 2 个 BF16 actor 节点；2 个 FP8 rollout 节点，每节点 8 张 H20 |
 | 并行 | actor TP4/PP2/CP2；4 个 TP4 rollout engine |
 | 每个 batch | 16 题 × 每题 16 轨迹，packing |
 | 轮次／context | 3 轮，24576 / 32768 / 40960 |
@@ -319,9 +319,15 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 | 本次改动 | 开启 source component credit，不启用跨轨迹状态聚合 |
 | 存储 | 每 20 步保存，新实验只保留最近 1 代完整 checkpoint；旧 checkpoint 不动 |
 
-存储调整是因为 node69 同时保留三代 checkpoint 的峰值会超过剩余空间；学习与采样参数不变。完整 debug rollout 只用于受控诊断，正式训练不持续保存大体积逐 batch dump
+存储保留数量按已有 checkpoint 与新一代写入的容量峰值确定；学习与采样参数不变。完整 debug rollout 只用于受控诊断，正式训练不持续保存大体积逐 batch dump
 
-Ray head 临时目录改到 node70 的 `/nfs/LOCAL/chenshuailin/ray_csrc70`。原目录所在盘超过 Ray 的 95% 使用率阈值，虽然仍有空闲空间，spill 时也可能被拒绝；其它节点的 Ray 路径保持不变
+Ray 临时数据应放在满足容量要求的存储上，避免触发磁盘使用率阈值而使 spill 失败；现场目录配置见 [RUNTIME.md](../../RUNTIME.md)
+
+### Checkpoint 就绪通知
+
+监控程序只读检查配置所列训练节点的保存完成标记、分片布局、metadata 引用的文件范围及实验身份。连续两次确认目标 iteration 完整后，通过 `codex queue` 通知配置指定的既有会话。收到通知的 Agent 重新核验现场，并按该实验已授权的流程处理停止训练、权重汇集转换与评测；监控程序只负责检查、通知和保存回执
+
+维护入口为 [notify_checkpoint_ready.py](../../scripts/notify_checkpoint_ready.py)，CPU 合约检查为 `python tests/test_checkpoint_ready_notifier.py`。`--once --config <配置文件>` 只读检查一次；`--watch --config <配置文件> --state-dir <回执目录>` 持续检查并通知既有会话。迁移环境时，在配置中指定训练节点、checkpoint 根目录、目标 iteration、实验身份和接收会话；现场机器映射与存储位置由 [RUNTIME.md](../../RUNTIME.md) 维护
 
 ## 局限与当前边界
 
