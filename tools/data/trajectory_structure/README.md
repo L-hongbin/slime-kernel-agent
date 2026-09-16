@@ -237,6 +237,33 @@ remaining scope are documented in the
 The opt-in training backend `--component-reward --component-reward-backend source`
 uses `examples/kernel_agent/source_components.py` and `source_component_reward.py`.
 Install this directory's pinned `requirements.txt` in every rollout environment.
+`source_credit_pilot.py` audits historical source allocations with explicitly
+reconstructed eligibility; its output is never training data. It uses the
+historical allocation rule without the additive mode's anchor speedup gate and
+may restore soft-finalization removals. It cannot reproduce current FastCredit
+training targets or masks.
+`source_credit_rollout_audit.py` instead checks a newly saved real rollout dump
+without reconstructing identity, rewards, tokens, masks or predictive support:
+
+```bash
+PYTHONPATH=. python -m tools.data.trajectory_structure.source_credit_rollout_audit \
+  --input /path/to/real/rollout_0.pt \
+  --output local_artifacts/source_credit_rollout_audit
+python -m tools.data.trajectory_structure.source_credit_pilot \
+  --input /path/to/exported_trajectories --output /path/to/new_pilot
+python -m tools.data.trajectory_structure.check_source_credit_audits
+```
+
+Both tools require new output directories. Only load trusted local `.pt` files;
+they use `torch.load(weights_only=False)`. The rollout audit checks serialized
+replacement-mode targets or additive-mode baseline rewards and targets, plus
+the predictive top-k support required by DPPO. An absent predictive payload on
+an active turn is an audit failure, even if another training configuration does
+not use predictive DPPO. Saved additive scale and gate values are checked for
+internal consistency; the audit does not verify a separate launch configuration
+or execute trajectory packing. Historical reconstruction is explicitly marked
+in the pilot output and does not satisfy the real-rollout audit.
+
 
 FastCredit adds source credit to baseline TRLOO with
 `--component-reward-mode trloo-credit-additive --component-reward-scale 0.25
