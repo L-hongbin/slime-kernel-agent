@@ -271,3 +271,41 @@ FastCredit adds source credit to baseline TRLOO with
 anchors; only earlier retained source turns receive the extra credit.
 The baseline dynamic filter remains active. See the
 [method and limitations](../../../handoffs/paper/component_reward_training.md).
+
+## Local revision / partial-output matching validation
+
+`implementation_match.py` builds bounded symbolic value descriptions for native
+kernels. It normalizes local names and exchanges addition/multiplication operands
+without reassociation, while preserving guards, formal input roles, output
+addresses, source context and pragmas. Loops remain opaque structured regions
+
+A partial candidate requires an after-kernel output value to occur in a
+before-kernel stage with a compatible output port. Unknown helpers, repeated
+local declarations and unsupported side effects produce unknown results rather
+than matches. These descriptions do not establish mathematical equivalence,
+automatic fusion counts or training credit
+
+```bash
+python -m tools.data.trajectory_structure.check_implementation_match
+python -m tools.data.trajectory_structure.match_validation \
+  --input /path/to/exported_training_trajectories \
+  --freeze /path/to/current_source_freeze.json \
+  --legacy-manifest /path/to/earlier_structure/manifest.json \
+  --previous-pool /path/to/earlier_training_exports \
+  --output /path/to/new_validation
+```
+
+The freeze JSON contains a `code_sha256` mapping from source paths to SHA-256
+hashes. Freeze the matcher, validation driver, parser and feature-analysis
+dependencies before examining candidate outcomes; a changed file stops the run
+
+The driver excludes raw/Python-AST reference overlap with the earlier pools,
+then compares exact and normalized matching on the same correct-timed records.
+Each method resolves one-to-one matches independently. Outputs retain selection,
+source sections, matched regions, timing evidence and input/code hashes. The
+input adapter and run identity are scoped to the retained rollout121 experiment;
+this is not a general sampling pipeline, and no generated CUDA code is executed
+
+The historical frozen validation found no additional natural matches. Its
+original source hashes are required to reproduce that result; a run with current
+code is a separate validation. See the [method and manual findings](../../../handoffs/paper/component_reward_training.md)
