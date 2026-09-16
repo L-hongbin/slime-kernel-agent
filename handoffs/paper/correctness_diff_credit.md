@@ -2,7 +2,7 @@
 
 目标是在 TRLOO baseline 上提高 kernel 正确率。当前用首个正确答案作为参照，通过代码 diff 找出与它接近的前轮实现，再给这些前轮少量额外 credit；FastCredit 保持关闭
 
-这轮从官方原始权重开始的实验已完成 100 次更新，step100 已转换并启动四机固定集评测，与 TRLOO step100 的 32K／48K／64K 协议对齐。截至下述评测异常核查，完整结果尚未验收，不能判断正确率是否提升
+这轮从官方原始权重开始的实验已完成 100 次更新及 step100 固定集评测，与 TRLOO 的 32K／48K／64K 协议对齐。结果没有显示整体正确率提升；预算截断较少，后续轮未提交完整代码的问题更突出
 
 实现预验证使用过 TRLOO step100 的诊断留样，分奖覆盖为 3.91%，入选修改已人工检查，正确参照已按原任务精度复测。这个数字不代表当前从 0 训练的覆盖率；此前的 step100 续训也不进入正式对照
 
@@ -141,11 +141,20 @@ diff 当前用于决定“哪一轮分奖”，训练仍使用该轮原有的完
 
 ### step100 固定集评测
 
-本次只测从 0 训练的 CorrectnessDiff025 step100，作业为 `qwen38-correctness-diff025-step100-ctx32k48k64k-20260916`。比较对象是已有的有效 TRLOO baseline-r2 step100 结果；两者沿用相同的冻结评测源码、题集和生成设置，见[评测身份与对照](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/identity.json)
+最终结果没有显示整体正确率提升：L1、L2 的 Best Correct 降低，L3 略高，但三个 level 的第三轮正确率都更低。比较对象是已有的有效 TRLOO baseline-r2 step100；这里只描述本轮观测，不把单次对照解释为已证明的 credit 因果效果
+
+| 级别 | 模型 | Correct T1（%） | Correct T3（%） | Correct Best（%） |
+|---|---|---:|---:|---:|
+| L1 | TRLOO | 84.88 | 85.13 | 98.13 |
+| L1 | CorrectnessDiff025 | 80.75 | 74.38 | 95.88 |
+| L2 | TRLOO | 62.13 | 65.50 | 82.25 |
+| L2 | CorrectnessDiff025 | 59.13 | 57.50 | 78.63 |
+| L3 | TRLOO | 25.50 | 38.50 | 52.50 |
+| L3 | CorrectnessDiff025 | 30.25 | 33.25 | 53.25 |
 
 | 配置 | 设置 |
 |---|---|
-| Checkpoint | 本实验 iter_0000099，累计 100 次更新 |
+| Checkpoint | 本实验 iter_0000099，从官方原始权重开始，累计 100 次更新 |
 | 题集 | KernelBench L1／L2／L3，分别 100／100／50 题 |
 | 采样 | 每题 8 条轨迹，每条 3 轮 |
 | 各轮总 context | 32768／49152／65536，包含历史上下文 |
@@ -153,13 +162,28 @@ diff 当前用于决定“哪一轮分奖”，训练仍使用该轮原有的完
 | 推理资源 | 4 台、32 张 H20，8 个 TP4 引擎，总客户端并发 256 |
 | 推理实现 | BF16、MTP3、CUDA Graph，FA3／Triton |
 
-step100 的完整分片归档通过逐文件 SHA256 校验，HF 转换检查通过，并完成四机权重同步。正式提交前，真实三轮小检查验证了新权重加载、生成与预算记录；该检查每轮仅生成 256 token，用于隔离验证，不进入正式分数。正式评测恢复完整输出预算，见[转换检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/hf_audit.json)、[四机权重检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/weight_sync.json)和[三轮验证](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/diagnostic/verification.json)
+原始全量沿用 baseline 相同的冻结评测源码、题集和生成设置；两条客户端异常轨迹在原始测试结束后单独补测，补测只修复取结果逻辑。完整逐轮 Compile、Correct、Fast 指标见[最终统计](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/final/results_audit.json)，对照汇总见[比较记录](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/final/comparison.json)
 
-八个实际引擎已全部通过模型身份和配置检查，四节点实际执行包也与冻结源码一致，首批完整轨迹已返回。人工查看了 Softsign 的完整回答，并按 task_id 复核一组编译失败后正确的三轮日志：首轮把 `device_id` 字段写成 `device_id()`，后两轮通过。该抽查用于确认生成、编译、反馈和修复链路正常，不用于估计整体正确率，见[启动验收](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/startup_acceptance.json)
+| 完整回答相关观察 | TRLOO（%） | CorrectnessDiff025（%） |
+|---|---:|---:|
+| 预算截断，占全部轮次 | 0.88 | 0.40 |
+| 正常停止但没有闭合 thinking，占全部轮次 | 3.42 | 11.92 |
+| 反馈报告缺少 ModelNew，占全部轮次 | 5.00 | 14.57 |
+| T2 没有闭合 thinking，占第二轮 | 2.35 | 20.60 |
 
-本次评测沿用既有 KernelGym 服务，没有部署或修改服务。完成后按正常分母统计逐轮及 Best Correct，同时检查截断和失败样例；训练批次上的指标不替代固定题集比较
+正常停止指生成状态为 completed；没有闭合 thinking 按实际 token 中缺少 `</think>` 统计，不等同于每条回答都没有代码。人工样例确认了真实的交付失败：补测题 81 的 T2 已在推理中发现转置卷积索引多减 1，却以 `im_end` 结束，没有提交 ModelNew；T3 提交完整实现后正确。这一轮还有剩余输出预算，不能归为预算截断。下一步值得重点检查后续轮为何停在推理或代码中途；目前没有把这个现象直接归因于额外 credit，见[预算与长度审计](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/final/context_length_audit.json)和[人工检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/final/manual_review.md)
 
-2026-09-16 的异常核查记录了两次客户端反馈解析异常：`env_state` 缺少 `metadata`，外层异常处理将相应整条轨迹转成 abort。这些轨迹不能算作模型答错，也不能在未补齐时发布正式对照。已用冻结源码复现一个相关缺陷：任务状态为 completed 后，取结果的一次 HTTP／读取／JSON 异常会被吞掉，客户端立即返回缺字段的简化状态，不再重取结果。告警前完成的任务目前均可取到完整 metadata，首个告警时段的服务端结果请求也均记录为 HTTP 200；旧客户端未记录底层取结果异常，尚不能确定本次具体是哪一种传输或解析故障。当前保持正常轨迹继续采集，完整 dump 发布后按 task_id、group_id 定位并补测受影响轨迹，再统一审计，见[异常核查与处理决定](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/generation_alert_disposition.json)
+最终验收为 2000 条轨迹、6000 轮，每题仍为 8 条；两条补测轨迹整体替换，其他 1998 条内容未变，独立统计与维护汇总一致，全部实际请求预算通过检查。checkpoint 转换、四机权重和实际执行包均已核验；32 张 H20 已释放，训练未恢复。原始全量与补测分别保留，正式分数只使用[合并验收目录](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/final/merge_audit.json)
+
+### 本次评测的客户端修复
+
+原始作业 `qwen38-correctness-diff025-step100-ctx32k48k64k-20260916` 出现两次缺少 metadata 的客户端异常，分别为 L1 group109／题14 的 T1 和 group643／题81 的 T2。两个原 KernelGym task 实际都为 Correct，但异常处理丢失了整条轨迹，原始 dump 因而只有 5996 轮。这些缺失不能算成模型错误，也不能拿两个原正确标记补造完整三轮历史
+
+slime 原先在 `/status` 为 completed 后吞掉单次 `/results` 读取异常，立即返回缺字段的简化状态。修复后只重取 GET，在原客户端 deadline 内等待完整结果并记录 task_id 与异常；不重复 POST、不修改模型反馈或分数。26 项 CPU 检查通过，向两个原 task 注入一次读取断连后，均成功重取真实结果并通过归一化，见[回归记录](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/cpu_test_receipt.json)和[真实 HTTP 检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/http_read_canary.json)
+
+按用户要求，修复和补测在原始评测结束后进行。补测作业 `qwen38-correctness-diff025-step100-recovery2-20260916` 仅对两个题各生成一条完整轨迹，保留其中的失败轮，不择优拼接；新快照仅改动一个客户端文件，见[源码差异](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/attempt1/source_difference.json)和[处理决定](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/recovery_disposition.json)
+
+底层读取异常被旧代码吞掉，仍无法完全还原具体连接、连接池或隧道原因。既有 KernelGym 未修改或重新部署。独立复核的 Grok、代理 Kimi 和原生 Kimi 分别受连接或额度限制，未取得审查结论；本次采用自审、回归、真实 HTTP 检查和人工样例核对，不计作独立复核通过，见[审阅边界](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/review_disposition.json)
 
 ### 训练完成与保留状态
 
@@ -206,7 +230,7 @@ Correct 使用原始 turn 编号、全部轨迹分母及 completed、compiled、
 
 恢复后的 rollout30 中，g10205 的 T3 用临时数组保存新的 LSTM 隐藏状态，再统一写回，修正 T2 循环内原地更新造成的新旧状态混用；T2 获得 0.25，T3 保留原奖励。另有 g10652 的 T2 原评测正确、参照复测却报输出不一致，当前冻结版因此取消该轨迹的额外项，原 TRLOO 回报不变；该不一致尚未额外 replay 归因。源码差分与原始判定保存在上述心跳证据中
 
-目前完成了从 0 开始的 diff 组训练，固定集评测的验收范围见上文；尚未另起新的 baseline 或随机对照训练。接下来比较与 TRLOO step100 协议对齐的正确率，最后一个训练批次的指标不能替代这一比较。提交恢复逻辑的缺口仍待单独修改，入训前 fail-fast 保护在本轮保留
+目前已完成从 0 开始的 diff 组训练及固定集评测；尚未另起新的 baseline 或随机对照训练。上面的固定集结果没有显示整体正确率提升，不能用训练最后一批的指标替代它。此前 POST 提交未确认的恢复缺口仍待单独修改，不与本次已修复的 GET 取结果问题混为一谈；入训前 fail-fast 保护在本轮保留
 
 本次运行曾出现四节点访问 KernelGym 超时及返回字段缺失，随后链路自行恢复，远端 API 进程没有重启。缺少 metadata 的响应触发客户端 abort，含 aborted 样本的题目组会在进入输出队列前被整体重排。rollout29、30，以及之后留存的 rollout31 已分别检查，未发现 aborted、客户端超时或 RESOURCE_ERROR 样本进入这些留样，分奖检查通过；这些检查没有覆盖当时尚未收齐的 rollout32，见[访问异常与入训检查](../../local_artifacts/paper/correctness_diff_training/fresh0/infra_access_20260915_0913.json)和[rollout31 心跳检查](../../local_artifacts/paper/correctness_diff_training/fresh0/heartbeat_1789466538.json)
 
@@ -339,4 +363,4 @@ T1 直接正确时没有额外 diff credit；T1 接近正确、T2 修复通过�
 
 只读[正式监控](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/formal_watcher_state.json)在训练期间检查保存、作业状态和 KernelGym 健康，发送三小时心跳与保存里程碑通知。确认 step100 完整且作业 SUCCEEDED 后，监控发出完成通知并正常退出；本轮不再发送训练心跳。保存清理进程也已退出，监控没有自动启动评测或后续对照
 
-用户授权评测后，主 Agent 完成 checkpoint 验证、转换和同步，再提交上述唯一评测作业。新的[评测只读监控](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/eval_watcher_state.json)发送三小时心跳、异常和完成通知；监控本身不停止、重启或重复提交任务
+用户授权评测后，主 Agent 完成 checkpoint 验证、转换和同步，再提交全量评测及上述两轨迹补测。[评测只读监控](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/eval_watcher_state.json)与[补测监控](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/recovery/recovery_watcher_state.json)均已发出完成通知并退出；监控本身没有停止、重启或重复提交任务
