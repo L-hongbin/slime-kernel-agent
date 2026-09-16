@@ -1,4 +1,371 @@
-# Qwen3.8 DataV2 / DataV4 / 新 reward KernelBench L1–L3 统一评测
+# Qwen3.8 KernelBench L1–L3 评测
+
+## FastCredit025 step100：64K / 128K / 192K
+
+本轮 6000 轮记录的预算截断率为 **0.00%**。相对 32K/48K/64K，L3 Best Correct 从 51.50% 提高到 59.50%，第三轮 Correct 从 31.50% 提高到 41.25%；L1/L2 Best Correct 则分别变化 −1.00 / −0.25 个百分点，Fast 指标没有全面提升。这些是同一 checkpoint 的单次评测点估计，不据此确定训练目标的根因
+
+| 三轮总 context | 全部轮次截断（%） |
+|---|---:|
+| 24K/32K/40K | 25.57 |
+| 32K/48K/64K | 7.30 |
+| 64K/128K/192K | 0.00 |
+
+本轮只测试 `Qwen3.8-27B-FastCredit025-Step100`，完成 100 次更新的 `iter_0000099`；该 checkpoint 训练时的来源 bonus 仅在正确且实测 speedup ≥ 1 时生效，系数 0.25、无最终回报封顶，评测本身不分配 component reward。没有重测 TRLOO 或恢复训练。2000 条轨迹、6000 轮反馈完整，独立 raw env_state 计数与维护 summarizer 一致，作业成功结束，耗时 154.95 分钟；收尾记录确认本次使用的 24 张 H20 已释放
+
+### 64K / 128K / 192K 各轮质量
+
+表格从原始计数统一四舍五入到两位小数。分母 L1/L2/L3 为 800/800/400 条轨迹；每题 8 条三轮轨迹，所有任务级失败保留在分母。Best 为每条轨迹任一轮达到各自指标，不是 pass@8 或最后一轮指标
+
+#### L1
+
+| 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---:|---:|---:|---:|
+| T1 | 96.63 | 89.38 | 23.25 | 19.00 |
+| T2 | 93.13 | 82.63 | 35.88 | 24.00 |
+| T3 | 89.88 | 81.13 | 37.88 | 27.13 |
+| Best | 100.00 | 98.50 | 44.63 | 28.63 |
+
+| 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | Prompt 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 0.00 | 0.13 | 6587.50 | 1345.50 | 1357.00 | 64179.00 | 56097.00 |
+| T2 | 0.00 | 1.88 | 8174.00 | 1517.50 | 9767.00 | 121305.00 | 111123.50 |
+| T3 | 0.00 | 0.75 | 6511.50 | 1669.00 | 20304.50 | 176299.50 | 165363.00 |
+
+#### L2
+
+| 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---:|---:|---:|---:|
+| T1 | 92.88 | 64.50 | 10.13 | 9.25 |
+| T2 | 93.13 | 68.00 | 21.38 | 13.25 |
+| T3 | 89.00 | 65.75 | 26.75 | 17.50 |
+| Best | 100.00 | 83.50 | 30.63 | 18.50 |
+
+| 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | Prompt 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 0.00 | 0.13 | 10856.00 | 1967.50 | 1397.50 | 64138.50 | 51102.00 |
+| T2 | 0.00 | 1.25 | 7856.50 | 2094.00 | 14778.00 | 116294.00 | 105374.00 |
+| T3 | 0.00 | 1.00 | 9376.50 | 2207.50 | 26050.50 | 170553.50 | 157811.00 |
+
+#### L3
+
+| 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---:|---:|---:|---:|
+| T1 | 71.75 | 31.50 | 3.00 | 2.50 |
+| T2 | 78.00 | 39.25 | 4.50 | 3.50 |
+| T3 | 81.00 | 41.25 | 7.75 | 5.25 |
+| Best | 94.50 | 59.50 | 8.50 | 6.25 |
+
+| 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | Prompt 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| T1 | 0.00 | 5.00 | 21403.00 | 3993.50 | 1922.50 | 63613.50 | 37754.50 |
+| T2 | 0.00 | 1.50 | 8604.50 | 4393.50 | 28172.50 | 102899.50 | 86454.50 |
+| T3 | 0.00 | 0.25 | 9352.00 | 4811.50 | 44987.50 | 151616.50 | 135649.00 |
+
+### FastCredit025 三套预算对照
+
+| Level | 三轮总 context | Best Correct（%） | Best Fast@1.0（%） | T3 Correct（%） | 全部轮次截断（%） |
+|---|---|---:|---:|---:|---:|
+| L1 | 24K/32K/40K | 97.88 | 42.38 | 67.13 | 14.79 |
+| L1 | 32K/48K/64K | 99.50 | 45.25 | 79.75 | 3.33 |
+| L1 | 64K/128K/192K | 98.50 | 44.63 | 81.13 | 0.00 |
+| L2 | 24K/32K/40K | 81.25 | 25.50 | 49.00 | 19.38 |
+| L2 | 32K/48K/64K | 83.75 | 29.88 | 61.38 | 3.83 |
+| L2 | 64K/128K/192K | 83.50 | 30.63 | 65.75 | 0.00 |
+| L3 | 24K/32K/40K | 40.00 | 4.75 | 21.75 | 59.50 |
+| L3 | 32K/48K/64K | 51.50 | 7.50 | 31.50 | 22.17 |
+| L3 | 64K/128K/192K | 59.50 | 8.50 | 41.25 | 0.00 |
+
+### 实际预算与输出边界
+
+65536 / 131072 / 196608 是包含 prompt 与保留历史的三轮总 context，并非每轮独立输出额度。server、rollout、eval 的全局 context/response cap 均为 196608；MTP 在全局边界保留 4 tokens，实际三轮有效上限为 65536 / 131072 / 196604。全部 6000 轮均核验实际 prompt、请求 `max_new_tokens` 与 response tokens，未发现客户端仍受旧 64K/128K cap 限制，见[逐轮预算与长度审计](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/fastcredit025/context_length_audit.json)
+
+本轮三个 turn 的最大实际总长度分别为 55323 / 83862 / 106045，最少剩余请求预算分别为 10213 / 47210 / 90559 tokens。301 轮总长度超过 64K，没有一轮超过 128K；因此本轮消除了已观测的预算截断，但没有证明第三轮 192K 是必需条件。原生 192K 服务边界另由 196588 输入加 16 输出的 MTP/CUDA Graph 诊断验证，见[实际使用汇总](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/observed_budget_summary.json)与[边界诊断](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/boundary_smoke.json)
+
+Thinking/answer 仍按实际响应 token IDs 的首个 `</think>` 分界，排除 special tokens；未关闭时全部计入 thinking，answer 计为 0。表格为包含失败轮次的中位数，完整均值与 P90 保存在长度审计。本轮 68 轮未关闭 thinking，均为 completed；“未关闭 thinking”“预算截断”“代码未完整交付”分别统计，不能混用
+
+L3 首轮 thinking 中位长度与上一套预算接近（21403.00 对 21601.50 tokens），answer 中位长度则从 2647.00 增至 3993.50 tokens。预算放宽后能看到更多完整代码和修复尝试，但完成生成仍不保证正确或更快
+
+### 代表性输出与任务级失败
+
+人工复核 9 条不同轨迹的三轮响应结构、前后文、关键代码和反馈，共 27 轮；完整输出与逐例记录见[人工复核](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/fastcredit025/manual_review.md)
+
+- L1 group360：首轮候选因 FP16 降精度被原 precheck 拒绝；后两轮正确但慢。第三轮总 context 92437，充分输出并不等于达到性能目标
+- L2 group723：三轮都正确，第三轮输出 39427 tokens，但三轮 speedup 都小于 1；继续长时间优化推导没有带来达标结果
+- L3 group225（Swin MLP）：首轮数值错误，后两轮正确但慢。第三轮 prompt 83248 加输出 22797，达到本轮最大实际总 context 106045
+- L3 group79：首轮已经关闭 thinking，却在 CUDA 实现中途以 `<|im_end|>` 结束，缺少完整 ModelNew；输出 29604 / 请求 63289，仍有 33685 tokens 未用。模型下一轮自称“truncated”不代表预算截断，实际保存状态与 token 证据显示是在有余量时结束，见[尾部 token 核对](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/fastcredit025/manual_token_end_audit.json)
+
+| Level | WorkerProcessCrashed 次数 |
+|---|---:|
+| L1 | 1 |
+| L2 | 7 |
+| L3 | 5 |
+
+共 13 轮 worker crash，全部保留正常分母，没有选择性删除或重测。L1 group655 的 host binding 直接读取在 GPU 上创建的 meta；L2 group18 的 host binding 解引用 GPU scalar 指针，与各自 native 错误栈吻合。后者改为 GPU kernel 内读取后正确，前者消除 crash 后仍触发原 decoy 检查；不能把“没有 crash”直接视为 Correct。源码片段见[候选代码复核](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/fastcredit025/worker_crash_source_review.json)，全量错误见[worker crash 审计](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/fastcredit025/worker_crash_audit.json)。未做独立 replay，其余 crash 的根因尚未逐项闭合
+
+### 运行配置与必要调整
+
+复用上一轮已修复的冻结 `runtime_repo`，生成/反馈/计分代码不变。模型与 tokenizer 原生上限均为 262144，没有新增 RoPE scaling、修改权重、换精度或 backend。保持 canonical KernelBench L1/L2/L3、每题 8 条轨迹、三轮、BF16、TP4、原生 MTP3、CUDA Graph、FA3/Triton、temperature 1、top-p 1、top-k −1、medium、保留历史 thinking、finalize none、原 prompt/feedback 和 KernelGym 计分口径
+
+预检发现一台候选机器仍有其它任务占用，本轮只使用确认空闲的三个节点，6 个 TP4 引擎共 24 张 H20。相对上一轮的必要运行调整如下；这些差异不应混入训练机制的因果解释
+
+| 项目 | 上一轮 | 本轮 |
+|---|---:|---:|
+| 引擎数 / H20 数 | 8 / 32 | 6 / 24 |
+| 每引擎 max-running / 客户端并发 | 64 / 256 | 32 / 128 |
+| CUDA Graph max batch | 64 | 32 |
+| Prefill chunk tokens | 8192 | 4096 |
+| 轨迹生成 guard 秒 | 3600 | 21600 |
+| Router request / queue timeout 秒 | 14400 / 2400 | 21600 / 21600 |
+
+HTTP 客户端原有无限总超时保持不变，KernelGym 算子与客户端 timeout 未修改。无生成 abort、推理请求超时、缺失反馈或 replacement 字符；所有任务级失败按原口径计分
+
+三节点权重、tokenizer/config、数据和代码哈希均核验，实际 Ray 执行包也已逐文件核对。先通过实际 192K MTP 边界检查，再通过真实 `evaluation=True` 三轮客户端 canary；canary 每轮 256 输出 tokens 仅用于生成、precheck 反馈和 metadata 链路检查，不计入正式分数，也未泄漏到正式 cap。正式作业 `qwen38-fastcredit025-step100-ctx64k128k192k-20260914` 仅含本模型，Controller 已正常结束，未创建后续模型任务
+
+[配置与证据入口](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/README.md)索引了原始 argv、实际引擎参数、BF16 解析、节点同步、预算核对和人工复核；[资源释放证据](../../local_artifacts/qwen38/fastcredit_step100_context64k128k192k_20260914/cleanup_evidence.json)确认本次 24 张卡已释放、训练继续停止，未干预其它容器
+
+## Step100：32K / 48K / 64K 对照
+
+扩大三轮总 context 后，两模型的预算截断都减少，但 **FastCredit025 的额外截断没有完全消除**。全部轮次的截断差由旧预算下的 13.17 个百分点缩小到 6.42 个百分点；剩余差异主要集中在 L3。本次只能确认这些 checkpoint 在两套预算下的实际表现，不据此确定训练目标造成该行为的根因
+
+| 模型 | 旧 24K/32K/40K 截断（%） | 新 32K/48K/64K 截断（%） |
+|---|---:|---:|
+| TRLOO baseline | 12.40 | 0.88 |
+| FastCredit025 | 25.57 | 7.30 |
+
+新预算下，FastCredit025 的三轮最佳 Correct 在 L1/L2 较高、L3 略低，三档最佳 Fast@1.0 均较高；但第三轮 Correct 仍分别比 baseline 低 5.38 / 4.13 / 7.00 个百分点。因此“保留已验证最佳候选”和“直接取最后一轮”仍给出不同结论。这些是单次评测点估计，未做显著性检验或训练重复
+
+两模型均为完成 100 次更新的 `iter_0000099`：原 TRLOO baseline 与 FastCredit025（正确且实测 speedup ≥ 1 才加来源 bonus，系数 0.25、无最终回报封顶）。两模型各完成 2,000 条轨迹、6,000 轮记录，独立 raw env_state 计数与维护 summarizer 一致，无生成 abort 或缺失反馈。此次评测未恢复训练，收尾记录确认本次使用的 32 张 H20 已释放
+
+### 新预算下的各轮质量
+
+表格从原始计数统一四舍五入到两位小数。三轮总 context 上限为 32768 / 49152 / 65536，包含 prompt 与全部保留历史。第三轮为原生 MTP 保留 4 个 token，因此实际请求的有效总上限为 65532。每档每题 8 条三轮轨迹；分母 L1/L2/L3 为 800/800/400 条，失败保留在分母。Best 是每条轨迹任一轮达到相应指标，区别于最后一轮和 pass@8
+
+#### L1
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 94.50 | 84.88 | 22.25 | 14.38 |
+| TRLOO baseline | T2 | 94.38 | 81.75 | 32.00 | 20.25 |
+| TRLOO baseline | T3 | 94.13 | 85.13 | 36.13 | 24.25 |
+| TRLOO baseline | Best | 100.00 | 98.13 | 41.88 | 25.00 |
+| FastCredit025 | T1 | 95.88 | 87.38 | 24.00 | 18.50 |
+| FastCredit025 | T2 | 89.25 | 82.38 | 35.50 | 23.88 |
+| FastCredit025 | T3 | 86.38 | 79.75 | 41.00 | 27.88 |
+| FastCredit025 | Best | 99.88 | 99.50 | 45.25 | 28.88 |
+
+| 模型 | 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 0.00 | 1.00 | 6139.00 | 1335.50 | 31411.00 | 23758.00 |
+| TRLOO baseline | T2 | 0.13 | 1.88 | 5083.00 | 1509.00 | 39797.50 | 32641.50 |
+| TRLOO baseline | T3 | 0.13 | 0.63 | 4125.50 | 1658.50 | 48685.50 | 40576.00 |
+| FastCredit025 | T1 | 0.38 | 0.25 | 6401.50 | 1352.50 | 31411.00 | 23543.00 |
+| FastCredit025 | T2 | 4.13 | 5.00 | 8108.00 | 1506.50 | 39591.50 | 29598.50 |
+| FastCredit025 | T3 | 5.50 | 4.13 | 6421.00 | 1541.50 | 45593.50 | 34081.50 |
+
+#### L2
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 91.00 | 62.13 | 3.88 | 3.75 |
+| TRLOO baseline | T2 | 91.63 | 64.88 | 16.00 | 8.88 |
+| TRLOO baseline | T3 | 91.25 | 65.50 | 20.88 | 12.00 |
+| TRLOO baseline | Best | 100.00 | 82.25 | 23.00 | 12.38 |
+| FastCredit025 | T1 | 92.63 | 65.25 | 9.38 | 7.88 |
+| FastCredit025 | T2 | 90.13 | 66.25 | 22.00 | 13.50 |
+| FastCredit025 | T3 | 82.50 | 61.38 | 26.00 | 17.13 |
+| FastCredit025 | Best | 99.88 | 83.75 | 29.88 | 17.88 |
+
+| 模型 | 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 0.13 | 1.13 | 10814.00 | 2002.00 | 31370.50 | 18414.00 |
+| TRLOO baseline | T2 | 0.13 | 1.63 | 5403.00 | 2133.50 | 34430.00 | 26334.00 |
+| TRLOO baseline | T3 | 0.25 | 0.88 | 5479.50 | 2202.50 | 42342.00 | 33569.50 |
+| FastCredit025 | T1 | 0.50 | 0.25 | 10759.00 | 1955.00 | 31370.50 | 18379.00 |
+| FastCredit025 | T2 | 4.13 | 3.50 | 8674.00 | 2023.50 | 34410.00 | 22991.00 |
+| FastCredit025 | T3 | 6.88 | 5.88 | 9195.00 | 2077.50 | 39004.50 | 25686.00 |
+
+#### L3
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） |
+|---|---|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 45.25 | 25.50 | 2.50 | 1.75 |
+| TRLOO baseline | T2 | 71.00 | 34.25 | 4.25 | 3.25 |
+| TRLOO baseline | T3 | 80.75 | 38.50 | 6.25 | 4.75 |
+| TRLOO baseline | Best | 89.00 | 52.50 | 6.75 | 4.75 |
+| FastCredit025 | T1 | 50.50 | 24.75 | 3.00 | 2.00 |
+| FastCredit025 | T2 | 61.50 | 30.25 | 5.50 | 3.75 |
+| FastCredit025 | T3 | 66.50 | 31.50 | 6.50 | 5.00 |
+| FastCredit025 | Best | 85.50 | 51.50 | 7.50 | 5.75 |
+
+| 模型 | 轮次 | 截断（%） | 未关闭 thinking（%） | Thinking 中位 token | Answer 中位 token | 可生成预算中位 token | 剩余未用预算中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 6.50 | 34.25 | 19196.00 | 2105.50 | 30845.50 | 9417.00 |
+| TRLOO baseline | T2 | 4.50 | 4.75 | 3459.00 | 3904.00 | 25612.50 | 15697.00 |
+| TRLOO baseline | T3 | 0.75 | 1.25 | 5495.00 | 4251.00 | 31706.00 | 20510.50 |
+| FastCredit025 | T1 | 34.75 | 22.00 | 21601.50 | 2647.00 | 30845.50 | 4089.50 |
+| FastCredit025 | T2 | 19.50 | 6.75 | 6415.50 | 3883.50 | 20128.50 | 8206.00 |
+| FastCredit025 | T3 | 12.25 | 4.75 | 7748.00 | 4165.50 | 24159.00 | 9706.50 |
+
+### 与旧 24K / 32K / 40K 预算比较
+
+| Level | 模型 | 旧 Best Correct（%） | 新 Best Correct（%） | 旧 Best Fast@1.0（%） | 新 Best Fast@1.0（%） | 旧全部轮次截断（%） | 新全部轮次截断（%） |
+|---|---|---:|---:|---:|---:|---:|---:|
+| L1 | TRLOO baseline | 97.50 | 98.13 | 43.38 | 41.88 | 5.04 | 0.08 |
+| L1 | FastCredit025 | 97.88 | 99.50 | 42.38 | 45.25 | 14.79 | 3.33 |
+| L2 | TRLOO baseline | 81.25 | 82.25 | 22.25 | 23.00 | 7.79 | 0.17 |
+| L2 | FastCredit025 | 81.25 | 83.75 | 25.50 | 29.88 | 19.38 | 3.83 |
+| L3 | TRLOO baseline | 44.00 | 52.50 | 8.00 | 6.75 | 36.33 | 3.92 |
+| L3 | FastCredit025 | 40.00 | 51.50 | 4.75 | 7.50 | 59.50 | 22.17 |
+
+
+#### 旧预算逐轮明细
+
+以下均为此前已完成的 24K/32K/40K 结果；质量指标读取原始计数，长度用旧 dump 按本轮相同 token 分界口径重算。新预算对应逐轮明细见上方 L1–L3 表。下表长度均为中位数，失败仍保留在分母
+
+旧预算 L1
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） | 截断（%） | Thinking 中位 token | Answer 中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 94.38 | 85.00 | 21.88 | 15.38 | 0.25 | 6131.50 | 1323.00 |
+| TRLOO baseline | T2 | 89.38 | 79.50 | 34.88 | 21.00 | 6.63 | 4567.50 | 1476.00 |
+| TRLOO baseline | T3 | 86.00 | 78.38 | 35.88 | 23.38 | 8.25 | 3719.50 | 1541.00 |
+| FastCredit025 | T1 | 96.13 | 89.25 | 22.50 | 18.00 | 1.38 | 6388.00 | 1374.00 |
+| FastCredit025 | T2 | 76.13 | 71.13 | 34.88 | 22.63 | 19.63 | 7971.00 | 1303.00 |
+| FastCredit025 | T3 | 72.25 | 67.13 | 34.63 | 25.75 | 23.38 | 5289.50 | 1320.50 |
+
+旧预算 L2
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） | 截断（%） | Thinking 中位 token | Answer 中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 88.75 | 59.38 | 3.63 | 3.38 | 2.50 | 10473.50 | 1936.50 |
+| TRLOO baseline | T2 | 84.50 | 59.88 | 13.63 | 7.75 | 10.63 | 5115.50 | 1975.00 |
+| TRLOO baseline | T3 | 82.75 | 61.13 | 20.13 | 11.75 | 10.25 | 4753.50 | 2056.50 |
+| FastCredit025 | T1 | 85.75 | 62.25 | 8.38 | 7.63 | 7.00 | 10965.00 | 1903.50 |
+| FastCredit025 | T2 | 72.75 | 53.63 | 18.50 | 12.25 | 22.63 | 7333.50 | 1828.00 |
+| FastCredit025 | T3 | 64.88 | 49.00 | 21.50 | 14.75 | 28.50 | 7469.00 | 1803.00 |
+
+旧预算 L3
+
+| 模型 | 轮次 | Compile（%） | Correct（%） | Fast@1.0（%） | Fast@1.2（%） | 截断（%） | Thinking 中位 token | Answer 中位 token |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| TRLOO baseline | T1 | 34.25 | 19.00 | 3.75 | 3.00 | 44.50 | 18921.50 | 1372.00 |
+| TRLOO baseline | T2 | 50.00 | 25.00 | 5.25 | 4.50 | 33.50 | 1593.50 | 3413.00 |
+| TRLOO baseline | T3 | 55.00 | 29.25 | 7.00 | 5.50 | 31.00 | 2220.00 | 3428.50 |
+| FastCredit025 | T1 | 26.75 | 19.50 | 1.50 | 1.00 | 66.50 | 20998.00 | 528.50 |
+| FastCredit025 | T2 | 35.50 | 18.00 | 2.50 | 1.50 | 59.25 | 6267.00 | 2158.50 |
+| FastCredit025 | T3 | 36.25 | 21.75 | 3.50 | 2.75 | 52.75 | 4184.50 | 2720.00 |
+
+旧长度完整均值、中位数、P90 与推导请求预算见 [baseline](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/historical_baseline/context_length_audit.json)和[FastCredit025](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/historical_fastcredit025/context_length_audit.json)；新旧 Best 指标分别见本节比较表、上方新预算质量表及下方保留的旧协议章节
+
+### 长度与实际预算
+
+表中的 thinking/answer 长度来自保存的响应 token IDs，以首个 `</think>` 分界，并去除 special tokens；没有关闭 token 时，全部计入 thinking、answer 为 0。统计包含全部轮次。未关闭 thinking 不等于预算截断，也不等于没有可提取的 CUDA 代码：两模型分别有 205 / 51 轮在未关闭 thinking 的情况下正常结束生成。对 baseline 的这类记录核对了文本与 token，未发现文本有关闭标记而 token 统计漏认的情况；抽查可见 EOS 停在推导或代码中途，见[关闭标记复核](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/baseline/thinking_delimiter_review.json)
+
+FastCredit025 在反馈后的 thinking 中位长度三档均更长，answer 中位长度则接近或更短；这描述输出分布，不单独建立训练机制的因果链。均值、P90、实际 prompt 长度以及逐条记录见 [baseline 长度审计](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/baseline/context_length_audit.json)与[FastCredit025 长度审计](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/fastcredit025/context_length_audit.json)
+
+可生成预算是该轮实际请求的 `max_new_tokens`；剩余未用预算是请求额度减去实际 response tokens。12,000 轮均验证 `max_new_tokens = max(0, min(configured_output_cap, min(turn_cap, server_cap − 4) − prompt_tokens))`，未发现越界或仍被 40K engine 限制。T1/T2 保留完整的 32768/49152 总上限，MTP 的四 token 余量只限制第三轮最末边界。两模型所有 53 / 438 个截断轮次均耗尽对应请求额度，见[baseline 截断预算检查](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/baseline/truncation_budget_check.json)与[FastCredit025 检查](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/fastcredit025/truncation_budget_check.json)
+
+旧预算的长度使用旧 dump 统一重算；旧请求预算从保存的 token 长度和原预算函数推导，新预算则由生成时直接记录的 metadata 核验，两者证据强度明确区分
+
+### 实际输出与任务级失败
+
+两模型各人工复核 9 条不同轨迹的三轮响应头尾、结构和反馈，共 54 轮；样例用于检查真实行为，不代表全体错误类型比例。完整文本与复核记录见 [baseline](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/baseline/manual_review.md)和[FastCredit025](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/fastcredit025/manual_review.md)
+
+- Baseline L1 group539：前两轮 ConvTranspose3d 正确但慢，第三轮在 prompt 40422 的基础上用尽 25110 输出 tokens，达到有效总长度 65532 后停在 CUDA 实现中途
+- FastCredit025 L1 group50：前两轮 GEMM 正确但慢，第三轮继续分析 shared-memory bank conflict，耗尽 18274 输出 tokens 后未交付完整代码
+- FastCredit025 L2 group0：第三轮仍有 39420 输出 tokens，但继续进行优化推导直到用完预算，没有完整 ModelNew；这说明增加到 64K 仍不能消除所有长 thinking 和交付失败
+- FastCredit025 L3 group34：首轮 AlexNet 正确但慢，第二轮优化后编译失败，第三轮修复 cuDNN API 时截断在 ModelNew.forward 中途
+- 反馈后修复也实际存在，例如 baseline L3 group6 修正 `dtype()` 后正确，FastCredit025 L1 group33 修正 `data_ptr()` 后正确
+
+| 模型 | L1 WorkerProcessCrashed 次数 | L2 次数 | L3 次数 |
+|---|---:|---:|---:|
+| TRLOO baseline | 2 | 12 | 3 |
+| FastCredit025 | 2 | 20 | 4 |
+
+这些任务按正常口径计失败并保留分母，没有选择性删除或重测。抽查 baseline L1 group261 / L3 group16、FastCredit025 L1 group466 的最终代码，可见 host C++ 解引用 CUDA tensor 的 `data_ptr`，与相应 native 函数中的崩溃栈吻合；这是所查候选的代码缺陷证据，不将其外推到全部 native crash。未做独立 replay，其余崩溃的根因尚未逐项闭合。两模型各有一轮含 replacement 字符，细节保存在长度审计的 anomalies 中
+
+### 配置、执行与偏离
+
+两模型均用四节点八个 TP4 engine、BF16、原生 MTP3、CUDA Graph、FA3/Triton，server / rollout / eval 全局 cap 均为 65536；客户端总并发 256、每引擎 max-running 64，未降低并发。canonical 数据、每题八条轨迹、temperature 1、top-p 1、top-k −1、medium、保留历史 thinking、finalize none、原 KernelGym URL 和计分口径一致
+
+本轮统一使用 FastCredit025 已验证的冻结评测源码；历史 prompt/feedback 模板同哈希，源码差异主要是本轮关闭的 component 分支。Mamba 参数名统一为 `radix-cache-strategy=extra_buffer`。旧 baseline 曾用三节点六引擎，本轮两模型均用八引擎；与旧结果比较时保留这一运行差异，不将时间差单独解释成预算或算法收益
+
+首跑 baseline 因新增预算诊断引用了未传入内部函数的 `evaluation` 变量而失败，已停止并全部作废。两份旧协议冻结源码与归档 manifest 匹配，均无该新增块，因此旧分数不受此 NameError 影响，见[源码复核](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/old_protocol_nameerror_audit.json)。修复、四节点重同步及真实三轮 GPU 诊断通过后，两模型均从本轮 `attempt2` 完整重跑；本文仅使用后缀 `-r2` 的有效作业。另一次 65516 输入加 16 输出 tokens 的 64K GPU 边界检查通过，两项诊断均不计入正式分数。有效作业分别耗时 80.24 / 105.67 分钟，没有使用 eager 或恢复训练。Controller 已正常收尾，`completed` 仅含 baseline、fastcredit025，没有第三个模型任务，见[终态回执](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/comparison_terminal.json)。收尾复查时，本次 controller 和 Ray 作业均已退出；一张 GPU 上的占用已核实来自其它容器的新任务，其余 31 张卡空闲，不属于本次评测残留，见[收尾与资源归属核查](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/final_closeout_recheck.json)
+
+两模型权重、配置、数据和实际执行包均核验一致；[配置与完整证据入口](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/README.md)索引了 checkpoint 来源、实际 engine 参数、运行回执、旧长度重算、作废记录和清理证据。模型身份分别见 [baseline](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/baseline/identity.json)与[FastCredit025](../../local_artifacts/qwen38/step100_context32k48k64k_20260914/attempt2/fastcredit025/identity.json)
+
+## FastCredit025 step100
+
+本节记录三轮总 context 为 24K/32K/40K 的已完成评测。与同预算的原 TRLOO baseline 相比，L1/L2 的三轮最佳 Correct 接近，L2 的 Fast 指标更高；L3 的 Compile、Correct 和 Fast 均更低。首轮正确率的点估计有所提高，但第三轮正确率三档都低于 baseline，整体截断也更多，当前没有显示出全面优于 baseline 的结果
+
+### 三轮最佳与 baseline 对照
+
+每条轨迹任一轮达到指标即计入三轮最佳，各指标分别统计；分母为该 level 的全部轨迹，失败不从分母中移除。Correct 排除 decoy，Fast 还要求正确且实测 speedup 达到阈值。该口径不是 pass@8，也不代表最后一轮答案
+
+| Level | 模型 | Best Compile（%） | Best Correct（%） | Best Fast@1.0（%） | Best Fast@1.2（%） |
+|---|---|---:|---:|---:|---:|
+| L1 | TRLOO baseline | 99.88 | 97.50 | 43.38 | 24.63 |
+| L1 | FastCredit025 | 99.63 | 97.88 | 42.38 | 26.75 |
+| L2 | TRLOO baseline | 99.75 | 81.25 | 22.25 | 12.75 |
+| L2 | FastCredit025 | 99.63 | 81.25 | 25.50 | 15.88 |
+| L3 | TRLOO baseline | 76.00 | 44.00 | 8.00 | 6.00 |
+| L3 | FastCredit025 | 65.25 | 40.00 | 4.75 | 3.00 |
+
+### 最后一轮质量与截断
+
+三轮最佳会保留前面已经做对的结果，因此还要看最终交付质量。本次首轮 Correct 略高，但第三轮 Correct 更低；仅看 Best Correct 会掩盖这一差异
+
+| Level | Baseline 首轮 Correct（%） | 本次首轮 Correct（%） | Baseline 第三轮 Correct（%） | 本次第三轮 Correct（%） |
+|---|---:|---:|---:|---:|
+| L1 | 85.00 | 89.25 | 78.38 | 67.13 |
+| L2 | 59.38 | 62.25 | 61.13 | 49.00 |
+| L3 | 19.00 | 19.50 | 29.25 | 21.75 |
+
+| 指标 | TRLOO baseline（%） | FastCredit025（%） |
+|---|---:|---:|
+| 全部生成轮次的截断比例 | 12.40 | 25.57 |
+
+人工抽查的 L1 `group_id=53` 展示了这个问题：第一轮错误调用 `ShapeView.has_value()` 导致编译失败，第二轮修正后正确；第三轮为优化性能继续推导 shared-memory bank conflict，最终思考截断、没有交付完整实现。该样例说明“已经修好又未完成输出”确实存在，不代表这一模式的全体占比；[完整三轮源码与反馈](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/manual_examples.json)保存在本地证据目录
+
+这些是本次运行的点估计，尚未做题级配对 bootstrap 或多次训练重复，暂不判断统计显著性，也不把截断增长单独归因于 component credit。抽查还发现 L2 `group_id=16` 的第一、三轮返回 `WorkerProcessCrashed`，原因未闭合；作业成功、没有生成 abort，不等于所有任务级失败都已排除环境因素
+
+### 协议与完成情况
+
+本轮训练使用正确且 speedup ≥ 1 门槛、来源系数 0.25、取消最终回报封顶，完成 100 次更新后停止，保留 step80/100 源 checkpoint。评测沿用相同 canonical L1–L3 数据、每题 8 条轨迹、三轮 24K/32K/40K、BF16/MTP3、temperature 1、medium、finalize none；baseline 使用 24 H20，本次使用 32 H20
+
+评测于 2026-09-14 06:06（UTC+9）成功结束，耗时约 85 分钟，全部轨迹与三轮反馈收齐，无生成 abort 或缺失 env_result。raw env_state 的独立计数与维护 summarizer 一致；收尾回执确认此次四节点评测 GPU 已释放，未恢复训练。配置、运行边界和验收入口见[本轮评测记录](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/README.md)，逐轮数据见[原始计数](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/results_audit.json)与[完整汇总](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/summary.txt)
+
+本节表格按原始计数统一四舍五入到两位小数；原始汇总使用不同的半数舍入规则，个别末位可能不同，底层计数没有变化
+
+## Source-component reward step100
+
+本节对应历史 source-component `replace` 目标，区别于前述 additive FastCredit。训练按用户指令停止后，评测完成 100 次更新的 `iter_0000099`。四节点的八个 TP4 引擎完成全部 2,000 条三轮轨迹、6,000 轮记录，作业成功且独立计数与维护汇总一致，耗时约 93 分钟。收尾记录确认本次使用的 32 张 H20 已释放，未恢复训练
+
+分母 L1/L2/L3 为全部 800/800/400 条轨迹，失败保留在分母。三轮最佳按每条轨迹任一轮达到相应指标统计，不是最后一轮或 pass@8；本表保留三位小数
+
+| Level | 首轮 Correct (%) | 第三轮 Correct (%) | 三轮最佳 Correct (%) | 三轮最佳 Fast@1.0 (%) | 三轮最佳 Fast@1.2 (%) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| L1 | 50.375 | 34.375 | 81.875 | 37.750 | 24.125 |
+| L2 | 24.625 | 23.625 | 50.375 | 15.875 | 7.750 |
+| L3 | 6.500 | 10.750 | 18.500 | 4.250 | 3.000 |
+
+沿用下节基线的三轮 24K/32K/40K、BF16/MTP3、temperature1、canonical 数据、每题 8 samples 和 finalize none。三轮最佳 Correct 相比基线分别下降 15.625/30.875/25.500 个百分点，截断从 12.40% 增至 46.63%。人工抽查可见长推导和代码未完成；模型/数据身份、权重导出、执行包和计数核对未发现错误，训练目标与退化之间的因果链尚未建立
+
+详细各轮分数、输出抽查、3 条含 replacement 字符的响应及并发边界见 [source-component step100 报告](../../local_artifacts/component_reward_training/step100_eval_20260912/results.md)。本次没有生成 abort、缺失反馈或 OOM；截断属于有计分记录的失败输出
+
+## v4_1 三轮 TRLOO step100
+
+用户要求停止三轮 packed TRLOO 训练并测试 step100，评测读取 `iter_0000099`。模型、optimizer 源 checkpoint 均保留，训练未恢复；评测作业 `qwen38-v4-1-trloo-step100-kernelbench-3turn-3nodes-20260908` 成功结束，使用三个节点共 24 张 H20，结束后已释放。canonical L1/L2/L3 各 100/100/50 题、每题 8 条三轮轨迹，2000 条轨迹、6000 条记录完整，无缺失反馈或生成 abort
+
+| Level | 首轮 Correct (%) | 第三轮 Correct (%) | 三轮最佳 Correct (%) | 三轮最佳 Fast@1.0 (%) | 三轮最佳 Fast@1.2 (%) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| L1 | 85.00 | 78.38 | 97.50 | 43.38 | 24.63 |
+| L2 | 59.38 | 61.13 | 81.25 | 22.25 | 12.75 |
+| L3 | 19.00 | 29.25 | 44.00 | 8.00 | 6.00 |
+
+三轮最佳是每条轨迹任一轮达到指标，分母保持每档全部轨迹，并非 pass@8 或最后一轮质量。L1 有 135 条首轮正确但第三轮错误的轨迹，82 条首轮错误但第三轮正确；因此最佳分数依赖保留并选择已验证候选，不能直接当作最后输出效果
+
+本次使用 BF16、原生 MTP3、三轮 24K/32K/40K、temperature1、FA3/Triton、CUDA Graph、tvm_ffi、finalize none，区别于以下单轮 no-spec 结果。为导出当前 checkpoint，串行转换器补充 GDN 分段 DCP 的合并，27 项 CPU 测试、完整张量形状/有限性审计与源张量抽查通过。配置、扩容边界、原始数据与独立计数由[step100 三轮评测报告](../../local_artifacts/qwen38/trloo_v4_1_step100_eval_20260908/results.md)统一维护
 
 ## 结论
 

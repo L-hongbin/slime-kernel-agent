@@ -350,11 +350,17 @@ step 使用零基日志编号。每项指标每个窗口覆盖十个 batch；rol
 
 在所有 rollout 环境安装 `tools/data/trajectory_structure/requirements.txt`，使用维护 launcher 时设置 `COMPONENT_REWARD=1 COMPONENT_REWARD_BACKEND=source COMPONENT_REWARD_MODE=trloo-credit-additive COMPONENT_REWARD_SCALE=0.25 COMPONENT_REWARD_MIN_SPEEDUP=1.0`。加奖模式沿用 baseline 动态过滤，省略 mode 时仍为历史 `replace` 模式
 
+### FastCredit025 step100 的同预算评测
+
+正确且实测 speedup ≥ 1 才加来源 bonus、系数 0.25、累计回报不封顶的 FastCredit025 完成 100 次更新后，已按三轮 24K/32K/40K 协议评测。与同预算 TRLOO baseline 相比，L1/L2 Best Correct 接近，L2 Fast 更高，但 L3 的 Compile、Correct 和 Fast 均更低；第三轮 Correct 三档均下降，整体截断更多
+
+本次对照未显示全面收益，也不能将差异归因于单一机制。逐轮与最佳指标、分母、运行差异及人工样例统一见 [FastCredit025 step100 评测](../qwen38/kernelbench_eval.md#fastcredit025-step100)。这些是单次评测点估计，未做题级配对显著性检验或重复训练
+
 ### 历史替代式目标的训练配置与执行
 
 训练以最新 v4_1 packed 三轮 TRLOO 为 baseline，使用原始 release actor checkpoint 创建新实验，不从旧 step119 续跑。源码分奖在 slime 内完成，KernelGym 沿用已有评测 URL 与正常评测预算
 
-正式作业为 `raysubmit_gBanNugYvJf2nrHv`，曲线见 [W&B](https://wandb.ai/shuailin_chen/slime/runs/60pc5qed)。首个更新训练用时 865.9 秒，更新后回灌用时 1.3 秒；目前只确认训练闭环运行正常，尚未产生可与 baseline 比较的 checkpoint 结果
+历史替代式作业 `raysubmit_gBanNugYvJf2nrHv` 已停止，step100 完成 KernelBench L1–L3 三轮评测。三档 Best Correct 均低于同预算 TRLOO baseline，截断明显增加；尚未建立训练目标与退化之间的因果链。完整结果与验证边界见 [replace step100 评测](../qwen38/kernelbench_eval.md#source-component-reward-step100)，不与 additive FastCredit 结果混合；训练曲线见 [W&B](https://wandb.ai/shuailin_chen/slime/runs/60pc5qed)
 
 | 项目 | 配置 |
 |---|---|
@@ -388,7 +394,7 @@ Ray 临时数据应放在满足容量要求的存储上，避免触发磁盘使�
 - **额外加奖不保证 advantage 增加**：最终目标满足 $Y_t\ge G_t$，同题同轮的其它回答也可能加奖，因此 leave-one-out advantage 仍可能降低。正确且 speedup ≥ 1 的门槛收紧了来源覆盖，当前重点观察实际加奖比例，不能只统计有合格答案的轨迹比例
 - **零系数恢复 baseline 数值目标**：当前没有封顶，系数为零时 $Y_t=G_t$，过滤与训练 mask 也保持 baseline；源码分析与日志记录仍会执行，因此计算开销不等于关闭 component 功能
 - **baseline 已移除的失败轮保持排除**：source 搜索在 baseline finalize 后执行。若最早来源被 soft-finalize 移除，则在后续合法轮次中重找；这会漏掉某些中间失败贡献，但不会改变 baseline 的有效 token 集合和 MTP 归一化
-- **训练收益需独立验证**：等权来源份额和正确且 speedup ≥ 1 的门槛都是启发式，来源匹配成功不能推出训练有效
+- **训练收益需独立验证**：同预算 step100 对照未显示全面收益，结论见[评测摘要](#fastcredit025-step100-的同预算评测)。等权来源份额和正确且 speedup ≥ 1 的门槛均为启发式，来源匹配成功不能推出训练有效
 
 ### 策略识别与来源追踪
 
