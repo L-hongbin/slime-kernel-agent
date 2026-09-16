@@ -14,6 +14,7 @@ from transformers import AutoConfig
 from typing_extensions import override
 
 from slime.backends.megatron_utils.megatron_to_hf import convert_to_hf, remove_padding
+from slime.backends.megatron_utils.megatron_to_hf.qwen3_5 import merge_gdn_checkpoint_sections
 
 
 class UnpicklerWrapper(pickle.Unpickler):
@@ -229,6 +230,9 @@ if __name__ == "__main__":
         no_dist=True,
     )
     print(f"model loaded in {time.time()-t:.2f} sec.")
+
+    if "qwen3_5" in args.model_name:
+        merge_gdn_checkpoint_sections(state_dict, megatron_args.tensor_model_parallel_size)
 
     save_tensors(
         megatron_args,

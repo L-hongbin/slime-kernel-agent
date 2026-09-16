@@ -204,6 +204,61 @@ def test_native_gdn_converter_restores_hf_projection_order(monkeypatch):
     assert converted[3][1][:, 0].tolist() == [6.0] * 2
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+def test_native_gdn_checkpoint_sections_export_in_global_hf_order(monkeypatch, tp_size):
+    monkeypatch.setattr(qwen3_5_converter, "_load_qwen_gdn_dimensions", lambda _: (4, 8, 4))
+    sections = ("query", "key", "value", "z", "beta", "alpha")
+    lengths = (4, 4, 8, 8, 4, 4)
+    prefix = "decoder.layers.0.self_attention"
+    weights = {
+        section: torch.arange(length * 3, dtype=torch.float32).reshape(length, 3) + 1000 * index
+        for index, (section, length) in enumerate(zip(sections, lengths, strict=True))
+    }
+    conv = {section: weight[:, :2].unsqueeze(1).clone() for section, weight in list(weights.items())[:3]}
+    state = {f"{prefix}.in_proj.weight.{section}": weight for section, weight in weights.items()}
+    state.update({f"{prefix}.conv1d.weight.{section}": weight for section, weight in conv.items()})
+    sentinel = torch.tensor([7.0])
+    state["mtp.layers.0.enorm.weight"] = sentinel
+    qwen3_5_converter.merge_gdn_checkpoint_sections(state, tp_size)
+    assert set(state) == {f"{prefix}.in_proj.weight", f"{prefix}.conv1d.weight", "mtp.layers.0.enorm.weight"}
+    assert state["mtp.layers.0.enorm.weight"] is sentinel
+    args = SimpleNamespace(hf_checkpoint="unused", tensor_model_parallel_size=tp_size)
+    converted = dict(
+        qwen3_5_converter.convert_qwen3_5_to_hf(
+            args, f"module.module.{prefix}.in_proj.weight", state[f"{prefix}.in_proj.weight"]
+        )
+    )
+    hf = "model.language_model.layers.0.linear_attn"
+    assert torch.equal(converted[f"{hf}.in_proj_qkv.weight"], torch.cat([weights[s] for s in sections[:3]]))
+    for section, hf_section in [("z", "z"), ("beta", "b"), ("alpha", "a")]:
+        assert torch.equal(converted[f"{hf}.in_proj_{hf_section}.weight"], weights[section])
+    converted_conv = dict(
+        qwen3_5_converter.convert_qwen3_5_to_hf(
+            args, f"module.module.{prefix}.conv1d.weight", state[f"{prefix}.conv1d.weight"]
+        )
+    )
+    assert torch.equal(converted_conv[f"{hf}.conv1d.weight"], torch.cat(list(conv.values())))
+
+
+@pytest.mark.parametrize("conflict", [False, True])
+def test_native_gdn_checkpoint_sections_reject_partial_or_mixed_layout(conflict):
+    prefix = "decoder.layers.0.self_attention.conv1d.weight"
+    state = {f"{prefix}.query": torch.ones(4, 1, 4)}
+    if conflict:
+        state.update(
+            {
+                f"{prefix}.key": torch.ones(4, 1, 4),
+                f"{prefix}.value": torch.ones(8, 1, 4),
+                prefix: torch.ones(16, 1, 4),
+            }
+        )
+    before = dict(state)
+    with pytest.raises(ValueError, match="Incomplete or conflicting"):
+        qwen3_5_converter.merge_gdn_checkpoint_sections(state, 4)
+    assert state.keys() == before.keys()
+    assert all(state[key] is value for key, value in before.items())
+
+
 def test_native_gdn_fp8_quantization_preserves_b_and_a(monkeypatch):
     quantized_names = []
 

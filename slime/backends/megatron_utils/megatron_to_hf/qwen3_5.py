@@ -33,6 +33,31 @@ def interleave_gdn_tp_sections(sections: list[torch.Tensor], tp_size: int) -> to
     return torch.cat(rank_shards, dim=0)
 
 
+def merge_gdn_checkpoint_sections(state_dict: dict[str, torch.Tensor], tp_size: int) -> None:
+    """Restore fused native weights from MCore's global logical DCP sections.
+
+    Runtime weight gathering concatenates TP ranks, while the checkpoint's
+    ShardedTensorFactory saves Q/K/V/Z/beta/alpha independently. Repack those
+    sections before using the same per-parameter HF conversion as refit.
+    """
+    groups: dict[str, set[str]] = {}
+    pattern = r"^(.*\.self_attention\.(?:in_proj|conv1d)\.weight)\.(query|key|value|z|beta|alpha)$"
+    for name in state_dict:
+        match = re.match(pattern, name)
+        if match:
+            groups.setdefault(match[1], set()).add(match[2])
+    for prefix, found in groups.items():
+        sections = ("query", "key", "value", "z", "beta", "alpha")
+        if prefix.endswith("conv1d.weight"):
+            sections = sections[:3]
+        if found != set(sections) or prefix in state_dict:
+            raise ValueError(f"Incomplete or conflicting GDN checkpoint sections for {prefix}: {sorted(found)}")
+        weights = [state_dict[f"{prefix}.{section}"] for section in sections]
+        state_dict[prefix] = interleave_gdn_tp_sections(weights, tp_size)
+        for section in sections:
+            del state_dict[f"{prefix}.{section}"]
+
+
 def deinterleave_gdn_tp_sections(
     tensor: torch.Tensor, section_sizes: tuple[int, ...], tp_size: int
 ) -> list[torch.Tensor]:
