@@ -265,6 +265,37 @@ def test_checkpoint_fallback_preserves_explicit_start_rollout_id(megatron_to_hf_
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("resume", [False, True])
+def test_release_initialization_is_distinct_from_explicit_rl_resume(tmp_path, resume):
+    release = tmp_path / "initial_release"
+    release.mkdir()
+    (release / "latest_checkpointed_iteration.txt").write_text("release")
+    checkpoint = tmp_path / "trained_checkpoint"
+    checkpoint.mkdir()
+    (checkpoint / "latest_checkpointed_iteration.txt").write_text("99")
+    args = types.SimpleNamespace(
+        megatron_to_hf_mode="raw",
+        load=str(checkpoint) if resume else None,
+        ref_load=str(release),
+        hf_checkpoint="unused-fp8-rollout-model",
+        ref_ckpt_step=None,
+        ckpt_step=None,
+        no_load_optim=False,
+        no_load_rng=False,
+        finetune=False,
+        start_rollout_id=None,
+    )
+
+    _resolve_checkpoint_load_args(args)
+
+    assert args.load == str(checkpoint if resume else release)
+    assert args.no_load_optim is (not resume)
+    assert args.no_load_rng is (not resume)
+    assert args.finetune is (not resume)
+    assert args.start_rollout_id == (None if resume else 0)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize(
     ("model_tag", "expected_load_step"),
     [("ref", 12), ("teacher", 34), ("rollout_actor", 77)],
