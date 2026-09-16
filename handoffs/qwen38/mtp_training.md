@@ -14,9 +14,9 @@ Qwen3.8 27B 使用 Qwen3.5 架构定义，checkpoint 只有一个原生 MTP laye
 | trainer | 原生 MTP layer=1，单步 teacher forcing |
 | MTP loss | 单个 CE 目标系数 0.2；默认 per-token，由 MCore 按 step response token 统一归一化，MTP 与 policy 均补偿 CP |
 | 梯度 | MTP 输入的 target hidden、embedding 和 lm-head stop-gradient；主干继续接受原有 RL 梯度 |
-| actor | node69 + node70，TP4、PP2、CP2、SP，distributed FlashQLA GDN |
+| actor | 两台训练节点、16 张 H20，TP4、PP2、CP2、SP，distributed FlashQLA GDN |
 | PP 与重算 | 37 / 27 层，R27；MTP 单独重算，CE 投影也重算 |
-| rollout 硬件 | node53 + node64，四个 TP4 engine，CUDA graphs 开启 |
+| rollout 硬件 | 两台 rollout 节点、16 张 H20，四个 TP4 engine，CUDA graphs 开启 |
 | 精度与 payload | BF16 trainer、FP8 rollout、T=1、top-p=1、top-k=-1、sampled logprob + top-20 |
 | 正式批量 | 16 prompt groups × 16 samples = 256 轨迹 |
 | 三轮 context | 24576 / 32768 / 40960，保留原有 token history、TRLOO、反馈和过滤流程 |
@@ -51,7 +51,7 @@ CPU 回归覆盖 CP1/2/4、THD/BSHD 的标签布局与 padding、终止 token �
 
 真实 27B train-only 使用留存的 24 轮、8 条轨迹，输入总量从 673543 降为 275815 tokens，最长 40958；237108 个有效监督 token 的 step 分母为 237109，保留一个被过滤轮次的 clamp。人工复核 4 处模板修复：实际历史读入换行，MTP 标签仍监督原 `<|im_end|>`
 
-node69/70 的 TP4/PP2/CP2、SP、PP37/27、R27、BF16 distributed FlashQLA 完成一次非零 RL advantage 下的联合更新，actor train 66.54s、MTP loss 0.30694、grad norm 0.18024；作业 `raysubmit_nWKMZL7RFeXu48Cd` 成功。两节点 445 个运行源码 hash 一致，Ray 实际执行包的四个关键文件再次核对通过。此项检查从不可变 MTP actor 输入初始化，未保存 checkpoint、未创建 SGLang；不将单次 train-only 时间宣称为端到端提速，也未重跑 packing 下的 refit/恢复流程
+两台训练节点的 TP4/PP2/CP2、SP、PP37/27、R27、BF16 distributed FlashQLA 完成一次非零 RL advantage 下的联合更新，actor train 66.54s、MTP loss 0.30694、grad norm 0.18024；作业 `raysubmit_nWKMZL7RFeXu48Cd` 成功。两节点 445 个运行源码 hash 一致，Ray 实际执行包的四个关键文件再次核对通过。此项检查从不可变 MTP actor 输入初始化，未保存 checkpoint、未创建 SGLang；不将单次 train-only 时间宣称为端到端提速，也未重跑 packing 下的 refit/恢复流程
 
 独立只读审查认可输入/标签分离、CP2 布局和 per-token 归一化，未发现当前正确性错误。按审查补齐 DP→actor→真实 trainer forward 的标签回归，并直接 hook 原生 head 的 embedding 输入；旧 trainer 标签传递的进程内反事实被回归准确拒绝。27B 的 split/packed GDN 数值等价仍未宣称成立
 
@@ -87,7 +87,7 @@ MCore 在第一个 PP stage 保存共享 embedding，最后一个 stage 的 MTP 
 
 合入 `dev_csl2` 时保留两轮 context 默认、轨迹打包与诊断接口；合并后的定向 CPU 测试和两种归一化模式的两卡 CP2 回归通过。上述三轮完整训练数字来自合并前的源码快照，合并检查未重新运行四节点完整训练
 
-显存约每五秒采样一次，actor 的采样最大 resident 为 node69 60995MiB、node70 85748MiB。监控在任务退出阶段因 SSH 查询超时结束，数字属于采样最大值；不视为分配器精确峰值，也不据此宣称正式 256 轨迹的容量上限
+显存约每五秒采样一次，两台 actor 节点的采样最大 resident 分别为 60995MiB、85748MiB。监控在任务退出阶段因 SSH 查询超时结束，数字属于采样最大值；不视为分配器精确峰值，也不据此宣称正式 256 轨迹的容量上限
 
 独立审查确认单步 teacher forcing 语义成立，并指出生产 per-token 模式未在原测试中覆盖。核对 slime 的完整 response-token 计数与 MCore SUM/finalize 后，补测在修复前复现梯度仅为参考的一半，修复后两种模式均通过。`0.2` 保持为单步 CE 系数，CP 补偿与 policy 的分布式归一化约定一致
 
@@ -99,14 +99,42 @@ MCore 在第一个 PP stage 保存共享 embedding，最后一个 stage 的 MTP 
 
 ## 使用
 
-代码随 `dev_csl2` 维护，开发分支为 `feature/qwen38-mtp3-train`，GPU 实验证据保留在 `/nfs/FM/chenshuailin/projects/kernel_agents/slime-qwen38-mtp3-train`。先同步选定 checkout 的代码、数据与配置并核对 hash，在各自 `:23538` 容器内准备隔离的 SGLang 副本
+### v4_1 三轮 packed TRLOO 正式启动
+
+用户指定的 v4_1 三轮训练从不可变 BF16 MTP 输入初始化，启用 trajectory packing，`OVERLONG_PENALTY_FACTOR=0` 使 reward 函数直接跳过长度惩罚。两台节点训练、两台节点 rollout，每台 8 张 H20，MTP3 推理与单步 MTP teacher forcing 系数 0.2；其余使用上表的三轮 40K、256 轨迹、PP37/27 与 R27 配置
+
+作业 `raysubmit_SqMVX9e1pARFJJzq` 提交至专用 Ray 集群，[W&B quc7eiwz](https://wandb.ai/shuailin_chen/slime/runs/quc7eiwz)记录训练。配置、启动命令、源码与数据哈希、真实 prompt 抽样统一保存在[本次配置 review](../../local_artifacts/qwen38/trloo_v4_1_packed_mtp_20260906/config_review.md)，实际执行使用同目录 `runtime_repo` 快照；该记录不代表作业此刻仍在运行
+
+checkpoint 写入两台 actor 的节点本地实验目录，每 20 step 保存并保留最近两代完整 checkpoint；目录需满足清理器的实验路径约束，部署位置见 [RUNTIME.md](../../RUNTIME.md)。当时的冻结源码未读取首批留样上限，运行侧采用作业内保留器限制为首批加最新一批，详见配置 review。维护源码现已直接支持限量保存与最新批次原子替换，入口为 [RolloutManager](../../slime/ray/rollout.py)
+
+首批真实留样核对了 768 轮 → 256 条轨迹，输入 token 约 1,396 万 → 603 万，最长 40,956，未产生长度惩罚 metadata。actor 完成两个 optimizer step，MTP loss 分别为 0.30735 / 0.30499，grad norm 为 0.14463 / 0.15450，未达到首次 checkpoint 保存点
+
+首次训练后 refit 成功，但恢复长请求的 prefill 时，两个 rollout engine 在 input-logprob 的 `logits.float()` 分配 1.89 GiB 临时张量失败并退出。下一次回传访问退出 engine 的 `/pause_generation`，作业于 09:20:19 UTC 失败。[OOM 因果证据与修复候选](../../local_artifacts/qwen38/trloo_v4_1_packed_mtp_20260906/oom_diagnosis.md)记录默认 2048 行全词表 FP32 logits 的峰值、Ray 环境变量传递要求，以及保留 MTP3/CUDA Graph 的较小 chunk 与静态显存预算方案；诊断时尚未做候选方案的 GPU 回归，后续验收见下文；首轮 refit RPC 成功不能代替恢复生成检查
+
+### 维护入口
+
+维护 launcher 对 matched serving 默认使用 `SGLANG_LOGPROB_CHUNK_SIZE=256`、`SGLANG_MEM_FRACTION_STATIC=0.80`，并把 logprob chunk 开关和大小显式传入 Ray runtime_env。该配置针对上述 refit 后历史输出重算的全词表 FP32 logits 峰值，不改 MTP3、CUDA Graph、训练批量或上下文上限
+
+修复后的两节点四引擎隔离检查完成 128 条长请求、两次原生 MTP norm 权重的 NCCL 回传与恢复，共约 210 万输出 token；四引擎均存活，sampled/top-20 有限，流式样本已有 behavior logprob 保持不变。压力请求强制忽略 EOS，不用于生成质量结论；隔离检查只回传一个 MTP 参数，正式 actor 全量回传单独验收。配置、进程环境、显存采样、脚本修正与正式重启证据由[refit 显存修复配置](../../local_artifacts/qwen38/trloo_v4_1_refit_fix_20260906/config_review.md)统一维护
+
+正式修复作业为 `raysubmit_KXWmmCHVJCkDVGeZ`、[W&B ql06a0fc](https://wandb.ai/shuailin_chen/slime/runs/ql06a0fc)。首步 MTP loss=0.31339、grad norm=0.14291；全量 actor/MTP 回传后四引擎均完成恢复 prefill，后续 68 秒内每个引擎的生成 token 计数持续增长，未复现 OOM，当时第二步训练已开始。该回执验证首个训练后 refit，后续 checkpoint 与恢复结果单独记录
+
+该作业 step31 起的 rollout_time 突增对应 fully-async 完成队列库存耗尽，客户端评测耗时明显上升，MTP acceptance 与模型请求耗时保持稳定。实际等待函数已通过隔离 CPU Ray actor 复现心跳查询阻塞结果回收的问题；真实后端慢任务也有贡献，两者占比及最初触发点尚未确定。[rollout 等待分析](../../local_artifacts/qwen38/trloo_v4_1_refit_fix_20260906/timing_analysis/report.md)统一保存逐 step 指标、生产样例、复现与修复建议，本次分析没有修改或重启正式训练
+
+维护源码现已将结果 Future 与独立心跳 task 解耦，心跳超时或失败只停止该请求的心跳，结果返回不再经过默认线程池或控制查询。14 项 CPU 回归及已有 HTTP retry 回归通过；真实 Ray 对照中，结果就绪后的额外等待从约 806ms 降至 2.1ms，取消与异常路径通过。[结果等待修复](../../local_artifacts/qwen38/trloo_v4_1_refit_fix_20260906/result_wait_fix/report.md)保存源码 hash、验证、独立审查、结果下载采样，以及对用户提供的 KernelGym 输入生成分析的判断；源码验收时未在线替换，部署在后续 step40 恢复中完成
+
+按用户指令停止旧作业后，从已完成的 `iter_0000039` 恢复，新作业为 `raysubmit_qgM4kabv9iZYm6nB`、[W&B ffe0dbz3](https://wandb.ai/shuailin_chen/slime/runs/ffe0dbz3)。32 个 checkpoint 分片固定到独立保存目录，恢复模型、optimizer、调度器和数据源状态，下一次编号为 40；仅结果等待修复进入新源码快照。四节点实际 Ray 包核对通过，actor/MTP 回传后四引擎持续生成，rollout40 已开始。启动验收时尚未完成恢复后的第一个 optimizer step；[恢复配置与证据](../../local_artifacts/qwen38/trloo_v4_1_resume40_waitfix_20260907/config_review.md)统一记录路径、参数、加载日志及 KernelGym 部署等待，不据初始冷启动时间推算稳态吞吐
+
+该恢复作业后续完成到零基日志编号 119，并在训练编号 120 期间按用户指令停止。停止前已完成的两代 checkpoint 为 `iter_0000099`、`iter_0000119`；step100 的两节点分片另行合并导出，用原生 MTP3 完成 KernelBench L1–L3 三轮评测。分数、导出格式修复和验证边界见 [KernelBench 评测](kernelbench_eval.md#v4_1-三轮-trloo-step100)，训练保持停止
+
+代码随 `dev_csl2` 维护，GPU 实验证据与隔离 SGLang 副本使用当前工作区 `local_artifacts/qwen38/` 入口；早期单步／三深度产物的可用性见文末。旧实验 worktree 已移除；其历史 HEAD `9ff07faf` 由 tag `archive/qwen38-mtp3-train-20260911` 和独立 Git bundle 保留，源码及未跟踪文件见[归档清单](../../local_artifacts/worktree_cleanup/20260911_152306/source_manifest.json)。模型文件及缺失产物通过同文件系统重命名迁入，已有同 inode 文件保留当前目录项，逐项对应见[迁移清单](../../local_artifacts/worktree_cleanup/20260911_152306/artifact_migration.json)。先同步选定 checkout 的代码、数据与配置并核对 hash，在各自运行容器内准备隔离的 SGLang 副本，机器和端口映射见 [RUNTIME.md](../../RUNTIME.md)；本地路径迁移不代表远端部署已更新或重新通过 GPU 验收
 
 ```bash
 python scripts/patch_sglang_qwen_mtp.py \
   --overlay-dir local_artifacts/qwen38/mtp_runtime
 ```
 
-在 node70 容器启动维护入口；默认四节点、MTP3 rollout 和单步 teacher forcing。共享 Ray 已由其它会话使用时，协调 GPU 资源后设置 `REUSE_RAY_CLUSTER=1`
+在 Ray head 的运行容器内启动维护入口；默认四节点、MTP3 rollout 和单步 teacher forcing。共享 Ray 已由其它会话使用时，协调 GPU 资源后设置 `REUSE_RAY_CLUSTER=1`
 
 ```bash
 MAX_TURNS=3 MAX_CONTEXT_LEN=40960 \
@@ -123,8 +151,10 @@ bash examples/kernel_agent/run.t1.qwen3.8.27B.fasync.sh
 - [单步 MTP trainer](../../slime_plugins/models/qwen3_5_mtp.py)、[模型接入](../../slime/backends/megatron_utils/model_provider.py)、[两卡 CP2 回归](../../tests/test_qwen3_5_mtp_training.py)
 - [SGLang 补丁](../../scripts/patch_sglang_qwen_mtp.py)、[engine 参数](../../slime/backends/sglang_utils/sglang_engine.py)、[context 预算](../../examples/kernel_agent/generate_with_cuda_agent.py)
 - [节点本地恢复缓存](../../scripts/prepare_mtp_resume_view.py)、[训练入口](../../examples/kernel_agent/run.t1.qwen3.8.27B.fasync.sh)
-- [单步训练产物](../../local_artifacts/qwen38/mtp1_train_20260906/)：`source_manifest_*.json`、`ray_bundle_manifest.json`、`train1_source.tar.gz`、`mtp1_cp2_both_modes.log`、`per_token_before_fix.log`、`final_review_verdict.txt`、`review_response.md`
+- 单步训练产物原目录 `local_artifacts/qwen38/mtp1_train_20260906/`：`source_manifest_*.json`、`ray_bundle_manifest.json`、`train1_source.tar.gz`、`mtp1_cp2_both_modes.log`、`per_token_before_fix.log`、`final_review_verdict.txt`、`review_response.md`
 - 完整环路的本地摘要与样本：`full_loop_metrics.json`、`full_loop_data_audit.json`、`full_loop_checkpoint_audit.json`、`full_loop_log_audit.json`、`mtp_checkpoint_delta.json`、`full_loop_manual_samples.txt`、`partial_memory_summary.json`；恢复证据为 `resume40k_metrics.json` 和 `resume40k_audit.json`
-- node70 同路径的 `train40k_engine.log`、`full_loop_engine.log`、`resume40k_engine.log` 和 `full_loop_rollout_0.pt` 保存原始训练证据；checkpoint storage 分布在 node69/node70 的 `full_loop_checkpoints/`
-- [此前基础设施与三深度实验原始产物](../../local_artifacts/qwen38/mtp3_train_20260905/)：`refit_*.json`、`actor_checkpoint_manifest_*.json`、`production_data_audit.json`、`production_checkpoint_audit.json`；该目录的训练产物不属于当前单步方案
+- 运行容器中的 `train40k_engine.log`、`full_loop_engine.log`、`resume40k_engine.log` 和 `full_loop_rollout_0.pt` 保存原始训练证据；两台 actor 分别保留 `full_loop_checkpoints/` 分片，部署位置见 [RUNTIME.md](../../RUNTIME.md)
+- 此前基础设施与三深度实验原目录 `local_artifacts/qwen38/mtp3_train_20260905/`：`refit_*.json`、`actor_checkpoint_manifest_*.json`、`production_data_audit.json`、`production_checkpoint_audit.json`；该目录的训练产物不属于当前单步方案
 - [DFlash2 接入分析](dflash2.md) 单独维护外部 draft 的运行时差距、训练接入与社区问题
+
+上述 `mtp1_train_20260906` 与 `mtp3_train_20260905` 入口在本次文档核查时仍是指向已移除 worktree 的失效链接。[迁移清单](../../local_artifacts/worktree_cleanup/20260911_152306/artifact_migration.json)保留文件名与当时的迁移记录，但不能替代原始内容；相关早期验证沿用历史记录，本次未重新读取这些产物或复跑 GPU 验证

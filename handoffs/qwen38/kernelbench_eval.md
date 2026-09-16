@@ -367,7 +367,7 @@ FastCredit025 在反馈后的 thinking 中位长度三档均更长，answer 中�
 
 本次使用 BF16、原生 MTP3、三轮 24K/32K/40K、temperature1、FA3/Triton、CUDA Graph、tvm_ffi、finalize none，区别于以下单轮 no-spec 结果。为导出当前 checkpoint，串行转换器补充 GDN 分段 DCP 的合并，27 项 CPU 测试、完整张量形状/有限性审计与源张量抽查通过。配置、扩容边界、原始数据与独立计数由[step100 三轮评测报告](../../local_artifacts/qwen38/trloo_v4_1_step100_eval_20260908/results.md)统一维护
 
-## 结论
+## DataV2 / DataV4 / 新 reward 单轮结论
 
 新 DataV4 lineage 明显强于旧版 DataV2 lineage。最可比的同 step80 结果中，逐 trajectory Correct 在 L1/L2/L3 分别从 **78.250%/38.375%/6.000%** 提升到 **87.250%/60.625%/16.750%**，即 **+9.000/+22.250/+10.750 pct-pt**。按题目配对的 20,000 次 bootstrap 95% CI 分别为 `[+4.750,+13.375]`、`[+16.375,+28.250]`、`[+5.000,+17.250]` pct-pt，三档提升都稳定为正
 

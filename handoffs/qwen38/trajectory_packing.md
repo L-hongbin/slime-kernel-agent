@@ -4,7 +4,7 @@
 
 本次验收检查训练目标与权重合同、高精度数学等价、真实训练执行和单步计算收益，并继续追查生产 BF16 的巨大梯度差异。只比较 reward 不足以发现 mask、target、loss 分母或模型导数变化。真实回放及固定系数、固定形状对照已完成；长期训练质量及端到端提速未验证
 
-实现位于 [trajectory_packing.py](../../slime/utils/trajectory_packing.py)，由 [RolloutManager](../../slime/ray/rollout.py) 在 reward postprocess 之后、DP schedule 之前调用。新 worktree 为 `/nfs/FM/chenshuailin/projects/kernel_agents/slime-trloo-packed-trajectories`，分支 `feature/trloo-packed-trajectories`，基线为 `dev_csl2` 的 `9e25fd9a`
+实现随 `dev_csl2` 维护，位于 [trajectory_packing.py](../../slime/utils/trajectory_packing.py)，由 [RolloutManager](../../slime/ray/rollout.py) 在 reward postprocess 之后、DP schedule 之前调用
 
 ## 配置
 
@@ -55,7 +55,7 @@ CPU 检查及相关回归共 123 项通过（含 replay capture 的保存与异�
 
 ## 正式 27B 固定回放
 
-2026-09-05 在 node69/70/53 的专用容器内完成真实三轮 rollout；训练采用 node69/70 的 H20×16、TP4/PP2/CP2、SP、PP33/31、R31、BF16 与 distributed FlashQLA。三节点 1197 个源码文件 hash 一致；[源码清单](../../local_artifacts/trloo_packing/formal/source_manifest.json)、节点 provenance、各组完整环境 JSON 和原始日志保存在同一 formal 目录。actor checkpoint 使用 `torch_dist_tp4_pp2_distributed_gdn_flashqla/release`
+2026-09-05 在三台节点的专用容器内完成真实三轮 rollout；训练采用两台节点的 H20×16、TP4/PP2/CP2、SP、PP33/31、R31、BF16 与 distributed FlashQLA。三节点 1197 个源码文件 hash 一致；[源码清单](../../local_artifacts/trloo_packing/formal/source_manifest.json)、节点 provenance、各组完整环境 JSON 和原始日志保存在同一 formal 目录。actor checkpoint 使用 `torch_dist_tp4_pp2_distributed_gdn_flashqla/release`
 
 [真实 rollout](../../local_artifacts/trloo_packing/formal/rollout_0.pt) 的 SHA256 为 `6e90bdd2aa0a9f094f07ef93ce457be08e4ecdb444c2611d9365549962315582`，含 2 个 prompt、8 条 trajectory、24 个真实 turn。原始输入共 673543 token，合并后 275815 token，最长 40958；237108 个评分 token 均有非零 advantage，4 处结束 token target 覆盖。有一轮被过滤，原分母的 clamp 使总 normalization count 为 237109。输入、反馈与结束位置已人工抽查，见[审计](../../local_artifacts/trloo_packing/formal/rollout_audit.json)和[真实文本](../../local_artifacts/trloo_packing/formal/real_train_example.txt)
 
