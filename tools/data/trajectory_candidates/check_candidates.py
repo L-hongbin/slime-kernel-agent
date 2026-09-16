@@ -1,12 +1,19 @@
-"""CPU-only candidate-screening behavioral checks."""
+"""CPU-only candidate-screening and manual-audit behavioral checks."""
 
 import copy
+import hashlib
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tools.data.trajectory_structure.check_structure import response
 from tools.data.trajectory_structure.structure import analyze_trajectory
 
-from .screen import Protocol, cues, decision_facts, observation_state, review_selection, screen_trajectory
+from .audit import raw_timing_evidence, run
+from .screen import Protocol, cues, decision_facts, observation_state, review_selection, screen_trajectory, sha
+
+NUM_GPUS = 0
 
 
 def fixture(speeds, codes=None):
@@ -194,6 +201,170 @@ class CandidateChecks(unittest.TestCase):
         self.assertEqual(len(selection), 20)
         self.assertEqual(len({s["trajectory_id"] for s in selection}), 20)
         self.assertEqual(sum(s["stratum"].startswith("control") for s in selection), 10)
+
+
+class AuditChecks(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.raw_path = self.root / "raw/g000.json"
+        self.raw = [
+            {
+                "turn_idx": i,
+                "response": f"saved response {i}",
+                "env_result": {
+                    "env_state": {
+                        "reference_runtime": 2.0,
+                        "kernel_runtime": 1.0,
+                        "speedup": 2.0,
+                        "metadata": {"num_perf_trials": 10, "profiling": {"kernels": [{"name": "kernel"}]}},
+                    },
+                    "env_extra_info": {"kernel_perf_cv": 0.03},
+                },
+            }
+            for i in range(2)
+        ]
+        self.structure = {
+            "turns": [
+                {
+                    "turn_idx": row["turn_idx"],
+                    "observation": {"response_sha256": hashlib.sha256(row["response"].encode()).hexdigest()},
+                }
+                for row in self.raw
+            ]
+        }
+        self.source_path = self.root / "structure/trajectories/case.json"
+        self.write(self.source_path, self.structure)
+        self.source_manifest = {"inputs": [{"name": "model", "path": str(self.raw_path.parent), "files": {}}]}
+        self.screened = {
+            "identity": ["model", "dev", "reference", "1", "0"],
+            "trajectory_id": "case",
+            "source_path": str(self.source_path),
+            "flags": {"candidate": True},
+            "uncertain_windows": [],
+            "timeline": [{"turn_idx": i, "state": "correct_timed"} for i in range(2)],
+        }
+        self.save_raw()
+        self.write(self.root / "structure/manifest.json", self.source_manifest)
+        self.manifest = {
+            "code_and_inputs_unchanged": True,
+            "input_dir": str(self.root / "structure"),
+            "input_manifest_sha256": sha(self.root / "structure/manifest.json"),
+            "input_files": {"trajectories/case.json": sha(self.source_path)},
+        }
+        self.write(self.root / "screen/manifest.json", self.manifest)
+        self.write(self.root / "screen/trajectories/case.json", self.screened)
+        self.selection = [{**self.screened, "stratum": "candidate"}]
+        self.write(self.root / "screen/review_selection.json", self.selection)
+        self.annotations = {
+            "scope": "fixture source review",
+            "cases": [
+                {
+                    "model": "model",
+                    "group": 0,
+                    "verdict": "control",
+                    "note": "Observed code is unchanged",
+                    "evidence": "T1 and T2 selected source",
+                    "priority": "none",
+                    "decision_class": "lexical_only",
+                }
+            ],
+        }
+        self.write(self.root / "annotations.json", self.annotations)
+
+    def write(self, path, value):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(value))
+
+    def save_raw(self):
+        self.write(self.raw_path, self.raw)
+        self.source_manifest["inputs"][0]["files"]["g000.json"] = sha(self.raw_path)
+
+    def evidence(self):
+        return raw_timing_evidence(self.screened, self.structure, self.source_manifest)
+
+    def audit(self):
+        run(self.root / "screen", self.root / "annotations.json", self.root / "output")
+
+    def test_human_verdict_is_preserved_independently_of_flags(self):
+        self.audit()
+        case = json.loads((self.root / "output/cases.json").read_text())[0]
+        self.assertEqual(case["verdict"], "control")
+        self.assertTrue(case["current_flags"]["candidate"])
+        self.assertEqual(case["causal_contribution"], "not_tested")
+        timing = case["raw_timing"]["timings"][0]
+        self.assertEqual(timing["num_perf_trials"], 10)
+        self.assertEqual(timing["kernel_perf_cv"], 0.03)
+        self.assertEqual(timing["profiling_kernels"], [{"name": "kernel"}])
+        self.assertTrue(timing["ratio_consistent"])
+
+    def test_duplicate_annotations_rejected(self):
+        self.annotations["cases"] *= 2
+        self.write(self.root / "annotations.json", self.annotations)
+        with self.assertRaisesRegex(ValueError, "duplicate manual"):
+            self.audit()
+
+    def test_missing_annotations_rejected(self):
+        self.annotations["cases"] = []
+        self.write(self.root / "annotations.json", self.annotations)
+        with self.assertRaisesRegex(ValueError, "incomplete audit"):
+            self.audit()
+
+    def test_invalid_manual_verdict_rejected(self):
+        self.annotations["cases"][0]["verdict"] = "automatic"
+        self.write(self.root / "annotations.json", self.annotations)
+        with self.assertRaisesRegex(ValueError, "invalid manual"):
+            self.audit()
+
+    def test_changed_raw_input_rejected(self):
+        self.raw_path.write_text("[]")
+        with self.assertRaisesRegex(ValueError, "raw input changed"):
+            self.evidence()
+
+    def test_response_mismatch_rejected(self):
+        self.raw[0]["response"] = "different response"
+        self.save_raw()
+        with self.assertRaisesRegex(ValueError, "response mismatch"):
+            self.evidence()
+
+    def test_inconsistent_timing_ratio_rejected(self):
+        self.raw[0]["env_result"]["env_state"]["speedup"] = 3.0
+        self.save_raw()
+        with self.assertRaisesRegex(ValueError, "inconsistent timing ratio"):
+            self.evidence()
+
+    def test_duplicate_cannot_mask_missing_turn(self):
+        self.raw = [self.raw[0], self.raw[0]]
+        self.save_raw()
+        with self.assertRaisesRegex(ValueError, "duplicate raw turn"):
+            self.evidence()
+
+    def test_missing_turn_rejected(self):
+        self.raw.pop()
+        self.save_raw()
+        with self.assertRaisesRegex(ValueError, "turn coverage mismatch"):
+            self.evidence()
+
+    def test_unavailable_raw_evidence_is_explicit(self):
+        self.source_manifest["inputs"][0]["files"] = {}
+        self.assertEqual(self.evidence(), {"available": False})
+
+    def test_changed_structure_manifest_rejected(self):
+        self.write(self.root / "structure/manifest.json", {})
+        with self.assertRaisesRegex(ValueError, "structure manifest changed"):
+            self.audit()
+
+    def test_changed_structure_source_rejected(self):
+        self.write(self.source_path, {})
+        with self.assertRaisesRegex(ValueError, "structure input changed"):
+            self.audit()
+
+    def test_selection_identity_mismatch_rejected(self):
+        self.selection[0]["identity"] = ["model", "dev", "other_reference", "1", "0"]
+        self.write(self.root / "screen/review_selection.json", self.selection)
+        with self.assertRaisesRegex(ValueError, "selection identity mismatch"):
+            self.audit()
 
 
 if __name__ == "__main__":

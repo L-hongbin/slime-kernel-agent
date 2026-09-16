@@ -4,6 +4,12 @@
 under `Data/`; review evidence and large audits belong under
 `local_artifacts/`.
 
+Offline rollout structure extraction and cross-turn modification tracking:
+[trajectory_structure](trajectory_structure/README.md)
+
+E1.1 candidate screening and explicit manual source-review reports:
+[trajectory_candidates](trajectory_candidates/README.md)
+
 ## Current cleanup interface
 
 The production cleaner has one fixed acceptance policy. Callers choose input,
