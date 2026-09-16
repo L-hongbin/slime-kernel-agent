@@ -384,3 +384,52 @@ These commands process saved data without executing generated code or contacting
 a service. Collecting new observations requires a separate tracing adapter with
 a matching source manifest. Raw traces, argument snapshots and host API events
 remain separate from evaluator feedback and scored timing
+
+## State aggregation
+
+`state_aggregation.py` builds reference-aligned operation graphs with source
+evidence, bounded address checks, adjacent-turn differences and pairwise
+comparisons. Its adapters are maintained in `structural_state_pilot.py`; the
+address and comparison rules live in `semantic_state.py`
+
+```bash
+python -m tools.data.trajectory_structure.check_state_aggregation
+python -m tools.data.trajectory_structure.state_aggregation \
+  --structure-root /path/to/trajectory_structure \
+  --output /path/to/new_structural_state
+```
+
+This is a manually reviewed two-task adapter pilot: MLP and MiniGPTBlock, two
+trajectories per task/model, snapshots 1–4 (32 cards total). It does not claim
+automatic semantic mapping for arbitrary generated programs. Source locators
+were manually aligned to reference operations. Each snapshot describes the
+state before the *next* decision; future answers/results are excluded
+
+Cards distinguish `reference_inputs/reference_output` from `candidate_wiring`
+Initial parameter roles and MLP loop/activation mappings are manually reviewed
+The attention adapter tracks buffer value roles through selected driver calls;
+unsupported paths and untracked reads stay unknown. Operation mapping coverage
+means that the selected reference slots have source anchors, not that all
+execution paths or numerical contracts are validated
+
+The CPU address checker uses actual Sgemm/StridedBatchedGemm call arguments,
+driver-to-helper scalar argument binding, integer declarations read from the
+helper's source, and reviewed outer shape environments. It checks leading dimensions, selected factor addresses, batch
+strides/counts. A mismatch carries a concrete witness; a pass only means the
+checked address constraints agree. Scalar coefficients, complete numerical
+behavior, runtime aliasing, library heuristics, GemmEx/Lt descriptors and custom
+kernel correctness remain outside that check
+
+`same_computation_plan` compares operation implementations and tracked activation,
+weight/bias roles (including explicit transposes), not source text. It is a candidate relation for further inspection, not state
+or policy equivalence. `same_recorded_state` is an audit of equality of currently
+recorded facts, **not** a training merge rule. Unknown wiring cannot establish
+a match. Shared checked-address slots are reported separately, so whole-program
+differences do not erase local common structure. Whole-program Correct never
+sets an untested operator's local correctness to true
+
+Outputs include Markdown/JSON `cards/`, `pairs.json`, `transitions.json`,
+`summary.json` and a before/after source-stability `manifest.json`. The output
+directory must be new. No generated CUDA code is executed; no GPU, live
+KernelGym endpoint, reward change or RL update is involved
+Read the [method and manually inspected examples](../../../handoffs/paper/state_aggregation.md)
