@@ -309,3 +309,36 @@ this is not a general sampling pipeline, and no generated CUDA code is executed
 The historical frozen validation found no additional natural matches. Its
 original source hashes are required to reproduce that result; a run with current
 code is a separate validation. See the [method and manual findings](../../../handoffs/paper/component_reward_training.md)
+
+## Best-answer source membership
+
+`best_answer_credit.py` selects the earliest maximum among consistent correct
+recorded evaluations, then traces exact component versions and unique historical
+token blocks to their observed source turns
+
+```bash
+python -m tools.data.trajectory_structure.best_answer_credit \
+  --structure-root /path/to/trajectory_structure \
+  --coverage component \
+  --output /path/to/new_membership
+python -m tools.data.trajectory_structure.check_best_answer_credit
+```
+
+`--coverage component` keeps locally valid components from incomplete or partly
+malformed intermediate submissions. `--coverage program` requires whole-program
+coverage. If the winning answer's source is unavailable, the result remains
+unknown; the tool does not choose a lower-scoring answer instead
+
+Outputs contain component/token origins, exact-version first sightings,
+possible origins for unknown tokens, and per-turn membership (`1`, `0`, or
+`null`). A copied version retains its earlier origins. Short or repeated token
+matches remain uncertain; strict signature identity can miss cross-signature
+reuse. These are normalized syntax tokens, not model tokens
+
+The CLI uses diagnostic raw speedup for winner selection; the Python API accepts
+an explicit score mapping for `q(K)`. All-failed trajectories emit no membership
+labels. Output directories must be new, and the manifest records input/code
+hashes and their final stability checks. This is an offline retention heuristic:
+it neither establishes causal contribution nor modifies training rewards. The
+proposed retention-ratio return and current training method are discussed in
+[the component-reward report](../../../handoffs/paper/component_reward_training.md)
