@@ -5,20 +5,25 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from .extract import (
+    RUN,
+    Bindings,
     build_graph,
     conflicting_writes,
     entry_read_regions,
     gemm_accesses,
     launch_configuration,
     normalize_leases,
+    subtract_regions,
     union,
     version_dependencies,
     view_regions,
 )
 from .lineage import trace_best
 from .match import compare
+from .service_replay import _inline_schema_graph
 
 
 def node(identity, seq, reads=(), writes=(), stream=0, **extra):
@@ -78,6 +83,23 @@ def graph(nodes):
 
 
 class Regions(unittest.TestCase):
+    def test_exact_region_subtraction_preserves_holes(self):
+        self.assertEqual(subtract_regions([[0, 16], [24, 32]], [[4, 8], [12, 28]]), [[0, 4], [8, 12], [28, 32]])
+
+    def test_merged_region_split_at_storage_boundaries_and_gaps(self):
+        binding = Bindings(
+            [
+                {"id": "a", "base": 100, "bytes": 4, "first_seq": 0, "last_seq": None},
+                {"id": "b", "base": 104, "bytes": 4, "first_seq": 0, "last_seq": None},
+                {"id": "c", "base": 112, "bytes": 4, "first_seq": 0, "last_seq": None},
+            ],
+            1,
+        )
+        self.assertEqual(
+            [(a["id"] if a else None, o, n) for a, o, n in binding.pieces(102, 14)],
+            [("a", 2, 2), ("b", 0, 4), (None, 0, 4), ("c", 0, 4)],
+        )
+
     def test_union_keeps_holes(self):
         self.assertEqual(union([(0, 4), (4, 8), (12, 16)]), [[0, 8], [12, 16]])
 
@@ -130,6 +152,21 @@ class Regions(unittest.TestCase):
 
 
 class Versions(unittest.TestCase):
+    def test_inline_unknown_input_is_preserved_on_consumer(self):
+        g = graph([node("r", 1, reads=[("b", 0, 64)])])
+        original = copy.deepcopy(g)
+        inline = _inline_schema_graph(g)
+        self.assertEqual(g, original)
+        self.assertFalse(inline["edges"])
+        self.assertIn("input_provenance_unresolved", inline["nodes"][0]["unknowns"])
+        self.assertEqual(inline["nodes"][0]["evidence"]["unknown_input_dependencies"], original["edges"])
+
+    def test_inline_proven_null_source_is_rejected(self):
+        g = graph([node("r", 1, reads=[("b", 0, 64)])])
+        g["edges"][0]["certainty"] = "proven_region_dependency"
+        with self.assertRaisesRegex(ValueError, "invalid_unknown_dependency"):
+            _inline_schema_graph(g)
+
     def test_unknown_stream_mutation_needs_observed_sync(self):
         ns = [node("w", 2, writes=[("b", 0, 64)]), node("r", 3, reads=[("b", 0, 64)])]
         self.assertEqual(
@@ -280,6 +317,49 @@ class LibraryContracts(unittest.TestCase):
 
 
 class Correspondence(unittest.TestCase):
+    def test_digest_collision_is_rejected_even_with_asserts_disabled(self):
+        other = graph([node("different", 1, reads=[("a", 4, 64)], writes=[("c", 0, 64)])])
+        with patch("tools.data.runtime_trace.match.digest", return_value="collision"):
+            with self.assertRaisesRegex(ValueError, "digest collision"):
+                compare(self.g, other)
+
+    def test_fused_role_revision_keeps_identity_separate_from_version(self):
+        other = copy.deepcopy(self.g)
+        other["nodes"][0]["implementation"] = "revised-fused-body"
+        other["nodes"][0]["configuration"]["block"] = [256, 1, 1]
+        match = compare(self.g, other)["matches"][0]
+        self.assertTrue(match["identity_evidence_complete"])
+        self.assertEqual(match["version_relation"], "revised")
+        result = trace_best(
+            [
+                {"turn": 1, "correct": False, "score": 0, "graph": self.g},
+                {"turn": 2, "correct": True, "score": 1, "graph": other},
+            ]
+        )
+        self.assertEqual(result["components"][0]["earliest_observed_call_role_candidate"]["turn"], 1)
+        self.assertIsNone(result["components"][0]["earliest_observed_retained_match"])
+
+    def test_fusion_does_not_match_a_separate_stage(self):
+        split = graph(
+            [
+                node("a", 1, reads=[("a", 0, 64)], writes=[("b", 0, 64)]),
+                node("b", 2, reads=[("b", 0, 64)], writes=[("c", 0, 64)]),
+            ]
+        )
+        self.assertFalse(compare(split, self.g)["matches"])
+
+    def test_layout_change_does_not_nominate_same_identity(self):
+        other = copy.deepcopy(self.g)
+        other["buffers"][0]["views"] = [{"shape": [4, 4], "stride": [1, 4], "dtype": "float32"}]
+        self.assertFalse(compare(self.g, other)["matches"])
+
+    def test_unobserved_input_does_not_certify_role_identity(self):
+        other = copy.deepcopy(self.g)
+        other["edges"][0].update(source=None, certainty="entry_value_unobserved")
+        result = compare(other, other)
+        self.assertFalse(result["matches"][0]["identity_evidence_complete"])
+        self.assertNotEqual(result["matches"][0]["relation"], "retained_observed_component")
+
     def test_extended_launch_configuration_missing_is_unknown(self):
         self.assertTrue(launch_configuration({})[1])
         self.assertTrue(launch_configuration({"launch_num_attrs": 1})[1])
@@ -349,7 +429,7 @@ class Correspondence(unittest.TestCase):
 
 
 class BoundedCapture(unittest.TestCase):
-    def raw_graph(self, *, memory=False, finish=True, dropped=0, exact=True, inspected=True):
+    def raw_graph(self, *, memory=False, finish=True, dropped=0, exact=True, inspected=True, regions=None):
         records = [
             {"type": "config", "schema": "coarse-memory-runs/v1", "cta_limit": -1, "capacity": 1},
             {
@@ -372,9 +452,18 @@ class BoundedCapture(unittest.TestCase):
                 "unsupported_memory_instructions": 0,
             },
         ]
+        if regions is not None:
+            records.append({"type": "record_format", "format": "exact_byte_regions/v1"})
         if finish:
             records += [
-                {"type": "complete", "seq": 2, "id": 0, "runs": 0, "dropped": dropped, "drop_count_exact": exact},
+                {
+                    "type": "complete",
+                    "seq": 2,
+                    "id": 0,
+                    "runs": len(regions or []),
+                    "dropped": dropped,
+                    "drop_count_exact": exact,
+                },
                 {"type": "end", "seq": 3, "launches": 1},
             ]
         with tempfile.TemporaryDirectory() as directory:
@@ -383,8 +472,30 @@ class BoundedCapture(unittest.TestCase):
                 "\n".join(json.dumps(r) for r in records) + ("\n" if finish else '\n{"type":"complete","seq":')
             )
             if memory:
-                Path(str(prefix) + ".launch0.bin").write_bytes(b"")
+                Path(str(prefix) + ".launch0.bin").write_bytes(
+                    b"".join(RUN.pack(address, 0, length, 1, mode, 0) for address, length, mode in regions or [])
+                )
             return build_graph(prefix, buffers())
+
+    def test_region_summary_preserves_holes(self):
+        n = self.raw_graph(memory=True, regions=[(1024, 4, 1), (1032, 4, 1), (1280, 8, 2)])["nodes"][0]
+        self.assertEqual(n["reads"][0]["regions"], [[0, 4], [8, 12]])
+        self.assertTrue(n["footprint_complete"])
+
+    def test_region_inplace_keeps_version_unknown(self):
+        n = self.raw_graph(memory=True, regions=[(1024, 16, 1), (1028, 8, 2)])["nodes"][0]
+        self.assertEqual(n["reads"][0]["entry_regions"], [[0, 4], [12, 16]])
+        self.assertEqual(n["reads"][0]["internal_or_unordered_regions"], [[4, 12]])
+        self.assertIn("inplace_order_requires_detailed_capture", n["unknowns"])
+
+    def test_region_overlap_and_atomic_flags_keep_write_unknown(self):
+        for flag in [4, 8]:
+            n = self.raw_graph(memory=True, regions=[(1280, 4, 2), (1280, 4, flag)])["nodes"][0]
+            self.assertIn("write_version_ambiguous", n["unknowns"])
+
+    def test_region_hash_overflow_is_incomplete(self):
+        n = self.raw_graph(memory=True, regions=[(1024, 4, 1)], dropped=1, exact=False)["nodes"][0]
+        self.assertFalse(n["footprint_complete"])
 
     def test_opaque_vendor_preserves_call_version_not_fabricated_access(self):
         graph = self.raw_graph()

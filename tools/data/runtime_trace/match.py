@@ -32,9 +32,11 @@ def describe(graph):
     roots = anchors(graph)
     buffers = {a["id"]: a for a in graph["buffers"]}
     incoming = defaultdict(list)
+    outgoing = defaultdict(list)
     nodes = {n["id"]: n for n in graph["nodes"]}
     for edge in graph["edges"]:
         incoming[edge["target"]].append(edge)
+        outgoing[edge["source"]].append(edge)
     descriptions = {}
     for node in graph["nodes"]:
 
@@ -50,11 +52,13 @@ def describe(graph):
             return {"temporary_bytes": buffers[storage]["bytes"], "producers": sorted(producers, key=canonical)}
 
         def port(access):
+            storage = buffers[access["buffer"]]
             return {
                 "role": buffer_role(access["buffer"]),
                 "regions": access["regions"],
                 "bytes": buffers[access["buffer"]]["bytes"],
                 "port": access["port"],
+                "views": sorted(storage.get("views", []), key=canonical),
             }
 
         interface = {
@@ -63,13 +67,41 @@ def describe(graph):
             # Output/temporary role may change when a consumer is added.
             "writes": sorted(
                 [
-                    {"regions": a["regions"], "bytes": buffers[a["buffer"]]["bytes"], "port": a["port"]}
+                    {
+                        "regions": a["regions"],
+                        "bytes": buffers[a["buffer"]]["bytes"],
+                        "port": a["port"],
+                        "views": sorted(buffers[a["buffer"]].get("views", []), key=canonical),
+                        "output_roles": sorted(r for r in buffers[a["buffer"]]["roles"] if r.startswith("output:")),
+                    }
                     for a in node["writes"]
                 ],
                 key=canonical,
             ),
             "roots": roots[node["id"]],
+            "consumers": sorted(
+                [
+                    {
+                        "kind": nodes[e["target"]].get("operation", nodes[e["target"]]["kind"]),
+                        "roots": roots[e["target"]],
+                        "regions": e["regions"],
+                        "port": e.get("port"),
+                    }
+                    for e in outgoing[node["id"]]
+                    if e["target"] in nodes and e.get("regions")
+                ],
+                key=canonical,
+            ),
         }
+        # Explicit alias pattern, independent of allocation addresses and the
+        # order in which StorageObserver encountered temporary allocations.
+        effects = [(mode, access) for mode in ("reads", "writes") for access in node[mode]]
+        alias_groups = defaultdict(list)
+        for mode, access in effects:
+            alias_groups[access["buffer"]].append({"mode": mode, "port": port(access)})
+        interface["alias_groups"] = sorted(
+            [sorted(group, key=canonical) for group in alias_groups.values()], key=canonical
+        )
         configuration = dict(node["configuration"])
         if "arguments" in configuration:
             configuration["arguments"] = [
@@ -98,6 +130,8 @@ def compare(left, right):
         "training_state_equivalence": False,
         "source_similarity_used": False,
         "creative_origin_proven": False,
+        "identity_meaning": "Candidate call-role identity from typed regional interfaces and adjacent dataflow; not numerical or semantic equivalence",
+        "training_identity_credit_enabled": False,
     }
     if absent or changed:
         return result
@@ -115,7 +149,8 @@ def compare(left, right):
             result["ambiguous"].append(group)
             continue
         x, y = group["left"][0], group["right"][0]
-        assert a[x]["interface"] == b[y]["interface"]
+        if a[x]["interface"] != b[y]["interface"]:
+            raise ValueError("component interface digest collision")
         cfg_keys = set(a[x]["configuration"]) | set(b[y]["configuration"])
         differences = {
             k: {"before": a[x]["configuration"].get(k), "after": b[y]["configuration"].get(k)}
@@ -129,9 +164,27 @@ def compare(left, right):
             for n in (an[x], bn[y])
         )
         ambiguous_effects = any("write_version_ambiguous" in n["unknowns"] for n in (an[x], bn[y]))
+        ambiguous_effects = ambiguous_effects or any(
+            access.get("internal_or_unordered_regions") for n in (an[x], bn[y]) for access in n.get("reads", [])
+        )
+        uncertain_inputs = any(
+            edge.get("certainty") not in {"proven_region_dependency", "initial_value_read"}
+            for g, key in ((left, x), (right, y))
+            for edge in g["edges"]
+            if edge["target"] == key
+        )
+        uncertain_inputs = uncertain_inputs or any(
+            "input_provenance_unresolved" in n["unknowns"] for n in (an[x], bn[y])
+        )
+        identity_complete = (
+            not incomplete
+            and not ambiguous_effects
+            and not uncertain_inputs
+            and bool(an[x]["reads"] or an[x]["writes"])
+        )
         if incomplete:
             relation = "partial_observed_correspondence"
-        elif ambiguous_effects:
+        elif ambiguous_effects or uncertain_inputs:
             relation = "same_observed_call_effects_ambiguous"
         elif not an[x]["reads"] and not an[x]["writes"]:
             relation = "no_observed_data_effect_call_correspondence"
@@ -150,6 +203,12 @@ def compare(left, right):
                 "relation": relation,
                 "configuration_changes": differences,
                 "implementation_same": impl_same,
+                "identity_relation": "same_call_role_candidate",
+                "identity_evidence_complete": identity_complete,
+                "component_identity_key": a[x]["key"],
+                "version_relation": (
+                    "unknown" if opaque_config else ("unchanged" if impl_same and not differences else "revised")
+                ),
                 "interface_evidence": a[x]["interface"],
                 "unknowns_before": an[x]["unknowns"],
                 "unknowns_after": bn[y]["unknowns"],

@@ -27,7 +27,8 @@ extern "C" cublasStatus_t cublasSetWorkspace_v2(cublasHandle_t h,void* p,size_t 
 extern "C" cublasStatus_t cublasSetStream_v2(cublasHandle_t h,cudaStream_t stream){static auto fn=real<decltype(&cublasSetStream_v2)>("cublasSetStream_v2");auto status=fn(h,stream);if(status==CUBLAS_STATUS_SUCCESS){std::lock_guard<std::mutex> guard(state_lock);workspace[h]={0,true,false};}return status;}
 static long long begin(const char* api,cublasHandle_t handle,int ta,int tb,int m,int n,int k,
     const void* alpha,const void* a,int at,int lda,const void* b,int bt,int ldb,
-    const void* beta,void* c,int ct,int ldc,int compute,int algorithm){
+    const void* beta,void* c,int ct,int ldc,int compute,int algorithm,
+    long long stride_a=0,long long stride_b=0,long long stride_c=0,int batch_count=-1){
     if(!coarse_active())return -1;
     cudaStream_t stream=nullptr;cublasPointerMode_t pointer=CUBLAS_POINTER_MODE_DEVICE;cublasMath_t math=CUBLAS_DEFAULT_MATH;
     auto gs=real<decltype(&cublasGetStream_v2)>("cublasGetStream_v2")(handle,&stream);
@@ -44,6 +45,7 @@ static long long begin(const char* api,cublasHandle_t handle,int ta,int tb,int m
     std::string attributes=data;attributes.pop_back();attributes+=",\"workspace_known\":";attributes+=ws.known?"true":"false";
     attributes+=",\"workspace_custom\":";attributes+=ws.custom?"true":"false";
     const char* mode=!ws.known?"unknown":!ws.explicitly_set?"default_pool":ws.bytes==0?"default_pool_disabled":ws.custom?"custom":"unknown";
+    if(batch_count>=0)attributes+=",\"stride_a\":"+std::to_string(stride_a)+",\"stride_b\":"+std::to_string(stride_b)+",\"stride_c\":"+std::to_string(stride_c)+",\"batch_count\":"+std::to_string(batch_count);
     attributes+=",\"workspace_mode\":\""+std::string(mode)+"\",\"workspace_bytes\":"+std::to_string(ws.bytes)+",\"library_version\":"+(version_status==CUBLAS_STATUS_SUCCESS?std::to_string(version):"null")+"}";
     return coarse_library_begin(api,attributes.c_str(),(uint64_t)stream);
 }
@@ -53,6 +55,13 @@ extern "C" cublasStatus_t cublasSgemm_v2(cublasHandle_t h,cublasOperation_t ta,c
     auto id=begin("cublasSgemm_v2",h,ta,tb,m,n,k,alpha,a,CUDA_R_32F,lda,b,CUDA_R_32F,ldb,beta,c,CUDA_R_32F,ldc,CUBLAS_COMPUTE_32F,-1);
     auto status=fn(h,ta,tb,m,n,k,alpha,a,lda,b,ldb,beta,c,ldc);coarse_library_end(id,status);return status;
 }
+extern "C" cublasStatus_t cublasSgemmStridedBatched(cublasHandle_t h,cublasOperation_t ta,cublasOperation_t tb,int m,int n,int k,
+    const float* alpha,const float* a,int lda,long long stride_a,const float* b,int ldb,long long stride_b,const float* beta,float* c,int ldc,long long stride_c,int batch_count){
+    using Fn=cublasStatus_t(*)(cublasHandle_t,cublasOperation_t,cublasOperation_t,int,int,int,const float*,const float*,int,long long,const float*,int,long long,const float*,float*,int,long long,int);
+    static auto fn=real<Fn>("cublasSgemmStridedBatched");
+    auto id=begin("cublasSgemmStridedBatched",h,ta,tb,m,n,k,alpha,a,CUDA_R_32F,lda,b,CUDA_R_32F,ldb,beta,c,CUDA_R_32F,ldc,CUBLAS_COMPUTE_32F,-1,stride_a,stride_b,stride_c,batch_count);
+    auto status=fn(h,ta,tb,m,n,k,alpha,a,lda,stride_a,b,ldb,stride_b,beta,c,ldc,stride_c,batch_count);coarse_library_end(id,status);return status;
+}
 extern "C" cublasStatus_t cublasGemmEx(cublasHandle_t h,cublasOperation_t ta,cublasOperation_t tb,int m,int n,int k,
     const void* alpha,const void* a,cudaDataType at,int lda,const void* b,cudaDataType bt,int ldb,
     const void* beta,void* c,cudaDataType ct,int ldc,cublasComputeType_t compute,cublasGemmAlgo_t algo){
@@ -60,4 +69,12 @@ extern "C" cublasStatus_t cublasGemmEx(cublasHandle_t h,cublasOperation_t ta,cub
     static auto fn=real<Fn>("cublasGemmEx");
     auto id=begin("cublasGemmEx",h,ta,tb,m,n,k,alpha,a,at,lda,b,bt,ldb,beta,c,ct,ldc,compute,algo);
     auto status=fn(h,ta,tb,m,n,k,alpha,a,at,lda,b,bt,ldb,beta,c,ct,ldc,compute,algo);coarse_library_end(id,status);return status;
+}
+extern "C" cublasStatus_t cublasGemmStridedBatchedEx(cublasHandle_t h,cublasOperation_t ta,cublasOperation_t tb,int m,int n,int k,
+    const void* alpha,const void* a,cudaDataType at,int lda,long long stride_a,const void* b,cudaDataType bt,int ldb,long long stride_b,
+    const void* beta,void* c,cudaDataType ct,int ldc,long long stride_c,int batch_count,cublasComputeType_t compute,cublasGemmAlgo_t algo){
+    using Fn=cublasStatus_t(*)(cublasHandle_t,cublasOperation_t,cublasOperation_t,int,int,int,const void*,const void*,cudaDataType,int,long long,const void*,cudaDataType,int,long long,const void*,void*,cudaDataType,int,long long,int,cublasComputeType_t,cublasGemmAlgo_t);
+    static auto fn=real<Fn>("cublasGemmStridedBatchedEx");
+    auto id=begin("cublasGemmStridedBatchedEx",h,ta,tb,m,n,k,alpha,a,at,lda,b,bt,ldb,beta,c,ct,ldc,compute,algo,stride_a,stride_b,stride_c,batch_count);
+    auto status=fn(h,ta,tb,m,n,k,alpha,a,at,lda,stride_a,b,bt,ldb,stride_b,beta,c,ct,ldc,stride_c,batch_count,compute,algo);coarse_library_end(id,status);return status;
 }

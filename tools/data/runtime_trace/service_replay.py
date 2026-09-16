@@ -176,6 +176,22 @@ def _inline_schema_graph(graph):
     same uncertainty in ``output_unknowns`` and omits only the invalid edge.
     """
     graph = json.loads(json.dumps(graph))
+    nodes = {n["id"]: n for n in graph["nodes"]}
+    edges = []
+    for edge in graph.get("edges", []):
+        if edge.get("source") is not None:
+            edges.append(edge)
+            continue
+        if (
+            edge.get("certainty")
+            not in {"entry_value_unobserved", "unordered_stream_writers", "partial_or_ambiguous_dependency"}
+            or edge.get("target") not in nodes
+        ):
+            raise ValueError("invalid_unknown_dependency")
+        target = nodes[edge["target"]]
+        target["unknowns"] = sorted(set(target.get("unknowns", [])) | {"input_provenance_unresolved"})
+        target.setdefault("evidence", {}).setdefault("unknown_input_dependencies", []).append(edge)
+    graph["edges"] = edges
     valid, unknowns = [], set(graph.get("output_unknowns", []))
     for edge in graph.get("outputs", []):
         if isinstance(edge.get("source"), str) and isinstance(edge.get("target"), str):
@@ -198,6 +214,19 @@ def _omit_incomplete_footprints(graph, node_ids):
     omitted = set(node_ids)
     removed_edges = 0
     for node in graph["nodes"]:
+        # The same partial ranges also appear in unresolved dependency evidence.
+        # Keep uncertainty and its audit digest, not megabytes of duplicate
+        # intervals that cannot authorize credit in the first place.
+        evidence = node.get("evidence", {})
+        unresolved = evidence.get("unknown_input_dependencies")
+        if unresolved:
+            evidence["unknown_input_dependency_summary"] = {
+                "count": len(unresolved),
+                "sha256": value_digest(unresolved),
+                "detail": "full_graph_artifact",
+            }
+            del evidence["unknown_input_dependencies"]
+            node["unknowns"] = sorted(set(node.get("unknowns", [])) | {"input_provenance_unresolved"})
         if node["id"] not in omitted:
             continue
         if node.get("footprint_complete") is True:
@@ -221,6 +250,7 @@ def _omit_incomplete_footprints(graph, node_ids):
         for edge in graph["outputs"]
         if not (edge.get("source") in omitted and edge.get("buffer") and edge.get("regions"))
     ]
+    graph["versions"] = [version for version in graph.get("versions", []) if version.get("producer") not in omitted]
     graph["output_unknowns"] = sorted(
         set(graph.get("output_unknowns", []))
         | {"inline_footprint_omitted_output_closure:" + node_id for node_id in omitted}
@@ -347,7 +377,7 @@ def execute(root, phase, device):
             result["unknowns"].append("initial_state_or_input_mismatch")
             return result
         observer = StorageObserver(
-            traced=phase == "trace",
+            traced=phase in {"trace", "trace_detail"},
             checkpoint=root / f"{phase}_allocations.json",
             max_leases=request["options"]["max_launches"] * 8 + 512,
         )
@@ -355,7 +385,7 @@ def execute(root, phase, device):
         for name, value in model_tensor_state(model).items():
             observer.observe(value, name)
         write(root / f"{phase}_allocations.json", observer.as_dict())
-        if phase == "trace":
+        if phase in {"trace", "trace_detail"}:
             enable = ctypes.CDLL(None).runtime_trace_set_enabled
             enable.argtypes = [ctypes.c_int]
         policy = {}
@@ -401,7 +431,64 @@ def execute(root, phase, device):
     return result
 
 
-def report(root):
+def ordered_retry_plan(result):
+    """Select only complete region captures whose read/write order is missing."""
+    if result.get("status") != "ok" or any(
+        result.get("alignment", {}).get(key) is not True for key in ("scored_control", "control_trace")
+    ):
+        return []
+    graph = result.get("graph") or {}
+    if not _complete_call_enumeration(graph.get("coverage", {})):
+        return []
+    return sorted(
+        {
+            node["evidence"]["launch_id"]
+            for node in graph.get("nodes", [])
+            if node.get("kind") == "kernel"
+            and node.get("footprint_complete") is True
+            and "inplace_order_requires_detailed_capture" in node.get("unknowns", [])
+            and not any(access.get("atomic_unknown") for access in node.get("writes", []))
+            and type(node.get("evidence", {}).get("launch_id")) is int
+            and 0 <= node["evidence"]["launch_id"] < 2048
+        }
+    )
+
+
+def _same_capture_interfaces(left, right):
+    """Retry is a whole new capture, never a merge of different executions.
+
+    Require identical call order, versions, launch arguments, byte interfaces,
+    alias leases, and stream topology. Only the ordered-read evidence may improve.
+    Addresses and concrete stream handles are process-local, not identity.
+    """
+
+    def material(graph):
+        streams = {}
+        nodes = []
+        for node in graph["nodes"]:
+            stream = streams.setdefault(node["stream"], len(streams))
+            nodes.append(
+                {
+                    **{
+                        key: node.get(key) for key in ("kind", "implementation", "configuration", "footprint_complete")
+                    },
+                    "stream": stream,
+                    **{
+                        side: sorted(
+                            [{key: access.get(key) for key in ("buffer", "regions", "port")} for access in node[side]],
+                            key=canonical,
+                        )
+                        for side in ("reads", "writes")
+                    },
+                }
+            )
+        buffers = [{key: value for key, value in buffer.items() if key != "base"} for buffer in graph["buffers"]]
+        return {"nodes": nodes, "buffers": sorted(buffers, key=lambda buffer: buffer["id"])}
+
+    return material(left) == material(right)
+
+
+def report(root, trace_phase="trace"):
     request = json.loads((root / "request.json").read_text())
     result = {
         "schema": "kernelgym-runtime-graph/v1",
@@ -412,11 +499,11 @@ def report(root):
     }
     result["unknowns"].extend(json.loads((root / "capsule.json").read_text()).get("unknowns", []))
     phases = {}
-    for name in ["control", "trace"]:
+    for name in ["control", trace_phase]:
         path = root / f"{name}_result.json"
         phases[name] = json.loads(path.read_text()) if path.exists() else {"unknowns": [f"{name}_process_incomplete"]}
         result["unknowns"].extend(phases[name].get("unknowns", []))
-    control, traced = phases["control"], phases["trace"]
+    control, traced = phases["control"], phases[trace_phase]
     normal_path = root / "normal_output.json"
     normal = json.loads(normal_path.read_text()) if normal_path.exists() else None
     capsule = json.loads((root / "capsule.json").read_text())
@@ -502,8 +589,9 @@ def report(root):
         "trace_forward_seconds": traced.get("forward_wall_seconds"),
         "report_seconds": None,
     }
-    metadata = root / "trace.jsonl"
-    allocation_path = root / "trace_allocations.json"
+    metadata = root / f"{trace_phase}.jsonl"
+    allocation_path = root / f"{trace_phase}_allocations.json"
+    graph_path = root / ("graph.json" if trace_phase == "trace" else "graph_detail.json")
     try:
         if control.get("status") != "completed" or traced.get("status") != "completed":
             raise ValueError("control_or_trace_execution_incomplete")
@@ -521,18 +609,42 @@ def report(root):
             "input_signature": result["identity"]["input_signature"],
             "environment_signature": result["identity"]["environment_signature"],
         }
-        full_graph = build_graph(root / "trace", allocations, context)
+        full_graph = build_graph(root / trace_phase, allocations, context)
+        if trace_phase == "trace_detail":
+            baseline = json.loads((root / "trace_result.json").read_text())
+            checks = {
+                key: _same(baseline.get(key), traced.get(key))
+                for key in (
+                    "source_sha256",
+                    "reference_sha256",
+                    "capsule_sha256",
+                    "runner_sha256",
+                    "artifact_provenance",
+                    "input",
+                    "state",
+                    "rng",
+                    "configuration",
+                    "output",
+                )
+            }
+            checks["call_interfaces"] = _same_capture_interfaces(
+                json.loads((root / "graph.json").read_text()), full_graph
+            )
+            checks["complete_calls"] = _complete_call_enumeration(full_graph.get("coverage", {}))
+            result["ordered_retry"] = {"checks": checks, "accepted": all(v is True for v in checks.values())}
+            if not result["ordered_retry"]["accepted"]:
+                raise ValueError("ordered_retry_capture_mismatch")
         full_coverage = full_graph.setdefault("coverage", {})
         full_coverage["summary_complete"] = bool(
             full_coverage.get("trace_process_complete")
             and _complete_call_enumeration(full_coverage)
             and len(full_graph.get("nodes", ())) <= request["options"]["max_summary_nodes"]
         )
-        write(root / "graph.json", full_graph)
+        write(graph_path, full_graph, compact=True)
         result["graph_artifact"] = {
-            "path": str(root / "graph.json"),
-            "sha256": sha(root / "graph.json"),
-            "bytes": (root / "graph.json").stat().st_size,
+            "path": str(graph_path),
+            "sha256": sha(graph_path),
+            "bytes": graph_path.stat().st_size,
             "content": "full_graph_before_inline_footprint_compression",
         }
         graph, graph_reason = _full_graph_summary(
@@ -593,17 +705,21 @@ def report(root):
         result["status"] = "unavailable"
         result["unknowns"].append("inline_graph_byte_budget_exceeded")
     # Budget and persist the same bytes; indentation can more than double it.
-    write(root / "summary.json", result, compact=True)
+    if trace_phase == "trace":
+        result["ordered_retry_launches"] = ordered_retry_plan(result)
+    write(root / ("summary.json" if trace_phase == "trace" else "summary_detail.json"), result, compact=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--phase", choices=["control", "trace", "report"], required=True)
+    parser.add_argument(
+        "--phase", choices=["control", "trace", "report", "trace_detail", "report_detail"], required=True
+    )
     args = parser.parse_args()
-    if args.phase == "report":
-        report(args.directory)
+    if args.phase in {"report", "report_detail"}:
+        report(args.directory, "trace_detail" if args.phase == "report_detail" else "trace")
     else:
         execute(args.directory, args.phase, args.device)
 

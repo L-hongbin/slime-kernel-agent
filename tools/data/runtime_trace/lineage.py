@@ -38,7 +38,7 @@ def trace_best(snapshots):
     if not best.get("graph"):
         result["status"] = "best_graph_missing"
         return result
-    origins = {}
+    origins, identity_origins = {}, {}
     for previous in ordered:
         if previous["turn"] >= best["turn"]:
             continue
@@ -48,6 +48,16 @@ def trace_best(snapshots):
         comparison = compare(previous["graph"], best["graph"])
         result["comparisons"].append({"turn": previous["turn"], **comparison})
         for match in comparison["matches"]:
+            if match.get("identity_evidence_complete"):
+                identity_origins.setdefault(
+                    match["after"],
+                    {
+                        "turn": previous["turn"],
+                        "node": match["before"],
+                        "identity_key": match["component_identity_key"],
+                        "version_relation": match["version_relation"],
+                    },
+                )
             if match["relation"] == "retained_observed_component":
                 origins.setdefault(match["after"], {"turn": previous["turn"], "node": match["before"]})
     for node in best["graph"]["nodes"]:
@@ -60,6 +70,7 @@ def trace_best(snapshots):
                 "kind": node["kind"],
                 "evidence": node["evidence"],
                 "earliest_observed_retained_match": origins.get(node["id"]),
+                "earliest_observed_call_role_candidate": identity_origins.get(node["id"]),
                 "status": "observed_retention" if node["id"] in origins else "new_changed_or_unresolved",
                 "unknowns": node["unknowns"],
             }

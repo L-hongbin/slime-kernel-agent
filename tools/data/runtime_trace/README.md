@@ -6,6 +6,12 @@
 
 ## 捕获与提取
 
+可选 `RUNTIME_TRACE_RECORD_FORMAT=regions`：按调用以一 KiB tile 索引精确字节位图，聚合重复／广播读，再导出区间。`runs` 为默认顺序模式，保留线程归属；区域模式的读写交集仍需顺序诊断，不能自动确认原地入口值
+
+`RUNTIME_TRACE_ORDERED_LAUNCHES=0,4` 可在 regions 模式的一次完整重放中，仅对指定 launch 使用顺序记录；同一个 CUfunction 的其它调用仍按区域记录。顺序记录使用额外的整个 forward 预算，最多 `min(CAPACITY, TOTAL_RECORDS)` 条，区域输出仍受原预算限制，实际值写入 `ordered_selection` 事件。KernelGym 适配器从第一张对齐图自动选择足迹完整的非原子原地调用，在剩余执行／报告时间内最多重试一次；只接受完整重放且输入、状态、输出与全部调用接口一致的新图，失败时保留第一张图
+
+区域模式下 `RUNTIME_TRACE_CAPACITY` 须为二的幂，限制每调用 tile 表及导出临时数组；`RUNTIME_TRACE_TOTAL_RECORDS` 限制整个 forward 输出的合并区间数。真实大输入试验使用四百万容量，tile 表约 1.06 GiB，导出临时数组最多 128 MiB。该计数与 raw events 不可直接比较；`record_format` 事件中的 `format`、`capacity_scope`、`total_record_unit` 和 `region_table_bytes` 记录实际含义。调用参数和非 opaque 实现指纹独立于访存预算保留
+
 需要外部 NVBit 1.8、CUDA toolkit 与 H20；构建产物默认进入 ignored `local_artifacts/component_tracking/coarse/build`
 
 ```bash
@@ -51,14 +57,16 @@ python -m tools.data.runtime_trace.lineage --snapshots snapshots.json --output l
 
 结果区分留存观测、配置变化、实现变化、局部对应、配置未知、重复调用歧义和无法一对一对应。完整但没有已观测数据效果的调用单列；结构候选不等于训练可用状态，不自动接 GRPO
 
+匹配结果另外区分 `same_call_role_candidate` 与实现版本 `unchanged/revised/unknown`；身份比较包含 typed views、alias、输入来源、输出角色和相邻消费者。融合版作为新组件，后续同角色修订可以追踪至早期候选；下游接口变化仍可能打断对应。`lineage` 输出身份候选与严格实现留存两种来源，不自动改变训练奖励
+
 ## 边界与证据
 
 - 全 forward、默认所有 CTA；每 kernel 最多 1,048,576 条压缩 memory runs，截断和未知不会被视为完整足迹
-- Warp 内仅对精确连续地址做无损区域压缩；保留读写、覆盖范围、alias 生命周期、输出 view 和版本
+- runs 模式仅对精确连续地址做无损压缩；regions 模式保留逐字节读写集合与空洞，重复写／原子标记在 tile 内保守扩散，原地顺序明确未知
 - 同 stream 与成功 event/device sync 建立顺序；诊断插桩自带的强制同步不进入程序依赖图
 - 未知中间调用会使旧版本失效；后续完整覆盖可按区域恢复。无序写入、原子冲突、无法绑定的私有 storage 保留未知
-- cuBLAS Sgemm/GemmEx 以公开逻辑矩阵契约覆盖，不宣称测到库内部每次物理访问；cuDNN/cuBLASLt 没有专门契约
-- 扩展 launch 属性只记录数量；缺失或非零时配置未知。workspace 模式区分默认池、自定义区和显式禁用默认池；默认池模式的 `workspace_bytes=0` 仅表示未绑定自定义容量
+- cuBLAS Sgemm/GemmEx 及两者的 StridedBatched API 以公开逻辑矩阵契约覆盖；batch stride 以元素为单位转换，按 operand 合并精确区域，保留 gap。负 stride／超预算返回未知；cuDNN/cuBLASLt 没有专门契约，库内部物理访存仍 opaque
+- 扩展 launch 记录支持的无指针属性（如 cluster 维度及调度策略）；事件、指针、未知属性和不完整列表保留配置未知。workspace 模式区分默认池、自定义区和显式禁用默认池；默认池模式的 `workspace_bytes=0` 仅表示未绑定自定义容量
 - 多活跃 CUDA context、多个 launch 主机线程、CUDA graph capture 当前拒绝；未支持 launch/内存 API 显式记 unknown
 - 采集会串行化执行，冷 forward 成本只用于诊断，不能作为训练性能分数
 
@@ -70,10 +78,16 @@ python -m tools.data.runtime_trace.lineage --snapshots snapshots.json --output l
 python -m tools.data.runtime_trace.export --native /absolute/path/runtime_trace.so --output /node-local/tracer-bundle
 ```
 
-Bundle 包含逐文件 manifest，KernelGym 的 `KERNELGYM_RUNTIME_GRAPH_BUNDLE` 指向它。KernelGym 源码集成与操作方配置说明在 `KernelGYM-component-runtime/docs/design-doc/RUNTIME_COMPONENT_GRAPH.md`；部署由主 Agent 负责
+Bundle 包含逐文件 manifest，KernelGym 的 `KERNELGYM_RUNTIME_GRAPH_BUNDLE` 指向它。源码与操作方配置见 [KernelGym 集成说明](../../../../KernelGYM-component-integration/docs/design-doc/RUNTIME_COMPONENT_GRAPH.md)；部署由主 Agent 负责
 
-服务采集使用 `RUNTIME_TRACE_TOTAL_RECORDS` 与 `RUNTIME_TRACE_MAX_LAUNCHES`，并设 `RUNTIME_TRACE_SKIP_VENDOR_MEMORY=1`，跳过 vendor 内部访存及静态解析。保留库 API 的关键配置与库版本，未检查的实现/ABI 明确 unknown。满容量后计数饱和，`dropped_runs_exact=false` 表示丢弃量仅为下界；不能拿它计算精确采样覆盖率。`RUNTIME_TRACE_MEMORY_POLICY=interfaces` 保留调用清单，访存未知
+服务请求 `record_format` 默认 regions，首次 trace 显式采用该值；区域表容量在进入子进程前检查为二次幂。服务设 `RUNTIME_TRACE_SKIP_VENDOR_MEMORY=1`，跳过 vendor 内部访存和 SASS 反汇编；受支持库的子调用通过 NVBit 导出 cubin，验证 CUDA ELF 区段和实际入口后，用完整二进制 SHA256＋入口定位＋launch 配置记录版本。库调用仍按父级组件计数，未知实现/ABI 保留 unknown
+
+默认每次 trace 最多导出 16 个库模块，每个最多 64 MiB；实际限制记在 native config。模块卸载会使 handle 缓存失效，编号和总次数预算不重置。NVBit 1.8 的 dump 返回值只留作诊断，成功条件来自实际文件验证；文件缺失／截断／入口缺失均不能成为指纹。正常在线 cleanup 同时回收 runs 与 cubin，显式 retain_raw 才保留原始证据
+
+访存满容量后计数饱和，`dropped_runs_exact=false` 表示丢弃量仅为下界；不能拿它计算精确采样覆盖率。`RUNTIME_TRACE_MEMORY_POLICY=interfaces` 保留调用清单和已支持库契约，自定义 kernel 访存未知
+
+CPU 区域减法使用单调扫描，版本相交查询使用有序区间索引，避免 strided 大图退化成平方级扫描。超出 inline 限制时仅省略已不完整节点的足迹及其重复 version 明细；未决依赖保留计数、哈希和显式 unknown，调用单位及完整足迹全部保留。`check_extract_fast_paths` 验证与朴素算法逐项相等，`check_bounded_summary` 验证分奖分母及 unknown 份额不缩水
 
 该路径与此前 coarse 冻结批次分别保留实际版本与证据，不混算旧全指令结果；它返回观测与缺口，不实现 scalar reward
 
-实际案例、成本、冻结批次和复现 manifest 见 [组件追踪报告](../../../handoffs/paper/runtime_component_tracking.md)
+首次了解采集和提图机制，见 [NVBit 提图教程](../../../handoffs/paper/runtime_graph_extraction.md)；奖励方法、实物结果和训练准备集中在 [组件奖励报告](../../../handoffs/paper/component_reward_training.md)
