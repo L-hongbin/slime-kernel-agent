@@ -164,6 +164,11 @@ elif [[ "${DEBUG_ROLLOUT_TWO_NODE}" == "1" ]]; then
    REMOTE_HOSTS=("10.11.2.169")
    REMOTE_PORTS=("23538")
    REMOTE_PLACEMENT_RESOURCES=("slime_rollout")
+elif [[ "${USE_NODE64_ROLLOUT}" == "1" && "${USE_NODE53_ROLLOUT:-1}" == "0" ]]; then
+   # Isolated three-node preliminary training: node69/70 actor, node64 rollout.
+   REMOTE_HOSTS=("10.11.2.169" "10.11.2.164")
+   REMOTE_PORTS=("23538" "23538")
+   REMOTE_PLACEMENT_RESOURCES=("slime_actor" "slime_rollout")
 elif [[ "${USE_NODE64_ROLLOUT}" == "1" ]]; then
    REMOTE_HOSTS=(
       "10.11.2.169"
@@ -220,7 +225,12 @@ else
    ROLLOUT_GPUS=${DERIVED_ROLLOUT_GPUS}
 fi
 ACTOR_PLACEMENT_RESOURCE="slime_actor"
-ROLLOUT_PLACEMENT_RESOURCE="slime_rollout"
+ROLLOUT_PLACEMENT_RESOURCE="${ROLLOUT_PLACEMENT_RESOURCE:-slime_rollout}"
+for i in "${!REMOTE_PLACEMENT_RESOURCES[@]}"; do
+   if [[ "${REMOTE_PLACEMENT_RESOURCES[$i]}" == "slime_rollout" ]]; then
+      REMOTE_PLACEMENT_RESOURCES[$i]="${ROLLOUT_PLACEMENT_RESOURCE}"
+   fi
+done
 ACTOR_RESOURCE_JSON="{\"${ACTOR_PLACEMENT_RESOURCE}\": ${ACTOR_GPUS_PER_NODE}}"
 if [[ "${DEBUG_ROLLOUT_TWO_NODE}" == "1" ]]; then
    # Four custom-resource units per node force one TP4 engine onto each host.
