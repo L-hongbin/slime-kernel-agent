@@ -107,6 +107,95 @@ The optional `.pt` check needs PyTorch. Development-pool results, manual example
 and remaining limits are documented in
 [the E1.1 findings in the experiment plan](../../../handoffs/paper/plan.md#e11-留下的有用线索).
 
+## First-correct repair-diff validation
+
+The current whole-turn training-snapshot workflow is `repair_credit_training.py`:
+
+```bash
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.check_repair_credit_training
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.repair_credit_training prepare \
+  --plan /path/to/training_snapshot_plan.json --output /path/to/new_audit
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.repair_credit_training shadow \
+  --audit /path/to/audit --labels /path/to/replay_labels.json \
+  --output /path/to/new_shadow
+```
+
+The plan and an adjacent `input_sync.json` identify already synchronized trusted
+training dumps and frozen runtimes. The scoped pilot requires full 256x3 batches
+and full 16-trajectory prompt groups; it is not a general training-set loader.
+It verifies saved gamma=1 returns, executes the archived scalar TRLOO postprocess,
+and independently checks leave-one-out arithmetic without modifying masks or
+training data. A whole adjacent turn is one bundle: transport blocks are not
+credit units. All B changes must transfer exactly and uniquely from T2 to T1.
+Conflicts, missing sections and unchanged-source outcome flips remain unknown.
+
+Training cases carry the recorded per-task precision and entry point. Replay
+plans may contain source-hash-bound historical client prechecks; rejected variants
+are recorded locally without POST. Explicit precision overrides must agree with
+the recorded case. A failed correct control stops interpretation; an ambiguous
+submission is never automatically retried. The shadow coefficients are diagnostic
+settings only, with no optimizer update or policy-gradient inference.
+
+The earlier evaluation-pool local-diff workflow remains available below.
+
+`repair_credit_audit.py` audits correctness repairs on original TRLOO, independently
+of the optimization registry and FastCredit. It selects the first correct,
+compiled, non-decoy completed turn, compares the actual executor-selected source
+to preceding turns, and records retained local-edit candidates. T1 is the base
+version, not an automatically rewarded origin. All-failed trajectories have no
+correct anchor. No reward is assigned, and unknown alignment is not a negative
+contribution label.
+
+```bash
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.check_repair_credit_audit
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.repair_credit_audit \
+  --input /path/to/trusted/baseline/eval_0.pt \
+  --runtime-root /path/to/evaluated/runtime_repo \
+  --output local_artifacts/paper/repair_credit_validation/new_audit
+```
+
+The CLI currently validates the complete three-turn KernelBench eval layout:
+800/800/400 trajectories across L1/L2/L3. It is a scoped validation driver, not
+yet a general training-set loader. It checks the response-selection parser
+against the frozen evaluated code and records input/code hashes. Outputs include
+`summary.json`, per-case source/diffs/feedback, a seeded review selection, and a
+manifest. Selection for review does not itself mean completed manual annotation.
+
+Strict categories stay separate from `syntax_fallback_candidates`: the latter
+allows malformed native functions with exact identity and unique old/new token
+contexts to supply lexical evidence, while keeping incomplete programs and
+Python AST failures unknown. Neither branch proves a contribution to correctness.
+To supplement a completed strict audit without overwriting it:
+
+```bash
+PYTHONPATH=.:local_artifacts/paper/trajectory_structure/deps \
+  python -m tools.data.trajectory_structure.repair_credit_audit \
+  --existing-audit /path/to/completed/audit \
+  --output /path/to/completed/audit/new_syntax_supplement.json
+```
+
+`repair_credit_replay.py` prepares explicitly planned, exact-source edits. Its
+default is prepare-only; `--submit` sends one case at a time to an already deployed
+KernelGym. A plan names the saved cases, base turns, exact scoped replacements,
+evaluation settings and required correct controls. The helper is not an automatic
+semantic patch generator. It records payloads and IDs before POST and does not
+automatically retry ambiguous submissions or redeploy services.
+
+```bash
+python -m tools.data.trajectory_structure.repair_credit_replay \
+  --plan /path/to/reviewed/replay_plan.json \
+  --output /path/to/new_preflight
+# Add --submit --url <existing-service> only for authorized execution.
+```
+
+The current method, coverage, manually inspected counterexamples and controlled
+replays are in [the correctness diff-credit report](../../../handoffs/paper/correctness_diff_credit.md).
+
 ## Single-pass optimization strategy coverage
 
 The canonical registry in `optimization_strategies.py` contains 58 templates
