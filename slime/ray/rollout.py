@@ -32,6 +32,7 @@ from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import init_http_client
 from slime.utils.lora_utils import use_lora_weight_sync
 from slime.utils.misc import Box, load_function
+from slime.utils.ppo_utils import get_argmaxrl_advantages
 from slime.utils.types import Sample
 
 from .utils import Lock, add_default_ray_env_vars
@@ -517,9 +518,42 @@ class RolloutManager:
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
-            return self.custom_reward_post_process_func(self.args, samples)
+            raw_rewards, rewards = self.custom_reward_post_process_func(self.args, samples)
+            if getattr(self.args, "advantage_estimator", None) not in {"argmaxrl", "tailrl"}:
+                return raw_rewards, rewards
+        else:
+            raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+            rewards = raw_rewards
 
-        raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+        if self.args.advantage_estimator in {"argmaxrl", "tailrl"}:
+            group_ids, rollout_ids, valid_mask = [], [], []
+            for i, sample in enumerate(samples):
+                valid = not sample.remove_sample and (sample.loss_mask is None or any(sample.loss_mask))
+                group = sample.group_index
+                if valid and group is None:
+                    raise ValueError("ArgMaxRL/TailRL requires Sample.group_index for every valid sample")
+                if getattr(self.args, "use_multi_turn", False):
+                    turn = (sample.metadata or {}).get("turn_idx")
+                    if valid and turn is None:
+                        raise ValueError("ArgMaxRL/TailRL with --use-multi-turn requires metadata['turn_idx']")
+                    group = (group, turn)
+                group_ids.append(group)
+                if sample.rollout_id is not None:
+                    rollout_ids.append(("rollout", sample.rollout_id))
+                elif sample.index is not None:
+                    rollout_ids.append(("index", sample.index))
+                else:
+                    rollout_ids.append(("sample", i))
+                valid_mask.append(valid)
+            return raw_rewards, get_argmaxrl_advantages(
+                rewards,
+                group_ids,
+                rollout_ids,
+                valid_mask,
+                reward_offset=getattr(self.args, "argmaxrl_reward_offset", 0.0),
+                center=self.args.advantage_estimator == "tailrl",
+            )
+
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "cispo", "reinforce_plus_plus_baseline", "rloo"]
             and self.args.rewards_normalization

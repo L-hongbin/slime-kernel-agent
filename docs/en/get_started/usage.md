@@ -211,6 +211,60 @@ This flag defaults to off, requires `--loss-type policy_loss`, and is incompatib
 
 Removing length division substantially increases the PG gradient scale: recheck learning rate, gradient norms and gradient clipping when switching. KernelAgent's `run_qwen3.6_27B_full_async_dppo.sh` accepts `CALC_LOSS_MODE=TokenSum`; its default remains `PerToken`.
 
+#### ArgMaxRL advantages
+
+Use `--advantage-estimator argmaxrl`, optionally with `--argmaxrl-reward-offset 1` if the known
+aggregate-reward lower bound is -1. The offset defaults to zero and is used only in weight calculation;
+it never rewrites sample rewards, components, task rewards, or verify history. Negative/nonfinite
+shifted rewards fail explicitly: there is no observed-group-minimum shift or zero clipping.
+
+Following [ArgMaxRL](https://www.doubleai.com/research/argmaxrl-generalizing-maxrl-to-continuous-rewards),
+sort nonnegative rewards descending and set `r[N+1]=0`. Compute
+`w[j] = sum((r[m]-r[m+1])/m, m=j..N)` and `A[j]=N*w[j]`.
+Here N counts valid candidates in the actual group. Scaling by N adapts the usual candidate-mean
+convention: `mean(A*score)=sum(w*score)`. Binary rewards give N/K for successes and zero for failures.
+
+Complete-group advantages are computed in `RolloutManager._post_process_rewards` before DP splitting,
+then broadcast to local tokens by the training backend. Group by `Sample.group_index`, or
+`(group_index, turn_idx)` for multi-turn kernel training. Use the settled aggregate reward, including
+enabled shaping, without separate correctness/performance/coverage objectives or TRLOO future-return
+folding. Removed/fully masked samples receive zero and are excluded. Fan-out segments sharing a
+trajectory in one group count once and must carry identical rewards. Custom reward hooks must provide
+uncentered aggregate scores; ArgMaxRL is applied once afterwards.
+
+No group centering or standard-deviation normalization is applied; the GRPO std flag is irrelevant.
+`--normalize-advantages`, custom advantage functions, reward KL (`--kl-coef`), and non-group verify
+baselines are rejected. Independent KL loss (`--use-kl-loss`) remains available.
+
+Loss reduction, PPO/DPPO clipping, filtering, CTM, and OPD remain independently configured. Thus the
+combined trainer is not necessarily the article's unbiased REINFORCE estimator. TokenSum is closest
+to its sequence log-prob sum; PerSample/PerToken/PerPrompt introduce their own length normalization.
+Equal positive rewards still produce nonzero advantages, although existing low-variance filtering
+may discard these groups. Group-dependent reward shaping is also an additional variant.
+
+#### TailRL advantages
+
+Use `--advantage-estimator tailrl`. This reuses ArgMaxRL's group/weight pipeline and adds
+centering over unique valid candidates: `A=N*(w-mean(w))`, without std normalization. It matches
+the [official code optimization implementation](https://github.com/Zanette-Labs/TailRL/blob/5682c6ac03387355e017ce966693266bb148fa10/experiments/code_optimization/code_opt/advantages.py#L22),
+including its N factor, rather than the website's simplified unscaled pseudocode.
+
+For rewards `[0,1,3]`, ArgMaxRL gives `[0,1.5,7.5]`; TailRL gives `[-3,-1.5,4.5]`.
+Equal-reward and singleton groups yield zero. Binary rewards give N/K-1 for successes and -1
+for failures when K>0; all-zero groups yield zero. Padding and removed samples do not enter
+the mean; repeated fan-out segments count as one candidate and share its advantage.
+
+TailRL is invariant to a common reward shift and accepts finite signed rewards. It rejects
+nonzero `--argmaxrl-reward-offset`. Internally subtracting the group minimum before computing
+nonnegative weights is algebraically equivalent after centering and improves numerical stability;
+this is never applied to uncentered ArgMaxRL. Sample rewards/components remain unchanged.
+
+Group by prompt/turn and center before DP slicing, without TRLOO future-return folding.
+The same restrictions on whitening and verify history/anchor baselines apply as for ArgMaxRL.
+Other loss/filter/CTM/OPD options remain independent. Group centering is not batch whitening;
+its sample-dependent baseline should not be conflated with the original uncentered ArgMaxRL's
+finite-sample unbiased estimator.
+
 #### Kernel rollout reward post-processing
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.

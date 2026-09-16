@@ -563,6 +563,14 @@ def reward_post_process_by_group(args, samples):
         metadata = sample.metadata or {}
         history_baseline = getattr(args, "verify_advantage_baseline", "group") == "history"
         anchor_baseline = metadata.get("verify_reward_mode") == "anchor"
+        if (
+            args.advantage_estimator in {"argmaxrl", "tailrl"}
+            and metadata.get("role") == "verify"
+            and (anchor_baseline or getattr(args, "verify_advantage_baseline", "group") != "group")
+        ):
+            raise ValueError(
+                "ArgMaxRL/TailRL cannot replace verify history/anchor advantage baselines; use group mode"
+            )
         if metadata.get("role") == "verify" and (anchor_baseline or history_baseline):
             if anchor_baseline and history_baseline:
                 raise ValueError("history advantage baseline cannot be applied to anchor-scored samples")
@@ -613,7 +621,7 @@ def reward_post_process_by_group(args, samples):
 
         group_index = idx_to_group_index[idx]
         stats = group_stats[group_index]
-        reward = raw_reward - stats["mean"]
+        reward = raw_reward if args.advantage_estimator in {"argmaxrl", "tailrl"} else raw_reward - stats["mean"]
 
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
             reward = reward / (stats["std"] + 1e-6)
