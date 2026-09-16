@@ -2,7 +2,7 @@
 
 目标是在 TRLOO baseline 上提高 kernel 正确率。当前用首个正确答案作为参照，通过代码 diff 找出与它接近的前轮实现，再给这些前轮少量额外 credit；FastCredit 保持关闭
 
-<!-- 正式实验从 baseline 相同的官方原始权重开始，RL step 从 0 计数，optimizer、RNG 和数据游标重新初始化；不加载 TRLOO 或 FastCredit 的 step100。四机新作业已启动，先训练到 step100，尚无训练后正确率改善的结论 -->
+这轮从官方原始权重开始的实验已完成 100 次更新，step100 已转换并启动四机固定集评测，与 TRLOO step100 的 32K／48K／64K 协议对齐。截至下述评测异常核查，完整结果尚未验收，不能判断正确率是否提升
 
 实现预验证使用过 TRLOO step100 的诊断留样，分奖覆盖为 3.91%，入选修改已人工检查，正确参照已按原任务精度复测。这个数字不代表当前从 0 训练的覆盖率；此前的 step100 续训也不进入正式对照
 
@@ -39,7 +39,7 @@ $$
 
 前轮还需要回答 completed、代码段完整、原 baseline 未移除且存在有效 loss mask。截断、padding、decoy 和没有正确参照的轨迹不发额外 credit。参照轮的原评测需要 completed、compiled=True、correctness=True、decoy_kernel=False；稳定性复测用于离线抽查，不作为分奖前置条件
 
-上述取消强制复测的改动已进入仓库代码，尚未同步到本次训练的冻结执行包；按用户要求，未为此停止或重启训练，运行时仍沿用原来的复测流程。该作业后来因主评测客户端超时退出，情况见后文；这次超时发生在原始评测，不是参照复测。代码改动已通过 CPU 回归与真实留样离线分奖检查，见[代码改动验收](../../local_artifacts/paper/correctness_diff_training/original_verdict_code_review.json)
+取消强制复测的改动已进入仓库代码，并通过 CPU 回归与真实留样离线检查，见[代码改动验收](../../local_artifacts/paper/correctness_diff_training/original_verdict_code_review.json)。按用户要求，该代码改动没有切换到正在运行的训练中：本轮完成的 100 次更新使用带参照复测的冻结执行包，故障后也沿用该包从自身 step20 恢复。因此，这轮训练结果对应保留参照复测的实现
 
 ## 一条轨迹具体分多少
 
@@ -94,7 +94,7 @@ diff 当前用于决定“哪一轮分奖”，训练仍使用该轮原有的完
 | 优化设置 | 原 TRLOO、predictive DPPO、1e-6 学习率、轨迹打包及原入训 mask |
 | 新参数 | 额外预算 0.25；各代码段最大差异比例 0.10 |
 | 资源 | 前期两台 train、一台 rollout；四机时两台 train、两台 rollout |
-| Checkpoint | 每 20 步保存，保留最近两代可恢复 checkpoint；保存里程碑检查容量 |
+| Checkpoint | 训练期间每 20 步保存并保留最近两代；完成后仅保留 step100，见下文保留记录 |
 
 同一数据起点和种子固定初始顺序；fully-async 的完成顺序与动态过滤会随策略变化，因此还要保存实际接受的题目身份，不能声称三组消费题目逐条完全相同。原 TRLOO 基础 reward 保持不变，仍包含原有性能与 coverage 项；正确性 diff 决定的是新增 credit，不是把整个 reward 改成二元 correctness
 
@@ -139,27 +139,51 @@ diff 当前用于决定“哪一轮分奖”，训练仍使用该轮原有的完
 
 ## 当前验证与尚需观察的结果
 
-当前运行的是 qwen38-correctness-diff025-from0-resume20-20260915，按用户授权从本实验自己的 step20 恢复，node69/70 训练、node53/64 rollout。累计完成 82 次更新，恢复后新增六十二次，第 83 次更新进行中。最新 checkpoint 为完整的 step80。近期 loss 和梯度有限，四节点 KernelGym 健康，恢复以来日志未发现生成异常、客户端评测超时或 OOM。已归档较早的 step60 并释放其源副本，空间足够保存 step100；训练参数和分奖规则未变，见[step80 保存与现场检查](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/step80_checkpoint_review.json)
+### step100 固定集评测
+
+本次只测从 0 训练的 CorrectnessDiff025 step100，作业为 `qwen38-correctness-diff025-step100-ctx32k48k64k-20260916`。比较对象是已有的有效 TRLOO baseline-r2 step100 结果；两者沿用相同的冻结评测源码、题集和生成设置，见[评测身份与对照](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/identity.json)
+
+| 配置 | 设置 |
+|---|---|
+| Checkpoint | 本实验 iter_0000099，累计 100 次更新 |
+| 题集 | KernelBench L1／L2／L3，分别 100／100／50 题 |
+| 采样 | 每题 8 条轨迹，每条 3 轮 |
+| 各轮总 context | 32768／49152／65536，包含历史上下文 |
+| 生成 | temperature 1，top-p 1，medium reasoning，保留历史 thinking |
+| 推理资源 | 4 台、32 张 H20，8 个 TP4 引擎，总客户端并发 256 |
+| 推理实现 | BF16、MTP3、CUDA Graph，FA3／Triton |
+
+step100 的完整分片归档通过逐文件 SHA256 校验，HF 转换检查通过，并完成四机权重同步。正式提交前，真实三轮小检查验证了新权重加载、生成与预算记录；该检查每轮仅生成 256 token，用于隔离验证，不进入正式分数。正式评测恢复完整输出预算，见[转换检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/hf_audit.json)、[四机权重检查](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/weight_sync.json)和[三轮验证](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/diagnostic/verification.json)
+
+八个实际引擎已全部通过模型身份和配置检查，四节点实际执行包也与冻结源码一致，首批完整轨迹已返回。人工查看了 Softsign 的完整回答，并按 task_id 复核一组编译失败后正确的三轮日志：首轮把 `device_id` 字段写成 `device_id()`，后两轮通过。该抽查用于确认生成、编译、反馈和修复链路正常，不用于估计整体正确率，见[启动验收](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/startup_acceptance.json)
+
+本次评测沿用既有 KernelGym 服务，没有部署或修改服务。完成后按正常分母统计逐轮及 Best Correct，同时检查截断和失败样例；训练批次上的指标不替代固定题集比较
+
+2026-09-16 的异常核查记录了两次客户端反馈解析异常：`env_state` 缺少 `metadata`，外层异常处理将相应整条轨迹转成 abort。这些轨迹不能算作模型答错，也不能在未补齐时发布正式对照。已用冻结源码复现一个相关缺陷：任务状态为 completed 后，取结果的一次 HTTP／读取／JSON 异常会被吞掉，客户端立即返回缺字段的简化状态，不再重取结果。告警前完成的任务目前均可取到完整 metadata，首个告警时段的服务端结果请求也均记录为 HTTP 200；旧客户端未记录底层取结果异常，尚不能确定本次具体是哪一种传输或解析故障。当前保持正常轨迹继续采集，完整 dump 发布后按 task_id、group_id 定位并补测受影响轨迹，再统一审计，见[异常核查与处理决定](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/generation_alert_disposition.json)
+
+### 训练完成与保留状态
+
+qwen38-correctness-diff025-from0-resume20-20260915 已以 SUCCEEDED 结束。该作业从本实验自己的 step20 恢复，连续完成第 21–100 次更新，最终 checkpoint 为 iter_0000099。恢复后全部更新的 loss、梯度和学习率记录均为有限值，日志未发现生成异常、客户端评测超时或 OOM。训练完成验收时，两台训练机与两台 rollout 机的 32 张 H20 已释放，KernelGym 健康且队列为空；后续评测另行使用推理资源，见[step100 完成验收](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/step100_checkpoint_review.json)
 
 恢复时已在 GPU 上成功加载 iter_0000019、恢复 optimizer 和数据游标，并按 resume 路径加载 RNG；actor 与 MTP 权重已同步到四个 rollout 引擎，见[恢复验收](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/startup_verification.json)
 
-原作业 qwen38-correctness-diff025-from0-20260915 从 baseline 相同的官方 release 开始，finetune=True、no_load_optim=True、no_load_rng=True、start_rollout_id=0，没有沿用旧 RL 状态。此次恢复沿用同一个从 0 实验的 checkpoint，没有加载历史 TRLOO 或 FastCredit step100；仍以累计 100 次更新为目标
+原作业 qwen38-correctness-diff025-from0-20260915 从 baseline 相同的官方 release 开始，finetune=True、no_load_optim=True、no_load_rng=True、start_rollout_id=0，没有沿用旧 RL 状态。此次恢复沿用同一个从 0 实验的 checkpoint，没有加载历史 TRLOO 或 FastCredit step100，最终达到累计 100 次更新
 
 原始 BF16 release 在两台训练机的全文件 SHA256 一致，metadata 不含 optimizer，来源 HF 路径为官方 Qwen3.8-27B。fresh 与显式 resume 的初始化回归已通过；新作业使用独立目录，先前诊断的模型更新和数据游标均未沿用，见[初始化约定](../../local_artifacts/paper/correctness_diff_training/fresh0/initialization_contract.json)、[权重校验](../../local_artifacts/paper/correctness_diff_training/fresh0/actor_release_verification.json)与[实际参数](../../local_artifacts/paper/correctness_diff_training/fresh0/formal_diff_config.json)
 
 原作业完成 32 次更新后，下一批 rollout32 的主评测客户端超时触发保护，以 FAILED 退出。该批在转换成训练数据之前被拒绝，没有进行第 33 次更新；故障排查阶段未自动重提，随后由用户明确要求恢复
 
-最新保存为 step80（iter_0000079），两节点分片、全局 metadata 文件范围、optimizer、RNG 和数据游标均已核查。较早的 step60 已完整归档到 node70，逐文件通过源端与归档端 SHA256 比对，归档的数据游标和恢复标记也已核对；随后只释放了 step60 的两机源目录。最近两代是可恢复的 step60 归档与 step80 分布式 checkpoint，之前的 step20、step40 归档保留，见[保存与容量处理](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/step80_checkpoint_review.json)
+最新保存为 step100（iter_0000099），两节点分片、全局 metadata 文件范围、optimizer、RNG 和数据游标均已核查。按用户最新要求，本实验只保留 step100：在完整归档和 HF 转换检查通过后，已删除旧 step20／40／60 归档、step80 源副本及 step20 恢复临时视图，旧代不再可恢复。step100 的完整训练状态与 HF 权重保留，历史 baseline、FastCredit 和共享模型未动，见[保留与清理记录](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/retention_receipt.json)与[旧恢复视图清理](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/old_mtp_view_cleanup.json)
 
 原作业中断时，最后 12 次已完成更新没有 checkpoint，此次从 step20 重跑；该恢复起点的核查见[step20 保存验收](../../local_artifacts/paper/correctness_diff_training/fresh0/step20_checkpoint_review.json)与[失败后的 checkpoint 复核](../../local_artifacts/paper/correctness_diff_training/fresh0/terminal_failure_20260915_1006.json)
 
-恢复使用原冻结执行包，四节点源码与推理运行时哈希一致；训练及分奖参数逐项比对通过，只增加恢复加载项并更换留样目录。原日志和留样保留，checkpoint 继续保存到同一实验目录，最近两代保留策略不变；尚未启用取消参照复测或提交重试的新行为，也没有重新部署 KernelGym。只读监控已重新接入三小时心跳、保存里程碑与作业终态通知，见[恢复参数](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/formal_diff_config.json)与[运行来源核验](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/runtime_provenance.json)
+恢复使用原冻结执行包，四节点源码与推理运行时哈希一致；训练及分奖参数逐项比对通过，只增加恢复加载项并更换留样目录。原日志和留样保留，checkpoint 保存到同一实验目录，训练期间保留最近两代；本轮未启用取消参照复测或提交重试的新行为，也没有重新部署 KernelGym。实际执行配置与来源见[恢复参数](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/formal_diff_config.json)和[运行来源核验](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/runtime_provenance.json)
 
-用户已授权后续可恢复故障的自主续训：训练中断后，主 Agent 先诊断并核查入训污染范围；确认运行条件、四节点同步、资源和最近有效 checkpoint 满足恢复要求后，直接 resume，不再逐次请求确认，分奖与训练超参保持不变。若条件尚未恢复，继续安排只读监控唤醒，待恢复后复核；每次决定和恢复结果均 page-user。监控程序本身仍只发送通知，不执行停训或重启；后续明确的用户停训指令优先，不因此覆盖旧证据、重复提交或影响其它任务
+运行期间，用户授权了可恢复故障的自主续训：训练中断后，主 Agent 先诊断并核查入训污染范围；确认运行条件、四节点同步、资源和最近有效 checkpoint 满足恢复要求后，直接 resume，分奖与训练超参保持不变。若条件尚未恢复，继续安排只读监控唤醒；每次决定和恢复结果均 page-user。监控程序只发送通知，不执行停训或重启。本轮现已成功完成，没有触发新的恢复操作
 
-step80 保存后，node69 只剩约 117 GiB，低于下一代约 172 GiB 的写入需求。释放已归档的 step60 源副本后，node69 可用空间恢复到约 289 GiB，node70 约 643 GiB，足够保存 step100。最近两代指两代可恢复状态，不要求源目录与归档各保留一套；本次没有停止训练、修改训练参数或删除共享模型
+step80 保存后，其中一台训练机的空间不足以写入下一代 checkpoint。完整归档并验证 step60 后，释放其重复源副本，保障了 step100 的写入峰值；处理记录见[归档与容量验收](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/step80_checkpoint_review.json)，部署约定见[运行环境](../../RUNTIME.md)
 
-下表各批次均通过源码与任务绑定、分奖资格、预算及 target 重算检查，截断轮没有获得额外项。恢复后的 rollout30、41、52、61、64、79、81 各人工查看两条受奖轨迹的源码 diff，重算接近度，并抽查实际存在的截断样本。rollout81 还在 CPU 上重算了整批筛选记录，与原记录一致；该检查复用原有参照判定，没有新增评测。各批题目不同，预取数据也不等于已经入训，且未做独立反事实验证，下面的变化不能解释为训练效果
+下表各批次均通过源码与任务绑定、分奖资格、预算及 target 重算检查，截断轮没有获得额外项。恢复后的 rollout30、41、52、61、64、79、81、94、99 各人工查看两条受奖轨迹的源码 diff，重算接近度，并抽查实际存在的截断样本。rollout81、99 还在 CPU 上重算了整批筛选记录，与原记录一致；该检查复用原有参照判定，没有新增评测。最后一批检查见[step100 留样验收](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/step100_rollout_audit.json)。各批题目不同，表中的“预取”指留样时的状态，且未做独立反事实验证，下面的变化不能解释为训练效果
 
 | 留样 rollout | T1 Correct（%） | T3 Correct（%） | Best Correct（%） | 分奖轨迹覆盖（%） | 总截断（%） |
 |---|---:|---:|---:|---:|---:|
@@ -173,6 +197,8 @@ step80 保存后，node69 只剩约 117 GiB，低于下一代约 172 GiB 的写�
 | 64（恢复后预取） | 55.08 | 76.56 | 83.20 | 12.11 | 1.69 |
 | 79（恢复后预取） | 53.91 | 61.72 | 71.09 | 9.77 | 0.00 |
 | 81（恢复后预取） | 52.34 | 55.86 | 67.58 | 6.64 | 1.04 |
+| 94（恢复后预取） | 69.53 | 83.59 | 86.72 | 10.94 | 0.13 |
+| 99（最终入训批次） | 70.31 | 75.78 | 84.38 | 7.81 | 1.82 |
 
 Correct 使用原始 turn 编号、全部轨迹分母及 completed、compiled、correctness、非 decoy 条件。发现现有日志会先跳过 speedup 缺失的轮次，再按剩余轮次顺序计算 best_by_turn，可能把 T2 正确计入首轮；本表已直接从留样重算，不沿用该日志口径。该问题不改变按原始 turn_idx 分配的 credit，本次未修改训练代码
 
@@ -180,7 +206,7 @@ Correct 使用原始 turn 编号、全部轨迹分母及 completed、compiled、
 
 恢复后的 rollout30 中，g10205 的 T3 用临时数组保存新的 LSTM 隐藏状态，再统一写回，修正 T2 循环内原地更新造成的新旧状态混用；T2 获得 0.25，T3 保留原奖励。另有 g10652 的 T2 原评测正确、参照复测却报输出不一致，当前冻结版因此取消该轨迹的额外项，原 TRLOO 回报不变；该不一致尚未额外 replay 归因。源码差分与原始判定保存在上述心跳证据中
 
-目前只启动过从 0 开始的 diff 组，尚未另起新的 baseline 或随机对照训练。用户确认当前链路正常后，已先恢复训练；提交恢复逻辑的缺口仍待单独修改，入训前 fail-fast 保护继续保留。后续观察正确率、截断和分奖表现，当前没有训练后正确率改善的结论
+目前完成了从 0 开始的 diff 组训练，固定集评测的验收范围见上文；尚未另起新的 baseline 或随机对照训练。接下来比较与 TRLOO step100 协议对齐的正确率，最后一个训练批次的指标不能替代这一比较。提交恢复逻辑的缺口仍待单独修改，入训前 fail-fast 保护在本轮保留
 
 本次运行曾出现四节点访问 KernelGym 超时及返回字段缺失，随后链路自行恢复，远端 API 进程没有重启。缺少 metadata 的响应触发客户端 abort，含 aborted 样本的题目组会在进入输出队列前被整体重排。rollout29、30，以及之后留存的 rollout31 已分别检查，未发现 aborted、客户端超时或 RESOURCE_ERROR 样本进入这些留样，分奖检查通过；这些检查没有覆盖当时尚未收齐的 rollout32，见[访问异常与入训检查](../../local_artifacts/paper/correctness_diff_training/fresh0/infra_access_20260915_0913.json)和[rollout31 心跳检查](../../local_artifacts/paper/correctness_diff_training/fresh0/heartbeat_1789466538.json)
 
@@ -190,15 +216,15 @@ Correct 使用原始 turn 编号、全部轨迹分母及 completed、compiled、
 
 | 环节 | 已确认的现象 | 对本次故障的影响 |
 |---|---|---|
-| 故障时段的 SSH 转发异常 | SSH 连接超时、握手失败，node69 转发器记录后端连接被拒绝；API 与 Redis 进程持续运行 | 可能阻断请求提交，但尚未将目标 task 的 POST 与具体失效的 SSH 连接一一对应 |
-| 转发恢复受阻 | node69 的部分端口持续报 Address already in use，新的反向转发反复绑定失败 | 重连不能立即恢复所有后端；旧 SSH 会话未释放端口是合理解释，但当时的端口占用 PID 未留存 |
+| 故障时段的 SSH 转发异常 | SSH 连接超时、握手失败，受影响训练机的转发器记录后端连接被拒绝；API 与 Redis 进程持续运行 | 可能阻断请求提交，但尚未将目标 task 的 POST 与具体失效的 SSH 连接一一对应 |
+| 转发恢复受阻 | 受影响训练机的部分端口持续报 Address already in use，新的反向转发反复绑定失败 | 重连不能立即恢复所有后端；旧 SSH 会话未释放端口是合理解释，但当时的端口占用 PID 未留存 |
 | Slime 没有恢复未确认的提交 | 三次 POST 失败后只查询原 task；网络恢复后仍不补交，直到客户端期限耗尽 | 将一次提交失败拖成约 40 分钟等待，最终触发整批 fail-fast |
 
 目标 task 在覆盖故障时段的 API 日志中没有完整请求正文记录，相邻 task 有；该 task 在运行期间的 status 查询全部返回 404。当前部署的 KernelGym 会把仍在运行的 workflow 返回为 processing，因此不能继续用旧客户端注释里的“正常运行的父任务也一直 404”解释本例。现有证据高度指向请求未成功提交，而非候选 kernel 长时间执行；但缺少独立的接收事务记录，仍保留这个归因边界
 
 用实际冻结客户端做了无网络的故障模拟：提交阶段均失败、随后恢复连通性时，客户端持续查询不存在的 task 并等到超时；若模拟任务已经被服务端接受、只是提交响应丢失，则可以正常取回结果。这确认了当前恢复逻辑只覆盖后一种情况。后续应补上未确认提交的安全恢复或整题组重采集，保留入训前保护；单纯增加 timeout 或取消保护都不能补出缺失的评测结果
 
-用户指出隧道正常后，从实际 node69 执行容器重新检查，/health 同样正常，而旧 task 的 status 与 results 仍返回 404。当前连通性、故障时段的转发异常、以及单个请求失败的具体原因需要分开判断：历史转发日志不能证明隧道现在仍故障，也不足以单独确定目标 POST 为何失败；已经独立复现的是客户端没有恢复未确认提交的能力
+用户指出隧道正常后，从受影响训练机的实际执行容器重新检查，/health 同样正常，而旧 task 的 status 与 results 仍返回 404。当前连通性、故障时段的转发异常、以及单个请求失败的具体原因需要分开判断：历史转发日志不能证明隧道现在仍故障，也不足以单独确定目标 POST 为何失败；已经独立复现的是客户端没有恢复未确认提交的能力
 
 更上游网关为何断线仍未定位，故障排查没有修改 SSH、KernelGym 或训练代码。此次中断不构成方法有效或无效的证据，不能据此将此前所有更新判为污染。任务时间线见[退出检查](../../local_artifacts/paper/correctness_diff_training/fresh0/terminal_failure_20260915_1006.json)，服务端对照、转发日志、当前复查和客户端复现见[提交恢复根因排查](../../local_artifacts/paper/correctness_diff_training/fresh0/submission_recovery_diagnosis_20260915.json)
 
@@ -217,7 +243,7 @@ Correct 使用原始 turn 编号、全部轨迹分母及 completed、compiled、
 
 最初两批检查时，KernelGym 健康且没有待排队任务。留样中有两次 300 秒任务超时，以及七次候选运行错误后的 60 秒 memcheck 超时；两类分别保留，相关超时轮均没有额外 credit。尚未独立 replay 这些超时，不能进一步归因
 
-后续心跳发现四节点均无法访问 KernelGym：20211 转发器仍在，但其八个后端端口全部消失，SSH 反向入口也无法完成握手。rollout110 中 g40363 的第三轮等待主评测超过客户端期限，得到合成零分，仍带有效 loss mask 进入第十一次训练计算。没有额外 credit 并不足以防止原 TRLOO 回报受到未完成评测的影响，因此已停止该作业并排除出正式对照；日志与留样保留，不能把该次中断解释为方法有效或无效
+后续心跳发现四节点均无法访问 KernelGym：服务入口转发器仍在，但其八个后端端口全部消失，SSH 反向入口也无法完成握手。rollout110 中 g40363 的第三轮等待主评测超过客户端期限，得到合成零分，仍带有效 loss mask 进入第十一次训练计算。没有额外 credit 并不足以防止原 TRLOO 回报受到未完成评测的影响，因此已停止该作业并排除出正式对照；日志与留样保留，不能把该次中断解释为方法有效或无效
 
 三组共用的代码已补上主评测客户端超时整批报错保护，在 LOO 前阻止更新；原有候选 kernel 超时、sanitizer 超时与原 TRLOO off 模式未改。CPU 合约检查和真实受影响批次的三模式离线检查均通过，保护已随新快照同步到四节点并用于重跑，见[故障与保护验证](../../local_artifacts/paper/correctness_diff_training/kernelgym_outage_audit.json)
 
@@ -303,12 +329,14 @@ T1 直接正确时没有额外 diff credit；T1 接近正确、T2 修复通过�
 - 新池分奖、参照复测与随机对照：[汇总](../../local_artifacts/paper/correctness_diff_training/near_annotated_capture/summary.json)、[逐轮记录](../../local_artifacts/paper/correctness_diff_training/near_annotated_capture/ledger.json)
 - 人工检查与训练张量抽查：[检查记录](../../local_artifacts/paper/correctness_diff_training/near_manual_review.md)
 - 实验设置与启动入口：[train_arm.sh](../../local_artifacts/paper/correctness_diff_training/train_arm.sh)
-- 正式实际 argv 与源码身份：[step0 新训练配置](../../local_artifacts/paper/correctness_diff_training/fresh0/formal_diff_config.json)
-- 新采集使用同步 debug-rollout 路径，正式训练使用原 fully-async 路径；大文件存放在实际执行容器的 /nfs/LOCAL，不把宿主终端同名路径当作已经同步
+- 正式实际 argv 与源码身份：[step0 新训练配置](../../local_artifacts/paper/correctness_diff_training/fresh0/formal_diff_config.json)、[恢复后执行配置](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/formal_diff_config.json)
+- 新采集使用同步 debug-rollout 路径，正式训练使用原 fully-async 路径；大文件存放在实际执行容器的节点本地实验目录，不把宿主终端同名路径当作已经同步
 - 只使用既有 KernelGym dev_csl 服务，未修改或重新部署 KernelGym；代码、配置、权重及数据按实际执行节点核验
 
-node53 的原占用提前自行结束，无需杀掉其 GPU 进程。首次四机启动在提交前发现 node64 旧 SGLang 副本缺少 MTP refit 补丁，随后采用实验私有副本，四节点逐文件 hash 与补丁检查均通过；共享运行时与 KernelGym 没有改动
+原有 GPU 占用提前自行结束，无需终止其进程。首次四机启动在提交前发现一台 rollout 机的旧 SGLang 副本缺少 MTP refit 补丁，随后采用实验私有副本，四节点逐文件 hash 与补丁检查均通过；共享运行时与 KernelGym 没有改动
 
 旧整包 hook 的 Grok 审阅、新规则的代理 Kimi 审阅均因连接问题未获得最终结论，原生 Kimi 又因额度限制无法调用。没有记为独立审查通过，也没有更改付费或账户设置；替代检查与边界见[审阅记录](../../local_artifacts/paper/correctness_diff_training/near_review_disposition.json)
 
-只读[正式监控](../../local_artifacts/paper/correctness_diff_training/fresh0/formal_watcher_state.json)检查 step100 保存、作业状态和 KernelGym 健康，每三小时 Queue 心跳；每 20 步保存后通知主 Agent 检查分奖与磁盘容量，链路连续三次不可达会提前通知。监控不会部署服务、停止作业或自动启动后续对照，处置仍由主 Agent 执行
+只读[正式监控](../../local_artifacts/paper/correctness_diff_training/fresh0/resume_step20/formal_watcher_state.json)在训练期间检查保存、作业状态和 KernelGym 健康，发送三小时心跳与保存里程碑通知。确认 step100 完整且作业 SUCCEEDED 后，监控发出完成通知并正常退出；本轮不再发送训练心跳。保存清理进程也已退出，监控没有自动启动评测或后续对照
+
+用户授权评测后，主 Agent 完成 checkpoint 验证、转换和同步，再提交上述唯一评测作业。新的[评测只读监控](../../local_artifacts/paper/correctness_diff_training/step100_eval_20260916/eval_watcher_state.json)发送三小时心跳、异常和完成通知；监控本身不停止、重启或重复提交任务

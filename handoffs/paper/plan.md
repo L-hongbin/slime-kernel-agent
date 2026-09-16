@@ -4,7 +4,7 @@
 
 本目录维护三个研究入口：[本文](plan.md)说明实验顺序，[组件奖励](component_reward_training.md)说明实现与验证，[状态聚合](state_aggregation.md)说明另一条研究线；[runtime 图教程](runtime_graph_extraction.md)单独展开采图方法。后续迭代直接更新对应文档
 
-从源码匹配到 runtime 图及优化规则的尝试和失败原因，集中记录在[失败路径复盘](component_tracking_failed_paths.md)，不在实验计划中重复展开
+从源码匹配到 runtime 图及优化规则的尝试和失败原因，集中记录在[失败路径复盘](component_tracking_failed_paths.md)，不在实验计划中重复展开。FastCredit 与 Correctness diff 的共同奖励假设、整轮信号风险和对照需求见[多轮 reward 设计分析](多轮reward设计分析.md)
 
 ## 当前先做什么
 
