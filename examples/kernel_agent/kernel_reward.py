@@ -83,6 +83,10 @@ def reward_post_process_by_group(args, samples):
         raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
     else:
         raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if getattr(args, "correctness_diff_mode", "off") != "off":
+        from .correctness_diff_reward import credited_returns
+
+        raw_rewards = credited_returns(args, samples, raw_rewards)
     rewards = [None] * len(raw_rewards)
     use_conditional_truncation_mask = getattr(args, "use_conditional_truncation_mask", False)
 

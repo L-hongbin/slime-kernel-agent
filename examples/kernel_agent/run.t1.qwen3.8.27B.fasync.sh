@@ -1607,6 +1607,14 @@ if [[ "${COMPONENT_REWARD}" == "1" ]]; then
       KERNEL_AGENT_ARGS+=(--runtime-graph-timeout "${RUNTIME_GRAPH_TIMEOUT}")
    fi
 fi
+if [[ "${CORRECTNESS_DIFF_MODE:-off}" != "off" ]]; then
+   KERNEL_AGENT_ARGS+=(
+      --correctness-diff-mode "${CORRECTNESS_DIFF_MODE}"
+      --correctness-diff-scale "${CORRECTNESS_DIFF_SCALE:-0.25}"
+      --correctness-diff-seed "${CORRECTNESS_DIFF_SEED:-42}"
+      --correctness-diff-max-edit-ratio "${CORRECTNESS_DIFF_MAX_EDIT_RATIO:-0.1}"
+   )
+fi
 
 if [[ "${ROLLOUT_CORRECTION_MODE}" == "hard_sequence_mis" ]]; then
    KERNEL_AGENT_ARGS+=(

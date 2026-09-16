@@ -1884,7 +1884,18 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
     return postprocess_turn_samples(args, output_samples, finish_reason="aborted")
 
 
-async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
+async def generate(
+    args, sample: Sample, sampling_params: dict[str, Any], evaluation: bool = False
+) -> Sample | list[Sample]:
+    output = await _guarded_generate(args, sample, sampling_params)
+    if not evaluation and getattr(args, "correctness_diff_mode", "off") != "off":
+        from .correctness_diff_reward import annotate_trajectory
+
+        output = await annotate_trajectory(args, output)
+    return output
+
+
+async def _guarded_generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     started_at = time.monotonic()
     try:
         async with asyncio.timeout(KERNEL_AGENT_GENERATE_GUARD_SEC):

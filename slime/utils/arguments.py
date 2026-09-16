@@ -2045,6 +2045,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--correctness-diff-mode",
+                choices=["off", "baseline", "diff", "shuffled"],
+                default="off",
+                help="Three-turn correctness-diff pilot: evidence-only baseline, diff recipients, or matched shuffled control.",
+            )
+            parser.add_argument("--correctness-diff-scale", type=float, default=0.25)
+            parser.add_argument("--correctness-diff-seed", type=int, default=42)
+            parser.add_argument("--correctness-diff-max-edit-ratio", type=float, default=0.1)
+            parser.add_argument(
                 "--component-reward",
                 action="store_true",
                 default=False,
@@ -2755,6 +2764,10 @@ def slime_validate_args(args):
 
     _validate_turn_context_limits(args)
     _validate_component_reward_args(args)
+    if getattr(args, "correctness_diff_mode", "off") != "off":
+        from examples.kernel_agent.correctness_diff_reward import validate_args as validate_correctness_diff_args
+
+        validate_correctness_diff_args(args)
     validate_trajectory_packing_args(args)
     _validate_partial_rollout_args(args)
     if args.overlong_penalty_turn_idx is not None:

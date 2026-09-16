@@ -755,6 +755,13 @@ class RolloutManager:
         if self.args.ci_test and self.args.use_fault_tolerance and rollout_id >= 2:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
+        if getattr(self.args, "correctness_diff_mode", "off") != "off":
+            from examples.kernel_agent.correctness_diff_reward import batch_metrics, credited_returns
+
+            # Capture the exact selected recipients before saving reviewable data.
+            # Postprocessing recomputes from unchanged baseline returns, so this is idempotent.
+            credited_returns(self.args, data, [s.metadata["multi_turn_reward"] for s in data])
+            metrics = {**(metrics or {}), **batch_metrics(data)}
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
         _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
         if self.args.debug_rollout_only:
