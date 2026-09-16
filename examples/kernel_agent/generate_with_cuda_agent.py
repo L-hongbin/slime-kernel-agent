@@ -1527,9 +1527,25 @@ async def cuda_kernel_env(
     response: str,
     turn_idx: int,
 ) -> dict[str, Any]:
+    from .component_reward import uses_runtime_graph
+
     entry_point = _get_entry_point(sample)
     ground_truth = _get_label_value(sample, "ground_truth")
     precision = _resolve_task_precision(sample, ground_truth)
+    source_backend = getattr(args, "component_reward", False) and not uses_runtime_graph(args)
+    if source_backend:
+        from .source_component_reward import source_request_identity
+        from .utils import extract_cuda_agent_kernel_code
+
+        sample.metadata = dict(sample.metadata or {})
+        sample.metadata["source_component_identity"] = source_request_identity(
+            ground_truth,
+            extract_cuda_agent_kernel_code(response),
+            entry_point=entry_point,
+            precision=precision,
+            submitted=False,
+        )
+        sample.metadata.pop("source_component_profiles", None)
     do_precheck = bool(getattr(args, "do_precheck", True))
     kernel_backend = args.kernel_backend
     reference_backend = getattr(args, "reference_backend", "torch")
@@ -1544,12 +1560,14 @@ async def cuda_kernel_env(
             "env_state": precheck_state,
             "env_extra_info": _extract_env_extra_info(precheck_state),
         }
-        if getattr(args, "component_reward", False):
+        if uses_runtime_graph(args):
             result["runtime_graph"] = {
                 "schema": "kernelgym-runtime-graph/v1",
                 "status": "unavailable",
                 "unknowns": ["client_precheck"],
             }
+        if source_backend:
+            result["source_component_identity"] = sample.metadata["source_component_identity"]
         return result
     else:
         task_id = next_kernel_task_id()
@@ -1608,7 +1626,7 @@ async def cuda_kernel_env(
                 "status": "invalid",
                 "unknowns": ["response_runtime_graph_not_object"],
             }
-    elif getattr(args, "component_reward", False):
+    elif uses_runtime_graph(args):
         runtime_graph = {
             "schema": "kernelgym-runtime-graph/v1",
             "status": "unavailable",
@@ -1622,6 +1640,11 @@ async def cuda_kernel_env(
     }
     if runtime_graph is not None:
         result["runtime_graph"] = runtime_graph
+    if source_backend:
+        result["source_component_identity"] = sample.metadata["source_component_identity"]
+        profiling = raw_metadata.get("profiling") if isinstance(raw_metadata, dict) else None
+        profiles = profiling.get("kernels") if isinstance(profiling, dict) else None
+        result["source_component_profiles"] = profiles if isinstance(profiles, list) else []
     return result
 
 
@@ -1674,6 +1697,10 @@ def _sample_for_turn(
     turn_sample.metadata.pop("runtime_graph", None)
     if "runtime_graph" in env_result:
         turn_sample.metadata["runtime_graph"] = env_result["runtime_graph"]
+    turn_sample.metadata.pop("source_component_profiles", None)
+    for key in ("source_component_identity", "source_component_profiles"):
+        if key in env_result:
+            turn_sample.metadata[key] = env_result[key]
     # Populate speculative-decoding / prefix-cache stats from the engine meta_info
     # so rollout/spec_accept_rate and rollout/prefix_cache_hit_rate are not silently 0.
     # Only the stat sub-updates are applied here (not the full update_from_meta_info)

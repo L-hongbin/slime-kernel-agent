@@ -397,8 +397,12 @@ def _build_kernel_eval_payload(args, payload: dict[str, Any], config: dict[str, 
     )
     if compute_sanitizer_mode is not None:
         task_payload["compute_sanitizer_mode"] = str(compute_sanitizer_mode)
+    from .component_reward import uses_runtime_graph
+
     runtime_graph = payload.get("runtime_graph")
-    if runtime_graph is None and getattr(args, "component_reward", False):
+    if getattr(args, "component_reward", False) and not uses_runtime_graph(args) and runtime_graph is not None:
+        raise ValueError("source component reward does not accept runtime_graph requests")
+    if runtime_graph is None and uses_runtime_graph(args):
         runtime_graph = {
             "enabled": True,
             "timeout_s": float(getattr(args, "runtime_graph_timeout", 60.0)),
@@ -518,12 +522,24 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
     config = dict(config)
     component_payload = None
     if getattr(args, "component_reward", False):
+        from .component_reward import uses_runtime_graph
+
         component_payload = _build_kernel_eval_payload(args, payload, config)
         sample.metadata = dict(sample.metadata or {})
-        sample.metadata["runtime_graph_expected_identity"] = {
-            "task_sha256": hashlib.sha256(component_payload["reference_code"].encode()).hexdigest(),
-            "candidate_source_sha256": hashlib.sha256(component_payload["kernel_code"].encode()).hexdigest(),
-        }
+        if uses_runtime_graph(args):
+            sample.metadata["runtime_graph_expected_identity"] = {
+                "task_sha256": hashlib.sha256(component_payload["reference_code"].encode()).hexdigest(),
+                "candidate_source_sha256": hashlib.sha256(component_payload["kernel_code"].encode()).hexdigest(),
+            }
+        else:
+            from .source_component_reward import source_request_identity
+
+            sample.metadata["source_component_identity"] = source_request_identity(
+                component_payload["reference_code"],
+                component_payload["kernel_code"],
+                entry_point=component_payload["entry_point"],
+                precision=component_payload["precision"],
+            )
     eval_func_path = _kernel_eval_param(args, config, "kernel_eval_function_path", None)
     if eval_func_path:
         if component_payload is not None:
@@ -532,6 +548,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
                 **{
                     key: component_payload[key]
                     for key in ("task_id", "reference_code", "kernel_code", "runtime_graph")
+                    if key in component_payload
                 },
             }
         task_payload = {

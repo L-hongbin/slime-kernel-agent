@@ -2051,6 +2051,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Distribute the best same-trajectory score by observed component origins; opt-in TRLOO heuristic.",
             )
             parser.add_argument(
+                "--component-reward-backend",
+                choices=["source", "runtime_graph"],
+                default="source",
+                help="Source implementation observations or the separately deployed runtime-graph collector.",
+            )
+            parser.add_argument(
+                "--component-reward-mode",
+                choices=["replace", "trloo-credit-additive"],
+                default="replace",
+                help=(
+                    "Replace task returns with component credit, or add source-only credit to baseline TRLOO "
+                    "using a correctness-passed, minimum-speedup-qualified best answer."
+                ),
+            )
+            parser.add_argument(
+                "--component-reward-scale",
+                type=float,
+                default=0.25,
+                help="Non-negative source credit coefficient added once to the credited earlier turn's TRLOO return.",
+            )
+            parser.add_argument(
+                "--component-reward-min-speedup",
+                type=float,
+                default=1.0,
+                help="Minimum finite measured speedup of a correctness-passed additive-credit anchor (inclusive).",
+            )
+            parser.add_argument(
                 "--runtime-graph-timeout",
                 type=float,
                 default=60.0,
@@ -2538,11 +2565,35 @@ def _validate_component_reward_args(args):
         raise ValueError("--component-reward requires --use-multi-turn and --advantage-estimator trloo")
     if args.custom_reward_post_process_path != "examples.kernel_agent.kernel_reward.reward_post_process_by_group":
         raise ValueError("--component-reward requires the kernel agent turn-aware reward postprocess hook")
-    expected_filter = "examples.kernel_agent.component_reward.filter_component_reward_group"
+    mode = getattr(args, "component_reward_mode", "replace")
+    if mode not in {"replace", "trloo-credit-additive"}:
+        raise ValueError("unknown --component-reward-mode")
+    scale = float(getattr(args, "component_reward_scale", 0.25))
+    if not math.isfinite(scale) or scale < 0:
+        raise ValueError("--component-reward-scale must be finite and non-negative")
+    expected_filter = (
+        "examples.kernel_agent.kernel_filter.filter_cuda_kernel_group"
+        if mode == "trloo-credit-additive"
+        else "examples.kernel_agent.component_reward.filter_component_reward_group"
+    )
     if getattr(args, "dynamic_sampling_filter_path", None) not in (None, expected_filter):
-        raise ValueError("--component-reward requires the component target-vector dynamic filter")
+        raise ValueError(f"--component-reward-mode {mode} requires dynamic filter {expected_filter}")
     if getattr(args, "dynamic_sampling_filter_path", None) and not getattr(args, "filter_by_last_turn", False):
         raise ValueError("--component-reward dynamic filtering requires --filter-by-last-turn for atomic trajectories")
+    backend = getattr(args, "component_reward_backend", "runtime_graph")
+    if backend not in {"source", "runtime_graph"}:
+        raise ValueError("unknown --component-reward-backend")
+    if mode == "trloo-credit-additive":
+        if backend != "source":
+            raise ValueError("trloo-credit-additive requires --component-reward-backend source")
+        gamma = float(getattr(args, "multi_turn_gamma", 1.0))
+        if not math.isfinite(gamma) or gamma <= 0:
+            raise ValueError("trloo-credit-additive requires finite positive --multi-turn-gamma")
+        minimum = float(getattr(args, "component_reward_min_speedup", 1.0))
+        if not math.isfinite(minimum) or minimum < 0:
+            raise ValueError("--component-reward-min-speedup must be finite and non-negative")
+    if backend == "source":
+        return
     timeout = float(getattr(args, "runtime_graph_timeout", 60.0))
     if not math.isfinite(timeout) or not 0 < timeout <= 120:
         raise ValueError("--runtime-graph-timeout must be finite and in (0, 120], matching KernelGym")

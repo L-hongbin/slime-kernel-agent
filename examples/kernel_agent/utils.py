@@ -1552,6 +1552,14 @@ def postprocess_turn_samples(args, output_samples: list[Sample], finish_reason: 
 
         return postprocess_component_turns(args, output_samples, finish_reason)
 
+    return _postprocess_baseline_turn_samples(args, output_samples, finish_reason)
+
+
+def _postprocess_baseline_turn_samples(args, output_samples: list[Sample], finish_reason: str) -> list[Sample]:
+    """Finalize baseline rewards and masks without changing shared rollout args."""
+    if not output_samples:
+        return []
+
     _apply_rollout_progress_metadata(output_samples, finish_reason)
 
     for sample in output_samples:

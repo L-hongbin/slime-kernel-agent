@@ -232,9 +232,39 @@ MAX_TURNS=${MAX_TURNS:-2}
 TURN_MAX_CONTEXT_LENS=${TURN_MAX_CONTEXT_LENS:-}
 PACK_MULTI_TURN_TRAJECTORIES=${PACK_MULTI_TURN_TRAJECTORIES:-0}
 COMPONENT_REWARD=${COMPONENT_REWARD:-0}
+COMPONENT_REWARD_BACKEND=${COMPONENT_REWARD_BACKEND:-source}
+COMPONENT_REWARD_MODE=${COMPONENT_REWARD_MODE:-replace}
+COMPONENT_REWARD_SCALE=${COMPONENT_REWARD_SCALE:-0.25}
+COMPONENT_REWARD_MIN_SPEEDUP=${COMPONENT_REWARD_MIN_SPEEDUP:-1.0}
 RUNTIME_GRAPH_TIMEOUT=${RUNTIME_GRAPH_TIMEOUT:-60}
+if [[ "${COMPONENT_REWARD_BACKEND}" != "source" && "${COMPONENT_REWARD_BACKEND}" != "runtime_graph" ]]; then
+   echo "COMPONENT_REWARD_BACKEND must be source or runtime_graph." >&2
+   exit 1
+fi
 if ! [[ "${COMPONENT_REWARD}" =~ ^[01]$ ]]; then
    echo "COMPONENT_REWARD must be 0 or 1." >&2
+   exit 1
+fi
+if [[ "${COMPONENT_REWARD_MODE}" != "replace" && "${COMPONENT_REWARD_MODE}" != "trloo-credit-additive" ]]; then
+   echo "COMPONENT_REWARD_MODE must be replace or trloo-credit-additive." >&2
+   exit 1
+fi
+if [[ "${COMPONENT_REWARD_MODE}" == "trloo-credit-additive" && ( "${COMPONENT_REWARD}" != "1" || "${COMPONENT_REWARD_BACKEND}" != "source" ) ]]; then
+   echo "trloo-credit-additive requires COMPONENT_REWARD=1 and COMPONENT_REWARD_BACKEND=source." >&2
+   exit 1
+fi
+if ! python3 - "${COMPONENT_REWARD_SCALE}" "${COMPONENT_REWARD_MIN_SPEEDUP}" <<'PY'
+import math
+import sys
+
+try:
+    values = [float(v) for v in sys.argv[1:]]
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if all(math.isfinite(v) and v >= 0 for v in values) else 1)
+PY
+then
+   echo "COMPONENT_REWARD_SCALE and COMPONENT_REWARD_MIN_SPEEDUP must be finite and non-negative." >&2
    exit 1
 fi
 if ! [[ "${PACK_MULTI_TURN_TRAJECTORIES}" =~ ^[01]$ ]]; then
@@ -618,7 +648,13 @@ if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
    TURN_POLICY_LABEL+=".Packed"
 fi
 if [[ "${COMPONENT_REWARD}" == "1" ]]; then
-   TURN_POLICY_LABEL+=".ComponentCredit"
+   # Keep the generated experiment directory below the filesystem's 255-byte
+   # component limit (the full three-turn source-credit label reached 257).
+   if [[ "${COMPONENT_REWARD_MODE}" == "trloo-credit-additive" ]]; then
+      TURN_POLICY_LABEL+=".CCa${COMPONENT_REWARD_SCALE/./p}"
+   else
+      TURN_POLICY_LABEL+=".CC${COMPONENT_REWARD_BACKEND}"
+   fi
 fi
 
 
@@ -1502,7 +1538,7 @@ esac
 # n=16 filter unchanged, and bypass it only for the n=1 diagnostic path.
 if [[ "${DEBUG_ROLLOUT_ONLY}" != "1" || "${N_SAMPLES_PER_PROMPT}" -gt 1 ]]; then
    DYNAMIC_SAMPLING_FILTER=examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
-   if [[ "${COMPONENT_REWARD}" == "1" ]]; then
+   if [[ "${COMPONENT_REWARD}" == "1" && "${COMPONENT_REWARD_MODE}" == "replace" ]]; then
       DYNAMIC_SAMPLING_FILTER=examples.kernel_agent.component_reward.filter_component_reward_group
    fi
    CUSTOM_ARGS+=(
@@ -1562,7 +1598,14 @@ if [[ "${PACK_MULTI_TURN_TRAJECTORIES}" == "1" ]]; then
    KERNEL_AGENT_ARGS+=(--pack-multi-turn-trajectories)
 fi
 if [[ "${COMPONENT_REWARD}" == "1" ]]; then
-   KERNEL_AGENT_ARGS+=(--component-reward --runtime-graph-timeout "${RUNTIME_GRAPH_TIMEOUT}")
+   KERNEL_AGENT_ARGS+=(
+      --component-reward --component-reward-backend "${COMPONENT_REWARD_BACKEND}"
+      --component-reward-mode "${COMPONENT_REWARD_MODE}" --component-reward-scale "${COMPONENT_REWARD_SCALE}"
+      --component-reward-min-speedup "${COMPONENT_REWARD_MIN_SPEEDUP}"
+   )
+   if [[ "${COMPONENT_REWARD_BACKEND}" == "runtime_graph" ]]; then
+      KERNEL_AGENT_ARGS+=(--runtime-graph-timeout "${RUNTIME_GRAPH_TIMEOUT}")
+   fi
 fi
 
 if [[ "${ROLLOUT_CORRECTION_MODE}" == "hard_sequence_mis" ]]; then
@@ -1801,7 +1844,9 @@ prepare_node_local_resume_metadata() {
 
 if [[ "${CONFIG_DRY_RUN}" == "1" ]]; then
    printf 'ENABLE_MTP_TRAINING=%s\n' "${ENABLE_MTP_TRAINING}"
-   printf 'COMPONENT_REWARD=%s\nRUNTIME_GRAPH_TIMEOUT=%s\n' "${COMPONENT_REWARD}" "${RUNTIME_GRAPH_TIMEOUT}"
+   printf 'COMPONENT_REWARD=%s\nCOMPONENT_REWARD_BACKEND=%s\nRUNTIME_GRAPH_TIMEOUT=%s\n' "${COMPONENT_REWARD}" "${COMPONENT_REWARD_BACKEND}" "${RUNTIME_GRAPH_TIMEOUT}"
+   printf 'COMPONENT_REWARD_MODE=%s\nCOMPONENT_REWARD_SCALE=%s\nCOMPONENT_REWARD_MIN_SPEEDUP=%s\n' \
+      "${COMPONENT_REWARD_MODE}" "${COMPONENT_REWARD_SCALE}" "${COMPONENT_REWARD_MIN_SPEEDUP}"
    printf 'PACK_MULTI_TURN_TRAJECTORIES=%s\nMAX_TURNS=%s\nTURN_MAX_CONTEXT_LENS=%s\n' \
       "${PACK_MULTI_TURN_TRAJECTORIES}" "${MAX_TURNS}" "${TURN_MAX_CONTEXT_LENS}"
    printf 'TRAIN_DTYPE=bf16\nROLLOUT_CHECKPOINT=%s\nTRAIN_CHECKPOINT=%s\n' \

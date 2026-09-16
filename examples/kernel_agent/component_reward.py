@@ -15,6 +15,8 @@ from collections import Counter, defaultdict
 
 logger = logging.getLogger(__name__)
 METHOD = "best-observed-components/v1"
+ADDITIVE_MODE = "trloo-credit-additive"
+ADDITIVE_METHOD = "trloo-fast-component-credit/v1"
 WIRE_SCHEMA = "kernelgym-runtime-graph/v1"
 GRAPH_SCHEMA = "coarse-component-graph/v1"
 MATCH_CONTEXT = ("task_sha256", "input_signature", "environment_signature", "collector_sha256")
@@ -23,8 +25,120 @@ SEMANTIC_ONLY = {"kernel_body_opaque", "opaque_kernel_semantics"}
 UNIT_KINDS = {"kernel", "library", "copy", "fill", "clone", "memcpy", "memset"}
 
 
+def uses_runtime_graph(args):
+    return (
+        bool(getattr(args, "component_reward", False))
+        and getattr(args, "component_reward_backend", "runtime_graph") == "runtime_graph"
+    )
+
+
 class ComponentRewardContractError(ValueError):
     pass
+
+
+def component_reward_mode(args):
+    mode = getattr(args, "component_reward_mode", "replace")
+    if mode not in {"replace", ADDITIVE_MODE}:
+        raise ComponentRewardContractError(f"unsupported component reward mode: {mode}")
+    return mode
+
+
+def validate_component_reward_record(args, record, *, sample=None):
+    """Reject stale objectives when a saved rollout is replayed with new settings."""
+    mode = component_reward_mode(args)
+    method = ADDITIVE_METHOD if mode == ADDITIVE_MODE else METHOD
+    if not isinstance(record, dict) or record.get("method") != method or record.get("mode", "replace") != mode:
+        raise ComponentRewardContractError("component reward method/mode mismatch; re-postprocess the saved rollout")
+    target = _finite(record.get("turn_target"), "component turn_target")
+    if mode == ADDITIVE_MODE:
+        from .source_component_reward import _correct, _observed_speedup
+
+        scale = _finite(getattr(args, "component_reward_scale", 0.25), "component_reward_scale")
+        minimum = _finite(getattr(args, "component_reward_min_speedup", 1.0), "component_reward_min_speedup")
+        if (
+            record.get("allocation_method") != METHOD
+            or record.get("backend") != "source-strategies/v1"
+            or _finite(record.get("scale"), "saved component_reward_scale") != scale
+            or _finite(record.get("anchor_min_speedup"), "saved component minimum speedup") != minimum
+        ):
+            raise ComponentRewardContractError(
+                "component reward scale/gate/backend mismatch; re-postprocess the saved rollout"
+            )
+        baseline, credits = record.get("baseline_returns"), record.get("credits")
+        if (
+            not isinstance(baseline, list)
+            or not isinstance(credits, list)
+            or not baseline
+            or len(baseline) != len(credits)
+        ):
+            raise ComponentRewardContractError("invalid additive component return/credit vectors")
+        width = len(baseline)
+        if any(
+            not isinstance(record.get(key), list) or len(record[key]) != width
+            for key in (
+                "baseline_rewards",
+                "base_scores",
+                "active_turns",
+                "targets",
+                "scaled_credits",
+                "target_deltas",
+                "anchor_correct",
+                "anchor_speedups",
+            )
+        ) or any(type(active) is not bool for active in record["active_turns"]):
+            raise ComponentRewardContractError("invalid additive component target/mask vectors")
+        eligible = record.get("anchor_eligible_turns")
+        if (
+            not isinstance(eligible, list)
+            or any(type(t) is not int or not 0 <= t < width for t in eligible)
+            or eligible != sorted(set(eligible))
+            or any(type(v) is not bool for v in record["anchor_correct"])
+            or any(v is not None and _finite(v, "saved anchor speedup") < 0 for v in record["anchor_speedups"])
+        ):
+            raise ComponentRewardContractError("invalid additive anchor observations")
+        for t in eligible:
+            if (
+                not record["active_turns"][t]
+                or not record["anchor_correct"][t]
+                or record["anchor_speedups"][t] is None
+                or record["anchor_speedups"][t] < minimum
+            ):
+                raise ComponentRewardContractError("component anchor did not pass correctness/speedup gate")
+        scores = [_finite(q, "saved base task reward") for q in record["base_scores"]]
+        best = max(eligible, key=lambda t: (scores[t], -t)) if eligible else None
+        if record.get("best_turn") != best or record.get("quality_budget") != (
+            max(scores[best], 0.0) if best is not None else 0.0
+        ):
+            raise ComponentRewardContractError("component anchor is not the best eligible answer")
+        expected = _additive_credit_targets(baseline, credits, best, record.get("quality_budget"), scale)
+        if any(record.get(key) != value for key, value in expected.items()):
+            raise ComponentRewardContractError(
+                "additive component target vectors do not match the configured objective"
+            )
+        if any(not record["active_turns"][t] for t in expected["source_turns"]):
+            raise ComponentRewardContractError("additive component source turn is inactive")
+        turn = record.get("turn_idx")
+        if type(turn) is not int or not 0 <= turn < width or target != expected["targets"][turn]:
+            raise ComponentRewardContractError("additive component turn_target does not match its turn")
+        if sample is not None and (
+            _metadata(sample).get("turn_idx") != turn
+            or _metadata(sample).get("multi_turn_reward") != baseline[turn]
+            or sample.reward != record["baseline_rewards"][turn]
+            or _trainable(sample) != record["active_turns"][turn]
+        ):
+            raise ComponentRewardContractError("additive component record no longer matches the baseline sample")
+        if sample is not None:
+            speedup = _observed_speedup(sample)
+            correct = _correct(sample)
+            qualifies = (
+                _trainable(sample) and not _decoy(sample) and correct and speedup is not None and speedup >= minimum
+            )
+            if (
+                correct != record["anchor_correct"][turn]
+                or speedup != record["anchor_speedups"][turn]
+                or qualifies != (turn in eligible)
+            ):
+                raise ComponentRewardContractError("saved anchor observations no longer match the evaluated sample")
 
 
 def _canonical(value):
@@ -35,6 +149,44 @@ def _finite(value, field):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise ComponentRewardContractError(f"{field} must be a finite number")
     return float(value)
+
+
+def _additive_credit_targets(baseline_returns, credits, best, budget, scale):
+    baseline_returns = [_finite(g, "baseline multi_turn_reward") for g in baseline_returns]
+    credits = [_finite(c, "source component credit") for c in credits]
+    budget = _finite(budget, "component quality_budget")
+    scale = _finite(scale, "component_reward_scale")
+    if (
+        len(credits) != len(baseline_returns)
+        or any(c < 0 for c in credits)
+        or budget < 0
+        or scale < 0
+        or (best is not None and (type(best) is not int or not 0 <= best < len(credits)))
+    ):
+        raise ComponentRewardContractError("invalid additive component budget/origin parameters")
+    if not math.isclose(math.fsum(credits), budget, rel_tol=1e-12, abs_tol=1e-12):
+        raise ComponentRewardContractError("component credits must share exactly one quality budget")
+    if best is None and (budget != 0 or any(credits)):
+        raise ComponentRewardContractError("component credit requires a qualifying anchor")
+    if best is not None and any(credits[t] for t in range(best + 1, len(credits))):
+        raise ComponentRewardContractError("component credit cannot originate after its anchor")
+    source_turns = [t for t, credit in enumerate(credits) if best is not None and t < best and credit > 0]
+    scaled_credits = [
+        _finite(scale * credit, "scaled source component credit") if t in source_turns else 0.0
+        for t, credit in enumerate(credits)
+    ]
+    targets = [
+        _finite(g + extra, "additive source return") for g, extra in zip(baseline_returns, scaled_credits, strict=True)
+    ]
+    return {
+        "source_turns": source_turns,
+        "scaled_credits": scaled_credits,
+        "targets": targets,
+        "target_deltas": [
+            _finite(target - baseline, "additive target delta")
+            for target, baseline in zip(targets, baseline_returns, strict=True)
+        ],
+    }
 
 
 def _metadata(sample):
@@ -380,6 +532,61 @@ def attribute_best_components(samples, base_scores):
     return result
 
 
+def _postprocess_additive_credit(args, samples, finish_reason, base):
+    from .source_component_reward import attribute_best_source_components
+    from .utils import _postprocess_baseline_turn_samples
+
+    if getattr(args, "component_reward_backend", "runtime_graph") != "source":
+        raise ComponentRewardContractError("trloo-credit-additive requires the source backend")
+    scale = _finite(getattr(args, "component_reward_scale", 0.25), "component_reward_scale")
+    if scale < 0:
+        raise ComponentRewardContractError("component_reward_scale must be nonnegative")
+
+    _postprocess_baseline_turn_samples(args, samples, finish_reason)
+    baseline_returns = [_finite(_metadata(s).get("multi_turn_reward"), "baseline multi_turn_reward") for s in samples]
+    # Source attribution runs AFTER baseline finalization. A soft-removed
+    # proposal must be traced to a later eligible occurrence, not resurrected.
+    allocation = attribute_best_source_components(
+        samples, base, min_speedup=getattr(args, "component_reward_min_speedup", 1.0)
+    )
+    best, budget = allocation["best_turn"], allocation["quality_budget"]
+    additive = _additive_credit_targets(baseline_returns, allocation["credits"], best, budget, scale)
+    active = [_trainable(s) for s in samples]
+    baseline_rewards = [float(s.reward) for s in samples]
+    for turn, sample in enumerate(samples):
+        # Keep reward, task_reward, multi_turn_reward, remove flags and masks
+        # exactly as baseline. Only the selected training target changes.
+        sample.metadata["component_reward"] = {
+            **allocation,
+            "method": ADDITIVE_METHOD,
+            "allocation_method": METHOD,
+            "mode": ADDITIVE_MODE,
+            "scale": scale,
+            "turn_idx": turn,
+            "baseline_rewards": baseline_rewards,
+            "baseline_returns": baseline_returns,
+            "baseline_future_fold_applied": True,
+            **additive,
+            "active_turns": active,
+            "turn_credit": allocation["credits"][turn],
+            "turn_scaled_credit": additive["scaled_credits"][turn],
+            "turn_target": additive["targets"][turn],
+            "turn_target_delta": additive["target_deltas"][turn],
+        }
+    logger.info(
+        "[component_reward_additive] trajectory=%s best=%s budget=%s sources=%s scale=%s min_speedup=%s baseline=%s targets=%s",
+        samples[0].index,
+        best,
+        budget,
+        additive["source_turns"],
+        scale,
+        allocation["anchor_min_speedup"],
+        baseline_returns,
+        additive["targets"],
+    )
+    return samples
+
+
 def postprocess_component_turns(args, samples, finish_reason):
     """Opt-in finalization; baseline postprocess never calls this when off."""
     from .utils import (
@@ -394,6 +601,8 @@ def postprocess_component_turns(args, samples, finish_reason):
     if [int(_metadata(s).get("turn_idx", -1)) for s in samples] != list(range(len(samples))):
         raise ComponentRewardContractError("component reward requires ordered unique turn indices")
     base = [_finite(s.get_reward_value(args), "task_reward") for s in samples]
+    if component_reward_mode(args) == ADDITIVE_MODE:
+        return _postprocess_additive_credit(args, samples, finish_reason, base)
     _apply_rollout_progress_metadata(samples, finish_reason)
     for sample in samples:
         if not _trainable(sample) or finish_reason == "model_abort":
@@ -409,7 +618,12 @@ def postprocess_component_turns(args, samples, finish_reason):
     _apply_overlong_penalty(args, samples)
     shaped = [float(s.reward) for s in samples]
     penalties = [max(0.0, q - shaped[t]) if _trainable(samples[t]) else 0.0 for t, q in enumerate(base)]
-    allocation = attribute_best_components(samples, base)
+    if getattr(args, "component_reward_backend", "runtime_graph") == "source":
+        from .source_component_reward import attribute_best_source_components
+
+        allocation = attribute_best_source_components(samples, base)
+    else:
+        allocation = attribute_best_components(samples, base)
     targets = [allocation["credits"][t] + min(q, 0.0) - penalties[t] for t, q in enumerate(base)]
     mode = getattr(args, "finalize_mode", "positive")
     maximum = shaped[0]
@@ -438,6 +652,7 @@ def postprocess_component_turns(args, samples, finish_reason):
                 "trajectory_finish_reason": finish_reason,
                 "component_reward": {
                     **allocation,
+                    "mode": "replace",
                     "turn_credit": allocation["credits"][turn],
                     "turn_target": targets[turn],
                     "targets": targets,
@@ -464,6 +679,8 @@ def filter_component_reward_group(args, samples, **kwargs):
         from .kernel_filter import filter_cuda_kernel_group
 
         return filter_cuda_kernel_group(args, samples, **kwargs)
+    if component_reward_mode(args) == ADDITIVE_MODE:
+        raise ComponentRewardContractError("trloo-credit-additive requires the baseline dynamic filter")
     from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 
     from .config import CUDA_AGENT_CONFIGS
@@ -522,14 +739,43 @@ def compute_component_reward_metrics(args, samples):
         key = (sample.group_index, sample.index)
         record = _metadata(sample).get("component_reward")
         if record is not None:
-            if record.get("method") != METHOD:
-                raise ComponentRewardContractError("metrics received unknown allocation method")
+            validate_component_reward_record(args, record, sample=sample)
             trajectories.setdefault(key, record)
         turns.setdefault((*key, _metadata(sample).get("turn_idx")), sample)
     records = list(trajectories.values())
     count = len(records)
     prefix = "component_reward/"
     metrics = {"trajectories": count, "observed_turns": len(turns)}
+    if component_reward_mode(args) == ADDITIVE_MODE:
+        metrics.update(
+            {
+                "additive/qualified_trajectories": sum(r["best_turn"] is not None for r in records),
+                "additive/qualified_fraction": (
+                    sum(r["best_turn"] is not None for r in records) / count if count else 0.0
+                ),
+                "additive/trajectories_with_sources": sum(bool(r["source_turns"]) for r in records),
+                "additive/source_turns": sum(len(r["source_turns"]) for r in records),
+                "additive/applied_trajectories": sum(any(c > 0 for c in r["scaled_credits"]) for r in records),
+                "additive/applied_fraction": (
+                    sum(any(c > 0 for c in r["scaled_credits"]) for r in records) / count if count else 0.0
+                ),
+                "additive/quality_budget_sum": math.fsum(r["quality_budget"] for r in records),
+                "additive/scaled_credit_sum": math.fsum(math.fsum(r["scaled_credits"]) for r in records),
+                "additive/source_target_sum": math.fsum(r["targets"][t] for r in records for t in r["source_turns"]),
+                "additive/target_delta_sum": math.fsum(math.fsum(r["target_deltas"]) for r in records),
+                "source/analysis_wall_seconds_sum": math.fsum(
+                    r.get("source_analysis_wall_seconds", 0.0) for r in records
+                ),
+                "source/trajectories": count,
+            }
+        )
+        width = max((len(r["targets"]) for r in records), default=0)
+        for turn in range(width):
+            for name, field in (("baseline", "baseline_returns"), ("target", "targets"), ("delta", "target_deltas")):
+                metrics[f"additive/{name}_by_turn/{turn}/sum"] = math.fsum(
+                    r[field][turn] for r in records if turn < len(r[field]) and r["active_turns"][turn]
+                )
+        return {prefix + key: value for key, value in metrics.items()}
     best_turns = Counter(r["best_turn"] for r in records)
     positive_best_turns = Counter(r["best_turn"] for r in records if r["quality_budget"] > 0)
     for turn, n in best_turns.items():
@@ -573,6 +819,12 @@ def compute_component_reward_metrics(args, samples):
         )
     statuses = Counter()
     costs = []
+    if getattr(args, "component_reward_backend", "runtime_graph") == "source":
+        metrics["source/analysis_wall_seconds_sum"] = math.fsum(
+            r.get("source_analysis_wall_seconds", 0.0) for r in records
+        )
+        metrics["source/trajectories"] = sum(r.get("backend") == "source-strategies/v1" for r in records)
+        return {prefix + key: value for key, value in metrics.items()}
     for sample in turns.values():
         payload = _metadata(sample).get("runtime_graph")
         statuses[payload.get("status", "invalid") if isinstance(payload, dict) else "missing"] += 1
