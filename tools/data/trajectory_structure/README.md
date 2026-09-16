@@ -264,13 +264,44 @@ internal consistency; the audit does not verify a separate launch configuration
 or execute trajectory packing. Historical reconstruction is explicitly marked
 in the pilot output and does not satisfy the real-rollout audit.
 
-
 FastCredit adds source credit to baseline TRLOO with
 `--component-reward-mode trloo-credit-additive --component-reward-scale 0.25
 --component-reward-min-speedup 1.0`. The gate selects correct, measured-fast
 anchors; only earlier retained source turns receive the extra credit.
 The baseline dynamic filter remains active. See the
 [method and limitations](../../../handoffs/paper/component_reward_training.md).
+
+## Correct-only optimization-feature speedup pilot
+
+`optimization_pilot.py` describes optimization features in correctly evaluated
+kernels, links them to saved profiling events and compares successive eligible
+correct turns. It uses the shared registry; program-level configuration and
+cross-turn strategy coverage are maintained by `optimization_coverage.py`
+
+```bash
+python -m tools.data.trajectory_structure.check_optimization_pilot
+python -m tools.data.trajectory_structure.optimization_pilot \
+  --structure-root /path/to/trajectory_structure \
+  --output /path/to/new_speedup_pilot
+```
+
+Install the pinned parser dependencies as described above, and run from the
+repository root. The input structure archive must retain its original raw-data
+manifest and extracted `g*.json` files. The output directory must be new
+
+The workflow verifies raw-response hashes and correct-only timing ratios, emits
+per-kernel source evidence and searches earlier correct versions of the best
+answer for unique normalized kernel structures. It records input/code hashes
+and checks stability at completion. The earlier correct turns can be
+nonadjacent in the original trajectory
+
+Outputs describe source features and retention candidates. They do not establish
+execution of every branch, general fusion/coalescing recognition or per-feature
+speed contributions. Launch arguments, helper bodies and semantic call roles
+are outside this matcher. Reduction postprocessing is reported separately because
+it can also describe required arithmetic. The 5% timing screen is not a confidence
+interval; profiling is a separate invocation from timing trials. Historical
+findings are in the [component-reward report](../../../handoffs/paper/component_reward_training.md#附录历史试验)
 
 ## Local revision / partial-output matching validation
 

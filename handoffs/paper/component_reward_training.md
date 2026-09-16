@@ -230,6 +230,35 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 
 这两组中，较早来源集中在整体失败的轮次。人工检查发现了真实的“实现已写好，接口仍出错”情况：Qwen group29 第一轮的 binding 使用旧 dtype API 而编译失败，后续最佳轮保留了其中四个计算组件；DeepSeek group314 第三轮的 FFI 调用错误地使用 keyword，第四轮改为 positional 后通过，native GRU kernel 保持相同。因此，这里的 credit 主要在补偿失败答案中已保留的实现，而非只把成功答案重复分奖
 
+### Precision／Recall 人工抽查
+
+这里分别检查两件事：策略标签是否符合真实源码中的机制，以及最佳答案的具体实现是否找到了合法的早期来源。前者不能用来替代后者，也不把“是否真正提速”当作本轮匹配真值。策略审查先阅读源码建立标注，再查看识别结果；来源审查结合已有 allocation 逐项阅读源码、枚举早期来源，并检查入训资格、decoy 标记和评测上下文，不宣称来源审查采用盲标
+
+策略审查从三个已有池分层抽取十八轮，其中一轮没有源码，原样保留且未补抽；对其余十七个 kernel 检查十三个常见标签。来源审查独立抽取六条完整轨迹，枚举其中二十四个最佳轮组件并阅读所有早轮，而非只看已命中的配对。下表只描述这些小样本的已判定项
+
+| 审查对象与口径 | TP / FP / FN | Precision（%） | Recall（%） |
+|---|---:|---:|---:|
+| 策略：源码中实际存在的优化机制 | 49 / 1 / 19 | 98.00 | 72.06 |
+| 策略：文档已声明的较窄模板条件 | 50 / 0 / 10 | 100.00 | 83.33 |
+| 来源：忽略已核实无关文件 context 的较宽同实现口径，保留入训资格 | 10 / 0 / 2 | 100.00 | 83.33 |
+
+来源行允许忽略已经人工确认与组件无关的文件声明变化，衡量的是较宽的实现保留目标。按当前全文件 token 签名自身的严格定义，本批早期来源均被检索到；较宽口径的漏报反映身份定义与研究目标的差距
+
+模板条件口径有四项待定，来源口径有三项待定，均未计入主表。若三个来源待定项都是真实早期来源，本批来源 Recall 为 66.67。另随机检查九个已归因组件，其保留关系均成立；按更宽的实现口径判断最早合法来源，七项明确正确，两项因 C linkage 改动保留未定，不能将它写成最早来源全部正确。抽样、逐项真值、订正和分母见[策略审查](../../local_artifacts/component_reward_training/precision_recall_audit/strategy/README.md)与[来源审查](../../local_artifacts/component_reward_training/precision_recall_audit/lineage/manual_review.md)
+
+下表汇总抽样审查与额外定向复核中已确认的问题；定向案例未计入上面的 P/R。本次审查仅做离线验证，未修改识别或 reward 算法
+
+| 问题 | 人工检查到的真实情况 | 对当前方法的影响 |
+|---|---|---|
+| 无关文件声明使旧组件失配 | DeepSeek group158 的 BN/ReLU、avgpool 正文与直接 launcher 均未变，新增其它 launcher 留下的 `extern "C"` token 却改变了全局签名上下文 | 两份合法早期来源被漏掉；仅修正这些无关 context 的离线反事实，会将最佳预算的 33.33% 移回早轮，总预算不变 |
+| 别名与后续赋值没有被追踪 | `out_ptr=output+offset`、`smem_s=smem` 后的访问未还原到原 buffer；`v=input[i]` 后多次修改字段的 min/max/tanh 链只追到了初始化 | 同一段代码会同时漏掉多种策略。抽中的 kernel 均仍有其它标签，因此标签漏报不等于这些组件失去全部分奖资格 |
+| 宽模板的名称强于判定条件 | 纯 max-pool 被标为 pointwise fusion，warp 越界退出被标为角色分工；库配置调用也被记录成 compute 标签 evidence | 标签及解释存在误报。但正式库分奖有独立窄规则，人工样本中的配置调用没有额外变成分奖组件 |
+| 源码位置与注释不变性有缺口 | `#pragma` masking 吞掉空白行，造成证据行号偏移；在真实源码的 launch 配置中插入注释，会使配置记录多出一项 | 前者影响人工定位，后者可能造成额外来源漏匹配；注释检查是定向构造，不计入自然样本 P/R |
+
+资格判断必须和签名问题分开。例如 Qwen group278 也有无关 context 引起的失配，但早期轮为 decoy，保持当前资格规则时修正签名不会移动 credit。[资格保留的离线反事实](../../local_artifacts/component_reward_training/precision_recall_audit/lineage/counterfactual.json)同时验证了这个零影响案例和 group158 的分配变化。该反事实针对历史替代式分配，使用离线重构的 token mask，不是正式 additive 训练批次
+
+这些结果来自已有 rollout 留样与 L3 池，不代表正式训练流量；不覆盖所有模板、所有源码抽取失败或全训练集。后续应基于限量保留的完整轨迹扩大逐类及未命中样本的人工复核；候选修正应离线验证后再决定是否用于后续训练版本
+
 ### 新生成轨迹的端到端检查
 
 使用原始 FP8 release 权重新跑了一个诊断 batch，保留相同的三轮 context、采样参数和四个 TP4 engine。生成及评测完成后，对保存的原始 Sample 逐项检查候选身份、完整 credit、真实 token/mask/logprob 和 predictive support
@@ -246,7 +275,7 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 
 本批唯一跨轮样本是 group19：第一轮因 binding 对 Tensor 调用不存在的 `.contiguous()` 而编译失败；第三轮 Correct 后，其中逐字保留的 `pad_kernel` 和直接 launcher 对应的一份 credit 回到第一轮，其余五份留在第三轮。这个比例低于训练 step121 留样，两个池分别来自原始权重与已训练权重，且题目不同；当前少量诊断不能用来估计全训练集覆盖率
 
-两节点 train-only 已使用这份真实 dump 完成全部 microbatch。正式训练随后也完成了首个更新（日志 step0）和更新后的权重回灌，第二步正在运行；两阶段均未出现 OOM、非有限数值或训练异常
+两节点 train-only 已使用这份真实 dump 完成全部 microbatch。正式训练的首个更新（日志 step0）和更新后的权重回灌也已验证；下表保留首次闭环检查结果，两阶段均未出现 OOM、非有限数值或训练异常
 
 | 训练验证 | microbatch | loss | grad norm | MTP loss |
 |---|---:|---:|---:|---:|
@@ -296,6 +325,27 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 
 以表中的 Qwen3.8 L3 group9 为例，第二轮同时使用 `float4` bias kernel 和带 `CUBLAS_COMPUTE_32F_FAST_TF32` 的 GEMM，分析器分别记录“向量访存”“库计算”“库 math mode”和“显式算法配置”，并指向各自的代码位置。第三轮评测失败，但源码中的 cuBLASLt epilogue 设置和算法选择调用仍被记录；这些记录描述失败尝试写出了什么，具体实现是否保留由后续来源追踪判断。该例源码与调用证据见 [trajectory0265](../../local_artifacts/paper/optimization_speedup_pilot/strategy_expansion_20260910/coverage_final/trajectories/trajectory_0265.json)
 
+### 历史替代式目标的训练日志审计
+
+对历史 `replace` 作业 `raysubmit_gBanNugYvJf2nrHv` 的日志 step0–50 做了只读审计。审计覆盖的日志中未检出 OOM、NCCL fatal 或非有限训练指标，但生成长度和截断随窗口上升，precheck 通过比例下降。窗口内任务组成不同，下表用于定位风险，不作为固定评测正确率或当前 additive FastCredit 的收益证据
+
+step 使用零基日志编号。每项指标每个窗口覆盖十个 batch；rollout 窗口各有 2560 条轨迹、7680 个 turn。actor 与 rollout 异步记录，相同 index 不代表同一时刻；均值按 batch 统计，跨轮比例以全部轨迹为分母
+
+| 日志指标 | step0–9 | step20–29 | step41–50 |
+|---|---:|---:|---:|
+| 单 turn 生成 token 均值 | 7200 | 8199 | 9466 |
+| TRUNCATED 状态比例（%） | 4.99 | 10.30 | 22.68 |
+| Precheck 通过比例（%） | 89.10 | 86.80 | 75.61 |
+| 跨轮 credit 轨迹比例（%） | 21.25 | 27.85 | 23.40 |
+| 每次训练耗时均值（s） | 890.45 | 993.34 | 1104.57 |
+
+- **审计快照中的源码留样不足**：该历史作业的已检查训练侧目录只有汇总日志，未持续保存正式 rollout 的完整三轮源码；单独的诊断 dump 不能替代正式训练样本，因此无法从这份日志计算归因 P/R
+- **反馈异常的原始原因未闭合**：日志记录三次缺少 `metadata` 的异常。已核对的异常处理会将轨迹标记 ABORTED、置零 mask，并由异步 worker 重排整个 prompt group；不能据中间零预算日志推断它们已作为模型低分入训。slime 在 completed 后读取 `/results` 失败时可能返回裸状态，是一条待验证路径；缺少原始响应，尚不能断言问题来自 KernelGym 最终结果
+- **异步吞吐指标口径有误导性**：缓存取数几乎即时，其耗时被拿来除 token 总量，得到不代表实际生成速度的极大吞吐。该审计近期窗口的训练耗时远大于等 rollout 的时间，不能据该派生指标判断模型 decode 性能
+- **超时统计要区分来源**：53 个已收集 batch 共 40704 个 turn，KernelGym eval timeout 为 35 次（0.09%），client 和 generate guard timeout 计数均为零；日志另有 SGLang 生成重试，不能与评测超时混算
+
+逐窗口数值、真实日志行、代码处置路径及缺失证据见[训练日志审计](../../local_artifacts/component_reward_training/precision_recall_audit/training/summary.md)。该次审计发生在历史作业 step100 评测之前，没有修改训练或 rollout 算法；这些日志观察与 checkpoint 评测结论分开解释
+
 ### 加奖模式的配置
 
 在所有 rollout 环境安装 `tools/data/trajectory_structure/requirements.txt`，使用维护 launcher 时设置 `COMPONENT_REWARD=1 COMPONENT_REWARD_BACKEND=source COMPONENT_REWARD_MODE=trloo-credit-additive COMPONENT_REWARD_SCALE=0.25 COMPONENT_REWARD_MIN_SPEEDUP=1.0`。加奖模式沿用 baseline 动态过滤，省略 mode 时仍为历史 `replace` 模式
@@ -342,9 +392,9 @@ Ray 临时数据应放在满足容量要求的存储上，避免触发磁盘使�
 
 ### 策略识别与来源追踪
 
-- **模板命中不等于发现有效优化**：本轮优先扩展策略种类，尚未评估匹配 precision／recall。连续复制也可能命中连续访存，warp 编号的边界检查也会进入 warp 分组模板；普通结构模式和显式 API 证据因此分别统计
+- **模板命中不等于发现有效优化**：已完成小样本人工 P/R 审查，但尚未覆盖全部模板或当前训练流量。连续复制也可能命中连续访存，warp 编号的边界检查也会进入 warp 分组模板；普通结构模式和显式 API 证据因此分别统计
 - **源码覆盖尚不完整**：主要覆盖 CUDA/C++，宏展开、间接库调用、其它 kernel 语言和任意算法重写仍有缺口。未命中模板不代表策略没有使用，例如库内部使用 Tensor Core 与源码直接写 MMA 属于不同观察层次
-- **实现签名偏保守**：重命名、等价改写，以及 host 函数中无关代码变化都可能打断匹配。此前局部阶段匹配和表达式规范化仍是附录中的离线分支，未用于本次训练
+- **实现签名偏保守**：重命名、等价改写和无关文件上下文都可能打断匹配；人工审查已确认无关 `extern "C"` 残余和 launch 配置注释的反例。此前局部阶段匹配和表达式规范化仍是附录中的离线分支，未用于本次训练
 - **组件粒度可能遗漏接口修复的贡献**：签名涵盖直接 CUDA launcher，未囊括所有上游 FFI wrapper 和 Python 调用者。DeepSeek group314 修好 FFI positional 调用后正确，native 实现仍归前轮；旧替代式目标使修复轮得到零，新定义保留最佳轮的原 TRLOO 回报，但不额外奖励或识别这个接口修复
 
 ### 调用结构与 runtime 证据
