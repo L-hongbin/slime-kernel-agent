@@ -187,7 +187,7 @@ $Y_t$ 直接进入同题、同轮次的 TRLOO leave-one-out 比较，不再向�
 
 ## 实验结果
 
-本节保留历史替代式目标的覆盖与验证结果；它们不能作为 `trloo-credit-additive` 的训练收益证据
+来源覆盖与早期 rollout 验证来自历史替代式目标，说明组件识别与来源搜索的覆盖。FastCredit additive 的训练验收和 step100 评测在后文单列，分别用于判断执行是否正确、训练是否有收益
 
 ### 数据与覆盖率
 
@@ -346,21 +346,21 @@ step 使用零基日志编号。每项指标每个窗口覆盖十个 batch；rol
 
 逐窗口数值、真实日志行、代码处置路径及缺失证据见[训练日志审计](../../local_artifacts/component_reward_training/precision_recall_audit/training/summary.md)。该次审计发生在历史作业 step100 评测之前，没有修改训练或 rollout 算法；这些日志观察与 checkpoint 评测结论分开解释
 
-### 加奖模式的配置
-
-在所有 rollout 环境安装 `tools/data/trajectory_structure/requirements.txt`，使用维护 launcher 时设置 `COMPONENT_REWARD=1 COMPONENT_REWARD_BACKEND=source COMPONENT_REWARD_MODE=trloo-credit-additive COMPONENT_REWARD_SCALE=0.25 COMPONENT_REWARD_MIN_SPEEDUP=1.0`。加奖模式沿用 baseline 动态过滤，省略 mode 时仍为历史 `replace` 模式
-
 ### FastCredit025 step100 的同预算评测
 
 正确且实测 speedup ≥ 1 才加来源 bonus、系数 0.25、累计回报不封顶的 FastCredit025 完成 100 次更新后，已按三轮 24K/32K/40K 协议评测。与同预算 TRLOO baseline 相比，L1/L2 Best Correct 接近，L2 Fast 更高，但 L3 的 Compile、Correct 和 Fast 均更低；第三轮 Correct 三档均下降，整体截断更多
 
 本次对照未显示全面收益，也不能将差异归因于单一机制。逐轮与最佳指标、分母、运行差异及人工样例统一见 [FastCredit025 step100 评测](../qwen38/kernelbench_eval.md#fastcredit025-step100)。这些是单次评测点估计，未做题级配对显著性检验或重复训练
 
-### 历史替代式目标的训练配置与执行
+### 训练配置与执行
 
 训练以最新 v4_1 packed 三轮 TRLOO 为 baseline，使用原始 release actor checkpoint 创建新实验，不从旧 step119 续跑。源码分奖在 slime 内完成，KernelGym 沿用已有评测 URL 与正常评测预算
 
-历史替代式作业 `raysubmit_gBanNugYvJf2nrHv` 已停止，step100 完成 KernelBench L1–L3 三轮评测。三档 Best Correct 均低于同预算 TRLOO baseline，截断明显增加；尚未建立训练目标与退化之间的因果链。完整结果与验证边界见 [replace step100 评测](../qwen38/kernelbench_eval.md#source-component-reward-step100)，不与 additive FastCredit 结果混合；训练曲线见 [W&B](https://wandb.ai/shuailin_chen/slime/runs/60pc5qed)
+FastCredit additive 作业为 `qwen38-fast-credit025-formal-20260912`，曲线见 [W&B](https://wandb.ai/shuailin_chen/slime/runs/fwr4cgwi)。该实验从原始 release 重新初始化，未继承封顶目标训练后的权重
+
+启动前四节点的 1279 个冻结文件、配置与数据哈希一致；当时的 CPU 回归 223 项通过，独立审阅后核对了实际启动参数。小批真实 rollout 成功，包含真实跨轮加奖的训练重放也在两个训练节点完成了一次更新。这些检查说明目标能够执行；配置与人工检查样例见[训练验收说明](../../local_artifacts/component_reward_training/fast_credit_training/README.md)
+
+在所有 rollout 环境安装 `tools/data/trajectory_structure/requirements.txt`，使用维护 launcher 时设置 `COMPONENT_REWARD=1 COMPONENT_REWARD_BACKEND=source COMPONENT_REWARD_MODE=trloo-credit-additive COMPONENT_REWARD_SCALE=0.25 COMPONENT_REWARD_MIN_SPEEDUP=1.0`。加奖模式沿用 baseline 动态过滤，省略 mode 时仍为历史 `replace` 模式
 
 | 项目 | 配置 |
 |---|---|
@@ -372,12 +372,24 @@ step 使用零基日志编号。每项指标每个窗口覆盖十个 batch；rol
 | 推理与 MTP | T1.0，top_p1，medium；MTP3 rollout，训练 MTP TF1 系数 0.2 |
 | 优化器／policy | lr 1e-6；原 TRLOO、DPPO predictive top20+tail |
 | 运行上限 | 3000 次更新，沿用 baseline 的配置上限 |
-| 本次改动 | 开启 source component credit，不启用跨轨迹状态聚合 |
-| 存储 | 每 20 步保存，新实验只保留最近 1 代完整 checkpoint；旧 checkpoint 不动 |
+| 本次目标 | `trloo-credit-additive`；正确且 speedup ≥ 1 的最佳答案向早期来源轮加奖，系数 0.25，最终回报不封顶 |
+| 存储 | 每 20 步保存，新实验保留最近 2 代完整 checkpoint |
 
-存储保留数量按已有 checkpoint 与新一代写入的容量峰值确定；学习与采样参数不变。完整 debug rollout 只用于受控诊断，正式训练不持续保存大体积逐 batch dump
+本实验配置保留最近两代完整 checkpoint，启动后的[实际配置回执](../../local_artifacts/component_reward_training/fast_credit_training/formal_effective_config.json)也记录了 `keep_sources=2`。清理器读取本实验的 `retention.json`，确认新一代完整后才清理本实验超出保留数量的旧代，不清理其它实验的 checkpoint。读取动态保留数量的机制在历史替代式作业中完成验证，见[保留策略调整](../../local_artifacts/component_reward_training/retention_keep2/deployment.json)
 
-Ray 临时数据应放在满足容量要求的存储上，避免触发磁盘使用率阈值而使 spill 失败；现场目录配置见 [RUNTIME.md](../../RUNTIME.md)
+正式训练保留首批和最新一批完整 rollout，最新一批采用原子替换，不按 step 无限累积；分轮截断指标直接覆盖本批所有有合法 turn_idx 的样本，包括 precheck 失败和被 mask 的轮次。原 TRLOO 的 partial reward、未来回报传播、finalize 和训练 mask 均未改动
+
+按[停止回执](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/training_stop.json)，该作业完成 100 次更新后已停止；[评测验收记录](../../local_artifacts/component_reward_training/fast_credit_step100_eval_20260914/README.md)确认保留 step80/100 源 checkpoint。step100 已完成 24K/32K/40K、32K/48K/64K 和 64K/128K/192K 三套 context 预算评测；各预算的对照范围、结果和边界统一见 [KernelBench 评测](../qwen38/kernelbench_eval.md)
+
+Ray 临时数据、checkpoint 和完整 rollout 的落盘位置按存储容量规划，现场目录配置见 [RUNTIME.md](../../RUNTIME.md)
+
+### 替代式与封顶实验的边界
+
+历史替代式作业 `raysubmit_gBanNugYvJf2nrHv` 已停止，step100 完成 KernelBench L1–L3 三轮评测。三档 Best Correct 均低于同预算 TRLOO baseline，截断明显增加；尚未建立训练目标与退化之间的因果链。完整结果与验证边界见 [replace step100 评测](../qwen38/kernelbench_eval.md#source-component-reward-step100)，训练曲线见 [W&B](https://wandb.ai/shuailin_chen/slime/runs/60pc5qed)
+
+封顶作业 `qwen38-credit-cap025-formal-20260912` 完成 31 次更新后于 2026-09-12 停止，保留第 20 次更新的完整 checkpoint，见[停止时配置](../../local_artifacts/component_reward_training/credit_cap_training/stopped_run_plan_20260912.json)与[训练曲线](https://wandb.ai/shuailin_chen/slime/runs/ngvspjlp)。其[长思考与截断分析](../../local_artifacts/component_reward_training/credit_cap_training/length_pressure.md)结合完整留样、同题同轮 advantage 重算和 DPPO 日志，确认了部分分回传、来源轮被削弱和历史预算挤压三条机制；未证明封顶会稳定偏向长回答。Additive 取消封顶，消除了该规则直接压低来源轮累计回报的路径，但尚未验证截断率是否因此改善
+
+这两条实验与 FastCredit additive 的目标不同，训练验收、日志观察和 checkpoint 结果应按各自实验身份解释
 
 ### Checkpoint 就绪通知
 
@@ -394,7 +406,7 @@ Ray 临时数据应放在满足容量要求的存储上，避免触发磁盘使�
 - **额外加奖不保证 advantage 增加**：最终目标满足 $Y_t\ge G_t$，同题同轮的其它回答也可能加奖，因此 leave-one-out advantage 仍可能降低。正确且 speedup ≥ 1 的门槛收紧了来源覆盖，当前重点观察实际加奖比例，不能只统计有合格答案的轨迹比例
 - **零系数恢复 baseline 数值目标**：当前没有封顶，系数为零时 $Y_t=G_t$，过滤与训练 mask 也保持 baseline；源码分析与日志记录仍会执行，因此计算开销不等于关闭 component 功能
 - **baseline 已移除的失败轮保持排除**：source 搜索在 baseline finalize 后执行。若最早来源被 soft-finalize 移除，则在后续合法轮次中重找；这会漏掉某些中间失败贡献，但不会改变 baseline 的有效 token 集合和 MTP 归一化
-- **训练收益需独立验证**：同预算 step100 对照未显示全面收益，结论见[评测摘要](#fastcredit025-step100-的同预算评测)。等权来源份额和正确且 speedup ≥ 1 的门槛均为启发式，来源匹配成功不能推出训练有效
+- **训练收益需独立验证**：同预算 step100 对照未显示全面收益，结论见[评测摘要](#fastcredit025-step100-的同预算评测)。等权来源份额和正确且 speedup ≥ 1 的门槛均为启发式，来源匹配成功不能推出训练有效；多套推理预算评测也不能替代重复训练或机制消融
 
 ### 策略识别与来源追踪
 
