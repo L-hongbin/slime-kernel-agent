@@ -304,7 +304,7 @@ ArgMaxRL 的有限样本无偏估计器。
 
 ##### 动态 gate 计算方式
 
-`--dynamic-reward-gate` 默认为 `None`（关闭），指定 `sqrt`、`piecewise`（分段线性）或 `piecewise-sqrt`（分段开方）即启用对应模式。动态调权仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
+`--dynamic-reward-gate` 默认为 `None`（关闭），指定 `sqrt`、`piecewise`（分段线性）或 `piecewise-sqrt`（分段开方）即启用对应模式。默认仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
 
 ```bash
 --dynamic-reward-gate piecewise-sqrt \
@@ -346,6 +346,22 @@ sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正�
 ```
 
 原有 correctness 条件及 coverage 开关仍然生效；显式失败评分分支保持其失败 reward，不会因全错 group 的 gate 为正就获得正奖励。speedup 影响基础 performance 评分，不参与 gate 的计算。
+
+若要同时将 correctness 乘以同一个 gate 的倒数，可单独开启：
+
+```bash
+--dynamic-reward-gate piecewise-sqrt \
+--dynamic-reward-gate-range 0.8 1.2 \
+--dynamic-reward-correctness inverse-gate
+```
+
+`--dynamic-reward-correctness` 默认为 `None`（也支持显式传入）。选择 `inverse-gate` 后，非显式失败分支的 reward 为 `C / gate + gate * (P + Coverage) + length_score`，C/P/Coverage 均为未调权的贡献。gate=0.8 时 correctness 乘以 1.25；gate=1.2 时乘以约 0.8333。要求搭配 `piecewise` 或 `piecewise-sqrt`，gate 下界严格大于 0 且倒数有限；旧 `sqrt` 可能产生 0，因此不允许组合使用。显式失败评分、长度分数、`raw_task_reward` 及已固定的 `return_reward` 不变。每次都从基础分数及配置权重重建 correctness，重复后处理不会叠乘。
+
+另一个候选值是 `--dynamic-reward-correctness inverse-correct-rate`：采用 `C / p`，其中 `p` 为同一个 prompt/turn group 内有效样本的正确率。它可独立于 `--dynamic-reward-gate` 启用：关闭 gate 时 performance/coverage 保持基础权重；同时启用 gate 时，非显式失败分支的 reward 为 `C / p + gate * (P + Coverage) + length_score`。已移除、aborted 和 padding 样本不进入正确率统计。`p=0` 时 correctness 缩放系数设为零，不做除法；显式失败分数及其他奖励组成仍按原有规则处理。两种 correctness 模式都不改原始历史奖励和未来折算项，重复处理不叠乘。
+
+只保留二值 correctness、基础权重为 1 时，组均值中心化得到 `(correct_i - p) / p`（`p>0`），即 MaxRL 形式的 advantage。但该选项只是奖励变换，不是新增 advantage estimator，也不代表完整复现 MaxRL。组内标准差归一化会抵消统一的 correctness 缩放，因此搭配 GRPO 时应使用 `--disable-grpo-std-normalization` 保留该效果；启动时会提示此组合，但不会自动修改配置。若加入性能奖励、非零失败分、长度奖惩或多轮未来折算，目标就不再是 correctness-only MaxRL。
+
+开启任一 correctness 模式后新增 `rollout/dynamic_reward/correctness_scale_{mean,min,max,p25,p50,p75}`（每个 prompt/turn group 一票），以及同前缀的 `correctness_reward_delta_{mean,min,max,p25,p50,p75}`（逐样本统计 correctness 贡献变化，包括不变的零值）。关闭时不输出这些额外指标。调整后的贡献也写回 `metadata.reward_component.correctness`。
 
 ##### G=16 的 gate 实例分布
 

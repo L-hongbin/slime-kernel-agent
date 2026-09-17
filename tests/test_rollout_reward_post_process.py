@@ -914,6 +914,196 @@ def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, 
         )
 
 
+@pytest.mark.parametrize(
+    "mode,correctness_mode",
+    [(mode, "inverse-gate") for mode in ("piecewise", "piecewise-sqrt")]
+    + [(mode, "inverse-correct-rate") for mode in (None, "sqrt", "piecewise", "piecewise-sqrt")],
+)
+@pytest.mark.parametrize("num_correct", [0, 2, 8, 14, 16])
+@pytest.mark.parametrize("reward_key", [None, "score"])
+def test_dynamic_correctness_settlement_is_idempotent(monkeypatch, mode, correctness_mode, num_correct, reward_key):
+    config = CUDA_AGENT_CONFIGS["reward"]
+    for key, value in {
+        "init_correct_weight": 0.5,
+        "init_performance_weight": 0.5,
+        "coverage_reward_weight": 0.5,
+        "coverage_reward_enable": True,
+        "apply_failed_group_reward": False,
+    }.items():
+        monkeypatch.setitem(config, key, value)
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.dynamic_reward_gate = mode
+    args.dynamic_reward_correctness = correctness_mode
+    args.reward_key = reward_key
+    gate = _compute_dynamic_auxiliary_gate(num_correct, 16, args=args)
+    scale = 1 / gate if correctness_mode == "inverse-gate" else (16 / num_correct if num_correct else 0.0)
+    samples = [_make_sample(i, 0, 0.0) for i in range(16)]
+    expected = []
+    for i, sample in enumerate(samples):
+        correct = i < num_correct
+        _set_reward_component(
+            sample,
+            correctness_score=float(correct),
+            performance_score=float(correct),
+            coverage_score=float(correct),
+            failed=None if correct else -0.7,
+            length_score=-0.1,
+        )
+        raw = 1.5 if correct else -0.7
+        sample.reward = {"score": raw - 0.1, "other": 123} if reward_key else raw - 0.1
+        sample.metadata.update(raw_task_reward=raw, task_reward=raw, return_reward=7.0)
+        sample.metadata["reward_component"]["return_reward"] = 7.0
+        expected.append(0.5 * scale + gate - 0.1 if correct else -0.8)
+
+    for _ in range(2):
+        assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
+        for i, sample in enumerate(samples):
+            correct = i < num_correct
+            assert sample.get_reward_value(args) == pytest.approx(expected[i])
+            if reward_key:
+                assert sample.reward["other"] == 123
+            components = sample.metadata["reward_component"]
+            assert components["correctness"] == pytest.approx(0.5 * scale if correct else 0.0)
+            assert components["performance"] == pytest.approx(0.5 * gate if correct else 0.0)
+            assert components["coverage"] == pytest.approx(0.5 * gate if correct else 0.0)
+            assert components["length"] == -0.1
+            assert components["return_reward"] == sample.metadata["return_reward"] == 7.0
+            assert sample.metadata["raw_task_reward"] == (1.5 if correct else -0.7)
+            assert sample.metadata["task_reward"] == pytest.approx(expected[i] + 0.1)
+        metrics = compute_reward_post_process_metrics(samples)
+        assert metrics["rollout/dynamic_reward/correctness_scale_mean"] == pytest.approx(scale)
+        assert metrics["rollout/dynamic_reward/correctness_reward_delta_mean"] == pytest.approx(
+            num_correct / 16 * 0.5 * (scale - 1)
+        )
+
+
+@pytest.mark.parametrize("selection", [None, "None", "inverse-gate", "inverse-correct-rate"])
+@pytest.mark.parametrize("mode", ["piecewise", "piecewise-sqrt"])
+def test_dynamic_correctness_args(selection, mode):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        ["--rollout-batch-size", "1", "--dynamic-reward-gate", mode]
+        + (["--dynamic-reward-correctness", selection] if selection is not None else [])
+    )
+    assert args.dynamic_reward_correctness == (None if selection in {None, "None"} else selection)
+    _validate_rollout_reward_post_process_args(args)
+
+
+@pytest.mark.parametrize(
+    "mode,bounds,selection",
+    [
+        (None, [0.8, 1.2], "inverse-gate"),
+        ("sqrt", [0.8, 1.2], "inverse-gate"),
+        ("piecewise", [0.0, 1.2], "inverse-gate"),
+        ("piecewise-sqrt", [1e-320, 1.2], "inverse-gate"),
+        ("piecewise", [0.8, 1.2], "unknown"),
+    ],
+)
+def test_dynamic_correctness_rejects_unsafe_configuration(mode, bounds, selection):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(
+        dynamic_reward_gate=mode, dynamic_reward_gate_range=bounds, dynamic_reward_correctness=selection
+    )
+    with pytest.raises(ValueError, match="--dynamic-reward-correctness"):
+        _validate_rollout_reward_post_process_args(args)
+    with pytest.raises(ValueError, match="--dynamic-reward-correctness"):
+        _apply_dynamic_group_reward_weights([_make_sample(i, 0, 0.0) for i in range(2)], [0, 0], {}, args=args)
+
+
+@pytest.mark.parametrize("std_normalization", [False, True])
+def test_inverse_correct_rate_cli_without_auxiliary_gate(caplog, std_normalization):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--advantage-estimator",
+            "grpo",
+            "--dynamic-reward-correctness",
+            "inverse-correct-rate",
+        ]
+        + ([] if std_normalization else ["--disable-grpo-std-normalization"])
+    )
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_gate is None
+    assert args.grpo_std_normalization is std_normalization
+    assert ("can cancel inverse-correct-rate" in caplog.text) is std_normalization
+    assert "Rollout reward shaping requires" in caplog.text
+
+
+@pytest.mark.parametrize("num_correct", [0, 1, 2, 16])
+@pytest.mark.parametrize("std_normalization", [False, True])
+def test_inverse_correct_rate_binary_centering(monkeypatch, num_correct, std_normalization):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_correct_weight", 1.0)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    args = _make_manager(
+        advantage_estimator="grpo", use_multi_turn=False, grpo_std_normalization=std_normalization
+    ).args
+    args.dynamic_reward_correctness = "inverse-correct-rate"
+    samples = [_make_sample(i, 0, float(i < num_correct)) for i in range(16)]
+    for i, sample in enumerate(samples):
+        _set_reward_component(sample, correctness_score=float(i < num_correct))
+    post_process_rollout_rewards(args, samples)
+    _, centered = reward_post_process_by_group(args, samples)
+    p = num_correct / 16
+    if not std_normalization:
+        expected = [(float(i < num_correct) - p) / p if p else 0.0 for i in range(16)]
+        assert centered == pytest.approx(expected)
+    else:
+        # Group std cancels the common scale (up to the normalization epsilon).
+        for sample in samples:
+            sample.reward = float(sample.index < num_correct)
+        _, unscaled = reward_post_process_by_group(args, samples)
+        assert centered == pytest.approx(unscaled, rel=1e-5, abs=1e-6)
+
+
+def test_inverse_correct_rate_groups_by_turn_and_excludes_ineligible_samples(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_correct_weight", 0.5)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
+    args.dynamic_reward_correctness = "inverse-correct-rate"
+    samples = []
+    for turn, outcomes in enumerate(([1, 0, 0, 0], [1, 1, 0, 0])):
+        for i, correct in enumerate(outcomes):
+            sample = _make_sample(i, 0, 0.5 * correct, turn_idx=turn)
+            _set_reward_component(sample, correctness_score=correct)
+            samples.append(sample)
+    excluded = [_make_sample(10 + i, 0, 99.0, turn_idx=0) for i in range(3)]
+    for sample in excluded:
+        _set_reward_component(sample, correctness_score=1.0)
+    excluded[0].remove_sample = True
+    excluded[1].metadata["is_pad_turn"] = True
+    excluded[2].status = Sample.Status.ABORTED
+    post_process_rollout_rewards(args, samples + excluded)
+    assert [s.reward for s in samples] == [2.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+    assert [s.reward for s in excluded] == [99.0] * 3
+    for sample in samples:
+        assert sample.metadata["group_num_valid"] == 4
+    metrics = compute_reward_post_process_metrics(samples + excluded)
+    assert metrics["rollout/dynamic_reward/correctness_scale_mean"] == 3.0
+
+
+def test_dynamic_correctness_disabled_preserves_component_and_metrics():
+    sample = _make_sample(0, 0, 3.0)
+    _set_reward_component(sample, correctness_score=1.0)
+    sample.metadata["reward_component"]["correctness"] = 3.0
+    args = SimpleNamespace(dynamic_reward_gate="piecewise", dynamic_reward_correctness=None)
+    assert _apply_dynamic_group_reward_weights(
+        [sample], [3.0], CUDA_AGENT_CONFIGS["reward"], args=args, record_metrics=True
+    ) == [3.0]
+    assert sample.metadata["dynamic_reward"] == {"gate": 1.0, "performance_reward_delta": 0.0}
+    assert not any("correctness" in name for name in compute_reward_post_process_metrics([sample]))
+
+
 def test_piecewise_gate_boosts_auxiliary_components_and_records_positive_delta(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_weight", 0.5)

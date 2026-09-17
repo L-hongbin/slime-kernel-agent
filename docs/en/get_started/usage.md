@@ -298,7 +298,7 @@ The two method selectors are independent: `--dynamic-reward-gate` selects dynami
 
 ##### Dynamic gate calculation
 
-`--dynamic-reward-gate` defaults to `None` (disabled); specifying `sqrt`, `piecewise` (linear), or `piecewise-sqrt` (square-root tails) enables the selected mode. Dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
+`--dynamic-reward-gate` defaults to `None` (disabled); specifying `sqrt`, `piecewise` (linear), or `piecewise-sqrt` (square-root tails) enables the selected mode. By default, dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
 
 ```bash
 --dynamic-reward-gate piecewise-sqrt \
@@ -340,6 +340,22 @@ sample.reward      = task_reward + length_score  # Negative for DAPO, positive f
 ```
 
 Existing correctness requirements and the coverage enable switch still apply. An explicit failure-score branch keeps its failure reward; the gate does not turn an all-failed group into positive rewards. Speedup affects the base performance score, not the gate itself.
+
+To also scale correctness by the reciprocal of the same gate, opt in separately:
+
+```bash
+--dynamic-reward-gate piecewise-sqrt \
+--dynamic-reward-gate-range 0.8 1.2 \
+--dynamic-reward-correctness inverse-gate
+```
+
+`--dynamic-reward-correctness` defaults to `None` (also accepted explicitly). With `inverse-gate`, the non-failure reward becomes `C / gate + gate * (P + Coverage) + length_score`, where C/P/Coverage are ungated contributions. A gate of 0.8 scales correctness by 1.25; 1.2 scales it by about 0.8333. This requires `piecewise` or `piecewise-sqrt` with a strictly positive minimum and a finite reciprocal; legacy `sqrt` can produce zero and is rejected. Explicit failure scores, length scores, `raw_task_reward`, and frozen `return_reward` are unchanged. Correctness is rebuilt from the base score and configured weight on every invocation, so repeated post-processing does not compound the scale.
+
+Alternatively, `--dynamic-reward-correctness inverse-correct-rate` uses `C / p`, where `p` is the correctness rate of valid samples in the same prompt/turn group. It works independently of `--dynamic-reward-gate`: with the gate disabled, performance/coverage keep their base weights; with a gate enabled, the non-failure reward is `C / p + gate * (P + Coverage) + length_score`. Removed, aborted, and padding samples do not enter `p`. For `p=0`, correctness scale is zero (no division); explicit failure scores and other reward components keep their existing rules. Both correctness modes preserve raw history and frozen future credit and are idempotent.
+
+For binary correctness-only rewards with unit base weight, group mean centering produces `(correct_i - p) / p` when `p>0`, matching the [MaxRL-style advantage](https://zanette-labs.github.io/MaxRL/). This option is a reward transformation, not a new advantage estimator or a full MaxRL implementation. Group standard-deviation normalization cancels a common correctness scale: use `--disable-grpo-std-normalization` to retain it with GRPO. Startup warns about this combination without changing your configuration. Performance rewards, nonzero failure scores, length shaping, and multi-turn future credit make the objective different from correctness-only MaxRL.
+
+When either correctness mode is enabled, `rollout/dynamic_reward/correctness_scale_{mean,min,max,p25,p50,p75}` reports one scale per prompt/turn group; `correctness_reward_delta_{mean,min,max,p25,p50,p75}` under the same prefix reports per-sample correctness contribution changes (including unchanged zeros). These additional metrics are absent when the option is disabled. The adjusted contribution is also written to `metadata.reward_component.correctness`.
 
 ##### Gate values for G=16
 

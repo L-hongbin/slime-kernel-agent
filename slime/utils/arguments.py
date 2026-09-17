@@ -63,6 +63,16 @@ def _validate_rollout_reward_post_process_args(args) -> None:
             raise ValueError("Piecewise dynamic reward gate parameters must be finite")
         if not 0.0 <= gate_min <= 1.0 <= gate_max:
             raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
+    correctness = getattr(args, "dynamic_reward_correctness", None)
+    if correctness not in {None, "inverse-gate", "inverse-correct-rate"}:
+        raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
+    if correctness == "inverse-gate":
+        if gate not in {"piecewise", "piecewise-sqrt"}:
+            raise ValueError("--dynamic-reward-correctness inverse-gate requires a piecewise or piecewise-sqrt gate")
+        if gate_min <= 0.0 or not math.isfinite(1.0 / gate_min):
+            raise ValueError(
+                "--dynamic-reward-correctness inverse-gate requires a positive gate min with finite inverse"
+            )
     overlong_penalty = getattr(args, "overlong_penalty", None)
     if overlong_penalty not in {None, "dapo", "laser-d"}:
         raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
@@ -73,7 +83,17 @@ def _validate_rollout_reward_post_process_args(args) -> None:
             raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
     elif overlong_penalty == "laser-d":
         _validate_laser_d_args(args)
-    if gate is not None or overlong_penalty is not None:
+    if (
+        correctness == "inverse-correct-rate"
+        and getattr(args, "advantage_estimator", None) in {"grpo", "gspo"}
+        and getattr(args, "rewards_normalization", True)
+        and getattr(args, "grpo_std_normalization", True)
+    ):
+        logger.warning(
+            "Group std normalization can cancel inverse-correct-rate scaling for correctness-only rewards. "
+            "Use --disable-grpo-std-normalization to preserve it; this reward option does not select a MaxRL estimator."
+        )
+    if gate is not None or correctness is not None or overlong_penalty is not None:
         if getattr(args, "custom_reward_post_process_path", None) != expected_path:
             logger.warning(
                 "Rollout reward shaping requires %s or a custom hook calling "
@@ -2312,6 +2332,19 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
                     "to strengthen both tails without changing their bounds. "
                     "Piecewise groups with fewer than two valid samples keep gate=1."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-reward-correctness",
+                type=lambda value: None if value == "None" else value,
+                choices=[None, "inverse-gate", "inverse-correct-rate"],
+                default=None,
+                help=(
+                    "Optional correctness weighting: inverse-gate divides the base correctness contribution by "
+                    "the performance/coverage gate (requires piecewise or piecewise-sqrt with a positive minimum). "
+                    "inverse-correct-rate divides by the valid prompt/turn group's correctness rate, independently "
+                    "of the auxiliary gate; all-wrong groups use a zero correctness scale. "
+                    "Omitted or None keeps correctness unchanged; failure scores are never scaled."
                 ),
             )
             parser.add_argument(

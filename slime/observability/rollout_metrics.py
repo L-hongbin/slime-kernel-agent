@@ -93,11 +93,13 @@ def _compute_reward_component_metrics(samples: list[Sample]) -> dict[str, float]
 def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, float]:
     """Aggregate final dynamic-weight records, never filter previews.
 
-    Gate statistics give each prompt/turn group one vote. Performance deltas
+    Gate and correctness-scale statistics give each prompt/turn group one vote. Reward deltas
     give each valid ordinary kernel sample one vote, including unchanged zeros.
     """
     group_gates = {}
     performance_deltas = []
+    group_correctness_scales = {}
+    correctness_deltas = []
     laser_records = []
     for sample in samples:
         metadata = sample.metadata or {}
@@ -122,6 +124,13 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
             continue
         group_gates[(sample.group_index, metadata.get("turn_idx"))] = float(gate)
         performance_deltas.append(float(delta))
+        scale, correctness_delta = record.get("correctness_scale"), record.get("correctness_reward_delta")
+        if all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+            for value in (scale, correctness_delta)
+        ):
+            group_correctness_scales[(sample.group_index, metadata.get("turn_idx"))] = float(scale)
+            correctness_deltas.append(float(correctness_delta))
     metrics = {}
     if laser_records:
         bonuses = np.asarray([record["length_score"] for record in laser_records])
@@ -149,7 +158,11 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
             f"{prefix}gate_boosted_fraction": float(np.mean(gates > 1.0)),
         }
     )
-    for name, values in (("gate", gates), ("performance_reward_delta", deltas)):
+    distributions = {"gate": gates, "performance_reward_delta": deltas}
+    if group_correctness_scales:
+        distributions["correctness_scale"] = np.asarray(list(group_correctness_scales.values()))
+        distributions["correctness_reward_delta"] = np.asarray(correctness_deltas)
+    for name, values in distributions.items():
         metrics[f"{prefix}{name}_mean"] = float(np.mean(values))
         metrics[f"{prefix}{name}_min"] = float(np.min(values))
         metrics[f"{prefix}{name}_max"] = float(np.max(values))

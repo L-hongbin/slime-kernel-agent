@@ -222,6 +222,25 @@ def _apply_dynamic_group_reward_weights(
 
     num_correct, group_size = annotate_group_difficulty(samples)
     gate = _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args)
+    correctness_mode = getattr(args, "dynamic_reward_correctness", None)
+    if correctness_mode not in {None, "inverse-gate", "inverse-correct-rate"}:
+        raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
+    correctness_scale = 1.0
+    if correctness_mode == "inverse-gate":
+        if getattr(args, "dynamic_reward_gate", None) not in {"piecewise", "piecewise-sqrt"}:
+            raise ValueError("--dynamic-reward-correctness inverse-gate requires a piecewise or piecewise-sqrt gate")
+        if not math.isfinite(gate) or gate <= 0.0 or not math.isfinite(1.0 / gate):
+            raise ValueError("--dynamic-reward-correctness inverse-gate requires a positive gate with finite inverse")
+        correctness_scale = 1.0 / gate
+    elif correctness_mode == "inverse-correct-rate":
+        # MaxRL-inspired inverse success-rate weighting: https://arxiv.org/abs/2602.02710
+        # For binary correctness c with unit weight and p=mean(c)>0, centering c/p
+        # over the same group gives (c-p)/p, the MaxRL advantage. Group std
+        # normalization cancels this scale; RLOO centering adds a G/(G-1) factor.
+        # This scales only correctness, not the full advantage: auxiliary rewards,
+        # nonzero failure scores, length shaping, or future returns break that equivalence.
+        # At p=0, keep the correctness contribution zero without dividing by zero.
+        correctness_scale = group_size / num_correct if num_correct else 0.0
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -244,7 +263,14 @@ def _apply_dynamic_group_reward_weights(
 
         dynamic_reward = failed_reward
         base_performance_reward = float(components["performance"])
+        correctness_delta = 0.0
         if dynamic_reward is None:
+            if correctness_mode is not None:
+                # Rebuild from the base score, not a previously scaled component.
+                base_correctness_reward = float(config["init_correct_weight"]) * correctness_score
+                correctness_reward = base_correctness_reward * correctness_scale
+                components["correctness"] = correctness_reward
+                correctness_delta = correctness_reward - base_correctness_reward
             weight_performance = float(config["init_performance_weight"])
             if config.get("performance_reward_requires_correctness", False):
                 weight_performance *= correctness_score
@@ -267,6 +293,10 @@ def _apply_dynamic_group_reward_weights(
                 "gate": gate,
                 "performance_reward_delta": float(components["performance"]) - base_performance_reward,
             }
+            if correctness_mode is not None:
+                metadata["dynamic_reward"].update(
+                    correctness_scale=correctness_scale, correctness_reward_delta=correctness_delta
+                )
         dynamic_rewards.append(dynamic_reward + length_score)
     return dynamic_rewards
 
@@ -311,7 +341,10 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             if isinstance(sample.metadata, dict):
                 sample.metadata.pop("dynamic_reward", None)
     config = CUDA_AGENT_CONFIGS["reward"]
-    dynamic_weight = stage == "rollout" and getattr(args, "dynamic_reward_gate", None) is not None
+    dynamic_weight = stage == "rollout" and (
+        getattr(args, "dynamic_reward_gate", None) is not None
+        or getattr(args, "dynamic_reward_correctness", None) is not None
+    )
     failed_group_reward = stage == "rollout" and bool(config["apply_failed_group_reward"])
     overlong_penalty = getattr(args, "overlong_penalty", None)
     if overlong_penalty not in {None, "dapo", "laser-d"}:
