@@ -182,9 +182,12 @@ build_dsv4_task_args() {
         --coverage-rs-factor 0.1
       )
       case "${OVERLONG_PENALTY:-None}" in
-        None|dapo) ;;
-        *) echo "FATAL: OVERLONG_PENALTY must be None or dapo" >&2; return 2 ;;
+        None|dapo|laser-d) ;;
+        *) echo "FATAL: OVERLONG_PENALTY must be None, dapo, or laser-d" >&2; return 2 ;;
       esac
+      if [[ "${OVERLONG_PENALTY:-None}" == "laser-d" ]]; then
+        reward_args+=(--overlong-penalty laser-d)
+      fi
       if [[ "${OVERLONG_PENALTY:-None}" == "dapo" ]]; then
         reward_args+=(
           --overlong-penalty dapo

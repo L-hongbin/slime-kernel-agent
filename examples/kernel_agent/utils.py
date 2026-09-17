@@ -1070,24 +1070,48 @@ def _mark_remove_sample(sample: Sample, reason: str) -> None:
 
 
 def _set_multi_turn_rewards(args, output_samples: list[Sample], finish_reason: str) -> None:
+    """Freeze future raw task credit before group reward shaping and filtering."""
     gamma = float(getattr(args, "multi_turn_gamma", 1.0))
-    if args.advantage_estimator not in ["trloo"] or gamma == 0.0:
+    if args.advantage_estimator != "trloo":
         return
 
-    multi_turn_reward = 0.0
+    cumulative_task_reward = 0.0
     for reverse_idx, sample in enumerate(reversed(output_samples)):
         turn_idx = sample.metadata.get("turn_idx") if isinstance(sample.metadata, dict) else None
         expected_turn_idx = len(output_samples) - 1 - reverse_idx
         assert int(turn_idx) == expected_turn_idx, f"turn_idx mismatch: {turn_idx=} {expected_turn_idx=}"
-        turn_reward = 0.0 if sample.remove_sample else float(sample.reward)
-        multi_turn_reward = turn_reward + gamma * multi_turn_reward
         sample.metadata = dict(sample.metadata or {})
+        reward_key = getattr(args, "reward_key", None)
+        turn_reward = (
+            0.0 if sample.remove_sample else float(sample.reward[reward_key] if reward_key else sample.reward)
+        )
+        if (
+            sample.metadata.get("role") == "verify"
+            or sample.metadata.get("verify_trajectory")
+            or sample.metadata.get("verify_scoring_branch") == "anchor"
+        ):
+            sample.metadata.update(multi_turn_reward=turn_reward, trajectory_finish_reason=finish_reason)
+            continue
+        # Legacy samples fall back to the task score at pre-shaping finalization.
+        task_reward = (
+            0.0
+            if sample.remove_sample
+            else float(sample.metadata.get("raw_task_reward", sample.metadata.get("task_reward", turn_reward)))
+        )
+        return_reward = gamma * cumulative_task_reward
+        # Diagnostic future credit, not part of the current single-turn reward.
+        sample.metadata["reward_component"] = {
+            **sample.metadata.get("reward_component", {}),
+            "return_reward": return_reward,
+        }
         sample.metadata.update(
             {
-                "multi_turn_reward": multi_turn_reward,
+                "return_reward": return_reward,
+                "multi_turn_reward": turn_reward + return_reward,
                 "trajectory_finish_reason": finish_reason,
             }
         )
+        cumulative_task_reward = task_reward + return_reward
 
 
 def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:

@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import sys
@@ -9,9 +10,31 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
+from examples.kernel_agent.kernel_reward import post_process_rollout_rewards
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("method", [None, "dapo", "laser-d"])
+@pytest.mark.parametrize("has_task_reward", [False, True])
+def test_filter_reward_selection_is_read_only(method, has_task_reward):
+    args = Namespace(
+        n_samples_per_prompt=2, min_group_size=2, target_group_size=2, reward_key="score", overlong_penalty=method
+    )
+    samples = [
+        Sample(
+            index=index,
+            group_index=0,
+            reward={"score": float(index), "other": 9.0},
+            metadata={"task_reward": 0.0} if has_task_reward else {},
+        )
+        for index in range(2)
+    ]
+    before = copy.deepcopy([sample.to_dict() for sample in samples])
+    result = filter_cuda_kernel_group(args, samples)
+    assert result.keep is (method == "laser-d" or not has_task_reward)
+    assert [sample.to_dict() for sample in samples] == before
 
 
 def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
@@ -100,18 +123,20 @@ def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, k
                         "performance": reward,
                         "coverage": 0.0,
                         "failed": None,
-                        "overlong_penalty": 0.0,
+                        "length": 0.0,
                     },
                 },
             )
         )
+    post_process_rollout_rewards(args, samples)
+    before = copy.deepcopy([sample.to_dict() for sample in samples])
     result = filter_cuda_kernel_group(args, samples)
     assert result.keep is keep
-    assert [sample.reward for sample in samples] == [0.0, 0.5]
+    assert [sample.to_dict() for sample in samples] == before
 
 
 @pytest.mark.parametrize("mode,keep", [("sqrt", False), ("piecewise", True), ("piecewise-sqrt", True)])
-def test_filter_uses_selected_dynamic_gate_without_recording_final_metrics(monkeypatch, mode, keep):
+def test_filter_reads_settled_dynamic_gate_without_mutation(monkeypatch, mode, keep):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
@@ -135,15 +160,62 @@ def test_filter_uses_selected_dynamic_gate_without_recording_final_metrics(monke
                     "performance": 0.5 * performance,
                     "coverage": 0.0,
                     "failed": None,
-                    "overlong_penalty": 0.0,
+                    "length": 0.0,
                 },
             },
         )
         for performance in (0.0, 1.0)
     ]
+    post_process_rollout_rewards(args, samples)
+    before = copy.deepcopy([sample.to_dict() for sample in samples])
     assert filter_cuda_kernel_group(args, samples).keep is keep
-    assert [sample.reward for sample in samples] == [0.5, 1.0]
-    assert all("dynamic_reward" not in sample.metadata for sample in samples)
+    assert [sample.to_dict() for sample in samples] == before
+    assert all("dynamic_reward" in sample.metadata for sample in samples)
+
+
+@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise-sqrt"])
+def test_laser_d_bonus_keeps_all_correct_groups_with_different_lengths(monkeypatch, gate):
+    from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = Namespace(
+        min_group_size=2,
+        n_samples_per_prompt=2,
+        target_group_size=2,
+        reward_key=None,
+        reward_std_threshold=0.1,
+        dynamic_reward_gate=gate,
+        overlong_penalty="laser-d",
+        rollout_max_response_len=16,
+        laser_d_min_length=4,
+    )
+    samples = [
+        Sample(
+            group_index=0,
+            reward=1.0,
+            response_length=length,
+            status=Sample.Status.COMPLETED,
+            metadata={
+                "task_reward": 1.0,
+                "kernel_score": {"correctness": 1.0, "performance": 1.0, "coverage": 0.0},
+                "reward_component": {
+                    "correctness": 0.5,
+                    "performance": 0.5,
+                    "coverage": 0.0,
+                    "failed": None,
+                    "length": 0.0,
+                },
+            },
+        )
+        for length in (4, 8)
+    ]
+    from types import SimpleNamespace
+
+    LaserDBudgetController(args, SimpleNamespace(metadata={}), 0).observe(samples)
+    post_process_rollout_rewards(args, samples)
+    assert filter_cuda_kernel_group(args, samples).keep
+    assert [sample.reward - sample.metadata["task_reward"] for sample in samples] == [0.5, 0.0]
 
 
 if __name__ == "__main__":

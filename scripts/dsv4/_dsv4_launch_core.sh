@@ -25,10 +25,10 @@ USE_LORA_WEIGHT_SYNC=0
 while (( "$#" > 0 )); do
   case "$1" in
     --overlong-penalty)
-      [[ "$#" -ge 2 ]] || { echo "FATAL: --overlong-penalty requires None or dapo" >&2; exit 2; }
+      [[ "$#" -ge 2 ]] || { echo "FATAL: --overlong-penalty requires None, dapo, or laser-d" >&2; exit 2; }
       case "$2" in
-        None|dapo) OVERLONG_PENALTY=$2 ;;
-        *) echo "FATAL: --overlong-penalty must be None or dapo" >&2; exit 2 ;;
+        None|dapo|laser-d) OVERLONG_PENALTY=$2 ;;
+        *) echo "FATAL: --overlong-penalty must be None, dapo, or laser-d" >&2; exit 2 ;;
       esac
       shift 2
       ;;

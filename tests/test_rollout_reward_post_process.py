@@ -21,6 +21,7 @@ from examples.kernel_agent.kernel_reward import (
     post_process_rollout_rewards,
     reward_post_process_by_group,
 )
+from examples.kernel_agent.utils import _set_multi_turn_rewards
 from slime.observability.rollout_metrics import compute_reward_post_process_metrics
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
@@ -215,6 +216,720 @@ def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_no
     return manager
 
 
+@pytest.mark.parametrize("custom_kernel_hook", [False, True])
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_aggregate_reward_grouping_turns_padding_and_no_mutation(custom_kernel_hook, estimator):
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=True, grpo_std_normalization=True)
+    if custom_kernel_hook:
+        manager.custom_reward_post_process_func = reward_post_process_by_group
+    # Intentionally interleaved prompt/turn groups; ignore configured fixed N=3.
+    samples = [
+        Sample(index=i, group_index=g, reward=r, loss_mask=[1], metadata={"turn_idx": t, "return_reward": 999})
+        for i, g, t, r in [(0, 0, 0, 1), (2, 1, 0, 2), (0, 0, 1, 0), (1, 0, 0, 3), (3, 1, 0, 2), (1, 0, 1, 2)]
+    ]
+    samples += [
+        Sample(index=9, group_index=0, reward=100, remove_sample=True, metadata={"turn_idx": 0}),
+        Sample(index=10, group_index=0, reward=100, loss_mask=[0], metadata={"turn_idx": 0}),
+    ]
+    original = [s.reward for s in samples]
+    raw, advantages = manager._post_process_rewards(samples)
+    assert raw == original
+    expected = [-2, 0, -2, 2, 0, 2, 0, 0] if estimator == "tailrl" else [1, 2, 0, 5, 2, 4, 0, 0]
+    assert advantages == pytest.approx(expected)
+    assert [s.reward for s in samples] == original
+    assert all("raw_task_reward" not in s.metadata for s in samples)
+
+
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_custom_reward_output_is_used_once(estimator):
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
+    calls = []
+
+    def custom(_args, samples):
+        calls.append(len(samples))
+        return [1.0, 2.0], [2.0, 4.0]
+
+    manager.custom_reward_post_process_func = custom
+    samples = [Sample(index=i, group_index=0, reward=r) for i, r in enumerate([1, 2])]
+    raw, advantages = manager._post_process_rewards(samples)
+    assert calls == [2]
+    assert raw == [1, 2]
+    assert advantages == pytest.approx([-2, 2] if estimator == "tailrl" else [2, 6])
+
+
+@pytest.mark.parametrize("baseline", ["history", "anchor", "greedy-anchor"])
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_rejects_verify_baseline_override(baseline, estimator):
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=True)
+    manager.args.verify_advantage_baseline = baseline
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    sample = Sample(index=0, group_index=0, reward=1, metadata={"role": "verify", "turn_idx": 0})
+    with pytest.raises(ValueError, match="history/anchor"):
+        manager._post_process_rewards([sample])
+
+
+def test_argmaxrl_kernel_offset_ctm_and_raw_reward_preserved():
+    manager = _make_manager(advantage_estimator="argmaxrl", use_multi_turn=False)
+    manager.args.argmaxrl_reward_offset = 1.0
+    manager.args.use_conditional_truncation_mask = True
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    samples = [Sample(index=i, group_index=0, reward=r, metadata={}) for i, r in enumerate([-1.0, 1.0])]
+    for sample in samples:
+        sample.metadata["conditional_truncation_masked"] = True
+    raw, advantages = manager._post_process_rewards(samples)
+    assert raw == [-1, 1]
+    assert advantages == [0, 4]
+    assert [s.reward for s in samples] == [-1, 1]
+    # Non-truncated samples are ineligible; calling the CTM annotator clears
+    # stale flags rather than preserving a previous selection.
+    assert all("conditional_truncation_masked" not in s.metadata for s in samples)
+
+
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_train_conversion_and_dp_shards_preserve_complete_group_weights(monkeypatch, estimator):
+    import slime.ray.rollout as rollout_module
+
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.args.global_batch_size = 4
+    manager.args.micro_batch_size = 1
+    manager.args.use_dynamic_batch_size = False
+    manager.args.balance_data = False
+    manager.args.balance_by_flops = False
+    manager.train_parallel_config = {
+        "dp_size": 2,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    samples = [
+        Sample(index=i, rollout_id=i, group_index=i // 2, reward=r, tokens=[1, 2], response_length=1)
+        for i, r in enumerate([1.0, 3.0, 2.0, 4.0])
+    ]
+    data = manager._convert_samples_to_train_data(samples)
+    assert data["raw_reward"] == [1, 3, 2, 4]
+    assert data["rewards"] == ([-2, 2, -2, 2] if estimator == "tailrl" else [1, 5, 2, 6])
+    monkeypatch.setattr(rollout_module.ray, "put", lambda data: data)
+    shards = [box.inner for box in manager._split_train_data_by_dp(data)]
+    # Strided DP scheduling puts one candidate from each prompt on each rank.
+    assert shards[0]["rewards"] == ([-2, -2] if estimator == "tailrl" else [1, 2])
+    assert shards[1]["rewards"] == ([2, 2] if estimator == "tailrl" else [5, 6])
+
+
+def _laser_args(**overrides):
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.overlong_penalty = "laser-d"
+    args.rollout_max_response_len = 16
+    args.laser_d_min_length = 4
+    args.laser_d_length_interval = 4
+    args.laser_d_update_interval = 2
+    args.laser_d_monitor_groups = 2
+    args.laser_d_length_score = 0.5
+    args.difficulty_thresholds = [1 / 3, 2 / 3]
+    args.rollout_global_dataset = True
+    args.custom_reward_post_process_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    return args
+
+
+def _laser_group(correct=1, lengths=(8,) * 8, group_index=0):
+    samples = []
+    for index, length in enumerate(lengths):
+        sample = _make_sample(index, group_index, float(index < correct))
+        sample.status = Sample.Status.COMPLETED
+        sample.response_length = length
+        sample.tokens = [0] * length
+        sample.metadata["task_reward"] = float(index < correct)
+        _set_reward_component(
+            sample, correctness_score=float(index < correct), performance_score=float(index < correct)
+        )
+        samples.append(sample)
+    return samples
+
+
+@pytest.mark.parametrize(
+    "size,correct,bucket", [(8, 0, 0), (8, 2, 0), (8, 3, 1), (8, 5, 1), (8, 6, 2), (3, 1, 1), (3, 2, 2)]
+)
+def test_laser_d_difficulty_uses_consistent_inclusive_boundaries(size, correct, bucket):
+    from examples.kernel_agent.length_reward import laser_d_bucket
+
+    assert laser_d_bucket(correct, size, [1 / 3, 2 / 3]) == bucket
+
+
+def test_laser_d_search_uses_paper_ecr_and_includes_non_grid_cap():
+    from examples.kernel_agent.length_reward import select_laser_d_budgets
+
+    records = [
+        {"bucket": 0, "lengths": [2] * 7 + [9]},
+        {"bucket": 1, "lengths": [2] * 3 + [9] * 5},
+        {"bucket": 2, "lengths": [2] * 2 + [9] * 6},
+    ]
+    assert select_laser_d_budgets(records, [1 / 3, 2 / 3], 4, 16, 4) == [12, 4, 4]
+    assert select_laser_d_budgets(records[:1], [1 / 3, 2 / 3], 4, 10, 4) == [10, 10, 10]
+    assert select_laser_d_budgets([], [1 / 3, 2 / 3], 4, 16, 4) == [16, 16, 16]
+
+
+@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise-sqrt"])
+def test_laser_d_step_bonus_is_idempotent_and_composes_with_gate(gate):
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    args = _laser_args(dynamic_reward_gate=gate)
+    controller = LaserDBudgetController(args, SimpleNamespace(metadata={}), 0)
+    samples = _laser_group(correct=2, lengths=(4, 5, 3, 3, 3, 3, 3, 3))
+    for sample in samples:
+        sample.metadata["raw_task_reward"] = sample.reward
+    controller.observe(samples)
+    post_process_rollout_rewards(args, samples, stage="sample")
+    assert [sample.reward for sample in samples] == [1.5, 1.0, 0, 0, 0, 0, 0, 0]
+    auxiliary_gate = _compute_dynamic_auxiliary_gate(2, 8, args=args)
+    for _ in range(2):
+        rewards = post_process_rollout_rewards(args, samples)
+        assert rewards[:2] == pytest.approx([1 + 0.5 * auxiliary_gate, 0.5 + 0.5 * auxiliary_gate])
+        assert rewards[2:] == [0] * 6
+        assert [sample.metadata["raw_task_reward"] for sample in samples] == [1.0, 1.0, 0, 0, 0, 0, 0, 0]
+        assert samples[0].metadata["reward_component"]["length"] == 0.5
+        for sample in samples:
+            assert sample.metadata["length_score"] == sample.metadata["reward_component"]["length"]
+            assert "overlong_penalty" not in sample.metadata
+            assert "overlong_penalty" not in sample.metadata["reward_component"]
+            assert "length_bonus" not in sample.metadata["reward_component"]
+            assert "length_score" not in sample.metadata["reward_component"]
+            assert sample.reward == pytest.approx(
+                sum(value for value in sample.metadata["reward_component"].values() if value is not None)
+            )
+    metrics = compute_reward_post_process_metrics(samples)
+    assert metrics["rollout/laser_d/length_score_mean"] == 0.5 / 8
+    assert metrics["rollout/laser_d/bonus_fraction"] == 1 / 8
+
+
+def test_laser_d_budget_snapshot_and_update_affect_only_future_rollouts():
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    args, source = _laser_args(), SimpleNamespace(metadata={})
+    first = LaserDBudgetController(args, source, 0)
+    old_samples = _laser_group()
+    first.observe(old_samples)
+    assert source.metadata == {}  # No half-completed rollout state is checkpointed.
+    assert first.finish()["laser_d/hard/budget_next"] == 8
+    assert old_samples[0].metadata["laser_d"]["budget"] == 4
+    second = LaserDBudgetController(args, source, 1)
+    new_samples = _laser_group(lengths=(4,) * 8)
+    second.observe(new_samples)
+    post_process_rollout_rewards(args, new_samples)
+    assert new_samples[0].reward == 1.5
+    assert second.finish()["laser_d/budget_updated"] == 0
+    third = LaserDBudgetController(args, source, 2)
+    third.observe(_laser_group(lengths=(4,) * 8))
+    assert third.finish()["laser_d/hard/budget_next"] == 4
+    assert post_process_rollout_rewards(args, old_samples)[0] == 1.0
+    assert new_samples[0].metadata["laser_d"]["budget"] == 8
+
+
+def test_laser_d_reservoir_and_budget_restore_through_dataset_checkpoint(tmp_path):
+    import copy
+
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+    from slime.rollout.data_source import RolloutDataSourceWithBuffer
+
+    args = _laser_args(save=str(tmp_path), load=str(tmp_path), rollout_shuffle=False)
+    source = object.__new__(RolloutDataSourceWithBuffer)
+    source.args, source.metadata, source.dataset = args, {}, None
+    source.sample_offset = source.epoch_id = source.sample_group_index = source.sample_index = 0
+    controller = LaserDBudgetController(args, source, 0)
+    controller.observe(_laser_group())
+    controller.finish()
+    controller = LaserDBudgetController(args, source, 1)
+    for index in range(10):
+        controller.observe(_laser_group(lengths=(index + 1,) * 8))
+    controller.finish()
+    assert len(source.metadata["laser_d"]["records"]) == 2
+    assert source.metadata["laser_d"]["seen_groups"] == 10
+    source.save(1)
+    restored = object.__new__(RolloutDataSourceWithBuffer)
+    restored.args, restored.metadata, restored.dataset = args, {}, None
+    restored.load(1)
+    assert restored.metadata == source.metadata
+    before = copy.deepcopy(source.metadata)
+    for data in (source, restored):
+        continuation = LaserDBudgetController(args, data, 2)
+        continuation.observe(_laser_group(lengths=(9,) * 8))
+        continuation.finish()
+    assert restored.metadata == source.metadata
+    assert source.metadata != before
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        LaserDBudgetController(_laser_args(laser_d_min_length=5), source, 3)
+
+
+@pytest.mark.parametrize("kind", ["verify", "verify_kernel", "anchor", "pad", "removed", "aborted"])
+def test_laser_d_excludes_nonordinary_samples_without_mutation(kind):
+    import copy
+
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    sample = _laser_group(correct=1, lengths=(2,))[0]
+    if kind == "verify":
+        sample.metadata["role"] = "verify"
+    elif kind == "verify_kernel":
+        sample.metadata["verify_trajectory"] = True
+    elif kind == "anchor":
+        sample.metadata["verify_scoring_branch"] = "anchor"
+    elif kind == "pad":
+        sample.metadata.update(role="pad", is_pad_turn=True)
+    elif kind == "removed":
+        sample.remove_sample = True
+    else:
+        sample.status = Sample.Status.ABORTED
+    before = copy.deepcopy(sample.to_dict())
+    args = _laser_args()
+    controller = LaserDBudgetController(args, SimpleNamespace(metadata={}), 0)
+    controller.observe([sample])
+    post_process_rollout_rewards(args, [sample])
+    assert sample.to_dict() == before
+    assert controller.finish()["laser_d/observed_groups"] == 0
+
+
+def test_laser_d_requires_collector_snapshot_only_at_training_stage():
+    args, samples = _laser_args(), _laser_group()
+    assert post_process_rollout_rewards(args, samples, stage="sample")[0] == 1.0
+    with pytest.raises(ValueError, match="budget snapshot"):
+        post_process_rollout_rewards(args, samples)
+
+
+def test_laser_d_trloo_keeps_bonus_local_to_current_turn():
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    args = _laser_args(advantage_estimator="trloo", use_multi_turn=True, multi_turn_gamma=0.5)
+    turns = [_laser_group(correct=2, lengths=lengths) for lengths in ((4, 8), (8, 4))]
+    controller = LaserDBudgetController(args, SimpleNamespace(metadata={}), 0)
+    for turn_idx, group in enumerate(turns):
+        for sample in group:
+            sample.metadata.update(turn_idx=turn_idx, multi_turn_reward=100.0)
+    for trajectory in zip(*turns, strict=True):
+        _set_multi_turn_rewards(args, list(trajectory), "env_done")
+    for group in turns:
+        controller.observe(group)
+        post_process_rollout_rewards(args, group)
+    samples = turns[0] + turns[1]
+    raw, advantages = reward_post_process_by_group(args, samples)
+    assert raw == pytest.approx([2.0, 1.5, 1.0, 1.5])
+    assert all(abs(value) > 0 for value in advantages)
+    assert [sample.reward for sample in samples] == [1.5, 1.0, 1.0, 1.5]
+    assert [sample.metadata["return_reward"] for sample in samples] == [0.5, 0.5, 0.0, 0.0]
+
+
+def test_laser_d_dictionary_reward_preserves_unrelated_keys():
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    args = _laser_args(reward_key="score")
+    samples = _laser_group(correct=2, lengths=(4, 8))
+    for sample in samples:
+        sample.reward = {"score": sample.reward, "other": 9.0}
+    LaserDBudgetController(args, SimpleNamespace(metadata={}), 0).observe(samples)
+    assert post_process_rollout_rewards(args, samples) == [1.5, 1.0]
+    assert samples[0].reward == {"score": 1.5, "other": 9.0}
+    assert samples[1].reward == {"score": 1.0, "other": 9.0}
+
+
+def test_laser_d_variable_group_sizes_use_group_weighted_ecr():
+    from examples.kernel_agent.length_reward import select_laser_d_budgets
+
+    records = [
+        {"bucket": 1, "lengths": [4, 4, 12, 12]},  # C_min=2; ECR(4)=1.
+        {"bucket": 1, "lengths": [4, 4, 4, 12, 12, 12, 12, 12]},  # C_min=3; ECR(4)=1.125.
+    ]
+    assert select_laser_d_budgets(records, [1 / 3, 2 / 3], 4, 16, 4) == [16, 4, 16]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"laser_d_min_length": 0},
+        {"laser_d_min_length": 17},
+        {"laser_d_length_interval": 0},
+        {"laser_d_update_interval": 0},
+        {"laser_d_monitor_groups": 0},
+        {"laser_d_length_score": -1},
+        {"laser_d_length_score": float("nan")},
+        {"laser_d_length_score": float("inf")},
+        {"difficulty_thresholds": [0.5]},
+        {"rollout_global_dataset": False},
+        {"custom_reward_post_process_path": None},
+        {"rollout_function_path": "custom.rollout"},
+    ],
+)
+def test_laser_d_rejects_invalid_configuration(override):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    with pytest.raises(ValueError):
+        _validate_rollout_reward_post_process_args(_laser_args(**override))
+
+
+@pytest.mark.parametrize("length_score", [None, 0.25])
+def test_laser_d_cli_routes_default_rollout_and_keeps_full_async(length_score):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--overlong-penalty",
+            "laser-d",
+            "--rollout-max-response-len",
+            "4096",
+            "--custom-reward-post-process-path",
+            "examples.kernel_agent.kernel_reward.reward_post_process_by_group",
+            *(["--laser-d-length-score", str(length_score)] if length_score is not None else []),
+        ]
+    )
+    assert args.rollout_global_dataset is True
+    _validate_rollout_reward_post_process_args(args)
+    assert args.laser_d_length_score == (0.5 if length_score is None else length_score)
+    assert args.laser_d_update_interval == 20
+    assert args.rollout_function_path == "examples.kernel_agent.kernel_reward.generate_rollout"
+    args.rollout_function_path = "examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async"
+    _validate_rollout_reward_post_process_args(args)
+    assert args.rollout_function_path.endswith("generate_rollout_fully_async")
+
+
+@pytest.mark.parametrize("gate", [None, "sqrt"])
+@pytest.mark.parametrize("method", [None, "dapo"])
+def test_kernel_reward_hook_routes_prefilter_settlement_even_without_length_shaping(gate, method):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = _laser_args(
+        overlong_penalty=method,
+        dynamic_reward_gate=gate,
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        rollout_function_path="slime.rollout.sglang_rollout.generate_rollout",
+    )
+    _validate_rollout_reward_post_process_args(args)
+    assert args.rollout_function_path == "examples.kernel_agent.kernel_reward.generate_rollout"
+    args.rollout_function_path = "examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async"
+    _validate_rollout_reward_post_process_args(args)
+    assert args.rollout_function_path.endswith("generate_rollout_fully_async")
+
+
+@pytest.mark.parametrize("method", [None, "dapo", "laser-d"])
+def test_kernel_sglang_collector_settles_before_dynamic_filter(monkeypatch, method):
+    import asyncio
+
+    from examples.kernel_agent.kernel_reward import generate_rollout
+    from slime.rollout import sglang_rollout
+    from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+
+    args = _laser_args(
+        overlong_penalty=method,
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        rollout_batch_size=1,
+        n_samples_per_prompt=8,
+        over_sampling_batch_size=1,
+        dynamic_sampling_filter_path=None,
+        rollout_sample_filter_path=None,
+        rollout_all_samples_process_path=None,
+        use_rollout_routing_replay=False,
+        laser_d_monitor_groups=10,
+    )
+    supplied = [
+        _laser_group(lengths=(12,) * 8, group_index=0),
+        _laser_group(correct=8, lengths=(4,) * 8, group_index=1),
+    ]
+    source = SimpleNamespace(metadata={}, get_samples=lambda count: [supplied.pop(0)])
+
+    class State:
+        remaining_batch_size = 0
+
+        def __init__(self):
+            self.pendings = set()
+
+        def submit_generate_tasks(self, groups):
+            async def completed(group):
+                return group
+
+            self.remaining_batch_size += len(groups)
+            self.pendings.update(asyncio.create_task(completed(group)) for group in groups)
+
+        def reset(self):
+            self.remaining_batch_size = 0
+
+    state = State()
+    visited = []
+
+    def filter_group(fn, args, group):
+        visited.append(group[0].group_index)
+        first = group[0].group_index == 0
+        if method == "laser-d":
+            assert group[0].metadata["laser_d"]["budget"] == 4
+            expected = 1.0 if first else 1.5
+        elif method == "dapo":
+            expected = 0.25 if first else 0.75
+        else:
+            expected = 1.0
+        assert group[0].reward == expected
+        return DynamicFilterOutput(keep=group[0].group_index == 1, reason="test")
+
+    async def abort(*args):
+        return []
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: state)
+    monkeypatch.setattr(sglang_rollout, "call_dynamic_filter", filter_group)
+    monkeypatch.setattr(sglang_rollout, "abort", abort)
+    output = generate_rollout(args, 0, source)
+    assert visited == [0, 1]
+    assert output.samples[0][0].group_index == 1
+    if method == "laser-d":
+        assert output.metrics["laser_d/hard/budget_next"] == 12
+        assert source.metadata["laser_d"]["budgets"] == [12, 16, 4]
+    else:
+        assert "laser_d" not in source.metadata
+
+
+@pytest.mark.parametrize("method", [None, "dapo", "laser-d"])
+def test_failed_group_replacement_excludes_length_penalty_and_writes_components(monkeypatch, method):
+    from examples.kernel_agent.length_reward import LaserDBudgetController
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(overlong_penalty=method, overlong_buffer_len=16, overlong_penalty_factor=1.0)
+    samples = _laser_group(correct=0, lengths=(4, 8))
+    for sample, stage_score in zip(samples, [-1.0, -0.75], strict=True):
+        sample.metadata["kernel_failed_score"] = stage_score
+    if method == "laser-d":
+        LaserDBudgetController(args, SimpleNamespace(metadata={}), 0).observe(samples)
+    expected = [-0.75, -0.875] if method == "dapo" else [-0.5, -0.375]
+    for _ in range(2):
+        assert post_process_rollout_rewards(args, samples) == expected
+        assert [sample.reward for sample in samples] == expected
+        for sample in samples:
+            assert sum(v for v in sample.metadata["reward_component"].values() if v is not None) == sample.reward
+    assert [sample.metadata["task_reward"] for sample in samples] == [-0.5, -0.375]
+
+
+def test_failed_group_replacement_preserves_length_penalty_exactly_once(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", -1.0)
+    args = _laser_args(
+        overlong_penalty="dapo", dynamic_reward_gate="sqrt", overlong_buffer_len=16, overlong_penalty_factor=1.0
+    )
+    samples = _laser_group(correct=0, lengths=(8, 8))
+    for sample, stage_score in zip(samples, [-0.25, -0.75], strict=True):
+        sample.reward = sample.metadata["task_reward"] = -0.5
+        sample.metadata["reward_component"]["failed"] = -0.5
+        sample.metadata["kernel_failed_score"] = stage_score
+    for _ in range(2):
+        assert post_process_rollout_rewards(args, samples) == [-0.625, -0.875]
+        assert all(sample.metadata["reward_component"]["length"] == -0.5 for sample in samples)
+
+
+def test_correct_samples_at_default_failure_reward_are_not_replaced(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(overlong_penalty="dapo", overlong_buffer_len=16, overlong_penalty_factor=1.0)
+    samples = _laser_group(correct=2, lengths=(16, 16))
+    for sample in samples:
+        sample.metadata["kernel_failed_score"] = -1.0
+    assert post_process_rollout_rewards(args, samples) == [0.0, 0.0]
+    assert all(sample.metadata["task_reward"] == 1.0 for sample in samples)
+
+
+@pytest.mark.parametrize(
+    "base,spread,threshold,replace",
+    [
+        (0.0, 0.0, 0.0, True),
+        (0.0, 0.0, 0.001, True),
+        (0.0, 1e-8, 1.0, False),
+        (0.25, 0.0, 1.0, False),
+        (0.25, 0.0005, 0.001, False),
+        (0.25, 0.004, 0.01, False),
+    ],
+)
+def test_failed_group_requires_exact_default_score_independent_of_variance_threshold(
+    monkeypatch, base, spread, threshold, replace
+):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", 0.0)
+    args = _laser_args(overlong_penalty=None, reward_std_threshold=threshold)
+    samples = _laser_group(correct=0, lengths=(4, 4))
+    original = [base, base + spread]
+    for sample, reward, score in zip(samples, original, [-1.0, -0.75], strict=True):
+        sample.reward = sample.metadata["task_reward"] = reward
+        sample.metadata["reward_component"]["failed"] = reward
+        sample.metadata["kernel_failed_score"] = score
+    expected = [-0.5, -0.375] if replace else original
+    assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
+
+
+def test_failed_group_does_not_use_length_penalty_to_hide_task_variance(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(overlong_penalty="dapo", overlong_buffer_len=16, overlong_penalty_factor=1.0)
+    samples = _laser_group(correct=0, lengths=(4, 8))
+    for sample, reward in zip(samples, [0.25, 0.5], strict=True):
+        sample.reward = sample.metadata["task_reward"] = reward
+        sample.metadata["reward_component"]["failed"] = reward
+        sample.metadata["kernel_failed_score"] = -1.0
+    assert post_process_rollout_rewards(args, samples) == [0.0, 0.0]
+    assert [sample.metadata["task_reward"] for sample in samples] == [0.25, 0.5]
+
+
+def test_uniform_failure_stages_still_fail_formal_filter(monkeypatch):
+    from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(
+        overlong_penalty="dapo",
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        n_samples_per_prompt=2,
+        min_group_size=2,
+        target_group_size=2,
+    )
+    samples = _laser_group(correct=0, lengths=(4, 8))
+    for sample in samples:
+        sample.metadata["kernel_failed_score"] = -1.0
+    assert post_process_rollout_rewards(args, samples) == [-0.75, -1.0]
+    assert not filter_cuda_kernel_group(args, samples).keep
+
+
+def test_training_does_not_reweight_a_filtered_subset():
+    args = _laser_args(overlong_penalty=None, dynamic_reward_gate="sqrt")
+    samples = _laser_group(correct=3, lengths=(4, 4, 4, 4))
+    post_process_rollout_rewards(args, samples)
+    selected = [samples[0], samples[3]]
+    expected = [sample.reward for sample in selected]
+    raw, _ = reward_post_process_by_group(args, selected)
+    assert raw == expected
+    assert selected[0].metadata["dynamic_reward"]["gate"] == pytest.approx((2 / 3) ** 0.5)
+    assert selected[0].metadata["reward_component"]["performance"] == pytest.approx(0.5 * (2 / 3) ** 0.5)
+
+
+def test_trloo_reads_settled_turn_rewards_even_without_shaping():
+    args = _laser_args(overlong_penalty=None, advantage_estimator="trloo", use_multi_turn=True, multi_turn_gamma=0.5)
+    samples = []
+    for turn in range(2):
+        group = _laser_group(correct=2, lengths=(4, 4))
+        for sample in group:
+            sample.metadata.update(turn_idx=turn, multi_turn_reward=999.0)
+        samples.extend(group)
+    for index in range(2):
+        _set_multi_turn_rewards(args, [samples[index], samples[index + 2]], "env_done")
+    raw, _ = reward_post_process_by_group(args, samples)
+    assert raw == [1.5, 1.5, 1.0, 1.0]
+    assert all(sample.reward == 1.0 for sample in samples)
+
+
+def test_failed_group_is_settled_before_filter_and_future_return(monkeypatch):
+    from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(
+        overlong_penalty=None,
+        advantage_estimator="trloo",
+        use_multi_turn=True,
+        multi_turn_gamma=0.5,
+        n_samples_per_prompt=2,
+        min_group_size=2,
+        target_group_size=2,
+    )
+    turns = [_laser_group(correct=correct, lengths=(4, 4)) for correct in (0, 2)]
+    for turn, group in enumerate(turns):
+        for sample, stage_score in zip(group, [-1.0, -0.75], strict=True):
+            sample.metadata.update(turn_idx=turn, kernel_failed_score=stage_score)
+    for trajectory in zip(*turns, strict=True):
+        _set_multi_turn_rewards(args, list(trajectory), "env_done")
+    for group in turns:
+        post_process_rollout_rewards(args, group)
+    assert filter_cuda_kernel_group(args, turns[0]).keep
+    assert [sample.reward for sample in turns[0]] == [-0.5, -0.375]
+    # A successful future turn must not suppress failure-stage replacement of turn 0.
+    raw, _ = reward_post_process_by_group(args, turns[0] + turns[1])
+    assert raw == [0.0, 0.125, 1.0, 1.0]
+    assert [sample.reward for sample in turns[0]] == [-0.5, -0.375]
+
+
+@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
+def test_trloo_future_credit_excludes_all_group_shaping_and_survives_filtering(monkeypatch, gamma):
+    from examples.kernel_agent.utils import postprocess_turn_samples
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
+    args = _laser_args(
+        advantage_estimator="trloo",
+        use_multi_turn=True,
+        multi_turn_gamma=gamma,
+        overlong_penalty="dapo",
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        dynamic_reward_gate="sqrt",
+        finalize_mode=None,
+    )
+    turns = [_laser_group(correct=correct, lengths=(length, length)) for correct, length in [(2, 4), (0, 8), (1, 12)]]
+    for turn, group in enumerate(turns):
+        for sample, stage_score in zip(group, [-1.0, -0.75], strict=True):
+            sample.metadata.update(turn_idx=turn, kernel_failed_score=stage_score, raw_task_reward=sample.reward)
+        # Real generation settles DAPO before completing the trajectory.
+        post_process_rollout_rewards(args, group, stage="sample")
+    for trajectory in zip(*turns, strict=True):
+        postprocess_turn_samples(args, list(trajectory), "env_done")
+    for group in turns:
+        post_process_rollout_rewards(args, group)
+    assert [sample.reward for sample in turns[1]] == [-1.0, -0.875]
+    assert [sample.metadata["task_reward"] for sample in turns[1]] == [-0.5, -0.375]
+    assert turns[2][0].metadata["task_reward"] == 0.5  # Gated down from raw 1.0.
+    all_samples = [sample for group in turns for sample in group]
+    assert [sample.metadata["raw_task_reward"] for sample in all_samples] == [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
+    for sample in all_samples:
+        assert sample.metadata["reward_component"]["return_reward"] == sample.metadata["return_reward"]
+    expected = [0.75 + gamma**2, 0.75, -1.0 + gamma, -0.875, -0.25, -0.75]
+    assert reward_post_process_by_group(args, all_samples)[0] == pytest.approx(expected)
+    assert [
+        sum(value for value in sample.metadata["reward_component"].values() if value is not None)
+        for sample in all_samples
+    ] == pytest.approx(expected)
+    # Future groups may be filtered out, but frozen raw task credit is retained.
+    assert reward_post_process_by_group(args, turns[0])[0] == pytest.approx(expected[:2])
+    assert [sample.reward for sample in turns[0]] == [0.75, 0.75]
+
+
+def test_trloo_missing_raw_future_credit_cannot_silently_use_shaped_returns():
+    args = _laser_args(advantage_estimator="trloo", use_multi_turn=True)
+    sample = _laser_group(correct=1, lengths=(4,))[0]
+    sample.metadata.update(turn_idx=0, multi_turn_reward=999.0)
+    with pytest.raises(ValueError, match="return_reward"):
+        reward_post_process_by_group(args, [sample])
+
+
+@pytest.mark.parametrize("gamma", [0.0, 0.5, 1.0])
+def test_trloo_future_credit_prefers_frozen_raw_task_reward(gamma):
+    args = _laser_args(advantage_estimator="trloo", use_multi_turn=True, multi_turn_gamma=gamma)
+    samples = [_make_sample(0, 0, reward, turn_idx=turn) for turn, reward in enumerate([0.2, -0.8, 0.3])]
+    for sample, raw_task_reward in zip(samples, [1.0, 0.0, 2.0], strict=True):
+        sample.metadata.update(raw_task_reward=raw_task_reward, task_reward=99.0)
+    _set_multi_turn_rewards(args, samples, "env_done")
+    assert [s.metadata["return_reward"] for s in samples] == pytest.approx([2 * gamma**2, 2 * gamma, 0.0])
+    assert reward_post_process_by_group(args, samples)[0] == pytest.approx([0.2 + 2 * gamma**2, -0.8 + 2 * gamma, 0.3])
+    assert [s.metadata["raw_task_reward"] for s in samples] == [1.0, 0.0, 2.0]
+
+
+def test_raw_future_credit_excludes_removed_turns_and_supports_dictionary_reward():
+    args = _laser_args(advantage_estimator="trloo", use_multi_turn=True, multi_turn_gamma=0.5, reward_key="score")
+    samples = []
+    for turn, (reward, task_reward) in enumerate([(0.8, 1.0), (99.0, 99.0), (0.6, 1.0)]):
+        sample = _make_sample(0, 0, reward, turn_idx=turn)
+        sample.reward = {"score": reward, "other": 9.0}
+        sample.metadata["task_reward"] = task_reward
+        samples.append(sample)
+    samples[1].remove_sample = True
+    _set_multi_turn_rewards(args, samples, "env_done")
+    assert samples[0].metadata["return_reward"] == 0.25
+    assert samples[0].metadata["reward_component"]["return_reward"] == 0.25
+    assert samples[2].metadata["reward_component"]["return_reward"] == 0.0
+    assert reward_post_process_by_group(args, [samples[0], samples[2]])[0] == [1.05, 0.6]
+    assert samples[0].reward == {"score": 0.8, "other": 9.0}
+
+
 def _enable_ctm(args) -> None:
     args.use_conditional_truncation_mask = True
     args.conditional_truncation_mask_prob = 1.0
@@ -236,7 +951,7 @@ def _set_reward_component(
     performance_score: float = 0.0,
     coverage_score: float = 0.0,
     failed: float | None = None,
-    overlong_penalty: float = 0.0,
+    length_score: float = 0.0,
 ) -> None:
     sample.metadata["kernel_score"] = {
         "correctness": correctness_score,
@@ -248,7 +963,7 @@ def _set_reward_component(
         "performance": 0.5 * performance_score,
         "coverage": 0.5 * coverage_score,
         "failed": failed,
-        "overlong_penalty": overlong_penalty,
+        "length": length_score,
     }
     sample.metadata["env_extra_info"] = {
         "correctness": correctness_score > 0.0,
@@ -478,6 +1193,7 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
     _set_reward_component(samples[2], correctness_score=1.0, performance_score=0.6, coverage_score=0.8)
     _set_reward_component(samples[3])
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
 
     gate = (1.0 / 3.0) ** 0.5
@@ -513,6 +1229,7 @@ def test_dynamic_reward_all_correct_matches_fixed_half_weights():
             coverage_score=2.0 * (sample.reward - 0.5 - performance_reward),
         )
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == pytest.approx([0.6, 0.8, 1.0])
@@ -523,11 +1240,12 @@ def test_dynamic_reward_rebuilds_overlong_penalty_from_components():
     manager.args.dynamic_reward_gate = "sqrt"
     correct = _make_sample(0, 0, 99.0)
     incorrect = _make_sample(1, 0, 0.0)
-    _set_reward_component(correct, correctness_score=1.0, performance_score=1.0, overlong_penalty=-0.2)
+    _set_reward_component(correct, correctness_score=1.0, performance_score=1.0, length_score=-0.2)
     _set_reward_component(incorrect)
     correct.metadata["task_reward"] = 1.0
-    correct.metadata["overlong_penalty"] = 0.2
+    correct.metadata["length_score"] = -0.2
 
+    post_process_rollout_rewards(manager.args, [correct, incorrect])
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, [correct, incorrect])
 
     # C=1 makes the auxiliary gate zero; the penalty is rebuilt from components.
@@ -537,6 +1255,7 @@ def test_dynamic_reward_rebuilds_overlong_penalty_from_components():
         sum(v for v in correct.metadata["reward_component"].values() if v is not None)
     )
     # Reprocessing must rebuild from base scores, not compound weighting or penalties.
+    post_process_rollout_rewards(manager.args, [correct, incorrect])
     assert reward_post_process_by_group(manager.args, [correct, incorrect])[0] == pytest.approx(raw_rewards)
     assert correct.reward == pytest.approx(0.3)
 
@@ -548,8 +1267,9 @@ def test_dynamic_reward_writeback_preserves_other_reward_keys():
     sample = _make_sample(0, 0, 99.0)
     original_reward = {"kernel": 99.0, "other": 7.0}
     sample.reward = original_reward
-    _set_reward_component(sample, correctness_score=1.0, performance_score=1.0, overlong_penalty=-0.2)
+    _set_reward_component(sample, correctness_score=1.0, performance_score=1.0, length_score=-0.2)
 
+    post_process_rollout_rewards(manager.args, [sample])
     raw, _ = reward_post_process_by_group(manager.args, [sample])
 
     assert raw == pytest.approx([0.3])
@@ -568,13 +1288,14 @@ def test_dynamic_reward_writeback_preserves_captured_verify_history(monkeypatch)
     sample = _make_sample(0, 0, 0.25)
     sample.metadata["history_baseline"] = 0.4
     sample.metadata["trajectory_states"] = ["failed"]
-    _set_reward_component(sample, failed=0.25, overlong_penalty=-0.1)
+    _set_reward_component(sample, failed=0.25, length_score=-0.1)
     monkeypatch.setattr(
         source_module, "extract_cuda_agent_kernel_code", lambda response: f"### {source_module.CUDA_SECTIONS[0]}\n```"
     )
     candidate = source._prepare_verify_candidate(sample, rollout_id=3)
     assert candidate is not None
 
+    post_process_rollout_rewards(manager.args, [sample])
     reward_post_process_by_group(manager.args, [sample])
 
     assert sample.reward == pytest.approx(0.15)
@@ -592,23 +1313,24 @@ def test_dynamic_reward_uses_failed_component_as_branch_sentinel():
         correctness_score=1.0,
         performance_score=1.0,
         failed=0.0,
-        overlong_penalty=-0.1,
+        length_score=-0.1,
     )
     _set_reward_component(
         output_mismatch,
         correctness_score=1.0,
         performance_score=1.0,
         failed=0.25,
-        overlong_penalty=-0.1,
+        length_score=-0.1,
     )
 
+    post_process_rollout_rewards(manager.args, [kernel_failure, output_mismatch])
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, [kernel_failure, output_mismatch])
 
     assert raw_rewards == pytest.approx([-0.1, 0.15])
     assert [kernel_failure.reward, output_mismatch.reward] == pytest.approx(raw_rewards)
 
 
-def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting():
+def test_dynamic_reward_trloo_discounts_raw_return_rewards():
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=True)
     manager.args.dynamic_reward_gate = "sqrt"
     manager.args.multi_turn_gamma = 0.5
@@ -623,13 +1345,17 @@ def test_dynamic_reward_rebuilds_trloo_returns_after_per_turn_weighting():
     _set_reward_component(samples[2], correctness_score=1.0, performance_score=0.8)
     _set_reward_component(samples[3])
     for sample in samples:
+        sample.metadata["task_reward"] = sample.reward
         sample.metadata["multi_turn_reward"] = -999.0
+    for index in range(2):
+        _set_multi_turn_rewards(manager.args, [samples[index], samples[index + 2]], "env_done")
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
 
     # turn 0: C=N => gate 1; turn 1: C=1 => gate 0.
-    assert raw_rewards == pytest.approx([0.85, 0.7, 0.5, 0.0])
-    assert advantages == pytest.approx([0.15, -0.15, 0.5, -0.5])
+    assert raw_rewards == pytest.approx([1.05, 0.7, 0.5, 0.0])
+    assert advantages == pytest.approx([0.35, -0.35, 0.5, -0.5])
     assert [sample.reward for sample in samples] == pytest.approx([0.6, 0.7, 0.5, 0.0])
     repeated_raw, repeated_advantages = reward_post_process_by_group(manager.args, samples)
     assert repeated_raw == pytest.approx(raw_rewards)
@@ -668,16 +1394,21 @@ def test_reward_switches_are_independent_and_keep_components_consistent(gate, ov
     for _ in range(2):
         assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
         assert [s.reward for s in samples] == pytest.approx(expected)
+        assert [s.metadata["raw_task_reward"] for s in samples] == [1.0, 1.0, 0.0]
         for sample, scores in zip(samples, base_scores, strict=True):
             metadata = sample.metadata
             assert metadata["kernel_score"] == scores
-            assert metadata["reward_component"]["overlong_penalty"] == pytest.approx(-penalty)
-            assert metadata["overlong_penalty"] == pytest.approx(penalty)
+            assert metadata["reward_component"]["length"] == pytest.approx(-penalty)
+            assert metadata["length_score"] == pytest.approx(-penalty)
+            assert "overlong_penalty" not in metadata
+            assert "overlong_penalty" not in metadata["reward_component"]
+            assert "length_bonus" not in metadata["reward_component"]
+            assert "length_score" not in metadata["reward_component"]
             assert sample.reward == pytest.approx(
                 sum(v for v in metadata["reward_component"].values() if v is not None)
             )
             assert sample.reward == pytest.approx(metadata["task_reward"] - penalty)
-    # The existing training hook delegates shaping, then centers rewards separately.
+    # The training hook reads settled rewards and centers them without reshaping.
     raw, advantages = reward_post_process_by_group(args, samples)
     assert raw == pytest.approx(expected)
     assert advantages == pytest.approx([reward - sum(expected) / 3 for reward in expected])
@@ -750,7 +1481,7 @@ def test_sample_reward_stage_shapes_verify_kernel_before_utility_settlement():
     assert post_process_rollout_rewards(args, [verify], stage="sample") == pytest.approx([0.8])
     # Once utilities are settled, neither turn gets reshaped in the rollout stage.
     assert post_process_rollout_rewards(args, [verify, kernel]) == pytest.approx([0.8, 0.8])
-    assert kernel.metadata["reward_component"]["overlong_penalty"] == pytest.approx(-0.2)
+    assert kernel.metadata["reward_component"]["length"] == pytest.approx(-0.2)
 
 
 def test_rollout_reward_processors_reject_unknown_stage():
@@ -867,6 +1598,7 @@ def test_dynamic_reward_metrics_logged_after_final_processing(monkeypatch, caplo
         logged.append(dict(metrics))
 
     monkeypatch.setattr(rollout_module.logging_utils, "log", capture_log)
+    post_process_rollout_rewards(manager.args, samples)
     with caplog.at_level(logging.INFO):
         manager._convert_samples_to_train_data(samples)
     if not dynamic:
@@ -1280,9 +2012,11 @@ def test_trloo_uses_kernel_failed_scores_only_for_all_failed_group(monkeypatch):
 
     assert [sample.metadata["reward_component"]["failed"] for sample in samples] == [0.0, 0.0, 0.0]
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
     expected_raw_rewards = [-0.5, -0.375, -0.125]
+    assert [sample.reward for sample in samples] == expected_raw_rewards
     assert raw_rewards == expected_raw_rewards
     assert rewards == pytest.approx([-0.25, -0.0625, 0.3125])
     assert [sample.metadata["task_reward"] for sample in samples] == expected_raw_rewards
@@ -1298,6 +2032,7 @@ def test_failed_group_reward_uses_configured_nonzero_failed_score(monkeypatch):
     for sample, kernel_failed_score in zip(samples, kernel_failed_scores, strict=True):
         sample.metadata.update({"multi_turn_reward": -1.0, "kernel_failed_score": kernel_failed_score})
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == pytest.approx([-0.5, -0.375, -0.125])
@@ -1311,6 +2046,7 @@ def test_failed_group_reward_can_be_disabled(monkeypatch):
     for sample, kernel_failed_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
         sample.metadata.update({"multi_turn_reward": 0.0, "kernel_failed_score": kernel_failed_score})
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == [0.0, 0.0, 0.0]
@@ -1328,6 +2064,7 @@ def test_kernel_failed_scores_do_not_change_group_with_nonzero_reward(monkeypatc
     for sample, kernel_failed_score in zip(samples, [-1.0, -0.75, -0.25], strict=True):
         sample.metadata.update({"multi_turn_reward": sample.reward, "kernel_failed_score": kernel_failed_score})
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, _ = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == [0.0, 0.0, 0.5]
@@ -1340,6 +2077,7 @@ def test_all_failed_reward_from_old_dump_without_kernel_failed_scores_is_unchang
     for sample in samples:
         sample.metadata["multi_turn_reward"] = 0.0
 
+    post_process_rollout_rewards(manager.args, samples)
     raw_rewards, rewards = reward_post_process_by_group(manager.args, samples)
 
     assert raw_rewards == [0.0, 0.0, 0.0]
@@ -1553,107 +2291,6 @@ def test_ctm_rejects_non_max_length_or_repeated_response(response_length, tokens
     assert candidate.remove_sample is False
     assert candidate.metadata.get("conditional_truncation_masking_eligible", False) is False
     assert rewards == pytest.approx([0.0])
-
-
-@pytest.mark.parametrize("custom_kernel_hook", [False, True])
-@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
-def test_argmaxrl_aggregate_reward_grouping_turns_padding_and_no_mutation(custom_kernel_hook, estimator):
-    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=True, grpo_std_normalization=True)
-    if custom_kernel_hook:
-        manager.custom_reward_post_process_func = reward_post_process_by_group
-    # Intentionally interleaved prompt/turn groups; ignore configured fixed N=3.
-    samples = [
-        Sample(index=i, group_index=g, reward=r, loss_mask=[1], metadata={"turn_idx": t, "return_reward": 999})
-        for i, g, t, r in [(0, 0, 0, 1), (2, 1, 0, 2), (0, 0, 1, 0), (1, 0, 0, 3), (3, 1, 0, 2), (1, 0, 1, 2)]
-    ]
-    samples += [
-        Sample(index=9, group_index=0, reward=100, remove_sample=True, metadata={"turn_idx": 0}),
-        Sample(index=10, group_index=0, reward=100, loss_mask=[0], metadata={"turn_idx": 0}),
-    ]
-    original = [s.reward for s in samples]
-    raw, advantages = manager._post_process_rewards(samples)
-    assert raw == original
-    expected = [-2, 0, -2, 2, 0, 2, 0, 0] if estimator == "tailrl" else [1, 2, 0, 5, 2, 4, 0, 0]
-    assert advantages == pytest.approx(expected)
-    assert [s.reward for s in samples] == original
-    assert all("raw_task_reward" not in s.metadata for s in samples)
-
-
-@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
-def test_argmaxrl_custom_reward_output_is_used_once(estimator):
-    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
-    calls = []
-
-    def custom(_args, samples):
-        calls.append(len(samples))
-        return [1.0, 2.0], [2.0, 4.0]
-
-    manager.custom_reward_post_process_func = custom
-    samples = [Sample(index=i, group_index=0, reward=r) for i, r in enumerate([1, 2])]
-    raw, advantages = manager._post_process_rewards(samples)
-    assert calls == [2]
-    assert raw == [1, 2]
-    assert advantages == pytest.approx([-2, 2] if estimator == "tailrl" else [2, 6])
-
-
-@pytest.mark.parametrize("baseline", ["history", "anchor", "greedy-anchor"])
-@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
-def test_argmaxrl_rejects_verify_baseline_override(baseline, estimator):
-    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=True)
-    manager.args.verify_advantage_baseline = baseline
-    manager.custom_reward_post_process_func = reward_post_process_by_group
-    sample = Sample(index=0, group_index=0, reward=1, metadata={"role": "verify", "turn_idx": 0})
-    with pytest.raises(ValueError, match="history/anchor"):
-        manager._post_process_rewards([sample])
-
-
-def test_argmaxrl_kernel_offset_ctm_and_raw_reward_preserved():
-    manager = _make_manager(advantage_estimator="argmaxrl", use_multi_turn=False)
-    manager.args.argmaxrl_reward_offset = 1.0
-    manager.args.use_conditional_truncation_mask = True
-    manager.custom_reward_post_process_func = reward_post_process_by_group
-    samples = [Sample(index=i, group_index=0, reward=r, metadata={}) for i, r in enumerate([-1.0, 1.0])]
-    for sample in samples:
-        sample.metadata["conditional_truncation_masked"] = True
-    raw, advantages = manager._post_process_rewards(samples)
-    assert raw == [-1, 1]
-    assert advantages == [0, 4]
-    assert [s.reward for s in samples] == [-1, 1]
-    # Non-truncated samples are ineligible; calling the CTM annotator clears
-    # stale flags rather than preserving a previous selection.
-    assert all("conditional_truncation_masked" not in s.metadata for s in samples)
-
-
-@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
-def test_argmaxrl_train_conversion_and_dp_shards_preserve_complete_group_weights(monkeypatch, estimator):
-    import slime.ray.rollout as rollout_module
-
-    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
-    manager.custom_reward_post_process_func = reward_post_process_by_group
-    manager.custom_convert_samples_to_train_data_func = None
-    manager.args.global_batch_size = 4
-    manager.args.micro_batch_size = 1
-    manager.args.use_dynamic_batch_size = False
-    manager.args.balance_data = False
-    manager.args.balance_by_flops = False
-    manager.train_parallel_config = {
-        "dp_size": 2,
-        "cp_size": 1,
-        "vpp_size": 1,
-        "microbatch_group_size_per_vp_stage": 1,
-    }
-    samples = [
-        Sample(index=i, rollout_id=i, group_index=i // 2, reward=r, tokens=[1, 2], response_length=1)
-        for i, r in enumerate([1.0, 3.0, 2.0, 4.0])
-    ]
-    data = manager._convert_samples_to_train_data(samples)
-    assert data["raw_reward"] == [1, 3, 2, 4]
-    assert data["rewards"] == ([-2, 2, -2, 2] if estimator == "tailrl" else [1, 5, 2, 6])
-    monkeypatch.setattr(rollout_module.ray, "put", lambda data: data)
-    shards = [box.inner for box in manager._split_train_data_by_dp(data)]
-    # Strided DP scheduling puts one candidate from each prompt on each rank.
-    assert shards[0]["rewards"] == ([-2, -2] if estimator == "tailrl" else [1, 2])
-    assert shards[1]["rewards"] == ([2, 2] if estimator == "tailrl" else [5, 6])
 
 
 if __name__ == "__main__":

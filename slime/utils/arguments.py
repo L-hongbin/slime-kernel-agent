@@ -21,6 +21,7 @@ _KERNEL_AGENT_DATA_SOURCE_PATH = "examples.kernel_agent.kernel_agent_data_source
 _DEFAULT_ROLLOUT_FUNCTION_PATH = "slime.rollout.sglang_rollout.generate_rollout"
 _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH = "examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async"
 _KERNEL_AGENT_VERIFY_CAPTURE_HOOK_PATH = "examples.kernel_agent.kernel_agent_data_source.capture_verify_candidates"
+_KERNEL_AGENT_REWARD_ROLLOUT_PATH = "examples.kernel_agent.kernel_reward.generate_rollout"
 
 
 def _validate_rollout_no_progress_args(args) -> None:
@@ -44,6 +45,13 @@ def _validate_difficulty_thresholds_args(args) -> None:
 
 
 def _validate_rollout_reward_post_process_args(args) -> None:
+    expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+    if getattr(args, "custom_reward_post_process_path", None) == expected_path:
+        rollout_path = getattr(args, "rollout_function_path", _DEFAULT_ROLLOUT_FUNCTION_PATH)
+        if rollout_path == _DEFAULT_ROLLOUT_FUNCTION_PATH:
+            args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
+        elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
+            logger.warning("Custom kernel rollout must call post_process_rollout_rewards before group filtering")
     gate = getattr(args, "dynamic_reward_gate", None)
     if gate not in {None, "sqrt", "piecewise", "piecewise-sqrt"}:
         raise ValueError("--dynamic-reward-gate must be sqrt, piecewise, or piecewise-sqrt")
@@ -59,21 +67,51 @@ def _validate_rollout_reward_post_process_args(args) -> None:
         if not 0.0 <= gate_min <= 1.0 <= gate_max:
             raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
     overlong_penalty = getattr(args, "overlong_penalty", None)
-    if overlong_penalty not in {None, "dapo"}:
-        raise ValueError("--overlong-penalty must be None or dapo")
+    if overlong_penalty not in {None, "dapo", "laser-d"}:
+        raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
     if overlong_penalty == "dapo":
         if args.overlong_buffer_len <= 0:
             raise ValueError("overlong-penalty requires --overlong-buffer-len > 0")
         if not math.isfinite(args.overlong_penalty_factor) or args.overlong_penalty_factor < 0:
             raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
+    elif overlong_penalty == "laser-d":
+        _validate_laser_d_args(args)
     if gate is not None or overlong_penalty is not None:
-        expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
         if getattr(args, "custom_reward_post_process_path", None) != expected_path:
             logger.warning(
                 "Rollout reward shaping requires %s or a custom hook calling "
-                "examples.kernel_agent.kernel_reward.post_process_rollout_rewards before advantage estimation.",
+                "examples.kernel_agent.kernel_reward.post_process_rollout_rewards before group filtering.",
                 expected_path,
             )
+
+
+def _validate_laser_d_args(args) -> None:
+    _validate_difficulty_thresholds_args(args)
+    if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
+        raise ValueError("LASER-D requires exactly two --difficulty-thresholds")
+    bonus = getattr(args, "laser_d_length_score", 0.5)
+    if not math.isfinite(bonus) or bonus < 0:
+        raise ValueError("--laser-d-length-score must be finite and >= 0")
+    for name, default in (
+        ("laser_d_min_length", 1024),
+        ("laser_d_length_interval", 1024),
+        ("laser_d_update_interval", 20),
+        ("laser_d_monitor_groups", 500),
+    ):
+        if getattr(args, name, default) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0")
+    if getattr(args, "rollout_max_response_len", 0) < getattr(args, "laser_d_min_length", 1024):
+        raise ValueError("LASER-D requires --rollout-max-response-len >= --laser-d-min-length")
+    if not getattr(args, "rollout_global_dataset", False):
+        raise ValueError("LASER-D requires checkpointable dataset state; remove --disable-rollout-global-dataset")
+    expected_hook = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+    if getattr(args, "custom_reward_post_process_path", None) != expected_hook:
+        raise ValueError(f"LASER-D requires --custom-reward-post-process-path {expected_hook}")
+    rollout_path = getattr(args, "rollout_function_path", _DEFAULT_ROLLOUT_FUNCTION_PATH)
+    if rollout_path == _DEFAULT_ROLLOUT_FUNCTION_PATH:
+        args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
+    elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
+        raise ValueError("LASER-D supports only the default SGLang and kernel-agent fully-async rollout paths")
 
 
 def _parse_verify_data_limit(value: str) -> int | float:
@@ -173,7 +211,7 @@ def _validate_verify_capture_args(args) -> None:
             "A positive --verify-rollout-ratio currently requires --rollout-function-path "
             f"{_KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}"
         )
-    if rollout_function_path != _DEFAULT_ROLLOUT_FUNCTION_PATH:
+    if rollout_function_path not in {_DEFAULT_ROLLOUT_FUNCTION_PATH, _KERNEL_AGENT_REWARD_ROLLOUT_PATH}:
         raise ValueError(
             "Verify capture is supported by the default rollout and kernel-agent fully-async rollout; "
             f"custom rollout function {rollout_function_path!r} must implement capture explicitly"
@@ -2506,12 +2544,43 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--overlong-penalty",
                 type=lambda value: None if value == "None" else value,
-                choices=[None, "dapo"],
+                choices=[None, "dapo", "laser-d"],
                 default=None,
                 help=(
                     "Length penalty method; omitted or None disables it. "
-                    "dapo applies the existing soft linear penalty near the response-length cap."
+                    "dapo applies the existing soft linear penalty near the response-length cap. "
+                    "laser-d adds a bonus to correct responses within an adaptive difficulty-dependent budget."
                 ),
+            )
+            parser.add_argument(
+                "--laser-d-length-score",
+                type=float,
+                default=0.5,
+                help="LASER-D step bonus for correct responses within budget; independent of DAPO's penalty factor.",
+            )
+            parser.add_argument(
+                "--laser-d-min-length",
+                type=int,
+                default=1024,
+                help="LASER-D budget-search lower bound and initial budget, in full response tokens.",
+            )
+            parser.add_argument(
+                "--laser-d-length-interval",
+                type=int,
+                default=1024,
+                help="LASER-D budget-search grid interval; upper bound is --rollout-max-response-len.",
+            )
+            parser.add_argument(
+                "--laser-d-update-interval",
+                type=int,
+                default=20,
+                help="Update LASER-D budgets every N rollout batches after bootstrapping from the first batch.",
+            )
+            parser.add_argument(
+                "--laser-d-monitor-groups",
+                type=int,
+                default=500,
+                help="Bounded reservoir of pre-filter prompt/turn groups per LASER-D monitoring window.",
             )
             parser.add_argument(
                 "--overlong-buffer-len",

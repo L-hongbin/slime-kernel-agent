@@ -260,7 +260,14 @@ def test_overlong_penalty_disabled_by_default_or_explicit_none(method):
 def test_overlong_penalty_rejects_invalid_method(method):
     result = _task_args_result(TASK_MODE="rl", REWARD_MODE="drkernel", OVERLONG_PENALTY=method)
     assert result.returncode == 2
-    assert "OVERLONG_PENALTY must be None or dapo" in result.stderr
+    assert "OVERLONG_PENALTY must be None, dapo, or laser-d" in result.stderr
+
+
+def test_laser_d_selects_method_without_dapo_options():
+    args = _task_args(TASK_MODE="rl", REWARD_MODE="drkernel", OVERLONG_PENALTY="laser-d")
+    assert args[args.index("--overlong-penalty") + 1] == "laser-d"
+    assert "--overlong-buffer-len" not in args
+    assert "--overlong-penalty-factor" not in args
 
 
 def test_entropy_diagnostics_are_explicit_cli_flags():

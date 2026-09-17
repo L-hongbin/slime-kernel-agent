@@ -666,6 +666,8 @@ def capture_verify_candidates(
         return
     if rollout_id is None:
         raise ValueError("verify capture requires the current rollout_id")
+    # The standard SGLang collector receives the bound get_samples callback.
+    data_source = getattr(data_source, "__self__", data_source)
     add_candidates = getattr(data_source, "add_verify_candidates", None)
     save_candidates = getattr(data_source, "save_captured_verify_data", None)
     begin_capture = getattr(data_source, "begin_verify_capture", None)

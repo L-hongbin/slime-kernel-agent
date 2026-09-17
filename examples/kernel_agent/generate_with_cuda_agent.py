@@ -1473,7 +1473,7 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
                 # Freeze the base score before any length or group reward shaping.
                 "raw_task_reward": float(reward_details["raw_task_reward"]),
                 "task_reward": float(reward_details["task_reward"]),
-                "overlong_penalty": float(reward_details["overlong_penalty"]),
+                "length_score": float(reward_details["length_score"]),
                 "overlong_prompt_len": int(reward_details["overlong_prompt_len"]),
                 "overlong_effective_response_cap": int(reward_details["overlong_effective_response_cap"]),
                 "kernel_failed_score": reward_details["kernel_failed_score"],

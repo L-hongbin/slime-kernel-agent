@@ -66,7 +66,7 @@ def _sample(reward, response_length, removed=False, prompt_length=0):
 def test_disabled_by_default():
     sample = _sample(1.0, 16384)
     details = _kernel_reward(_args(False), sample)
-    assert details["overlong_penalty"] == 0.0
+    assert details["length_score"] == 0.0
     assert details["overlong_prompt_len"] == 0
     # Disabled processors do not evaluate length diagnostics.
     assert details["overlong_effective_response_cap"] == 0
@@ -75,7 +75,7 @@ def test_disabled_by_default():
 def test_no_penalty_below_threshold():
     sample = _sample(1.0, 16384 - 2048)
     details = _kernel_reward(_args(True), sample)
-    assert details["overlong_penalty"] == 0.0
+    assert details["length_score"] == 0.0
     assert details["overlong_prompt_len"] == 0
     assert details["overlong_effective_response_cap"] == 16384
 
@@ -84,20 +84,20 @@ def test_linear_ramp_and_cap():
     half = _sample(1.0, 16384 - 1024)
     full = _sample(1.0, 16384)
     over = _sample(0.0, 16384)
-    assert _kernel_reward(_args(True), half)["overlong_penalty"] == pytest.approx(0.5)
-    assert _kernel_reward(_args(True), full)["overlong_penalty"] == pytest.approx(1.0)
-    assert _kernel_reward(_args(True), over)["overlong_penalty"] == pytest.approx(1.0)
+    assert _kernel_reward(_args(True), half)["length_score"] == pytest.approx(-0.5)
+    assert _kernel_reward(_args(True), full)["length_score"] == pytest.approx(-1.0)
+    assert _kernel_reward(_args(True), over)["length_score"] == pytest.approx(-1.0)
 
 
 def test_removed_samples_untouched():
     sample = _sample(1.0, 16384, removed=True)
-    assert _kernel_reward(_args(True), sample)["overlong_penalty"] == 0.0
+    assert _kernel_reward(_args(True), sample)["length_score"] == 0.0
 
 
 def test_custom_factor_and_buffer():
     sample = _sample(2.0, 16384 - 500)
     details = _kernel_reward(_args(True, buffer_len=1000, factor=0.5), sample)
-    assert details["overlong_penalty"] == pytest.approx(0.25)
+    assert details["length_score"] == pytest.approx(-0.25)
 
 
 def test_penalty_is_independent_of_task_reward():
@@ -105,9 +105,9 @@ def test_penalty_is_independent_of_task_reward():
     fail_long = _sample(0.0, 16384)
     success_long = _sample(1.0, 16384)
 
-    assert _kernel_reward(_args(True), fail_short)["overlong_penalty"] == 0.0
-    assert _kernel_reward(_args(True), fail_long)["overlong_penalty"] == pytest.approx(1.0)
-    assert _kernel_reward(_args(True), success_long)["overlong_penalty"] == pytest.approx(1.0)
+    assert _kernel_reward(_args(True), fail_short)["length_score"] == 0.0
+    assert _kernel_reward(_args(True), fail_long)["length_score"] == pytest.approx(-1.0)
+    assert _kernel_reward(_args(True), success_long)["length_score"] == pytest.approx(-1.0)
 
 
 def test_reviewed_24k_policy_uses_effective_response_cap_after_prompt():
@@ -139,7 +139,7 @@ def test_reviewed_24k_policy_uses_effective_response_cap_after_prompt():
     )
 
     for details in (partial_details, correct_details):
-        assert details["overlong_penalty"] == pytest.approx(0.2)
+        assert details["length_score"] == pytest.approx(-0.2)
         assert details["overlong_prompt_len"] == 4096
         assert details["overlong_effective_response_cap"] == 20480
 

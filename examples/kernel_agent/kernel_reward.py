@@ -115,7 +115,7 @@ _REWARD_COMPONENT_KEYS = (
     "performance",
     "coverage",
     "failed",
-    "overlong_penalty",
+    "length",
 )
 _KERNEL_SCORE_KEYS = ("correctness", "performance", "coverage")
 
@@ -243,9 +243,8 @@ def _apply_dynamic_group_reward_weights(
         correctness_score, performance_score, coverage_score = (float(kernel_score[key]) for key in _KERNEL_SCORE_KEYS)
         correctness_reward = float(components["correctness"])
         failed_reward = components["failed"]
-        overlong_penalty_score = components["overlong_penalty"]
+        length_score = float(components["length"])
         failed_reward = None if failed_reward is None else float(failed_reward)
-        overlong_penalty_score = float(overlong_penalty_score)
 
         dynamic_reward = failed_reward
         base_performance_reward = float(components["performance"])
@@ -264,6 +263,7 @@ def _apply_dynamic_group_reward_weights(
             components["coverage"] = coverage_reward
             dynamic_reward = correctness_reward + performance_reward + coverage_reward
         metadata["task_reward"] = dynamic_reward
+        metadata["length_score"] = length_score
         if record_metrics:
             # Compare against the ungated contribution, not an earlier filter
             # preview or a previous invocation of reward post-processing.
@@ -271,7 +271,7 @@ def _apply_dynamic_group_reward_weights(
                 "gate": gate,
                 "performance_reward_delta": float(components["performance"]) - base_performance_reward,
             }
-        dynamic_rewards.append(dynamic_reward + overlong_penalty_score)
+        dynamic_rewards.append(dynamic_reward + length_score)
     return dynamic_rewards
 
 
@@ -294,10 +294,10 @@ def _apply_overlong_penalty(args, sample, metadata: dict[str, Any]) -> float:
         exceed = response_len - (effective_cap - window)
         penalty = factor * min(1.0, max(0, exceed) / window)
 
-    metadata["overlong_penalty"] = penalty
+    metadata["length_score"] = -penalty
     metadata["overlong_prompt_len"] = prompt_len
     metadata["overlong_effective_response_cap"] = effective_cap
-    metadata["reward_component"]["overlong_penalty"] = -penalty
+    metadata["reward_component"]["length"] = -penalty
     return float(metadata["task_reward"]) - penalty
 
 
@@ -305,8 +305,8 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
     """Shape and write back single-turn rewards; never compute returns or advantages.
 
     The sample stage applies length shaping before verify utility assignment and
-    history capture. The rollout stage also applies dynamic weights using complete
-    same-prompt/same-turn statistics, skipping settled verify trajectories.
+    history capture. The rollout stage settles dynamic weights, length shaping,
+    and failure-stage fallback before filtering complete prompt/turn groups.
     Reapplication is idempotent; removed samples are always untouched.
     """
     if stage not in {"sample", "rollout"}:
@@ -317,24 +317,32 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
                 sample.metadata.pop("dynamic_reward", None)
     config = CUDA_AGENT_CONFIGS["reward"]
     dynamic_weight = stage == "rollout" and getattr(args, "dynamic_reward_gate", None) is not None
+    failed_group_reward = stage == "rollout" and bool(config["apply_failed_group_reward"])
     overlong_penalty = getattr(args, "overlong_penalty", None)
-    if overlong_penalty not in {None, "dapo"}:
-        raise ValueError("--overlong-penalty must be None or dapo")
+    if overlong_penalty not in {None, "dapo", "laser-d"}:
+        raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
     reward_key = getattr(args, "reward_key", None)
     rewards = [float(sample.reward[reward_key] if reward_key else sample.reward) for sample in samples]
-    if not dynamic_weight and overlong_penalty is None:
+    if not dynamic_weight and not failed_group_reward and overlong_penalty is None:
         return rewards
 
     reward_groups: dict[object, list[int]] = {}
+    eligible_indices = []
     for idx, sample in enumerate(samples):
         metadata = sample.metadata or {}
         if (
             sample.remove_sample
-            or metadata.get("role") == "verify"
-            or (stage == "rollout" and metadata.get("verify_trajectory", False))
+            or sample.status == sample.Status.ABORTED
+            or metadata.get("role", "kernel") != "kernel"
+            or metadata.get("is_pad_turn")
+            or (
+                stage == "rollout"
+                and (metadata.get("verify_trajectory") or metadata.get("verify_scoring_branch") == "anchor")
+            )
         ):
             continue
-        if dynamic_weight:
+        eligible_indices.append(idx)
+        if dynamic_weight or failed_group_reward:
             group_key: object = sample.group_index
             if getattr(args, "use_multi_turn", False):
                 turn_idx = metadata.get("turn_idx")
@@ -343,6 +351,8 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             reward_groups.setdefault(group_key, []).append(idx)
 
     for group_indices in reward_groups.values():
+        if not dynamic_weight:
+            continue
         group_samples = [samples[idx] for idx in group_indices]
         group_values = _apply_dynamic_group_reward_weights(
             group_samples,
@@ -354,53 +364,58 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
         for idx, reward in zip(group_indices, group_values, strict=True):
             rewards[idx] = reward
 
-    for idx, sample in enumerate(samples):
+    for idx in eligible_indices:
+        sample = samples[idx]
         metadata = sample.metadata or {}
-        if (
-            sample.remove_sample
-            or metadata.get("role") == "verify"
-            or (stage == "rollout" and metadata.get("verify_trajectory", False))
-        ):
-            continue
         if overlong_penalty == "dapo":
             if "reward_component" not in metadata or "task_reward" not in metadata:
                 raise ValueError("overlong-penalty requires kernel task_reward and reward_component metadata")
             rewards[idx] = _apply_overlong_penalty(args, sample, metadata)
+        elif overlong_penalty == "laser-d":
+            if (
+                sample.status not in {sample.Status.COMPLETED, sample.Status.TRUNCATED}
+                or metadata.get("role", "kernel") != "kernel"
+                or metadata.get("is_pad_turn")
+                or metadata.get("verify_trajectory")
+                or metadata.get("verify_scoring_branch") == "anchor"
+            ):
+                continue
+            record = metadata.get("laser_d")
+            if not isinstance(record, dict):
+                if stage == "sample":
+                    # Individual generation does not yet know the complete group's difficulty.
+                    continue
+                raise ValueError("LASER-D requires a budget snapshot from the pre-filter rollout collector")
+            bonus = (
+                float(getattr(args, "laser_d_length_score", 0.5))
+                if _sample_is_correct(sample) and sample.response_length <= record["budget"]
+                else 0.0
+            )
+            metadata["reward_component"]["length"] = bonus
+            metadata["length_score"] = bonus
+            record["length_score"] = bonus
+            rewards[idx] = float(metadata["task_reward"]) + bonus
+
+    if failed_group_reward:
+        for group_indices in reward_groups.values():
+            group_values = _apply_failed_group_reward(
+                args,
+                [samples[idx] for idx in group_indices],
+                [rewards[idx] for idx in group_indices],
+                float(config["failed_score"]),
+                float(config["init_correct_weight"]),
+            )
+            for idx, reward in zip(group_indices, group_values, strict=True):
+                rewards[idx] = reward
+
+    for idx in eligible_indices:
+        sample = samples[idx]
         # Keep dictionary-valued rewards and their unrelated fields intact.
         if reward_key:
             sample.reward = {**sample.reward, reward_key: rewards[idx]}
         else:
             sample.reward = rewards[idx]
     return rewards
-
-
-def _compute_trajectory_returns(args, samples, turn_rewards: list[float]) -> list[float]:
-    """Accumulate shaped turn rewards without overwriting sample.reward."""
-    if not getattr(args, "use_multi_turn", False):
-        return turn_rewards
-
-    gamma = float(getattr(args, "multi_turn_gamma", 1.0))
-    trajectory_groups: dict[tuple[object, object], list[int]] = {}
-    for idx, sample in enumerate(samples):
-        metadata = sample.metadata or {}
-        if metadata.get("role") == "verify" or metadata.get("verify_trajectory", False):
-            # Paired verify/kernel turns keep their assigned utility, not future returns.
-            continue
-        trajectory_id = sample.rollout_id if sample.rollout_id is not None else sample.index
-        trajectory_groups.setdefault((sample.group_index, trajectory_id), []).append(idx)
-
-    raw_rewards = list(turn_rewards)
-    for trajectory_indices in trajectory_groups.values():
-        trajectory_indices.sort(
-            key=lambda idx: int(samples[idx].metadata.get("turn_idx", 0)),
-            reverse=True,
-        )
-        cumulative_reward = 0.0
-        for idx in trajectory_indices:
-            turn_reward = 0.0 if samples[idx].remove_sample else turn_rewards[idx]
-            cumulative_reward = turn_reward + gamma * cumulative_reward
-            raw_rewards[idx] = cumulative_reward
-    return raw_rewards
 
 
 def _annotate_conditional_truncation_mask(args, sample) -> None:
@@ -538,16 +553,47 @@ def reward_post_process_by_group(args, samples):
         for sample in samples
     ):
         raise ValueError("shared anchor rewards must be settled by the group rollout before training")
-    reward_config = CUDA_AGENT_CONFIGS["reward"]
-    raw_rewards = post_process_rollout_rewards(args, samples)
-    if args.advantage_estimator == "trloo":
-        if (
-            getattr(args, "dynamic_reward_gate", None) is not None
-            or getattr(args, "overlong_penalty", None) is not None
-        ):
-            raw_rewards = _compute_trajectory_returns(args, samples, raw_rewards)
-        else:
-            raw_rewards = [sample.metadata["multi_turn_reward"] for sample in samples]
+    # Collectors have settled and written rewards before filtering. Never
+    # recompute shaping from a filtered subset at the training boundary.
+    raw_rewards = [float(sample.get_reward_value(args)) for sample in samples]
+    if args.advantage_estimator in {"argmaxrl", "tailrl"}:
+        for sample in samples:
+            metadata = sample.metadata or {}
+            if (
+                not sample.remove_sample
+                and metadata.get("role") == "verify"
+                and (
+                    metadata.get("verify_reward_mode") == "anchor"
+                    or getattr(args, "verify_advantage_baseline", "group") != "group"
+                )
+            ):
+                raise ValueError(
+                    "ArgMaxRL/TailRL cannot replace verify history/anchor advantage baselines; use group mode"
+                )
+            if getattr(args, "use_conditional_truncation_mask", False):
+                _annotate_conditional_truncation_mask(args, sample)
+        # RolloutManager computes complete-group ArgMaxRL/TailRL advantages before DP
+        # partitioning. Preserve the settled aggregate reward, without centering,
+        # std normalization, or TRLOO future-return folding.
+        return raw_rewards, raw_rewards
+    if args.advantage_estimator == "trloo" and getattr(args, "use_multi_turn", False):
+        for idx, sample in enumerate(samples):
+            metadata = sample.metadata or {}
+            if (
+                sample.remove_sample
+                or metadata.get("role") == "verify"
+                or metadata.get("verify_trajectory")
+                or metadata.get("verify_scoring_branch") == "anchor"
+            ):
+                continue
+            if "return_reward" not in metadata:
+                raise ValueError(
+                    "TRLOO requires metadata['return_reward'] computed from the complete trajectory "
+                    "before reward post-processing; regenerate legacy rollout data missing this field"
+                )
+            # Only the current turn uses shaped reward; future credit was frozen
+            # from original task_reward before dynamic weighting/failure fallback.
+            raw_rewards[idx] += float(metadata["return_reward"])
     rewards = [None] * len(raw_rewards)
     use_conditional_truncation_mask = getattr(args, "use_conditional_truncation_mask", False)
 
@@ -563,14 +609,6 @@ def reward_post_process_by_group(args, samples):
         metadata = sample.metadata or {}
         history_baseline = getattr(args, "verify_advantage_baseline", "group") == "history"
         anchor_baseline = metadata.get("verify_reward_mode") == "anchor"
-        if (
-            args.advantage_estimator in {"argmaxrl", "tailrl"}
-            and metadata.get("role") == "verify"
-            and (anchor_baseline or getattr(args, "verify_advantage_baseline", "group") != "group")
-        ):
-            raise ValueError(
-                "ArgMaxRL/TailRL cannot replace verify history/anchor advantage baselines; use group mode"
-            )
         if metadata.get("role") == "verify" and (anchor_baseline or history_baseline):
             if anchor_baseline and history_baseline:
                 raise ValueError("history advantage baseline cannot be applied to anchor-scored samples")
@@ -590,24 +628,10 @@ def reward_post_process_by_group(args, samples):
         reward_groups.setdefault(group_index, []).append(idx)
 
     group_stats: dict[object, dict[str, float]] = {}
-    apply_failed_group_reward = bool(reward_config["apply_failed_group_reward"])
-    failed_score = float(reward_config["failed_score"])
     for group_index, group_indices in reward_groups.items():
         group_samples = [samples[idx] for idx in group_indices]
         annotate_group_difficulty(group_samples)
         group_reward_values = [raw_rewards[idx] for idx in group_indices]
-        if apply_failed_group_reward and not any(
-            (sample.metadata or {}).get("role") == "verify" or (sample.metadata or {}).get("verify_trajectory", False)
-            for sample in group_samples
-        ):
-            group_reward_values = _apply_failed_group_reward(
-                group_samples,
-                group_reward_values,
-                failed_score,
-                float(reward_config["init_correct_weight"]),
-            )
-        for idx, reward in zip(group_indices, group_reward_values, strict=True):
-            raw_rewards[idx] = reward
         group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
         group_stats[group_index] = {
             "mean": group_rewards.mean().item(),
@@ -621,7 +645,7 @@ def reward_post_process_by_group(args, samples):
 
         group_index = idx_to_group_index[idx]
         stats = group_stats[group_index]
-        reward = raw_reward if args.advantage_estimator in {"argmaxrl", "tailrl"} else raw_reward - stats["mean"]
+        reward = raw_reward - stats["mean"]
 
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
             reward = reward / (stats["std"] + 1e-6)
@@ -642,16 +666,34 @@ def reward_post_process_by_group(args, samples):
     return raw_rewards, rewards
 
 
+def get_kernel_group_filter_rewards(args, samples, rewards) -> list[float]:
+    """Shared reward basis for failure-group detection and read-only filtering."""
+    if getattr(args, "overlong_penalty", None) == "laser-d":
+        return [float(reward) for reward in rewards]
+    return [
+        float(sample.metadata.get("task_reward", reward) if isinstance(sample.metadata, dict) else reward)
+        for sample, reward in zip(samples, rewards, strict=True)
+    ]
+
+
 def _apply_failed_group_reward(
+    args,
     samples,
     rewards,
     failed_score: float,
     init_correct_weight: float,
 ) -> list[float]:
-    """Use saved kernel failure scores when every group reward equals the failure score."""
+    """Replace default-scored all-failed groups before filtering.
+
+    Detection uses the filter's reward basis, requiring exact equality to the
+    weighted default failure score. DAPO penalties are retained, but not tested.
+    """
     rewards = [float(reward) for reward in rewards]
+    if not rewards or any(_sample_is_correct(sample) for sample in samples):
+        return rewards
+    filter_rewards = get_kernel_group_filter_rewards(args, samples, rewards)
     default_failed_reward = failed_score * init_correct_weight
-    if not rewards or any(reward != default_failed_reward for reward in rewards):
+    if any(reward != default_failed_reward for reward in filter_rewards):
         return rewards
 
     metadata = [sample.metadata if isinstance(sample.metadata, dict) else {} for sample in samples]
@@ -660,11 +702,50 @@ def _apply_failed_group_reward(
 
     failed_rewards = [float(item["kernel_failed_score"]) * init_correct_weight for item in metadata]
     for item, failed_reward in zip(metadata, failed_rewards, strict=True):
-        components = item.get("reward_component")
-        if isinstance(components, dict):
-            components["failed"] = failed_reward
+        components = item.setdefault("reward_component", {})
+        # Replace only task contributions; retain length shaping and frozen future credit.
+        for key in components:
+            if key not in {"length", "return_reward"}:
+                components[key] = 0.0
+        components["failed"] = failed_reward
         item["task_reward"] = failed_reward
-    return failed_rewards
+        item["failed_group_reward"] = True
+    return [
+        failed_reward + (reward - filter_reward)
+        for failed_reward, reward, filter_reward in zip(failed_rewards, rewards, filter_rewards, strict=True)
+    ]
+
+
+def generate_rollout(args, rollout_id, data_source, evaluation=False):
+    """Kernel reward settlement before the standard SGLang group filter."""
+    from slime.rollout.sglang_rollout import generate_rollout as default_generate_rollout
+    from slime.rollout.sglang_rollout import generate_rollout_async
+    from slime.utils.async_utils import run
+
+    from .length_reward import LaserDBudgetController
+
+    if evaluation:
+        return default_generate_rollout(args, rollout_id, data_source, evaluation=True)
+    controller = (
+        LaserDBudgetController(args, data_source, rollout_id)
+        if getattr(args, "overlong_penalty", None) == "laser-d"
+        else None
+    )
+
+    def process_group(group):
+        annotate_group_difficulty(group)
+        if controller is not None:
+            controller.observe(group)
+        post_process_rollout_rewards(args, group)
+
+    output, aborted = run(
+        generate_rollout_async(args, rollout_id, data_source.get_samples, on_group_completed=process_group)
+    )
+    if aborted:
+        data_source.add_samples(aborted)
+    if controller is not None:
+        output.metrics = {**(output.metrics or {}), **controller.finish()}
+    return output
 
 
 def _resolve_kernel_failed_score(env_state: dict[str, Any], config: dict[str, Any]) -> tuple[float, str]:
@@ -827,7 +908,7 @@ def calculate_kernel_reward(
         "reward": task_reward,
         "raw_task_reward": task_reward,
         "task_reward": task_reward,
-        "overlong_penalty": 0.0,
+        "length_score": 0.0,
         "overlong_prompt_len": 0,
         "overlong_effective_response_cap": 0,
         "speedup": speedup,
@@ -848,7 +929,7 @@ def calculate_kernel_reward(
             "performance": performance_reward,
             "coverage": coverage_reward,
             "failed": failed_reward,
-            "overlong_penalty": 0.0,
+            "length": 0.0,
         },
         "speedup_log_standard_error": speedup_log_standard_error,
         **coverage_info,

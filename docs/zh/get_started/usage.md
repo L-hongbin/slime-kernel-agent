@@ -335,7 +335,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤预计算与最终 reward 后处理使用相同计算。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
+`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤和训练读取同一份已结算 reward，不再各自重算 gate。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
 
 对走常规分量评分路径的样本，奖励按以下方式组合：
 
@@ -343,7 +343,7 @@ else:
 performance_reward = 未调权的 performance_reward * gate
 coverage_reward    = 未调权的 coverage_reward * gate
 task_reward        = correctness_reward + performance_reward + coverage_reward
-sample.reward      = task_reward - overlong_penalty  # 开启长度惩罚时。
+sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正，未启用时为 0。
 ```
 
 原有 correctness 条件及 coverage 开关仍然生效；显式失败评分分支保持其失败 reward，不会因全错 group 的 gate 为正就获得正奖励。speedup 影响基础 performance 评分，不参与 gate 的计算。
@@ -376,9 +376,19 @@ sample.reward      = task_reward - overlong_penalty  # 开启长度惩罚时。
 
 这里借鉴 [Coda 的难度阈值 gate](https://arxiv.org/html/2603.08659v1#S3)，**不是其长度奖励**：困难 kernel group 降低 performance/coverage 激励，简单 group 提高激励。不引入 token 长度 bonus，verify 轨迹仍不参与动态调权。
 
-`kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，其中 `overlong_penalty` 为负数。`task_reward` 不含长度惩罚，`sample.reward` 包含长度惩罚。再次执行从评分/分量重建，避免重复扣分；TRLOO 在这之后累计 return，不覆盖单 turn reward。
+`kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，长度贡献记为 `length`：DAPO 惩罚为负数，LASER-D bonus 为正数，未启用或未触发时为 0。组件指标统一为 `reward/component/length`，不再分别记录 `overlong_penalty` 和 `length_bonus` 组件。顶层 `metadata.length_score` 使用相同有符号值，相关指标为 `kernel/length_score/mean` 和 `exp/rollout/reward/length_score/*`；现有 CLI 参数不变。`task_reward` 不含长度奖惩，`sample.reward` 包含长度奖惩。再次执行从评分/分量重建，避免重复扣分。
 
-`calculate_kernel_reward()` 只计算基础评分。评分后，`reward_func` 调用 `post_process_rollout_rewards(..., stage="sample")` 应用长度惩罚，保证 verify、anchor 和历史 baseline 的奖励口径不变；动态加权留到默认的 `stage="rollout"` 执行。rollout 后处理跳过已经结算的 verify 轨迹和移除样本，不对 verify 动态加权。此次没有移动过滤、verify 数据捕捉、日志或落盘时机，因此在训练后处理之前产生的记录不包含后续动态加权结果。两项均未启用时也不影响独立的失败评分或 CTM。
+TRLOO 在完整轨迹收尾时、group reward 后处理和过滤之前，用原始 `task_reward` 固定未来折算项 `metadata.return_reward`：`gamma * 原始task_reward[t+1] + gamma² * 原始task_reward[t+2] + ...`。该项不含动态调权、失败组替换或长度奖惩；收尾时已标记移除的 turn 贡献为零。训练时只计算 `return[t] = 当前sample.reward + return_reward[t]`，所以当前 turn 保留全部后处理效果，未来 turn 不携带这些调整。之后的 group 过滤不会重算或删除已固定的未来贡献，单 turn reward 不被 return 覆盖。verify/anchor 仍保持已分配的 utility，不做跨 turn 累计。旧 rollout dump 若缺少此字段，需重新生成，不能直接用可能包含后处理结果的旧 `multi_turn_reward` 代替。
+
+TRLOO 同时把固定的未来折算项记录到 `metadata.reward_component.return_reward`，用于观测。该组件不计入 `sample.reward`；对有效普通 TRLOO 样本，全部组件求和现在包含未来贡献，对应减 baseline 前的 return。动态调权和失败组替换均保留该项。所有支持的奖励组件（`correctness`、`performance`、`coverage`、`failed`、`length`、`return_reward`）均作为常规指标记录到 `rollout/reward/component/{字段}/{mean,min,max}`，无需 `--log-exp-metrics`；开启 `--use-tensorboard` 即可写入 TensorBoard。padding、缺失值和非有限值不进入组件统计，旧的 `exp/rollout/reward/component/*` 指标不再输出。
+
+`metadata.raw_task_reward` 保存按配置基础权重计算的原始单 turn 任务奖励，不含动态调权、失败组替换和长度奖惩。基础评分时写入，后续 reward 后处理不覆盖；它与可变的 `task_reward` 分开，可作为后续历史统计的数据源。TRLOO 的未来折算优先读取此字段；缺少字段的旧样本，在后处理前的轨迹收尾阶段仍回退到 `task_reward`，再回退到单 turn reward。该字段不是额外可加的 reward component。Verify 捕捉时，用同题、同轮完整有效 group（含成功样本）的 `avg(raw_task_reward)` 写入 `metadata.history_baseline`，再筛选失败样本。旧 verify 数据缺少该 baseline 时，回退到源 group 正确率 × 配置的 correctness 权重，不对已保存的失败子集重新求均值。History 模式使用 `R2 - history_baseline`，后续 verify 各轮复用同一固定值。
+
+`calculate_kernel_reward()` 只计算基础评分。普通 kernel 的处理顺序为：基础评分 → 完整 prompt/turn group 的 reward 后处理（动态调权 → 长度奖励/惩罚 → 失败组替换）→ 写回 `sample.reward` 和 `metadata.reward_component` → group 过滤 → return/advantage。默认 SGLang rollout 在配置 kernel reward hook 时自动接入 `examples.kernel_agent.kernel_reward.generate_rollout`；fully-async collector 在取出完整 group 后、过滤前执行相同后处理。
+
+开启 `apply_failed_group_reward` 时，先按过滤器相同的奖励口径判断：有效样本全部 failed，且每个分数都精确等于默认失败分 `failed_score * init_correct_weight`，才尝试用各样本的 `kernel_failed_score * init_correct_weight` 替换基础奖励。失败组判定不使用方差阈值。普通模式的判定使用 `task_reward`，不计入 DAPO 长度惩罚；LASER-D 使用含 bonus 的 reward（失败样本无 bonus）。缺少任一样本的失败阶段分则保持原值。替换同步更新 `task_reward`、`sample.reward` 和组件贡献，保留长度惩罚且不重复扣分；随后只执行一次正式过滤，再计算 return。替换后仍低方差或样本数不足的组不会被强制放行。
+
+过滤器只读已结算结果：LASER-D 使用包含长度 bonus 的 `sample.reward`；其它模式优先使用 `metadata.task_reward`，字段不存在时才回退到 `sample.reward`。训练侧的 `reward_post_process_by_group` 不再调权或加减分，只从写回的单 turn reward 计算 return/advantage，避免过滤后重算 gate。单样本阶段仍提前应用 DAPO，供 verify/anchor utility 使用；完整 group 后处理跳过已结算的 verify 轨迹、anchor 和无效样本，不改写已捕捉的 verify 历史副本。新捕捉的数据来自后处理后的 kernel 结果。两项长度/调权开关均未启用也不影响独立的失败评分或 CTM。
 
 开启动态调权时，训练数据转换在最终 reward 后处理结束后，单独输出 `reward post-process` 日志，并通过现有 TensorBoard/W&B 通道记录 `rollout/dynamic_reward/*` scalar；不需要额外开启 `--log-exp-metrics`。关闭动态调权，或本批没有符合条件的样本时，不输出这些指标：
 
@@ -387,7 +397,51 @@ sample.reward      = task_reward - overlong_penalty  # 开启长度惩罚时。
 - `performance_reward_delta_mean/min/max/p25/p50/p75`：逐样本统计“调权后的 performance 贡献 − 未调权时的贡献”，不是实测 speedup 或总 reward 的差值；未发生变化的有效样本计为零。
 - `group_count`、`sample_count`：统计分母；排除 verify 轨迹、anchor、remove、aborted 和 pad 样本。
 
-最终逐样本记录保存在 `metadata.dynamic_reward`。过滤预计算不生成这些记录；重复后处理始终相对未调权基准计算差值。原有提前执行的 rollout 日志和落盘时机保持不变。
+最终逐样本记录保存在 `metadata.dynamic_reward`，在过滤前生成；训练数据转换只汇总保留样本的记录。重复后处理始终相对未调权基准计算差值。单样本生成阶段的早期日志仍可能早于完整 group 调权。
+
+#### LASER-D 自适应长度奖励
+
+`--overlong-penalty` 可选 `None`（默认关闭）、`dapo`（现有线性扣分）、`laser-d`。LASER-D 在这个统一入口下是**加分**：正确且完整 response token 数不超过预算时，加一个固定 bonus；错误或超预算不加分，也不额外扣分。不改变生成长度上限，不往 prompt 注入预算，不加入 speedup 系数。参见[论文 Table 2 / 第 5 节](https://arxiv.org/html/2505.15612v1#S5)和[官方奖励实现](https://github.com/hkust-nlp/Laser/blob/main/verl/utils/reward_score/length_penalty.py)。
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--overlong-penalty laser-d \
+--laser-d-length-score 0.5 \
+--laser-d-min-length 1024 \
+--laser-d-length-interval 1024 \
+--laser-d-update-interval 20 \
+--laser-d-monitor-groups 500
+```
+
+上面是各参数默认值；预算搜索上限直接取 `--rollout-max-response-len`，下限不得超过上限。DAPO 的 `--overlong-buffer-len`、`--overlong-penalty-factor`、`--overlong-use-effective-response-cap` 不参与 LASER-D。`--dynamic-reward-gate` 仍独立控制 performance/coverage 权重，不缩放长度 bonus。
+
+按同题、同 turn 的有效样本计算正确率 `s`，复用 `--difficulty-thresholds`（必须恰好两个，默认 `1/3 2/3`）：`s < h` 为 hard，`h <= s < e` 为 medium，`s >= e` 为 easy。监测和奖励使用同一套边界。移除、aborted、pad、verify/anchor 轨迹不参与监测或 LASER-D 加分。
+
+预算计算（普通文本公式）：
+
+```text
+K = 当前有效 group size
+C_min = 此难度桶在 K 下可达到的最小正整数正确数
+        默认阈值、K=8:  hard=1, medium=3, easy=6
+        默认阈值、K=16: hard=1, medium=6, easy=11
+coverage_g(L) = group g 中 response_length <= L 的比例（包含错误回答）
+ECR_bucket(L) = mean_g[C_min(g) * coverage_g(L)]
+B_bucket = 网格中使 ECR >= 1 的最小 L
+           缺少观测或未找到时使用 response 上限
+reward = task_reward + bonus * I(correct and response_length <= B_bucket)
+```
+
+固定 K 时等价于论文的 `C_min * coverage`；多轮导致 K 不等时，按 group 等权平均其估计值。网格总是包含上限，即使上限不能整除步长。ECR 是长度覆盖代理，不保证实际保留下来的回答一定正确。本实现采用论文中的最小可达正确数，而非官方代码可选的 `floor` 近似。
+
+**与论文的区别及异步语义：**按当前训练方案，不新增独立 monitoring rollout，而是复用动态过滤前的训练 group。一个有界 reservoir 在更新窗口中最多保留 `monitor-groups` 个 prompt/turn group 的长度列表，不保存 response 文本；被动态过滤的组也参与，warm queue 中尚未取出的组不提前统计。多轮每个 turn 是一次观测。初始各桶预算为 `min-length`；首个有监测数据的 rollout 完成后更新一次，之后每隔 `update-interval` 个 rollout 批次更新，**不是 actor optimizer step**。窗口更新后清空监测池。
+
+每批 collector 固定使用进入该批时的预算快照，打标后才过滤；本批监测只更新后续批次的预算。加分通过现有 `post_process_rollout_rewards` 写回，`reward_component.length` 记录正贡献，`task_reward` 不包含它。重复后处理不重复加分；TRLOO 仅在当前 turn 保留该 bonus，不计入未来折算项。verify/anchor 不加分，已有历史 reward 不改写。
+
+LASER-D 的低方差过滤使用包含 bonus 的 reward，保留“全部正确，但短回答有加分”的有效组；DAPO 仍按原来的 pre-penalty `task_reward` 过滤。
+
+普通 SGLang rollout 在参数校验时自动接入 LASER-D collector；kernel-agent fully-async 直接支持。要求保持默认启用的数据源管理（不要传 `--disable-rollout-global-dataset`），并使用上面的 reward hook；其它自定义 rollout 会启动报错，防止静默漏接。预算、监测池、更新位置、reservoir RNG 状态随数据源 `metadata["laser_d"]` 保存在现有 `rollout/global_dataset_state_dict_<rollout_id>.pt` 中；用对应 checkpoint 恢复即可，预算/监测参数不匹配会报错。没有完成的批次不会提交新的预算状态。
+
+TensorBoard/W&B 沿用现有通道：`rollout/laser_d/{hard,medium,easy}/budget_used`、`budget_next`、`budget_updated`、`observed_groups`、`monitor_groups_retained/seen` 记录收集/更新；最终训练样本记录 `length_score_mean`、`bonus_fraction`、`sample_count` 及各桶 `budget_mean`/`sample_count`。逐样本预算和 bonus 在 `metadata.laser_d`。这些指标不需要 `--log-exp-metrics`。
 
 #### GRPO 算法
 

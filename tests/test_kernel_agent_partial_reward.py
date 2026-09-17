@@ -362,7 +362,7 @@ def test_kernel_and_overlong_penalties_are_recorded_separately():
     assert reward == pytest.approx(-1.375)
     assert sample.reward == pytest.approx(reward)
     assert details["reward_component"]["failed"] == pytest.approx(-0.375)
-    assert details["reward_component"]["overlong_penalty"] == pytest.approx(-1.0)
+    assert details["reward_component"]["length"] == pytest.approx(-1.0)
 
 
 def test_calculate_kernel_reward_rejects_conflicting_penalty_modes():
@@ -405,7 +405,7 @@ def test_reward_component_sums_to_reward(env_state):
     assert details["task_reward"] == pytest.approx(details["reward"])
     assert details["raw_task_reward"] == pytest.approx(details["reward"])
     assert "raw_task_reward" not in details["reward_component"]
-    assert details["overlong_penalty"] == 0.0
+    assert details["length_score"] == 0.0
     assert details["overlong_prompt_len"] == 0
     assert details["overlong_effective_response_cap"] == 0
     assert "score" not in details
@@ -591,7 +591,7 @@ def test_reward_func_records_fail_score_metadata(monkeypatch):
         "performance": 0.0,
         "coverage": 0.0,
         "failed": 0.125,
-        "overlong_penalty": 0.0,
+        "length": 0.0,
     }
     assert sample.metadata["env_extra_info"]["kernel_failed_score_tag"] == "output_mismatch"
     assert "failure_stage" not in sample.metadata
@@ -643,7 +643,7 @@ def test_kernel_failed_score_tag_metrics_count_each_failure_category():
         reward=0.25,
         metadata={
             "kernel_failed_score_tag": "output_mismatch",
-            "overlong_penalty": 0.1,
+            "length_score": -0.1,
             "env_extra_info": {
                 "correctness": False,
                 "compilation": True,
@@ -676,7 +676,7 @@ def test_kernel_failed_score_tag_metrics_count_each_failure_category():
     assert metrics["kernel/failed_score_tag/decoy_count"] == 1
     assert metrics["kernel/failed_score_tag/runtime_count"] == 1
     assert metrics["kernel/failed_score_tag/compilation_count"] == 1
-    assert metrics["kernel/overlong_penalty/mean"] == pytest.approx(0.1)
+    assert metrics["kernel/length_score/mean"] == pytest.approx(-0.1)
     assert "env_extra_info/kernel_failed_score_tag/mean" not in metrics
     assert metrics["env_extra_info/speedup_log_standard_error/mean"] == pytest.approx(0.0125)
     assert not any("reward_component" in key for key in metrics)
@@ -763,7 +763,7 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
     assert [sample.metadata["raw_task_reward"] for sample in samples] == pytest.approx([-0.375, 0.125, 0.625])
     assert samples[1].reward == pytest.approx(-0.075)
     assert samples[1].metadata["reward_component"]["failed"] == pytest.approx(0.125)
-    assert samples[1].metadata["reward_component"]["overlong_penalty"] == pytest.approx(-0.2)
+    assert samples[1].metadata["reward_component"]["length"] == pytest.approx(-0.2)
     assert sum(
         value for value in samples[1].metadata["reward_component"].values() if value is not None
     ) == pytest.approx(samples[1].reward)
@@ -791,6 +791,8 @@ def test_qwen_reward_length_filter_chain_uses_task_reward_and_keeps_correct_cove
 
 @pytest.mark.parametrize("failed_score", [0.0, -2.0])
 def test_low_variance_filter_uses_scores_for_all_failed_group(monkeypatch, failed_score):
+    from examples.kernel_agent.kernel_reward import post_process_rollout_rewards
+
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", failed_score)
     args = SimpleNamespace(
@@ -810,9 +812,11 @@ def test_low_variance_filter_uses_scores_for_all_failed_group(monkeypatch, faile
         for index, kernel_failed_score in enumerate((-1.0, -0.75, -0.25))
     ]
 
+    post_process_rollout_rewards(args, samples)
     result = filter_cuda_kernel_group(args, samples)
 
     assert result.keep is True
+    assert [sample.reward for sample in samples] == [-0.5, -0.375, -0.125]
 
 
 def test_low_variance_filter_ignores_scores_when_failed_group_reward_is_disabled(monkeypatch):

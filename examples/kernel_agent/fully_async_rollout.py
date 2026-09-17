@@ -21,7 +21,8 @@ from itertools import islice
 from typing import Any
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_reward import annotate_group_difficulty
+from examples.kernel_agent.kernel_reward import annotate_group_difficulty, post_process_rollout_rewards
+from examples.kernel_agent.length_reward import LaserDBudgetController
 
 from slime.observability.metric_utils import compute_rollout_step
 from slime.rollout.base_types import RolloutFnTrainOutput
@@ -626,6 +627,11 @@ class KernelAgentAsyncRolloutWorker:
 
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
+    laser_d = (
+        LaserDBudgetController(args, data_buffer, rollout_id)
+        if getattr(args, "overlong_penalty", None) == "laser-d"
+        else None
+    )
 
     verify_capture_enabled = bool(getattr(args, "capture_verify_data", False))
     if verify_capture_enabled and not callable(getattr(data_buffer, "add_verify_candidates", None)):
@@ -703,6 +709,9 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
                 continue
             for group in groups:
                 annotate_group_difficulty(group)
+                if laser_d is not None:
+                    laser_d.observe(group)
+                post_process_rollout_rewards(args, group)
                 if verify_capture_enabled:
                     verify_candidates_added += data_buffer.add_verify_candidates(group, rollout_id=rollout_id)
 
@@ -843,6 +852,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         metrics["exp/rollout/async/acceptance_per_examined"] = (
             len(collected) / examined_task_groups if examined_task_groups > 0 else 0.0
         )
+    if laser_d is not None:
+        metrics.update(laser_d.finish())
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 

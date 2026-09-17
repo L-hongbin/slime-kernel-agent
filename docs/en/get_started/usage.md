@@ -329,7 +329,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filter previews and final reward processing share the same calculation. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filtering and training read the same settled rewards without separately recomputing gates. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
 
 For samples on the normal component-scoring path, the resulting contributions are:
 
@@ -337,7 +337,7 @@ For samples on the normal component-scoring path, the resulting contributions ar
 performance_reward = ungated_performance_reward * gate
 coverage_reward    = ungated_coverage_reward * gate
 task_reward        = correctness_reward + performance_reward + coverage_reward
-sample.reward      = task_reward - overlong_penalty  # If length shaping is enabled.
+sample.reward      = task_reward + length_score  # Negative for DAPO, positive for LASER-D, zero when disabled.
 ```
 
 Existing correctness requirements and the coverage enable switch still apply. An explicit failure-score branch keeps its failure reward; the gate does not turn an all-failed group into positive rewards. Speedup affects the base performance score, not the gate itself.
@@ -370,9 +370,19 @@ These are mappings, not observed training frequencies. Both piecewise modes redu
 
 This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08659v1#S3), **not its length reward**: hard kernel groups receive weaker performance/coverage incentives, easy groups stronger ones. No token-length bonus is introduced, and verify trajectories remain excluded.
 
-`kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions, including a negative `overlong_penalty`. `task_reward` excludes that penalty and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties. TRLOO accumulates returns afterward without overwriting single-turn rewards.
+`kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions. Its `length` contribution is negative for DAPO penalties, positive for LASER-D bonuses, and zero when disabled or inactive. Component metrics use `reward/component/length`, replacing the separate `overlong_penalty` and `length_bonus` components. Top-level `metadata.length_score` uses the same signed value; related metrics are `kernel/length_score/mean` and `exp/rollout/reward/length_score/*`. Existing CLI arguments are unchanged. `task_reward` excludes length shaping and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties.
 
-`calculate_kernel_reward()` only computes base scores. After scoring, `reward_func` calls `post_process_rollout_rewards(..., stage="sample")` to apply length shaping before verify/anchor utility assignment and history capture; dynamic weighting waits for the default `stage="rollout"`. Rollout post-processing skips settled verify trajectories and removed samples; verify is not dynamically reweighted. Filtering, verify capture, logging, and dump timing are unchanged: records produced before training reward post-processing do not contain subsequent dynamic weighting. Leaving both shaping switches off does not disable separate failure-scoring policies or CTM.
+At complete-trajectory finalization, before group reward processing and filtering, TRLOO freezes `metadata.return_reward = gamma * original_task_reward[t+1] + gamma² * original_task_reward[t+2] + ...`. This excludes dynamic weighting, failed-group replacement, and length shaping; turns already marked removed contribute zero. Training computes only `return[t] = current sample.reward + return_reward[t]`, retaining all shaping for the current turn but none in future credit. Later group filtering does not recompute or erase frozen future credit. Single-turn rewards are not overwritten. Verify/anchor samples retain assigned utilities without cross-turn accumulation. Legacy rollout dumps missing this field must be regenerated rather than silently falling back to potentially shaped `multi_turn_reward` values.
+
+TRLOO also mirrors frozen future credit into `metadata.reward_component.return_reward` for diagnostics. This component is not part of `sample.reward`; summing all components now includes future credit, giving the pre-baseline return for valid ordinary TRLOO samples. Dynamic weighting and failed-group replacement preserve it. All supported reward components (`correctness`, `performance`, `coverage`, `failed`, `length`, `return_reward`) are logged as regular metrics under `rollout/reward/component/{field}/{mean,min,max}`, without requiring `--log-exp-metrics`. Enable `--use-tensorboard` to write them to TensorBoard. Padding and missing/nonfinite component values are excluded. The old `exp/rollout/reward/component/*` metrics are no longer emitted.
+
+`metadata.raw_task_reward` preserves the initial single-turn task reward with the configured base weights, before dynamic weighting, failed-group replacement, and length shaping. It is written at base scoring and is not overwritten by reward postprocessing. Unlike mutable `task_reward`, it is a stable source for historical statistics. TRLOO prefers this field for future credit, falling back to `task_reward` (then the turn reward) for legacy samples at pre-shaping trajectory finalization. It is not an extra additive reward component. Verify capture stores its mean over the full valid source group/turn as `metadata.history_baseline`, including successes before selecting failures. Legacy verify data missing this baseline uses source group correctness rate times the configured correctness weight; loaded failed-only data is never re-averaged. History mode uses `R2 - history_baseline`, fixed across verify rounds.
+
+Ordinary kernels follow: base scoring → complete prompt/turn group reward processing (dynamic weights → length bonus/penalty → failed-group replacement) → write back `sample.reward` and `metadata.reward_component` → group filtering → return/advantage calculation. With the kernel reward hook configured, the default SGLang rollout automatically uses `examples.kernel_agent.kernel_reward.generate_rollout`. The fully-async collector settles rewards after draining complete groups and before filtering.
+
+With `apply_failed_group_reward` enabled, detect all-failed groups whose scores all exactly equal the weighted default failure score (`failed_score * init_correct_weight`), using the same reward basis as filtering. Failure-group detection does not use a variance threshold. Ordinary modes use `task_reward` without DAPO penalties; LASER-D uses reward including its bonus (failed samples receive no bonus). If every sample has a saved `kernel_failed_score`, replace task contributions with that score times `init_correct_weight`, updating `task_reward`, `sample.reward`, and components while retaining length penalties exactly once. Then run formal filtering once, followed by return calculation. Replacement does not bypass low-variance or minimum-size filtering.
+
+The filter is read-only: LASER-D reads `sample.reward` including its length bonus; other modes prefer `metadata.task_reward`, falling back to `sample.reward` only when absent. The training hook `reward_post_process_by_group` computes returns/advantages from written-back turn rewards without reshaping a filtered subset. Sample-stage DAPO still precedes verify/anchor utility assignment; group processing excludes settled verify trajectories, anchors, and invalid samples. Previously captured verify history copies remain unchanged; new captures use post-processed kernel results. Disabling length and gate shaping does not disable separate failure-scoring policies or CTM.
 
 When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
 
@@ -381,7 +391,46 @@ When dynamic weighting is enabled, train-data conversion emits a separate `rewar
 - `performance_reward_delta_mean/min/max/p25/p50/p75`: per-sample performance contribution after gating minus its ungated contribution, not a change in measured speedup or total reward. Unchanged valid samples contribute zero.
 - `group_count`, `sample_count`: denominators; verify trajectories, anchors, removed, aborted, and padded samples are excluded.
 
-Final per-sample records live in `metadata.dynamic_reward`. Filter previews do not create these records; repeated reward processing recomputes deltas against the ungated baseline. Existing early rollout logs and dumps retain their original timing.
+Final per-sample records live in `metadata.dynamic_reward` and are created before filtering; train-data conversion aggregates retained samples only. Repeated processing compares against the ungated baseline. Early per-sample generation logs can still precede complete-group weighting.
+
+#### LASER-D adaptive length rewards
+
+`--overlong-penalty` accepts `None` (default/off), `dapo` (the existing linear subtraction), or `laser-d`. Despite the shared selector name, LASER-D is a **bonus**: add a constant only to correct responses whose full response token count is within budget. Incorrect or over-budget responses are unchanged. No decoding cap, prompt budget, or speedup multiplier is introduced. See [the paper, Table 2 / Section 5](https://arxiv.org/html/2505.15612v1#S5) and [official reward code](https://github.com/hkust-nlp/Laser/blob/main/verl/utils/reward_score/length_penalty.py).
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--overlong-penalty laser-d \
+--laser-d-length-score 0.5 \
+--laser-d-min-length 1024 \
+--laser-d-length-interval 1024 \
+--laser-d-update-interval 20 \
+--laser-d-monitor-groups 500
+```
+
+These are the defaults. The search upper bound is `--rollout-max-response-len`; the lower bound must not exceed it. DAPO's buffer, penalty factor, and effective-context-cap options do not affect LASER-D. Dynamic performance/coverage gating remains independent and does not scale the bonus.
+
+Reuse the two `--difficulty-thresholds` (default thirds): hard if `s < h`, medium if `h <= s < e`, easy if `s >= e`, where `s` is the valid prompt/turn group's correctness rate. Monitoring and reward assignment share these boundaries. Removed, aborted, pad, verify, and anchor trajectories are excluded.
+
+```text
+C_min(g) = smallest attainable positive correct count in g's bucket
+           K=8: hard=1, medium=3, easy=6; K=16: hard=1, medium=6, easy=11
+coverage_g(L) = fraction of ALL responses in g with response_length <= L
+ECR_bucket(L) = mean_g[C_min(g) * coverage_g(L)]
+B_bucket = smallest grid L with ECR >= 1; use response cap if unavailable
+reward = task_reward + bonus * I(correct and response_length <= B_bucket)
+```
+
+At fixed group size this reduces to `C_min * coverage`; variable-size turn groups receive equal group weight. The grid always includes the cap, even when not divisible by its interval. ECR is a coverage proxy, not a correctness guarantee. We use the paper's minimum attainable counts rather than the official code's optional floor approximation.
+
+Our monitoring adaptation reuses **pre-dynamic-filter training rollouts**, not a separate monitoring dataset/rollout. A bounded reservoir keeps at most `monitor-groups` prompt/turn length lists per update window, without response bodies. Rejected groups contribute; unconsumed warm-queue groups do not. Each turn contributes one observation. All budgets start at `min-length`. Bootstrap after the first rollout with monitoring data; then update every `update-interval` rollout batches (not actor optimizer steps), clearing the reservoir after each update.
+
+Each collector batch uses a fixed budget snapshot; its observations only change future batches. The shared reward postprocessor writes `sample.reward` and positive `reward_component.length`; `task_reward` excludes the bonus. Reprocessing is idempotent; TRLOO retains the bonus only for the current turn, not in future credit. Verify/anchor utility and captured historical rewards are not reshaped.
+
+LASER-D's low-variance filter includes the bonus, retaining all-correct groups with informative length differences. DAPO retains its existing pre-penalty `task_reward` filter policy.
+
+Argument validation automatically routes the default SGLang rollout through the LASER-D collector; kernel-agent fully-async supports it directly. Keep dataset management enabled by default (do not pass `--disable-rollout-global-dataset`) and use the reward hook above; other custom rollout paths fail validation. Budgets, reservoir, update position, and RNG state use data-source `metadata["laser_d"]`, saved in the existing `rollout/global_dataset_state_dict_<rollout_id>.pt`. Resume with the matching checkpoint; changed budget/monitor settings fail explicitly. Unfinished batches do not commit budget state.
+
+Existing TensorBoard/W&B channels log `rollout/laser_d/{hard,medium,easy}/budget_used` and `budget_next`, plus `budget_updated`, `observed_groups`, and `monitor_groups_retained/seen`. Final training records provide `length_score_mean`, `bonus_fraction`, `sample_count`, and each bucket's `budget_mean`/`sample_count`. Per-sample snapshots live in `metadata.laser_d`. No `--log-exp-metrics` flag is required.
 
 #### GRPO Algorithm
 
