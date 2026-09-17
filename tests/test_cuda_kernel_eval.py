@@ -1,10 +1,12 @@
 import asyncio
 import inspect
+import json
 import logging
 import os
 import sys
 import threading
 import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -708,6 +710,17 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", False)
     sample = Sample(prompt="hidden prompt", metadata={"uuid": "stats-only"})
+    env_result = {
+        "env_state": {"status": "completed", "error_message": "output mismatch"},
+        "env_extra_info": {
+            "precheck": "passed",
+            "detail_env_time": {"compile_time": 0.1},
+            "kernel_perf_cv": 0.02,
+            "num_coverage": 0.8,
+        },
+    }
+    sample.metadata["env_result"] = env_result
+    original_sample = deepcopy(sample.to_dict())
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
     generate_with_cuda_agent._log_rollout_info(
@@ -722,7 +735,7 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
                 "prompt": sample.prompt,
                 "response": VALID_CUDA_AGENT_RESPONSE,
                 "reward": 0.0,
-                "env_result": {"env_state": {"status": "completed"}},
+                "env_result": env_result,
             }
         ],
         finish_reason="max_turns",
@@ -732,6 +745,17 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     assert "[turn 0] task_id=stats-only-task" in caplog.text
     assert "[turn 0] env_feedback:" in caplog.text
     assert '"status": "completed"' in caplog.text
+    feedback_records = [
+        record.getMessage() for record in caplog.records if "[turn 0] env_feedback:" in record.getMessage()
+    ]
+    assert len(feedback_records) == 1
+    assert json.loads(feedback_records[0].split("env_feedback:\n", 1)[1]) == env_result["env_state"]
+    assert "env_extra_info" not in caplog.text
+    assert "num_coverage" not in caplog.text
+    assert "precheck=passed" in caplog.text
+    assert "compile_time" in caplog.text
+    assert "kernel_perf_cv" in caplog.text
+    assert sample.to_dict() == original_sample
     assert "[prompt]:" not in caplog.text
     assert "[turn 0] user_content:" not in caplog.text
     assert "response_content" not in caplog.text

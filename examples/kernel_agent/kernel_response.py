@@ -612,7 +612,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
             object_ref,
             worker,
             payload,
-            heartbeat_interval=float(_kernel_eval_param(args, config, "kernel_eval_heartbeat_interval", 60.0)),
+            heartbeat_interval=float(_kernel_eval_param(args, config, "kernel_eval_heartbeat_interval", 120.0)),
             rate_limit=int(_kernel_eval_param(args, config, "kernel_eval_rate_limit")),
             timeout=min(client_timeout - (time.monotonic() - started), deadline - time.time()),
         )

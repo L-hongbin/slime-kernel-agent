@@ -348,7 +348,7 @@ def _log_rollout_info(
                 "%s[turn %s] env_feedback:\n%s",
                 prefix,
                 item.get("turn_idx"),
-                _format_log_value(env_result, log_max_chars),
+                _format_log_value(env_state, log_max_chars),
             )
             continue
         logger.info(
