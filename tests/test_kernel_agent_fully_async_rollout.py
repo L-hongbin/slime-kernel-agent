@@ -697,6 +697,77 @@ def test_kernel_agent_rollout_stats_only_keeps_surplus_completed_groups_queued(m
     assert "secret-response" not in caplog.text
 
 
+@pytest.mark.parametrize("method", [None, "dapo", "laser-d"])
+def test_full_async_settles_before_filter_and_leaves_warm_queue_untouched(monkeypatch, method):
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+        fully_async_rollout.KernelAgentAsyncRolloutWorker
+    )
+    worker.output_queue = queue.Queue()
+    for gid, correct_count, length in ((0, 1, 12), (1, 8, 4), (2, 1, 8)):
+        group = []
+        for index in range(8):
+            correct = float(index < correct_count)
+            group.append(
+                Sample(
+                    group_index=gid,
+                    index=gid * 8 + index,
+                    response_length=length,
+                    reward=correct,
+                    status=Sample.Status.COMPLETED,
+                    metadata={
+                        "task_reward": correct,
+                        "env_extra_info": {"correctness": bool(correct)},
+                        "reward_component": {"correctness": correct, "length": 0.0},
+                    },
+                )
+            )
+        worker.output_queue.put((gid, group))
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda *args: worker)
+    visited = []
+
+    def filter_group(fn, args, group):
+        visited.append(group[0].group_index)
+        first = group[0].group_index == 0
+        if method == "laser-d":
+            assert group[0].metadata["laser_d"]["budget"] == 4
+            expected = 1.0 if first else 1.5
+        elif method == "dapo":
+            expected = 0.25 if first else 0.75
+        else:
+            expected = 1.0
+        assert group[0].reward == expected
+        return SimpleNamespace(keep=group[0].group_index == 1, reason="test")
+
+    monkeypatch.setattr(fully_async_rollout, "call_dynamic_filter", filter_group)
+    args = Namespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=1,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+        overlong_penalty=method,
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        rollout_max_response_len=16,
+        laser_d_min_length=4,
+        laser_d_length_interval=4,
+        laser_d_monitor_groups=10,
+    )
+    source = SimpleNamespace(metadata={})
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, 0, source))
+    assert visited == [0, 1]
+    assert output.samples[0][0].group_index == 1
+    if method == "laser-d":
+        assert output.metrics["laser_d/observed_groups"] == 2
+        assert output.metrics["laser_d/hard/budget_next"] == 12
+        assert source.metadata["laser_d"]["budgets"] == [12, 16, 4]
+    else:
+        assert "laser_d" not in source.metadata
+    remaining = worker.get_completed_groups()
+    assert remaining[0][0] == 2
+    assert all("laser_d" not in sample.metadata for sample in remaining[0][1])
+    assert all(sample.reward == sample.metadata["task_reward"] for sample in remaining[0][1])
+
+
 def test_kernel_agent_rollout_logs_sample_bodies_when_stats_only_is_disabled(monkeypatch, caplog):
     worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
         fully_async_rollout.KernelAgentAsyncRolloutWorker

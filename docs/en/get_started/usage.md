@@ -205,6 +205,157 @@ The recommended contract is to put the source identifier in `metadata["source_na
 - `--calculate-per-token-loss`: By default, slime calculates loss on a per-sample basis, i.e., `mean(sum(sample_i) / len(sample_i))`. Enable this flag to calculate loss on a per-token basis, i.e., `sum(sum(sample_i)) / sum(len(sample_i))`.
 - `--use-tis`: Enable this setting to use TIS (Truncated Importance Sampling) (https://fengyao.notion.site/off-policy-rl).
 
+#### Kernel rollout reward post-processing
+
+`examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.
+
+The existing training hook calls this interface:
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--dynamic-reward-gate sqrt \
+--overlong-penalty dapo \
+--overlong-buffer-len 2048 \
+--overlong-penalty-factor 0.2
+```
+
+The two method selectors are independent: `--dynamic-reward-gate` selects dynamic weighting, and `--overlong-penalty` selects length shaping. Both default to Python `None` (disabled), and both accept the explicit CLI value `None`. `--overlong-penalty dapo` enables the existing soft linear penalty; a bare `--overlong-penalty` is no longer accepted. Buffer length and penalty factor keep their existing meanings. When both methods are enabled, weights always precede the penalty. There is no processor-list selector or separate configuration/environment switch for dynamic weighting. The DPPO example script sets `--dynamic-reward-gate None`, so dynamic weighting is off by default there as well. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
+
+##### Dynamic gate calculation
+
+`--dynamic-reward-gate` defaults to `None` (disabled); specifying `sqrt`, `piecewise` (linear), or `piecewise-sqrt` (square-root tails) enables the selected mode. Dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
+
+```bash
+--dynamic-reward-gate piecewise-sqrt \
+--dynamic-reward-gate-range 0.8 1.2
+```
+
+`--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[1/3, 2/3]` to divide the correctness-rate range into three equal intervals, not equal-sized sample buckets. The example omits this flag to use those defaults; explicit decimal values override them (e.g. `--difficulty-thresholds 0.25 0.75`). Its validation is independent of dynamic reward weighting. Both piecewise modes require exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
+
+Let `G` be the number of valid samples for the same prompt and turn, `c` the correct count, and `s=c/G`. Removed, padded, and aborted samples do not count toward `G`; it can therefore differ from `--n-samples-per-prompt`. The recorded `group_difficulty` is `1-s`, but gate thresholds use `s`. Define `h, e = difficulty_thresholds` and `lo, hi = dynamic_reward_gate_range` (default `[0.8, 1.2]`).
+
+The legacy `sqrt` mode ignores the thresholds and range:
+
+```python
+gate = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+```
+
+For `piecewise`, use `f(d)=d`; for `piecewise-sqrt`, use `f(d)=sqrt(d)`:
+
+```python
+if G <= 1:
+    gate = 1  # Insufficient group evidence.
+elif s < h:
+    gate = 1 - (1 - lo) * f((h - s) / h)
+elif s > e:
+    gate = 1 + (hi - 1) * f((s - e) / (1 - e))
+else:
+    gate = 1
+```
+
+`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filtering and training read the same settled rewards without separately recomputing gates. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+
+For samples on the normal component-scoring path, the resulting contributions are:
+
+```text
+performance_reward = ungated_performance_reward * gate
+coverage_reward    = ungated_coverage_reward * gate
+task_reward        = correctness_reward + performance_reward + coverage_reward
+sample.reward      = task_reward + length_score  # Negative for DAPO, positive for LASER-D, zero when disabled.
+```
+
+Existing correctness requirements and the coverage enable switch still apply. An explicit failure-score branch keeps its failure reward; the gate does not turn an all-failed group into positive rewards. Speedup affects the base performance score, not the gate itself.
+
+##### Gate values for G=16
+
+Assume all 16 samples are valid, with thresholds `[1/3, 2/3]` and range `[0.8, 1.2]`. Values are rounded to four decimal places:
+
+| Correct count | Correctness rate | `sqrt` | `piecewise` | `piecewise-sqrt` |
+|---|---:|---:|---:|---:|
+| 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
+| 1 | 6.25% | 0.0000 | 0.8375 | 0.8197 |
+| 2 | 12.5% | 0.2582 | 0.8750 | 0.8419 |
+| 3 | 18.75% | 0.3651 | 0.9125 | 0.8677 |
+| 4 | 25% | 0.4472 | 0.9500 | 0.9000 |
+| 5 | 31.25% | 0.5164 | 0.9875 | 0.9500 |
+| 6 | 37.5% | 0.5774 | 1.0000 | 1.0000 |
+| 7 | 43.75% | 0.6325 | 1.0000 | 1.0000 |
+| 8 | 50% | 0.6831 | 1.0000 | 1.0000 |
+| 9 | 56.25% | 0.7303 | 1.0000 | 1.0000 |
+| 10 | 62.5% | 0.7746 | 1.0000 | 1.0000 |
+| 11 | 68.75% | 0.8165 | 1.0125 | 1.0500 |
+| 12 | 75% | 0.8563 | 1.0500 | 1.1000 |
+| 13 | 81.25% | 0.8944 | 1.0875 | 1.1323 |
+| 14 | 87.5% | 0.9309 | 1.1250 | 1.1581 |
+| 15 | 93.75% | 0.9661 | 1.1625 | 1.1803 |
+| 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
+
+These are mappings, not observed training frequencies. Both piecewise modes reduce weights for 0–5 correct samples, preserve them for 6–10, and increase them for 11–16. Actual gate frequencies depend on the observed group correctness distribution; see the metrics below.
+
+This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08659v1#S3), **not its length reward**: hard kernel groups receive weaker performance/coverage incentives, easy groups stronger ones. No token-length bonus is introduced.
+
+`kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions. Its `length` contribution is negative for DAPO penalties, positive for LASER-D bonuses, and zero when disabled or inactive. Component metrics use `reward/component/length`, replacing the separate `overlong_penalty` and `length_bonus` components. Top-level `metadata.length_score` uses the same signed value; related metrics are `kernel/length_score/mean` and `exp/rollout/reward/length_score/*`. Existing CLI arguments are unchanged. `task_reward` excludes length shaping and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties.
+
+At complete-trajectory finalization, before group reward processing and filtering, TRLOO freezes `metadata.return_reward = gamma * original_task_reward[t+1] + gamma² * original_task_reward[t+2] + ...`. This excludes dynamic weighting, failed-group replacement, and length shaping; turns already marked removed contribute zero. Training computes only `return[t] = current sample.reward + return_reward[t]`, retaining all shaping for the current turn but none in future credit. Later group filtering does not recompute or erase frozen future credit. Single-turn rewards are not overwritten. Legacy rollout dumps missing this field must be regenerated rather than silently falling back to potentially shaped `multi_turn_reward` values.
+
+TRLOO also mirrors frozen future credit into `metadata.reward_component.return_reward` for diagnostics. This component is not part of `sample.reward`; summing all components now includes future credit, giving the pre-baseline return for valid ordinary TRLOO samples. Dynamic weighting and failed-group replacement preserve it. All supported reward components (`correctness`, `performance`, `coverage`, `failed`, `length`, `return_reward`) are logged as regular metrics under `rollout/reward/component/{field}/{mean,min,max}`, without requiring `--log-exp-metrics`. Enable `--use-tensorboard` to write them to TensorBoard. Padding and missing/nonfinite component values are excluded. The old `exp/rollout/reward/component/*` metrics are no longer emitted.
+
+`metadata.raw_task_reward` preserves the initial single-turn task reward with the configured base weights, before dynamic weighting, failed-group replacement, and length shaping. It is written at base scoring and is not overwritten by reward postprocessing. Unlike mutable `task_reward`, it is a stable source for historical statistics. TRLOO prefers this field for future credit, falling back to `task_reward` (then the turn reward) for legacy samples at pre-shaping trajectory finalization. It is not an extra additive reward component.
+
+Ordinary kernels follow: base scoring → complete prompt/turn group reward processing (dynamic weights → length bonus/penalty → failed-group replacement) → write back `sample.reward` and `metadata.reward_component` → group filtering → return/advantage calculation. With the kernel reward hook configured, the default SGLang rollout automatically uses `examples.kernel_agent.kernel_reward.generate_rollout`. The fully-async collector settles rewards after draining complete groups and before filtering.
+
+With `apply_failed_group_reward` enabled, detect all-failed groups whose scores all exactly equal the weighted default failure score (`failed_score * init_correct_weight`), using the same reward basis as filtering. Failure-group detection does not use a variance threshold. Ordinary modes use `task_reward` without DAPO penalties; LASER-D uses reward including its bonus (failed samples receive no bonus). If every sample has a saved `kernel_failed_score`, replace task contributions with that score times `init_correct_weight`, updating `task_reward`, `sample.reward`, and components while retaining length penalties exactly once. Then run formal filtering once, followed by return calculation. Replacement does not bypass low-variance or minimum-size filtering.
+
+The filter is read-only: LASER-D reads `sample.reward` including its length bonus; other modes prefer `metadata.task_reward`, falling back to `sample.reward` only when absent. The training hook `reward_post_process_by_group` computes returns/advantages from written-back turn rewards without reshaping a filtered subset. Group processing excludes invalid samples. Disabling length and gate shaping does not disable separate failure-scoring policies or CTM.
+
+When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
+
+- `gate_mean`, `gate_min`, `gate_max`, `gate_p25/p50/p75`: one vote per `(group_index, turn_idx)` group.
+- `gate_zero_fraction`, `gate_scaled_fraction`, `gate_one_fraction`, `gate_boosted_fraction`: fractions with gate equal to zero, strictly between zero and one, equal to one, and greater than one.
+- `performance_reward_delta_mean/min/max/p25/p50/p75`: per-sample performance contribution after gating minus its ungated contribution, not a change in measured speedup or total reward. Unchanged valid samples contribute zero.
+- `group_count`, `sample_count`: denominators; removed, aborted, and padded samples are excluded.
+
+Final per-sample records live in `metadata.dynamic_reward` and are created before filtering; train-data conversion aggregates retained samples only. Repeated processing compares against the ungated baseline. Early per-sample generation logs can still precede complete-group weighting.
+
+#### LASER-D adaptive length rewards
+
+`--overlong-penalty` accepts `None` (default/off), `dapo` (the existing linear subtraction), or `laser-d`. Despite the shared selector name, LASER-D is a **bonus**: add a constant only to correct responses whose full response token count is within budget. Incorrect or over-budget responses are unchanged. No decoding cap, prompt budget, or speedup multiplier is introduced. See [the paper, Table 2 / Section 5](https://arxiv.org/html/2505.15612v1#S5) and [official reward code](https://github.com/hkust-nlp/Laser/blob/main/verl/utils/reward_score/length_penalty.py).
+
+```bash
+--custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
+--overlong-penalty laser-d \
+--laser-d-length-score 0.5 \
+--laser-d-min-length 1024 \
+--laser-d-length-interval 1024 \
+--laser-d-update-interval 20 \
+--laser-d-monitor-groups 500
+```
+
+These are the defaults. The search upper bound is `--rollout-max-response-len`; the lower bound must not exceed it. DAPO's buffer, penalty factor, and effective-context-cap options do not affect LASER-D. Dynamic performance/coverage gating remains independent and does not scale the bonus.
+
+Reuse the two `--difficulty-thresholds` (default thirds): hard if `s < h`, medium if `h <= s < e`, easy if `s >= e`, where `s` is the valid prompt/turn group's correctness rate. Monitoring and reward assignment share these boundaries. Removed, aborted, and padded samples are excluded.
+
+```text
+C_min(g) = smallest attainable positive correct count in g's bucket
+           K=8: hard=1, medium=3, easy=6; K=16: hard=1, medium=6, easy=11
+coverage_g(L) = fraction of ALL responses in g with response_length <= L
+ECR_bucket(L) = mean_g[C_min(g) * coverage_g(L)]
+B_bucket = smallest grid L with ECR >= 1; use response cap if unavailable
+reward = task_reward + bonus * I(correct and response_length <= B_bucket)
+```
+
+At fixed group size this reduces to `C_min * coverage`; variable-size turn groups receive equal group weight. The grid always includes the cap, even when not divisible by its interval. ECR is a coverage proxy, not a correctness guarantee. We use the paper's minimum attainable counts rather than the official code's optional floor approximation.
+
+Our monitoring adaptation reuses **pre-dynamic-filter training rollouts**, not a separate monitoring dataset/rollout. A bounded reservoir keeps at most `monitor-groups` prompt/turn length lists per update window, without response bodies. Rejected groups contribute; unconsumed warm-queue groups do not. Each turn contributes one observation. All budgets start at `min-length`. Bootstrap after the first rollout with monitoring data; then update every `update-interval` rollout batches (not actor optimizer steps), clearing the reservoir after each update.
+
+Each collector batch uses a fixed budget snapshot; its observations only change future batches. The shared reward postprocessor writes `sample.reward` and positive `reward_component.length`; `task_reward` excludes the bonus. Reprocessing is idempotent; TRLOO retains the bonus only for the current turn, not in future credit.
+
+LASER-D's low-variance filter includes the bonus, retaining all-correct groups with informative length differences. DAPO retains its existing pre-penalty `task_reward` filter policy.
+
+Argument validation automatically routes the default SGLang rollout through the LASER-D collector; kernel-agent fully-async supports it directly. Keep dataset management enabled by default (do not pass `--disable-rollout-global-dataset`) and use the reward hook above; other custom rollout paths fail validation. Budgets, reservoir, update position, and RNG state use data-source `metadata["laser_d"]`, saved in the existing `rollout/global_dataset_state_dict_<rollout_id>.pt`. Resume with the matching checkpoint; changed budget/monitor settings fail explicitly. Unfinished batches do not commit budget state.
+
+Existing TensorBoard/W&B channels log `rollout/laser_d/{hard,medium,easy}/budget_used` and `budget_next`, plus `budget_updated`, `observed_groups`, and `monitor_groups_retained/seen`. Final training records provide `length_score_mean`, `bonus_fraction`, `sample_count`, and each bucket's `budget_mean`/`sample_count`. Per-sample snapshots live in `metadata.laser_d`. No `--log-exp-metrics` flag is required.
+
 #### GRPO Algorithm
 
 GRPO (Group Relative Policy Optimization) is an RL algorithm proposed in DeepSeek-Math. Its core idea is to compute advantage through intra-group relative comparisons, eliminating the need for a separate critic model.
@@ -225,6 +376,7 @@ Related parameters:
 
 - `--n-samples-per-prompt`: Number of responses sampled per prompt for intra-group comparison.
 - `--normalize-advantages`: Whether to normalize advantages.
+- `--use-conditional-truncation-mask`: Kernel Agent reward post-processing records only the CTM selection. The Megatron backend zeros selected advantages after OPD and advantage normalization, or at the end of advantage computation when normalization is disabled. Rewards, returns, loss masks, and normalization statistics are unchanged. Runtime and later execution-stage failures are excluded from CTM masking.
 - `--eps-clip`: PPO-style clip range.
 
 #### PPO Algorithm

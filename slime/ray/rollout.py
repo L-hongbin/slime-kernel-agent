@@ -11,6 +11,7 @@ import torch
 from slime.backends.sglang_utils.deployment import start_rollout_servers
 from slime.observability import logging_utils
 from slime.observability.logging_utils import configure_logger, init_tracking
+from slime.observability.metric_utils import compute_rollout_step
 from slime.observability.rollout_data_utils import (
     load_debug_rollout_data,
     save_debug_rollout_data,
@@ -18,7 +19,11 @@ from slime.observability.rollout_data_utils import (
     validate_rollout_id_annotated,
     validate_rollout_routed_experts_for_replay,
 )
-from slime.observability.rollout_metrics import log_eval_rollout_data, log_rollout_data
+from slime.observability.rollout_metrics import (
+    compute_reward_post_process_metrics,
+    log_eval_rollout_data,
+    log_rollout_data,
+)
 from slime.rollout.base_types import call_rollout_fn
 from slime.rollout.sample_hooks import set_current_rollout_id
 from slime.utils.data import get_source
@@ -598,6 +603,15 @@ class RolloutManager:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
+        reward_metrics = compute_reward_post_process_metrics(samples)
+        if reward_metrics:
+            logger.info("reward post-process %s: %s", self.rollout_id, reward_metrics)
+            step = compute_rollout_step(self.args, self.rollout_id)
+            reward_metrics["rollout/step"] = step
+            if self.args.wandb_always_use_train_step:
+                reward_metrics["train/step"] = step
+            logging_utils.log(self.args, reward_metrics, step_key="rollout/step")
+
         rollout_ids = [sample.rollout_id for sample in samples]
         existed_rollout_id_values = set(rid for rid in rollout_ids if rid is not None)
         tmp_id = 0
@@ -622,6 +636,13 @@ class RolloutManager:
         if any(sample.metadata and "turn_idx" in sample.metadata for sample in samples):
             train_data["turn_indices"] = [
                 sample.metadata.get("turn_idx") if sample.metadata else None for sample in samples
+            ]
+        if getattr(self.args, "use_conditional_truncation_mask", False):
+            # One rollout-side Bernoulli decision, replayed on every TP/CP
+            # shard after training-side advantage normalization.
+            train_data["conditional_truncation_masked"] = [
+                bool((sample.metadata or {}).get("conditional_truncation_masked", False)) and not sample.remove_sample
+                for sample in samples
             ]
 
         # loss mask
@@ -838,6 +859,7 @@ class RolloutManager:
                 "response_lengths",
                 "rewards",
                 "truncated",
+                "conditional_truncation_masked",
                 "loss_masks",
                 "round_number",
                 "sample_indices",

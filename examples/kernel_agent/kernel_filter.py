@@ -11,10 +11,10 @@ from slime.utils.types import Sample
 
 try:
     from .config import CUDA_AGENT_CONFIGS
-    from .kernel_reward import _apply_dynamic_group_reward_weights, _apply_failed_group_reward
+    from .kernel_reward import get_kernel_group_filter_rewards
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
-    from kernel_reward import _apply_dynamic_group_reward_weights, _apply_failed_group_reward
+    from kernel_reward import get_kernel_group_filter_rewards
 
 logger = logging.getLogger(__name__)
 _FILTER_CONFIG_LOGGED = False
@@ -44,9 +44,8 @@ def _low_variance_audit_record(args, samples: list[Sample], filter_rewards: list
                 "id": stable_id(sample),
                 "sample_index": sample.index,
                 "rollout_id": sample.rollout_id if sample.rollout_id is not None else sample.index,
-                # filter_reward is normally the pre-overlong task reward. For
-                # an all-failed group it is the failure-stage penalty fallback.
-                # reward is the effective sample reward before group processing.
+                # Both fields are settled before filtering. LASER-D filters
+                # with the length bonus; other modes prefer task_reward.
                 "filter_reward": float(filter_reward),
                 "reward": float(sample.get_reward_value(args)),
             }
@@ -112,27 +111,12 @@ def filter_cuda_kernel_group(args, samples: list[Sample], **kwargs: Any) -> Dyna
         )
 
     if reject_low_variance_groups:
-        # Variance normally uses the PRE-PENALTY task reward recorded by the
-        # overlong policy. An all-failed group instead uses weighted failure-stage scores
-        # so a group with different evaluation progress can reach TRLOO.
-        rewards = [
-            (
-                sample.metadata.get("task_reward")
-                if isinstance(sample.metadata, dict) and "task_reward" in sample.metadata
-                else sample.get_reward_value(args)
-            )
-            for sample in valid_samples
-        ]
-        reward_config = CUDA_AGENT_CONFIGS["reward"]
-        rewards = _apply_dynamic_group_reward_weights(valid_samples, rewards, reward_config)
-        if bool(reward_config["apply_failed_group_reward"]):
-            failed_score = float(reward_config["failed_score"])
-            rewards = _apply_failed_group_reward(
-                valid_samples,
-                rewards,
-                failed_score,
-                float(reward_config["init_correct_weight"]),
-            )
+        # Keep DAPO's pre-penalty variance policy. LASER-D's correctness-gated
+        # bonus is a learning signal even in all-correct groups and must survive
+        # filtering; its collector has already written the per-sample bonus.
+        rewards = get_kernel_group_filter_rewards(
+            args, valid_samples, [sample.get_reward_value(args) for sample in valid_samples]
+        )
         reward_std = torch.tensor(rewards, dtype=torch.float64).std(unbiased=False).item()
         if reward_std < reward_std_threshold:
             audit_record = _low_variance_audit_record(args, valid_samples, rewards)

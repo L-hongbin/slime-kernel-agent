@@ -19,6 +19,8 @@ from itertools import islice
 from typing import Any
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
+from examples.kernel_agent.kernel_reward import annotate_group_difficulty, post_process_rollout_rewards
+from examples.kernel_agent.length_reward import LaserDBudgetController
 
 from slime.observability.metric_utils import compute_rollout_step
 from slime.rollout.base_types import RolloutFnTrainOutput
@@ -494,6 +496,12 @@ class KernelAgentAsyncRolloutWorker:
 
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
+    laser_d = (
+        LaserDBudgetController(args, data_buffer, rollout_id)
+        if getattr(args, "overlong_penalty", None) == "laser-d"
+        else None
+    )
+
     dynamic_filter = (
         load_function(args.dynamic_sampling_filter_path) if args.dynamic_sampling_filter_path is not None else None
     )
@@ -551,6 +559,12 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             groups = _as_sample_groups(task_group)
             if not groups:
                 continue
+            for group in groups:
+                annotate_group_difficulty(group)
+                if laser_d is not None:
+                    laser_d.observe(group)
+                post_process_rollout_rewards(args, group)
+
             if do_print:
                 sample = groups[0][0]
                 logger.info(
@@ -677,6 +691,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         metrics["exp/rollout/async/acceptance_per_examined"] = (
             len(collected) / examined_task_groups if examined_task_groups > 0 else 0.0
         )
+    if laser_d is not None:
+        metrics.update(laser_d.finish())
     return RolloutFnTrainOutput(samples=data, metrics=metrics)
 
 

@@ -530,6 +530,6 @@ exec "${SCRIPT_DIR}/run.t1.deepseek_v4_flash.rl.sh" \
   --dsv4-lora-shared-expert \
   --lora-checkpoint-max-node-bytes "${FORMAL_LORA_CHECKPOINT_MAX_NODE_BYTES}" \
   --lora-adapter-resume-load "${LORA_ADAPTER_RESUME_LOAD}" \
-  --overlong-penalty \
+  --overlong-penalty dapo \
   --overlong-buffer-len "${OVERLONG_BUFFER_LEN}" \
   --overlong-penalty-factor "${OVERLONG_PENALTY_FACTOR}"

@@ -49,6 +49,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_kernel_agent_metrics(samples)
+    log_dict |= _compute_reward_component_metrics(samples)
     if getattr(args, "use_multi_turn", False):
         log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
@@ -61,6 +62,100 @@ def compute_metrics_from_samples(args, samples):
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _compute_reward_component_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Regular component statistics on non-padding samples with finite values."""
+    component_values = {
+        key: [] for key in ("correctness", "performance", "coverage", "failed", "length", "return_reward")
+    }
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if metadata.get("is_pad_turn"):
+            continue
+        components = metadata.get("reward_component")
+        if not isinstance(components, dict):
+            continue
+        for key, values in component_values.items():
+            value = components.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+                values.append(float(value))
+
+    metrics = {}
+    for key, values in component_values.items():
+        if values:
+            metrics[f"reward/component/{key}/mean"] = float(np.mean(values))
+            metrics[f"reward/component/{key}/min"] = float(np.min(values))
+            metrics[f"reward/component/{key}/max"] = float(np.max(values))
+    return metrics
+
+
+def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Aggregate final dynamic-weight records, never filter previews.
+
+    Gate statistics give each prompt/turn group one vote. Performance deltas
+    give each valid ordinary kernel sample one vote, including unchanged zeros.
+    """
+    group_gates = {}
+    performance_deltas = []
+    laser_records = []
+    for sample in samples:
+        metadata = sample.metadata or {}
+        if (
+            sample.remove_sample
+            or sample.status == Sample.Status.ABORTED
+            or metadata.get("role", "kernel") != "kernel"
+            or metadata.get("is_pad_turn")
+        ):
+            continue
+        laser_record = metadata.get("laser_d")
+        if isinstance(laser_record, dict) and "length_score" in laser_record:
+            laser_records.append(laser_record)
+        record = metadata.get("dynamic_reward")
+        if not isinstance(record, dict):
+            continue
+        gate, delta = record.get("gate"), record.get("performance_reward_delta")
+        if not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+            for value in (gate, delta)
+        ):
+            continue
+        group_gates[(sample.group_index, metadata.get("turn_idx"))] = float(gate)
+        performance_deltas.append(float(delta))
+    metrics = {}
+    if laser_records:
+        bonuses = np.asarray([record["length_score"] for record in laser_records])
+        metrics["rollout/laser_d/length_score_mean"] = float(np.mean(bonuses))
+        metrics["rollout/laser_d/bonus_fraction"] = float(np.mean(bonuses > 0))
+        metrics["rollout/laser_d/sample_count"] = len(laser_records)
+        for bucket in ("hard", "medium", "easy"):
+            budgets = [record["budget"] for record in laser_records if record["bucket"] == bucket]
+            metrics[f"rollout/laser_d/{bucket}/sample_count"] = len(budgets)
+            if budgets:
+                metrics[f"rollout/laser_d/{bucket}/budget_mean"] = float(np.mean(budgets))
+    if not group_gates:
+        return metrics
+
+    gates = np.asarray(list(group_gates.values()))
+    deltas = np.asarray(performance_deltas)
+    prefix = "rollout/dynamic_reward/"
+    metrics.update(
+        {
+            f"{prefix}group_count": len(gates),
+            f"{prefix}sample_count": len(deltas),
+            f"{prefix}gate_zero_fraction": float(np.mean(gates == 0.0)),
+            f"{prefix}gate_scaled_fraction": float(np.mean((gates > 0.0) & (gates < 1.0))),
+            f"{prefix}gate_one_fraction": float(np.mean(gates == 1.0)),
+            f"{prefix}gate_boosted_fraction": float(np.mean(gates > 1.0)),
+        }
+    )
+    for name, values in (("gate", gates), ("performance_reward_delta", deltas)):
+        metrics[f"{prefix}{name}_mean"] = float(np.mean(values))
+        metrics[f"{prefix}{name}_min"] = float(np.min(values))
+        metrics[f"{prefix}{name}_max"] = float(np.max(values))
+        for percentile in (25, 50, 75):
+            metrics[f"{prefix}{name}_p{percentile}"] = float(np.percentile(values, percentile))
+    return metrics
 
 
 def _iter_response_diversity_groups(args, samples):
@@ -190,29 +285,9 @@ def _compute_exp_rollout_metrics(args, samples: list[Sample]) -> dict[str, float
         [(sample.metadata or {}).get("multi_turn_reward") for sample in non_pad_samples],
     )
     add_stats(
-        "reward/overlong_penalty",
-        [(sample.metadata or {}).get("overlong_penalty", 0.0) for sample in non_pad_samples],
+        "reward/length_score",
+        [(sample.metadata or {}).get("length_score", 0.0) for sample in non_pad_samples],
     )
-    component_keys = (
-        "correctness",
-        "performance",
-        "coverage",
-        "failed",
-        "overlong_penalty",
-    )
-    for component in component_keys:
-        add_stats(
-            f"reward/component/{component}",
-            [
-                (
-                    (sample.metadata or {}).get("reward_component", {}).get(component)
-                    if isinstance((sample.metadata or {}).get("reward_component"), dict)
-                    else None
-                )
-                for sample in non_pad_samples
-            ],
-        )
-
     outcomes = [_kernel_outcome_class(sample) for sample in non_pad_samples]
     for outcome in _KERNEL_OUTCOMES:
         metrics[f"{prefix}/reward/outcome/{outcome}_fraction"] = outcomes.count(outcome) / len(outcomes)
@@ -378,7 +453,7 @@ def _compute_kernel_agent_metrics(samples):
     values_by_key = {}
     decoy_reason_count = {}
     incorrect_backend_probe_skip_reason_count = {}
-    overlong_penalty_values = []
+    length_score_values = []
     time_values = {
         "model_time": [],
         "env_time": [],
@@ -416,9 +491,9 @@ def _compute_kernel_agent_metrics(samples):
     for sample in samples:
         metadata = sample.metadata or {}
         record_reason(kernel_failed_score_tag_count, metadata.get("kernel_failed_score_tag"))
-        overlong_penalty = metadata.get("overlong_penalty")
-        if isinstance(overlong_penalty, (int, float)) and not isinstance(overlong_penalty, bool):
-            overlong_penalty_values.append(float(overlong_penalty))
+        length_score = metadata.get("length_score")
+        if isinstance(length_score, (int, float)) and not isinstance(length_score, bool):
+            length_score_values.append(float(length_score))
         coverage_masked = sample.remove_sample and metadata.get("remove_reason") == "coverage_rs"
         conditional_masked = bool(metadata.get("conditional_truncation_masked"))
         coverage_rs_masked_count += int(coverage_masked)
@@ -543,8 +618,8 @@ def _compute_kernel_agent_metrics(samples):
             metrics["kernel/incorrect_backend_probe/decoy_detected_ratio_of_valid"] = (
                 incorrect_backend_probe_decoy_detected_count / incorrect_backend_probe_valid_count
             )
-    if overlong_penalty_values:
-        metrics["kernel/overlong_penalty/mean"] = np.mean(overlong_penalty_values).item()
+    if length_score_values:
+        metrics["kernel/length_score/mean"] = np.mean(length_score_values).item()
     for key, values in time_values.items():
         if not values:
             continue

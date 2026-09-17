@@ -34,7 +34,6 @@ import _cp_dist_helpers  # noqa: F401
 import pytest
 from _cp_dist_helpers import free_port, stub_megatron_in_worker
 
-
 NUM_GPUS = 0
 
 # (total_length, response_length) per sample, plus its rollout reward. Eight
@@ -61,7 +60,7 @@ class _Args:
     lambd = 1.0
 
 
-def _whiten_worker(rank, world_size, cp_size, dp_size, master_port, result_dir):
+def _whiten_worker(rank, world_size, cp_size, dp_size, master_port, result_dir, ctm):
     """One spawned rank: whiten its DP shard's CP slice, dump the results."""
     import torch
     import torch.distributed as _dist
@@ -117,7 +116,13 @@ def _whiten_worker(rank, world_size, cp_size, dp_size, master_port, result_dir):
             "total_lengths": [SEQS[i][0] for i in my_samples],
         }
 
-        compute_advantages_and_returns(_Args(), rollout_data)
+        args = _Args()
+        args.use_conditional_truncation_mask = ctm
+        if ctm:
+            rollout_data["conditional_truncation_masked"] = [i in {1, 3} for i in my_samples]
+        compute_advantages_and_returns(args, rollout_data)
+        for i, returns in zip(my_samples, rollout_data["returns"], strict=True):
+            torch.testing.assert_close(returns, torch.full_like(returns, REWARDS[i]))
 
         # grpo gives every token of a sample the same advantage, and whitening is
         # affine, so one value per sample fully describes the result. Ranks that
@@ -133,17 +138,17 @@ def _whiten_worker(rank, world_size, cp_size, dp_size, master_port, result_dir):
         _dist.destroy_process_group()
 
 
-def _run_case(dp_size, cp_size, tmp_path):
+def _run_case(dp_size, cp_size, tmp_path, ctm=False):
     """Spawn the world, then merge every rank's per-sample whitened values."""
     import torch.multiprocessing as mp
 
     world_size = dp_size * cp_size
-    result_dir = tmp_path / f"dp{dp_size}_cp{cp_size}"
+    result_dir = tmp_path / f"dp{dp_size}_cp{cp_size}_ctm{ctm}"
     result_dir.mkdir(parents=True, exist_ok=True)
 
     ctx = mp.spawn(
         _whiten_worker,
-        args=(world_size, cp_size, dp_size, free_port(), str(result_dir)),
+        args=(world_size, cp_size, dp_size, free_port(), str(result_dir), ctm),
         nprocs=world_size,
         join=False,
     )
@@ -187,6 +192,76 @@ def test_whitened_advantages_are_cp_invariant(dp_size, cp_size, tmp_path):
             f"dp={dp_size} cp={cp_size}: sample {sample_idx} whitened to {got[sample_idx]}, "
             f"single-rank baseline is {expected}"
         )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 1), (1, 2), (2, 2)])
+def test_ctm_masks_after_global_whitening(dp_size, cp_size, tmp_path):
+    baseline = _run_case(1, 1, tmp_path)
+    got = _run_case(dp_size, cp_size, tmp_path, ctm=True)
+    assert sorted(got) == sorted(baseline)
+    for sample_idx, expected in baseline.items():
+        assert got[sample_idx] == pytest.approx(0.0 if int(sample_idx) in {1, 3} else expected, abs=1e-5)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("normalize", [False, True])
+@pytest.mark.parametrize("opd", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ctm_is_final_advantage_mask(monkeypatch, normalize, opd, enabled):
+    import copy
+
+    import torch
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils.loss import compute_advantages_and_returns
+
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_data_parallel_group", lambda **kw: None, raising=False)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda *a, **kw: None)
+    args = _Args()
+    args.normalize_advantages = normalize
+    args.use_opd = opd
+    args.opd_kl_coef = 0.5
+    data = {
+        "log_probs": [torch.tensor([-1.0, -2.0]), torch.tensor([-3.0])],
+        "teacher_log_probs": [torch.zeros(2), torch.zeros(1)],
+        "loss_masks": [torch.ones(2), torch.ones(1)],
+        "rewards": [-1.0, 2.0],
+        "response_lengths": [2, 1],
+        "total_lengths": [4, 4],
+        "conditional_truncation_masked": [True, False],
+    }
+    baseline = copy.deepcopy(data)
+    compute_advantages_and_returns(args, baseline)
+    args.use_conditional_truncation_mask = enabled
+    compute_advantages_and_returns(args, data)
+    for i in range(2):
+        expected = torch.zeros_like(baseline["advantages"][i]) if enabled and i == 0 else baseline["advantages"][i]
+        torch.testing.assert_close(data["advantages"][i], expected)
+        torch.testing.assert_close(data["returns"][i], baseline["returns"][i])
+        torch.testing.assert_close(data["loss_masks"][i], baseline["loss_masks"][i])
+    assert data["rewards"] == baseline["rewards"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("flags", [None, [], [True, False]])
+def test_ctm_requires_aligned_training_flags(monkeypatch, flags):
+    import torch
+    from megatron.core import mpu
+
+    from slime.backends.megatron_utils.loss import compute_advantages_and_returns
+
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    args = _Args()
+    args.normalize_advantages = False
+    args.use_conditional_truncation_mask = True
+    data = {"log_probs": [torch.zeros(2)], "rewards": [1.0]}
+    if flags is not None:
+        data["conditional_truncation_masked"] = flags
+    with pytest.raises(ValueError, match="one conditional_truncation_masked flag per training sample"):
+        compute_advantages_and_returns(args, data)
 
 
 if __name__ == "__main__":

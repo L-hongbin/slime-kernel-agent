@@ -12,7 +12,6 @@ export CUDA_AGENT_SPEEDUP_SCORE_MODE="${CUDA_AGENT_SPEEDUP_SCORE_MODE:-legacy}"
 export CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE="${CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE:-1.96}"
 export CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR="${CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR:-0.0}"
 export CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS="${CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS:-1}"
-export CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT="${CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT:-1}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # MODEL CONFIG
@@ -99,6 +98,8 @@ if [[ ! -f "${TURN_PROMPT_PATH}" ]]; then
    echo "TURN_PROMPT_PATH does not exist or is not a regular file: ${TURN_PROMPT_PATH}" >&2
    exit 1
 fi
+ROLLOUT_NO_PROGRESS_WARN_SECONDS="${ROLLOUT_NO_PROGRESS_WARN_SECONDS:-900}"
+ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS="${ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS:-7200}"
 
 case "${LOSS_MODE}" in
     cispo)
@@ -319,6 +320,8 @@ ROLLOUT_ARGS=(
    --rollout-shuffle
    --num-rollout 3000
    --rollout-batch-size 16
+   --rollout-no-progress-warn-seconds "$ROLLOUT_NO_PROGRESS_WARN_SECONDS"
+   --rollout-no-progress-timeout-seconds "$ROLLOUT_NO_PROGRESS_TIMEOUT_SECONDS"
    --n-samples-per-prompt 16
    --rollout-max-response-len $MAX_RESPONSE_LEN
    --rollout-max-context-len $CONTEXT_LEN
@@ -399,6 +402,7 @@ CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group
+   --dynamic-reward-gate None
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
    --multi-turn-prompt-config-path $TURN_PROMPT_PATH
    # TIS-related args, recommended to enable when using TIS
@@ -463,8 +467,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_AGENT_SPEEDUP_SCORE_MODE": "${CUDA_AGENT_SPEEDUP_SCORE_MODE}",
     "CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE": "${CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE}",
     "CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR": "${CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR}",
-    "CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS": "${CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS}",
-    "CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT": "${CUDA_AGENT_ENABLE_DYNAMIC_REWARD_WEIGHT}"
+    "CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS": "${CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS}"
   }
 }
 EOF_JSON

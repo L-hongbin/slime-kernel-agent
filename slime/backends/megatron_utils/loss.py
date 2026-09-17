@@ -1281,6 +1281,18 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
         chunk_lengths = [chunk.size(0) for chunk in advantages]
         advantages = list(torch.split(whitened_advs_flat, chunk_lengths))
 
+    # CTM is a final PG-advantage mask, not a reward rewrite. Apply after
+    # OPD and whitening so selected zeros cannot be shifted back to nonzero.
+    # Keep returns/loss_masks unchanged, including normalization denominators.
+    if getattr(args, "use_conditional_truncation_mask", False):
+        ctm_mask = rollout_data.get("conditional_truncation_masked")
+        if ctm_mask is None or len(ctm_mask) != len(advantages):
+            raise ValueError("CTM requires one conditional_truncation_masked flag per training sample")
+        advantages = [
+            torch.zeros_like(advantage) if masked else advantage
+            for advantage, masked in zip(advantages, ctm_mask, strict=True)
+        ]
+
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
 

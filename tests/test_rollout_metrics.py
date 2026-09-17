@@ -14,8 +14,10 @@ if repo_root_path not in sys.path:
 
 from slime.observability.rollout_metrics import (
     _compute_exp_rollout_metrics,
+    _compute_reward_component_metrics,
     _compute_top_p_kept_vocab_metrics,
     _iter_response_diversity_groups,
+    compute_metrics_from_samples,
 )
 from slime.utils.misc import decode_int32_meta_array
 from slime.utils.types import Sample
@@ -123,8 +125,93 @@ def test_exp_rollout_metrics_cover_reward_groups_turns_and_async_state():
     assert metrics["exp/rollout/sample/removed_fraction"] == pytest.approx(0.5)
     assert metrics["exp/rollout/async/engine_version_span_fraction"] == pytest.approx(0.5)
     assert metrics["exp/rollout/async/engine_version_mismatch_fraction"] == pytest.approx(0.5)
-    assert metrics["exp/rollout/reward/component/correctness/mean"] == pytest.approx(0.5)
-    assert metrics["exp/rollout/reward/component/failed/mean"] == pytest.approx(-0.25)
+    assert not any("reward/component/" in key for key in metrics)
+    component_metrics = _compute_reward_component_metrics(samples)
+    assert component_metrics["reward/component/correctness/mean"] == pytest.approx(0.5)
+    assert component_metrics["reward/component/failed/mean"] == pytest.approx(-0.25)
+
+
+@pytest.mark.parametrize("length_score", [-0.5, 0.0, 0.5])
+def test_length_score_metrics_use_signed_unified_fields(length_score):
+    from slime.observability.rollout_metrics import _compute_kernel_agent_metrics
+
+    sample = Sample(
+        reward=0.5 + length_score,
+        metadata={
+            "task_reward": 0.5,
+            "length_score": length_score,
+            "reward_component": {"correctness": 0.5, "length": length_score},
+        },
+    )
+    metrics = _compute_exp_rollout_metrics(Namespace(log_exp_metrics=True), [sample])
+    assert metrics["exp/rollout/reward/length_score/mean"] == length_score
+    assert _compute_reward_component_metrics([sample])["reward/component/length/mean"] == length_score
+    kernel_metrics = _compute_kernel_agent_metrics([sample])
+    assert kernel_metrics["kernel/length_score/mean"] == length_score
+    assert not any("overlong_penalty" in key or "length_bonus" in key for key in {*metrics, *kernel_metrics})
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_return_reward_component_metrics_are_regular_and_skip_missing_values(enabled):
+    samples = [
+        Sample(reward=0.5, metadata={"reward_component": {"return_reward": credit}}) for credit in [-0.5, 0.0, 2.0]
+    ]
+    samples.append(Sample(reward=0.5, metadata={"reward_component": {"correctness": 0.5}}))
+    args = Namespace(advantage_estimator="ppo", log_reward_category=None, log_exp_metrics=enabled)
+    metrics = compute_metrics_from_samples(args, samples)
+    prefix = "reward/component/return_reward"
+    assert metrics[f"{prefix}/mean"] == 0.5
+    assert metrics[f"{prefix}/min"] == -0.5
+    assert metrics[f"{prefix}/max"] == 2.0
+    assert not any("reward/component/" in key for key in _compute_exp_rollout_metrics(args, samples))
+
+
+@pytest.mark.parametrize("component", ["correctness", "performance", "coverage", "failed", "length", "return_reward"])
+def test_regular_reward_components_skip_padding_and_nonfinite_values(component):
+    samples = [
+        Sample(metadata={"reward_component": {component: value}})
+        for value in [-1.0, 0.0, 4.0, None, True, "2", float("nan"), float("inf")]
+    ]
+    samples.extend(
+        [
+            Sample(metadata={"is_pad_turn": True, "reward_component": {component: 999.0}}),
+            Sample(metadata={"reward_component": None}),
+            Sample(),
+        ]
+    )
+    assert _compute_reward_component_metrics(samples) == {
+        f"reward/component/{component}/mean": 1.0,
+        f"reward/component/{component}/min": -1.0,
+        f"reward/component/{component}/max": 4.0,
+    }
+    assert _compute_reward_component_metrics([]) == {}
+
+
+def test_reward_components_reach_regular_tracker_without_exp_metrics(monkeypatch):
+    from slime.observability import rollout_metrics
+
+    args = Namespace(
+        advantage_estimator="ppo",
+        log_reward_category=None,
+        log_exp_metrics=False,
+        custom_rollout_log_function_path=None,
+        load_debug_rollout_data=None,
+        wandb_always_use_train_step=False,
+    )
+    samples = [Sample(reward=1.0, metadata={"reward_component": {"correctness": 1.0, "return_reward": 0.5}})]
+    logged = []
+    monkeypatch.setattr(rollout_metrics, "compute_perf_metrics_from_samples", lambda *args: {})
+    monkeypatch.setattr(rollout_metrics, "compute_rollout_step", lambda *args: 7)
+    monkeypatch.setattr(rollout_metrics.logging_utils, "log", lambda args, metrics, **kwargs: logged.append(metrics))
+    monkeypatch.setattr(rollout_metrics.logging_utils, "log_exp_metrics", lambda *args, **kwargs: None)
+
+    rollout_metrics.log_rollout_data(7, args, samples, {}, 1.0)
+
+    assert len(logged) == 1
+    assert logged[0]["rollout/reward/component/return_reward/mean"] == 0.5
+    assert logged[0]["rollout/reward/component/correctness/mean"] == 1.0
+    assert logged[0]["rollout/step"] == 7
+    assert not any(key.startswith("exp/") for key in logged[0])
 
 
 def _b64_int32(values: list[int]) -> str:

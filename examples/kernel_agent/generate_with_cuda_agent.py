@@ -30,7 +30,7 @@ from slime.utils.types import Sample, _extract_rollout_top_p_token_data
 try:
     from .config import CUDA_AGENT_CONFIGS
     from .kernel_response import KERNEL_EVAL_DEADLINE, cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from .kernel_reward import calculate_kernel_reward
+    from .kernel_reward import calculate_kernel_reward, post_process_rollout_rewards
     from .utils import (
         _extract_env_extra_info,
         _truncate_middle,
@@ -43,7 +43,7 @@ try:
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
     from kernel_response import KERNEL_EVAL_DEADLINE, cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from kernel_reward import calculate_kernel_reward
+    from kernel_reward import calculate_kernel_reward, post_process_rollout_rewards
 
     from utils import (
         _extract_env_extra_info,
@@ -1204,8 +1204,6 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
         reward_details = calculate_kernel_reward(
             env_state,
             CUDA_AGENT_CONFIGS["reward"],
-            args=args,
-            sample=sample,
         )
 
         kernel_failed_score_tag = reward_details["kernel_failed_score_tag"]
@@ -1215,8 +1213,10 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
         kernel_score = {key: float(value) for key, value in reward_details["kernel_score"].items()}
         metadata.update(
             {
+                # Freeze the base score before any length or group reward shaping.
+                "raw_task_reward": float(reward_details["raw_task_reward"]),
                 "task_reward": float(reward_details["task_reward"]),
-                "overlong_penalty": float(reward_details["overlong_penalty"]),
+                "length_score": float(reward_details["length_score"]),
                 "overlong_prompt_len": int(reward_details["overlong_prompt_len"]),
                 "overlong_effective_response_cap": int(reward_details["overlong_effective_response_cap"]),
                 "kernel_failed_score": reward_details["kernel_failed_score"],
@@ -1230,7 +1230,10 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
             env_extra_info["kernel_failed_score_tag"] = kernel_failed_score_tag
             env_extra_info["speedup_log_standard_error"] = reward_details.get("speedup_log_standard_error")
         sample.metadata = metadata
-        return float(reward_details["reward"])
+        sample.reward = float(reward_details["reward"])
+        # Settle per-sample length shaping before group reward processing.
+        # Dynamic weights require the complete rollout and are deferred here.
+        return post_process_rollout_rewards(args, [sample], stage="sample")[0]
 
     if isinstance(samples, list):
         return [get_reward(sample) for sample in samples]

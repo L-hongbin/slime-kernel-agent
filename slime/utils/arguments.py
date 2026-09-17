@@ -16,6 +16,10 @@ from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_config
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_ROLLOUT_FUNCTION_PATH = "slime.rollout.sglang_rollout.generate_rollout"
+_KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH = "examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async"
+_KERNEL_AGENT_REWARD_ROLLOUT_PATH = "examples.kernel_agent.kernel_reward.generate_rollout"
+
 
 def _validate_rollout_no_progress_args(args) -> None:
     if getattr(args, "rollout_max_retries", 10) < 0:
@@ -27,6 +31,84 @@ def _validate_rollout_no_progress_args(args) -> None:
             raise ValueError(f"--rollout-no-progress-{name}-seconds must be finite and >= 0 (0 disables it)")
     if warn > 0 and timeout > 0 and warn >= timeout:
         raise ValueError("--rollout-no-progress-warn-seconds must be less than --rollout-no-progress-timeout-seconds")
+
+
+def _validate_difficulty_thresholds_args(args) -> None:
+    thresholds = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
+    if not thresholds or any(not math.isfinite(value) or not 0.0 < value < 1.0 for value in thresholds):
+        raise ValueError("--difficulty-thresholds must be a non-empty list of finite values strictly between 0 and 1")
+    if any(left >= right for left, right in zip(thresholds, thresholds[1:], strict=False)):
+        raise ValueError("--difficulty-thresholds must be strictly increasing")
+
+
+def _validate_rollout_reward_post_process_args(args) -> None:
+    expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+    if getattr(args, "custom_reward_post_process_path", None) == expected_path:
+        rollout_path = getattr(args, "rollout_function_path", _DEFAULT_ROLLOUT_FUNCTION_PATH)
+        if rollout_path == _DEFAULT_ROLLOUT_FUNCTION_PATH:
+            args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
+        elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
+            logger.warning("Custom kernel rollout must call post_process_rollout_rewards before group filtering")
+    gate = getattr(args, "dynamic_reward_gate", None)
+    if gate not in {None, "sqrt", "piecewise", "piecewise-sqrt"}:
+        raise ValueError("--dynamic-reward-gate must be sqrt, piecewise, or piecewise-sqrt")
+    if gate in {"piecewise", "piecewise-sqrt"}:
+        if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
+            raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
+        gate_range = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
+        if len(gate_range) != 2:
+            raise ValueError("Piecewise --dynamic-reward-gate-range requires exactly two values: min max")
+        gate_min, gate_max = gate_range
+        if not all(math.isfinite(value) for value in (gate_min, gate_max)):
+            raise ValueError("Piecewise dynamic reward gate parameters must be finite")
+        if not 0.0 <= gate_min <= 1.0 <= gate_max:
+            raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
+    overlong_penalty = getattr(args, "overlong_penalty", None)
+    if overlong_penalty not in {None, "dapo", "laser-d"}:
+        raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
+    if overlong_penalty == "dapo":
+        if args.overlong_buffer_len <= 0:
+            raise ValueError("overlong-penalty requires --overlong-buffer-len > 0")
+        if not math.isfinite(args.overlong_penalty_factor) or args.overlong_penalty_factor < 0:
+            raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
+    elif overlong_penalty == "laser-d":
+        _validate_laser_d_args(args)
+    if gate is not None or overlong_penalty is not None:
+        if getattr(args, "custom_reward_post_process_path", None) != expected_path:
+            logger.warning(
+                "Rollout reward shaping requires %s or a custom hook calling "
+                "examples.kernel_agent.kernel_reward.post_process_rollout_rewards before group filtering.",
+                expected_path,
+            )
+
+
+def _validate_laser_d_args(args) -> None:
+    _validate_difficulty_thresholds_args(args)
+    if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
+        raise ValueError("LASER-D requires exactly two --difficulty-thresholds")
+    bonus = getattr(args, "laser_d_length_score", 0.5)
+    if not math.isfinite(bonus) or bonus < 0:
+        raise ValueError("--laser-d-length-score must be finite and >= 0")
+    for name, default in (
+        ("laser_d_min_length", 1024),
+        ("laser_d_length_interval", 1024),
+        ("laser_d_update_interval", 20),
+        ("laser_d_monitor_groups", 500),
+    ):
+        if getattr(args, name, default) <= 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be > 0")
+    if getattr(args, "rollout_max_response_len", 0) < getattr(args, "laser_d_min_length", 1024):
+        raise ValueError("LASER-D requires --rollout-max-response-len >= --laser-d-min-length")
+    if not getattr(args, "rollout_global_dataset", False):
+        raise ValueError("LASER-D requires checkpointable dataset state; remove --disable-rollout-global-dataset")
+    expected_hook = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
+    if getattr(args, "custom_reward_post_process_path", None) != expected_hook:
+        raise ValueError(f"LASER-D requires --custom-reward-post-process-path {expected_hook}")
+    rollout_path = getattr(args, "rollout_function_path", _DEFAULT_ROLLOUT_FUNCTION_PATH)
+    if rollout_path == _DEFAULT_ROLLOUT_FUNCTION_PATH:
+        args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
+    elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
+        raise ValueError("LASER-D supports only the default SGLang and kernel-agent fully-async rollout paths")
 
 
 def _validate_lora_args(args) -> None:
@@ -2192,10 +2274,82 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
             )
             parser.add_argument(
+                "--dynamic-reward-gate",
+                type=lambda value: None if value == "None" else value,
+                choices=[None, "sqrt", "piecewise", "piecewise-sqrt"],
+                default=None,
+                help=(
+                    "Enable dynamic performance/coverage weighting with this gate; omitted (None) disables it. "
+                    "sqrt preserves the legacy gate. piecewise uses correctness-rate thresholds to reduce "
+                    "hard-group weights, keep middle groups unchanged, and boost easy-group weights linearly. "
+                    "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
+                    "to strengthen both tails without changing their bounds. "
+                    "Piecewise groups with fewer than two valid samples keep gate=1."
+                ),
+            )
+            parser.add_argument(
+                "--difficulty-thresholds",
+                type=float,
+                nargs="+",
+                default=[1 / 3, 2 / 3],
+                help=(
+                    "Shared difficulty-bucket boundaries expressed as group correctness rates (not 1 - correctness). "
+                    "Defaults to 1/3 and 2/3, dividing the correctness-rate range into three equal intervals. "
+                    "Values must be strictly increasing and between 0 and 1. Both piecewise dynamic reward gates "
+                    "require exactly two values: the hard upper boundary and easy lower boundary."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-reward-gate-range",
+                type=float,
+                nargs=2,
+                metavar=("MIN", "MAX"),
+                default=[0.8, 1.2],
+                help=(
+                    "Piecewise gate bounds at correctness rates 0 and 1, respectively. "
+                    "Both must be finite with 0 <= MIN <= 1 <= MAX. Ignored by sqrt mode."
+                ),
+            )
+            parser.add_argument(
                 "--overlong-penalty",
-                action="store_true",
-                default=False,
-                help="Apply a linear reward penalty near the response-length cap.",
+                type=lambda value: None if value == "None" else value,
+                choices=[None, "dapo", "laser-d"],
+                default=None,
+                help=(
+                    "Length penalty method; omitted or None disables it. "
+                    "dapo applies the existing soft linear penalty near the response-length cap. "
+                    "laser-d adds a bonus to correct responses within an adaptive difficulty-dependent budget."
+                ),
+            )
+            parser.add_argument(
+                "--laser-d-length-score",
+                type=float,
+                default=0.5,
+                help="LASER-D step bonus for correct responses within budget; independent of DAPO's penalty factor.",
+            )
+            parser.add_argument(
+                "--laser-d-min-length",
+                type=int,
+                default=1024,
+                help="LASER-D budget-search lower bound and initial budget, in full response tokens.",
+            )
+            parser.add_argument(
+                "--laser-d-length-interval",
+                type=int,
+                default=1024,
+                help="LASER-D budget-search grid interval; upper bound is --rollout-max-response-len.",
+            )
+            parser.add_argument(
+                "--laser-d-update-interval",
+                type=int,
+                default=20,
+                help="Update LASER-D budgets every N rollout batches after bootstrapping from the first batch.",
+            )
+            parser.add_argument(
+                "--laser-d-monitor-groups",
+                type=int,
+                default=500,
+                help="Bounded reservoir of pre-filter prompt/turn groups per LASER-D monitoring window.",
             )
             parser.add_argument(
                 "--overlong-buffer-len",
@@ -2224,7 +2378,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Enable Conditional Truncation Masking from MicroCoder-GRPO (arXiv:2603.07777), which "
-                    "probabilistically zeros post-processed advantages for eligible max-length responses."
+                    "selects eligible max-length responses during rollout and zeros their final advantages "
+                    "after OPD and advantage normalization on the training backend."
                 ),
             )
             parser.add_argument(
@@ -2680,6 +2835,9 @@ def slime_validate_args(args):
     _validate_sequence_mis_ratio_source(args)
     args.eval_datasets = _resolve_eval_datasets(args)
 
+    _validate_difficulty_thresholds_args(args)
+    _validate_rollout_reward_post_process_args(args)
+
     conditional_truncation_mask_prob = getattr(args, "conditional_truncation_mask_prob", 0.1)
     assert 0.0 <= conditional_truncation_mask_prob <= 1.0, "conditional_truncation_mask_prob must be in [0, 1]."
     if getattr(args, "use_conditional_truncation_mask", False):
@@ -2687,9 +2845,9 @@ def slime_validate_args(args):
         expected_path = "examples.kernel_agent.kernel_reward.reward_post_process_by_group"
         if reward_post_process_path != expected_path:
             logger.warning(
-                "--use-conditional-truncation-mask is applied by %s, but "
+                "--use-conditional-truncation-mask selects samples through %s, but "
                 "--custom-reward-post-process-path is %r. CTM will not be applied unless the configured hook "
-                "implements equivalent post-normalization masking.",
+                "sets equivalent conditional_truncation_masked sample metadata for training-side masking.",
                 expected_path,
                 reward_post_process_path,
             )

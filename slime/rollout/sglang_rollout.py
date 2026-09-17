@@ -831,7 +831,11 @@ def _get_over_sampling_fetch_size(args: Namespace, target_data_size: int, accept
 
 
 async def generate_rollout_async(
-    args: Namespace, rollout_id: int, data_source: Callable[[int], list[list[Sample]]]
+    args: Namespace,
+    rollout_id: int,
+    data_source: Callable[[int], list[list[Sample]]],
+    *,
+    on_group_completed: Callable[[list[Sample]], None] | None = None,
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     """An example to implement the generate_rollout function for an rule based rm rollout generation.
 
@@ -912,6 +916,9 @@ async def generate_rollout_async(
                 assert state.remaining_batch_size >= 0
                 continue
             groups: list[list[Sample]] = task_group if isinstance(task_group[0], list) else [task_group]
+            if on_group_completed is not None:
+                for group in groups:
+                    on_group_completed(group)
             is_filtered = True
 
             last_turn_dynamic_filter_output = None
