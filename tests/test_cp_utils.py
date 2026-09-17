@@ -28,7 +28,6 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_sum_of_sample_mean,
 )
 
-
 NUM_GPUS = 0
 
 
@@ -174,6 +173,41 @@ def test_cp_chunking_preserves_per_rollout_mean_report(monkeypatch):
         cp_total += reducer_cp2(x_for_rank).item()
 
     assert cp_total == pytest.approx(baseline)
+
+
+@pytest.mark.parametrize("layout", ["thd", "bshd"])
+@pytest.mark.parametrize("partition_mode", ["zigzag", "contiguous"])
+def test_prompt_mean_cp_and_microbatch_gradient_invariance(monkeypatch, layout, partition_mode):
+    from megatron.core import mpu
+
+    import slime.backends.megatron_utils.cp_utils as cp
+
+    monkeypatch.setattr(cp, "_CP_PARTITION_MODE", partition_mode)
+    lengths = [8, 12, 4]
+    totals = [n + 4 for n in lengths]
+    masks = [torch.ones(n) for n in lengths]
+    masks[1][2] = 0
+    # First two samples: one prompt with two unequal trajectories. Third: another prompt.
+    denoms = torch.tensor([19.0, 19.0, 4.0])
+    values = torch.arange(24, dtype=torch.float32, requires_grad=True)
+    chunks = values.split(lengths)
+    baseline = ((chunks[0].sum() + (chunks[1] * masks[1]).sum()) / 19 + chunks[2].mean()) / 2
+    expected_grad = torch.autograd.grad(baseline, values)[0]
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 2)
+    result = 0
+    for rank in range(2):
+        monkeypatch.setattr(mpu, "get_context_parallel_rank", lambda rank=rank: rank)
+        # Separate microbatches retain the full prompt denominator and R/P scale.
+        for i, (tl, rl) in enumerate(zip(totals, lengths, strict=True)):
+            width = 24 if layout == "bshd" else None
+            offsets = get_logits_and_tokens_offset_with_cp(tl, rl, layout, width)[3]
+            local = torch.cat([chunks[i][start - 4 : end - 4] for start, end in offsets])
+            reducer = get_sum_of_sample_mean(
+                [tl], [rl], [masks[i]], denoms[i : i + 1], qkv_format=layout, max_seq_lens=[width]
+            )
+            result = result + reducer(local) * (3 / 2) / 3
+    torch.testing.assert_close(result, baseline)
+    torch.testing.assert_close(torch.autograd.grad(result, values)[0], expected_grad)
 
 
 if __name__ == "__main__":

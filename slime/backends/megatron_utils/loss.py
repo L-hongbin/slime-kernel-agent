@@ -1936,8 +1936,39 @@ def policy_loss_function(
             args.calculate_per_token_loss,
         )
 
-    # Determine pg_loss reducer: use custom if specified, otherwise default
-    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+    # MiniRL, Eq. (7): https://arxiv.org/html/2512.01374v1#S4.SS1
+    # Sum valid token losses within each response, then average responses;
+    # here a multi-turn rollout is one response unit (sum across its turns).
+    # This changes only PG aggregation, not advantages or clipping. Keep the non-per-token outer
+    # contract: loss_function / Megatron divide by rollout count, not tokens.
+    # Use post-rejection masks when present; never divide by kept-token count.
+    if getattr(args, "calculate_token_sum_loss", False):
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            calculate_per_token_loss=True,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
+    elif getattr(args, "calculate_per_prompt_loss", False):
+        # Prompt-mean aggregation, as in SkyRL and slime PR #2090:
+        # https://github.com/THUDM/slime/pull/2090
+        # Pool valid tokens across every trajectory/turn of a prompt. Keep
+        # original denominators even when TIS/RS rejects tokens afterwards.
+        if "prompt_mask_sums" not in batch or "prompt_loss_scales" not in batch:
+            raise ValueError("--calculate-per-prompt-loss requires prompt_mask_sums and prompt_loss_scales")
+        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+        pg_loss_reducer = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            sample_denoms=batch["prompt_mask_sums"],
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
+    elif getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
         # Determine which loss_masks to use for pg_loss reducer
         pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
@@ -1948,6 +1979,10 @@ def policy_loss_function(
         pg_loss_reducer = sum_of_sample_mean
 
     pg_loss = pg_loss_reducer(pg_loss)
+    if getattr(args, "calculate_per_prompt_loss", False):
+        # Every microbatch belongs to one optimizer step, hence one R/P scale.
+        # The unchanged outer /R then produces /P, including uneven groups.
+        pg_loss = pg_loss * batch["prompt_loss_scales"][0]
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 

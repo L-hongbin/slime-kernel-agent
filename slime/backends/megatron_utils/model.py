@@ -836,6 +836,8 @@ def train_one_step(
                     "max_seq_lens",
                     "teacher_log_probs",
                     "rollout_mask_sums",
+                    "prompt_mask_sums",
+                    "prompt_loss_scales",
                     "gen_weight_versions",
                     "train_weight_versions",
                     "sample_ages_seconds",

@@ -54,6 +54,55 @@ from slime.utils.seqlen_balancing import expand_bins_by_splitting, first_fit_pac
 logger = logging.getLogger(__name__)
 
 
+def build_prompt_loss_metadata(
+    group_indices: list[int | None],
+    mask_sums: list[int],
+    partitions: list[list[int]],
+    micro_batch_indices: list[list[list[int]]],
+    num_microbatches: list[int],
+    global_batch_sizes: list[int],
+) -> tuple[list[int], list[float]]:
+    """Full-prompt token denominators and R/P scales for the actual optimizer steps.
+
+    Packing may split prompts across DP ranks/microbatches, but never across
+    optimizer steps (or between a retained step and the dropped tail).
+    R is the existing outer rollout-count divisor; P counts nonempty prompts.
+    """
+    group_totals = {}
+    for group, count in zip(group_indices, mask_sums, strict=True):
+        if group is None:
+            raise ValueError("--calculate-per-prompt-loss requires Sample.group_index for every sample")
+        group_totals[group] = group_totals.get(group, 0) + count
+
+    sample_steps = [None] * len(group_indices)
+    scales = [0.0] * len(group_indices)
+    offset = 0
+    for step, (num_mbs, rollout_count) in enumerate(zip(num_microbatches, global_batch_sizes, strict=True)):
+        positions = [
+            partition[i]
+            for partition, batches in zip(partitions, micro_batch_indices, strict=True)
+            for mb in batches[offset : offset + num_mbs]
+            for i in mb
+        ]
+        prompt_count = len({group_indices[i] for i in positions if group_totals[group_indices[i]] > 0})
+        if not prompt_count:
+            raise ValueError(f"--calculate-per-prompt-loss: optimizer step {step} has no valid prompt tokens")
+        for i in positions:
+            sample_steps[i] = step
+            scales[i] = rollout_count / prompt_count
+        offset += num_mbs
+
+    group_steps = {}
+    for group, step in zip(group_indices, sample_steps, strict=True):
+        if group in group_steps and group_steps[group] != step:
+            raise ValueError(
+                f"--calculate-per-prompt-loss: prompt group {group!r} spans optimizer steps or a dropped tail; "
+                "keep each prompt group within one step (check global_batch_size and group ordering)"
+            )
+        group_steps[group] = step
+    return [group_totals[group] for group in group_indices], scales
+
+
 def _calculate_workloads(step_lengths, args):
     return [calculate_fwd_flops([sl], args) for sl in step_lengths]
 

@@ -57,6 +57,8 @@ def test_tensorize_rollout_data_for_training_normalizes_cpu_tensors():
             }
         ],
         "rollout_mask_sums": [2],
+        "prompt_mask_sums": [5],
+        "prompt_loss_scales": [1.5],
     }
 
     tensorize_rollout_data_for_training(rollout_data)
@@ -66,6 +68,9 @@ def test_tensorize_rollout_data_for_training_normalizes_cpu_tensors():
     assert rollout_data["multimodal_train_inputs"][0]["metadata"] == "unchanged"
     assert not rollout_data["multimodal_train_inputs"][0]["pixel_values"].requires_grad
     assert rollout_data["rollout_mask_sums"].dtype == torch.float32
+    assert rollout_data["prompt_mask_sums"].tolist() == [5.0]
+    assert rollout_data["prompt_loss_scales"].tolist() == [1.5]
+    assert rollout_data["prompt_loss_scales"].dtype == torch.float32
 
 
 def test_save_and_load_debug_rollout_data_round_trip(tmp_path):
