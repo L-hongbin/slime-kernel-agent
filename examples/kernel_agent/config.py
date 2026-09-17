@@ -12,7 +12,7 @@ log_slowest_info = bool(int(os.environ.get("CUDA_AGENT_LOG_SLOWEST_INFO", 1)))
 log_slowest_step_window = int(os.environ.get("CUDA_AGENT_LOG_SLOWEST_STEP_WINDOW", 100))
 log_slowest_min_delta_seconds = float(os.environ.get("CUDA_AGENT_LOG_SLOWEST_MIN_DELTA_SECONDS", 10.0))
 # KernelGym request lifecycle settings.
-kernel_eval_heartbeat_interval = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL", 60.0))
+kernel_eval_heartbeat_interval = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_HEARTBEAT_INTERVAL", 120.0))
 kernel_eval_task_timeout = float(os.environ.get("CUDA_AGENT_KERNEL_EVAL_TASK_TIMEOUT", 300.0))
 # Correctness and performance trial settings.
 num_correct_trials = int(os.environ.get("CUDA_AGENT_NUM_CORRECT_TRIALS", 5))

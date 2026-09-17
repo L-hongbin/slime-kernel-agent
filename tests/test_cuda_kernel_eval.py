@@ -1,10 +1,16 @@
 import asyncio
+import inspect
+import json
 import logging
 import os
 import sys
+import threading
+import time
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 NUM_GPUS = 0
@@ -18,7 +24,7 @@ if repo_root_path in sys.path:
     sys.path.remove(repo_root_path)
 sys.path.insert(0, repo_root_path)
 
-from examples.kernel_agent import generate_with_cuda_agent
+from examples.kernel_agent import generate_with_cuda_agent, kernel_response
 from examples.kernel_agent import utils as kernel_agent_utils
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.utils import (
@@ -541,6 +547,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
                 "response": response_with_think,
                 "env_result": env_result,
                 "format_feedback": format_feedback,
+                "reward": 1.2456 if case["feedback_compiled"] else 0.0,
             }
         ],
         finish_reason="max_turns",
@@ -703,6 +710,17 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_first_rollout", False)
     sample = Sample(prompt="hidden prompt", metadata={"uuid": "stats-only"})
+    env_result = {
+        "env_state": {"status": "completed", "error_message": "output mismatch"},
+        "env_extra_info": {
+            "precheck": "passed",
+            "detail_env_time": {"compile_time": 0.1},
+            "kernel_perf_cv": 0.02,
+            "num_coverage": 0.8,
+        },
+    }
+    sample.metadata["env_result"] = env_result
+    original_sample = deepcopy(sample.to_dict())
 
     caplog.set_level(logging.INFO, logger=generate_with_cuda_agent.logger.name)
     generate_with_cuda_agent._log_rollout_info(
@@ -717,7 +735,7 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
                 "prompt": sample.prompt,
                 "response": VALID_CUDA_AGENT_RESPONSE,
                 "reward": 0.0,
-                "env_result": {"env_state": {"status": "completed"}},
+                "env_result": env_result,
             }
         ],
         finish_reason="max_turns",
@@ -727,6 +745,17 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     assert "[turn 0] task_id=stats-only-task" in caplog.text
     assert "[turn 0] env_feedback:" in caplog.text
     assert '"status": "completed"' in caplog.text
+    feedback_records = [
+        record.getMessage() for record in caplog.records if "[turn 0] env_feedback:" in record.getMessage()
+    ]
+    assert len(feedback_records) == 1
+    assert json.loads(feedback_records[0].split("env_feedback:\n", 1)[1]) == env_result["env_state"]
+    assert "env_extra_info" not in caplog.text
+    assert "num_coverage" not in caplog.text
+    assert "precheck=passed" in caplog.text
+    assert "compile_time" in caplog.text
+    assert "kernel_perf_cv" in caplog.text
+    assert sample.to_dict() == original_sample
     assert "[prompt]:" not in caplog.text
     assert "[turn 0] user_content:" not in caplog.text
     assert "response_content" not in caplog.text
@@ -751,6 +780,61 @@ def test_normalize_env_feedback_strips_compile_worker_routing_metadata():
     )
 
     assert normalized["metadata"] == {"compilation_error_detail": "other"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error_message,metadata_error,removed",
+    [
+        ("CUDA fault", "CUDA fault", True),
+        ("Task processing failed: CUDA fault\nadditional detail", "CUDA fault", True),
+        ("CUDA fault", "CUDA fault\nadditional detail", False),
+        ("CUDA fault", "different error", False),
+        (None, "CUDA fault", False),
+        ("", "CUDA fault", False),
+        ("CUDA fault", "", False),
+        ("CUDA fault", None, False),
+        ("CUDA fault", {"detail": "CUDA fault"}, False),
+    ],
+)
+def test_strip_env_feedback_drops_only_contained_metadata_error(error_message, metadata_error, removed):
+    raw = {"error_message": error_message, "metadata": {"error": metadata_error, "keep": "detail"}}
+
+    cleaned = kernel_agent_utils._strip_env_feedback_fields(raw)
+
+    assert cleaned["error_message"] == error_message
+    assert cleaned["metadata"]["keep"] == "detail"
+    assert ("error" not in cleaned["metadata"]) is removed
+    if not removed:
+        assert cleaned["metadata"]["error"] == metadata_error
+    assert raw["metadata"] == {"error": metadata_error, "keep": "detail"}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("already_in_message", [False, True])
+def test_normalize_env_feedback_preserves_error_detail_once(already_in_message):
+    detail = (
+        "Task processing failed: CudaFinalSyncError: CUDA final synchronize failed: "
+        "CUDA error: an illegal memory access was encountered"
+    )
+    raw = {
+        "status": "failed",
+        "compiled": True,
+        "correctness": False,
+        "error_code": "RUNTIME_ERROR",
+        "error_message": detail if already_in_message else "Kernel execution failed",
+        "speedup": 0.0,
+        "metadata": {"error": detail},
+    }
+
+    normalized, _ = normalize_env_feedback(raw)
+
+    assert normalized["error"] == "RUNTIME_ERROR"
+    assert normalized["error_message"].count(detail) == 1
+    if not already_in_message:
+        assert normalized["error_message"].startswith("Kernel execution failed")
+    assert "error" not in normalized["metadata"]
+    assert raw["metadata"]["error"] == detail
 
 
 @pytest.mark.unit
@@ -1251,6 +1335,571 @@ def test_kernel_agent_metrics_reuse_kernel_time_for_detail_env_time():
     assert metrics["kernel/time/detail_env_time/runtime_sanitizer_time_s/sum"] == pytest.approx(12.0)
     assert metrics["kernel/time/detail_env_time/refer_runtime/max"] == pytest.approx(3000.0)
     assert metrics["sample_mask/conditional_truncation_masked_fraction"] == pytest.approx(1 / 3)
+
+
+class _LocalEvalRPC:
+    """Schedule the real actor method locally without starting a Ray cluster."""
+
+    def __init__(self, method):
+        self.method = method
+
+    def remote(self, *args, **kwargs):
+        async def invoke():
+            result = self.method(*args, **kwargs)
+            return await result if inspect.isawaitable(result) else result
+
+        return asyncio.create_task(invoke())
+
+
+@pytest.fixture
+def local_eval_worker(monkeypatch):
+    limiter_cls = kernel_response._TokenBucketWorker.__ray_metadata__.modified_class
+    limiter = limiter_cls(1)
+    worker_cls = kernel_response._HybridHttpWorker.__ray_metadata__.modified_class
+    worker = worker_cls.__new__(worker_cls)
+    worker.server_url = "http://eval.test"
+    worker.default_timeout = 1
+    worker.acquire_timeout = 1
+    worker._lock = threading.Lock()
+    worker._running = {}
+    worker._invalidated = {}
+    worker._task_status = {}
+    # HTTP behavior tests route both independent production clients through the
+    # same mock transport. Pool separation is checked separately below.
+    worker._control_client = SimpleNamespace(get=lambda *args, **kwargs: worker._client.get(*args, **kwargs))
+    worker._rate_limit_worker = SimpleNamespace(
+        **{name: _LocalEvalRPC(getattr(limiter, name)) for name in ("acquire", "release", "get_current_count")}
+    )
+    cancelled = []
+
+    def cancel(ref, **kwargs):
+        assert kwargs == {"force": False, "recursive": False}
+        cancelled.append(ref)
+        ref.cancel()
+
+    monkeypatch.setattr(kernel_response.ray, "cancel", cancel)
+
+    async def delete(*args):
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+    return worker, limiter, cancelled
+
+
+@pytest.mark.unit
+def test_kernel_eval_leases_are_idempotent_expiring_and_fence_late_acquire(local_eval_worker, monkeypatch):
+    _, limiter, _ = local_eval_worker
+    now = [100.0]
+    monkeypatch.setattr(kernel_response.time, "time", lambda: now[0])
+    assert limiter.acquire("first", 110)
+    assert limiter.acquire("first", 110)
+    assert not limiter.acquire("second", 110)
+    limiter.release("first", 110)
+    limiter.release("first", 110)
+    assert limiter.get_current_count() == 0
+    assert not limiter.acquire("first", 110)
+    # Cancellation may reach the limiter before the acquire RPC.
+    limiter.release("late", 110)
+    assert not limiter.acquire("late", 110)
+    assert limiter.acquire("second", 110)
+    assert not limiter.acquire("third", 110)
+    now[0] = 111
+    assert limiter.get_current_count() == 0
+    assert not limiter.acquire("expired", 110)
+    assert limiter.acquire("third", 120)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("invalidated", [False, True])
+def test_kernel_eval_queued_calls_do_not_post_after_deadline_or_invalidation(local_eval_worker, invalidated):
+    worker, limiter, _ = local_eval_worker
+
+    async def scenario():
+        deadline = time.time() + (10 if invalidated else -1)
+        if invalidated:
+            assert await worker.invalidate("queued", deadline) is False
+        # Deliberately no HTTP client: neither path may reach a POST.
+        result = await worker.submit_and_poll({"task_id": "queued"}, 10, 1, 0.01, deadline=deadline)
+        assert result["status"] == ("cancelled" if invalidated else "timeout")
+        assert limiter.get_current_count() == 0
+        assert not worker._running
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_eval_acquire_timeout_does_not_post_or_leak_token(local_eval_worker):
+    worker, limiter, _ = local_eval_worker
+
+    async def scenario():
+        assert limiter.acquire("occupied", time.time() + 10)
+        worker.acquire_timeout = 0.02
+        result = await worker.submit_and_poll({"task_id": "waiting"}, 1, 1, 0.01)
+        assert result["status"] == "timeout"
+        assert limiter.get_current_count() == 1
+        limiter.release("occupied", time.time() + 10)
+        assert limiter.get_current_count() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["completed", "failed", "timeout", "cancelled"])
+def test_kernel_eval_preserves_terminal_result_diagnostics(local_eval_worker, status):
+    worker, limiter, _ = local_eval_worker
+    urls = []
+
+    async def handler(request):
+        urls.append(request.url.path)
+        if request.url.path == "/evaluate":
+            return httpx.Response(409)
+        if request.url.path.startswith("/status/"):
+            return httpx.Response(200, json={"status": status})
+        return httpx.Response(200, json={"compiled": True, "correctness": False, "metadata": {"compile_s": 2.0}})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "diagnostics"}, 1, 1, 0.01)
+        assert result["status"] == status
+        assert result["compiled"] is True
+        assert result["metadata"]["compile_s"] == 2.0
+        assert urls == ["/evaluate", "/status/diagnostics", "/results/diagnostics"]
+        assert limiter.get_current_count() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_eval_invalidation_after_token_grant_prevents_post(local_eval_worker):
+    worker, limiter, _ = local_eval_worker
+
+    def acquire(lease_id, expiry):
+        granted = limiter.acquire(lease_id, expiry)
+        with worker._lock:
+            worker._invalidated["after-grant"] = expiry
+        return granted
+
+    worker._rate_limit_worker.acquire = _LocalEvalRPC(acquire)
+
+    async def scenario():
+        # No HTTP client: a cancellation observed after the grant must stop here.
+        with pytest.raises(asyncio.CancelledError):
+            await worker.submit_and_poll({"task_id": "after-grant"}, 1, 1, 0.01)
+        assert limiter.get_current_count() == 0
+        assert not worker._running
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("heartbeat_interval", [0, 0.001])
+def test_run_kernel_eval_deadline_includes_remote_queue(local_eval_worker, monkeypatch, heartbeat_interval):
+    worker, _, cancelled = local_eval_worker
+    submissions = []
+    invalidations = []
+
+    async def queued(payload, **kwargs):
+        submissions.append(kwargs)
+        await asyncio.Event().wait()
+
+    async def invalidate(task_id, deadline):
+        invalidations.append((task_id, deadline))
+        return False  # never submitted HTTP
+
+    async def blocked_query(*args):
+        await asyncio.Event().wait()
+
+    handle = SimpleNamespace(
+        submit_and_poll=_LocalEvalRPC(queued),
+        invalidate=_LocalEvalRPC(invalidate),
+        get_task_status=_LocalEvalRPC(blocked_query),
+    )
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lambda args, config: handle)
+
+    async def delete(*args):
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+    config = {
+        "kernel_env_url": worker.server_url,
+        "kernel_eval_client_timeout": 0.03,
+        "kernel_eval_cancel_timeout": 0.1,
+        "kernel_eval_max_retries": 1,
+        "kernel_eval_poll_interval": 0.01,
+        "kernel_eval_heartbeat_interval": heartbeat_interval,
+        "kernel_eval_rate_limit": 1,
+    }
+
+    async def scenario():
+        before = time.time()
+        result = await asyncio.wait_for(
+            kernel_response.run_kernel_eval(SimpleNamespace(), Sample(), {"task_id": "queued"}, config), 0.5
+        )
+        assert result["env_state"]["status"] == "timeout"
+        assert before <= submissions[0]["deadline"] <= before + 0.1
+        assert invalidations == [("queued", submissions[0]["deadline"])]
+        assert cancelled
+        assert not kernel_response._ACTIVE_EVALS
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", ["http_error", "retry", "poll_timeout"])
+def test_kernel_eval_errors_and_infinite_retries_respect_deadline_and_release(local_eval_worker, monkeypatch, failure):
+    worker, limiter, _ = local_eval_worker
+    deletes = []
+    releases = []
+    original_release = limiter.release
+
+    def release(*args):
+        releases.append(args[0])
+        original_release(*args)
+
+    worker._rate_limit_worker.release = _LocalEvalRPC(release)
+
+    async def delete(url, task_id, timeout):
+        deletes.append(task_id)
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+
+    async def handler(request):
+        if request.method == "POST":
+            return httpx.Response({"http_error": 500, "retry": 503, "poll_timeout": 200}[failure])
+        await asyncio.Event().wait()
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await asyncio.wait_for(worker.submit_and_poll({"task_id": "failed"}, 0.05, -1, 0.01), timeout=0.5)
+        assert result["status"] == ("failed" if failure == "http_error" else "timeout")
+        assert len(releases) == len(set(releases)) == 1
+        assert limiter.get_current_count() == 0
+        assert deletes == ["failed"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_eval_ready_result_is_not_blocked_by_heartbeat(local_eval_worker, monkeypatch):
+    worker, _, cancelled = local_eval_worker
+
+    async def forbidden_thread(*args, **kwargs):
+        pytest.fail("Kernel eval must not use the default thread pool")
+
+    monkeypatch.setattr(asyncio, "to_thread", forbidden_thread)
+
+    async def scenario():
+        querying = asyncio.Event()
+
+        async def blocked_query(*args):
+            querying.set()
+            await asyncio.Event().wait()
+
+        handle = SimpleNamespace(get_task_status=_LocalEvalRPC(blocked_query))
+        result = asyncio.get_running_loop().create_future()
+        waiting = asyncio.create_task(
+            kernel_response._wait_kernel_eval_result(result, handle, {"task_id": "heartbeat"}, 0.001, 1, 0.5)
+        )
+        await asyncio.wait_for(querying.wait(), 0.2)
+        result.set_result({"status": "completed", "compiled": True})
+        returned = await asyncio.wait_for(waiting, 0.2)
+        assert returned["compiled"] is True
+        assert cancelled  # outstanding heartbeat RPC was cancelled as well
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("exit_mode", ["cancel", "timeout", "exception"])
+def test_run_kernel_eval_cleans_ray_and_http_on_every_abnormal_exit(local_eval_worker, monkeypatch, exit_mode):
+    worker, limiter, cancelled = local_eval_worker
+    deletes = []
+    handle = SimpleNamespace(
+        submit_and_poll=_LocalEvalRPC(worker.submit_and_poll), invalidate=_LocalEvalRPC(worker.invalidate)
+    )
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lambda args, config: handle)
+
+    async def delete(url, task_id, timeout):
+        deletes.append(task_id)
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+    config = {
+        "kernel_env_url": worker.server_url,
+        "kernel_eval_client_timeout": 0.05 if exit_mode == "timeout" else 10,
+        "kernel_eval_cancel_timeout": 0.2,
+        "kernel_eval_max_retries": 1,
+        "kernel_eval_poll_interval": 0.01,
+        "kernel_eval_heartbeat_interval": 0,
+        "kernel_eval_rate_limit": 1,
+    }
+
+    async def scenario():
+        submitted = asyncio.Event()
+
+        async def handler(request):
+            submitted.set()
+            await asyncio.Event().wait()
+
+        if exit_mode == "exception":
+
+            async def failed_wait(*args, **kwargs):
+                await submitted.wait()
+                raise RuntimeError("failed result wait")
+
+            monkeypatch.setattr(kernel_response, "_wait_kernel_eval_result", failed_wait)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            task = asyncio.create_task(
+                kernel_response.run_kernel_eval(SimpleNamespace(), Sample(), {"task_id": "running"}, config)
+            )
+            await asyncio.wait_for(submitted.wait(), 0.5)
+            if exit_mode == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif exit_mode == "exception":
+                with pytest.raises(RuntimeError, match="failed result wait"):
+                    await task
+            else:
+                assert (await asyncio.wait_for(task, 0.5))["env_state"]["status"] == "timeout"
+            # A second cancellation may leave shielded, bounded cleanup finishing.
+            async with asyncio.timeout(0.5):
+                while kernel_response._CLEANUP_TASKS or worker._running:
+                    await asyncio.sleep(0.001)
+        assert cancelled
+        assert deletes and set(deletes) == {"running"}
+        assert "running" in worker._invalidated
+        assert not kernel_response._ACTIVE_EVALS
+        assert limiter.get_current_count() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_eval_delete_retries_404_and_has_total_timeout(monkeypatch):
+    client_class = httpx.AsyncClient
+    attempts = []
+
+    async def handler(request):
+        attempts.append(request.method)
+        return httpx.Response(404 if len(attempts) == 1 else 200)
+
+    monkeypatch.setattr(
+        kernel_response.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    assert asyncio.run(kernel_response._delete_server_task("http://eval.test", "late", 0.5))
+    assert attempts == ["DELETE", "DELETE"]
+
+    async def missing(request):
+        return httpx.Response(404)
+
+    monkeypatch.setattr(
+        kernel_response.httpx,
+        "AsyncClient",
+        lambda **kwargs: client_class(transport=httpx.MockTransport(missing), **kwargs),
+    )
+    assert asyncio.run(kernel_response._delete_server_task("http://eval.test", "missing", 0.02)) is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ray_cancel_raises", [False, True])
+def test_cancel_queued_call_always_installs_server_tombstone(
+    local_eval_worker, monkeypatch, caplog, ray_cancel_raises
+):
+    worker, _, _ = local_eval_worker
+    caplog.set_level(logging.INFO)
+    deletes, invalidations = [], []
+
+    async def invalidate(task_id, deadline):
+        invalidations.append(task_id)
+        return False  # HTTP has not started; this must not skip DELETE.
+
+    async def delete(url, task_id, timeout):
+        deletes.append(task_id)
+        return True
+
+    def cancel(*args, **kwargs):
+        if ray_cancel_raises:
+            raise RuntimeError("Ray cancellation unavailable")
+
+    monkeypatch.setattr(kernel_response.ray, "cancel", cancel)
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+
+    async def scenario():
+        handle = SimpleNamespace(invalidate=_LocalEvalRPC(invalidate))
+        assert await kernel_response._cancel_eval_call(
+            handle, object(), worker.server_url, "queued", time.time() + 10, 0.1
+        )
+        assert invalidations == deletes == ["queued"]
+
+    asyncio.run(scenario())
+    assert "event=cancel_acknowledged scope=invalidation" in caplog.text
+
+
+@pytest.mark.unit
+def test_cancel_server_fence_does_not_wait_for_congested_ray_control(local_eval_worker, monkeypatch):
+    worker, _, _ = local_eval_worker
+    monkeypatch.setattr(kernel_response, "_CONTROL_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(kernel_response.ray, "cancel", lambda *args, **kwargs: None)
+
+    async def scenario():
+        release, deleted, invalidated = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def invalidate(*args):
+            await release.wait()
+            invalidated.set()
+            return False
+
+        async def delete(*args):
+            deleted.set()
+            return True
+
+        monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+        handle = SimpleNamespace(invalidate=_LocalEvalRPC(invalidate))
+        cleanup = asyncio.create_task(
+            kernel_response._cancel_eval_call(handle, object(), worker.server_url, "queued", time.time() + 1, 0.1)
+        )
+        await asyncio.wait_for(deleted.wait(), 0.1)
+        assert not invalidated.is_set()
+        assert await cleanup is False  # Server ACK alone is not a Ray invalidation ACK.
+        release.set()
+        await asyncio.wait_for(invalidated.wait(), 0.1)  # Timed-out invalidation was not discarded.
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_expired_trajectory_never_creates_ray_eval(local_eval_worker, monkeypatch):
+    worker, _, _ = local_eval_worker
+
+    def lookup(*args):
+        pytest.fail("Expired trajectories must not create Ray work")
+
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lookup)
+
+    async def scenario():
+        token = kernel_response.KERNEL_EVAL_DEADLINE.set(time.time() - 1)
+        try:
+            result = await kernel_response.run_kernel_eval(
+                SimpleNamespace(),
+                Sample(),
+                {"task_id": "expired"},
+                {
+                    "kernel_env_url": worker.server_url,
+                    "kernel_eval_client_timeout": 100,
+                },
+            )
+        finally:
+            kernel_response.KERNEL_EVAL_DEADLINE.reset(token)
+        assert result["env_state"]["status"] == "timeout"
+        assert not kernel_response._ACTIVE_EVALS
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_generate_deadline_is_inherited_and_restored(monkeypatch):
+    deadlines = []
+
+    async def impl(*args):
+        deadlines.append(kernel_response.KERNEL_EVAL_DEADLINE.get())
+        return []
+
+    monkeypatch.setattr(generate_with_cuda_agent, "_generate_impl", impl)
+    monkeypatch.setattr(generate_with_cuda_agent, "KERNEL_AGENT_GENERATE_GUARD_SEC", 100)
+
+    async def scenario():
+        deadline = time.time() + 1
+        token = kernel_response.KERNEL_EVAL_DEADLINE.set(deadline)
+        try:
+            await generate_with_cuda_agent.generate(SimpleNamespace(), Sample(), {})
+            assert deadlines == [deadline]
+            assert kernel_response.KERNEL_EVAL_DEADLINE.get() == deadline
+        finally:
+            kernel_response.KERNEL_EVAL_DEADLINE.reset(token)
+        assert kernel_response.KERNEL_EVAL_DEADLINE.get() is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_cancel_http_channel_is_bounded_and_logs_404_as_unconfirmed(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    original = httpx.AsyncClient
+    active = maximum = 0
+
+    async def handler(request):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        try:
+            await asyncio.sleep(0.01)
+            return httpx.Response(404 if request.url.path.endswith("missing") else 200)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(
+        kernel_response.httpx,
+        "AsyncClient",
+        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    async def scenario():
+        assert all(
+            await asyncio.gather(
+                *(kernel_response._delete_server_task("http://eval.test", f"t{i}", 1) for i in range(20))
+            )
+        )
+        assert maximum <= 8
+        assert not await kernel_response._delete_server_task("http://eval.test", "missing", 0.03)
+
+    asyncio.run(scenario())
+    assert "event=cancel_not_found scope=server task_id=missing" in caplog.text
+    assert "event=cancel_acknowledged scope=server task_id=missing" not in caplog.text
+    assert "event=cancel_failed scope=server task_id=missing" in caplog.text
+
+
+@pytest.mark.unit
+def test_http_poll_pool_and_ray_cancellation_slots_are_independent(monkeypatch):
+    monkeypatch.setattr(
+        kernel_response._TokenBucketWorker, "options", lambda **kwargs: SimpleNamespace(remote=lambda *args: None)
+    )
+    worker_cls = kernel_response._HybridHttpWorker.__ray_metadata__.modified_class
+
+    async def scenario():
+        worker = worker_cls("http://eval.test", 1, 10, 1)
+        try:
+            assert worker._control_client is not worker._client
+            assert worker._control_client._transport._pool._max_connections == 8
+            assert worker._client._transport._pool._max_connections == 128
+            assert worker_cls.invalidate.__ray_concurrency_group__ == "cancellation"
+            assert worker_cls.get_task_status.__ray_concurrency_group__ == "heartbeat"
+        finally:
+            await worker._control_client.aclose()
+            await worker._client.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_cancelled_server_id_is_not_polled_until_client_deadline(local_eval_worker):
+    worker, _, _ = local_eval_worker
+    paths = []
+
+    async def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(409, json={"detail": "Task was cancelled; use a new ID"})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "old"}, 100, -1, 1)
+        assert result["status"] == "cancelled"
+        assert paths == ["/evaluate"]
+
+    asyncio.run(scenario())
 
 
 if __name__ == "__main__":

@@ -6,9 +6,10 @@ import queue
 import sys
 import threading
 import time
-from argparse import Namespace
+from argparse import ArgumentParser, Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -29,11 +30,24 @@ if (examples_package := sys.modules.get("examples")) is not None and hasattr(exa
     ]
 
 from examples.kernel_agent import fully_async_rollout, generate_with_cuda_agent
+from slime.utils import arguments as slime_arguments
 from slime.utils import http_utils
 from slime.utils.types import Sample
 
 pytestmark = pytest.mark.unit
 NUM_GPUS = 0
+
+
+def test_normal_kernel_cli_has_no_verify_pipeline_options():
+    parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
+    options = parser._option_string_actions
+    assert "--capture-verify-data" not in options
+    assert "--verify-rollout-ratio" not in options
+    assert "--verify-advantage-baseline" not in options
+    assert "--load-verify-data" not in options
+    assert "--kernel-verify-max-turns" not in options
+    assert not hasattr(generate_with_cuda_agent, "_generate_with_verify_impl")
+    assert not hasattr(generate_with_cuda_agent, "generate_anchor")
 
 
 def _make_rollout_args(**overrides):
@@ -63,6 +77,165 @@ def _make_group(index: int) -> list[Sample]:
     return [sample]
 
 
+def test_no_progress_cli_defaults_and_overrides():
+    parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1"])
+    assert args.rollout_no_progress_warn_seconds == 900
+    assert args.rollout_no_progress_timeout_seconds == 7200
+    slime_arguments._validate_rollout_no_progress_args(args)
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--rollout-no-progress-warn-seconds",
+            "0",
+            "--rollout-no-progress-timeout-seconds",
+            "60",
+        ]
+    )
+    slime_arguments._validate_rollout_no_progress_args(args)
+    assert args.rollout_no_progress_timeout_seconds == 60
+
+
+@pytest.mark.parametrize(
+    "warn,timeout", [(-1, 20), (10, -1), (float("nan"), 20), (10, float("inf")), (20, 20), (21, 20)]
+)
+def test_no_progress_validation_rejects_invalid_thresholds(warn, timeout):
+    with pytest.raises(ValueError, match="rollout-no-progress"):
+        slime_arguments._validate_rollout_no_progress_args(
+            Namespace(
+                rollout_no_progress_warn_seconds=warn,
+                rollout_no_progress_timeout_seconds=timeout,
+            )
+        )
+
+
+@pytest.fixture
+def no_progress_worker(monkeypatch):
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", lambda args: Namespace(sampling_params={}))
+    args = _make_rollout_args(
+        rollout_global_dataset=True,
+        rollout_batch_size=2,
+        dynamic_sampling_filter_path=None,
+        use_multi_turn=False,
+        rollout_no_progress_warn_seconds=10,
+        rollout_no_progress_timeout_seconds=20,
+    )
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(args, None, concurrency=2)
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda *args: worker)
+    clock = [0.0]
+    # Patch only this module's clock, not asyncio's monotonic scheduler clock.
+    monkeypatch.setattr(fully_async_rollout, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time))
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(seconds):
+        await real_sleep(0)
+
+    monkeypatch.setattr(fully_async_rollout.asyncio, "sleep", fast_sleep)
+    return args, worker, clock
+
+
+def test_no_progress_warning_resets_on_accepted_group_growth(no_progress_worker, monkeypatch, caplog):
+    args, worker, clock = no_progress_worker
+    events = iter([(10, []), (11, [(0, _make_group(0))]), (20, []), (21, []), (22, [(1, _make_group(1))])])
+
+    def drain(limit):
+        clock[0], groups = next(events)
+        return groups
+
+    monkeypatch.setattr(worker, "get_completed_groups", drain)
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, 7, None))
+    assert [group[0].index for group in output.samples] == [0, 1]
+    assert output.metrics["fully_async_no_progress_warnings"] == 2
+    assert output.metrics["fully_async_max_no_progress_seconds"] == 11
+    assert caplog.text.count("no-progress warning: snapshot=") == 2
+    assert "'accepted_groups': 0" in caplog.text
+    assert "'accepted_groups': 1" in caplog.text
+    assert worker.running
+
+
+@pytest.mark.parametrize("rejected", [False, True])
+def test_no_progress_timeout_stops_even_if_completions_keep_arriving(
+    no_progress_worker, monkeypatch, caplog, rejected
+):
+    args, worker, clock = no_progress_worker
+    stop_calls = []
+
+    def drain(limit):
+        clock[0] += 5
+        if rejected:
+            worker.completed_count += 1
+            return [(int(clock[0]), _make_group(int(clock[0])))]
+        return []
+
+    def stop(*, cancel):
+        assert not worker.running  # submissions fenced before snapshot/shutdown
+        stop_calls.append(cancel)
+        return True
+
+    monkeypatch.setattr(worker, "get_completed_groups", drain)
+    monkeypatch.setattr(worker, "stop", stop)
+    if rejected:
+        args.dynamic_sampling_filter_path = "reject"
+        monkeypatch.setattr(fully_async_rollout, "load_function", lambda path: object())
+        monkeypatch.setattr(
+            fully_async_rollout, "call_dynamic_filter", lambda *args: Namespace(keep=False, reason="reject")
+        )
+    with pytest.raises(RuntimeError, match="no accepted-group progress.*collected=0/2"):
+        asyncio.run(fully_async_rollout._generate_rollout_async(args, 8, None))
+    assert clock[0] == 20
+    assert stop_calls == [True]
+    assert worker._failure_reason
+    assert caplog.text.count("no-progress warning: snapshot=") == 1
+    assert caplog.text.count("no-progress timeout: snapshot=") == 1
+    if rejected:
+        assert "'drop_reason_counts': {'reject': 4}" in caplog.text
+        assert "'examined_task_groups': 4" in caplog.text
+
+
+def test_no_progress_protection_can_be_disabled(no_progress_worker, monkeypatch, caplog):
+    args, worker, clock = no_progress_worker
+    args.rollout_no_progress_warn_seconds = args.rollout_no_progress_timeout_seconds = 0
+
+    def drain(limit):
+        clock[0] += 100_000
+        if clock[0] == 100_000:
+            return []
+        return [(0, _make_group(0)), (1, _make_group(1))]
+
+    monkeypatch.setattr(worker, "get_completed_groups", drain)
+    output = asyncio.run(fully_async_rollout._generate_rollout_async(args, 9, None))
+    assert len(output.samples) == 2
+    assert output.metrics["fully_async_no_progress_warnings"] == 0
+    assert "no-progress warning" not in caplog.text
+    assert worker.running
+
+
+def test_no_progress_snapshot_is_bounded_and_excludes_bodies(no_progress_worker):
+    _, worker, clock = no_progress_worker
+    clock[0] = 15
+    for gid in range(10):
+        group = [
+            Sample(index=i, prompt="SECRET_PROMPT", response="SECRET_KERNEL", metadata={"task_id": f"task-{i}"})
+            for i in range(10)
+        ]
+        worker._inflight[gid] = (5, group)
+        worker.output_queue.put((gid, group))
+    snapshot = worker.snapshot(limit=2)
+    assert len(snapshot["active_head"]) == len(snapshot["queued_head"]) == 2
+    assert snapshot["active_head"][0]["age_seconds"] == 10
+    assert len(snapshot["active_head"][0]["samples"]) == 2
+    assert "SECRET" not in str(snapshot)
+    assert "task-0" in str(snapshot)
+    assert snapshot["queued_groups"] == 10
+
+
+def test_no_progress_failed_worker_is_not_automatically_restarted(monkeypatch):
+    monkeypatch.setattr(fully_async_rollout, "_global_worker", Namespace(_failure_reason="stalled rollout"))
+    with pytest.raises(RuntimeError, match="stalled rollout"):
+        fully_async_rollout._get_global_worker(_make_rollout_args(), None, 0)
+
+
 def test_kernel_agent_group_concurrency_matches_client_capacity():
     args = _make_rollout_args()
 
@@ -71,6 +244,35 @@ def test_kernel_agent_group_concurrency_matches_client_capacity():
 
     assert client_concurrency == 64
     assert group_concurrency == 4
+
+
+def test_kernel_agent_logs_cuda_agent_config_once_per_process(monkeypatch, caplog):
+    class FakeThread:
+        @staticmethod
+        def is_alive():
+            return True
+
+    class FakeWorker:
+        def __init__(self, args, data_buffer, concurrency):
+            self.worker_thread = None
+
+        def set_generation_context(self, rollout_id):
+            pass
+
+        def start(self):
+            self.worker_thread = FakeThread()
+
+    monkeypatch.setattr(fully_async_rollout, "_global_worker", None)
+    monkeypatch.setattr(fully_async_rollout, "_config_logged", False)
+    monkeypatch.setattr(fully_async_rollout, "KernelAgentAsyncRolloutWorker", FakeWorker)
+    monkeypatch.setattr(fully_async_rollout, "get_sglang_client_concurrency", lambda args: 4)
+    caplog.set_level(logging.INFO, logger=fully_async_rollout.logger.name)
+
+    args = _make_rollout_args()
+    fully_async_rollout._get_global_worker(args, data_buffer=None, rollout_id=0)
+    fully_async_rollout._get_global_worker(args, data_buffer=None, rollout_id=1)
+
+    assert caplog.text.count("CUDA_AGENT_CONFIGS=") == 1
 
 
 def test_kernel_agent_rollout_leaves_surplus_completed_groups_queued(monkeypatch):
@@ -537,7 +739,8 @@ def test_kernel_agent_completed_group_drain_honors_limit():
     assert [gid for gid, _ in worker.get_completed_groups()] == [2, 3]
 
 
-def test_kernel_agent_worker_cancels_inflight_tasks_on_stop(monkeypatch):
+@pytest.mark.parametrize("cancel", [False, True])
+def test_kernel_agent_worker_cancels_inflight_tasks_on_stop(monkeypatch, cancel):
     class FakeGenerateState:
         def __init__(self, args):
             self.sampling_params = {}
@@ -575,13 +778,18 @@ def test_kernel_agent_worker_cancels_inflight_tasks_on_stop(monkeypatch):
     try:
         assert started.wait(timeout=2.0)
     finally:
-        worker.stop()
+        stopping_at = time.monotonic()
+        worker.stop(cancel=cancel)
+    if cancel:
+        assert time.monotonic() - stopping_at < 3.0
 
     assert cancelled.wait(timeout=2.0)
     assert worker.worker_thread is not None
     assert not worker.worker_thread.is_alive()
     assert worker.exception_count == 0
     assert worker.active_count == 0
+    assert not worker._inflight
+    assert worker.submitted_count == 1
 
 
 def test_kernel_agent_http_client_does_not_cancel_slow_posts():
@@ -664,6 +872,92 @@ def test_cuda_agent_sglang_post_is_fail_fast_by_default():
     assert 'rollout_request_max_retries = int(CUDA_AGENT_CONFIGS.get("rollout_request_max_retries", 60))' in source
     assert "post(url, payload, max_retries=rollout_request_max_retries)" in source
     assert "_generate_max_retries" not in source
+
+
+@pytest.mark.parametrize("failure", ["aborted", "exception", "cancelled"])
+@pytest.mark.parametrize("max_retries", [0, 2, 10])
+def test_failed_group_retries_are_bounded_and_shutdown_does_not_requeue(monkeypatch, failure, max_retries):
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", lambda args: Namespace(sampling_params={}))
+    queued = []
+    worker = fully_async_rollout.KernelAgentAsyncRolloutWorker(
+        _make_rollout_args(rollout_max_retries=max_retries),
+        SimpleNamespace(add_samples=lambda groups: queued.extend(groups)),
+    )
+    original = [Sample(index=1, prompt="original", metadata={"gen_weight_version": 1})]
+
+    class Failed:
+        def result(self):
+            if failure == "exception":
+                raise RuntimeError("synthetic infrastructure failure")
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            return [Sample(status=Sample.Status.ABORTED)]
+
+    for attempt in range(max_retries + 1):
+        worker._make_done_cb(attempt, original)(Failed())
+        if attempt < max_retries:
+            assert worker.running
+            original = queued.pop()
+            assert original[0].metadata["kernel_agent_group_retry"] == attempt + 1
+            assert original[0].prompt == "original"
+            assert original[0].status == Sample.Status.PENDING
+    assert not queued
+    assert not worker.running and worker._cancel_on_stop
+    assert worker._failure_reason and "submissions stopped" in worker._failure_reason
+    assert worker.stats()["retried_groups"] == max_retries
+    assert worker.stats()["retry_exhausted_groups"] == 1
+    worker._make_done_cb(99, original)(Failed())
+    assert not queued
+
+
+def test_group_retry_failure_propagates_without_waiting_for_no_progress_deadline(no_progress_worker):
+    args, worker, _ = no_progress_worker
+    worker._failure_reason = "retry budget exhausted"
+    with pytest.raises(RuntimeError, match="retry budget exhausted"):
+        asyncio.run(fully_async_rollout._generate_rollout_async(args, 0, None))
+    assert not worker.running
+
+
+def test_group_retry_cli_is_finite_by_default():
+    parser = slime_arguments.get_slime_extra_args_provider()(ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1"])
+    assert args.rollout_max_retries == 10
+    slime_arguments._validate_rollout_no_progress_args(args)
+    assert parser.parse_args(["--rollout-batch-size", "1", "--rollout-max-retries", "3"]).rollout_max_retries == 3
+    args.rollout_max_retries = -1
+    with pytest.raises(ValueError, match="rollout-max-retries"):
+        slime_arguments._validate_rollout_no_progress_args(args)
+
+
+def test_group_exception_cancels_sibling_trajectories(monkeypatch):
+    from slime.rollout import sglang_rollout
+
+    monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: Namespace(aborted=False))
+
+    async def scenario():
+        entered, reaped = asyncio.Event(), asyncio.Event()
+
+        async def generate(args, sample, *a, **kw):
+            if sample.index == 0:
+                await entered.wait()
+                raise RuntimeError("one trajectory failed")
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                reaped.set()
+
+        monkeypatch.setattr(sglang_rollout, "generate_and_rm", generate)
+        with pytest.raises(RuntimeError, match="one trajectory failed"):
+            await asyncio.wait_for(
+                sglang_rollout.generate_and_rm_group(
+                    Namespace(group_rm=False), [Sample(index=0), Sample(index=1)], {}
+                ),
+                1,
+            )
+        assert reaped.is_set()
+
+    asyncio.run(scenario())
 
 
 if __name__ == "__main__":

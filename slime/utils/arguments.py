@@ -17,6 +17,18 @@ from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_config
 logger = logging.getLogger(__name__)
 
 
+def _validate_rollout_no_progress_args(args) -> None:
+    if getattr(args, "rollout_max_retries", 10) < 0:
+        raise ValueError("--rollout-max-retries must be >= 0; unlimited group retry is not supported")
+    warn = float(getattr(args, "rollout_no_progress_warn_seconds", 900.0))
+    timeout = float(getattr(args, "rollout_no_progress_timeout_seconds", 7200.0))
+    for name, value in (("warn", warn), ("timeout", timeout)):
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"--rollout-no-progress-{name}-seconds must be finite and >= 0 (0 disables it)")
+    if warn > 0 and timeout > 0 and warn >= timeout:
+        raise ValueError("--rollout-no-progress-warn-seconds must be less than --rollout-no-progress-timeout-seconds")
+
+
 def _validate_lora_args(args) -> None:
     dim = int(getattr(args, "lora_dim", 0) or 0)
     alpha = getattr(args, "lora_alpha", None)
@@ -1077,6 +1089,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_fault_tolerance_arguments(parser):
+            parser.add_argument(
+                "--rollout-max-retries",
+                type=int,
+                default=10,
+                help="Maximum additional retries of a failed rollout prompt group (currently enforced by kernel-agent full-async). "
+                "0 disables retries; exhaustion stops submissions and fails the rollout instead of silently dropping data.",
+            )
+            parser.add_argument(
+                "--rollout-no-progress-warn-seconds",
+                type=float,
+                default=900.0,
+                help="Kernel-agent full-async: warn and snapshot queues after this many seconds without an accepted "
+                "prompt-group increase. Repeat at this interval while stalled; 0 disables warnings.",
+            )
+            parser.add_argument(
+                "--rollout-no-progress-timeout-seconds",
+                type=float,
+                default=7200.0,
+                help="Kernel-agent full-async: stop new submissions, cancel in-flight work and fail the rollout after "
+                "this many seconds without an accepted prompt-group increase. 0 disables the timeout.",
+            )
             parser.add_argument(
                 "--use-fault-tolerance",
                 action="store_true",
@@ -2614,6 +2647,7 @@ def _resolve_checkpoint_load_args(args) -> None:
 
 
 def slime_validate_args(args):
+    _validate_rollout_no_progress_args(args)
     validate_qwen_gdn_distributed_options(args)
     if getattr(args, "enable_fp32_lm_head", False):
         args.fp32_lm_head = True

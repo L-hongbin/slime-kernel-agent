@@ -29,8 +29,8 @@ from slime.utils.types import Sample, _extract_rollout_top_p_token_data
 
 try:
     from .config import CUDA_AGENT_CONFIGS
-    from .kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from .kernel_reward import calculate_kernel_reward, calculate_reward
+    from .kernel_response import KERNEL_EVAL_DEADLINE, cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
+    from .kernel_reward import calculate_kernel_reward
     from .utils import (
         _extract_env_extra_info,
         _truncate_middle,
@@ -42,8 +42,8 @@ try:
     )
 except ImportError:
     from config import CUDA_AGENT_CONFIGS
-    from kernel_response import cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
-    from kernel_reward import calculate_kernel_reward, calculate_reward
+    from kernel_response import KERNEL_EVAL_DEADLINE, cancel_kernel_eval, next_kernel_task_id, run_kernel_eval
+    from kernel_reward import calculate_kernel_reward
 
     from utils import (
         _extract_env_extra_info,
@@ -321,8 +321,6 @@ def _log_rollout_info(
         env_result = item.get("env_result") if isinstance(item.get("env_result"), dict) else {}
         env_state = env_result.get("env_state") if isinstance(env_result.get("env_state"), dict) else {}
         reward = item.get("reward")
-        if reward is None:
-            reward = calculate_reward(item.get("env_result", {}), CUDA_AGENT_CONFIGS["reward"])
         env_extra_info = env_result.get("env_extra_info") if isinstance(env_result.get("env_extra_info"), dict) else {}
         detail_env_time = (
             env_extra_info.get("detail_env_time") if isinstance(env_extra_info.get("detail_env_time"), dict) else {}
@@ -362,7 +360,7 @@ def _log_rollout_info(
                 "%s[turn %s] env_feedback:\n%s",
                 prefix,
                 item.get("turn_idx"),
-                _format_log_value(env_result, log_max_chars),
+                _format_log_value(env_state, log_max_chars),
             )
             continue
         logger.info(
@@ -906,32 +904,41 @@ def _abort_result(args, sample: Sample, abort_reason: str, elapsed_sec: float) -
 
 async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
     started_at = time.monotonic()
+    deadline = time.time() + KERNEL_AGENT_GENERATE_GUARD_SEC
+    inherited_deadline = KERNEL_EVAL_DEADLINE.get()
+    if inherited_deadline is not None:
+        deadline = min(deadline, inherited_deadline)
+    deadline_token = KERNEL_EVAL_DEADLINE.set(deadline)
     try:
-        async with asyncio.timeout(KERNEL_AGENT_GENERATE_GUARD_SEC):
+        async with asyncio.timeout(max(0.0, deadline - time.time())):
             return await _generate_impl(args, sample, sampling_params)
     except asyncio.TimeoutError:
         elapsed_sec = time.monotonic() - started_at
-        task_id = (sample.metadata or {}).get("task_id")
-        cancel_sent = False
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        task_id = metadata.get("task_id")
+        cancel_acknowledged = False
         if task_id:
             try:
-                cancel_sent = await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
+                cancel_acknowledged = await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to cancel KernelGYM task after generate timeout: task_id=%s error=%s", task_id, exc
                 )
         logger.warning(
-            "CUDA agent generate timed out after %.1fs (guard=%ss, task_id=%s, cancel_sent=%s)",
+            "CUDA agent event=cancel_requested reason=trajectory_timeout after %.1fs "
+            "(guard=%ss, task_id=%s, cancel_acknowledged=%s)",
             elapsed_sec,
             KERNEL_AGENT_GENERATE_GUARD_SEC,
             task_id,
-            cancel_sent,
+            cancel_acknowledged,
         )
         return _abort_result(args, sample, "wall_clock_timeout", elapsed_sec)
     except Exception as exc:  # noqa: BLE001
         elapsed_sec = time.monotonic() - started_at
         logger.exception("CUDA agent generate failed after %.1fs: %s", elapsed_sec, exc)
         return _abort_result(args, sample, f"exception:{type(exc).__name__}", elapsed_sec)
+    finally:
+        KERNEL_EVAL_DEADLINE.reset(deadline_token)
 
 
 async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) -> Sample | list[Sample]:
