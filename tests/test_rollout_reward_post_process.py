@@ -51,6 +51,96 @@ def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_no
     return manager
 
 
+@pytest.mark.parametrize("custom_kernel_hook", [False, True])
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_aggregate_reward_grouping_turns_padding_and_no_mutation(custom_kernel_hook, estimator):
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=True, grpo_std_normalization=True)
+    if custom_kernel_hook:
+        manager.custom_reward_post_process_func = reward_post_process_by_group
+    # Intentionally interleaved prompt/turn groups; ignore configured fixed N=3.
+    samples = [
+        Sample(index=i, group_index=g, reward=r, loss_mask=[1], metadata={"turn_idx": t, "return_reward": 999})
+        for i, g, t, r in [(0, 0, 0, 1), (2, 1, 0, 2), (0, 0, 1, 0), (1, 0, 0, 3), (3, 1, 0, 2), (1, 0, 1, 2)]
+    ]
+    samples += [
+        Sample(index=9, group_index=0, reward=100, remove_sample=True, metadata={"turn_idx": 0}),
+        Sample(index=10, group_index=0, reward=100, loss_mask=[0], metadata={"turn_idx": 0}),
+    ]
+    original = [s.reward for s in samples]
+    raw, advantages = manager._post_process_rewards(samples)
+    assert raw == original
+    expected = [-2, 0, -2, 2, 0, 2, 0, 0] if estimator == "tailrl" else [1, 2, 0, 5, 2, 4, 0, 0]
+    assert advantages == pytest.approx(expected)
+    assert [s.reward for s in samples] == original
+    assert all("raw_task_reward" not in s.metadata for s in samples)
+
+
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_custom_reward_output_is_used_once(estimator):
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
+    calls = []
+
+    def custom(_args, samples):
+        calls.append(len(samples))
+        return [1.0, 2.0], [2.0, 4.0]
+
+    manager.custom_reward_post_process_func = custom
+    samples = [Sample(index=i, group_index=0, reward=r) for i, r in enumerate([1, 2])]
+    raw, advantages = manager._post_process_rewards(samples)
+    assert calls == [2]
+    assert raw == [1, 2]
+    assert advantages == pytest.approx([-2, 2] if estimator == "tailrl" else [2, 6])
+
+
+def test_argmaxrl_kernel_offset_ctm_and_raw_reward_preserved():
+    manager = _make_manager(advantage_estimator="argmaxrl", use_multi_turn=False)
+    manager.args.argmaxrl_reward_offset = 1.0
+    manager.args.use_conditional_truncation_mask = True
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    samples = [Sample(index=i, group_index=0, reward=r, metadata={}) for i, r in enumerate([-1.0, 1.0])]
+    for sample in samples:
+        sample.metadata["conditional_truncation_masked"] = True
+    raw, advantages = manager._post_process_rewards(samples)
+    assert raw == [-1, 1]
+    assert advantages == [0, 4]
+    assert [s.reward for s in samples] == [-1, 1]
+    # Non-truncated samples are ineligible; calling the CTM annotator clears
+    # stale flags rather than preserving a previous selection.
+    assert all("conditional_truncation_masked" not in s.metadata for s in samples)
+
+
+@pytest.mark.parametrize("estimator", ["argmaxrl", "tailrl"])
+def test_argmaxrl_train_conversion_and_dp_shards_preserve_complete_group_weights(monkeypatch, estimator):
+    import slime.ray.rollout as rollout_module
+
+    manager = _make_manager(advantage_estimator=estimator, use_multi_turn=False)
+    manager.custom_reward_post_process_func = reward_post_process_by_group
+    manager.custom_convert_samples_to_train_data_func = None
+    manager.args.global_batch_size = 4
+    manager.args.micro_batch_size = 1
+    manager.args.use_dynamic_batch_size = False
+    manager.args.balance_data = False
+    manager.args.balance_by_flops = False
+    manager.train_parallel_config = {
+        "dp_size": 2,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    samples = [
+        Sample(index=i, rollout_id=i, group_index=i // 2, reward=r, tokens=[1, 2], response_length=1)
+        for i, r in enumerate([1.0, 3.0, 2.0, 4.0])
+    ]
+    data = manager._convert_samples_to_train_data(samples)
+    assert data["raw_reward"] == [1, 3, 2, 4]
+    assert data["rewards"] == ([-2, 2, -2, 2] if estimator == "tailrl" else [1, 5, 2, 6])
+    monkeypatch.setattr(rollout_module.ray, "put", lambda data: data)
+    shards = [box.inner for box in manager._split_train_data_by_dp(data)]
+    # Strided DP scheduling puts one candidate from each prompt on each rank.
+    assert shards[0]["rewards"] == ([-2, -2] if estimator == "tailrl" else [1, 2])
+    assert shards[1]["rewards"] == ([2, 2] if estimator == "tailrl" else [5, 6])
+
+
 def _laser_args(**overrides):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
     args.overlong_penalty = "laser-d"

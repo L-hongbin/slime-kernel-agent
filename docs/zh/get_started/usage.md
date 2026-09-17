@@ -209,6 +209,63 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 - `--calculate-per-token-loss`：slime 中默认的方案是 per sample loss，即 `mean(sum(sample_i) / len(sample_i))`，如果需要计算 per token loss，即 `sum(sum(sample_i)) / sum(len(sample_i))`，可以开启 `--calculate-per-token-loss`；
 - `--use-tis`：如果需要开启 tis（https://fengyao.notion.site/off-policy-rl），可以开启这一设置；
 
+#### ArgMaxRL advantage
+
+```bash
+--advantage-estimator argmaxrl
+# 若完整 reward 的已知下界为 -1，再加：
+--argmaxrl-reward-offset 1
+```
+
+实现参考 [ArgMaxRL](https://www.doubleai.com/research/argmaxrl-generalizing-maxrl-to-continuous-rewards)。
+直接使用已结算的聚合 reward（包括已启用的动态调权、失败评分及长度分数），不拆分 correctness、
+performance、coverage，也不额外应用 correctness gate。默认 offset 为 0；只在计算权重时加上固定
+offset，不改写 `sample.reward`、`task_reward`或组件。偏移后仍为负或非有限值时报错；
+不会按组减最小值或将负数截成零。
+
+同组 reward 降序排列 `r[1] >= ... >= r[N] >= 0`，并令 `r[N+1] = 0`：
+
+```text
+w[j] = sum((r[m] - r[m+1]) / m, m=j..N)
+A[j] = N * w[j]
+```
+
+`N` 是该组有效候选数，不是配置的固定 group size 或 turn 总数。`N*w` 适配按候选平均的约定：
+`mean(A * score) = sum(w * score)`。二值奖励退化为成功样本 `A=N/K`、失败样本 `A=0`。
+不减组均值、不除标准差，`--disable-grpo-std-normalization` 无需额外设置；
+`--normalize-advantages` 和自定义 advantage 函数会在启动时被拒绝。
+
+权重在 `RolloutManager._post_process_rewards` 中、DP 切分前按完整组计算，训练侧只广播到本地 token。
+使用 `Sample.group_index`，多轮使用 `(group_index, turn_idx)`，不累加 TRLOO `return_reward`。
+移除和全 mask 样本不参与排序且 advantage 为零；同组内同一轨迹的 fan-out 片段只计一个候选，
+要求它们携带相同 reward。自定义 reward hook 应返回未中心化的聚合分数，随后只执行一次 ArgMaxRL。
+
+现有 loss 聚合、PPO/DPPO clipping、动态过滤、CTM 和 OPD 不自动改变，因此组合后的训练不应宣称
+严格复现原文的无偏 REINFORCE 梯度。`TokenSum` 更接近原文完整 response 的 log-prob 求和；
+PerSample/PerToken/PerPrompt 会施加各自的长度归一化。相同的正 reward 仍产生非零权重，现有低方差
+过滤若开启仍可能过滤这些组。动态调权等依赖当前组的 reward 变换也属于额外变体。
+`--kl-coef` 不支持；需要 KL 正则时使用独立 `--use-kl-loss`。
+
+#### TailRL advantage
+
+使用 `--advantage-estimator tailrl`。复用上述 ArgMaxRL 的权重和分组管线，仅在每组有效独立候选之间
+增加中心化：`A = N * (w - mean(w))`，不除标准差。对齐
+[TailRL 官方 code optimization 实现](https://github.com/Zanette-Labs/TailRL/blob/5682c6ac03387355e017ce966693266bb148fa10/experiments/code_optimization/code_opt/advantages.py#L22)，
+不是官网简化伪代码中省略 N 的版本。
+
+例如 reward `[0, 1, 3]`，ArgMaxRL 的 advantage 为 `[0, 1.5, 7.5]`，TailRL 为 `[-3, -1.5, 4.5]`。
+全组同分、全零和单候选组均为零；组内有成功时，二值失败样本为 -1，成功样本为 N/K-1。
+padding、移除样本不参与均值，fan-out 片段共享同一候选的结果，不重复计数。
+
+TailRL 对 reward 的共同平移不变，支持有限负 reward，不需要也不接受非零
+`--argmaxrl-reward-offset`。内部先减组最小值再复用非负 tail 权重计算，中心化后的结果与官方公式
+等价；这个步骤只用于 TailRL，不改变原 ArgMaxRL。不修改 `sample.reward` 或 reward components。
+
+多轮仍按同题同 turn 计算，DP 切分前中心化；不折算 TRLOO 未来 reward。与 ArgMaxRL 相同，禁用
+`--normalize-advantages`；其它 loss/过滤/CTM/OPD 设置保持独立。
+组内减均值不是跨 batch whitening，也不应把这种依赖同组样本的 baseline 直接等同于原始未中心化
+ArgMaxRL 的有限样本无偏估计器。
+
 #### Kernel rollout reward 后处理
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。

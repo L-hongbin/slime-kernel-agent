@@ -1707,12 +1707,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "ppo",
                     "rloo",
                     "trloo",
+                    "argmaxrl",
+                    "tailrl",
                 ],
                 default="grpo",
                 help=(
                     "Advantage estimator to use. Note: on-policy distillation (OPD) is now orthogonal "
                     "to the advantage estimator. Use --opd-kl-coef > 0 to enable OPD on top of any estimator."
                 ),
+            )
+            parser.add_argument(
+                "--argmaxrl-reward-offset",
+                type=float,
+                default=0.0,
+                help="Fixed offset added only inside ArgMaxRL weight calculation; reward + offset must be "
+                "finite and nonnegative. Does not rewrite sample rewards. Never uses the observed group minimum.",
             )
             parser.add_argument(
                 "--multi-turn-gamma",
@@ -2802,6 +2811,26 @@ def _resolve_checkpoint_load_args(args) -> None:
 
 
 def slime_validate_args(args):
+    if getattr(args, "advantage_estimator", None) in {"argmaxrl", "tailrl"}:
+        if not math.isfinite(getattr(args, "argmaxrl_reward_offset", 0.0)):
+            raise ValueError("--argmaxrl-reward-offset must be finite")
+        if getattr(args, "normalize_advantages", False):
+            raise ValueError("ArgMaxRL/TailRL requires --normalize-advantages to be disabled to preserve its weights")
+        if getattr(args, "custom_advantage_function_path", None) is not None:
+            raise ValueError("ArgMaxRL/TailRL cannot be combined with --custom-advantage-function-path")
+        if getattr(args, "kl_coef", 0.0) != 0:
+            raise ValueError("ArgMaxRL/TailRL does not apply --kl-coef reward shaping; use --use-kl-loss instead")
+        logger.info(
+            "%s: complete-group N*w advantages from aggregate rewards; group centering=%s, no std normalization. "
+            "Loss aggregation, clipping, filtering, OPD and CTM remain independently configured.",
+            args.advantage_estimator,
+            args.advantage_estimator == "tailrl",
+        )
+    if (
+        getattr(args, "advantage_estimator", None) != "argmaxrl"
+        and getattr(args, "argmaxrl_reward_offset", 0.0) != 0.0
+    ):
+        raise ValueError("--argmaxrl-reward-offset requires --advantage-estimator argmaxrl")
     _validate_rollout_no_progress_args(args)
     validate_qwen_gdn_distributed_options(args)
     if getattr(args, "enable_fp32_lm_head", False):

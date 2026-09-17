@@ -517,6 +517,14 @@ def reward_post_process_by_group(args, samples):
     # Collectors have settled and written rewards before filtering. Never
     # recompute shaping from a filtered subset at the training boundary.
     raw_rewards = [float(sample.get_reward_value(args)) for sample in samples]
+    if args.advantage_estimator in {"argmaxrl", "tailrl"}:
+        for sample in samples:
+            if getattr(args, "use_conditional_truncation_mask", False):
+                _annotate_conditional_truncation_mask(args, sample)
+        # RolloutManager computes complete-group ArgMaxRL/TailRL advantages before DP
+        # partitioning. Preserve the settled aggregate reward, without centering,
+        # std normalization, or TRLOO future-return folding.
+        return raw_rewards, raw_rewards
     if args.advantage_estimator == "trloo" and getattr(args, "use_multi_turn", False):
         for idx, sample in enumerate(samples):
             metadata = sample.metadata or {}

@@ -3,6 +3,7 @@
 
 import math
 from argparse import Namespace
+from collections.abc import Hashable
 
 import torch
 import torch.distributed as dist
@@ -1370,6 +1371,93 @@ def compute_entropy_and_dppo_directional_moment_from_logits(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return entropy and ``sum p^2(log p + H)`` from one TP softmax pass."""
     return _VocabParallelEntropyWithDirectionalMoment.apply(logits, process_group)
+
+
+def get_argmaxrl_weights(rewards: torch.Tensor) -> torch.Tensor:
+    """ArgMaxRL's uncentered weights for one group of nonnegative rewards.
+
+    https://www.doubleai.com/research/argmaxrl-generalizing-maxrl-to-continuous-rewards
+    Descending r: w[j] = sum_{m=j..N} (r[m] - r[m+1]) / m, r[N+1] = 0.
+    Binary rewards recover C_i / K, not a GRPO mean/std-normalized advantage.
+    """
+    if rewards.ndim != 1 or not rewards.is_floating_point():
+        raise ValueError("ArgMaxRL requires a one-dimensional floating-point reward tensor")
+    if not torch.isfinite(rewards).all() or (rewards < 0).any():
+        raise ValueError("ArgMaxRL requires finite nonnegative rewards after the fixed reward offset")
+    if rewards.numel() == 0:
+        return rewards.clone()
+    sorted_rewards, order = rewards.detach().sort(descending=True)
+    gaps = sorted_rewards - torch.cat([sorted_rewards[1:], sorted_rewards.new_zeros(1)])
+    ranks = torch.arange(1, rewards.numel() + 1, dtype=rewards.dtype, device=rewards.device)
+    sorted_weights = (gaps / ranks).flip(0).cumsum(0).flip(0)
+    return torch.empty_like(sorted_weights).scatter_(0, order, sorted_weights)
+
+
+def get_argmaxrl_advantages(
+    rewards: list[float],
+    group_ids: list[Hashable],
+    rollout_ids: list[Hashable],
+    valid_mask: list[bool],
+    *,
+    reward_offset: float = 0.0,
+    center: bool = False,
+) -> list[float]:
+    """Compute complete-group scalar advantages before DP slicing.
+
+    A_i = N * w_i compensates the usual sample-mean loss's 1/N. N counts
+    valid trajectories in this group, not turns, padding, or fan-out segments.
+    Caller supplies (prompt, turn) keys for turn-level kernel training. A
+    repeated trajectory within a group must carry the same outcome reward.
+    With center=True, implements canonical TailRL: N*(w-mean(w)), without
+    std normalization. Center over unique valid candidates, not segments.
+    Reference: Zanette-Labs/TailRL, experiments/code_optimization/code_opt/advantages.py.
+    The loss aggregation and PPO/DPPO surrogate are left to the caller.
+    """
+    if not math.isfinite(reward_offset):
+        raise ValueError("--argmaxrl-reward-offset must be finite")
+    if center and reward_offset != 0.0:
+        raise ValueError("TailRL is translation-invariant and does not use --argmaxrl-reward-offset")
+    groups: dict[Hashable, dict[Hashable, list[int]]] = {}
+    for i, (reward, group, rollout, valid) in enumerate(zip(rewards, group_ids, rollout_ids, valid_mask, strict=True)):
+        if not valid:
+            continue
+        if group is None:
+            raise ValueError("ArgMaxRL/TailRL requires a group_index for every valid sample")
+        if center and not math.isfinite(reward):
+            raise ValueError(f"TailRL requires finite rewards; sample {i}, group {group!r}: reward={reward}")
+        if not center and (
+            not math.isfinite(reward) or not math.isfinite(reward + reward_offset) or reward + reward_offset < 0
+        ):
+            raise ValueError(
+                f"ArgMaxRL requires finite nonnegative rewards after --argmaxrl-reward-offset; "
+                f"sample {i}, group {group!r}: reward={reward}, offset={reward_offset}. "
+                "Set a fixed offset from the known reward lower bound; do not shift by the observed group minimum."
+            )
+        indices = groups.setdefault(group, {}).setdefault(rollout, [])
+        if indices and reward != rewards[indices[0]]:
+            raise ValueError(
+                "ArgMaxRL/TailRL fan-out segments of one rollout must share the same reward within a group"
+            )
+        indices.append(i)
+
+    advantages = [0.0] * len(rewards)
+    for candidates in groups.values():
+        group_rewards = torch.tensor(
+            [rewards[indices[0]] + reward_offset for indices in candidates.values()], dtype=torch.float64
+        )
+        if center:
+            # A common reward shift adds the same constant/N to every raw w,
+            # which cancels after centering. This permits signed rewards and
+            # avoids cancellation of a large common offset. Never apply this
+            # to uncentered ArgMaxRL, whose sample weights would change.
+            group_rewards = group_rewards - group_rewards.min()
+        weights = get_argmaxrl_weights(group_rewards) * len(candidates)
+        if center:
+            weights = weights - weights.mean()
+        for indices, weight in zip(candidates.values(), weights.tolist(), strict=True):
+            for i in indices:
+                advantages[i] = weight
+    return advantages
 
 
 def get_grpo_returns(
