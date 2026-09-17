@@ -27,7 +27,7 @@ from slime.observability.rollout_metrics import (
 from slime.rollout.base_types import call_rollout_fn
 from slime.rollout.sample_hooks import set_current_rollout_id
 from slime.utils.data import get_source
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, build_prompt_loss_metadata
 from slime.utils.health_monitor import RolloutHealthMonitor
 from slime.utils.http_utils import init_http_client
 from slime.utils.lora_utils import use_lora_weight_sync
@@ -718,6 +718,8 @@ class RolloutManager:
         for rid, ms in zip(rollout_id_list, mask_sums_per_sample, strict=True):
             rollout_total_mask[rid] = rollout_total_mask.get(rid, 0) + ms
         train_data["rollout_mask_sums"] = [rollout_total_mask[rid] for rid in rollout_id_list]
+        if getattr(self.args, "calculate_per_prompt_loss", False):
+            train_data["group_indices"] = [sample.group_index for sample in samples]
 
         # Overwrite raw_reward when available. Mixed-source batches may only
         # populate this field for a subset of samples (e.g. SWE but not code).
@@ -882,6 +884,18 @@ class RolloutManager:
                 rollout_indices=data["rollout_ids"],
             )
 
+        if getattr(self.args, "calculate_per_prompt_loss", False):
+            if "group_indices" not in data:
+                raise ValueError("--calculate-per-prompt-loss requires group_indices in converted train data")
+            data["prompt_mask_sums"], data["prompt_loss_scales"] = build_prompt_loss_metadata(
+                data["group_indices"],
+                [sum(mask) for mask in data["loss_masks"]],
+                partitions,
+                micro_batch_indices,
+                num_microbatches,
+                global_batch_sizes,
+            )
+
         # Package per-rank rollout_data
         rollout_data_refs = []
         for r in range(dp_size):
@@ -900,6 +914,8 @@ class RolloutManager:
                 "turn_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "prompt_mask_sums",
+                "prompt_loss_scales",
                 "rollout_log_probs",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",

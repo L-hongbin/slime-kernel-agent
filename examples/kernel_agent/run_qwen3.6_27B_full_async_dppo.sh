@@ -189,8 +189,9 @@ case "$CALC_LOSS_MODE" in
    PerToken) EXP_ARGS+=(--calculate-per-token-loss) ;;
    PerSample) ;;
    TokenSum) EXP_ARGS+=(--calculate-token-sum-loss) ;;
+   PerPrompt) EXP_ARGS+=(--calculate-per-prompt-loss) ;;
    *)
-      echo "Unknown CALC_LOSS_MODE: ${CALC_LOSS_MODE}; expected PerToken, PerSample or TokenSum." >&2
+      echo "Unknown CALC_LOSS_MODE: ${CALC_LOSS_MODE}; expected PerToken, PerSample, PerPrompt or TokenSum." >&2
       exit 1
       ;;
 esac

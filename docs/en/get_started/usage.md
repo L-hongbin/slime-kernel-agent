@@ -211,6 +211,22 @@ This flag defaults to off, requires `--loss-type policy_loss`, and is incompatib
 
 Removing length division substantially increases the PG gradient scale: recheck learning rate, gradient norms and gradient clipping when switching. KernelAgent's `run_qwen3.6_27B_full_async_dppo.sh` accepts `CALC_LOSS_MODE=TokenSum`; its default remains `PerToken`.
 
+`--calculate-per-prompt-loss` enables prompt-mean PG aggregation, following the approach in
+[slime PR #2090](https://github.com/THUDM/slime/pull/2090): pool valid token losses across all
+trajectories and turns sharing `Sample.group_index`, divide by that prompt's valid token count,
+then average nonempty prompts within each optimizer step. It defaults to off and requires Megatron
+with `--loss-type policy_loss`. It is mutually exclusive with per-token loss, token-sum loss, and
+custom PG reducers. Rewards, returns, advantages, and entropy/KL reductions are unchanged.
+
+Denominators are computed before DP/microbatch slicing and are not recomputed after TIS/RS rejection.
+The step scale uses the actual rollout count divided by the number of nonempty prompts, supporting
+uneven groups. Fully masked prompts are excluded from that prompt count; an entirely masked step
+fails explicitly. Prompts may span DP ranks/microbatches, but spanning optimizer steps or partially
+dropping a prompt at the batch tail raises an error. Keep groups contiguous and choose an appropriate
+global batch size (a multiple of group size for fixed-size groups). Custom train-data converters must
+provide `group_indices`. The KernelAgent Qwen launch script accepts `CALC_LOSS_MODE=PerPrompt`;
+its default remains `PerToken`.
+
 #### ArgMaxRL advantages
 
 Use `--advantage-estimator argmaxrl`, optionally with `--argmaxrl-reward-offset 1` if the known

@@ -123,5 +123,42 @@ def test_generate_rollout_rejects_groups_missing_routing_for_refill():
     assert _groups_missing_routing_replay(args_on, [[broken[1]]]) is True
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("turn_partitions", [False, True])
+def test_prompt_metadata_conversion_and_dp_transport(monkeypatch, enabled, turn_partitions):
+    import slime.ray.rollout as rollout_module
+
+    manager = _make_manager(use_multi_turn=True, enable_turns_dp_partitions=turn_partitions)
+    manager.args.calculate_per_prompt_loss = enabled
+    manager.args.use_rollout_routing_replay = False
+    manager.args.global_batch_size = 4
+    manager.args.micro_batch_size = 1
+    manager.args.use_dynamic_batch_size = False
+    manager.args.balance_data = False
+    manager.args.balance_by_flops = False
+    manager.train_parallel_config = {
+        "dp_size": 2,
+        "cp_size": 1,
+        "vpp_size": 1,
+        "microbatch_group_size_per_vp_stage": 1,
+    }
+    samples = [_make_sample(i, float(i), turn) for i in range(4) for turn in range(2)]
+    for sample in samples:
+        sample.rollout_id = sample.index
+    for sample in samples[-2:]:
+        sample.group_index = 1
+    data = manager._convert_samples_to_train_data(samples)
+    assert ("group_indices" in data) is enabled
+    if enabled:
+        assert data["group_indices"] == [0] * 6 + [1] * 2
+    monkeypatch.setattr(rollout_module.ray, "put", lambda data: data)
+    shards = [box.inner for box in manager._split_train_data_by_dp(data)]
+    for shard in shards:
+        assert ("prompt_mask_sums" in shard) is enabled
+        if enabled:
+            assert shard["prompt_mask_sums"].tolist() == [6.0 if i < 6 else 2.0 for i in shard["partition"]]
+            assert shard["prompt_loss_scales"].tolist() == [2.0] * len(shard["partition"])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

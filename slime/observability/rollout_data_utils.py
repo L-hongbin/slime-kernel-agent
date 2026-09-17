@@ -45,11 +45,9 @@ def tensorize_rollout_data_for_training(rollout_data: dict[str, Any]) -> None:
             for mm_dict in rollout_data["multimodal_train_inputs"]
         ]
 
-    if "rollout_mask_sums" in rollout_data:
-        rollout_data["rollout_mask_sums"] = _cpu_tensor(
-            rollout_data["rollout_mask_sums"],
-            dtype=torch.float32,
-        )
+    for key in ("rollout_mask_sums", "prompt_mask_sums", "prompt_loss_scales"):
+        if key in rollout_data:
+            rollout_data[key] = _cpu_tensor(rollout_data[key], dtype=torch.float32)
 
 
 def validate_rollout_routed_experts_for_replay(

@@ -215,6 +215,20 @@ slime 支持加载 `.jsonl` 和 `.parquet` 格式文件；读取 Parquet 需要�
 
 去掉长度分母会明显增大 PG 梯度尺度，切换时应检查学习率、梯度范数及梯度裁剪比例。KernelAgent 的 `run_qwen3.6_27B_full_async_dppo.sh` 可用 `CALC_LOSS_MODE=TokenSum` 启用；脚本默认仍是 `PerToken`。
 
+`--calculate-per-prompt-loss` 启用 prompt-mean PG 聚合，参考
+[slime PR #2090](https://github.com/THUDM/slime/pull/2090)：同一 `Sample.group_index` 下所有
+candidate、所有 turn 的有效 token loss 相加，除以该 prompt 的有效 token 总数，再对当前
+optimizer step 的非空 prompt 求平均。默认关闭，仅支持 Megatron 的 `--loss-type policy_loss`；
+不能与 per-token、token-sum 或自定义 PG reducer 同时启用。不改变 reward、return、advantage
+和 entropy/KL 的聚合方式。
+
+分母在 DP/microbatch 切分前计算，TIS/RS 后续拒绝 token 时不重新计算分母。缩放使用当前 step
+的实际轨迹数 / 非空 prompt 数，支持不等大的 group。全 mask 的 prompt 不计入 prompt 数；
+整个 step 无有效 token 时明确报错。同一 prompt 可以跨 DP rank/microbatch，但跨 optimizer step
+或尾部只保留部分 prompt 时会报错。请保持 group 连续，并选择合适的 global batch size
+（固定 group size 时可取其整数倍）。自定义训练数据转换器需提供 `group_indices`。
+KernelAgent 的 Qwen 启动脚本支持 `CALC_LOSS_MODE=PerPrompt`，默认仍为 `PerToken`。
+
 #### ArgMaxRL advantage
 
 ```bash

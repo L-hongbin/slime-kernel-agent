@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, build_prompt_loss_metadata
 
 NUM_GPUS = 0
 
@@ -408,6 +408,45 @@ def test_turn_aware_descending_order_rejects_multi_turn_trajectories():
             pack_group_atomic=True,
             group_sample_sort_keys=[0, 1],
         )
+
+
+@pytest.mark.parametrize("atomic", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_prompt_denominators_follow_real_multiturn_dp_schedule(atomic, dynamic):
+    # Each step: uneven groups with 3+1 trajectories, each having two turns.
+    groups = [10] * 6 + [20] * 2 + [30] * 2 + [40] * 6
+    rollouts = [i // 2 for i in range(16)]
+    counts = [2, 3] * 4 + [0, 0] + [2, 3] * 3
+    schedule = build_dp_schedule(
+        make_args(use_dynamic_batch_size=dynamic, max_tokens_per_gpu=32),
+        make_tp(dp_size=2),
+        [8] * len(groups),
+        global_batch_size=4,
+        rollout_indices=rollouts,
+        pack_group_atomic=atomic,
+    )
+    denoms, scales = build_prompt_loss_metadata(groups, counts, *schedule)
+    assert denoms == [15] * 6 + [5] * 2 + [0] * 2 + [15] * 6
+    # First step: R=4/P=2. Second: R=4/P=1, excluding the fully masked prompt.
+    assert scales == [2.0] * 8 + [4.0] * 8
+
+
+@pytest.mark.parametrize("groups", [[0, 1, 0, 1], [0, 0, 0, 1]])
+def test_prompt_rejects_split_optimizer_steps_or_partial_tail(groups):
+    # Only first two samples kept; a shared group extends into the dropped tail.
+    with pytest.raises(ValueError, match="spans optimizer steps or a dropped tail"):
+        build_prompt_loss_metadata(groups, [1] * 4, [[0, 1]], [[[0], [1]]], [2], [2])
+    with pytest.raises(ValueError, match="spans optimizer steps or a dropped tail"):
+        build_prompt_loss_metadata(groups, [1] * 4, [[0, 1, 2, 3]], [[[0], [1], [2], [3]]], [2, 2], [2, 2])
+
+
+def test_prompt_accepts_whole_dropped_groups_and_rejects_missing_or_empty():
+    schedule = ([[0, 1]], [[[0], [1]]], [2], [2])
+    assert build_prompt_loss_metadata([0, 0, 1], [1, 2, 3], *schedule) == ([3, 3, 3], [2.0, 2.0, 0.0])
+    with pytest.raises(ValueError, match="group_index"):
+        build_prompt_loss_metadata([0, None], [1, 2], *schedule)
+    with pytest.raises(ValueError, match="no valid prompt tokens"):
+        build_prompt_loss_metadata([0, 0], [0, 0], *schedule)
 
 
 if __name__ == "__main__":
