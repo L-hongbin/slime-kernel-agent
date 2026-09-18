@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import time
@@ -1201,6 +1202,18 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
         metadata = dict(sample.metadata or {})
         env_result = metadata.get("env_result") if isinstance(metadata.get("env_result"), dict) else {}
         env_state = env_result.get("env_state") if isinstance(env_result.get("env_state"), dict) else {}
+        if CUDA_AGENT_CONFIGS["reward"]["coverage_reward_type"] == "reference_time_coverage":
+            reference_ms = env_state.get(
+                "reference_runtime", (env_state.get("metadata") or {}).get("reference_runtime")
+            )
+            if env_state.get("correctness") and (
+                not isinstance(reference_ms, (int, float)) or not math.isfinite(reference_ms) or reference_ms <= 0
+            ):
+                # A failed reference evaluation cannot score the candidate. Exclude
+                # it from training instead of retrying the entire prompt group.
+                sample.remove_sample = True
+                metadata["remove_reason"] = "invalid_reference_runtime"
+                env_state = {**env_state, "status": "failed", "correctness": False}
         reward_details = calculate_kernel_reward(
             env_state,
             CUDA_AGENT_CONFIGS["reward"],

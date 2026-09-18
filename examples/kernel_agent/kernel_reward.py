@@ -790,7 +790,24 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
 
     number_coverage = float(num_custom_kernel) / float(num_total_kernels) if num_total_kernels else 0.0
     time_coverage = float(custom_time) / float(total_time) if total_time else 0.0
-    coverage = time_coverage if config["coverage_reward_type"] == "time_coverage" else number_coverage
+    coverage_type = config["coverage_reward_type"]
+    if coverage_type == "reference_time_coverage":
+        # KernelGym reports reference_runtime in ms and profiler kernel sums in us.
+        # Keep the reference fixed (reference cache), independent of custom speed.
+        reference_ms = result.get("reference_runtime", metadata.get("reference_runtime"))
+        if reference_ms is None or not math.isfinite(float(reference_ms)) or float(reference_ms) <= 0:
+            raise ValueError("reference_time_coverage requires positive finite reference_runtime in ms")
+        if not math.isfinite(float(total_time)) or float(total_time) <= 0:
+            raise ValueError("reference_time_coverage requires positive finite total profiling time in us")
+        if not math.isfinite(float(custom_time)) or float(custom_time) < 0:
+            raise ValueError("reference_time_coverage requires non-negative finite custom profiling time in us")
+        coverage = min(max(1.0 - (float(total_time) - float(custom_time)) / (float(reference_ms) * 1000.0), 0.0), 1.0)
+    elif coverage_type == "time_coverage":
+        coverage = time_coverage
+    elif coverage_type == "number_coverage":
+        coverage = number_coverage
+    else:
+        raise ValueError(f"Unknown coverage reward type: {coverage_type!r}")
     return {
         "coverage": coverage,
         "num_custom_kernel": num_custom_kernel,
