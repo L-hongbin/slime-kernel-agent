@@ -10,9 +10,27 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts.patch_megatron_mtp_hidden_detach import NEW, OLD
+from scripts.patch_megatron_mtp_hidden_detach import patch_file as patch_hidden_detach
 from scripts.patch_megatron_mtp_zero_token import _PATCHED_ROLL_BLOCK, _REPLACEMENTS, _ROLL_BLOCK, patch_file
 
 NUM_GPUS = 0
+
+
+def test_hidden_detach_patch_is_exact_and_idempotent(tmp_path):
+    target = tmp_path / "multi_token_prediction.py"
+    target.write_text("decoder_input = decoder_input.detach()\n" + OLD)
+    patch_hidden_detach(target)
+    assert NEW in target.read_text()
+    patch_hidden_detach(target)
+    patch_hidden_detach(target, check_only=True)
+
+
+def test_hidden_detach_patch_rejects_unknown_source(tmp_path):
+    target = tmp_path / "multi_token_prediction.py"
+    target.write_text("unknown")
+    with pytest.raises(RuntimeError, match="Unexpected MTP"):
+        patch_hidden_detach(target)
 
 
 def _fixture_source() -> str:
