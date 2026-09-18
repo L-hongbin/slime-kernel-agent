@@ -75,9 +75,9 @@ def test_cp2_bshd_support_embedding_round_trips_local_order(monkeypatch, cp_rank
             None,
             [total_length],
             [response_length],
-            "bshd",
-            [max_seq_len],
-            False,
+            allgather_cp=False,
+            qkv_format="bshd",
+            max_seq_lens=[max_seq_len],
         )
         torch.testing.assert_close(extracted[0], local)
     finally:
@@ -118,6 +118,39 @@ def test_current_support_log_probs_use_response_predictor_rows(monkeypatch, temp
     )[0]
     expected = torch.log_softmax(logits[0, 1:3] / temperature, dim=-1).gather(1, ids)
     torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("cp_rank", range(4))
+@pytest.mark.parametrize("response_length", [3, 9])
+def test_current_support_log_probs_cp4_match_dense_reference(monkeypatch, cp_rank, response_length):
+    _patch_parallel(monkeypatch, cp_size=4, cp_rank=cp_rank)
+    old_mode = cp_utils.get_cp_partition_mode()
+    cp_utils.set_cp_partition_mode(cp_utils.CP_PARTITION_ZIGZAG)
+    try:
+        logits = torch.arange(16 * 5, dtype=torch.float32).view(16, 5).sin()
+        ids = torch.arange(response_length * 3, dtype=torch.long).view(response_length, 3) % 5
+        positions = torch.cat(
+            (torch.arange(2 * cp_rank, 2 * cp_rank + 2), torch.arange(2 * (7 - cp_rank), 2 * (8 - cp_rank)))
+        )
+        local_ids = slice_log_prob_with_cp(ids, 16, response_length, "thd")
+        args = Namespace(
+            qkv_format="thd", allgather_cp=False, rollout_temperature=1.0, log_probs_chunk_size=2, vocab_size=5
+        )
+        actual = get_dppo_predictive_support_log_probs(
+            logits[positions].unsqueeze(0),
+            args=args,
+            support_token_ids=[local_ids],
+            support_valid_masks=[torch.ones_like(local_ids, dtype=torch.bool)],
+            total_lengths=[16],
+            response_lengths=[response_length],
+            max_seq_lens=None,
+        )[0]
+        response_positions = positions[(positions >= 15 - response_length) & (positions < 15)]
+        expected_ids = ids[response_positions - (15 - response_length)]
+        expected = torch.log_softmax(logits[response_positions], dim=-1).gather(1, expected_ids)
+        torch.testing.assert_close(actual, expected)
+    finally:
+        cp_utils.set_cp_partition_mode(old_mode)
 
 
 def _valid_batch(*, second_row_active=True):

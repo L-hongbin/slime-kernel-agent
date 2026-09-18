@@ -478,8 +478,13 @@ def _extract_per_sample(
     total_lengths: list[int],
     response_lengths: list[int],
     allgather_cp: bool,
+    *,
+    qkv_format: str = "thd",
+    max_seq_lens: list[int] | None = None,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
-    """Slice per-sample response log-probs/entropy from full-length 1-D tensors."""
+    """Slice response rows, preserving trailing dimensions such as Top-K support."""
+    if qkv_format == "bshd" and max_seq_lens is None:
+        raise ValueError("max_seq_lens is required for BSHD response extraction.")
     cp_size = mpu.get_context_parallel_world_size()
     log_probs_list: list[torch.Tensor] = []
     entropy_list: list[torch.Tensor] = []
@@ -487,9 +492,9 @@ def _extract_per_sample(
     if cp_size > 1 and not allgather_cp:
         # zigzag CP
         pos = 0
-        for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
+        for i, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=False)):
             chunk_size_cp, chunks_offset, logits_offset, _tokens_offset = get_logits_and_tokens_offset_with_cp(
-                total_length, response_length
+                total_length, response_length, qkv_format, max_seq_lens[i] if max_seq_lens is not None else None
             )
             lo0 = logits_offset[0][0] - chunks_offset[0][0]
             hi0 = logits_offset[0][1] - chunks_offset[0][0]
@@ -542,8 +547,8 @@ def _extract_per_sample(
     else:
         # cp1
         offset = 0
-        for total_length, response_length in zip(total_lengths, response_lengths, strict=False):
-            end = offset + total_length
+        for i, (total_length, response_length) in enumerate(zip(total_lengths, response_lengths, strict=False)):
+            end = (max_seq_lens[i] * i if qkv_format == "bshd" else offset) + total_length
             start = end - response_length
             log_probs_list.append(log_prob_full[start - 1 : end - 1])
             if entropy_full is not None:
@@ -993,9 +998,9 @@ def get_dppo_predictive_support_log_probs(
         None,
         total_lengths,
         response_lengths,
-        args.qkv_format,
-        max_seq_lens,
-        args.allgather_cp,
+        allgather_cp=args.allgather_cp,
+        qkv_format=args.qkv_format,
+        max_seq_lens=max_seq_lens,
     )
     return current
 
