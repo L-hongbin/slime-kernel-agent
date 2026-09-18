@@ -100,5 +100,42 @@ def test_fp32_lm_head_strided_sequence_gradients(batch_size, frozen_weight, sequ
         torch.testing.assert_close(model.output_layer.weight.main_grad, reference_weight.grad)
 
 
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("frozen_weight", [False, True])
+def test_fp32_lm_head_megatron_cross_entropy_gradients(monkeypatch, batch_size, frozen_weight):
+    from megatron.core.tensor_parallel import cross_entropy
+
+    monkeypatch.setattr(cross_entropy, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(cross_entropy, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(cross_entropy, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **kwargs: None)
+
+    torch.manual_seed(1234)
+    hidden = torch.randn(3, batch_size, 5, dtype=torch.bfloat16).permute(2, 1, 0).requires_grad_()
+    weight = torch.randn(7, 3, dtype=torch.bfloat16)
+    target = torch.randint(7, (5, batch_size))
+    model = SimpleNamespace(output_layer=_TinyOutputLayer(weight))
+    _enable_actor_fp32_lm_head(model)
+    output_weight = model.output_layer.weight.detach() if frozen_weight else model.output_layer.weight
+    logits, _ = model.output_layer(hidden, weight=output_weight)
+    # MTP uses Megatron's CE, which mutates FP32 logits in place and saves them for backward.
+    loss = cross_entropy.vocab_parallel_cross_entropy(logits, target).mean()
+    loss.backward()
+
+    reference_hidden = hidden.detach().float().requires_grad_()
+    reference_weight = weight.float().requires_grad_(not frozen_weight)
+    reference_logits = torch.nn.functional.linear(reference_hidden, reference_weight)
+    reference_loss = torch.nn.functional.cross_entropy(reference_logits.reshape(-1, 7), target.reshape(-1))
+    reference_loss.backward()
+
+    torch.testing.assert_close(loss, reference_loss)
+    torch.testing.assert_close(hidden.grad, reference_hidden.grad.to(hidden.dtype))
+    if frozen_weight:
+        assert model.output_layer.weight.grad is None
+        assert torch.count_nonzero(model.output_layer.weight.main_grad) == 0
+    else:
+        torch.testing.assert_close(model.output_layer.weight.main_grad, reference_weight.grad)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

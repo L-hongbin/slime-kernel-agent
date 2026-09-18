@@ -81,7 +81,11 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         # matmul can otherwise select a batch of GEMVs, especially when MTP
         # supplies a detached output weight.
         input_2d = total_input.reshape(-1, total_input.shape[-1]).float()
-        output = torch.mm(input_2d, weight.float().t()).reshape(*total_input.shape[:-1], weight.shape[0])
+        # Megatron MTP cross entropy mutates FP32 logits in place. Returning a
+        # view created inside this custom Function makes its backward illegal.
+        # Write GEMM into an owned output tensor without copying the full logits.
+        output = torch.empty((*total_input.shape[:-1], weight.shape[0]), dtype=torch.float32, device=input_2d.device)
+        torch.mm(input_2d, weight.float().t(), out=output.view(-1, weight.shape[0]))
         if bias is not None:
             output = output + bias.float()
         return output
