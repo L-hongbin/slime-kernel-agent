@@ -771,8 +771,8 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(
         assert env_state["reference_runtime"] == case["env_state"]["reference_runtime"]
         assert env_state["kernel_runtime"] == case["env_state"]["kernel_runtime"]
         assert env_state["speedup"] == case["env_state"]["speedup"]
-        assert "Compilation failed. Compiler output:" in env_state["error_message"]
-        assert "nvcc fatal: syntax error" in env_state["error_message"]
+        assert env_state["error_message"] == "Compilation failed.\n" + case["env_state"]["error_message"]
+        assert "nvcc fatal: syntax error" not in env_state["error_message"]
         assert "compile_only" not in env_state["metadata"]
         assert "device" not in env_state["metadata"]
         assert "entry_point" not in env_state["metadata"]
@@ -856,7 +856,7 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(
     _, response_content = split_think_response(response_with_think)
     assert "### CUDA_KERNELS" in response_content
     if not case["feedback_compiled"]:
-        assert "nvcc fatal: syntax error" in caplog.text
+        assert case["env_state"]["error_message"] in caplog.text
 
 
 @pytest.mark.unit
@@ -1039,6 +1039,131 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     assert "[prompt]:" not in caplog.text
     assert "[turn 0] user_content:" not in caplog.text
     assert "response_content" not in caplog.text
+
+
+@pytest.mark.unit
+def test_normalize_env_feedback_strips_ncu_filter_and_kernel_device():
+    raw = {
+        "compiled": True,
+        "correctness": True,
+        "speedup": 1.5,
+        "metadata": {
+            "ncu": {
+                "status": "ok",
+                "kernel_filter": ["copy_kernel"],
+                "profiled_kernel_count": 2,
+                "kernels": [
+                    {
+                        "name": "copy_kernel",
+                        "device": "NVIDIA GPU (0)",
+                        "metrics": {"gpu__time_duration.sum": {"value": 12.5, "unit": "us"}},
+                    },
+                    {"name": "reduce_kernel", "device": 0, "grid": [8, 1, 1]},
+                    {"name": "kernel_without_device"},
+                ],
+            }
+        },
+    }
+    original = deepcopy(raw)
+
+    normalized, _ = normalize_env_feedback(raw)
+
+    assert normalized["metadata"]["ncu"] == {
+        "status": "ok",
+        "profiled_kernel_count": 2,
+        "kernels": [
+            {"name": "copy_kernel", "duration": "12.5 us"},
+            {"name": "reduce_kernel", "grid": [8, 1, 1]},
+            {"name": "kernel_without_device"},
+        ],
+    }
+    feedback = _format_feedback_for_test({"env_state": normalized})
+    assert '"kernel_filter"' not in feedback
+    assert '"device"' not in feedback
+    assert '"duration": "12.5 us"' in feedback
+    assert raw == original
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("kernels", [None, [], [None, "unknown", {"device": 0}], "unavailable"])
+def test_normalize_ncu_filter_handles_partial_results(kernels):
+    raw = {"kernel_filter": ["copy_kernel"], "kernels": kernels, "status": "partial"}
+    original = deepcopy(raw)
+    result = kernel_agent_utils._normalize_ncu_metadata(raw)
+    assert "kernel_filter" not in result
+    assert result["status"] == "partial"
+    assert result["kernels"] == ([None, "unknown", {}] if isinstance(kernels, list) and kernels else kernels)
+    assert raw == original
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("seed_reset_enabled", [True, False])
+def test_normalize_env_feedback_strips_eval_config_metadata(seed_reset_enabled):
+    raw = {
+        "compiled": True,
+        "correctness": False,
+        "speedup": 0.0,
+        "error_code": "CORRECTNESS_ERROR",
+        "error_message": "output mismatch",
+        "metadata": {
+            "aten_allowlist_version": "v1",
+            "execution_policy": "eval_no_grad_tf32_decoy_v3",
+            "correctness_forward_seed_reset_enabled": seed_reset_enabled,
+            "max_abs_error": 0.5,
+        },
+    }
+    original = deepcopy(raw)
+
+    normalized, _ = normalize_env_feedback(raw)
+
+    assert normalized["metadata"] == {"max_abs_error": 0.5}
+    assert "output mismatch" in normalized["error_message"]
+    assert normalized["correctness"] is False
+    assert raw == original
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "error_message,compilation_error,artifact_compilation_error,artifact_error,expected",
+    [
+        ("top", "metadata", "artifact compile", "artifact error", "Compilation failed.\ntop"),
+        (None, "metadata", "artifact compile", "artifact error", "Compilation failed.\nmetadata"),
+        (None, None, "artifact compile", "artifact error", "Compilation failed.\nartifact compile"),
+        (None, None, None, "artifact error", "Compilation failed.\nartifact error"),
+        (None, None, None, None, "Compilation failed."),
+        ("", "metadata", None, None, "Compilation failed.\n"),
+        (None, "", "artifact compile", None, "Compilation failed.\n"),
+        (None, None, "", "artifact error", "Compilation failed.\n"),
+    ],
+)
+def test_compilation_error_uses_first_non_none_without_mutating_fields(
+    error_message, compilation_error, artifact_compilation_error, artifact_error, expected
+):
+    raw = {
+        "compiled": False,
+        "correctness": False,
+        "speedup": 0.0,
+        "error_message": error_message,
+        "metadata": {
+            "compilation_error": compilation_error,
+            "compile_artifact": {
+                "compilation_error": artifact_compilation_error,
+                "error": artifact_error,
+                "keep": "artifact info",
+            },
+        },
+    }
+    original = deepcopy(raw)
+    assert kernel_agent_utils._format_compilation_error_message(raw) == expected
+    assert raw == original
+
+    normalized_fields = kernel_agent_utils._normalize_env_feedback_fields(raw)
+    assert normalized_fields["error_message"] == expected
+    assert normalized_fields["metadata"] == original["metadata"]
+    cleaned = kernel_agent_utils._strip_env_feedback_fields(normalized_fields)
+    assert cleaned["metadata"] == {"compile_artifact": {"keep": "artifact info"}}
+    assert cleaned["error_message"] == expected
+    assert raw == original
 
 
 @pytest.mark.unit

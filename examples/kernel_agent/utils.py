@@ -36,6 +36,8 @@ def _truncate_middle(text: str, max_chars: int) -> str:
 
 
 METADATA_POP_KEYS = (
+    "aten_allowlist_version",
+    "execution_policy",
     "compile_only",
     "device",
     "required_resource",
@@ -52,6 +54,7 @@ METADATA_POP_KEYS = (
     "compile_artifact_cache_enabled",
     "compile_artifact_cache_hit",
     "correctness_early_stop_enabled",
+    "correctness_forward_seed_reset_enabled",
     "correctness_inplace_compare_enabled",
     "correctness_reference_cache_poison_enabled",
     "correctness_reference_alias_clone_trials",
@@ -76,6 +79,8 @@ METADATA_POP_KEYS = (
 )
 
 COMPILE_ARTIFACT_POP_KEYS = (
+    "error",
+    "compilation_error",
     "precheck",
     "compiled",
     "compile_mode",
@@ -98,6 +103,7 @@ COMPILE_ARTIFACT_POP_KEYS = (
 )
 
 NCU_POP_KEYS = (
+    "kernel_filter",
     "profile_version",
     "tool_version",
     "requested_metrics",
@@ -139,15 +145,18 @@ INCORRECT_BACKEND_PROBE_KEEP_KEYS = (
 def _format_compilation_error_message(env_state: dict[str, Any]) -> str:
     metadata = env_state.get("metadata") if isinstance(env_state.get("metadata"), dict) else {}
     compile_artifact = metadata.get("compile_artifact")
-
-    compile_error = None
-    if isinstance(compile_artifact, dict):
-        compile_error = compile_artifact.pop("error", None)
-        if "compilation_error" in compile_artifact:
-            compile_error = compile_artifact.pop("compilation_error", None)
-    if compile_error:
-        return f"Compilation failed. Compiler output:\n{compile_error}"
-    return str(env_state.get("error_message") or "Compilation failed.")
+    compile_artifact = compile_artifact if isinstance(compile_artifact, dict) else {}
+    message = "Compilation failed."
+    for detail in (
+        env_state.get("error_message"),
+        metadata.get("compilation_error"),
+        compile_artifact.get("compilation_error"),
+        compile_artifact.get("error"),
+    ):
+        if detail is not None:
+            message += f"\n{detail}"
+            break
+    return message
 
 
 def _extract_env_precheck_error_message(env_state: dict[str, Any]) -> str | None:
@@ -208,6 +217,7 @@ def _normalize_ncu_metadata(ncu_metadata: Any) -> Any:
             normalized_kernels.append(kernel)
             continue
         normalized_kernel = dict(kernel)
+        normalized_kernel.pop("device", None)
         metrics = normalized_kernel.pop("metrics", None)
         if isinstance(metrics, dict):
             for metric_name, metric_payload in metrics.items():
