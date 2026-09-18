@@ -915,6 +915,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-context-budget-nudge",
+                type=lambda value: None if value == "None" else float(value),
+                default=None,
+                help=(
+                    "Kernel-agent context reminder threshold as a remaining-budget fraction in (0, 1], e.g. 0.2 "
+                    "for 20%%. Omitted or None disables it. Requires --rollout-max-context-len > 0. "
+                    "Estimates prompt + response + cached template + feedback tokens."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-max-prompt-len",
                 type=int,
                 default=None,
@@ -2862,6 +2872,12 @@ def _resolve_checkpoint_load_args(args) -> None:
 
 
 def slime_validate_args(args):
+    nudge_ratio = getattr(args, "use_context_budget_nudge", None)
+    if nudge_ratio is not None:
+        if not math.isfinite(nudge_ratio) or not 0 < nudge_ratio <= 1:
+            raise ValueError("--use-context-budget-nudge must be None or a finite ratio in (0, 1]")
+        if (getattr(args, "rollout_max_context_len", None) or 0) <= 0:
+            raise ValueError("--use-context-budget-nudge requires --rollout-max-context-len > 0")
     if getattr(args, "advantage_estimator", None) in {"argmaxrl", "tailrl"}:
         if not math.isfinite(getattr(args, "argmaxrl_reward_offset", 0.0)):
             raise ValueError("--argmaxrl-reward-offset must be finite")

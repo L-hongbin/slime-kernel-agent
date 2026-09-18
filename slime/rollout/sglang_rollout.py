@@ -292,20 +292,27 @@ class PromptTemplate:
     FORMAT_SUFFIXES = {".yaml", ".yml"}
     JINJA_SUFFIXES = {".jinja", ".j2"}
 
-    def __init__(self, template: str, render_mode: str, source: str | None = None) -> None:
+    def __init__(self, template: str, render_mode: str, source: str | None = None, *, tokenizer=None) -> None:
         self.template = template
         self.render_mode = render_mode
         self.source = source
+        # Static source estimate (including placeholders/Jinja syntax), cached
+        # without rendering feedback-dependent expressions at initialization.
+        self.template_tokens = (
+            len(tokenizer(template, add_special_tokens=False)["input_ids"]) if tokenizer is not None else None
+        )
 
     @classmethod
-    def from_path(cls, config_path: str | None, *, prompt_name: str = "tool_response") -> "PromptTemplate | None":
+    def from_path(
+        cls, config_path: str | None, *, prompt_name: str = "tool_response", tokenizer=None
+    ) -> "PromptTemplate | None":
         if config_path is None:
             return None
 
         config_file = Path(config_path)
         suffix = config_file.suffix.lower()
         if suffix in cls.JINJA_SUFFIXES:
-            return cls(config_file.read_text(encoding="utf-8"), "jinja", str(config_file))
+            return cls(config_file.read_text(encoding="utf-8"), "jinja", str(config_file), tokenizer=tokenizer)
         if suffix not in cls.FORMAT_SUFFIXES:
             raise ValueError(
                 f"Unsupported multi_turn_prompt_config_path suffix: {config_file.suffix}. "
@@ -317,17 +324,21 @@ class PromptTemplate:
 
         for item in prompt_cfg.get("per_turn_prompts", []) or []:
             if str(item.get("name")) == prompt_name and item.get("template"):
-                return cls(str(item["template"]), "format", str(config_file))
+                return cls(str(item["template"]), "format", str(config_file), tokenizer=tokenizer)
         return None
 
-    def format(self, feedback: str, feedback_dict: dict[str, Any]) -> str:
+    def format(self, feedback: str, feedback_dict: dict[str, Any], context_budget_nudge: str = "") -> str:
         if self.render_mode == "format":
-            return self.template.format(feedback=feedback, feedback_dict=feedback_dict)
+            return self.template.format(
+                feedback=feedback, feedback_dict=feedback_dict, context_budget_nudge=context_budget_nudge
+            )
         if self.render_mode == "jinja":
             if Template is None:
                 raise RuntimeError("Jinja multi-turn prompt template requires jinja2 to be installed.")
             try:
-                return Template(self.template).render(feedback=feedback, feedback_dict=feedback_dict)
+                return Template(self.template).render(
+                    feedback=feedback, feedback_dict=feedback_dict, context_budget_nudge=context_budget_nudge
+                )
             except TemplateError:
                 raise
             except Exception as exc:
@@ -371,7 +382,9 @@ class GenerateState(metaclass=SingletonMeta):
         self.apply_chat_template_kwargs = self._get_apply_chat_template_kwargs()
         logger.info("GenerateState apply_chat_template_kwargs=%s", self.apply_chat_template_kwargs)
         self._warn_history_thinking_template()
-        self.multi_turn_template = PromptTemplate.from_path(getattr(args, "multi_turn_prompt_config_path", None))
+        self.multi_turn_template = PromptTemplate.from_path(
+            getattr(args, "multi_turn_prompt_config_path", None), tokenizer=self.tokenizer
+        )
 
         self.semaphore = asyncio.Semaphore(get_sglang_client_concurrency(args))
         self.sampling_params: dict[str, Any] = dict(

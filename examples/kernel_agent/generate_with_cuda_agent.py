@@ -98,7 +98,7 @@ DEFAULT_TOOL_RESPONSE_TEMPLATE = """Now you have received the server feedback fo
 
 Here is the server feedback. Please refer to this feedback to improve the implementation:
 Server feedback (status/metrics/errors):
-{feedback}
+{feedback}{context_budget_nudge}
 
 Modify any section as needed.
 
@@ -117,11 +117,21 @@ def _get_tool_response_template(state: GenerateState) -> PromptTemplate:
     response_template = getattr(state, "multi_turn_template", None)
     if response_template is None:
         logger.warning("multi-turn tool_response template is not set; using built-in CUDA agent prompt template.")
-        return PromptTemplate(DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in")
+        response_template = PromptTemplate(
+            DEFAULT_TOOL_RESPONSE_TEMPLATE, "format", "built-in", tokenizer=state.tokenizer
+        )
+        state.multi_turn_template = response_template
     return response_template
 
 
-def _apply_feedback_template(env_result: dict[str, Any], response_template: PromptTemplate) -> str:
+def _apply_feedback_template(
+    env_result: dict[str, Any],
+    response_template: PromptTemplate,
+    tokenizer,
+    *,
+    args=None,
+    context_length: int | None = None,
+) -> tuple[str, int, int]:
     feedback_dict = env_result.get("env_state") or env_result
     try:
         feedback = json.dumps(feedback_dict, ensure_ascii=False, indent=2)
@@ -131,7 +141,42 @@ def _apply_feedback_template(env_result: dict[str, Any], response_template: Prom
     max_chars = int(CUDA_AGENT_CONFIGS["max_feedback_chars"])
     # max_chars <= 0 means no truncation
     feedback = _truncate_middle(feedback, max_chars)
-    return response_template.format(feedback=feedback, feedback_dict=feedback_dict)
+    template_tokens = response_template.template_tokens
+    if template_tokens is None:
+        raise ValueError("Feedback template must be loaded with the rollout tokenizer")
+    feedback_tokens = len(tokenizer(feedback, add_special_tokens=False)["input_ids"])
+    context_budget_nudge = ""
+    nudge_ratio = getattr(args, "use_context_budget_nudge", None)
+    if nudge_ratio is not None:
+        if not 0 < nudge_ratio <= 1:
+            raise ValueError("--use-context-budget-nudge must be None or a finite ratio in (0, 1]")
+        max_context_len = getattr(args, "rollout_max_context_len", None)
+        if max_context_len is None or max_context_len <= 0:
+            raise ValueError("--use-context-budget-nudge requires --rollout-max-context-len > 0")
+        if context_length is None or context_length < 0:
+            raise ValueError("Context budget nudge requires the current prompt + response token count")
+        # Mercor-style context nudge: estimate the next prompt without
+        # re-rendering/tokenizing the conversation. Separate token counts omit
+        # new chat framing and the nudge; the next turn enforces the actual limit.
+        # https://github.com/Mercor-Intelligence/ApexAgents-SkyRL-Recipe
+        context_length += template_tokens + feedback_tokens
+        remaining = max_context_len - context_length
+        if 0 < remaining <= nudge_ratio * max_context_len:
+            context_budget_nudge = (
+                f"\n\n[CONTEXT BUDGET NOTICE] Approximately {round(remaining / max_context_len * 100)}% "
+                "of the context window remains. Prioritize correctness and provide a complete, runnable kernel "
+                "in your next response. Avoid further speculative optimizations."
+            )
+            logger.info(
+                "CUDA agent context budget nudge: context_tokens=%s context_limit=%s", context_length, max_context_len
+            )
+    return (
+        response_template.format(
+            feedback=feedback, feedback_dict=feedback_dict, context_budget_nudge=context_budget_nudge
+        ),
+        template_tokens,
+        feedback_tokens,
+    )
 
 
 def _format_log_value(value: Any, max_chars: int) -> str:
@@ -332,7 +377,7 @@ def _log_rollout_info(
         }
         logger.info(
             "%s[turn %s] task_id=%s model_time=%.3fs env_time=%.3fs prompt_tokens=%s max_new_tokens=%s "
-            "response_tokens=%s "
+            "response_tokens=%s template_tokens=%s feedback_tokens=%s "
             "finish_type=%s status=%s error=%s precheck=%s speedup=%s correctness=%s compiled=%s "
             "kernel_failed_score_tag=%s reward=%s detail_env_time=%s perf_cv=%s",
             prefix,
@@ -343,6 +388,8 @@ def _log_rollout_info(
             item.get("prompt_tokens"),
             item.get("max_new_tokens"),
             item.get("response_tokens"),
+            item.get("template_tokens"),
+            item.get("feedback_tokens"),
             item.get("finish_type"),
             env_state.get("status"),
             env_state.get("error"),
@@ -1119,6 +1166,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
         turn_sample.metadata["env_time"] = env_time
         turn_reward = await reward_func(args, turn_sample)
         turn_sample.reward = turn_reward
+        output_samples.append(turn_sample)
+
+        format_feedback, template_tokens, feedback_tokens = _apply_feedback_template(
+            env_result, template, state.tokenizer, args=args, context_length=len(prompt_ids) + len(response_ids)
+        )
         turn_log = {
             "turn_idx": turn_idx,
             "task_id": turn_sample.metadata.get("task_id"),
@@ -1127,15 +1179,16 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "prompt_tokens": len(prompt_ids),
             "max_new_tokens": turn_sampling_params.get("max_new_tokens"),
             "response_tokens": len(response_ids),
+            "template_tokens": template_tokens,
+            "feedback_tokens": feedback_tokens,
             "finish_type": finish_type,
             "prompt": prompt_text,
             "response": response,
             "env_result": env_result,
             "reward": turn_reward,
-            "format_feedback": None,
+            "format_feedback": format_feedback,
         }
         turn_logs.append(turn_log)
-        output_samples.append(turn_sample)
         _update_sample_progress(sample, turn_logs, "running")
 
         messages.append(
@@ -1144,9 +1197,6 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
                 "content": response,
             }
         )
-
-        format_feedback = _apply_feedback_template(env_result, template)
-        turn_log["format_feedback"] = format_feedback
 
         if _is_done(env_result, turn_idx, max_turns):
             finish_reason = "env_done" if turn_idx + 1 < max_turns else "max_turns"

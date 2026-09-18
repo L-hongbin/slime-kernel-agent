@@ -280,6 +280,14 @@ Other loss/filter/CTM/OPD options remain independent. Group centering is not bat
 its sample-dependent baseline should not be conflated with the original uncentered ArgMaxRL's
 finite-sample unbiased estimator.
 
+#### Kernel-agent context budget nudge
+
+Kernel-agent multi-turn rollouts optionally support `--use-context-budget-nudge 0.2`, inspired by [Mercor's context nudge](https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/). The value is a finite remaining-budget fraction in `(0, 1]`; omitted or explicit `None` disables it. It requires a positive `--rollout-max-context-len`. With `0.2`, a reminder is inserted when the remaining context is positive and at most 20% of that limit, asking for a complete, correct kernel on the next turn rather than speculative optimization.
+
+`GenerateState` counts template source tokens once on load with the rollout tokenizer and caches `template_tokens` on the template; the built-in fallback is also cached on first use. `_apply_feedback_template` counts the serialized, truncated feedback as `feedback_tokens` each turn, even when nudge is disabled. Both counts use `add_special_tokens=False` and are returned alongside the formatted feedback, stored in the turn log, and printed in turn stats. The nudge estimates context use as `prompt_tokens + response_tokens + template_tokens + feedback_tokens`, builds the reminder before rendering, and passes `context_budget_nudge` to the template (empty when inactive). This is an estimate: static template tokens include placeholders/Jinja syntax, separate tokenization can differ at boundaries, and new chat framing and the reminder are not counted. The conversation is not re-tokenized for this estimate; the next turn's existing context guard enforces the actual limit.
+
+Built-in and repository response templates include the nudge field. Custom format/YAML templates need `{context_budget_nudge}`, and custom Jinja templates need `{{ context_budget_nudge }}` to display it. Each qualifying feedback may receive a reminder (not one-shot per trajectory). This is next-turn user input, not assistant output, and does not directly change rewards or response loss masks. It acts between turns, not during a single response, and the flag also applies to evaluation if enabled there.
+
 #### KernelGYM detailed correctness diagnostics
 
 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` defaults to `0` (`False`). Set it to `1` before starting training to send `return_detail_correctness=true` in KernelGYM evaluation requests. The Qwen3.8 WarmUp/MultiTurn scripts forward this setting through Ray's runtime environment; custom launchers must also forward it to rollout workers.

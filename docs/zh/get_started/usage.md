@@ -286,6 +286,14 @@ TailRL 对 reward 的共同平移不变，支持有限负 reward，不需要也�
 组内减均值不是跨 batch whitening，也不应把这种依赖同组样本的 baseline 直接等同于原始未中心化
 ArgMaxRL 的有限样本无偏估计器。
 
+#### Kernel-agent 上下文预算提醒
+
+Kernel-agent 多轮 rollout 可通过 `--use-context-budget-nudge 0.2` 开启上下文预算提醒，参考 [Mercor 的 context nudge](https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/)。参数为 `(0, 1]` 内的有限比例；不传或显式传 `None` 均关闭。要求 `--rollout-max-context-len > 0`。`0.2` 表示剩余上下文大于 0 且不超过上限的 20% 时，提醒下一轮优先提交完整、正确的 kernel，避免探索性优化。
+
+`GenerateState` 加载模板时，用 rollout tokenizer 统计模板原文的 token 数，缓存为模板的 `template_tokens` 属性；内置 fallback 模板也在首次使用时缓存。`_apply_feedback_template` 每轮统计序列化、截断后的 feedback，得到 `feedback_tokens`，即使关闭 nudge 也统计。两项均使用 `add_special_tokens=False`，与格式化后的 feedback 一起返回，写入 turn log 并打印到 turn stats。nudge 使用 `prompt_tokens + response_tokens + template_tokens + feedback_tokens` 估计上下文长度，在模板渲染前构建提醒，以 `context_budget_nudge` 传入模板（未触发时为空字符串）。这是估计值：模板原文包含占位符/Jinja 语法，分段 tokenize 的边界也可能有误差，且未计入新增 chat framing 和提醒文本。不为此重复 tokenize 整段上下文，下一轮已有的上下文检查负责实际长度限制。
+
+内置及仓库中的 response 模板已包含提醒字段；自定义 format/YAML 模板需要加入 `{context_budget_nudge}`，Jinja 模板需要加入 `{{ context_budget_nudge }}` 才会展示提醒。每轮满足条件都可以追加，不是整条轨迹只提醒一次。提醒属于下一轮 user 输入，不是 assistant 输出，不直接修改 reward 或 response loss mask；只在轮次之间生效，不能中断单轮长思考。若评测也打开此参数，评测同样生效。
+
 #### KernelGYM 详细正确性诊断
 
 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 默认 `0`（`False`），训练启动前设为 `1` 即可在 KernelGYM 评测请求中传入 `return_detail_correctness=true`。Qwen3.8 的 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传；自定义启动脚本也需要将此环境变量传给 rollout worker。

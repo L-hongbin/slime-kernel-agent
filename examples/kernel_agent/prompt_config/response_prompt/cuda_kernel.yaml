@@ -28,7 +28,7 @@ per_turn_prompts:
 
       Here is the server feedback. Please refer to this feedback to improve the implementation:
       Server feedback (status/metrics/errors):
-      {feedback}
+      {feedback}{context_budget_nudge}
 
       Modify any section as needed.
 

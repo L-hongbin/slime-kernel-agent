@@ -326,8 +326,274 @@ def _skip_unselected_compiled_case(request, case, compiled_key):
 
 
 def _format_feedback_for_test(env_result):
-    template = generate_with_cuda_agent._get_tool_response_template(SimpleNamespace(multi_turn_template=None))
-    return generate_with_cuda_agent._apply_feedback_template(env_result, template)
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent._get_tool_response_template(
+        SimpleNamespace(multi_turn_template=None, tokenizer=tokenizer)
+    )
+    return generate_with_cuda_agent._apply_feedback_template(env_result, template, tokenizer)[0]
+
+
+class _BudgetTokenizer:
+    """One character per token, with explicit chat framing for budget checks."""
+
+    def __init__(self):
+        self.render_calls = 0
+        self.tokenize_calls = 0
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        self.render_calls += 1
+        assert tokenize is False and add_generation_prompt is True
+        assert kwargs == {"enable_thinking": True}
+        return "".join(f"<{message['role']}>{message['content']}</end>" for message in messages) + "<assistant>"
+
+    def __call__(self, text, *, add_special_tokens):
+        self.tokenize_calls += 1
+        assert add_special_tokens is False
+        return {"input_ids": list(map(ord, text))}
+
+
+@pytest.mark.parametrize(
+    "ratio,context_length,expected_nudge",
+    [
+        (0.2, 1599, False),
+        (0.2, 1600, True),
+        (0.2, 1601, True),
+        (0.2, 1950, True),
+        (0.2, 2000, False),
+        (0.2, 2001, False),
+        (0.1, 1600, False),
+        (0.3, 1500, True),
+    ],
+)
+@pytest.mark.parametrize("mode", ["format", "jinja"])
+def test_feedback_budget_nudge_reuses_token_count_and_renders_once(
+    monkeypatch, ratio, context_length, expected_nudge, mode
+):
+    text = "Feedback: {feedback}{context_budget_nudge}"
+    if mode == "jinja":
+        text = "Feedback: {{ feedback }}{{ context_budget_nudge }}"
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate(text, mode, "test", tokenizer=tokenizer)
+    env_result = {"env_state": {"error": "failed"}}
+    feedback, template_tokens, feedback_tokens = generate_with_cuda_agent._apply_feedback_template(
+        env_result, template, tokenizer
+    )
+    assert template_tokens == len(text)
+    assert feedback_tokens == len(json.dumps(env_result["env_state"], ensure_ascii=False, indent=2))
+    assert tokenizer.tokenize_calls == 2
+    original_env = deepcopy(env_result)
+    format_calls = []
+    original_format = template.format
+
+    def tracked_format(**kwargs):
+        format_calls.append(kwargs)
+        return original_format(**kwargs)
+
+    monkeypatch.setattr(template, "format", tracked_format)
+    args = SimpleNamespace(use_context_budget_nudge=ratio, rollout_max_context_len=2000)
+    for iteration in range(2):
+        result, cached_tokens, current_feedback_tokens = generate_with_cuda_agent._apply_feedback_template(
+            env_result,
+            template,
+            tokenizer,
+            args=args,
+            context_length=context_length - template_tokens - feedback_tokens,
+        )
+        assert cached_tokens == template_tokens
+        assert current_feedback_tokens == feedback_tokens
+        assert tokenizer.tokenize_calls == iteration + 3
+        assert tokenizer.render_calls == 0
+        assert len(format_calls) == iteration + 1
+        assert format_calls[-1]["feedback_dict"] == original_env["env_state"]
+        assert ("[CONTEXT BUDGET NOTICE]" in result) is expected_nudge
+        if expected_nudge:
+            assert result.startswith(feedback + "\n\n")
+            assert f"Approximately {round((2000 - context_length) / 2000 * 100)}%" in result
+        else:
+            assert result == feedback
+            assert format_calls[-1]["context_budget_nudge"] == ""
+        assert env_result == original_env
+
+
+def test_feedback_budget_nudge_disabled_still_counts_tokens():
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate("Feedback: {feedback}", "format", "test", tokenizer=tokenizer)
+    env_result = {"env_state": {"correctness": False}}
+    args = SimpleNamespace(use_context_budget_nudge=None, rollout_max_context_len=1)
+    assert generate_with_cuda_agent._apply_feedback_template(env_result, template, tokenizer, args=args) == (
+        generate_with_cuda_agent._apply_feedback_template(env_result, template, tokenizer)
+    )
+    assert tokenizer.tokenize_calls == 3
+
+
+def test_default_response_template_token_count_is_cached():
+    state = SimpleNamespace(multi_turn_template=None, tokenizer=_BudgetTokenizer())
+    template = generate_with_cuda_agent._get_tool_response_template(state)
+    assert template.template_tokens == len(generate_with_cuda_agent.DEFAULT_TOOL_RESPONSE_TEMPLATE)
+    assert generate_with_cuda_agent._get_tool_response_template(state) is template
+    assert state.tokenizer.tokenize_calls == 1
+
+
+def test_feedback_tokens_count_truncated_text(monkeypatch):
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate("{feedback}", "format", tokenizer=tokenizer)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 100)
+    env_result = {"env_state": {"error_message": "long error " * 100}}
+    result, template_tokens, feedback_tokens = generate_with_cuda_agent._apply_feedback_template(
+        env_result, template, tokenizer
+    )
+    assert result == generate_with_cuda_agent._truncate_middle(json.dumps(env_result["env_state"], indent=2), 100)
+    assert feedback_tokens == len(result)
+    assert template_tokens == template.template_tokens
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "cuda_kernel.yaml",
+        "tvm_ffi_short.yaml",
+        "tvm_ffi_short.jinja",
+        "tvm_ffi_gepa_kimi_v1.jinja",
+        "tvm_ffi_gepa_kimi_v2.jinja",
+    ],
+)
+def test_response_templates_render_optional_context_budget_nudge(filename):
+    path = REPO_ROOT / "examples/kernel_agent/prompt_config/response_prompt" / filename
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate.from_path(str(path), tokenizer=tokenizer)
+    assert template.template_tokens == len(template.template)
+    assert tokenizer.tokenize_calls == 1
+    plain = template.format(feedback="execution feedback", feedback_dict={})
+    nudged = template.format(feedback="execution feedback", feedback_dict={}, context_budget_nudge="\n\nNUDGE")
+    assert "execution feedback\n\nNUDGE" in nudged
+    assert nudged.replace("\n\nNUDGE", "") == plain
+    assert tokenizer.tokenize_calls == 1
+
+
+@pytest.mark.parametrize("context_limit", [None, 0, -1])
+def test_feedback_budget_nudge_rejects_missing_or_invalid_limit(context_limit):
+    from slime.utils.arguments import slime_validate_args
+
+    args = SimpleNamespace(use_context_budget_nudge=0.2, rollout_max_context_len=context_limit)
+    with pytest.raises(ValueError, match="--rollout-max-context-len > 0"):
+        slime_validate_args(args)
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate("{feedback}", "format", "test", tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="--rollout-max-context-len > 0"):
+        generate_with_cuda_agent._apply_feedback_template({}, template, tokenizer, args=args)
+
+
+@pytest.mark.parametrize("ratio", [0, -0.1, 1.1, float("nan"), float("inf")])
+def test_context_budget_nudge_rejects_invalid_ratio(ratio):
+    from slime.utils.arguments import slime_validate_args
+
+    args = SimpleNamespace(use_context_budget_nudge=ratio, rollout_max_context_len=2000)
+    with pytest.raises(ValueError, match="finite ratio"):
+        slime_validate_args(args)
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate("{feedback}", "format", "test", tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="finite ratio"):
+        generate_with_cuda_agent._apply_feedback_template({}, template, tokenizer, args=args, context_length=1600)
+
+
+@pytest.mark.parametrize("context_length", [None, -1])
+def test_context_budget_nudge_requires_current_token_count(context_length):
+    args = SimpleNamespace(use_context_budget_nudge=0.2, rollout_max_context_len=2000)
+    tokenizer = _BudgetTokenizer()
+    template = generate_with_cuda_agent.PromptTemplate("{feedback}", "format", "test", tokenizer=tokenizer)
+    with pytest.raises(ValueError, match="token count"):
+        generate_with_cuda_agent._apply_feedback_template(
+            {}, template, tokenizer, args=args, context_length=context_length
+        )
+
+
+def test_context_budget_nudge_cli_is_opt_in():
+    import argparse
+
+    from slime.utils.arguments import get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    assert parser.parse_args(["--rollout-batch-size", "1"]).use_context_budget_nudge is None
+    args = parser.parse_args(
+        ["--rollout-batch-size", "1", "--use-context-budget-nudge", "0.2", "--rollout-max-context-len", "2000"]
+    )
+    assert args.use_context_budget_nudge == 0.2
+    assert args.rollout_max_context_len == 2000
+    args = parser.parse_args(["--rollout-batch-size", "1", "--use-context-budget-nudge", "None"])
+    assert args.use_context_budget_nudge is None
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--use-context-budget-nudge"])
+    assert "20%" in parser.format_help()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_context_budget_nudge_reaches_next_turn_but_not_response(monkeypatch, enabled):
+    tokenizer = _BudgetTokenizer()
+    state = SimpleNamespace(
+        tokenizer=tokenizer,
+        apply_chat_template_kwargs={"enable_thinking": True},
+        multi_turn_template=generate_with_cuda_agent.PromptTemplate(
+            "Feedback: {feedback}{context_budget_nudge}", "format", "test", tokenizer=tokenizer
+        ),
+        active_lora_name=None,
+    )
+    requests = []
+    turn_logs = []
+
+    def capture_logs(sample, messages, logs, *args, **kwargs):
+        turn_logs.extend(logs)
+
+    async def fake_post(url, payload, **kwargs):
+        requests.append(payload)
+        return {
+            "text": "kernel",
+            "meta_info": {
+                "finish_reason": {"type": "stop"},
+                "output_token_logprobs": [[-0.25, ord(char)] for char in "kernel"],
+            },
+        }
+
+    async def fake_env(*args, **kwargs):
+        return {"env_state": {"done": False, "correctness": False}, "env_extra_info": {}}
+
+    async def fake_reward(*args, **kwargs):
+        return 0.5
+
+    monkeypatch.setattr(generate_with_cuda_agent, "GenerateState", lambda args: state)
+    monkeypatch.setattr(generate_with_cuda_agent, "post", fake_post)
+    monkeypatch.setattr(generate_with_cuda_agent, "cuda_kernel_env", fake_env)
+    monkeypatch.setattr(generate_with_cuda_agent, "reward_func", fake_reward)
+    monkeypatch.setattr(generate_with_cuda_agent, "_log_rollout_info", capture_logs)
+    monkeypatch.setattr(generate_with_cuda_agent, "postprocess_turn_samples", lambda args, samples, **kwargs: samples)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info", False)
+    args = SimpleNamespace(
+        max_turns=2,
+        use_multi_turn=True,
+        padding_turns=False,
+        use_context_budget_nudge=0.2 if enabled else None,
+        rollout_max_context_len=2000,
+        sglang_router_ip="localhost",
+        sglang_router_port=1,
+    )
+    samples = asyncio.run(
+        generate_with_cuda_agent._generate_impl(args, Sample(prompt="x" * 1550), {"max_new_tokens": 10})
+    )
+    assert len(requests) == len(samples) == 2
+    assert tokenizer.render_calls == 2
+    assert tokenizer.tokenize_calls == 5  # One template, two full prompts, two feedback strings.
+    assert len(turn_logs) == 2
+    for turn_log in turn_logs:
+        assert turn_log["template_tokens"] == state.multi_turn_template.template_tokens
+        assert turn_log["feedback_tokens"] == len(json.dumps({"done": False, "correctness": False}, indent=2))
+    assert turn_logs[0]["prompt_tokens"] + turn_logs[0]["response_tokens"] < 1600
+    next_prompt = "".join(map(chr, requests[1]["input_ids"]))
+    assert ("[CONTEXT BUDGET NOTICE]" in next_prompt) is enabled
+    for sample in samples:
+        assert sample.response == "kernel"
+        assert sample.tokens[-sample.response_length :] == list(map(ord, "kernel"))
+        assert sample.rollout_log_probs == [-0.25] * len("kernel")
+        assert sample.loss_mask == [1] * len("kernel")
+        assert sample.reward == 0.5
 
 
 @pytest.mark.unit
@@ -741,6 +1007,8 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
             {
                 "turn_idx": 0,
                 "task_id": "stats-only-task",
+                "template_tokens": 123,
+                "feedback_tokens": 45,
                 "model_time": 0.25,
                 "env_time": 0.75,
                 "prompt": sample.prompt,
@@ -754,6 +1022,7 @@ def test_rollout_stats_only_omits_messages_and_turn_text(monkeypatch, caplog):
     )
 
     assert "[turn 0] task_id=stats-only-task" in caplog.text
+    assert "template_tokens=123 feedback_tokens=45" in caplog.text
     assert "[turn 0] env_feedback:" in caplog.text
     assert '"status": "completed"' in caplog.text
     feedback_records = [
