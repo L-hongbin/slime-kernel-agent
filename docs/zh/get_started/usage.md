@@ -286,6 +286,12 @@ TailRL 对 reward 的共同平移不变，支持有限负 reward，不需要也�
 组内减均值不是跨 batch whitening，也不应把这种依赖同组样本的 baseline 直接等同于原始未中心化
 ArgMaxRL 的有限样本无偏估计器。
 
+#### KernelGYM 详细正确性诊断
+
+`CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 默认 `0`（`False`），训练启动前设为 `1` 即可在 KernelGYM 评测请求中传入 `return_detail_correctness=true`。Qwen3.8 的 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传；自定义启动脚本也需要将此环境变量传给 rollout worker。
+
+该开关请求详细正确性诊断，不修改 reward 计算，与 `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER` 独立：两者可以各自单独开启，也可以同时开启。sanitizer 是否实际执行仍取决于服务端触发规则。显式诊断命令 `run_request_env.py --mode sanitizer` 只开启 sanitizer，详细正确性诊断仍由 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 控制，默认关闭。
+
 #### Kernel rollout reward 后处理
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。

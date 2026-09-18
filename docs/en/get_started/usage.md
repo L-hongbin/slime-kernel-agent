@@ -280,6 +280,12 @@ Other loss/filter/CTM/OPD options remain independent. Group centering is not bat
 its sample-dependent baseline should not be conflated with the original uncentered ArgMaxRL's
 finite-sample unbiased estimator.
 
+#### KernelGYM detailed correctness diagnostics
+
+`CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` defaults to `0` (`False`). Set it to `1` before starting training to send `return_detail_correctness=true` in KernelGYM evaluation requests. The Qwen3.8 WarmUp/MultiTurn scripts forward this setting through Ray's runtime environment; custom launchers must also forward it to rollout workers.
+
+This requests detailed correctness diagnostics, not a reward change. It is independent of `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER`: either feature can be enabled alone or both can be enabled together. Sanitizer execution remains subject to the server's trigger rules. The explicit `run_request_env.py --mode sanitizer` diagnostic enables only the sanitizer; detailed correctness still follows `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` (default off).
+
 #### Kernel rollout reward post-processing
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.

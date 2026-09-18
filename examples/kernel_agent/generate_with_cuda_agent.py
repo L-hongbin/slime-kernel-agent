@@ -604,6 +604,7 @@ async def cuda_kernel_env(
             "enable_profiling": _kernel_eval_config_value(args, env_config, "enable_profiling", True),
             "enable_ncu": bool(env_config.get("enable_ncu", False)),
             "enable_compute_sanitizer": bool(env_config.get("enable_compute_sanitizer", False)),
+            "return_detail_correctness": bool(env_config.get("return_detail_correctness", False)),
             "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
             "enable_correctness_input_perturbations": bool(
                 env_config.get("enable_correctness_input_perturbations", False)

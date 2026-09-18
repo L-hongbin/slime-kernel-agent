@@ -372,6 +372,7 @@ def _build_payload(
         "enable_profiling": bool(env_config.get("enable_profiling", True)),
         "enable_ncu": mode == "ncu",
         "enable_compute_sanitizer": mode == "sanitizer",
+        "return_detail_correctness": bool(env_config.get("return_detail_correctness", False)),
         "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
         "enable_correctness_input_perturbations": bool(
             env_config.get("enable_correctness_input_perturbations", False)

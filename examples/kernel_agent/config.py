@@ -74,6 +74,8 @@ if apply_kernel_failed_score and apply_failed_group_reward:
 enable_profiling = bool(int(os.environ.get("CUDA_AGENT_ENABLE_PROFILING", 1)))
 enable_ncu = bool(int(os.environ.get("CUDA_AGENT_ENABLE_NCU", 0)))
 enable_compute_sanitizer = bool(int(os.environ.get("CUDA_AGENT_ENABLE_COMPUTE_SANITIZER", 0)))
+# Detailed correctness is opt-in and independent of Compute Sanitizer.
+return_detail_correctness = bool(int(os.environ.get("CUDA_AGENT_RETURN_DETAIL_CORRECTNESS", 0)))
 compute_sanitizer_mode = os.environ.get("CUDA_AGENT_COMPUTE_SANITIZER_MODE", "error_based").strip().lower()
 if compute_sanitizer_mode not in {"error_based", "full"}:
     raise ValueError("CUDA_AGENT_COMPUTE_SANITIZER_MODE must be 'error_based' or 'full'")
@@ -145,6 +147,7 @@ CUDA_AGENT_CONFIGS = {
         "enable_profiling": enable_profiling,
         "enable_ncu": enable_ncu,
         "enable_compute_sanitizer": enable_compute_sanitizer,
+        "return_detail_correctness": return_detail_correctness,
         "compute_sanitizer_mode": compute_sanitizer_mode,
         "enable_correctness_input_perturbations": enable_correctness_input_perturbations,
         "simplify_error": True,

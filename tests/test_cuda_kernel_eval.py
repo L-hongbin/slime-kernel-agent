@@ -3,6 +3,7 @@ import inspect
 import json
 import logging
 import os
+import runpy
 import sys
 import threading
 import time
@@ -409,8 +410,13 @@ class ModelNew(nn.Module):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("case", KERNEL_EVAL_CASES)
-def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, monkeypatch, caplog, case):
+@pytest.mark.parametrize("detail_correctness", [None, False, True])
+@pytest.mark.parametrize("enable_sanitizer", [False, True])
+def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(
+    request, monkeypatch, caplog, case, detail_correctness, enable_sanitizer
+):
     _skip_unselected_compiled_case(request, case, "feedback_compiled")
+    case = deepcopy(case)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_info_rate", 1.0)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_multi_turn_info", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "log_rollout_stats_only", False)
@@ -418,7 +424,11 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     monkeypatch.setattr(generate_with_cuda_agent, "_LOGGED_FIRST_ROLLOUT", False)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "max_feedback_chars", 8192)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_ncu", False)
-    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_compute_sanitizer", True)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_compute_sanitizer", enable_sanitizer)
+    if detail_correctness is None:
+        monkeypatch.delitem(CUDA_AGENT_CONFIGS["env"], "return_detail_correctness", raising=False)
+    else:
+        monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "return_detail_correctness", detail_correctness)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "compute_sanitizer_mode", "full")
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "enable_correctness_input_perturbations", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["env"], "memory_ratio_threshold", 2.25)
@@ -474,7 +484,8 @@ def test_cuda_kernel_env_uses_kernel_eval_result_and_multiturn_logs(request, mon
     assert captured_payload["kernel_code"] == extract_cuda_agent_kernel_code(VALID_CUDA_AGENT_RESPONSE)
     assert captured_payload["backend"] == "cuda"
     assert captured_payload["enable_ncu"] is False
-    assert captured_payload["enable_compute_sanitizer"] is True
+    assert captured_payload["enable_compute_sanitizer"] is enable_sanitizer
+    assert captured_payload["return_detail_correctness"] is bool(detail_correctness)
     assert captured_payload["compute_sanitizer_mode"] == "full"
     assert captured_payload["enable_correctness_input_perturbations"] is True
     assert captured_payload["memory_ratio_threshold"] == pytest.approx(2.25)
@@ -1900,6 +1911,17 @@ def test_cancelled_server_id_is_not_polled_until_client_deadline(local_eval_work
         assert paths == ["/evaluate"]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
+def test_detail_correctness_config_defaults_off_and_accepts_opt_in(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("CUDA_AGENT_RETURN_DETAIL_CORRECTNESS", raising=False)
+    else:
+        monkeypatch.setenv("CUDA_AGENT_RETURN_DETAIL_CORRECTNESS", value)
+    config = runpy.run_path(str(REPO_ROOT / "examples/kernel_agent/config.py"))
+    assert config["CUDA_AGENT_CONFIGS"]["env"]["return_detail_correctness"] is expected
 
 
 if __name__ == "__main__":

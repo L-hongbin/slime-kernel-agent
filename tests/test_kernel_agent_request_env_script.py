@@ -50,10 +50,14 @@ def env_config() -> dict:
 
 
 @pytest.mark.parametrize("mode", ["sanitizer", "ncu", "compile"])
-def test_request_modes_enable_only_the_requested_diagnostic(mode: str, env_config: dict) -> None:
+@pytest.mark.parametrize("detail_correctness", [None, False, True])
+def test_request_modes_enable_only_the_requested_diagnostic(mode: str, env_config: dict, detail_correctness) -> None:
+    if detail_correctness is not None:
+        env_config["return_detail_correctness"] = detail_correctness
     payload = _build_payload(mode, f"test-{mode}", env_config)
 
     assert payload["enable_compute_sanitizer"] is (mode == "sanitizer")
+    assert payload["return_detail_correctness"] is bool(detail_correctness)
     assert payload["enable_ncu"] is (mode == "ncu")
     assert payload["force_refresh"] is True
     assert payload["compute_sanitizer_mode"] == "error_based"
