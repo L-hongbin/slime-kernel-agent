@@ -127,6 +127,7 @@ async def _run(args) -> None:
         "enable_ncu": bool(env_config.get("enable_ncu", False)),
         "enable_compute_sanitizer": bool(env_config.get("enable_compute_sanitizer", False)),
         "return_detail_correctness": bool(env_config.get("return_detail_correctness", False)),
+        "return_detail_compilation": bool(env_config.get("return_detail_compilation", False)),
         "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
         "enable_correctness_input_perturbations": bool(
             env_config.get("enable_correctness_input_perturbations", False)

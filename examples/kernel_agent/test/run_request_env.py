@@ -278,16 +278,12 @@ COMPILE_ERROR_KERNEL_CODES = {
         1,
     ),
     "function_argument_mismatch": _inject_compile_error("    copy_launcher(nullptr, nullptr);"),
-    "invalid_type_conversion": _inject_compile_error(
-        """    void* raw_pointer = nullptr;
-    float* typed_pointer = raw_pointer;"""
-    ),
+    "invalid_type_conversion": _inject_compile_error("""    void* raw_pointer = nullptr;
+    float* typed_pointer = raw_pointer;"""),
     "invalid_declaration": _inject_compile_error("    void invalid_declaration_for_test;"),
     "syntax_error": _inject_compile_error("    int syntax_error_for_test = ;"),
-    "incomplete_type": _inject_compile_error(
-        """    struct incomplete_type_for_test;
-    incomplete_type_for_test incomplete_value_for_test;"""
-    ),
+    "incomplete_type": _inject_compile_error("""    struct incomplete_type_for_test;
+    incomplete_type_for_test incomplete_value_for_test;"""),
     "multiple_errors": _inject_cuda_compile_error(
         _inject_compile_error("    int syntax_error_for_test = ;"),
         """        struct incomplete_type_for_test;
@@ -373,6 +369,7 @@ def _build_payload(
         "enable_ncu": mode == "ncu",
         "enable_compute_sanitizer": mode == "sanitizer",
         "return_detail_correctness": bool(env_config.get("return_detail_correctness", False)),
+        "return_detail_compilation": bool(env_config.get("return_detail_compilation", False)),
         "compute_sanitizer_mode": env_config.get("compute_sanitizer_mode", "error_based"),
         "enable_correctness_input_perturbations": bool(
             env_config.get("enable_correctness_input_perturbations", False)
@@ -457,6 +454,7 @@ def _validate_mode_result(
     *,
     sanitizer_error_case: str = DEFAULT_SANITIZER_ERROR_CASE,
     compile_error_case: str = DEFAULT_COMPILE_ERROR_CASE,
+    return_detail_compilation: bool = False,
 ) -> tuple[bool, str]:
     if mode == "sanitizer":
         sanitizer = raw_env.get("runtime_sanitizer")
@@ -483,14 +481,31 @@ def _validate_mode_result(
         success = status == "ok" and isinstance(kernel_count, int) and kernel_count > 0
         return success, f"metadata.ncu status={status!r}, profiled_kernel_count={kernel_count!r}"
 
+    compile_failed = raw_env.get("compiled") is False and raw_env.get("error_code") == "COMPILATION_ERROR"
+    if not return_detail_compilation:
+        message = raw_env.get("error_message")
+        return compile_failed and isinstance(message, str) and bool(message.strip()), (
+            f"compiled={raw_env.get('compiled')!r}, error_code={raw_env.get('error_code')!r}, "
+            f"error_message={message!r}"
+        )
+
     detail = metadata.get("compilation_error_detail")
+    # New servers include count/truncated/errors per category; retain support
+    # for older servers that returned the excerpt list directly.
+    grouped_errors = (
+        {key: value.get("errors") if isinstance(value, dict) else value for key, value in detail.items()}
+        if isinstance(detail, dict)
+        else {}
+    )
     expected_details = COMPILE_ERROR_EXPECTED_DETAILS[compile_error_case]
-    details_match = isinstance(detail, dict) and all(
-        isinstance(detail.get(error_type), list)
-        and any(isinstance(excerpt, str) and expected_excerpt_token in excerpt for excerpt in detail[error_type])
+    details_match = all(
+        isinstance(grouped_errors.get(error_type), list)
+        and any(
+            isinstance(excerpt, str) and expected_excerpt_token in excerpt for excerpt in grouped_errors[error_type]
+        )
         for error_type, expected_excerpt_token in expected_details.items()
     )
-    success = raw_env.get("compiled") is False and raw_env.get("error_code") == "COMPILATION_ERROR" and details_match
+    success = compile_failed and details_match
     return success, (
         f"compiled={raw_env.get('compiled')!r}, error_code={raw_env.get('error_code')!r}, "
         f"compilation_error_detail={detail!r}"
@@ -555,6 +570,7 @@ def _run(args: argparse.Namespace) -> int:
             raw_env,
             sanitizer_error_case=args.sanitizer_error_case,
             compile_error_case=compile_error_case,
+            return_detail_compilation=payload["return_detail_compilation"],
         )
         if not succeeded:
             print(

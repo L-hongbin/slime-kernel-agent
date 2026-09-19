@@ -300,6 +300,20 @@ Kernel-agent 多轮 rollout 可通过 `--use-context-budget-nudge 0.2` 开启上
 
 该开关请求详细正确性诊断，不修改 reward 计算，与 `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER` 独立：两者可以各自单独开启，也可以同时开启。sanitizer 是否实际执行仍取决于服务端触发规则。显式诊断命令 `run_request_env.py --mode sanitizer` 只开启 sanitizer，详细正确性诊断仍由 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 控制，默认关闭。
 
+#### KernelGYM 详细编译诊断
+
+`CUDA_AGENT_RETURN_DETAIL_COMPILATION` 默认 `0`（`False`）。设为 `1` 后，在 KernelGYM 请求中传入
+`return_detail_compilation=true`，启用编译错误分类，返回 `metadata.compilation_error_detail` 和摘要形式的
+`error_message`；关闭时服务端跳过分类，在 `error_message` 中返回完整编译错误文本。
+该开关与详细正确性诊断、Compute Sanitizer 独立，不改变 reward 计算。
+
+```bash
+export CUDA_AGENT_RETURN_DETAIL_COMPILATION=1
+```
+
+Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定义启动脚本也需要传给 rollout worker。
+训练请求、`run_request_env.py` 和 `run_response_pipeline.py` 都沿用此配置；`--mode compile` 不会自动开启详细编译诊断。
+
 #### Kernel rollout reward 后处理
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。

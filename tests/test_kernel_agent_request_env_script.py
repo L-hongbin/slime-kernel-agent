@@ -51,13 +51,19 @@ def env_config() -> dict:
 
 @pytest.mark.parametrize("mode", ["sanitizer", "ncu", "compile"])
 @pytest.mark.parametrize("detail_correctness", [None, False, True])
-def test_request_modes_enable_only_the_requested_diagnostic(mode: str, env_config: dict, detail_correctness) -> None:
+@pytest.mark.parametrize("detail_compilation", [None, False, True])
+def test_request_modes_enable_only_the_requested_diagnostic(
+    mode: str, env_config: dict, detail_correctness, detail_compilation
+) -> None:
     if detail_correctness is not None:
         env_config["return_detail_correctness"] = detail_correctness
+    if detail_compilation is not None:
+        env_config["return_detail_compilation"] = detail_compilation
     payload = _build_payload(mode, f"test-{mode}", env_config)
 
     assert payload["enable_compute_sanitizer"] is (mode == "sanitizer")
     assert payload["return_detail_correctness"] is bool(detail_correctness)
+    assert payload["return_detail_compilation"] is bool(detail_compilation)
     assert payload["enable_ncu"] is (mode == "ncu")
     assert payload["force_refresh"] is True
     assert payload["compute_sanitizer_mode"] == "error_based"
@@ -95,7 +101,7 @@ def test_request_modes_enable_only_the_requested_diagnostic(mode: str, env_confi
     ],
 )
 def test_request_mode_result_validation_accepts_expected_response(mode: str, raw_env: dict) -> None:
-    succeeded, _detail = _validate_mode_result(mode, raw_env)
+    succeeded, _detail = _validate_mode_result(mode, raw_env, return_detail_compilation=True)
     assert succeeded is True
 
 
@@ -164,7 +170,8 @@ def test_compile_error_cases_build_distinct_compile_only_payloads(
 
 
 @pytest.mark.parametrize("compile_error_case", COMPILE_ERROR_CASES)
-def test_compile_error_cases_validate_grouped_detail_excerpts(compile_error_case: str) -> None:
+@pytest.mark.parametrize("structured", [False, True])
+def test_compile_error_cases_validate_grouped_detail_excerpts(compile_error_case: str, structured: bool) -> None:
     expected_details = COMPILE_ERROR_EXPECTED_DETAILS[compile_error_case]
     raw_env = {
         "compiled": False,
@@ -176,11 +183,17 @@ def test_compile_error_cases_validate_grouped_detail_excerpts(compile_error_case
             },
         },
     }
+    if structured:
+        raw_env["metadata"]["compilation_error_detail"] = {
+            key: {"count": len(errors), "truncated": False, "errors": errors}
+            for key, errors in raw_env["metadata"]["compilation_error_detail"].items()
+        }
 
     succeeded, _detail = _validate_mode_result(
         "compile",
         raw_env,
         compile_error_case=compile_error_case,
+        return_detail_compilation=True,
     )
     assert succeeded is True
 
@@ -200,9 +213,29 @@ def test_compile_error_case_requires_matching_excerpt() -> None:
         "compile",
         raw_env,
         compile_error_case="invalid_type_conversion",
+        return_detail_compilation=True,
     )
     assert succeeded is False
     assert "unrelated failure" in detail
+
+
+@pytest.mark.parametrize(
+    "message,expected", [("Compiler error: invalid conversion", True), ("", False), (None, False)]
+)
+def test_compile_without_detail_validates_original_error_message(message, expected):
+    raw_env = {"compiled": False, "error_code": "COMPILATION_ERROR", "error_message": message, "metadata": {}}
+    succeeded, _ = _validate_mode_result("compile", raw_env, return_detail_compilation=False)
+    assert succeeded is expected
+    # Enabling detail requires the requested diagnostic, not just an error string.
+    succeeded, _ = _validate_mode_result("compile", raw_env, return_detail_compilation=True)
+    assert succeeded is False
+
+
+@pytest.mark.parametrize("name", ["WarmUp", "MultiTurn"])
+def test_launchers_forward_detail_compilation(name):
+    script = (REPO_ROOT / f"examples/kernel_agent/run_qwen3.8_27B_{name}.sh").read_text()
+    assert 'export CUDA_AGENT_RETURN_DETAIL_COMPILATION="${CUDA_AGENT_RETURN_DETAIL_COMPILATION:-0}"' in script
+    assert '"CUDA_AGENT_RETURN_DETAIL_COMPILATION": "${CUDA_AGENT_RETURN_DETAIL_COMPILATION}"' in script
 
 
 if __name__ == "__main__":

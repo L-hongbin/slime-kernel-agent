@@ -294,6 +294,15 @@ Built-in and repository response templates include the nudge field. Custom forma
 
 This requests detailed correctness diagnostics, not a reward change. It is independent of `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER`: either feature can be enabled alone or both can be enabled together. Sanitizer execution remains subject to the server's trigger rules. The explicit `run_request_env.py --mode sanitizer` diagnostic enables only the sanitizer; detailed correctness still follows `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` (default off).
 
+#### KernelGYM detailed compilation diagnostics
+
+`CUDA_AGENT_RETURN_DETAIL_COMPILATION` independently defaults to `0` (`False`). Set it to `1` to request
+compilation-error classification (`return_detail_compilation=true`): the server returns
+`metadata.compilation_error_detail` and a summarized `error_message`. When disabled, classification is skipped
+and `error_message` contains the full compilation error. This does not change reward computation.
+The Qwen3.8 WarmUp/MultiTurn launchers forward it through Ray's runtime environment; custom launchers must do the same.
+Training requests, `run_request_env.py`, and `run_response_pipeline.py` use this setting; `--mode compile` does not enable it automatically.
+
 #### Kernel rollout reward post-processing
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.
