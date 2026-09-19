@@ -195,6 +195,15 @@ def test_sequence_mis_token_veto_without_aggregation() -> None:
             )
 
 
+def test_live_binary_kl_skips_pretrain_hook() -> None:
+    sequence_mis = _import_targets()
+    # No precomputed actor log_probs are required; admission happens later in
+    # the live policy loss. Existing launchers may retain the legacy hook.
+    data = {"loss_masks": [torch.ones(3)]}
+    assert sequence_mis(Namespace(sequence_mis_aggregation="binary_kl"), 0, data) == {}
+    assert torch.equal(data["loss_masks"][0], torch.ones(3))
+
+
 def test_sequence_mis_writes_seq_mis_metrics() -> None:
     sequence_mis = _import_targets()
     train_log_probs, rollout_log_probs, loss_masks, _advantages = _build_inputs()

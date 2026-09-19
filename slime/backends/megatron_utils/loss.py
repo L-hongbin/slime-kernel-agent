@@ -21,6 +21,7 @@ from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_aspo_policy_loss,
+    compute_binary_kl_sample_gate,
     compute_cispo_policy_loss,
     compute_cppo_policy_loss,
     compute_dis_policy_loss,
@@ -1616,6 +1617,45 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    sequence_mis_metrics = {}
+    if getattr(args, "sequence_mis_aggregation", None) == "binary_kl":
+        behavior_log_probs = batch.get("rollout_log_probs")
+        if behavior_log_probs is None or len(behavior_log_probs) != len(log_probs):
+            raise ValueError("Sequence MIS binary_kl requires rollout_log_probs for every sample.")
+        masked_loss_masks, kl_chunks, rejected_chunks = [], [], []
+        for i, (current, behavior, mask) in enumerate(
+            zip(log_probs, behavior_log_probs, batch["loss_masks"], strict=True)
+        ):
+            layout = {
+                "qkv_format": args.qkv_format,
+                "max_seq_len": None if max_seq_lens is None else max_seq_lens[i],
+            }
+            with torch.no_grad():
+                full_current = all_gather_with_cp(current.detach(), total_lengths[i], response_lengths[i], **layout)
+                full_behavior = all_gather_with_cp(behavior.detach(), total_lengths[i], response_lengths[i], **layout)
+            keep, mean_kl = compute_binary_kl_sample_gate(full_current, full_behavior, mask, args.sequence_mis_upper)
+            masked_loss_masks.append(mask * keep.to(mask.dtype))
+            kl_chunks.append(mean_kl.expand_as(current))
+            rejected_chunks.append((~keep).float().expand_as(current))
+        # Diagnose admission using ORIGINAL masks/denominators. Multi-turn
+        # metrics follow the existing token-weighted, per-rollout reducer.
+        sequence_mis_metrics = {
+            "seq_mis_binary_kl": sum_of_sample_mean(torch.cat(kl_chunks)).detach(),
+            "seq_mis_masked_fraction": sum_of_sample_mean(torch.cat(rejected_chunks)).detach(),
+        }
+        # Mask the entire sample, including entropy/reference KL. Use a local
+        # batch copy: activation-checkpoint recomputation and later epochs must
+        # always start from the original masks, not the previous admission.
+        batch = {**batch, "loss_masks": masked_loss_masks}
+        sum_of_sample_mean = get_sum_of_sample_mean(
+            total_lengths,
+            response_lengths,
+            masked_loss_masks,
+            batch["rollout_mask_sums"],
+            args.calculate_per_token_loss,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
+        )
     # Snapshot the per-sample policy log-probs for the train debug dump (no-op
     # unless capture is enabled). Must run before the torch.cat below rebinds
     # `log_probs` to a single concatenated tensor.
@@ -1934,6 +1974,8 @@ def policy_loss_function(
             modified_response_masks,
             batch["rollout_mask_sums"],
             args.calculate_per_token_loss,
+            qkv_format=args.qkv_format,
+            max_seq_lens=max_seq_lens,
         )
 
     # MiniRL, Eq. (7): https://arxiv.org/html/2512.01374v1#S4.SS1
@@ -2103,6 +2145,7 @@ def policy_loss_function(
         "ppo_kl": ppo_kl.clone().detach(),
     }
     reported_loss.update(entropy_common_probe_stats)
+    reported_loss.update(sequence_mis_metrics)
     reported_loss.update(binary_exp_metrics)
     for _k, _v in policy_loss_metrics.items():
         if _k == "pg_clipfrac":
@@ -2287,6 +2330,8 @@ def loss_function(
         batch["loss_masks"],
         batch["rollout_mask_sums"],
         args.calculate_per_token_loss,
+        qkv_format=args.qkv_format,
+        max_seq_lens=batch.get("max_seq_lens"),
     )
 
     match args.loss_type:

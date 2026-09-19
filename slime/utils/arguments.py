@@ -267,11 +267,33 @@ def _parse_sequence_mis_args(args) -> None:
         args.sequence_mis_ratio_source = ratio_source
 
     aggregation = getattr(args, "sequence_mis_aggregation", "geometric")
-    if aggregation not in {"kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop"}:
+    if aggregation not in {"kl", "geometric", "mirrorpop", "turns_geometric", "turns_mirrorpop", "binary_kl"}:
         raise ValueError(
-            "--sequence-mis-config aggregation must be one of ['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop'], "
+            "--sequence-mis-config aggregation must be one of "
+            "['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop', 'binary_kl'], "
             f"got {aggregation!r}."
         )
+    if aggregation == "binary_kl":
+        # FlashREINFORCE-style sample admission uses the live training forward,
+        # not the pre-training actor/old-actor recompute used by legacy MIS.
+        upper = getattr(args, "sequence_mis_upper", None)
+        if upper is None:
+            upper = args.sequence_mis_upper = 0.05
+        if not math.isfinite(upper) or upper < 0:
+            raise ValueError("Sequence MIS binary_kl requires a finite, nonnegative upper threshold.")
+        if {"lower", "delta", "token_veto_threshold"} & config.keys() or config.get("use_advantage", False):
+            raise ValueError(
+                "Sequence MIS binary_kl only supports upper; token veto and advantage protection are disabled."
+            )
+        if config.get("ratio_source", "rollout") != "rollout":
+            raise ValueError(
+                "Sequence MIS binary_kl requires ratio_source='rollout' (actual sampling log-probabilities)."
+            )
+        if (
+            getattr(args, "train_backend", "megatron") != "megatron"
+            or getattr(args, "loss_type", "policy_loss") != "policy_loss"
+        ):
+            raise ValueError("Sequence MIS binary_kl requires the Megatron policy_loss backend.")
     if aggregation in {"turns_geometric", "turns_mirrorpop"} and args.max_turns is None:
         raise ValueError(
             "--max-turns must be set when --sequence-mis-config aggregation=turns_geometric or turns_mirrorpop."
@@ -1952,7 +1974,9 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Optional Sequence MIS config for rollout-data postprocess masking. "
+                    "Optional Sequence MIS config. aggregation=binary_kl masks individual samples in the "
+                    "training loss using current-forward vs rollout probabilities (upper defaults to 0.05, must be >= 0); "
+                    "no rollout-data postprocess hook is needed. Other modes use rollout-data postprocess masking. "
                     "Supports aggregation, lower/upper thresholds, token veto, and use_advantage keys. "
                     'Must be a JSON object, for example \'{"aggregation":"turns_geometric","lower":0.999,"upper":1.001}\'.'
                 ),
