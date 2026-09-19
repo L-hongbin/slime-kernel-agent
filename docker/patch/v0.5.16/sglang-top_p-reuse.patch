@@ -1,0 +1,187 @@
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -159,6 +159,7 @@
+     need_min_p_sampling: bool,
+     request_mask: torch.Tensor,
+     force_keep_token_ids: Optional[torch.Tensor] = None,
++    precomputed_support: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+ ) -> Optional[torch.Tensor]:
+     rows = _top_p_filter_rows(
+         top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+@@ -166,9 +167,11 @@
+     if not bool(rows.any().item()):
+         return None
+ 
+-    keep, probs_idx = _top_p_keep_mask_sorted(
+-        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+-    )
++    if precomputed_support is None:
++        precomputed_support = _top_p_keep_mask_sorted(
++            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
++        )
++    keep, probs_idx = precomputed_support
+     # Scatter the keep-mask back to vocab order so we renormalize directly over
+     # vocab ids (and can force-keep specific token ids).
+     keep_vocab = torch.empty_like(keep)
+@@ -198,6 +201,7 @@
+     need_top_p_sampling: bool,
+     need_min_p_sampling: bool,
+     request_mask: torch.Tensor,
++    precomputed_support: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+ ) -> Optional[List[Optional[torch.Tensor]]]:
+     rows = _top_p_filter_rows(
+         top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+@@ -205,9 +209,11 @@
+     if not bool(rows.any().item()):
+         return None
+ 
+-    keep, probs_idx = _top_p_keep_mask_sorted(
+-        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+-    )
++    if precomputed_support is None:
++        precomputed_support = _top_p_keep_mask_sorted(
++            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
++        )
++    keep, probs_idx = precomputed_support
+     return [
+         probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
+         for i in range(probs.shape[0])
+@@ -462,9 +468,11 @@
+ 
+         if batch.sampling_info.is_all_greedy:
+             logits_output.next_token_top_p_token_ids = [
+-                accepted_token_ids[i : i + 1].to(torch.int32)
+-                if bool(request_mask[i].item())
+-                else None
++                (
++                    accepted_token_ids[i : i + 1].to(torch.int32)
++                    if bool(request_mask[i].item())
++                    else None
++                )
+                 for i in range(bs * max_accept)
+             ]
+         else:
+@@ -484,6 +492,26 @@
+             expanded_min_ps = torch.repeat_interleave(
+                 batch.sampling_info.min_ps, max_accept
+             )
++            # Both replay consumers use exactly the same nucleus. Keep it
++            # local to this step; online weight updates invalidate old logits.
++            replay_rows = _top_p_filter_rows(
++                expanded_top_ks,
++                expanded_top_ps,
++                expanded_min_ps,
++                batch.sampling_info.need_top_p_sampling,
++                False,
++                request_mask,
++            )
++            replay_support = None
++            if bool(replay_rows.any().item()):
++                replay_support = _top_p_keep_mask_sorted(
++                    probs,
++                    expanded_top_ks,
++                    expanded_top_ps,
++                    expanded_min_ps,
++                    batch.sampling_info.need_top_p_sampling,
++                    False,
++                )
+             top_p_token_ids = get_top_p_token_ids_from_probs(
+                 probs=probs,
+                 top_ks=expanded_top_ks,
+@@ -492,6 +520,7 @@
+                 need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                 need_min_p_sampling=False,
+                 request_mask=request_mask,
++                precomputed_support=replay_support,
+             )
+             if top_p_token_ids is not None:
+                 logits_output.next_token_top_p_token_ids = top_p_token_ids
+@@ -504,6 +533,7 @@
+                 need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                 need_min_p_sampling=False,
+                 request_mask=request_mask,
++                precomputed_support=replay_support,
+                 # Force-keep the accepted token: a small fraction of
+                 # speculatively accepted tokens land outside their own top-p
+                 # nucleus, which would give a -inf renormalized logprob.
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -14,6 +14,7 @@
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.logprob_processor import (
+     OutputLogprobProcessor,
++    _top_p_keep_mask_sorted,
+     get_top_p_token_ids_from_probs,
+     renorm_logprob_over_top_p,
+ )
+@@ -195,7 +196,7 @@
+                 # In-place op to save memory
+                 logits[:] = torch.softmax(logits, dim=-1)
+                 probs = logits
+-                self._attach_top_p_token_ids_to_output(
++                replay_support = self._attach_top_p_token_ids_to_output(
+                     logits_output, probs, sampling_info, simple_sampling_case
+                 )
+ 
+@@ -224,6 +225,7 @@
+                             need_min_p_sampling=sampling_info.need_min_p_sampling,
+                             request_mask=sampling_info.return_top_p_token_ids,
+                             force_keep_token_ids=batch_next_token_ids,
++                            precomputed_support=replay_support,
+                         )
+                     if top_p_logprobs is not None:
+                         logprobs = top_p_logprobs
+@@ -261,9 +263,11 @@
+ 
+         request_mask = sampling_info.return_top_p_token_ids
+         logits_output.next_token_top_p_token_ids = [
+-            batch_next_token_ids[i : i + 1].to(torch.int32)
+-            if bool(request_mask[i].item())
+-            else None
++            (
++                batch_next_token_ids[i : i + 1].to(torch.int32)
++                if bool(request_mask[i].item())
++                else None
++            )
+             for i in range(len(batch_next_token_ids))
+         ]
+ 
+@@ -273,7 +277,7 @@
+         probs: torch.Tensor,
+         sampling_info: SamplingBatchInfo,
+         simple_sampling_case: bool,
+-    ) -> None:
++    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+         if (
+             not sampling_info.need_return_top_p_token_ids
+             or sampling_info.return_top_p_token_ids is None
+@@ -281,6 +285,14 @@
+         ):
+             return
+ 
++        replay_support = _top_p_keep_mask_sorted(
++            probs,
++            sampling_info.top_ks,
++            sampling_info.top_ps,
++            sampling_info.min_ps,
++            sampling_info.need_top_p_sampling,
++            sampling_info.need_min_p_sampling,
++        )
+         top_p_token_ids = get_top_p_token_ids_from_probs(
+             probs=probs,
+             top_ks=sampling_info.top_ks,
+@@ -289,10 +301,11 @@
+             need_top_p_sampling=sampling_info.need_top_p_sampling,
+             need_min_p_sampling=sampling_info.need_min_p_sampling,
+             request_mask=sampling_info.return_top_p_token_ids,
++            precomputed_support=replay_support,
+         )
+         if top_p_token_ids is not None:
+             logits_output.next_token_top_p_token_ids = top_p_token_ids
+-
++        return replay_support
+ 
+     def _sample_from_probs(
+         self,
