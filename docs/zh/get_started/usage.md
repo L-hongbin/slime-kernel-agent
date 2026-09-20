@@ -425,6 +425,14 @@ TRLOO 在完整轨迹收尾时、group reward 后处理和过滤之前，用原�
 
 TRLOO 同时把固定的未来折算项记录到 `metadata.reward_component.return_reward`，用于观测。该组件不计入 `sample.reward`；对有效普通 TRLOO 样本，全部组件求和现在包含未来贡献，对应减 baseline 前的 return。动态调权和失败组替换均保留该项。所有支持的奖励组件（`correctness`、`performance`、`coverage`、`failed`、`length`、`return_reward`）均作为常规指标记录到 `rollout/reward/component/{字段}/{mean,min,max}`，无需 `--log-exp-metrics`；开启 `--use-tensorboard` 即可写入 TensorBoard。padding、缺失值和非有限值不进入组件统计，旧的 `exp/rollout/reward/component/*` 指标不再输出。
 
+Megatron 训练侧在 advantage 计算及 rollout 后处理后、训练 forward 前，默认记录以下指标，无需 `--log-exp-metrics`；开启 `--use-tensorboard` 即可写入 TensorBoard：
+
+- `rollout/advantage/{positive,negative,zero}_sample_fraction`：按每条样本有效 token 的平均 advantage 判定符号，统计样本占比。
+- `rollout/advantage/{positive,negative}_abs_mass`：对应符号样本的 advantage 绝对值之和除以全部样本数，不是该符号内部的条件均值。
+- `rollout/sequence/{positive,negative}_response_length`：对应符号样本的完整 response token 数均值，多轮中每个拆分 turn 算一条样本。
+
+统计沿用当前 loss mask；全 mask 样本的平均 advantage 为零，计入零样本占比。DP/CP 汇总使用总和/计数；全局没有某符号样本时，其平均长度记为 0，应结合样本占比解读。这些指标不反映随后训练 forward 内 seq-MIS 新增的 mask。原 `exp/rollout/train_batch/advantage/*` 和 `exp/rollout/train_batch/sequence/*` 不再重复输出；按 turn 的细分占比和异步诊断仍由 `--log-exp-metrics` 控制。
+
 `metadata.raw_task_reward` 保存按配置基础权重计算的原始单 turn 任务奖励，不含动态调权、失败组替换和长度奖惩。基础评分时写入，后续 reward 后处理不覆盖；它与可变的 `task_reward` 分开，可作为后续历史统计的数据源。TRLOO 的未来折算优先读取此字段；缺少字段的旧样本，在后处理前的轨迹收尾阶段仍回退到 `task_reward`，再回退到单 turn reward。该字段不是额外可加的 reward component。
 
 `calculate_kernel_reward()` 只计算基础评分。普通 kernel 的处理顺序为：基础评分 → 完整 prompt/turn group 的 reward 后处理（动态调权 → 长度奖励/惩罚 → 失败组替换）→ 写回 `sample.reward` 和 `metadata.reward_component` → group 过滤 → return/advantage。默认 SGLang rollout 在配置 kernel reward hook 时自动接入 `examples.kernel_agent.kernel_reward.generate_rollout`；fully-async collector 在取出完整 group 后、过滤前执行相同后处理。

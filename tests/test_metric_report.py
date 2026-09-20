@@ -16,6 +16,8 @@ end-to-end variants (real torch.distributed) live in
 
 from __future__ import annotations
 
+from argparse import Namespace
+
 # Import the helpers BEFORE the slime imports so the megatron stub lands
 # in sys.modules first. pytest's prepend importmode puts this file's
 # directory (``tests/``) on sys.path, which is what makes the bare-name
@@ -29,6 +31,7 @@ from slime.backends.megatron_utils.cp_utils import (  # noqa: E402
     get_logits_and_tokens_offset_with_cp,
     get_sum_of_sample_mean,
 )
+from slime.observability import train_metric_utils  # noqa: E402
 from slime.observability.train_metric_utils import (  # noqa: E402
     _compute_sample_advantage_scalars,
     reduce_train_step_metrics,
@@ -39,7 +42,7 @@ NUM_GPUS = 0
 
 
 @pytest.mark.unit
-def test_exp_sample_advantage_scalar_aligns_context_parallel_mask(monkeypatch):
+def test_sample_advantage_scalar_aligns_context_parallel_mask(monkeypatch):
     from megatron.core import mpu as _mpu
 
     total_length = 12
@@ -72,6 +75,109 @@ def test_exp_sample_advantage_scalar_aligns_context_parallel_mask(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("log_exp_metrics", [False, True])
+@pytest.mark.parametrize("fully_masked", [False, True])
+@pytest.mark.parametrize("sample_values", [[2.0, -1.0, 0.0], [2.0, 1.0, 3.0], [-2.0, -1.0, -3.0], [0.0, 0.0, 0.0]])
+def test_advantage_length_metrics_are_regular(monkeypatch, log_exp_metrics, fully_masked, sample_values):
+    from megatron.core import mpu
+
+    monkeypatch.setattr(mpu, "get_tensor_model_parallel_rank", lambda: 0, raising=False)
+    monkeypatch.setattr(mpu, "is_pipeline_last_stage", lambda: True, raising=False)
+    monkeypatch.setattr(mpu, "get_context_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(mpu, "get_data_parallel_world_size", lambda **kwargs: 1, raising=False)
+    captured = {}
+
+    def capture(metric_name, args, rollout_id, log_dict):
+        captured[metric_name] = log_dict.copy()
+        return {}
+
+    monkeypatch.setattr(train_metric_utils, "gather_log_data", capture)
+    args = Namespace(
+        qkv_format="thd",
+        ci_test=False,
+        log_multi_turn=False,
+        log_passrate=False,
+        log_correct_samples=False,
+        log_exp_metrics=log_exp_metrics,
+    )
+    lengths = [2, 4, 6]
+    advantages = [torch.full((length,), value) for length, value in zip(lengths, sample_values, strict=True)]
+    # Masked tokens do not decide the sign, but reported lengths are full responses.
+    advantages[0][0] = -999.0
+    rollout_data = {
+        "advantages": advantages,
+        "loss_masks": [torch.tensor([0.0, 1.0]), torch.ones(4), torch.ones(6)],
+        "total_lengths": [length + 1 for length in lengths],
+        "response_lengths": lengths,
+        "global_batch_sizes": [3],
+        "gen_weight_versions": [1, 1, 1],
+        "train_weight_versions": [2, 2, 2],
+    }
+    original_advantages = [value.clone() for value in advantages]
+    if fully_masked:
+        rollout_data["loss_masks"] = [torch.zeros(length) for length in lengths]
+        sample_values = [0.0] * len(lengths)
+
+    train_metric_utils.log_rollout_data(0, args, rollout_data)
+
+    regular = captured["rollout"]
+    assert regular["advantage/zero_sample_fraction"] == (sample_values.count(0.0), 3.0)
+    for sign in ("positive", "negative"):
+        selected = [value > 0 if sign == "positive" else value < 0 for value in sample_values]
+        assert regular[f"advantage/{sign}_sample_fraction"] == (sum(selected), 3.0)
+        assert regular[f"advantage/{sign}_abs_mass"] == (
+            sum(abs(value) for value, keep in zip(sample_values, selected, strict=True) if keep),
+            3.0,
+        )
+        assert regular[f"sequence/{sign}_response_length"] == (
+            sum(length for length, keep in zip(lengths, selected, strict=True) if keep),
+            sum(selected),
+        )
+    if log_exp_metrics:
+        experimental = captured["exp/rollout/train_batch"]
+        assert "async/policy_lag" in experimental
+        assert not any(key.startswith(("advantage/", "sequence/")) for key in experimental)
+    else:
+        assert set(captured) == {"rollout"}
+    for original, actual in zip(original_advantages, advantages, strict=True):
+        torch.testing.assert_close(original, actual)
+
+
+@pytest.mark.unit
+def test_signed_length_metrics_reduce_empty_rank_groups(monkeypatch):
+    ranks = [
+        {
+            "sequence/positive_response_length": (2.0, 1.0),
+            "sequence/negative_response_length": (0.0, 0.0),
+            "advantage/positive_sample_fraction": (1.0, 1.0),
+        },
+        {
+            "sequence/positive_response_length": (0.0, 0.0),
+            "sequence/negative_response_length": (14.0, 2.0),
+            "advantage/positive_sample_fraction": (0.0, 2.0),
+        },
+    ]
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    def gather(local, output, dst, group):
+        output[:] = ranks
+
+    monkeypatch.setattr(torch.distributed, "gather_object", gather)
+    reduced = train_metric_utils.gather_and_reduce_log_dict(ranks[0], dp_size=2, dp_src_rank=0, dp_group=None)
+    assert reduced == pytest.approx(
+        {
+            "sequence/positive_response_length": 2.0,
+            "sequence/negative_response_length": 7.0,
+            "advantage/positive_sample_fraction": 1.0 / 3.0,
+        }
+    )
+    for rank in ranks:
+        rank["sequence/positive_response_length"] = (0.0, 0.0)
+    reduced = train_metric_utils.gather_and_reduce_log_dict(ranks[0], dp_size=2, dp_src_rank=0, dp_group=None)
+    assert reduced["sequence/positive_response_length"] == 0.0
+
+
+@pytest.mark.unit
 def test_loss_function_packs_metric_scalars_without_python_scalarization(monkeypatch):
     def fake_custom_loss(args, batch, logits, reducer):
         return torch.tensor(1.0), {"metric_tensor": torch.tensor(2.0), "metric_float": 3.0}
@@ -89,6 +195,7 @@ def test_loss_function_packs_metric_scalars_without_python_scalarization(monkeyp
         (),
         {
             "calculate_per_token_loss": False,
+            "qkv_format": "thd",
             "loss_type": "custom_loss",
             "custom_loss_function_path": "unused",
             "recompute_loss_function": False,
