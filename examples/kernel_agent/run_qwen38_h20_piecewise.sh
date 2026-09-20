@@ -7,9 +7,11 @@ cd "$REPO_ROOT"
 source scripts/models/qwen3.5-27B.sh
 
 export HF_MODEL_PATH=${HF_MODEL_PATH:-/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.8-27B}
+export TRAIN_LOAD_PATH=${TRAIN_LOAD_PATH:-$HF_MODEL_PATH}
 export RL_DATA=${RL_DATA:-$REPO_ROOT/Data/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet}
 export EXP_ROOT=${EXP_ROOT:-/nfs/FM/chenshuailin/experiments/qwen38_gepav4_piecewise_h20_bf16_mtp3_dppotv_fp32_rc32_80rollout}
 export NUM_ROLLOUT=${NUM_ROLLOUT:-80}
+SAVE_INTERVAL=${SAVE_INTERVAL:-10}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-4}
@@ -67,9 +69,9 @@ ARGS=(
    --actor-num-nodes 2 --actor-num-gpus-per-node 8 --rollout-num-gpus 16
    --actor-placement-resource slime_actor --rollout-placement-resource slime_rollout
    --train-env-vars "$TRAIN_ENV_JSON"
-   --hf-checkpoint "$HF_MODEL_PATH" --load "$HF_MODEL_PATH"
+   --hf-checkpoint "$HF_MODEL_PATH" --load "$TRAIN_LOAD_PATH"
    --save "$EXP_ROOT/checkpoints" --save-hf "$EXP_ROOT/hf/rollout_{rollout_id}"
-   --save-interval "$NUM_ROLLOUT"
+   --save-interval "$SAVE_INTERVAL"
    --rollout-function-path examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async
    --update-weights-interval 1
    --prompt-data "$RL_DATA" --input-key prompt --label-key reward_model --metadata-key extra_info
@@ -155,6 +157,14 @@ assert not config.get('quantization_config'), 'Rollout checkpoint must be unquan
 index = json.loads((root / 'model.safetensors.index.json').read_text())
 assert all((root / name).is_file() for name in set(index['weight_map'].values()))
 assert Path(os.environ['RL_DATA']).is_file()
+load_root = Path(os.environ['TRAIN_LOAD_PATH'])
+assert load_root.is_dir(), f'Missing training load directory: {load_root}'
+if load_root != root:
+    tracker = load_root / 'latest_checkpointed_iteration.txt'
+    assert tracker.is_file(), f'Missing resume checkpoint tracker: {tracker}'
+    iteration = int(tracker.read_text().strip())
+    assert (load_root / f'iter_{iteration:07d}' / '.metadata').is_file(), 'Missing distributed resume metadata'
+    print(f'Resume requested from checkpoint iteration {iteration}: {load_root}')
 assert hashlib.sha256(Path(os.environ['RL_DATA']).read_bytes()).hexdigest() == 'ca5cd825d33406de2f73245274be63617ebccf8160c46f34ffcafffca8d03f94', 'Expected user-supplied GEPA4o_v2 torch_ops_difficulty_lt18.parquet'
 assert not (Path(os.environ['EXP_ROOT']) / 'checkpoints/latest_checkpointed_iteration.txt').exists(), 'Use a fresh experiment directory'
 print('Verified unquantized checkpoint, complete weights, dataset, and fresh output directory.')
