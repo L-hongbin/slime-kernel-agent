@@ -71,6 +71,8 @@ METADATA_POP_KEYS = (
     "correctness_issue",
     "correctness_issue_name",
     "kernel_task_id",
+    "kernel_execution_device_id",
+    "kernel_execution_epoch_ns",
     "coverage_backend",
     "reference_task_id",
     "split_compile_and_execute",

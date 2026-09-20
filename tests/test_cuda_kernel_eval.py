@@ -1115,6 +1115,8 @@ def test_normalize_env_feedback_strips_eval_config_metadata(seed_reset_enabled):
             "aten_allowlist_version": "v1",
             "execution_policy": "eval_no_grad_tf32_decoy_v3",
             "correctness_forward_seed_reset_enabled": seed_reset_enabled,
+            "kernel_execution_device_id": 0,
+            "kernel_execution_epoch_ns": 1750000000000000000,
             "max_abs_error": 0.5,
         },
     }
