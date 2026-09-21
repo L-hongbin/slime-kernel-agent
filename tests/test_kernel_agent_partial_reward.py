@@ -456,6 +456,25 @@ def test_failed_sample_does_not_receive_performance_reward_from_malformed_env_st
     assert ungated_details["reward"] == 0.0
 
 
+@pytest.mark.parametrize(
+    "mode,speedup,expected",
+    [
+        ("legacy", 2.0, 2.0),
+        ("legacy", 3.0, 3.0),
+        ("legacy", 5.0, 5.0),
+        ("legacy", 6.0, 5.0),
+        ("improvement", 2.0, 0.25),
+        ("improvement", 3.0, 0.5),
+        ("improvement", 5.0, 1.0),
+        ("improvement", 6.0, 1.0),
+    ],
+)
+def test_default_speedup_reward_upper_bound(mode, speedup, expected):
+    config = _reward_config()
+    assert config["speedup_reward_upper_bound"] == 5.0
+    assert _calculate_performance_score(speedup, mode, None, config) == pytest.approx(expected)
+
+
 def test_improvement_performance_score_only_rewards_gain_over_reference():
     config = {
         **_reward_config(),
@@ -531,7 +550,7 @@ def test_lcb_improvement_supports_cached_reference_with_noise_floor():
     performance_score = _calculate_performance_score(1.5, "lcb_improvement", timing_metadata, config)
     expected_lcb = 1.5 * math.exp(-expected_log_se)
     assert actual_log_se == pytest.approx(expected_log_se)
-    assert performance_score == pytest.approx(expected_lcb - 1.0)
+    assert performance_score == pytest.approx((expected_lcb - 1.0) / (config["speedup_reward_upper_bound"] - 1.0))
 
 
 def test_normalization_uses_runtime_error_code_for_kernel_failed_score_tag():

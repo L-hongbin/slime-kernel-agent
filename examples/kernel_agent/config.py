@@ -166,7 +166,7 @@ CUDA_AGENT_CONFIGS = {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
         "speedup_score_mode": speedup_score_mode,
-        "speedup_reward_upper_bound": 2.0,
+        "speedup_reward_upper_bound": 5.0,
         "speedup_reward_lower_bound": 0.0,
         "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
         "speedup_uncertainty_log_std_floor": speedup_uncertainty_log_std_floor,
