@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
@@ -17,6 +18,7 @@ try:
 except ImportError:
     pass
 
+from .gated_attention import TPGatedSelfAttention
 from .hf_attention import HuggingfaceAttention, _load_hf_config
 from .qwen_gdn_backend import get_chunk_gated_delta_rule
 
@@ -308,5 +310,12 @@ def get_qwen3_5_spec(args, config, vp_stage):
                     module=Attention,
                     params={"args": args},
                 )
+            transformer_layer_spec.layer_specs[layer_id] = layer_specs
+        elif getattr(config, "attention_output_gate", False):
+            layer_specs = copy.deepcopy(transformer_layer_spec.layer_specs[layer_id])
+            attention_spec = layer_specs.submodules.self_attention
+            if attention_spec.module not in (SelfAttention, TPGatedSelfAttention):
+                raise ValueError("Qwen gated full attention requires a Megatron SelfAttention module spec.")
+            attention_spec.module = TPGatedSelfAttention
             transformer_layer_spec.layer_specs[layer_id] = layer_specs
     return transformer_layer_spec

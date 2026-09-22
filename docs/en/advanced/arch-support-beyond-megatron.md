@@ -27,6 +27,14 @@ slime leverages this mechanism by **hijacking the spec generation stage to repla
 
 Through the coordination of these three components, we can successfully run a complex model architecture not natively supported by Megatron—using its HuggingFace implementation as the vehicle—on top of Megatron's parallel framework. This is achieved while fully retaining all key capabilities like model parallelism, MoE acceleration, and pipeline scheduling.
 
+## Qwen Full-Attention TP Gate Compatibility
+
+When `attention_output_gate=True`, `get_qwen3_5_spec` and `get_qwen3_next_spec` automatically replace full-attention `SelfAttention` with slime's `TPGatedSelfAttention`. No extra flag or installed Megatron source modification is needed; linear-attention selection remains unchanged.
+
+Older Megatron versions slice query but not gate when TP exceeds the KV head count. The compatibility module applies the matching head slice using the module's TP group rank; newer versions that already return a rank-local gate pass through unchanged. For Q24 / KV4, TP4 retains 6 query/gate heads per rank and TP8 retains 3. Unrecognized mismatched layouts raise an explicit error.
+
+The module adds no parameters, checkpoint keys, or communication, and preserves autograd through the slice. `tests/test_gated_attention_compat.py` covers old/new layouts, every TP4/TP8 rank, output values, and hidden-state/QKV-weight gradients. These CPU layout simulations do not replace real multi-GPU collective validation.
+
 ## Current Limitations
 
 * This approach does not currently support Tensor Parallelism (TP) within the replaced module itself (e.g., the Attention layer in this case).

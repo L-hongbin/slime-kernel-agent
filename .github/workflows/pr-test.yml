@@ -771,6 +771,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_gated_attention_compat.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_accelerator.py"
             },
             {

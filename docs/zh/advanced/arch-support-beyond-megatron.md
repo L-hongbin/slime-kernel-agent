@@ -27,6 +27,14 @@ Megatron 的模型实例化分为两步：首先根据配置生成“层规格�
 
 通过这三层协同，我们成功地将一个 Megatron 原本不支持的复杂模型结构（以其 HuggingFace 实现为载体），运行在了 Megatron 的并行框架之上，并完整保留了模型并行、MoE 加速、流水线调度等全部关键能力。
 
+## Qwen full attention 的 TP gate 兼容
+
+`get_qwen3_5_spec` 和 `get_qwen3_next_spec` 在 `attention_output_gate=True` 时，自动将 full attention 的 `SelfAttention` 替换为 slime 的 `TPGatedSelfAttention`，不需要新增启动参数，也不修改安装的 Megatron 源码。linear attention 的选择不变。
+
+旧版 Megatron 在 TP 大于 KV head 数时只切分 query、不切分 gate。兼容模块按当前模块 TP group 的 rank 对 gate 做同样的 head 切片；新版已经返回 rank-local gate 时直接透传。以 Q24 / KV4 为例：TP4 每个 rank 保留 6 个 query/gate head，TP8 保留 3 个。未知的不匹配形状会明确报错。
+
+该模块不增加参数、checkpoint key 或通信，切片保留 autograd。`tests/test_gated_attention_compat.py` 覆盖旧版/新版布局、TP4/TP8 全部 rank、输出值及 hidden-state/QKV-weight 梯度；这是 CPU 模拟布局测试，不替代真实多 GPU 通信验证。
+
 ## 当前限制
 
 * 本方案暂不支持被替换模块（如此处的 Attention 层）自身的张量并行（TP）。
