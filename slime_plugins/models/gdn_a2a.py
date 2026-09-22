@@ -342,25 +342,33 @@ def _all_to_all_single(
 
 class _FusedCPToHP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tensor, rank_widths, cp_group, permutation):
+    def forward(ctx, tensor, rank_widths, cp_group, permutation, sequence_permutation):
         cp_size = cp_group.size()
         local_seq_len, batch, total_width = tensor.shape
         local_width = rank_widths[cp_group.rank()]
         rows = local_seq_len * batch
         send = _pack_rank_major(tensor, rank_widths, permutation)
         output = tensor.new_empty(local_seq_len * cp_size, batch, local_width)
+        if sequence_permutation is not None:
+            _validate_sequence_permutation(sequence_permutation, output.size(0), tensor.device)
+            received = _get_communication_workspace(tensor, output.numel(), slot=1)
+        else:
+            received = output.view(-1)
         _all_to_all_single(
-            output.view(-1),
+            received,
             send,
             [rows * local_width] * cp_size,
             [rows * width for width in rank_widths],
             cp_group,
         )
+        if sequence_permutation is not None:
+            torch.index_select(received.view_as(output), 0, sequence_permutation, out=output)
 
         ctx.rank_widths = rank_widths
         ctx.cp_group = cp_group
         ctx.input_shape = tensor.shape
         ctx.permutation = permutation
+        ctx.sequence_permutation = sequence_permutation
         return output
 
     @staticmethod
@@ -371,31 +379,43 @@ class _FusedCPToHP(torch.autograd.Function):
         local_seq_len, batch, total_width = ctx.input_shape
         local_width = rank_widths[cp_group.rank()]
         rows = local_seq_len * batch
+        if ctx.sequence_permutation is not None:
+            send = _get_communication_workspace(grad_output, grad_output.numel(), slot=1)
+            # This is a bijection: scatter directly instead of index_select's
+            # generic zero-fill/index-add backward. Do not retain scratch in ctx.
+            _unpack_sequence(grad_output.contiguous(), send.view_as(grad_output), ctx.sequence_permutation)
+        else:
+            send = grad_output.contiguous().view(-1)
         received = _get_communication_workspace(grad_output, rows * total_width)
         _all_to_all_single(
             received,
-            grad_output.contiguous().view(-1),
+            send,
             [rows * width for width in rank_widths],
             [rows * local_width] * cp_group.size(),
             cp_group,
         )
         grad_input = grad_output.new_empty(ctx.input_shape)
         _unpack_rank_major(received, grad_input, rank_widths, ctx.permutation)
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 class _RaggedHPToCP(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, tensor, rank_widths, cp_group):
+    def forward(ctx, tensor, rank_widths, cp_group, sequence_permutation):
         cp_size = cp_group.size()
         total_seq_len, batch, local_width = tensor.shape
         local_seq_len = total_seq_len // cp_size
         total_width = sum(rank_widths)
         rows = local_seq_len * batch
-        received = _get_communication_workspace(tensor, rows * total_width)
+        send = (
+            _pack_sequence(tensor, sequence_permutation)
+            if sequence_permutation is not None
+            else tensor.contiguous().view(-1)
+        )
+        received = _get_communication_workspace(tensor, rows * total_width, slot=1)
         _all_to_all_single(
             received,
-            tensor.contiguous().view(-1),
+            send,
             [rows * width for width in rank_widths],
             [rows * local_width] * cp_size,
             cp_group,
@@ -406,6 +426,7 @@ class _RaggedHPToCP(torch.autograd.Function):
         ctx.rank_widths = rank_widths
         ctx.cp_group = cp_group
         ctx.input_shape = tensor.shape
+        ctx.sequence_permutation = sequence_permutation
         return output
 
     @staticmethod
@@ -418,14 +439,21 @@ class _RaggedHPToCP(torch.autograd.Function):
         rows = local_seq_len * batch
         send = _pack_rank_major(grad_output, rank_widths, None)
         grad_input = grad_output.new_empty(ctx.input_shape)
+        received = (
+            _get_communication_workspace(grad_output, grad_input.numel(), slot=1)
+            if ctx.sequence_permutation is not None
+            else grad_input.view(-1)
+        )
         _all_to_all_single(
-            grad_input.view(-1),
+            received,
             send,
             [rows * local_width] * cp_group.size(),
             [rows * width for width in rank_widths],
             cp_group,
         )
-        return grad_input, None, None
+        if ctx.sequence_permutation is not None:
+            _unpack_sequence(received, grad_input, ctx.sequence_permutation)
+        return grad_input, None, None, None
 
 
 class _FusedHPToCP(torch.autograd.Function):
@@ -484,16 +512,18 @@ def fused_cp_to_hp(
     rank_widths: tuple[int, ...],
     cp_group: torch.distributed.ProcessGroup,
     permutation: torch.Tensor | None = None,
+    sequence_permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _FusedCPToHP.apply(tensor, rank_widths, cp_group, permutation)
+    return _FusedCPToHP.apply(tensor, rank_widths, cp_group, permutation, sequence_permutation)
 
 
 def ragged_hp_to_cp(
     tensor: torch.Tensor,
     rank_widths: tuple[int, ...],
     cp_group: torch.distributed.ProcessGroup,
+    sequence_permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    return _RaggedHPToCP.apply(tensor, rank_widths, cp_group)
+    return _RaggedHPToCP.apply(tensor, rank_widths, cp_group, sequence_permutation)
 
 
 def fused_hp_to_cp(

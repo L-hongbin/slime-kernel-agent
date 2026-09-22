@@ -26,6 +26,7 @@ from slime_plugins.models.distributed_gdn import (
     _build_head_perm_for_split_sections,
     _build_nonpacked_zigzag_perm,
     _build_thd_cp_a2a_perm,
+    _get_packed_cu_seqlens,
     _get_parameter_local_cp,
     _get_thd_cp_a2a_perm,
     _reorder_nonpacked_zigzag,
@@ -44,6 +45,149 @@ from slime_plugins.models.gdn_a2a import (
 from slime_plugins.models.qwen3_5 import _validate_qwen_gdn_recompute_norm_out
 
 NUM_GPUS = 0
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_packed_boundary_validation_cache(monkeypatch, shared):
+    q = torch.tensor([0, 8, 16], dtype=torch.int32)
+    kv = q if shared else q.clone()
+    params = SimpleNamespace(cu_seqlens_q=q, cu_seqlens_kv=kv, cu_seqlens_q_padded=None, cu_seqlens_kv_padded=None)
+    original = distributed_gdn_module._resolve_cu_seqlens
+    calls = []
+
+    def resolve(*args):
+        calls.append(args[3])
+        return original(*args)
+
+    monkeypatch.setattr(distributed_gdn_module, "_resolve_cu_seqlens", resolve)
+    assert _get_packed_cu_seqlens(params, 16, 2, cache_validation=True) is q
+    assert len(calls) == (1 if shared else 2)
+    calls.clear()
+    assert _get_packed_cu_seqlens(params, 16, 2, cache_validation=True) is q
+    assert calls == []
+    # Uncached calls must validate even after a previous cached call.
+    _get_packed_cu_seqlens(params, 16, 2)
+    assert calls
+    calls.clear()
+    # CP topology is part of the key, even when the boundaries are unchanged.
+    _get_packed_cu_seqlens(params, 16, 4, cache_validation=True)
+    assert calls
+    with pytest.raises(ValueError, match="total_sequence_length"):
+        _get_packed_cu_seqlens(params, 32, 4, cache_validation=True)
+
+
+@pytest.mark.parametrize("change", ["q_mutation", "kv_mutation", "replacement", "padded", "missing"])
+def test_packed_boundary_cache_never_hides_invalid_input(change):
+    q = torch.tensor([0, 8, 16], dtype=torch.int32)
+    params = SimpleNamespace(
+        cu_seqlens_q=q, cu_seqlens_kv=q.clone(), cu_seqlens_q_padded=None, cu_seqlens_kv_padded=None
+    )
+    _get_packed_cu_seqlens(params, 16, 2, cache_validation=True)
+    if change == "q_mutation":
+        params.cu_seqlens_q[1] = 4
+    elif change == "kv_mutation":
+        params.cu_seqlens_kv[1] = 4
+    elif change == "replacement":
+        params.cu_seqlens_kv = torch.tensor([0, 4, 16], dtype=torch.int32)
+    elif change == "padded":
+        params.cu_seqlens_q_padded = torch.tensor([0, 6, 16], dtype=torch.int32)
+    else:
+        params.cu_seqlens_kv = None
+    with pytest.raises(ValueError):
+        _get_packed_cu_seqlens(params, 16, 2, cache_validation=True)
+
+
+@pytest.mark.parametrize(
+    "device",
+    ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"))],
+)
+@pytest.mark.parametrize("widths", [(4, 4), (4, 2, 2), (2, 2, 2, 2)])
+@pytest.mark.parametrize("packed", [False, True])
+def test_fused_packed_a2a_values_and_nonuniform_gradients(monkeypatch, device, widths, packed):
+    """Simulate all ranks with independent layout references, including ragged heads.
+
+    CUDA runs exercise the real Triton pack/unpack kernels, not NCCL.
+    """
+    cp = len(widths)
+    local_s, batch, width = 6, 1, sum(widths)
+    cu = torch.tensor([0, 2 * cp, 6 * cp], dtype=torch.int32, device=device)
+    if packed:
+        index, inverse = _build_thd_cp_a2a_perm(cu, cp, 6 * cp)
+    else:
+        inverse = _build_nonpacked_zigzag_perm(6 * cp, cp, torch.device(device))
+        index = torch.argsort(inverse)
+    permutation = torch.arange(width - 1, -1, -1, device=device)
+    sources = [
+        torch.arange(local_s * width, device=device, dtype=torch.float32).reshape(local_s, batch, width) + 100 * r
+        for r in range(cp)
+    ]
+    reordered = [x.index_select(-1, permutation) for x in sources]
+    heads = [torch.cat([x.split(widths, -1)[r] for x in reordered], 0) for r in range(cp)]
+    # Non-contiguous, nonuniform gradients expose incorrect permutations hidden by sum().
+    grads = [
+        torch.arange(6 * cp * w, device=device, dtype=torch.float32).reshape(w, 1, 6 * cp).transpose(0, 2) + 10 * r
+        for r, w in enumerate(widths)
+    ]
+    for rank in range(cp):
+        group = SimpleNamespace(size=lambda: cp, rank=lambda: rank)
+        source = sources[rank].clone().requires_grad_()
+        expected_send = torch.cat([x.reshape(-1) for x in reordered[rank].split(widths, -1)])
+        backward_chunks = [g.index_select(0, inverse).chunk(cp, 0)[rank] for g in grads]
+        received_grad = torch.cat([x.reshape(-1) for x in backward_chunks])
+        expected_grad = torch.empty_like(source)
+        expected_grad.index_copy_(-1, permutation, torch.cat(backward_chunks, -1))
+        calls = []
+
+        def cp2hp(output, input_, output_split_sizes, input_split_sizes, actual_group):
+            assert output.data_ptr() != input_.data_ptr()
+            if not calls:
+                torch.testing.assert_close(input_, expected_send)
+                output.copy_(heads[rank].reshape(-1))
+            else:
+                torch.testing.assert_close(input_, grads[rank].index_select(0, inverse).reshape(-1))
+                output.copy_(received_grad)
+            calls.append(1)
+
+        monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", cp2hp)
+        actual = _a2a_cp2hp_fused(source, widths, group, permutation, index)
+        torch.testing.assert_close(actual, heads[rank].index_select(0, index))
+        actual.backward(grads[rank])
+        torch.testing.assert_close(source.grad, expected_grad)
+        assert len(calls) == 2
+
+        head = heads[rank].index_select(0, index).detach().requires_grad_()
+        expected_send = head.detach().index_select(0, inverse).reshape(-1)
+        received = torch.cat([x.chunk(cp, 0)[rank].reshape(-1) for x in heads])
+        expected_output = torch.cat([x.chunk(cp, 0)[rank] for x in heads], -1)
+        out_grads = [x * 0.25 + 1 for x in sources]
+        recv_grad = torch.cat([g.split(widths, -1)[rank] for g in out_grads], 0)
+        expected_backward_send = torch.cat([x.reshape(-1) for x in out_grads[rank].split(widths, -1)])
+        calls.clear()
+
+        def hp2cp(output, input_, output_split_sizes, input_split_sizes, actual_group):
+            assert output.data_ptr() != input_.data_ptr()
+            if not calls:
+                torch.testing.assert_close(input_, expected_send)
+                output.copy_(received)
+            else:
+                torch.testing.assert_close(input_, expected_backward_send)
+                output.copy_(recv_grad.reshape(-1))
+            calls.append(1)
+
+        monkeypatch.setattr(gdn_a2a_module, "_all_to_all_single", hp2cp)
+        actual = a2a_hp_to_cp_packed(
+            head,
+            cp,
+            group,
+            SimpleNamespace(qkv_format="thd") if packed else None,
+            inverse if packed else None,
+            rank_widths=widths,
+            a2a_implementation="fused",
+        )
+        torch.testing.assert_close(actual, expected_output)
+        actual.backward(out_grads[rank])
+        torch.testing.assert_close(head.grad, recv_grad.index_select(0, index))
+        assert len(calls) == 2
 
 
 def test_shared_qwen_gdn_arguments_support_distributed_flashqla():

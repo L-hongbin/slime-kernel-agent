@@ -35,8 +35,26 @@ Megatron 的模型实例化分为两步：首先根据配置生成“层规格�
 
 该模块不增加参数、checkpoint key 或通信，切片保留 autograd。`tests/test_gated_attention_compat.py` 覆盖旧版/新版布局、TP4/TP8 全部 rank、输出值及 hidden-state/QKV-weight 梯度；这是 CPU 模拟布局测试，不替代真实多 GPU 通信验证。
 
+## Distributed GDN 的 A2A 优化
+
+训练时可以组合使用：
+
+```bash
+--qwen-gdn-implementation distributed \
+--qwen-gdn-a2a-implementation fused \
+--qwen-gdn-cache-thd-permutation
+```
+
+`native` 和 `fused` 都已经将 packed 序列合并通信；CP>1 时，每层 GDN 的普通 forward/backward 各执行两次 A2A，不计重计算。`fused` 额外将 head 重排融合进打包，并复用按执行 stream 隔离的收发缓冲区。
+
+packed CP→HP 的序列重排在自定义 autograd 内完成，反向利用一一对应的排列直接 scatter，避免通用 `index_select` backward 的清零和累加。ragged HP→CP 同样直接将序列重排写入发送缓冲区，其反向直接恢复原序列顺序。返回张量不引用通信 scratch，梯度计算也不依赖上次调用留下的 scratch 内容。native 的均匀分片路径不变；ragged 分片仍使用专用 fused 路径。
+
+`--qwen-gdn-cache-thd-permutation` 同时缓存 Q/KV packed 边界校验，减少每层重复的 GPU→CPU 同步。缓存绑定当前 packed batch、实际采用的边界 tensor identity/version、总长度和 CP size；替换边界、正常原地修改或改变布局都会重新校验。该缓存不跳过首次校验，也不全局复用不同 batch 的结果。
+
+回归测试位于 `tests/test_distributed_qwen_gdn.py`，覆盖缓存失效、packed/nonpacked、均匀/非均匀 CP 分片、全部模拟 rank 的输出与非均匀梯度，并在有 CUDA 时执行 Triton 打包/解包。通信由测试替身提供，不代表已完成真实多卡 NCCL 性能验证。性能对比应同时覆盖 forward/backward、实际序列分布和训练使用的 recompute 配置。
+
 ## 当前限制
 
-* 本方案暂不支持被替换模块（如此处的 Attention 层）自身的张量并行（TP）。
+* 前述 HuggingFace replicated 封装路径不对被替换模块自身做张量并行（TP）；这一限制不适用于上面的 distributed GDN 路径。
 * **影响**：在大多数大规模 MoE 模型中，Attention 层的参数量占比较小，因此该限制对显存占用和训练吞吐的影响通常有限。
-* **替代方案**：如果该模块的 TP 至关重要，则需要回归到侵入式修改 Megatron 的原生实现方案。
+* **替代方案**：支持的 Qwen GDN 可以使用 `--qwen-gdn-implementation distributed`，由 slime 的模块规格接入 TP/CP 分片实现。

@@ -35,8 +35,26 @@ Older Megatron versions slice query but not gate when TP exceeds the KV head cou
 
 The module adds no parameters, checkpoint keys, or communication, and preserves autograd through the slice. `tests/test_gated_attention_compat.py` covers old/new layouts, every TP4/TP8 rank, output values, and hidden-state/QKV-weight gradients. These CPU layout simulations do not replace real multi-GPU collective validation.
 
+## Distributed GDN A2A Optimizations
+
+Use the existing options together:
+
+```bash
+--qwen-gdn-implementation distributed \
+--qwen-gdn-a2a-implementation fused \
+--qwen-gdn-cache-thd-permutation
+```
+
+Both `native` and `fused` already combine packed sequences into a single collective per direction. With CP>1, each GDN layer issues two forward and two backward A2As, excluding recomputation. The fused path additionally combines head permutation with packing and reuses stream-local send/receive scratch buffers.
+
+Packed CP-to-HP sequence reordering runs inside custom autograd. Its backward directly scatters a bijective permutation instead of using generic `index_select` backward zero-fill/accumulation. Ragged HP-to-CP similarly packs reordered sequence rows directly into send scratch and restores the original order in backward. Returned tensors do not alias communication scratch, and backward does not depend on scratch contents from a previous call. The evenly sharded native path is unchanged; ragged sharding still uses its dedicated fused path.
+
+`--qwen-gdn-cache-thd-permutation` also caches Q/KV boundary validation to avoid repeated per-layer GPU-to-CPU synchronization. The cache belongs to the packed batch and tracks the selected boundary tensors' identities/versions, total length, and CP size. Tensor replacement, normal in-place mutations, or layout changes trigger revalidation; initial validation is never skipped.
+
+`tests/test_distributed_qwen_gdn.py` covers cache invalidation, packed/nonpacked layouts, equal/ragged sharding, and outputs/nonuniform gradients across simulated ranks, including Triton pack/unpack on CUDA when available. Collectives are simulated, not a real multi-GPU NCCL performance validation. Performance comparisons should include forward/backward, representative packed lengths, and the training recomputation configuration.
+
 ## Current Limitations
 
-* This approach does not currently support Tensor Parallelism (TP) within the replaced module itself (e.g., the Attention layer in this case).
+* The HuggingFace replicated wrapper described above does not shard the replaced module itself over TP. This limitation does not apply to the distributed GDN path above.
 * **Impact**: In most large-scale MoE models, the parameter count of the Attention layer is relatively small, so this limitation typically has a minimal effect on memory footprint and training throughput.
-* **Alternative**: If TP for the module is critical, the only alternative is to revert to the more invasive approach of modifying Megatron's native implementation.
+* **Alternative**: Supported Qwen GDN models can use `--qwen-gdn-implementation distributed`, which installs TP/CP-sharded modules through slime's module specifications.

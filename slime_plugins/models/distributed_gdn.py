@@ -101,6 +101,39 @@ def _resolve_cu_seqlens(
     return cu_seqlens
 
 
+def _get_packed_cu_seqlens(
+    packed_seq_params: PackedSeqParams, total_seq_len: int, cp_size: int, *, cache_validation: bool = False
+) -> torch.Tensor:
+    """Validate once per packed batch/layout; tensor replacement or mutation invalidates the cache."""
+    q = packed_seq_params.cu_seqlens_q_padded
+    if q is None:
+        q = packed_seq_params.cu_seqlens_q
+    kv = packed_seq_params.cu_seqlens_kv_padded
+    if kv is None:
+        kv = packed_seq_params.cu_seqlens_kv
+    cache = getattr(packed_seq_params, "_slime_gdn_boundary_cache", None) if cache_validation else None
+    if cache is not None:
+        cached_q, q_version, cached_kv, kv_version, cached_length, cached_cp = cache
+        if (
+            q is cached_q
+            and kv is cached_kv
+            and q._version == q_version
+            and kv._version == kv_version
+            and total_seq_len == cached_length
+            and cp_size == cached_cp
+        ):
+            return q
+
+    q = _resolve_cu_seqlens(None, q, total_seq_len, "cu_seqlens_q", cp_size)
+    if kv is not q:
+        kv = _resolve_cu_seqlens(None, kv, total_seq_len, "cu_seqlens_kv", cp_size)
+        if not torch.equal(q, kv):
+            raise ValueError("GDN currently requires identical Q and KV packed boundaries.")
+    if cache_validation:
+        packed_seq_params._slime_gdn_boundary_cache = (q, q._version, kv, kv._version, total_seq_len, cp_size)
+    return q
+
+
 def _get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
@@ -225,6 +258,7 @@ def _a2a_cp2hp_fused(
     rank_widths: tuple[int, ...],
     cp_group: torch.distributed.ProcessGroup,
     permutation: torch.Tensor | None = None,
+    sequence_permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Convert sequence shards to equal or uneven head shards with fused packing."""
     cp_size = cp_group.size()
@@ -238,13 +272,14 @@ def _a2a_cp2hp_fused(
             f"hidden size {tensor.size(-1)}."
         )
 
-    return fused_cp_to_hp(tensor, rank_widths, cp_group, permutation)
+    return fused_cp_to_hp(tensor, rank_widths, cp_group, permutation, sequence_permutation)
 
 
 def _a2a_hp2cp_ragged(
     tensor: torch.Tensor,
     rank_widths: tuple[int, ...],
     cp_group: torch.distributed.ProcessGroup,
+    sequence_permutation: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Restore sequence shards from uneven head shards with all-to-all-v."""
     cp_size = cp_group.size()
@@ -263,7 +298,7 @@ def _a2a_hp2cp_ragged(
     if local_width != rank_widths[cp_rank]:
         raise ValueError(f"CP rank {cp_rank} owns head width {rank_widths[cp_rank]}, got tensor width {local_width}.")
 
-    return ragged_hp_to_cp(tensor, rank_widths, cp_group)
+    return ragged_hp_to_cp(tensor, rank_widths, cp_group, sequence_permutation)
 
 
 def _reorder_nonpacked_zigzag(tensor: torch.Tensor, cp_size: int, *, undo: bool) -> torch.Tensor:
@@ -320,8 +355,14 @@ def a2a_cp_to_hp_packed(
     inverse = None
     if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
         if cp_size > 1:
+            if cu_seqlens is None:
+                raise ValueError("Packed THD GDN requires cu_seqlens.")
+            if cache_thd_permutation:
+                index, inverse = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size, total_seq_len)
+            else:
+                index, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
             if use_fused_a2a:
-                projected = _a2a_cp2hp_fused(projected, a2a_rank_widths, cp_group, head_perm)
+                projected = _a2a_cp2hp_fused(projected, a2a_rank_widths, cp_group, head_perm, index)
             else:
                 projected = tensor_a2a_cp2hp(
                     projected,
@@ -330,13 +371,7 @@ def a2a_cp_to_hp_packed(
                     cp_group=cp_group,
                     undo_attention_load_balancing=False,
                 )
-            if cu_seqlens is None:
-                raise ValueError("Packed THD GDN requires cu_seqlens.")
-            if cache_thd_permutation:
-                index, inverse = _get_thd_cp_a2a_perm(packed_seq_params, cu_seqlens, cp_size, total_seq_len)
-            else:
-                index, inverse = _build_thd_cp_a2a_perm(cu_seqlens, cp_size, total_seq_len)
-            projected = projected.index_select(0, index)
+                projected = projected.index_select(0, index)
     else:
         if cp_size > 1:
             if use_fused_a2a:
@@ -364,8 +399,7 @@ def a2a_hp_to_cp_packed(
             if inverse is None:
                 raise ValueError("Packed THD GDN requires the inverse CP permutation.")
         if rank_widths is not None:
-            output = output.index_select(0, inverse)
-            return _a2a_hp2cp_ragged(output, rank_widths, cp_group)
+            return _a2a_hp2cp_ragged(output, rank_widths, cp_group, inverse)
         if cp_size > 1 and a2a_implementation == "fused":
             return fused_hp_to_cp(output, cp_group, inverse)
         if cp_size > 1:
@@ -378,8 +412,8 @@ def a2a_hp_to_cp_packed(
             redo_attention_load_balancing=False,
         )
     if rank_widths is not None:
-        output = _reorder_nonpacked_zigzag(output, cp_size, undo=False)
-        return _a2a_hp2cp_ragged(output, rank_widths, cp_group)
+        sequence_permutation = _build_nonpacked_zigzag_perm(output.size(0), cp_size, output.device)
+        return _a2a_hp2cp_ragged(output, rank_widths, cp_group, sequence_permutation)
     if cp_size > 1 and a2a_implementation == "fused":
         sequence_permutation = _build_nonpacked_zigzag_perm(output.size(0), cp_size, output.device)
         return fused_hp_to_cp(output, cp_group, sequence_permutation)
@@ -517,22 +551,9 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
                 )
             if batch != 1:
                 raise ValueError(f"Packed THD GDN requires batch=1, got {batch}.")
-            cu_seqlens_q = _resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_q_padded,
-                packed_seq_params.cu_seqlens_q,
-                total_seq_len,
-                "cu_seqlens_q",
-                self.cp_size,
+            cu_seqlens_q = _get_packed_cu_seqlens(
+                packed_seq_params, total_seq_len, self.cp_size, cache_validation=self.cache_thd_permutation
             )
-            cu_seqlens_kv = _resolve_cu_seqlens(
-                packed_seq_params.cu_seqlens_kv_padded,
-                packed_seq_params.cu_seqlens_kv,
-                total_seq_len,
-                "cu_seqlens_kv",
-                self.cp_size,
-            )
-            if not torch.equal(cu_seqlens_q, cu_seqlens_kv):
-                raise ValueError("GDN currently requires identical Q and KV packed boundaries.")
         else:
             cu_seqlens_q = None
 

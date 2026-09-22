@@ -436,7 +436,10 @@ def add_qwen_gdn_arguments(parser):
     parser.add_argument(
         "--qwen-gdn-cache-thd-permutation",
         action="store_true",
-        help="Cache the packed THD context-parallel permutation across distributed Qwen GDN layers.",
+        help=(
+            "Cache packed THD boundary validation and context-parallel permutations across distributed Qwen GDN "
+            "layers. Tensor replacement, in-place mutation, or layout changes invalidate the caches."
+        ),
     )
     parser.add_argument(
         "--qwen-gdn-sp-disable-batch-p2p-comm",
