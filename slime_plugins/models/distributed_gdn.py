@@ -86,17 +86,20 @@ def _resolve_cu_seqlens(
     if cu_seqlens is None:
         raise ValueError(f"GDN requires {name} for packed THD input.")
 
-    total_cu = int(cu_seqlens[-1].item())
+    from slime.utils.sequence_metadata import get_cpu_sequence_boundaries
+
+    boundaries = get_cpu_sequence_boundaries(cu_seqlens)
+    total_cu = boundaries[-1]
     if total_cu != total_seq_len:
         raise ValueError(f"GDN: {name}[-1]={total_cu} does not match total_sequence_length={total_seq_len}.")
 
     if cp_size > 1:
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_lengths = [end - start for start, end in zip(boundaries, boundaries[1:], strict=False)]
         cp_partition_size = 2 * cp_size
-        if bool((seq_lengths % cp_partition_size != 0).any()):
+        if any(length % cp_partition_size != 0 for length in seq_lengths):
             raise ValueError(
                 "All packed sequence lengths must be divisible by "
-                f"2*cp_size={cp_partition_size} for zigzag CP, got {seq_lengths.tolist()}."
+                f"2*cp_size={cp_partition_size} for zigzag CP, got {seq_lengths}."
             )
     return cu_seqlens
 
@@ -531,7 +534,7 @@ class DistributedQwenGatedDeltaNet(GatedDeltaNet):
                 "cu_seqlens_kv",
                 self.cp_size,
             )
-            if not torch.equal(cu_seqlens_q, cu_seqlens_kv):
+            if cu_seqlens_q is not cu_seqlens_kv and not torch.equal(cu_seqlens_q, cu_seqlens_kv):
                 raise ValueError("GDN currently requires identical Q and KV packed boundaries.")
         else:
             cu_seqlens_q = None

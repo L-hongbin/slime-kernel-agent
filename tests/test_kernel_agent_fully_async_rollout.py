@@ -636,6 +636,21 @@ def test_kernel_agent_top_p_request_is_forced_for_each_turn():
     assert adjusted["custom_params"] == {"return_top_p_token_ids": True}
 
 
+def test_kernel_agent_native_sampling_mask_request_skips_legacy_custom_param():
+    args = Namespace(
+        rollout_top_p=0.95,
+        rollout_max_context_len=None,
+        sglang_sampling_mask_max_tokens=32768,
+    )
+    adjusted = generate_with_cuda_agent._sampling_params_for_prompt_context(
+        args,
+        {"max_new_tokens": 10},
+        prompt_token_count=3,
+    )
+
+    assert "custom_params" not in adjusted
+
+
 def test_kernel_agent_synthetic_samples_have_singleton_top_p_replay():
     base_sample = Sample(index=1)
     padded = generate_with_cuda_agent._pad_turn_samples(

@@ -10,7 +10,6 @@ import torch
 
 from slime.utils.ppo_utils import calculate_log_probs_and_entropy
 
-
 NUM_GPUS = 2
 
 # Megatron's JIT fused CE can differ from the same Python-level expression by
@@ -157,13 +156,16 @@ def _assert_legacy_parity(
     with_entropy: bool,
     entropy_has_grad: bool,
 ) -> None:
+    def mask_factory(*, row_start, row_end):
+        return keep_mask[row_start:row_end].clone()
+
     log_probs, entropy = calculate_log_probs_and_entropy(
         logits,
         tokens,
         tp_group=process_group,
         with_entropy=with_entropy,
         chunk_size=chunk_size,
-        log_prob_keep_mask=keep_mask,
+        log_prob_keep_mask=mask_factory if keep_mask is not None else None,
         with_entropy_grad=entropy_has_grad,
     )
 
@@ -187,7 +189,7 @@ def _assert_legacy_parity(
         tp_group=process_group,
         with_entropy=with_entropy,
         chunk_size=chunk_size,
-        log_prob_keep_mask=keep_mask,
+        log_prob_keep_mask=mask_factory if keep_mask is not None else None,
         with_entropy_grad=entropy_has_grad,
     )
     legacy_logprob_logits = logits.detach().clone().requires_grad_()

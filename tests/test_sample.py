@@ -20,9 +20,9 @@ from __future__ import annotations
 import argparse
 
 import pytest
+import torch
 
-from slime.utils.types import Sample
-
+from slime.utils.types import Sample, _extract_rollout_top_p_token_data
 
 NUM_GPUS = 0
 
@@ -281,6 +281,29 @@ def test_spec_info_only_updated_when_speculative_enabled():
     with_spec.append_response_tokens(_make_args(speculative=True), tokens=[], trainable=True, meta_info=meta_info)
     assert with_spec.spec_info.spec_accept_token_num == 7
     assert with_spec.spec_info.spec_draft_token_num == 10
+
+
+@pytest.mark.unit
+def test_native_sglang_sampling_mask_decodes_to_top_p_replay_spans():
+    token_ids, offsets = _extract_rollout_top_p_token_data(
+        {
+            "output_token_sampling_mask": [[3, 7], [4], [9, 10, 11]],
+            "output_token_sampling_logprobs": [-0.1, -0.2, -0.3],
+        },
+        expected_num_tokens=3,
+    )
+
+    torch.testing.assert_close(token_ids, torch.tensor([3, 7, 4, 9, 10, 11], dtype=torch.int32))
+    torch.testing.assert_close(offsets, torch.tensor([0, 2, 3, 6], dtype=torch.int32))
+
+
+@pytest.mark.unit
+def test_native_sglang_sampling_mask_rejects_missing_token_support():
+    with pytest.raises(ValueError, match="missing for generated token 1"):
+        _extract_rollout_top_p_token_data(
+            {"output_token_sampling_mask": [[3], None]},
+            expected_num_tokens=2,
+        )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,119 @@
+diff --git a/python/sglang/srt/layers/fp32_lm_head_cache.py b/python/sglang/srt/layers/fp32_lm_head_cache.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/layers/fp32_lm_head_cache.py
+@@ -0,0 +1,33 @@
++"""Inference-only FP32 LM head cache, shared through the LM head module.
++
++Create during eager warmup, then refresh in place after online weight loads:
++CUDA graphs retain the cache address, not the Python attribute lookup.
++"""
++
++import torch
++
++
++@torch.no_grad()
++def get_fp32_lm_head_weight(lm_head):
++    weight = lm_head.weight
++    cache = getattr(lm_head, "_fp32_lm_head_weight", None)
++    if cache is None:
++        if weight.is_cuda and torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("Warm up the FP32 LM head cache before CUDA graph capture")
++        with torch.inference_mode(False):
++            cache = weight.detach().to(dtype=torch.float32, copy=True)
++        lm_head.register_buffer("_fp32_lm_head_weight", cache, persistent=False)
++    if (
++        cache.shape != weight.shape
++        or cache.device != weight.device
++        or cache.dtype != torch.float32
++    ):
++        raise RuntimeError("FP32 LM head cache layout changed; restart the engine")
++    return cache
++
++
++@torch.no_grad()
++def refresh_fp32_lm_head_cache(model):
++    for module in model.modules():
++        if getattr(module, "_fp32_lm_head_weight", None) is not None:
++            get_fp32_lm_head_weight(module).copy_(module.weight)
+diff --git a/python/sglang/srt/layers/logits_processor.py b/python/sglang/srt/layers/logits_processor.py
+--- a/python/sglang/srt/layers/logits_processor.py
++++ b/python/sglang/srt/layers/logits_processor.py
+@@ -20,6 +20,8 @@
+ 
+ import torch
+ from torch import nn
++
++from sglang.srt.layers.fp32_lm_head_cache import get_fp32_lm_head_weight
+ 
+ from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+ from sglang.srt.environ import envs
+@@ -963,7 +965,7 @@
+             # Normal linear layer
+             if self.use_fp32_lm_head:
+                 logits = torch.matmul(
+-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
++                    hidden_states.to(torch.float32), get_fp32_lm_head_weight(lm_head).T
+                 )
+             elif use_intel_amx_backend(lm_head):
+                 logits = torch.ops.sgl_kernel.weight_packed_linear(
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -32,6 +32,8 @@
+ import torch
+ import torch.distributed as dist
+ from torch import nn
++
++from sglang.srt.layers.fp32_lm_head_cache import refresh_fp32_lm_head_cache
+ 
+ from sglang.jit_kernel.ngram_embedding import update_token_table_decode
+ from sglang.srt.configs import (
+@@ -1875,6 +1877,7 @@
+ 
+         def model_load_weights(model, iter):
+             loader.load_weights_and_postprocess(model, iter, target_device)
++            refresh_fp32_lm_head_cache(model)
+             return model
+ 
+         with set_default_torch_dtype(self.model_config.dtype):
+@@ -2117,6 +2120,7 @@
+                 handle.wait()
+ 
+             self.model.load_weights(weights)
++            refresh_fp32_lm_head_cache(self.model)
+             return True, "Succeeded to update parameter online."
+ 
+         except Exception as e:
+@@ -2149,6 +2153,7 @@
+             )
+             reconstructed_tensors = bucket.reconstruct_tensors()
+             self.model.load_weights(reconstructed_tensors)
++            refresh_fp32_lm_head_cache(self.model)
+             return True, f"Succeeded to update parameter online."
+         except Exception as e:
+             error_msg = (
+@@ -2188,6 +2193,7 @@
+             self.model.load_weights(named_tensors)
+         else:
+             raise NotImplementedError(f"Unknown load_format={load_format}")
++        refresh_fp32_lm_head_cache(self.model)
+         return True, "Success"
+ 
+     def _update_weights_from_flattened_bucket(
+@@ -2219,6 +2225,7 @@
+ 
+         # Load the reconstructed tensors using the standard method
+         self.model.load_weights(reconstructed_tensors)
++        refresh_fp32_lm_head_cache(self.model)
+ 
+         # The flattened tensor can be backed by CUDA IPC memory owned by the
+         # training process.  Weight loaders enqueue device-to-device copies,
+@@ -3370,6 +3377,7 @@
+             # Create a worker extension that integrates with SGLang's model
+             worker = SGLangCheckpointEngineWorkerExtensionImpl(self)
+             worker.update_weights_from_ipc(recv_req.zmq_handles)
++            refresh_fp32_lm_head_cache(self.model)
+             return True, "IPC weight update completed successfully"
+         except ImportError as e:
+             return False, f"IPC weight update failed: ImportError {e}"

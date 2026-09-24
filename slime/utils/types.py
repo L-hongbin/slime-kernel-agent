@@ -9,6 +9,30 @@ from slime.utils.misc import decode_int32_meta_array
 
 _TOP_P_TOKEN_ID_META_KEYS = ("top_p_token_ids", "top_p_kept_token_ids")
 _TOP_P_TOKEN_OFFSET_META_KEYS = ("top_p_token_offsets", "top_p_kept_token_offsets")
+_NATIVE_SAMPLING_MASK_META_KEY = "output_token_sampling_mask"
+
+
+def _extract_native_sampling_mask_data(
+    meta_info: dict[str, Any],
+    *,
+    expected_num_tokens: int | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    masks = meta_info.get(_NATIVE_SAMPLING_MASK_META_KEY)
+    if masks is None:
+        return None
+    if expected_num_tokens is not None and len(masks) != expected_num_tokens:
+        raise ValueError(
+            "SGLang sampling-mask length must equal generated token count: "
+            f"len(masks)={len(masks)}, generated={expected_num_tokens}."
+        )
+    token_ids: list[int] = []
+    offsets = [0]
+    for index, mask in enumerate(masks):
+        if mask is None:
+            raise ValueError(f"SGLang sampling mask is missing for generated token {index}.")
+        token_ids.extend(_to_int_list(mask))
+        offsets.append(len(token_ids))
+    return torch.tensor(token_ids, dtype=torch.int32), torch.tensor(offsets, dtype=torch.int32)
 
 
 def _extract_rollout_top_p_token_data(
@@ -19,7 +43,10 @@ def _extract_rollout_top_p_token_data(
     token_ids = decode_int32_meta_array(meta_info, _TOP_P_TOKEN_ID_META_KEYS)
     offsets = decode_int32_meta_array(meta_info, _TOP_P_TOKEN_OFFSET_META_KEYS)
     if token_ids is None and offsets is None:
-        return None
+        return _extract_native_sampling_mask_data(
+            meta_info,
+            expected_num_tokens=expected_num_tokens,
+        )
     if token_ids is None or offsets is None:
         raise ValueError("SGLang top-p token replay must include both token ids and offsets.")
     if offsets.numel() == 0 or int(offsets[0]) != 0:
@@ -347,7 +374,10 @@ class Sample:
             top_p_data = _extract_rollout_top_p_token_data(meta_info, expected_num_tokens=new_token_count)
             if top_p_data is not None:
                 applied_top_p_data = True
-                base_token_ids, base_offsets = self.rollout_top_p_token_ids, self.rollout_top_p_token_offsets
+                base_token_ids, base_offsets = (
+                    self.rollout_top_p_token_ids,
+                    self.rollout_top_p_token_offsets,
+                )
                 if base_token_ids is None and base_offsets is None:
                     self.rollout_top_p_token_ids, self.rollout_top_p_token_offsets = top_p_data
                 else:
