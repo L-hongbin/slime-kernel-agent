@@ -1,8 +1,10 @@
 import os
 from argparse import Namespace
 from collections.abc import Callable, Iterator
+from functools import partial
 from typing import Any
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -377,16 +379,16 @@ def _fill_topp_mask_rows(
     vocab_end: int,
 ) -> None:
     end = min(response_start + length, max(len(offsets) - 1, 0))
-    for response_idx in range(response_start, end):
-        local_ids = [
-            token_id - vocab_start
-            for token_id in ids[offsets[response_idx] : offsets[response_idx + 1]]
-            if vocab_start <= token_id < vocab_end
-        ]
-        row = local_start + response_idx - response_start
-        keep[row].fill_(False)
-        if local_ids:
-            keep[row, torch.tensor(local_ids, device=keep.device, dtype=torch.long)] = True
+    if end <= response_start:
+        return
+    offsets = np.asarray(offsets, dtype=np.int64)[response_start : end + 1]
+    token_ids = np.asarray(ids, dtype=np.int64)[offsets[0] : offsets[-1]]
+    rows = np.repeat(np.arange(local_start, local_start + end - response_start), np.diff(offsets))
+    local = (token_ids >= vocab_start) & (token_ids < vocab_end)
+    keep[local_start : local_start + end - response_start].fill_(False)
+    if np.any(local):
+        indices = torch.from_numpy(np.stack((rows[local], token_ids[local] - vocab_start))).to(keep.device)
+        keep[indices[0], indices[1]] = True
 
 
 def _build_topp_keep_mask(
@@ -398,23 +400,45 @@ def _build_topp_keep_mask(
     total_lengths: list[int],
     response_lengths: list[int],
     allgather_cp: bool,
+    *,
+    row_start: int = 0,
+    row_end: int | None = None,
 ) -> torch.Tensor:
-    """Build a ``[T, vocab_local]`` boolean keep-mask aligned to local logits.
+    """Build a boolean keep-mask for a local-logit row interval.
 
     For response token ``r`` of a sample, the rollout top-p nucleus is
     ``ids[offsets[r]:offsets[r + 1]]``. Rows without a recorded nucleus stay
     all-True, so only response rows with replay data are masked.
     """
+    row_end = T if row_end is None else row_end
+    if not 0 <= row_start <= row_end <= T:
+        raise ValueError(f"Invalid top-p mask interval [{row_start}, {row_end}) for {T} rows")
     cp_size = mpu.get_context_parallel_world_size()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     vocab_start = tp_rank * vocab_local
     vocab_end = vocab_start + vocab_local
 
-    # Normalize ragged payloads (may arrive as CPU int32 tensors) to python lists.
-    top_p_token_ids = [t.tolist() if torch.is_tensor(t) else list(t) for t in top_p_token_ids]
-    top_p_token_offsets = [t.tolist() if torch.is_tensor(t) else list(t) for t in top_p_token_offsets]
+    top_p_token_ids = [np.asarray(t.cpu() if torch.is_tensor(t) else t, dtype=np.int64) for t in top_p_token_ids]
+    top_p_token_offsets = [
+        np.asarray(t.cpu() if torch.is_tensor(t) else t, dtype=np.int64) for t in top_p_token_offsets
+    ]
 
-    keep = torch.ones((T, vocab_local), dtype=torch.bool, device=device)
+    keep = torch.ones((row_end - row_start, vocab_local), dtype=torch.bool, device=device)
+
+    def fill_rows(ids, offsets, response_start, local_start, length):
+        overlap_start = max(local_start, row_start)
+        overlap_end = min(local_start + length, row_end)
+        if overlap_end > overlap_start:
+            _fill_topp_mask_rows(
+                keep,
+                ids,
+                offsets,
+                response_start + overlap_start - local_start,
+                overlap_start - row_start,
+                overlap_end - overlap_start,
+                vocab_start,
+                vocab_end,
+            )
 
     if cp_size > 1 and not allgather_cp:
         local_base = 0
@@ -429,7 +453,7 @@ def _build_topp_keep_mask(
                 local_start = base + logits_offset[half][0] - chunks_offset[half][0]
                 length = logits_offset[half][1] - logits_offset[half][0]
                 response_start = tokens_offset[half][0] - prompt_length
-                _fill_topp_mask_rows(keep, ids, offsets, response_start, local_start, length, vocab_start, vocab_end)
+                fill_rows(ids, offsets, response_start, local_start, length)
             local_base += 2 * chunk_size_cp
         return keep
 
@@ -447,15 +471,12 @@ def _build_topp_keep_mask(
             s = max(logit_global_start, chunk_start)
             e = min(logit_global_end, chunk_end)
             if e > s:
-                _fill_topp_mask_rows(
-                    keep,
+                fill_rows(
                     ids,
                     offsets,
                     s - logit_global_start,
                     s - chunk_start,
                     e - s,
-                    vocab_start,
-                    vocab_end,
                 )
             seq_start += total_length
         return keep
@@ -466,7 +487,7 @@ def _build_topp_keep_mask(
     ):
         end = offset + total_length
         start = end - response_length
-        _fill_topp_mask_rows(keep, ids, offsets, 0, start - 1, response_length, vocab_start, vocab_end)
+        fill_rows(ids, offsets, 0, start - 1, response_length)
         offset += total_length
 
     return keep
@@ -610,12 +631,16 @@ def get_log_probs_and_entropy(
     # --- build top-p nucleus keep-mask (logprob only; entropy stays unmasked) ---
     top_p_keep_mask = None
     if top_p_token_ids is not None and top_p_token_offsets is not None:
-        top_p_keep_mask = _build_topp_keep_mask(
+        top_p_keep_mask = partial(
+            _build_topp_keep_mask,
             T,
             logits.size(-1),
             device,
-            top_p_token_ids,
-            top_p_token_offsets,
+            [np.asarray(ids.cpu() if torch.is_tensor(ids) else ids, dtype=np.int64) for ids in top_p_token_ids],
+            [
+                np.asarray(offsets.cpu() if torch.is_tensor(offsets) else offsets, dtype=np.int64)
+                for offsets in top_p_token_offsets
+            ],
             total_lengths,
             response_lengths,
             args.allgather_cp,

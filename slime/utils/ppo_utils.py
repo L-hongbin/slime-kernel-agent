@@ -3,7 +3,7 @@
 
 import math
 from argparse import Namespace
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 
 import torch
 import torch.distributed as dist
@@ -1204,12 +1204,12 @@ class _VocabParallelLogProbEntropy(torch.autograd.Function):
                 entropy = entropy_logits_max + entropy_sum_exp_logits.log() - sum_softmax_times_logits
                 entropy = entropy.squeeze(dim=-1)
 
-            local_target_rows = torch.nonzero(~target_mask, as_tuple=False).squeeze(-1)
             log_prob_logits = vocab_parallel_logits.masked_fill(~log_prob_keep_mask, float("-inf"))
-            if local_target_rows.numel() > 0:
-                log_prob_logits[local_target_rows, masked_target_1d[local_target_rows]] = vocab_parallel_logits[
-                    local_target_rows, masked_target_1d[local_target_rows]
-                ]
+            log_prob_logits[arange_1d, masked_target_1d] = torch.where(
+                target_mask,
+                log_prob_logits[arange_1d, masked_target_1d],
+                vocab_parallel_logits[arange_1d, masked_target_1d],
+            )
             # ``log_prob_logits`` is an owned scratch buffer here, so let the softmax
             # consume it in place rather than allocating another copy.
             predicted_logits, log_prob_sum_exp_logits, log_prob_softmax, _log_prob_logits_max = vocab_parallel_softmax(
@@ -1852,10 +1852,15 @@ def calculate_log_probs_and_entropy(
     tp_group,
     with_entropy: bool = False,
     chunk_size: int = -1,
-    log_prob_keep_mask=None,
+    log_prob_keep_mask: torch.Tensor | Callable[..., torch.Tensor] | None = None,
     with_entropy_grad: bool = True,
     with_dppo_directional_moment: bool = False,
 ):
+    """Calculate selected-token log-probs, optionally constructing replay masks per chunk.
+
+    A mask callable receives keyword arguments ``row_start`` and ``row_end``
+    and returns only those rows, avoiding a full sequence-by-vocabulary mask.
+    """
     if with_dppo_directional_moment and not with_entropy:
         raise ValueError("DPPO entropy directional moments require with_entropy=True.")
     if with_dppo_directional_moment and log_prob_keep_mask is not None:
@@ -1868,9 +1873,6 @@ def calculate_log_probs_and_entropy(
             num_chunks = (logits.size(0) - 1) // chunk_size + 1
             logits_chunks = logits.chunk(num_chunks, dim=0)
             tokens_chunks = tokens.chunk(num_chunks, dim=0)
-            mask_chunks = (
-                log_prob_keep_mask.chunk(num_chunks, dim=0) if log_prob_keep_mask is not None else [None] * num_chunks
-            )
 
             if with_dppo_directional_moment:
                 entropys = []
@@ -1887,7 +1889,15 @@ def calculate_log_probs_and_entropy(
 
             log_probs = []
             entropy_chunks = []
-            for tokens_chunk, logits_chunk, mask_chunk in zip(tokens_chunks, logits_chunks, mask_chunks, strict=True):
+            row_start = 0
+            for tokens_chunk, logits_chunk in zip(tokens_chunks, logits_chunks, strict=True):
+                row_end = row_start + logits_chunk.size(0)
+                if callable(log_prob_keep_mask):
+                    mask_chunk = log_prob_keep_mask(row_start=row_start, row_end=row_end)
+                elif log_prob_keep_mask is not None:
+                    mask_chunk = log_prob_keep_mask[row_start:row_end]
+                else:
+                    mask_chunk = None
                 if with_dppo_directional_moment:
                     log_prob = compute_log_probs(logits_chunk.clone(), tokens_chunk, tp_group)
                     entropy_chunk = None
@@ -1903,6 +1913,8 @@ def calculate_log_probs_and_entropy(
                 log_probs.append(log_prob)
                 if entropy_chunk is not None:
                     entropy_chunks.append(entropy_chunk)
+                row_start = row_end
+                del mask_chunk
             log_prob = torch.cat(log_probs, dim=0)
             if entropy_chunks:
                 entropy = torch.cat(entropy_chunks, dim=0)
@@ -1920,7 +1932,11 @@ def calculate_log_probs_and_entropy(
                     tp_group,
                     with_entropy=with_entropy,
                     with_entropy_grad=with_entropy_grad,
-                    log_prob_keep_mask=log_prob_keep_mask,
+                    log_prob_keep_mask=(
+                        log_prob_keep_mask(row_start=0, row_end=logits.size(0))
+                        if callable(log_prob_keep_mask)
+                        else log_prob_keep_mask
+                    ),
                 )
     else:
         log_prob = logits.new_zeros((0,))
