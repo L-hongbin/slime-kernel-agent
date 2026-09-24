@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -17,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 old_new_group_dict = {}
 default_process_group_states = {}
+_COMM_MEMORY_CHECK_INTERVAL = max(1, int(os.environ.get("SLIME_COMM_MEMORY_CHECK_INTERVAL", "1")))
+_comm_memory_checks_remaining = 0
+_comm_memory_check_deadline = 0.0
 
 
 @dataclass
@@ -482,11 +486,18 @@ def reload_process_groups():
 
 @contextmanager
 def _wrap_low_level_call(check_memory=True):
+    global _comm_memory_checks_remaining, _comm_memory_check_deadline
     try:
         if check_memory:
-            mem_info = available_memory()
-            if mem_info["free_GB"] < 3:
-                clear_memory()
+            now = time.monotonic()
+            if _comm_memory_checks_remaining <= 0 or now >= _comm_memory_check_deadline:
+                mem_info = available_memory()
+                _comm_memory_checks_remaining = _COMM_MEMORY_CHECK_INTERVAL
+                _comm_memory_check_deadline = now + 0.25
+                if mem_info["free_GB"] < 3:
+                    clear_memory()
+                    _comm_memory_checks_remaining = 1
+            _comm_memory_checks_remaining -= 1
         yield
     except Exception as e:
         mem_info = print_memory("after torch distributed error")
