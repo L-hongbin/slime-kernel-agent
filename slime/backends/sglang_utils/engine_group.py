@@ -155,6 +155,10 @@ class ServerGroup:
             env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
                 key: os.environ.get(key, default_val) for key, default_val in SGLANG_ENGINE_ENV_DEFAULTS.items()
             }
+            # Use an explicit package path for rollout engines when their
+            # SGLang/Torch dependencies differ from the training environment.
+            if rollout_pythonpath := os.environ.get("SLIME_ROLLOUT_PYTHONPATH"):
+                env_vars["PYTHONPATH"] = rollout_pythonpath
             rollout_engine = RolloutRayActor.options(
                 num_cpus=num_cpus,
                 num_gpus=num_gpus,
