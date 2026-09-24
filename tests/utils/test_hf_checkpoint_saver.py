@@ -61,6 +61,46 @@ def test_save_hf_model_to_path_rejects_origin_checkpoint(tmp_path: Path):
         save_hf_model_to_path(args, tmp_path, model=None)
 
 
+def test_prepare_hf_directory_on_nonzero_node_writer(tmp_path, monkeypatch):
+    import torch.distributed as dist
+    from slime.backends.megatron_utils import hf_checkpoint_saver as saver
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    output = tmp_path / "node70" / "hf" / "rollout_9"
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 8)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 16)
+    broadcasts = []
+    monkeypatch.setattr(dist, "broadcast_object_list", lambda payload, src: broadcasts.append(src))
+    args = SimpleNamespace(hf_checkpoint=str(source), actor_num_nodes=2, actor_num_gpus_per_node=8)
+    saver._prepare_hf_output_directory(args, output)
+    assert broadcasts == [0, 8]
+    assert (output / "config.json").is_file()
+    writer = saver._SafetensorShardWriter(output, enabled=True)
+    writer.write([("weight", torch.ones(2, 2))], shard_idx=1)
+    assert len(list(output.glob("*.safetensors"))) == 1
+
+
+def test_prepare_hf_directory_broadcasts_remote_writer_failure(tmp_path, monkeypatch):
+    import torch.distributed as dist
+    from slime.backends.megatron_utils import hf_checkpoint_saver as saver
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda: 1)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 16)
+
+    def broadcast(payload, src):
+        if src == 8:
+            payload[0] = "PermissionError: writer path is not writable"
+
+    monkeypatch.setattr(dist, "broadcast_object_list", broadcast)
+    args = SimpleNamespace(hf_checkpoint=str(tmp_path), actor_num_nodes=2, actor_num_gpus_per_node=8)
+    with pytest.raises(RuntimeError, match="writer rank 8.*PermissionError"):
+        saver._prepare_hf_output_directory(args, tmp_path / "output")
+
+
 def test_safetensor_shard_writer_writes_hf_index(tmp_path: Path):
     writer = _SafetensorShardWriter(tmp_path, enabled=True)
     writer.write([("layers.0.weight", torch.ones(2, 2)), ("layers.0.weight_scale", torch.ones(1))], shard_idx=0)
