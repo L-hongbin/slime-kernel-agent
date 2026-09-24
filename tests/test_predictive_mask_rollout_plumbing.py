@@ -344,3 +344,54 @@ def test_actor_cp_slice_preserves_support_rows_and_converts_gpu_dtypes_on_cpu(mo
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("backend", ["default", "kernel_agent"])
+@pytest.mark.parametrize("sampling_logprobs", [[-0.05, -0.15], None, [-0.05]])
+def test_native_sampling_mask_requests_and_logprobs(monkeypatch, backend, sampling_logprobs):
+    captured = {}
+    meta = _meta_info()
+    meta["output_token_sampling_mask"] = [[7, 8], [99]]
+    if sampling_logprobs is not None:
+        meta["output_token_sampling_logprobs"] = sampling_logprobs
+
+    async def fake_post(url, payload, **kwargs):
+        captured.update(payload)
+        return {"text": "answer", "meta_info": meta}
+
+    async def fake_env(*args, **kwargs):
+        return {"env_state": {"done": True}}
+
+    async def fake_reward(*args, **kwargs):
+        return 1.0
+
+    args = _default_generate_args()
+    args.dppo_predictive_top_k = 0
+    args.rollout_top_p = 0.9
+    args.sglang_sampling_mask_max_tokens = 32768
+    args.max_turns = 1
+    args.use_multi_turn = True
+    args.padding_turns = False
+    args.rollout_max_context_len = None
+    module = sglang_rollout if backend == "default" else cuda_agent
+    monkeypatch.setattr(module, "GenerateState", lambda args: _GenerateState())
+    monkeypatch.setattr(module, "post", fake_post)
+    if backend == "kernel_agent":
+        monkeypatch.setattr(cuda_agent, "cuda_kernel_env", fake_env)
+        monkeypatch.setattr(cuda_agent, "reward_func", fake_reward)
+        monkeypatch.setattr(cuda_agent, "_extract_env_extra_info", lambda result: {})
+        monkeypatch.setattr(cuda_agent, "postprocess_turn_samples", lambda args, samples, finish_reason: samples)
+    generate = sglang_rollout.generate if backend == "default" else cuda_agent._generate_impl
+    request = generate(args, Sample(prompt="hello"), {"max_new_tokens": 2})
+    if sampling_logprobs is None or len(sampling_logprobs) != 2:
+        with pytest.raises(ValueError, match="sampling-mask logprobs must align"):
+            asyncio.run(request)
+    else:
+        result = asyncio.run(request)
+        sample = result if backend == "default" else result[0]
+        assert sample.rollout_log_probs == sampling_logprobs
+        assert sample.rollout_top_p_token_ids.tolist() == [7, 8, 99]
+        assert sample.rollout_top_p_token_offsets.tolist() == [0, 2, 3]
+    assert captured["return_sampling_mask"] is True
+    assert "custom_params" not in captured["sampling_params"]

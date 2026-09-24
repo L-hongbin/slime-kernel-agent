@@ -23,6 +23,7 @@ from slime.rollout.sglang_rollout import (
     _decode_routed_experts,
     _empty_predictive_support,
     _extract_predictive_support,
+    _uses_native_sampling_mask,
 )
 from slime.utils.http_utils import post
 from slime.utils.lora_utils import rollout_lora_path as _rollout_lora_path
@@ -413,7 +414,7 @@ def _sampling_params_for_prompt_context(
     prompt_token_count: int,
 ) -> dict[str, Any]:
     turn_sampling_params = sampling_params.copy()
-    if getattr(args, "rollout_top_p", 1.0) != 1.0:
+    if getattr(args, "rollout_top_p", 1.0) != 1.0 and not _uses_native_sampling_mask(args):
         custom_params = dict(turn_sampling_params.get("custom_params") or {})
         custom_params["return_top_p_token_ids"] = True
         turn_sampling_params["custom_params"] = custom_params
@@ -1009,6 +1010,8 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             "sampling_params": turn_sampling_params,
             "return_logprob": True,
         }
+        if _uses_native_sampling_mask(args) and getattr(args, "rollout_top_p", 1.0) != 1.0:
+            payload["return_sampling_mask"] = True
         predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
         if predictive_top_k < 0:
             raise ValueError(f"dppo_predictive_top_k must be non-negative, got {predictive_top_k}")
@@ -1082,6 +1085,15 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             token_logprobs = output["meta_info"].get("output_token_logprobs", [])
             response_ids = [item[1] for item in token_logprobs]
             log_probs = [item[0] for item in token_logprobs]
+            if _uses_native_sampling_mask(args) and getattr(args, "rollout_top_p", 1.0) != 1.0:
+                sampling_logprobs = output["meta_info"].get("output_token_sampling_logprobs")
+                if sampling_logprobs is None or len(sampling_logprobs) != len(response_ids):
+                    raise ValueError(
+                        "SGLang native sampling-mask logprobs must align with generated tokens: "
+                        f"logprobs={None if sampling_logprobs is None else len(sampling_logprobs)}, "
+                        f"tokens={len(response_ids)}."
+                    )
+                log_probs = [float(value) for value in sampling_logprobs]
         response = output["text"]
         if not response_ids:
             if predictive_top_k and response:
