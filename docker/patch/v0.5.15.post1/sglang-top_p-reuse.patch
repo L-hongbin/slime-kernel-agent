@@ -1,0 +1,144 @@
+diff --git a/python/sglang/srt/layers/utils/logprob.py b/python/sglang/srt/layers/utils/logprob.py
+--- a/python/sglang/srt/layers/utils/logprob.py
++++ b/python/sglang/srt/layers/utils/logprob.py
+@@ -135,6 +135,7 @@
+     need_min_p_sampling: bool,
+     request_mask: torch.Tensor,
+     force_keep_token_ids: Optional[torch.Tensor] = None,
++    precomputed_support: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+ ) -> Optional[torch.Tensor]:
+     rows = _top_p_filter_rows(
+         top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+@@ -142,9 +143,11 @@
+     if not bool(rows.any().item()):
+         return None
+ 
+-    keep, probs_idx = _top_p_keep_mask_sorted(
+-        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+-    )
++    if precomputed_support is None:
++        precomputed_support = _top_p_keep_mask_sorted(
++            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
++        )
++    keep, probs_idx = precomputed_support
+     # Scatter the keep-mask back to vocab order so we renormalize directly over
+     # vocab ids (and can force-keep specific token ids).
+     keep_vocab = torch.empty_like(keep)
+@@ -174,6 +177,7 @@
+     need_top_p_sampling: bool,
+     need_min_p_sampling: bool,
+     request_mask: torch.Tensor,
++    precomputed_support: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+ ) -> Optional[List[Optional[torch.Tensor]]]:
+     rows = _top_p_filter_rows(
+         top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling, request_mask
+@@ -181,9 +185,11 @@
+     if not bool(rows.any().item()):
+         return None
+ 
+-    keep, probs_idx = _top_p_keep_mask_sorted(
+-        probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
+-    )
++    if precomputed_support is None:
++        precomputed_support = _top_p_keep_mask_sorted(
++            probs, top_ks, top_ps, min_ps, need_top_p_sampling, need_min_p_sampling
++        )
++    keep, probs_idx = precomputed_support
+     return [
+         probs_idx[i][keep[i]].to(torch.int32) if bool(rows[i].item()) else None
+         for i in range(probs.shape[0])
+@@ -475,6 +481,14 @@
+             expanded_min_ps = torch.repeat_interleave(
+                 batch.sampling_info.min_ps, max_accept
+             )
++            replay_support = _top_p_keep_mask_sorted(
++                probs,
++                expanded_top_ks,
++                expanded_top_ps,
++                expanded_min_ps,
++                batch.sampling_info.need_top_p_sampling,
++                False,
++            )
+             top_p_token_ids = get_top_p_token_ids_from_probs(
+                 probs=probs,
+                 top_ks=expanded_top_ks,
+@@ -483,6 +497,7 @@
+                 need_top_p_sampling=batch.sampling_info.need_top_p_sampling,
+                 need_min_p_sampling=False,
+                 request_mask=request_mask,
++                precomputed_support=replay_support,
+             )
+             if top_p_token_ids is not None:
+                 logits_output.next_token_top_p_token_ids = top_p_token_ids
+@@ -502,6 +517,7 @@
+                 # matching the trainer which also force-keeps the target token,
+                 # so these tokens stay finite and on-policy.
+                 force_keep_token_ids=accepted_token_ids.long(),
++                precomputed_support=replay_support,
+             )
+             if renorm_logprobs is not None:
+                 idx = torch.arange(bs * max_accept, device=device)
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -13,6 +13,7 @@
+ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+ from sglang.srt.layers.utils.hash import murmur_hash32
+ from sglang.srt.layers.utils.logprob import (
++    _top_p_keep_mask_sorted,
+     get_token_ids_logprobs,
+     get_top_logprobs,
+     get_top_p_token_ids_from_probs,
+@@ -193,7 +194,7 @@
+                 logits[:] = torch.softmax(logits, dim=-1)
+                 probs = logits
+ 
+-                self._attach_top_p_token_ids_to_output(
++                replay_support = self._attach_top_p_token_ids_to_output(
+                     logits_output,
+                     probs,
+                     sampling_info,
+@@ -223,6 +224,7 @@
+                             need_min_p_sampling=sampling_info.need_min_p_sampling,
+                             request_mask=sampling_info.return_top_p_token_ids,
+                             force_keep_token_ids=batch_next_token_ids,
++                            precomputed_support=replay_support,
+                         )
+                     if top_p_logprobs is not None:
+                         logprobs = top_p_logprobs
+@@ -417,7 +419,7 @@
+         probs: torch.Tensor,
+         sampling_info: SamplingBatchInfo,
+         simple_sampling_case: bool,
+-    ) -> None:
++    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+         if (
+             not sampling_info.need_return_top_p_token_ids
+             or sampling_info.return_top_p_token_ids is None
+@@ -425,6 +427,14 @@
+         ):
+             return
+ 
++        replay_support = _top_p_keep_mask_sorted(
++            probs,
++            sampling_info.top_ks,
++            sampling_info.top_ps,
++            sampling_info.min_ps,
++            sampling_info.need_top_p_sampling,
++            sampling_info.need_min_p_sampling,
++        )
+         top_p_token_ids = get_top_p_token_ids_from_probs(
+             probs=probs,
+             top_ks=sampling_info.top_ks,
+@@ -433,9 +443,11 @@
+             need_top_p_sampling=sampling_info.need_top_p_sampling,
+             need_min_p_sampling=sampling_info.need_min_p_sampling,
+             request_mask=sampling_info.return_top_p_token_ids,
++            precomputed_support=replay_support,
+         )
+         if top_p_token_ids is not None:
+             logits_output.next_token_top_p_token_ids = top_p_token_ids
++        return replay_support
+ 
+     def _attach_logprobs_to_output(
+         self,
