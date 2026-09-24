@@ -817,6 +817,25 @@ def test_packed_boundaries_allow_odd_lengths_without_cp():
     assert _resolve_cu_seqlens(None, boundaries, 4096, "cu_seqlens_q", cp_size=1) is boundaries
 
 
+def test_packed_boundary_validation_reuses_cpu_metadata(monkeypatch):
+    from slime.utils.sequence_metadata import cache_cpu_sequence_boundaries
+
+    boundaries = torch.tensor([0, 8, 24], dtype=torch.int32)
+    cache_cpu_sequence_boundaries(boundaries, [0, 8, 24])
+    monkeypatch.setattr(torch.Tensor, "item", lambda self: pytest.fail("unexpected scalar readback"))
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: pytest.fail("unexpected boundary readback"))
+    for _ in range(3):
+        assert _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2) is boundaries
+
+
+def test_packed_boundary_validation_detects_mutated_tensor():
+    boundaries = torch.tensor([0, 8, 24])
+    _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2)
+    boundaries[-1] = 26
+    with pytest.raises(ValueError, match="does not match"):
+        _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2)
+
+
 def test_parameter_cp_slice_preserves_fused_sections():
     class FakeGroup:
         def size(self):
