@@ -78,6 +78,7 @@ CP_PARTITION_MODE=${CP_PARTITION_MODE:-zigzag}
 CUDA_AGENT_APPLY_FAILED_GROUP_REWARD=${CUDA_AGENT_APPLY_FAILED_GROUP_REWARD:-0}
 CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE=${CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE:-0}
 DYNAMIC_REWARD=${DYNAMIC_REWARD:-None}
+DYNAMIC_CORRECTNESS_REWARD=${DYNAMIC_CORRECTNESS_REWARD:-None}
 
 # will prevent ray from buffering stdout/stderr
 export PYTHONUNBUFFERED=1
@@ -220,7 +221,7 @@ elif [[ $CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE == 1 ]]; then
 fi
 
 case "${DYNAMIC_REWARD}" in
-   None) EXP_PARAM+="FixedRW" ;;
+   None) ;;
    sqrt) EXP_PARAM+="DynamicRWSqrt" ;;
    piecewise) EXP_PARAM+="DynamicRWPiecewise" ;;
    piecewise-sqrt) EXP_PARAM+="DynamicRWPiecewiseSqrt" ;;
@@ -230,6 +231,16 @@ case "${DYNAMIC_REWARD}" in
       ;;
 esac
 EXP_ARGS+=(--dynamic-reward-gate "${DYNAMIC_REWARD}" --dynamic-reward-gate-range 0.8 1.2)
+case "${DYNAMIC_CORRECTNESS_REWARD}" in
+   None) ;;  # correctness 不调权
+   inverse-correct-rate) EXP_PARAM+="CorrectnessMaxFormat" ;;
+   inverse-gate) EXP_PARAM+="CorrectnessGateFormat" ;;
+   *)
+      echo "DYNAMIC_CORRECTNESS_REWARD must be None, inverse-correct-rate." >&2
+      exit 1
+      ;;
+esac
+EXP_ARGS+=(--dynamic-reward-correctness $DYNAMIC_CORRECTNESS_REWARD)
 
 EXP_ARGS+=("${MIS_ARGS[@]}")
 EXP_NAME="Kernel-FAsync-${KERNEL_BACKEND^^}"
