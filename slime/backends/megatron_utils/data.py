@@ -214,11 +214,7 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = torch.tensor(
-                cu_seqlens_list,
-                dtype=torch.int,
-                device=accelerator.current_device(),
-            )
+            cu_seqlens = cu_seqlens_list
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(token_ids, pad_token_id, qkv_format) for token_ids in tokens]
@@ -234,9 +230,10 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # THD requires cu_seqlens in the original (pre-CP) lengths.
-            cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.current_device()) * cp_size
+            cu_seqlens = [offset * cp_size for offset in cu_seqlens]
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        max_seqlen = max(end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True))
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.current_device())
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,

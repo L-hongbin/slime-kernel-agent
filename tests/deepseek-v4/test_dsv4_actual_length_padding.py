@@ -129,6 +129,59 @@ def test_get_batch_consumes_the_current_microbatch_width_on_cpu(monkeypatch):
     assert second["tokens"].shape == second["full_loss_masks"].shape == (1, 128)
 
 
+@pytest.mark.parametrize(
+    "cp_size,allgather,expected",
+    [
+        (1, False, [0, 13, 20, 24]),
+        (1, True, [0, 13, 20, 24]),
+        (2, False, [0, 16, 24, 32]),
+        (2, True, [0, 13, 20, 32]),
+    ],
+)
+@pytest.mark.parametrize("mode", [CP_PARTITION_CONTIGUOUS, CP_PARTITION_ZIGZAG])
+def test_thd_packed_boundaries_are_computed_without_device_scalar_reads(
+    monkeypatch, cp_size, allgather, expected, mode
+):
+    total_lengths = [13, 7]
+    rollout_data = {
+        "tokens": [torch.arange(length) for length in total_lengths],
+        "loss_masks": [torch.ones(length - 1, dtype=torch.int) for length in total_lengths],
+        "total_lengths": total_lengths,
+        "response_lengths": [length - 1 for length in total_lengths],
+    }
+    monkeypatch.setattr(data_module.mpu, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(data_module.mpu, "get_context_parallel_world_size", lambda: cp_size)
+    monkeypatch.setattr(data_module.accelerator, "current_device", lambda: torch.device("cpu"))
+    old_mode = cp_utils.get_cp_partition_mode()
+    cp_utils.set_cp_partition_mode(mode)
+
+    def reject_item(*args, **kwargs):
+        raise AssertionError("Packing should compute boundaries on CPU without Tensor.item()")
+
+    try:
+        for rank in range(cp_size):
+            monkeypatch.setattr(data_module.mpu, "get_context_parallel_rank", lambda rank=rank: rank)
+            with monkeypatch.context() as patch:
+                patch.setattr(torch.Tensor, "item", reject_item)
+                batch = get_batch(
+                    DataIterator(rollout_data, [[0, 1]]),
+                    list(rollout_data),
+                    pad_multiplier=8,
+                    qkv_format="thd",
+                    allgather_cp=allgather,
+                )
+            params = batch["packed_seq_params"]
+            assert params.cu_seqlens_q.tolist() == params.cu_seqlens_kv.tolist() == expected
+            assert (
+                params.max_seqlen_q
+                == params.max_seqlen_kv
+                == max(b - a for a, b in zip(expected[:-1], expected[1:], strict=True))
+            )
+            assert batch["tokens"].shape == batch["full_loss_masks"].shape == (1, expected[-1] // cp_size)
+    finally:
+        cp_utils.set_cp_partition_mode(old_mode)
+
+
 def test_padding_summary_reports_widths_and_saved_slots():
     summary = summarize_bshd_padding(
         [5706, 16382, 6000],

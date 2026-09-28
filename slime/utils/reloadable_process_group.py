@@ -1,5 +1,6 @@
 import logging
 import os
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import timedelta
@@ -17,6 +18,10 @@ logger = logging.getLogger(__name__)
 
 old_new_group_dict = {}
 default_process_group_states = {}
+# Healthy-memory checks are shared by nested Python/C++ communication wrappers.
+# Recheck immediately after a low-memory result, group recreation, or an error.
+_COMM_MEMORY_CHECK_INTERVAL_S = 0.1
+_next_comm_memory_check = {}
 
 
 @dataclass
@@ -166,6 +171,7 @@ def monkey_patch_torch_dist():
             backend = normalized_backend
 
         group = old_new_group(*args, **kwargs)
+        _next_comm_memory_check.pop(pid, None)
 
         # Before WORLD is registered, preserve the historical behavior of
         # leaving CPU groups and singleton groups untouched.  Afterwards every
@@ -332,6 +338,7 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
     @staticmethod
     def reload_process_groups():
         pid = os.getpid()
+        _next_comm_memory_check.pop(pid, None)
         reloadable_groups = ReloadableProcessGroup.GROUPS.get(pid, [])
         backend_counts = {}
         for reloadable_group in reloadable_groups:
@@ -484,11 +491,17 @@ def reload_process_groups():
 def _wrap_low_level_call(check_memory=True):
     try:
         if check_memory:
-            mem_info = available_memory()
-            if mem_info["free_GB"] < 3:
-                clear_memory()
+            pid, now = os.getpid(), time.monotonic()
+            if now >= _next_comm_memory_check.get(pid, float("-inf")):
+                mem_info = available_memory()
+                if mem_info["free_GB"] < 3:
+                    _next_comm_memory_check.pop(pid, None)
+                    clear_memory()
+                else:
+                    _next_comm_memory_check[pid] = now + _COMM_MEMORY_CHECK_INTERVAL_S
         yield
     except Exception as e:
+        _next_comm_memory_check.pop(os.getpid(), None)
         mem_info = print_memory("after torch distributed error")
         e.add_note(f"{mem_info=}")
         raise
