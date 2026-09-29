@@ -238,7 +238,7 @@ if root not in target.parents:
     raise SystemExit('TRAIN_SAVE_PATH must be inside LOCAL_CHECKPOINT_ROOT')
 print(f'Checkpoint staging: {target}; NFS archival is managed by the standalone host uploader')
 PYCHECKPOINT
-python scripts/check_qwen38_b300_runtime.py
+python scripts/b300/check_qwen38_b300_runtime.py
 python scripts/check_kernelgym_health.py --url "$KERNEL_ENV_URL" --timeout 5 --attempts 3
 run_rollout_python scripts/check_sglang_top_p_replay.py --check-sort-reuse
 run_rollout_python scripts/check_sglang_fp32_lm_head_cache.py

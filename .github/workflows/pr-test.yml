@@ -739,6 +739,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_qwen38_b300_runtime.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_kernelgym_health_backoff.py"
             },
             {

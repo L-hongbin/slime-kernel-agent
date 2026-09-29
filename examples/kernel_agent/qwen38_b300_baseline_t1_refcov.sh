@@ -223,7 +223,7 @@ if [[ "${CONFIG_DRY_RUN:-0}" == 1 ]]; then
    printf '\n'
    exit 0
 fi
-python scripts/check_qwen38_b300_runtime.py
+python scripts/b300/check_qwen38_b300_runtime.py
 python scripts/check_kernelgym_health.py --url "$KERNEL_ENV_URL" --timeout 5 --attempts 3
 run_rollout_python scripts/check_sglang_top_p_replay.py --check-sort-reuse
 run_rollout_python scripts/check_sglang_fp32_lm_head_cache.py
