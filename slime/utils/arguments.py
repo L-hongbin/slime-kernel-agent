@@ -233,7 +233,16 @@ def _parse_sequence_mis_args(args) -> None:
     if not isinstance(config, dict):
         raise ValueError("--sequence-mis-config must parse to a dictionary/object.")
 
-    allowed_keys = {"aggregation", "lower", "upper", "delta", "token_veto_threshold", "use_advantage", "ratio_source"}
+    allowed_keys = {
+        "aggregation",
+        "lower",
+        "upper",
+        "delta",
+        "token_veto_threshold",
+        "use_advantage",
+        "ratio_source",
+        "actor_logprob",
+    }
     unknown_keys = set(config) - allowed_keys
     if unknown_keys:
         raise ValueError(f"Unknown --sequence-mis-config keys: {sorted(unknown_keys)}")
@@ -273,9 +282,19 @@ def _parse_sequence_mis_args(args) -> None:
             "['kl', 'geometric', 'mirrorpop', 'turns_geometric', 'turns_mirrorpop', 'binary_kl'], "
             f"got {aggregation!r}."
         )
+    actor_logprob = config.get("actor_logprob", "dynamic" if aggregation == "binary_kl" else "static")
+    if not isinstance(actor_logprob, str) or actor_logprob not in {"static", "dynamic"}:
+        raise ValueError("Sequence MIS actor_logprob must be 'static' or 'dynamic'.")
+    args.sequence_mis_actor_logprob = actor_logprob
+    if actor_logprob == "dynamic":
+        if aggregation in {"turns_geometric", "turns_mirrorpop"}:
+            raise ValueError("Sequence MIS turns_* requires actor_logprob='static' for complete trajectories.")
+        if (
+            getattr(args, "train_backend", "megatron") != "megatron"
+            or getattr(args, "loss_type", "policy_loss") != "policy_loss"
+        ):
+            raise ValueError("Sequence MIS dynamic actor_logprob requires the Megatron policy_loss backend.")
     if aggregation == "binary_kl":
-        # FlashREINFORCE-style sample admission uses the live training forward,
-        # not the pre-training actor/old-actor recompute used by legacy MIS.
         upper = getattr(args, "sequence_mis_upper", None)
         if upper is None:
             upper = args.sequence_mis_upper = 0.05
@@ -294,6 +313,10 @@ def _parse_sequence_mis_args(args) -> None:
             or getattr(args, "loss_type", "policy_loss") != "policy_loss"
         ):
             raise ValueError("Sequence MIS binary_kl requires the Megatron policy_loss backend.")
+    lower = getattr(args, "sequence_mis_lower", None)
+    upper = getattr(args, "sequence_mis_upper", None)
+    if lower is not None and upper is not None and lower >= upper:
+        raise ValueError("Sequence MIS lower must be smaller than upper.")
     if aggregation in {"turns_geometric", "turns_mirrorpop"} and args.max_turns is None:
         raise ValueError(
             "--max-turns must be set when --sequence-mis-config aggregation=turns_geometric or turns_mirrorpop."
@@ -1977,10 +2000,11 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Optional Sequence MIS config. aggregation=binary_kl masks individual samples in the "
-                    "training loss using current-forward vs rollout probabilities (upper defaults to 0.05, must be >= 0); "
-                    "no rollout-data postprocess hook is needed. Other modes use rollout-data postprocess masking. "
-                    "Supports aggregation, lower/upper thresholds, token veto, and use_advantage keys. "
+                    "Optional Sequence MIS config. actor_logprob='static' uses pre-training recompute and "
+                    "the sequence_mis rollout-data postprocess hook; 'dynamic' uses live training-forward "
+                    "probabilities without that hook. Defaults: binary_kl dynamic, other aggregations static. "
+                    "turns_* requires static. Supports aggregation, actor_logprob, ratio_source, lower/upper, "
+                    "token_veto_threshold and use_advantage. binary_kl upper defaults to 0.05. "
                     'Must be a JSON object, for example \'{"aggregation":"turns_geometric","lower":0.999,"upper":1.001}\'.'
                 ),
             )

@@ -23,7 +23,6 @@ from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
     compute_aspo_policy_loss,
-    compute_binary_kl_sample_gate,
     compute_cispo_policy_loss,
     compute_cppo_policy_loss,
     compute_dis_policy_loss,
@@ -41,6 +40,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from slime.utils.sequence_mis import compute_sequence_mis
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1648,11 +1648,20 @@ def policy_loss_function(
 
     log_probs = log_probs_and_entropy["log_probs"]
     sequence_mis_metrics = {}
-    if getattr(args, "sequence_mis_aggregation", None) == "binary_kl":
-        behavior_log_probs = batch.get("rollout_log_probs")
+    mis_aggregation = getattr(args, "sequence_mis_aggregation", None)
+    mis_actor_logprob = getattr(
+        args, "sequence_mis_actor_logprob", "dynamic" if mis_aggregation == "binary_kl" else "static"
+    )
+    if mis_actor_logprob == "dynamic":
+        reference_key = (
+            "log_probs"
+            if getattr(args, "sequence_mis_ratio_source", "rollout") == "old_actor"
+            else "rollout_log_probs"
+        )
+        behavior_log_probs = batch.get(reference_key)
         if behavior_log_probs is None or len(behavior_log_probs) != len(log_probs):
-            raise ValueError("Sequence MIS binary_kl requires rollout_log_probs for every sample.")
-        masked_loss_masks, kl_chunks, rejected_chunks = [], [], []
+            raise ValueError(f"Sequence MIS requires {reference_key} for every sample.")
+        full_actor, full_reference, full_advantages = [], [], []
         for i, (current, behavior, mask) in enumerate(
             zip(log_probs, behavior_log_probs, batch["loss_masks"], strict=True)
         ):
@@ -1663,14 +1672,27 @@ def policy_loss_function(
             with torch.no_grad():
                 full_current = all_gather_with_cp(current.detach(), total_lengths[i], response_lengths[i], **layout)
                 full_behavior = all_gather_with_cp(behavior.detach(), total_lengths[i], response_lengths[i], **layout)
-            keep, mean_kl = compute_binary_kl_sample_gate(full_current, full_behavior, mask, args.sequence_mis_upper)
-            masked_loss_masks.append(mask * keep.to(mask.dtype))
-            kl_chunks.append(mean_kl.expand_as(current))
-            rejected_chunks.append((~keep).float().expand_as(current))
+                full_advantage = None
+                if getattr(args, "sequence_mis_use_advantage", False):
+                    full_advantage = all_gather_with_cp(
+                        batch["advantages"][i].detach(), total_lengths[i], response_lengths[i], **layout
+                    )
+            full_actor.append(full_current)
+            full_reference.append(full_behavior)
+            if full_advantage is not None:
+                full_advantages.append(full_advantage)
+        result = compute_sequence_mis(args, full_actor, full_reference, batch["loss_masks"], full_advantages or None)
+        masked_loss_masks = result.loss_masks
+        score_chunks = [score.expand_as(current) for score, current in zip(result.scores, log_probs, strict=True)]
+        rejected_chunks = [
+            (~keep).float().expand_as(current) for keep, current in zip(result.keep, log_probs, strict=True)
+        ]
         # Diagnose admission using ORIGINAL masks/denominators. Multi-turn
         # metrics follow the existing token-weighted, per-rollout reducer.
         sequence_mis_metrics = {
-            "seq_mis_binary_kl": sum_of_sample_mean(torch.cat(kl_chunks)).detach(),
+            f"seq_mis_{'binary_kl' if mis_aggregation == 'binary_kl' else 'score'}": sum_of_sample_mean(
+                torch.cat(score_chunks)
+            ).detach(),
             "seq_mis_masked_fraction": sum_of_sample_mean(torch.cat(rejected_chunks)).detach(),
         }
         # Mask the entire sample, including entropy/reference KL. Use a local

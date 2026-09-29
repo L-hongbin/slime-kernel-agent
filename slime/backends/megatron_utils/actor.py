@@ -929,6 +929,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     and not self.args.use_critic
                     and not self.args.keep_old_actor
                     and not self.args.use_opd
+                    and getattr(self.args, "sequence_mis_actor_logprob", None) != "static"
                     and (not self.args.use_routing_replay or self.args.use_rollout_routing_replay)
                     and self.args.advantage_estimator != "gspo"
                 )
@@ -976,6 +977,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     if (
                         lora_old is not None
                         and getattr(self.args, "sequence_mis_ratio_source", "rollout") == "old_actor"
+                        and getattr(self.args, "sequence_mis_actor_logprob", "static") == "static"
                     ):
                         # Same-stack MIS: also recompute under the CURRENT live
                         # adapter (θ_k, already restored above) so the postprocess can
