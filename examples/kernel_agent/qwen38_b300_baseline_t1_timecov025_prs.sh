@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Reproduce the current B300 training setup with original time coverage at 0.5
-# and no dynamic reward gate.
+# 旧Timecov辅助项权重0.25；保留Effrefcov/SpeedAux共同测量与custom-work门禁。
+# 基础正确性与性能奖励保留；原reference_time_coverage/.3/.1、测量检查和名称版本保持。
+# 从基础模型新训练，seed1234、recompute32、80rollout/160update。
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 export SLIME_TRAIN_PACKAGES=${SLIME_TRAIN_PACKAGES:-$REPO_ROOT/local_artifacts/qwen38_b300_r9/runtime/train_packages_sgl0520}
 source "$REPO_ROOT/examples/kernel_agent/qwen38_b300_env.sh"
@@ -12,7 +13,7 @@ source scripts/models/qwen3.5-27B.sh
 export HF_MODEL_PATH=${HF_MODEL_PATH:-/nfs/hw-data/ms/FM/checkpoints/Qwen-Zoo/Qwen3.8-27B}
 export TRAIN_LOAD_PATH=${TRAIN_LOAD_PATH:-$HF_MODEL_PATH}
 export RL_DATA=${RL_DATA:-/nfs/hw-data/ms/FM/lihongbin/dataset/CUDA_RL/cuda_rl/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet}
-export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/experiments/qwen38_b300_baseline_t1}
+export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/experiments/qwen38_b300_baseline_t1_timecov025_prs}
 # Local NVMe staging; a standalone host uploader archives completed checkpoints.
 export LOCAL_CHECKPOINT_ROOT=${LOCAL_CHECKPOINT_ROOT:-/data2/chenshuailin/slime_checkpoints}
 export TRAIN_SAVE_PATH=${TRAIN_SAVE_PATH:-$LOCAL_CHECKPOINT_ROOT/${EXP_ROOT##*/}/checkpoints}
@@ -23,12 +24,11 @@ ASYNC_SAVE=${ASYNC_SAVE:-1}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-# Default for the next launch; the currently running job retains its explicit 32-layer override.
-# Use 24 as a conservative reduction; 8 previously OOMed, and 24 still needs peak-memory validation.
-RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-24}
+# Match the completed baseline run, which explicitly used 32 layers.
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-32}
 export TRAIN_ATTENTION_BACKEND=${TRAIN_ATTENTION_BACKEND:-flash}
 RAY_DASHBOARD=${RAY_DASHBOARD:-http://127.0.0.2:8270}
-RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38_b300_baseline_t1}
+RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38_b300_baseline_t1_timecov025_prs}
 export KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.112.55:20111}
 export TENSORBOARD_DIR="$EXP_ROOT"
 GLOBAL_BATCH_SIZE=128
@@ -73,8 +73,8 @@ if (( 4 % ROLLOUT_TP_SIZE != 0 )); then
    exit 1
 fi
 SAVE_INTERVAL=$((SAVE_INTERVAL_STEPS / STEPS_PER_ROLLOUT))
-export CUDA_AGENT_COVERAGE_REWARD_TYPE=time_coverage
-export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=0.5
+export CUDA_AGENT_COVERAGE_REWARD_TYPE=gated_time_coverage
+export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=0.25
 export CUDA_AGENT_USE_REFERENCE_CACHE=1
 export CUDA_AGENT_NUM_WARMUP=10
 export CUDA_AGENT_NUM_PERF_TRIALS=100
@@ -181,9 +181,9 @@ ARGS=(
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
    --kernel-env-url "$KERNEL_ENV_URL" --kernel-backend tvm_ffi --reference-backend torch
    --do-precheck --use-reference-cache --finalize-mode positive --use-multi-turn --filter-by-last-turn --padding-turns --max-turns 1
-   --use-coverage-rs --coverage-rs-key time_coverage --coverage-rs-threshold 0.3 --coverage-rs-factor 0.1
+   --use-coverage-rs --coverage-rs-key reference_time_coverage --coverage-rs-threshold 0.3 --coverage-rs-factor 0.1
    --save-debug-rollout-data "$EXP_ROOT/rollout/rollout_{rollout_id}.pt"
-   --use-tensorboard --tb-project-name qwen38_b300_baseline_t1 --tb-experiment-name "$RAY_SUBMISSION_ID"
+   --use-tensorboard --tb-project-name qwen38_b300_baseline_t1_timecov025_prs --tb-experiment-name "$RAY_SUBMISSION_ID"
    --wandb-always-use-train-step --wandb-centralized
    --log-throughput --log-progress --log-device-memory-used
 )
