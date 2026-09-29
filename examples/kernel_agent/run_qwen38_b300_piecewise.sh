@@ -1,36 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Reproduce the current B300 training setup with original time coverage at 0.5
-# and no dynamic reward gate.
 REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-export SLIME_TRAIN_PACKAGES=${SLIME_TRAIN_PACKAGES:-$REPO_ROOT/local_artifacts/qwen38_b300_r9/runtime/train_packages_sgl0520}
 source "$REPO_ROOT/examples/kernel_agent/qwen38_b300_env.sh"
-export PYTHONPATH="$SLIME_TRAIN_PACKAGES:$PYTHONPATH"
 cd "$REPO_ROOT"
 source scripts/models/qwen3.5-27B.sh
 
 export HF_MODEL_PATH=${HF_MODEL_PATH:-/nfs/hw-data/ms/FM/checkpoints/Qwen-Zoo/Qwen3.8-27B}
 export TRAIN_LOAD_PATH=${TRAIN_LOAD_PATH:-$HF_MODEL_PATH}
 export RL_DATA=${RL_DATA:-/nfs/hw-data/ms/FM/lihongbin/dataset/CUDA_RL/cuda_rl/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet}
-export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/experiments/qwen38_b300_baseline_t1}
-# Local NVMe staging; a standalone host uploader archives completed checkpoints.
-export LOCAL_CHECKPOINT_ROOT=${LOCAL_CHECKPOINT_ROOT:-/data2/chenshuailin/slime_checkpoints}
-export TRAIN_SAVE_PATH=${TRAIN_SAVE_PATH:-$LOCAL_CHECKPOINT_ROOT/${EXP_ROOT##*/}/checkpoints}
-export SLIME_ROLLOUT_PYTHONPATH=${SLIME_ROLLOUT_PYTHONPATH:-$REPO_ROOT/local_artifacts/qwen38_b300_r9/runtime/rollout_sgl0520_packages}
+export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/local_artifacts/qwen38_b300_r9}
 export NUM_ROLLOUT=${NUM_ROLLOUT:-80}
-SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS:-40}
-ASYNC_SAVE=${ASYNC_SAVE:-1}
+SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS:-20}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-# Default for the next launch; the currently running job retains its explicit 32-layer override.
-# Use 24 as a conservative reduction; 8 previously OOMed, and 24 still needs peak-memory validation.
-RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-24}
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-8}
 export TRAIN_ATTENTION_BACKEND=${TRAIN_ATTENTION_BACKEND:-flash}
-RAY_DASHBOARD=${RAY_DASHBOARD:-http://127.0.0.2:8270}
-RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38_b300_baseline_t1}
+RAY_DASHBOARD=${RAY_DASHBOARD:-http://192.168.99.151:8269}
+RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38-piecewise-b300-4train4rollout-tp4-cp1-fa4-rc${RECOMPUTE_NUM_LAYERS}-mb16k-rtp1-mem85-m320-opt2-r9}
 export KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.112.55:20111}
-export TENSORBOARD_DIR="$EXP_ROOT"
+export TENSORBOARD_DIR="$EXP_ROOT/tensorboard"
 GLOBAL_BATCH_SIZE=128
 if [[ ! "$RECOMPUTE_NUM_LAYERS" =~ ^(0|[1-9][0-9]*)$ ]] || (( RECOMPUTE_NUM_LAYERS > 64 )); then
    echo 'RECOMPUTE_NUM_LAYERS must be an integer between 0 and 64' >&2
@@ -73,14 +62,9 @@ if (( 4 % ROLLOUT_TP_SIZE != 0 )); then
    exit 1
 fi
 SAVE_INTERVAL=$((SAVE_INTERVAL_STEPS / STEPS_PER_ROLLOUT))
-export CUDA_AGENT_COVERAGE_REWARD_TYPE=time_coverage
-export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=0.5
+export CUDA_AGENT_COVERAGE_REWARD_TYPE=reference_time_coverage
+export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=${CUDA_AGENT_COVERAGE_REWARD_WEIGHT:-0.5}
 export CUDA_AGENT_USE_REFERENCE_CACHE=1
-export CUDA_AGENT_NUM_WARMUP=10
-export CUDA_AGENT_NUM_PERF_TRIALS=100
-export CUDA_AGENT_REFER_NUM_PERF_TRIALS=150
-export CUDA_AGENT_ENABLE_NCU=0
-export CUDA_AGENT_ENABLE_COMPUTE_SANITIZER=0
 export CUDA_AGENT_ENABLE_PROFILING=1
 export CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE=0
 export CUDA_AGENT_APPLY_FAILED_GROUP_REWARD=0
@@ -93,7 +77,7 @@ export PYTHONUNBUFFERED=1
 TRAIN_ENV_JSON=$(python - <<'PYENV'
 import json, os
 print(json.dumps({
-    'PYTHONPATH': os.environ['PYTHONPATH'],
+    'PYTHONPATH': os.environ['SLIME_TRAIN_PACKAGES'] + ':' + os.environ['PYTHONPATH'],
     'TILELANG_CACHE_DIR': os.environ['B300_RUNTIME'] + '/cache/train_tilelang019',
     'LD_LIBRARY_PATH': os.environ['SLIME_TRAIN_LD_LIBRARY_PATH'],
     'PYTORCH_ALLOC_CONF': 'expandable_segments:True',
@@ -118,14 +102,13 @@ names = [
     'HF_HOME', 'CUDA_CACHE_PATH', 'PYTHONDONTWRITEBYTECODE', 'CUDA_DEVICE_MAX_CONNECTIONS', 'CUDA_HOME',
     'NCCL_SOCKET_IFNAME', 'GLOO_SOCKET_IFNAME', 'NCCL_IB_HCA', 'OMP_NUM_THREADS', 'NO_PROXY', 'no_proxy',
     'SGLANG_CACHE_DIR', 'SGLANG_DG_CACHE_DIR', 'SLIME_ROLLOUT_PYTHONPATH', 'PYTHONUNBUFFERED', 'SLIME_SAVE_DEBUG_ROLLOUT_MAX_ID',
-    'TRAIN_SAVE_PATH', 'LOCAL_CHECKPOINT_ROOT', 'TENSORBOARD_DIR', 'NCCL_DEBUG', 'NCCL_DEBUG_SUBSYS', 'SLIME_TRAIN_LD_LIBRARY_PATH',
+    'TENSORBOARD_DIR', 'NCCL_DEBUG', 'NCCL_DEBUG_SUBSYS', 'SLIME_TRAIN_LD_LIBRARY_PATH',
 ]
 names += [k for k in os.environ if k.startswith('CUDA_AGENT_')]
-env_vars = {k: os.environ[k] for k in names if k in os.environ}
 print(json.dumps({
     'working_dir': os.environ['SLIME_REPO'],
-    'excludes': ['.git/', 'Data/', 'local_artifacts/', 'experiments/', 'handoffs/', '.claude/', '.github/', 'imgs/', 'docs/', 'tests/', '__pycache__/'],
-    'env_vars': env_vars,
+    'excludes': ['.git/', 'Data/', 'local_artifacts/', 'handoffs/', '.claude/', '.github/', 'imgs/', 'docs/', 'tests/', '__pycache__/'],
+    'env_vars': {k: os.environ[k] for k in names if k in os.environ},
 }))
 PY
 )
@@ -133,7 +116,6 @@ PY
 ARGS=(
    "${MODEL_ARGS[@]}"
    --actor-num-nodes 1 --actor-num-gpus-per-node 4 --rollout-num-gpus 4
-   --actor-placement-resource slime_actor --rollout-placement-resource slime_rollout
    --train-env-vars "$TRAIN_ENV_JSON"
    --hf-checkpoint "$HF_MODEL_PATH" --load "$TRAIN_LOAD_PATH"
    --rollout-function-path examples.kernel_agent.fully_async_rollout.generate_rollout_fully_async
@@ -160,7 +142,9 @@ ARGS=(
    --eps-clip 0.2 --eps-clip-high 0.2 --eps-clip-c 20
    --enable-fp32-lm-head
    --entropy-coef 0.0 --overlong-penalty None
-   --dynamic-reward-gate None --dynamic-reward-correctness None
+   --dynamic-reward-gate piecewise
+   --difficulty-thresholds 0.3333333333333333 0.6666666666666666
+   --dynamic-reward-gate-range 0.8 1.2
    --optimizer adam --lr 1e-6 --lr-decay-style constant --weight-decay 0.0
    --adam-beta1 0.9 --adam-beta2 0.98 --use-distributed-optimizer
    --overlap-grad-reduce --overlap-param-gather --use-precision-aware-optimizer
@@ -179,16 +163,17 @@ ARGS=(
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
+   --multi-turn-prompt-config-path "$REPO_ROOT/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_short.yaml"
    --kernel-env-url "$KERNEL_ENV_URL" --kernel-backend tvm_ffi --reference-backend torch
-   --do-precheck --use-reference-cache --finalize-mode positive --use-multi-turn --filter-by-last-turn --padding-turns --max-turns 1
+   --do-precheck --use-reference-cache --finalize-mode positive --max-turns 1 --enable-turns-dp-partitions
    --use-coverage-rs --coverage-rs-key time_coverage --coverage-rs-threshold 0.3 --coverage-rs-factor 0.1
    --save-debug-rollout-data "$EXP_ROOT/rollout/rollout_{rollout_id}.pt"
-   --use-tensorboard --tb-project-name qwen38_b300_baseline_t1 --tb-experiment-name "$RAY_SUBMISSION_ID"
+   --use-tensorboard --tb-project-name qwen38_b300_r9 --tb-experiment-name "$RAY_SUBMISSION_ID"
    --wandb-always-use-train-step --wandb-centralized
    --log-throughput --log-progress --log-device-memory-used
 )
 
-SGLANG_VERSION=$(run_rollout_python - <<'PYVERSION'
+SGLANG_VERSION=$(python - <<'PYVERSION'
 import importlib.metadata
 print(importlib.metadata.version("sglang"))
 PYVERSION
@@ -212,7 +197,7 @@ if [[ "${ASYNC_SAVE:-0}" == 1 ]]; then
    ARGS+=(--async-save --use-persistent-ckpt-worker)
 fi
 if [[ "${VALIDATION_NO_SAVE:-0}" != 1 ]]; then
-   ARGS+=(--save "$TRAIN_SAVE_PATH" --save-interval "$SAVE_INTERVAL")
+   ARGS+=(--save "$EXP_ROOT/checkpoints" --save-interval "$SAVE_INTERVAL")
 fi
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]]; then
    ARGS+=(--load-debug-rollout-data "$LOAD_DEBUG_ROLLOUT_DATA")
@@ -228,18 +213,6 @@ if [[ "${CONFIG_DRY_RUN:-0}" == 1 ]]; then
    printf '\n'
    exit 0
 fi
-# Both actor and rollout containers must bind-mount LOCAL_CHECKPOINT_ROOT.
-python - <<'PYCHECKPOINT'
-import os
-from pathlib import Path
-root = Path(os.environ['LOCAL_CHECKPOINT_ROOT']).resolve()
-target = Path(os.environ['TRAIN_SAVE_PATH']).resolve()
-if not root.is_dir() or root.stat().st_dev == Path('/').stat().st_dev:
-    raise SystemExit(f'{root} must be mounted from /data2; refusing container-system-disk checkpoint writes')
-if root not in target.parents:
-    raise SystemExit('TRAIN_SAVE_PATH must be inside LOCAL_CHECKPOINT_ROOT')
-print(f'Checkpoint staging: {target}; NFS archival is managed by the standalone host uploader')
-PYCHECKPOINT
 python scripts/check_qwen38_b300_runtime.py
 python scripts/check_kernelgym_health.py --url "$KERNEL_ENV_URL" --timeout 5 --attempts 3
 run_rollout_python scripts/check_sglang_top_p_replay.py --check-sort-reuse
@@ -251,5 +224,4 @@ mkdir -p "$EXP_ROOT/logs" "$EXP_ROOT/rollout" "$EXP_ROOT/provenance"
 printf '%q ' python "$REPO_ROOT/train_async.py" "${ARGS[@]}" > "$EXP_ROOT/provenance/command.sh"
 printf '%s\n' "$RUNTIME_ENV_JSON" | python -c 'import json,sys; d=json.load(sys.stdin); json.dump(d,sys.stdout,indent=2)' > "$EXP_ROOT/provenance/runtime_env.json"
 exec ray job submit --address "$RAY_DASHBOARD" --submission-id "$RAY_SUBMISSION_ID" \
-   --entrypoint-resources '{"node:127.0.0.3":0.001}' \
    --runtime-env-json "$RUNTIME_ENV_JSON" -- python "$REPO_ROOT/train_async.py" "${ARGS[@]}"
