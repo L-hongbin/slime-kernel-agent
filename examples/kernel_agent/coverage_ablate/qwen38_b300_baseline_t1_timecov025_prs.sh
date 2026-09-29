@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
-# Reproduce the current B300 training setup with reference coverage at 0.5
-# and no dynamic reward gate.
-REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+# 旧Timecov辅助项权重0.25；保留Effrefcov/SpeedAux共同测量与custom-work门禁。
+# 基础正确性与性能奖励保留；原reference_time_coverage/.3/.1、测量检查和名称版本保持。
+# 从基础模型新训练，seed1234、recompute32、80rollout/160update。
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
 export SLIME_TRAIN_PACKAGES=${SLIME_TRAIN_PACKAGES:-$REPO_ROOT/local_artifacts/qwen38_b300_r9/runtime/train_packages_sgl0520}
 source "$REPO_ROOT/examples/kernel_agent/qwen38_b300_env.sh"
 export PYTHONPATH="$SLIME_TRAIN_PACKAGES:$PYTHONPATH"
@@ -12,7 +13,10 @@ source scripts/models/qwen3.5-27B.sh
 export HF_MODEL_PATH=${HF_MODEL_PATH:-/nfs/hw-data/ms/FM/checkpoints/Qwen-Zoo/Qwen3.8-27B}
 export TRAIN_LOAD_PATH=${TRAIN_LOAD_PATH:-$HF_MODEL_PATH}
 export RL_DATA=${RL_DATA:-/nfs/hw-data/ms/FM/lihongbin/dataset/CUDA_RL/cuda_rl/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet}
-export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/experiments/qwen38_b300_baseline_t1_refcov}
+export EXP_ROOT=${EXP_ROOT:-$REPO_ROOT/experiments/qwen38_b300_baseline_t1_timecov025_prs}
+# Local NVMe staging; a standalone host uploader archives completed checkpoints.
+export LOCAL_CHECKPOINT_ROOT=${LOCAL_CHECKPOINT_ROOT:-/data2/chenshuailin/slime_checkpoints}
+export TRAIN_SAVE_PATH=${TRAIN_SAVE_PATH:-$LOCAL_CHECKPOINT_ROOT/${EXP_ROOT##*/}/checkpoints}
 export SLIME_ROLLOUT_PYTHONPATH=${SLIME_ROLLOUT_PYTHONPATH:-$REPO_ROOT/local_artifacts/qwen38_b300_r9/runtime/rollout_sgl0520_packages}
 export NUM_ROLLOUT=${NUM_ROLLOUT:-80}
 SAVE_INTERVAL_STEPS=${SAVE_INTERVAL_STEPS:-40}
@@ -20,10 +24,11 @@ ASYNC_SAVE=${ASYNC_SAVE:-1}
 ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-16}
 N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 ROLLOUT_TP_SIZE=${ROLLOUT_TP_SIZE:-1}
-RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-8}
+# Match the completed baseline run, which explicitly used 32 layers.
+RECOMPUTE_NUM_LAYERS=${RECOMPUTE_NUM_LAYERS:-32}
 export TRAIN_ATTENTION_BACKEND=${TRAIN_ATTENTION_BACKEND:-flash}
 RAY_DASHBOARD=${RAY_DASHBOARD:-http://127.0.0.2:8270}
-RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38_b300_baseline_t1_refcov}
+RAY_SUBMISSION_ID=${RAY_SUBMISSION_ID:-qwen38_b300_baseline_t1_timecov025_prs}
 export KERNEL_ENV_URL=${KERNEL_ENV_URL:-http://192.168.112.55:20111}
 export TENSORBOARD_DIR="$EXP_ROOT"
 GLOBAL_BATCH_SIZE=128
@@ -68,8 +73,8 @@ if (( 4 % ROLLOUT_TP_SIZE != 0 )); then
    exit 1
 fi
 SAVE_INTERVAL=$((SAVE_INTERVAL_STEPS / STEPS_PER_ROLLOUT))
-export CUDA_AGENT_COVERAGE_REWARD_TYPE=reference_time_coverage
-export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=0.5
+export CUDA_AGENT_COVERAGE_REWARD_TYPE=gated_time_coverage
+export CUDA_AGENT_COVERAGE_REWARD_WEIGHT=0.25
 export CUDA_AGENT_USE_REFERENCE_CACHE=1
 export CUDA_AGENT_NUM_WARMUP=10
 export CUDA_AGENT_NUM_PERF_TRIALS=100
@@ -113,7 +118,7 @@ names = [
     'HF_HOME', 'CUDA_CACHE_PATH', 'PYTHONDONTWRITEBYTECODE', 'CUDA_DEVICE_MAX_CONNECTIONS', 'CUDA_HOME',
     'NCCL_SOCKET_IFNAME', 'GLOO_SOCKET_IFNAME', 'NCCL_IB_HCA', 'OMP_NUM_THREADS', 'NO_PROXY', 'no_proxy',
     'SGLANG_CACHE_DIR', 'SGLANG_DG_CACHE_DIR', 'SLIME_ROLLOUT_PYTHONPATH', 'PYTHONUNBUFFERED', 'SLIME_SAVE_DEBUG_ROLLOUT_MAX_ID',
-    'TENSORBOARD_DIR', 'NCCL_DEBUG', 'NCCL_DEBUG_SUBSYS', 'SLIME_TRAIN_LD_LIBRARY_PATH',
+    'TRAIN_SAVE_PATH', 'LOCAL_CHECKPOINT_ROOT', 'TENSORBOARD_DIR', 'NCCL_DEBUG', 'NCCL_DEBUG_SUBSYS', 'SLIME_TRAIN_LD_LIBRARY_PATH',
 ]
 names += [k for k in os.environ if k.startswith('CUDA_AGENT_')]
 env_vars = {k: os.environ[k] for k in names if k in os.environ}
@@ -176,9 +181,9 @@ ARGS=(
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
    --kernel-env-url "$KERNEL_ENV_URL" --kernel-backend tvm_ffi --reference-backend torch
    --do-precheck --use-reference-cache --finalize-mode positive --use-multi-turn --filter-by-last-turn --padding-turns --max-turns 1
-   --use-coverage-rs --coverage-rs-key time_coverage --coverage-rs-threshold 0.3 --coverage-rs-factor 0.1
+   --use-coverage-rs --coverage-rs-key reference_time_coverage --coverage-rs-threshold 0.3 --coverage-rs-factor 0.1
    --save-debug-rollout-data "$EXP_ROOT/rollout/rollout_{rollout_id}.pt"
-   --use-tensorboard --tb-project-name qwen38_b300_baseline_t1_refcov --tb-experiment-name "$RAY_SUBMISSION_ID"
+   --use-tensorboard --tb-project-name qwen38_b300_baseline_t1_timecov025_prs --tb-experiment-name "$RAY_SUBMISSION_ID"
    --wandb-always-use-train-step --wandb-centralized
    --log-throughput --log-progress --log-device-memory-used
 )
@@ -207,7 +212,7 @@ if [[ "${ASYNC_SAVE:-0}" == 1 ]]; then
    ARGS+=(--async-save --use-persistent-ckpt-worker)
 fi
 if [[ "${VALIDATION_NO_SAVE:-0}" != 1 ]]; then
-   ARGS+=(--save "$EXP_ROOT/checkpoints" --save-interval "$SAVE_INTERVAL")
+   ARGS+=(--save "$TRAIN_SAVE_PATH" --save-interval "$SAVE_INTERVAL")
 fi
 if [[ -n "${LOAD_DEBUG_ROLLOUT_DATA:-}" ]]; then
    ARGS+=(--load-debug-rollout-data "$LOAD_DEBUG_ROLLOUT_DATA")
@@ -223,6 +228,18 @@ if [[ "${CONFIG_DRY_RUN:-0}" == 1 ]]; then
    printf '\n'
    exit 0
 fi
+# Both actor and rollout containers must bind-mount LOCAL_CHECKPOINT_ROOT.
+python - <<'PYCHECKPOINT'
+import os
+from pathlib import Path
+root = Path(os.environ['LOCAL_CHECKPOINT_ROOT']).resolve()
+target = Path(os.environ['TRAIN_SAVE_PATH']).resolve()
+if not root.is_dir() or root.stat().st_dev == Path('/').stat().st_dev:
+    raise SystemExit(f'{root} must be mounted from /data2; refusing container-system-disk checkpoint writes')
+if root not in target.parents:
+    raise SystemExit('TRAIN_SAVE_PATH must be inside LOCAL_CHECKPOINT_ROOT')
+print(f'Checkpoint staging: {target}; NFS archival is managed by the standalone host uploader')
+PYCHECKPOINT
 python scripts/b300/check_qwen38_b300_runtime.py
 python scripts/check_kernelgym_health.py --url "$KERNEL_ENV_URL" --timeout 5 --attempts 3
 run_rollout_python scripts/check_sglang_top_p_replay.py --check-sort-reuse
