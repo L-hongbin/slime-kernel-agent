@@ -1,57 +1,36 @@
-# Coverage reward and PRS ablations (Qwen3.8 B300)
+# Coverage Reward 与 PRS 消融实验 (Qwen3.8 B300)
 
-These launchers collect the B300 coverage-reward and probabilistic rejection
-sampling (PRS) experiments. Shared environment setup remains in
-`examples/kernel_agent/qwen38_b300_env.sh`. Runtime preflight and GPU diagnostic
-tools are documented in [`scripts/b300/README.md`](../../../scripts/b300/README.md).
+本目录提供在 B300 上训练 Qwen3.8 时使用的覆盖率辅助奖励（Coverage Reward）与概率拒绝采样（PRS, Probabilistic Rejection Sampling）的实验配置。**其中 `effrefcov`（效率折扣参考时间覆盖率）为最终方案**，其余配置用于基线对比与消融分析。
 
-## Experiment defaults
+## 方案对照
 
-All filenames below end in `.sh`. Reward weight refers only to the coverage or
-speed auxiliary reward; zero weight does not disable the base reward or other
-validity filters. Enabled PRS uses threshold `0.3` and factor `0.1`.
+- **最终方案定义**：`effrefcov` 将参考时间覆盖率乘以效率折扣因子（仅在候选实现的端到端耗时长于参考实现时进行衰减：`discount = min(1.0, reference / candidate)`），而 PRS 保持使用原始未折扣的 `reference_time_coverage`。
+- **关键机制与事实**：
+  - 表中辅助奖励权重仅作用于 coverage 或 speed 辅助项；权重为 0 时仅关闭辅助奖励，不影响基础奖励及有效性过滤。
+  - 所有启用 PRS 的方案统一使用阈值 `0.3` 与线性过渡宽度（factor）`0.1`。
+  - **重计算层数历史差异**：基线 `qwen38_b300_baseline_t1` 当前默认值为 24（历史已完成的实际训练使用了显式覆盖 `RECOMPUTE_NUM_LAYERS=32`，早期 8 层曾发生 OOM）；历史 `refcov` 脚本默认仍为 8；其余方案默认均为 32。24 层尚未经过完整训练验证；受这些配置差异影响，对照时还需核对实际启动参数。
 
-| Launcher | Auxiliary reward type | Weight | PRS coverage key | Recompute layers |
-| --- | --- | --- | --- | --- |
-| `qwen38_b300_baseline_t1` | `time_coverage` | 0.5 | `time_coverage` | 24 |
-| `qwen38_b300_baseline_t1_refcov` | `reference_time_coverage` | 0.5 | `time_coverage` | 8 |
-| `qwen38_b300_baseline_t1_effrefcov` | `efficiency_reference_time_coverage` | 0.5 | `reference_time_coverage` | 32 |
-| `qwen38_b300_baseline_t1_nocov_noprs` | `efficiency_reference_time_coverage` | 0 | Disabled | 32 |
-| `qwen38_b300_baseline_t1_nocov_prs` | `capped_speed_auxiliary` | 0 | `reference_time_coverage` | 32 |
-| `qwen38_b300_baseline_t1_refcov_prs` | `reference_time_coverage` | 0.5 | `reference_time_coverage` | 32 |
-| `qwen38_b300_baseline_t1_speedaux_prs` | `capped_speed_auxiliary` | 0.5 | `reference_time_coverage` | 32 |
-| `qwen38_b300_baseline_t1_timecov025_prs` | `gated_time_coverage` | 0.25 | `reference_time_coverage` | 32 |
+| 启动脚本 (Launcher) | 方案定位 | 辅助奖励类型 (Auxiliary reward type) | 辅助权重 | PRS Coverage Key | 重计算层数 |
+| --- | --- | --- | --- | --- | --- |
+| `qwen38_b300_baseline_t1_effrefcov.sh` | **最终方案** | `efficiency_reference_time_coverage` | 0.5 | `reference_time_coverage` | 32 |
+| `qwen38_b300_baseline_t1.sh` | 基线 | `time_coverage` | 0.5 | `time_coverage` | 24 (历史运行 32) |
+| `qwen38_b300_baseline_t1_refcov.sh` | 对照 | `reference_time_coverage` | 0.5 | `time_coverage` | 8 |
+| `qwen38_b300_baseline_t1_nocov_noprs.sh` | 消融 | `efficiency_reference_time_coverage` | 0 | 禁用 (Disabled) | 32 |
+| `qwen38_b300_baseline_t1_nocov_prs.sh` | 消融 | `capped_speed_auxiliary` | 0 | `reference_time_coverage` | 32 |
+| `qwen38_b300_baseline_t1_refcov_prs.sh` | 消融 | `reference_time_coverage` | 0.5 | `reference_time_coverage` | 32 |
+| `qwen38_b300_baseline_t1_speedaux_prs.sh` | 消融 | `capped_speed_auxiliary` | 0.5 | `reference_time_coverage` | 32 |
+| `qwen38_b300_baseline_t1_timecov025_prs.sh` | 消融 | `gated_time_coverage` | 0.25 | `reference_time_coverage` | 32 |
 
-These are preserved experiment configurations, not a guarantee that only the
-ablation variable differs. In particular, the completed time-coverage baseline
-used an explicit `RECOMPUTE_NUM_LAYERS=32` override. Its current default of 24 is
-a candidate for future launches, not a validated replacement for that run; the
-earlier 8-layer configuration OOMed. The historical refcov launcher still
-defaults to 8. Review the full scripts and recorded launch overrides before
-claiming a controlled comparison. Directory reorganization does not normalize
-these settings.
+## 运行环境与启动命令
 
-## Running
-
-These scripts require the prepared B300 deployment, not a generic local Python
-environment. Model/data paths, local checkpoint mounts, runtime packages,
-KernelGym endpoint, and Ray resources have machine-specific defaults. Check
-those settings and active jobs before launching; do not submit duplicate jobs.
-The train and rollout roles require separate compatible containers, with
-`slime_actor` and `slime_rollout` placement resources. See the shared environment
-script and your deployment records for setup.
-
-From the repository root, after preparing the environment and checking resources:
+本组实验依赖预配置的 B300 双容器环境（训练与 Rollout 容器隔离，分别分配 `slime_actor` 与 `slime_rollout` 资源，共享配置见 `examples/kernel_agent/qwen38_b300_env.sh`，诊断工具见 `scripts/b300/README.md`）。在仓库根目录下确认环境与资源后，最终方案的完整启动命令如下：
 
 ```bash
 bash examples/kernel_agent/coverage_ablate/qwen38_b300_baseline_t1_effrefcov.sh
 ```
 
-Existing environment overrides remain supported. Experiment output paths,
-checkpoint locations, Ray submission IDs, and TensorBoard names are unchanged
-by the move. Launch automation must use the new script paths; no compatibility
-wrappers are retained at the old paths.
+如需执行其他基线或消融对比实验，替换为对应的脚本路径即可。各方案的输出路径、Ray submission ID 与 TensorBoard 记录均保持相互独立。
 
-The machine-local GEPA-V2 evaluation launchers and artifact validators are kept
-separately under `local_artifacts/qwen38_gepav2_eval/` and are intentionally not
-versioned. Training scripts here do not launch that evaluation suite.
+## 评测入口
+
+本地仓库已版本化追踪各方案对应的 GEPA-V2 评测脚本与校验工具。评测套件入口位于 `examples/kernel_agent/eval/`（例如最终方案对应的 `examples/kernel_agent/eval/qwen38_b300_baseline_t1_effrefcov_gepav2_all.sh`），产物校验与导出工具见 `scripts/qwen38_*_eval_artifacts.py`。训练脚本本身不自动触发评测流程。
