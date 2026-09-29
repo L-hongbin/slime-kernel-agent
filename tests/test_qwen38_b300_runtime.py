@@ -1,8 +1,11 @@
+import sys
 from pathlib import Path
 
 import pytest
 
-from scripts import check_qwen38_b300_runtime as runtime
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.b300 import check_qwen38_b300_runtime as runtime  # noqa: E402
 
 NUM_GPUS = 0
 pytestmark = pytest.mark.unit
@@ -48,3 +51,7 @@ def test_package_version_prefers_rollout_overlay(tmp_path, monkeypatch):
     assert runtime._check_sglang_version() == "0.5.20"
     monkeypatch.setenv("SLIME_ROLLOUT_PYTHONPATH", "")
     assert runtime._check_sglang_version() == "0.5.15.post1"
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
