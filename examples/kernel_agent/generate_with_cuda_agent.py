@@ -1028,6 +1028,11 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
     should_log = _should_log_rollout(sample) if log_rollout_info else False
     finish_reason = "max_turns"
 
+    # Keep every turn of this rollout on the same consistent-hashing key.
+    headers = None
+    if sample.session_id and getattr(args, "router_policy", None) == "consistent_hashing":
+        headers = {"X-SMG-Routing-Key": sample.session_id}
+
     for turn_idx in range(max_turns):
         prompt_text = state.tokenizer.apply_chat_template(
             messages,
@@ -1083,7 +1088,7 @@ async def _generate_impl(args, sample: Sample, sampling_params: dict[str, Any]) 
             payload["lora_path"] = lora_path
         url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
         model_started_at = time.monotonic()
-        output = await post(url, payload, max_retries=rollout_request_max_retries)
+        output = await post(url, payload, max_retries=rollout_request_max_retries, headers=headers)
         model_time = time.monotonic() - model_started_at
         finish_type = output["meta_info"]["finish_reason"]["type"]
         if finish_type == "abort":

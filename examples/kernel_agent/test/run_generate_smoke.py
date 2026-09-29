@@ -313,7 +313,7 @@ def _install_fake_generate_state() -> None:
 
 
 def _install_fake_model(response: str) -> None:
-    async def fake_post(url, payload, max_retries=None):
+    async def fake_post(url, payload, max_retries=None, headers=None):
         token_ids = list(range(1, len(response.split()) + 1))
         return {
             "text": response,
