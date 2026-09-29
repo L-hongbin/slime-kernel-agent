@@ -280,6 +280,29 @@ Other loss/filter/CTM/OPD options remain independent. Group centering is not bat
 its sample-dependent baseline should not be conflated with the original uncentered ArgMaxRL's
 finite-sample unbiased estimator.
 
+#### Kernel-agent context budget nudge
+
+Kernel-agent multi-turn rollouts optionally support `--use-context-budget-nudge 0.2`, inspired by [Mercor's context nudge](https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/). The value is a finite remaining-budget fraction in `(0, 1]`; omitted or explicit `None` disables it. It requires a positive `--rollout-max-context-len`. With `0.2`, a reminder is inserted when the remaining context is positive and at most 20% of that limit, asking for a complete, correct kernel on the next turn rather than speculative optimization.
+
+`GenerateState` counts template source tokens once on load with the rollout tokenizer and caches `template_tokens` on the template; the built-in fallback is also cached on first use. `_apply_feedback_template` counts the serialized, truncated feedback as `feedback_tokens` each turn, even when nudge is disabled. Both counts use `add_special_tokens=False` and are returned alongside the formatted feedback, stored in the turn log, and printed in turn stats. The nudge estimates context use as `prompt_tokens + response_tokens + template_tokens + feedback_tokens`, builds the reminder before rendering, and passes `context_budget_nudge` to the template (empty when inactive). This is an estimate: static template tokens include placeholders/Jinja syntax, separate tokenization can differ at boundaries, and new chat framing and the reminder are not counted. The conversation is not re-tokenized for this estimate; the next turn's existing context guard enforces the actual limit.
+
+Built-in and repository response templates include the nudge field. Custom format/YAML templates need `{context_budget_nudge}`, and custom Jinja templates need `{{ context_budget_nudge }}` to display it. Each qualifying feedback may receive a reminder (not one-shot per trajectory). This is next-turn user input, not assistant output, and does not directly change rewards or response loss masks. It acts between turns, not during a single response, and the flag also applies to evaluation if enabled there.
+
+#### KernelGYM detailed correctness diagnostics
+
+`CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` defaults to `0` (`False`). Set it to `1` before starting training to send `return_detail_correctness=true` in KernelGYM evaluation requests. The Qwen3.8 WarmUp/MultiTurn scripts forward this setting through Ray's runtime environment; custom launchers must also forward it to rollout workers.
+
+This requests detailed correctness diagnostics, not a reward change. It is independent of `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER`: either feature can be enabled alone or both can be enabled together. Sanitizer execution remains subject to the server's trigger rules. The explicit `run_request_env.py --mode sanitizer` diagnostic enables only the sanitizer; detailed correctness still follows `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` (default off).
+
+#### KernelGYM detailed compilation diagnostics
+
+`CUDA_AGENT_RETURN_DETAIL_COMPILATION` independently defaults to `0` (`False`). Set it to `1` to request
+compilation-error classification (`return_detail_compilation=true`): the server returns
+`metadata.compilation_error_detail` and a summarized `error_message`. When disabled, classification is skipped
+and `error_message` contains the full compilation error. This does not change reward computation.
+The Qwen3.8 WarmUp/MultiTurn launchers forward it through Ray's runtime environment; custom launchers must do the same.
+Training requests, `run_request_env.py`, and `run_response_pipeline.py` use this setting; `--mode compile` does not enable it automatically.
+
 #### Kernel rollout reward post-processing
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` returns shaped single-turn rewards and writes them back to `sample.reward`. It manages dynamic weighting and overlong penalties; same-prompt/same-turn groups are only an internal statistical scope. It does not compute trajectory returns, baselines, or normalized advantages.
@@ -390,6 +413,14 @@ This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08
 At complete-trajectory finalization, before group reward processing and filtering, TRLOO freezes `metadata.return_reward = gamma * original_task_reward[t+1] + gamma² * original_task_reward[t+2] + ...`. This excludes dynamic weighting, failed-group replacement, and length shaping; turns already marked removed contribute zero. Training computes only `return[t] = current sample.reward + return_reward[t]`, retaining all shaping for the current turn but none in future credit. Later group filtering does not recompute or erase frozen future credit. Single-turn rewards are not overwritten. Legacy rollout dumps missing this field must be regenerated rather than silently falling back to potentially shaped `multi_turn_reward` values.
 
 TRLOO also mirrors frozen future credit into `metadata.reward_component.return_reward` for diagnostics. This component is not part of `sample.reward`; summing all components now includes future credit, giving the pre-baseline return for valid ordinary TRLOO samples. Dynamic weighting and failed-group replacement preserve it. All supported reward components (`correctness`, `performance`, `coverage`, `failed`, `length`, `return_reward`) are logged as regular metrics under `rollout/reward/component/{field}/{mean,min,max}`, without requiring `--log-exp-metrics`. Enable `--use-tensorboard` to write them to TensorBoard. Padding and missing/nonfinite component values are excluded. The old `exp/rollout/reward/component/*` metrics are no longer emitted.
+
+Megatron logs these regular metrics after advantage calculation and rollout postprocessing, before the training forward. They do not require `--log-exp-metrics`; enable `--use-tensorboard` to write them to TensorBoard:
+
+- `rollout/advantage/{positive,negative,zero}_sample_fraction`: sample fractions classified by the sign of each sample's masked mean token advantage.
+- `rollout/advantage/{positive,negative}_abs_mass`: the sum of absolute sample advantages of that sign divided by the total sample count, not a within-sign conditional mean.
+- `rollout/sequence/{positive,negative}_response_length`: mean full response token count among samples of that sign; each split turn counts as one sample.
+
+These metrics use the current loss masks. Fully masked samples have zero mean advantage and contribute to the zero fraction. DP/CP aggregation uses sums/counts; if a sign has no samples globally, its mean length is reported as 0 and should be interpreted alongside its sample fraction. Masks subsequently added by live-forward seq-MIS are not reflected. The old `exp/rollout/train_batch/advantage/*` and `exp/rollout/train_batch/sequence/*` metrics are no longer duplicated; per-turn sign fractions and async diagnostics still require `--log-exp-metrics`.
 
 `metadata.raw_task_reward` preserves the initial single-turn task reward with the configured base weights, before dynamic weighting, failed-group replacement, and length shaping. It is written at base scoring and is not overwritten by reward postprocessing. Unlike mutable `task_reward`, it is a stable source for historical statistics. TRLOO prefers this field for future credit, falling back to `task_reward` (then the turn reward) for legacy samples at pre-shaping trajectory finalization. It is not an extra additive reward component.
 

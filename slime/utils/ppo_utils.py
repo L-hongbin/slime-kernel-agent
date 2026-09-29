@@ -53,6 +53,37 @@ def compute_approx_kl(
     return kl
 
 
+@torch.no_grad()
+def compute_binary_kl_sample_gate(
+    log_probs: torch.Tensor,
+    rollout_log_probs: torch.Tensor,
+    loss_mask: torch.Tensor,
+    threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FlashREINFORCE mean Bernoulli KL admission, applied to one training sample.
+
+    https://github.com/yifanzhang-pro/FlashREINFORCE/blob/master/flashreinforce/loss.py
+    Caller supplies the full response (gather CP slices first). Unlike the paper's
+    complete trajectories, a sample here may be just one turn. Masked/pad tokens
+    do not contribute; rejected samples retain their original loss denominators.
+    """
+    if log_probs.shape != rollout_log_probs.shape or log_probs.shape != loss_mask.shape:
+        raise ValueError("Binary KL sample gate requires matching log-probability and loss-mask shapes.")
+    if not math.isfinite(threshold) or threshold < 0:
+        raise ValueError("Binary KL sample gate threshold must be finite and nonnegative.")
+    valid = loss_mask.bool()
+    # Ignore arbitrary values outside the action mask, including NaN padding.
+    current = torch.where(valid, log_probs.float(), 0.0)
+    behavior = torch.where(valid, rollout_log_probs.float(), 0.0)
+    finite = torch.isfinite(current).all() & torch.isfinite(behavior).all()
+    p = behavior.exp().clamp(1e-6, 1 - 1e-6)
+    q = current.exp().clamp(1e-6, 1 - 1e-6)
+    divergence = p * (p.log() - q.log()) + (1 - p) * (torch.log1p(-p) - torch.log1p(-q))
+    mean_kl = (torch.where(valid, divergence, 0.0).sum() / valid.sum().clamp_min(1)).clamp_min(0)
+    keep = finite & (current <= 0).all() & (behavior <= 0).all() & (mean_kl <= threshold)
+    return keep, mean_kl
+
+
 def compute_opsm_mask(
     args: Namespace,
     full_log_probs: list[torch.Tensor],

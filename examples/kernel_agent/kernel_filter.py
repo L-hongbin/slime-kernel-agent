@@ -579,6 +579,11 @@ def sequence_mis(args, rollout_id: int, rollout_data: dict[str, Any]) -> dict[st
         routing replay; enforced in ``slime_validate_args``).
     """
 
+    # Live-forward sample admission is performed in policy_loss_function. Keep
+    # existing launchers with this hook compatible without filtering twice.
+    if getattr(args, "sequence_mis_aggregation", None) == "binary_kl":
+        return {}
+
     if "log_probs" not in rollout_data:
         logger.info(
             "[kernel_agent][sequence_mis] skip rollout_id=%s because rollout_data['log_probs'] is unavailable "

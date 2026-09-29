@@ -26,6 +26,7 @@ def install_megatron_stubs() -> None:
     packed_seq_mod = types.ModuleType("megatron.core.packed_seq_params")
     transformer_mod = types.ModuleType("megatron.core.transformer")
     transformer_module_mod = types.ModuleType("megatron.core.transformer.module")
+    attention_mod = types.ModuleType("megatron.core.transformer.attention")
     spec_utils_mod = types.ModuleType("megatron.core.transformer.spec_utils")
     transformer_block_mod = types.ModuleType("megatron.core.transformer.transformer_block")
     transformer_layer_mod = types.ModuleType("megatron.core.transformer.transformer_layer")
@@ -60,6 +61,7 @@ def install_megatron_stubs() -> None:
     inference_contexts_mod.BaseInferenceContext = type("BaseInferenceContext", (), {})
     packed_seq_mod.PackedSeqParams = PackedSeqParams
     transformer_module_mod.MegatronModule = MegatronModule
+    attention_mod.SelfAttention = type("SelfAttention", (nn.Module,), {})
     spec_utils_mod.ModuleSpec = ModuleSpec
     transformer_block_mod.get_num_layers_to_build = lambda *args, **kwargs: 0
     transformer_layer_mod.get_transformer_layer_offset = lambda *args, **kwargs: 0
@@ -77,6 +79,7 @@ def install_megatron_stubs() -> None:
     sys.modules["megatron.core.packed_seq_params"] = packed_seq_mod
     sys.modules["megatron.core.transformer"] = transformer_mod
     sys.modules["megatron.core.transformer.module"] = transformer_module_mod
+    sys.modules["megatron.core.transformer.attention"] = attention_mod
     sys.modules["megatron.core.transformer.spec_utils"] = spec_utils_mod
     sys.modules["megatron.core.transformer.transformer_block"] = transformer_block_mod
     sys.modules["megatron.core.transformer.transformer_layer"] = transformer_layer_mod
@@ -117,6 +120,63 @@ def load_module(module_name: str):
     sys.modules.pop("slime_plugins.models.hf_attention", None)
     sys.modules.pop(module_name, None)
     return importlib.import_module(module_name)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("module_name", ["qwen3_5", "qwen3_next"])
+@pytest.mark.parametrize("output_gate", [False, True])
+def test_qwen_spec_installs_gate_compat_only_on_full_attention(monkeypatch, module_name, output_gate):
+    module = load_module(f"slime_plugins.models.{module_name}")
+    original_attention = SimpleNamespace(
+        module=module.SelfAttention,
+        params={"attn_mask_type": "causal"},
+        submodules=SimpleNamespace(linear_qkv="original_qkv", core_attention="original_core"),
+    )
+    original_layer = SimpleNamespace(submodules=SimpleNamespace(self_attention=original_attention))
+    # Upstream specs can share objects: changing full attention must not leak to GDN.
+    block = SimpleNamespace(layer_specs=[original_layer, original_layer])
+    monkeypatch.setattr(module, "get_gpt_decoder_block_spec", lambda *args, **kwargs: block)
+    monkeypatch.setattr(module, "get_num_layers_to_build", lambda *args, **kwargs: 2)
+    monkeypatch.setattr(module, "get_transformer_layer_offset", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(
+        module,
+        "_load_hf_config",
+        lambda _: SimpleNamespace(
+            layer_types=["linear_attention", "full_attention", "linear_attention", "full_attention"]
+        ),
+    )
+    args = SimpleNamespace(num_experts=None, hf_checkpoint="unused", qwen_gdn_implementation="replicated")
+    config = SimpleNamespace(num_layers=4, pipeline_model_parallel_layout=None, attention_output_gate=output_gate)
+    builder = getattr(module, f"get_{module_name}_spec")
+
+    result = builder(args, config, vp_stage=0)
+
+    full = result.layer_specs[0].submodules.self_attention
+    linear = result.layer_specs[1].submodules.self_attention
+    assert full.module is (module.TPGatedSelfAttention if output_gate else module.SelfAttention)
+    assert full.params == original_attention.params
+    assert full.submodules.linear_qkv == "original_qkv"
+    assert full.submodules.core_attention == "original_core"
+    assert linear.module is module.Attention
+    assert original_attention.module is module.SelfAttention
+    # Rebuilding from an already-compatible full-attention spec is idempotent.
+    assert builder(args, config, vp_stage=0).layer_specs[0].submodules.self_attention.module is full.module
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("module_name", ["qwen3_5", "qwen3_next"])
+def test_gate_compat_does_not_silently_replace_custom_attention(monkeypatch, module_name):
+    module = load_module(f"slime_plugins.models.{module_name}")
+    custom_attention = SimpleNamespace(module=object)
+    block = SimpleNamespace(layer_specs=[SimpleNamespace(submodules=SimpleNamespace(self_attention=custom_attention))])
+    monkeypatch.setattr(module, "get_gpt_decoder_block_spec", lambda *args, **kwargs: block)
+    monkeypatch.setattr(module, "get_num_layers_to_build", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(module, "get_transformer_layer_offset", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(module, "_load_hf_config", lambda _: SimpleNamespace(layer_types=["full_attention"]))
+    args = SimpleNamespace(num_experts=None, hf_checkpoint="unused", qwen_gdn_implementation="replicated")
+    config = SimpleNamespace(num_layers=1, pipeline_model_parallel_layout=None, attention_output_gate=True)
+    with pytest.raises(ValueError, match="SelfAttention module spec"):
+        getattr(module, f"get_{module_name}_spec")(args, config, vp_stage=None)
 
 
 @pytest.mark.unit

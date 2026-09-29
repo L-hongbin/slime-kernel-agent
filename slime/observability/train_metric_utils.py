@@ -322,6 +322,31 @@ def log_rollout_data(
 
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         cp_size = mpu.get_context_parallel_world_size()
+        log_dict = {}
+        sample_advantages = []
+        if rollout_data.get("advantages"):
+            sample_advantages = _compute_sample_advantage_scalars(args, rollout_data).detach().float().cpu().tolist()
+            response_lengths = rollout_data["response_lengths"]
+            sample_count = float(len(sample_advantages))
+            log_dict["advantage/zero_sample_fraction"] = (
+                float(sum(value == 0 for value in sample_advantages)),
+                sample_count,
+            )
+            for sign in ("positive", "negative"):
+                selected = [value > 0 if sign == "positive" else value < 0 for value in sample_advantages]
+                selected_count = float(sum(selected))
+                log_dict[f"advantage/{sign}_sample_fraction"] = (selected_count, sample_count)
+                log_dict[f"advantage/{sign}_abs_mass"] = (
+                    sum(abs(value) for value, keep in zip(sample_advantages, selected, strict=True) if keep),
+                    sample_count,
+                )
+                # Keep both keys on every DP rank, including ranks with no samples
+                # of this sign. Reduce sums/counts, not rank-local length means.
+                log_dict[f"sequence/{sign}_response_length"] = (
+                    sum(float(length) for length, keep in zip(response_lengths, selected, strict=True) if keep),
+                    selected_count,
+                )
+
         if getattr(args, "log_exp_metrics", False):
             sample_exp_metrics: dict[str, tuple[float, float]] = {}
 
@@ -329,44 +354,7 @@ def log_rollout_data(
                 if values:
                     sample_exp_metrics[name] = (float(sum(values)), float(len(values)))
 
-            sample_advantages = []
-            if rollout_data.get("advantages"):
-                sample_advantages = (
-                    _compute_sample_advantage_scalars(args, rollout_data).detach().float().cpu().tolist()
-                )
-            response_lengths_for_exp = [float(value) for value in rollout_data.get("response_lengths", [])]
             if sample_advantages:
-                positive = [float(value > 0) for value in sample_advantages]
-                negative = [float(value < 0) for value in sample_advantages]
-                zero = [float(value == 0) for value in sample_advantages]
-                add_sample_mean("advantage/positive_sample_fraction", positive)
-                add_sample_mean("advantage/negative_sample_fraction", negative)
-                add_sample_mean("advantage/zero_sample_fraction", zero)
-                add_sample_mean(
-                    "advantage/positive_abs_mass",
-                    [abs(value) if value > 0 else 0.0 for value in sample_advantages],
-                )
-                add_sample_mean(
-                    "advantage/negative_abs_mass",
-                    [abs(value) if value < 0 else 0.0 for value in sample_advantages],
-                )
-                add_sample_mean(
-                    "sequence/positive_response_length",
-                    [
-                        length
-                        for length, value in zip(response_lengths_for_exp, sample_advantages, strict=True)
-                        if value > 0
-                    ],
-                )
-                add_sample_mean(
-                    "sequence/negative_response_length",
-                    [
-                        length
-                        for length, value in zip(response_lengths_for_exp, sample_advantages, strict=True)
-                        if value < 0
-                    ],
-                )
-
                 turn_indices = rollout_data.get("turn_indices")
                 if turn_indices is not None:
                     for turn in sorted({int(value) for value in turn_indices if value is not None}):
@@ -429,7 +417,6 @@ def log_rollout_data(
             if sample_exp_metrics:
                 gather_log_data("exp/rollout/train_batch", args, rollout_id, sample_exp_metrics)
 
-        log_dict = {}
         response_lengths = rollout_data["response_lengths"]
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]

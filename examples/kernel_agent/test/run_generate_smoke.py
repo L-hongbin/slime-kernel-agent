@@ -496,9 +496,14 @@ async def _run(args) -> None:
             env_result = (output_sample.metadata or {}).get("env_result", {})
             env_state = env_result.get("env_state", env_result)
             reward = await generate_with_cuda_agent.reward_func(rollout_args, output_sample)
-            format_feedback = generate_with_cuda_agent._apply_feedback_template(
+            format_feedback, template_tokens, feedback_tokens = generate_with_cuda_agent._apply_feedback_template(
                 env_result,
                 tool_response_template,
+                state.tokenizer,
+            )
+            print(
+                f"[cuda_agent][generate_smoke][sample {idx}] "
+                f"template_tokens={template_tokens} feedback_tokens={feedback_tokens}"
             )
             print(f"\n[cuda_agent][generate_smoke][sample {idx}] status={output_sample.status}")
             print(f"[cuda_agent][generate_smoke][sample {idx}] remove_sample={output_sample.remove_sample}")

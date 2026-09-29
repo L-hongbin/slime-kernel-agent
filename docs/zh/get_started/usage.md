@@ -286,6 +286,34 @@ TailRL 对 reward 的共同平移不变，支持有限负 reward，不需要也�
 组内减均值不是跨 batch whitening，也不应把这种依赖同组样本的 baseline 直接等同于原始未中心化
 ArgMaxRL 的有限样本无偏估计器。
 
+#### Kernel-agent 上下文预算提醒
+
+Kernel-agent 多轮 rollout 可通过 `--use-context-budget-nudge 0.2` 开启上下文预算提醒，参考 [Mercor 的 context nudge](https://www.mercor.com/blog/training-frontier-knowledge-work-agents-a-397b-rl-training-guide-with-skyrl/)。参数为 `(0, 1]` 内的有限比例；不传或显式传 `None` 均关闭。要求 `--rollout-max-context-len > 0`。`0.2` 表示剩余上下文大于 0 且不超过上限的 20% 时，提醒下一轮优先提交完整、正确的 kernel，避免探索性优化。
+
+`GenerateState` 加载模板时，用 rollout tokenizer 统计模板原文的 token 数，缓存为模板的 `template_tokens` 属性；内置 fallback 模板也在首次使用时缓存。`_apply_feedback_template` 每轮统计序列化、截断后的 feedback，得到 `feedback_tokens`，即使关闭 nudge 也统计。两项均使用 `add_special_tokens=False`，与格式化后的 feedback 一起返回，写入 turn log 并打印到 turn stats。nudge 使用 `prompt_tokens + response_tokens + template_tokens + feedback_tokens` 估计上下文长度，在模板渲染前构建提醒，以 `context_budget_nudge` 传入模板（未触发时为空字符串）。这是估计值：模板原文包含占位符/Jinja 语法，分段 tokenize 的边界也可能有误差，且未计入新增 chat framing 和提醒文本。不为此重复 tokenize 整段上下文，下一轮已有的上下文检查负责实际长度限制。
+
+内置及仓库中的 response 模板已包含提醒字段；自定义 format/YAML 模板需要加入 `{context_budget_nudge}`，Jinja 模板需要加入 `{{ context_budget_nudge }}` 才会展示提醒。每轮满足条件都可以追加，不是整条轨迹只提醒一次。提醒属于下一轮 user 输入，不是 assistant 输出，不直接修改 reward 或 response loss mask；只在轮次之间生效，不能中断单轮长思考。若评测也打开此参数，评测同样生效。
+
+#### KernelGYM 详细正确性诊断
+
+`CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 默认 `0`（`False`），训练启动前设为 `1` 即可在 KernelGYM 评测请求中传入 `return_detail_correctness=true`。Qwen3.8 的 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传；自定义启动脚本也需要将此环境变量传给 rollout worker。
+
+该开关请求详细正确性诊断，不修改 reward 计算，与 `CUDA_AGENT_ENABLE_COMPUTE_SANITIZER` 独立：两者可以各自单独开启，也可以同时开启。sanitizer 是否实际执行仍取决于服务端触发规则。显式诊断命令 `run_request_env.py --mode sanitizer` 只开启 sanitizer，详细正确性诊断仍由 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 控制，默认关闭。
+
+#### KernelGYM 详细编译诊断
+
+`CUDA_AGENT_RETURN_DETAIL_COMPILATION` 默认 `0`（`False`）。设为 `1` 后，在 KernelGYM 请求中传入
+`return_detail_compilation=true`，启用编译错误分类，返回 `metadata.compilation_error_detail` 和摘要形式的
+`error_message`；关闭时服务端跳过分类，在 `error_message` 中返回完整编译错误文本。
+该开关与详细正确性诊断、Compute Sanitizer 独立，不改变 reward 计算。
+
+```bash
+export CUDA_AGENT_RETURN_DETAIL_COMPILATION=1
+```
+
+Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定义启动脚本也需要传给 rollout worker。
+训练请求、`run_request_env.py` 和 `run_response_pipeline.py` 都沿用此配置；`--mode compile` 不会自动开启详细编译诊断。
+
 #### Kernel rollout reward 后处理
 
 `examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。
@@ -396,6 +424,14 @@ sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正�
 TRLOO 在完整轨迹收尾时、group reward 后处理和过滤之前，用原始 `task_reward` 固定未来折算项 `metadata.return_reward`：`gamma * 原始task_reward[t+1] + gamma² * 原始task_reward[t+2] + ...`。该项不含动态调权、失败组替换或长度奖惩；收尾时已标记移除的 turn 贡献为零。训练时只计算 `return[t] = 当前sample.reward + return_reward[t]`，所以当前 turn 保留全部后处理效果，未来 turn 不携带这些调整。之后的 group 过滤不会重算或删除已固定的未来贡献，单 turn reward 不被 return 覆盖。旧 rollout dump 若缺少此字段，需重新生成，不能直接用可能包含后处理结果的旧 `multi_turn_reward` 代替。
 
 TRLOO 同时把固定的未来折算项记录到 `metadata.reward_component.return_reward`，用于观测。该组件不计入 `sample.reward`；对有效普通 TRLOO 样本，全部组件求和现在包含未来贡献，对应减 baseline 前的 return。动态调权和失败组替换均保留该项。所有支持的奖励组件（`correctness`、`performance`、`coverage`、`failed`、`length`、`return_reward`）均作为常规指标记录到 `rollout/reward/component/{字段}/{mean,min,max}`，无需 `--log-exp-metrics`；开启 `--use-tensorboard` 即可写入 TensorBoard。padding、缺失值和非有限值不进入组件统计，旧的 `exp/rollout/reward/component/*` 指标不再输出。
+
+Megatron 训练侧在 advantage 计算及 rollout 后处理后、训练 forward 前，默认记录以下指标，无需 `--log-exp-metrics`；开启 `--use-tensorboard` 即可写入 TensorBoard：
+
+- `rollout/advantage/{positive,negative,zero}_sample_fraction`：按每条样本有效 token 的平均 advantage 判定符号，统计样本占比。
+- `rollout/advantage/{positive,negative}_abs_mass`：对应符号样本的 advantage 绝对值之和除以全部样本数，不是该符号内部的条件均值。
+- `rollout/sequence/{positive,negative}_response_length`：对应符号样本的完整 response token 数均值，多轮中每个拆分 turn 算一条样本。
+
+统计沿用当前 loss mask；全 mask 样本的平均 advantage 为零，计入零样本占比。DP/CP 汇总使用总和/计数；全局没有某符号样本时，其平均长度记为 0，应结合样本占比解读。这些指标不反映随后训练 forward 内 seq-MIS 新增的 mask。原 `exp/rollout/train_batch/advantage/*` 和 `exp/rollout/train_batch/sequence/*` 不再重复输出；按 turn 的细分占比和异步诊断仍由 `--log-exp-metrics` 控制。
 
 `metadata.raw_task_reward` 保存按配置基础权重计算的原始单 turn 任务奖励，不含动态调权、失败组替换和长度奖惩。基础评分时写入，后续 reward 后处理不覆盖；它与可变的 `task_reward` 分开，可作为后续历史统计的数据源。TRLOO 的未来折算优先读取此字段；缺少字段的旧样本，在后处理前的轨迹收尾阶段仍回退到 `task_reward`，再回退到单 turn reward。该字段不是额外可加的 reward component。
 
