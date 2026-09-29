@@ -743,6 +743,14 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_kernel_agent_coverage.py"
+            },
+            {
+              "num_gpus": 0,
+              "test_file": "test_kernel_agent_reference_coverage_rs.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_kernelgym_health_backoff.py"
             },
             {

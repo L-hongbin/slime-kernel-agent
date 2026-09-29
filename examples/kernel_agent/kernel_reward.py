@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 try:
+    from .kernel_coverage import _compute_coverage
     from .config import CUDA_AGENT_CONFIGS
     from .utils import (
         COMPILATION_ERROR,
@@ -17,6 +18,7 @@ try:
         VALIDATION_ERROR,
     )
 except ImportError:
+    from kernel_coverage import _compute_coverage
     from config import CUDA_AGENT_CONFIGS
     from utils import (
         COMPILATION_ERROR,
@@ -767,54 +769,6 @@ def _resolve_kernel_failed_score(env_state: dict[str, Any], config: dict[str, An
         stage = "other"
 
     return float(kernel_failed_score.get(stage, config["failed_score"])), stage
-
-
-def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    num_custom_kernel = result.get("num_custom_kernel", metadata.get("num_custom_kernel", 0)) or 0
-    num_total_kernels = result.get("num_total_kernels", metadata.get("num_total_kernels", 0)) or 0
-    custom_time = (
-        result.get(
-            "custom_kernel_cuda_time_in_profiling_us",
-            metadata.get("custom_kernel_cuda_time_in_profiling_us", 0),
-        )
-        or 0
-    )
-    total_time = (
-        result.get(
-            "total_kernel_run_time_in_profiling_us",
-            metadata.get("total_kernel_run_time_in_profiling_us", 0),
-        )
-        or 0
-    )
-
-    number_coverage = float(num_custom_kernel) / float(num_total_kernels) if num_total_kernels else 0.0
-    time_coverage = float(custom_time) / float(total_time) if total_time else 0.0
-    coverage_type = config["coverage_reward_type"]
-    if coverage_type == "reference_time_coverage":
-        # KernelGym reports reference_runtime in ms and profiler kernel sums in us.
-        # Keep the reference fixed (reference cache), independent of custom speed.
-        reference_ms = result.get("reference_runtime", metadata.get("reference_runtime"))
-        if reference_ms is None or not math.isfinite(float(reference_ms)) or float(reference_ms) <= 0:
-            raise ValueError("reference_time_coverage requires positive finite reference_runtime in ms")
-        if not math.isfinite(float(total_time)) or float(total_time) <= 0:
-            raise ValueError("reference_time_coverage requires positive finite total profiling time in us")
-        if not math.isfinite(float(custom_time)) or float(custom_time) < 0:
-            raise ValueError("reference_time_coverage requires non-negative finite custom profiling time in us")
-        coverage = min(max(1.0 - (float(total_time) - float(custom_time)) / (float(reference_ms) * 1000.0), 0.0), 1.0)
-    elif coverage_type == "time_coverage":
-        coverage = time_coverage
-    elif coverage_type == "number_coverage":
-        coverage = number_coverage
-    else:
-        raise ValueError(f"Unknown coverage reward type: {coverage_type!r}")
-    return {
-        "coverage": coverage,
-        "num_custom_kernel": num_custom_kernel,
-        "num_total_kernels": num_total_kernels,
-        "custom_kernel_cuda_time_in_profiling_us": custom_time,
-        "total_kernel_run_time_in_profiling_us": total_time,
-    }
 
 
 def calculate_kernel_reward(
