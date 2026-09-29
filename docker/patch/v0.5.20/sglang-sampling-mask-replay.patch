@@ -1,0 +1,500 @@
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -349,6 +349,110 @@
+     return next_split_pruned_len
+ 
+ 
++def _build_spec_sampling_mask(
++    batch: ScheduleBatch,
++    gathered_logprobs: torch.Tensor,
++    accepted_token_ids: torch.Tensor,
++    accept_lens: torch.Tensor,
++    max_accept: int,
++    *,
++    max_tokens: Optional[int] = None,
++):
++    """Build replay supports for the accepted tokens of an EAGLE verify step."""
++    sampling_info = batch.sampling_info
++    batch_indices = sampling_info.sampling_mask_batch_indices
++    if batch_indices is None:
++        return None
++
++    from sglang.srt.layers.logits_processor import (
++        SamplingMaskOutput,
++        SamplingMaskStatus,
++    )
++
++    device = gathered_logprobs.device
++    batch_indices = batch_indices.to(device=device, dtype=torch.long)
++    steps = torch.arange(max_accept, device=device)
++    flat_rows = (batch_indices[:, None] * max_accept + steps[None, :]).reshape(-1)
++    valid = (
++        steps[None, :]
++        < accept_lens.to(device=device).index_select(0, batch_indices)[:, None]
++    ).reshape(-1)
++    row_logprobs = gathered_logprobs.index_select(0, flat_rows)
++    row_probs = row_logprobs.exp()
++    sampled_tokens = accepted_token_ids.index_select(0, flat_rows).long()
++
++    if sampling_info.is_all_greedy:
++        support = torch.zeros_like(row_probs, dtype=torch.bool)
++        support.scatter_(1, sampled_tokens[:, None], valid[:, None])
++    else:
++        top_ks = torch.repeat_interleave(sampling_info.top_ks, max_accept).index_select(
++            0, flat_rows
++        )
++        top_ps = torch.repeat_interleave(sampling_info.top_ps, max_accept).index_select(
++            0, flat_rows
++        )
++        min_ps = torch.repeat_interleave(sampling_info.min_ps, max_accept).index_select(
++            0, flat_rows
++        )
++        sorted_probs, sorted_ids = row_probs.sort(dim=-1, descending=True)
++        ranks = torch.arange(sorted_probs.shape[-1], device=device).view(1, -1)
++        keep = ranks < top_ks[:, None]
++        if sampling_info.need_top_p_sampling:
++            keep &= (sorted_probs.cumsum(dim=-1) - sorted_probs) <= top_ps[:, None]
++        if sampling_info.need_min_p_sampling:
++            keep &= sorted_probs >= sorted_probs[:, :1] * min_ps[:, None]
++        support = torch.zeros_like(keep)
++        support.scatter_(1, sorted_ids, keep)
++        # Spec acceptance can retain a boundary token that the torch replay
++        # reconstruction excludes. Match the trainer contract by force-keeping
++        # the token that was actually emitted.
++        support.scatter_(1, sampled_tokens[:, None], valid[:, None])
++        support &= valid[:, None]
++
++    realized_lengths = support.sum(dim=-1, dtype=torch.int32)
++    selected_weight = row_probs.gather(1, sampled_tokens[:, None]).squeeze(1).float()
++    support_mass = torch.where(support, row_probs, torch.zeros_like(row_probs)).sum(
++        dim=-1, dtype=torch.float32
++    )
++    selected_logprobs = torch.where(
++        valid,
++        torch.log(selected_weight / support_mass),
++        torch.zeros_like(selected_weight),
++    )
++    invalid = valid & ~(
++        (selected_weight > 0) & (support_mass > 0) & torch.isfinite(selected_logprobs)
++    )
++    if max_tokens is None:
++        max_tokens = get_exec().features.sampling_mask_max_tokens
++    overflow = valid & (realized_lengths > max_tokens)
++    statuses = torch.where(
++        invalid,
++        SamplingMaskStatus.INVALID,
++        torch.where(overflow, SamplingMaskStatus.OVERFLOW, SamplingMaskStatus.OK),
++    ).to(torch.int32)
++
++    realized_max = int(realized_lengths.max().item()) if realized_lengths.numel() else 0
++    packed_size = min(max_tokens, row_probs.shape[-1], max(1, realized_max))
++    packed_token_ids = torch.topk(
++        row_probs.masked_fill(~support, -1.0),
++        k=packed_size,
++        dim=-1,
++        largest=True,
++        sorted=True,
++    ).indices.to(torch.int32)
++    return (
++        SamplingMaskOutput(
++            token_ids=packed_token_ids,
++            lengths=realized_lengths.clamp(max=packed_size),
++            selected_logprobs=selected_logprobs,
++            statuses=statuses,
++        ),
++        flat_rows,
++        valid,
++        selected_logprobs,
++    )
++
++
+ def compute_spec_logprobs(
+     batch: ScheduleBatch,
+     logits_output: LogitsProcessorOutput,
+@@ -356,10 +460,11 @@
+     *,
+     accept_index: Optional[torch.Tensor] = None,
+     chain_stride: Optional[int] = None,
++    accept_lens: Optional[torch.Tensor] = None,
+ ):
+-    assert (accept_index is None) != (chain_stride is None), (
+-        "pass exactly one of accept_index / chain_stride"
+-    )
++    assert (accept_index is None) != (
++        chain_stride is None
++    ), "pass exactly one of accept_index / chain_stride"
+ 
+     bs = len(batch.seq_lens)
+     next_token_logits = logits_output.next_token_logits
+@@ -393,9 +498,23 @@
+         )
+     gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
+ 
+-    logits_output.next_token_logprobs = gathered_logprobs.gather(
++    token_logprobs = gathered_logprobs.gather(
+         1, accepted_token_ids.long().view(-1, 1)
+     ).view(bs, max_accept)
++    if accept_lens is not None:
++        sampling_mask = _build_spec_sampling_mask(
++            batch,
++            gathered_logprobs,
++            accepted_token_ids,
++            accept_lens,
++            max_accept,
++        )
++        if sampling_mask is not None:
++            output, flat_rows, valid, selected_logprobs = sampling_mask
++            logits_output.sampling_mask_output = output
++            flat_token_logprobs = token_logprobs.reshape(-1)
++            flat_token_logprobs[flat_rows[valid]] = selected_logprobs[valid]
++    logits_output.next_token_logprobs = token_logprobs
+ 
+     if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
+         top_logprobs_nums_expanded = [
+@@ -667,9 +786,9 @@
+ 
+         # Restore the full-pruned lm_head batch_info after chunk iteration.
+         if num_chunks > 1 and hasattr(lm_head, "reset_lm_head_pass"):
+-            assert hasattr(lm_head, "set_lm_head_pass"), (
+-                "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+-            )
++            assert hasattr(
++                lm_head, "set_lm_head_pass"
++            ), "lm_head must have set_lm_head_pass method and reset_lm_head_pass method at the same time"
+             lm_head.reset_lm_head_pass()
+ 
+         # Concatenate the results
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -355,9 +355,9 @@
+         else:
+             backend = get_exec().kernel.sampling_backend
+             if backend == "flashinfer":
+-                assert sampling_info.sampling_seed is None, (
+-                    "Sampling seed is not supported for flashinfer backend"
+-                )
++                assert (
++                    sampling_info.sampling_seed is None
++                ), "Sampling seed is not supported for flashinfer backend"
+                 if sampling_info.need_min_p_sampling:
+                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
+                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+@@ -419,6 +419,24 @@
+                             1,
+                             capture_tokens.long().view(-1, 1),
+                         ).squeeze(1)
++                        # The fused sampler and replay reconstruction can differ
++                        # at an exact cutoff boundary. Keep the token that was
++                        # actually sampled so replay remains finite.
++                        original_selected_weight = torch.gather(
++                            capture_probs,
++                            1,
++                            capture_tokens.long().view(-1, 1),
++                        ).squeeze(1)
++                        selected_weight = torch.where(
++                            selected_weight > 0,
++                            selected_weight,
++                            original_selected_weight,
++                        )
++                        filtered_probs.scatter_(
++                            1,
++                            capture_tokens.long().view(-1, 1),
++                            selected_weight.view(-1, 1),
++                        )
+                         sampling_mask_capture = _SamplingMaskCapture(
+                             weights=filtered_probs,
+                             token_ids=None,
+@@ -546,7 +564,16 @@
+                     statuses, op=dist.ReduceOp.MAX, group=self.cp_sync_group
+                 )
+ 
+-        packed_size = min(self.sampling_mask_max_tokens, weights.shape[-1])
++        # Avoid copying the configured maximum width for every decode step.
++        # Top-p supports are normally tiny but can have rare long tails.
++        realized_max = (
++            int(realized_lengths.max().item()) if realized_lengths.numel() else 0
++        )
++        packed_size = min(
++            self.sampling_mask_max_tokens,
++            weights.shape[-1],
++            max(1, realized_max),
++        )
+         if token_ids is None:
+             _, packed_positions = torch.topk(
+                 weights, k=packed_size, dim=-1, largest=True, sorted=True
+@@ -574,9 +601,9 @@
+         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
+         Requires sampling_seed to be set in sampling_info.
+         """
+-        assert sampling_info.sampling_seed is not None, (
+-            "sampling_seed is required for sampling from logprobs"
+-        )
++        assert (
++            sampling_info.sampling_seed is not None
++        ), "sampling_seed is required for sampling from logprobs"
+         sampled_index = multinomial_with_seed(
+             logprobs, sampling_info.sampling_seed, positions
+         )
+@@ -604,9 +631,9 @@
+                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
+             return batch_next_token_ids.to(torch.int32)
+         else:
+-            assert self.use_ascend_backend, (
+-                "Only ascend backend supports sampling from logits"
+-            )
++            assert (
++                self.use_ascend_backend
++            ), "Only ascend backend supports sampling from logits"
+             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
+                 logits,
+                 sampling_info.top_ks,
+@@ -744,9 +771,9 @@
+ 
+     if need_min_p_sampling:
+         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
+-        assert sampling_seed is None, (
+-            "With sampling seed, multinomial_with_seed will provide wrong results"
+-        )
++        assert (
++            sampling_seed is None
++        ), "With sampling seed, multinomial_with_seed will provide wrong results"
+         min_p_thresholds = probs_sort[:, 0] * min_ps
+         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+ 
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -28,6 +28,8 @@
+ from http import HTTPStatus
+ from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+ 
++from sglang.srt.sampling.sampling_params import TOP_K_ALL
++
+ from sglang.srt.runtime_context import (
+     attention_backends,
+     get_context,
+@@ -2912,24 +2914,29 @@
+                 )
+                 return
+             top_k = req.sampling_params.top_k
++            top_p = req.sampling_params.top_p
++            min_p = req.sampling_params.min_p
+             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
+-            if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
++            bounded_by_probability = top_k == TOP_K_ALL and (top_p < 1.0 or min_p > 0.0)
++            if (
++                top_k != 1
++                and not (1 < top_k <= sampling_mask_cap)
++                and not bounded_by_probability
++            ):
+                 error_msg = (
+-                    "return_sampling_mask requires top_k=1 for greedy sampling "
+-                    f"or finite 1 < top_k <= {sampling_mask_cap}; got top_k="
+-                    f"{top_k}. Lower top_k or increase "
+-                    "--sampling-mask-max-tokens."
++                    "return_sampling_mask requires top_k=1, finite top_k within "
++                    f"the configured cap {sampling_mask_cap}, or a top-p/min-p "
++                    f"filter; got top_k={top_k}, top_p={top_p}, min_p={min_p}."
+                 )
+                 self._reject_sampling_mask_request(req, error_msg)
+                 return
+ 
+-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+-            # Spec workers do not emit one sampling support per accepted token, so
+-            # the returned mask would not align 1:1 with generated tokens. Reject
+-            # the combination instead of silently returning a misaligned mask.
+-            error_msg = (
+-                "return_sampling_mask is not supported with speculative decoding."
+-            )
++        if (
++            req.return_sampling_mask
++            and not self.spec_algorithm.is_none()
++            and not self.spec_algorithm.is_eagle()
++        ):
++            error_msg = "return_sampling_mask with speculative decoding currently supports only EAGLE/NEXTN."
+             self._reject_sampling_mask_request(req, error_msg)
+             return
+ 
+@@ -3892,8 +3899,9 @@
+                     running_batch.batch_is_full = True
+ 
+             if running_batch.batch_is_full:
+-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
+-                    req
++                if (
++                    not self.enable_priority_preemption
++                    or not adder.preempt_to_schedule(req)
+                 ):
+                     break
+ 
+--- a/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
++++ b/python/sglang/srt/managers/scheduler_components/batch_result_processor.py
+@@ -938,7 +938,8 @@
+             result.next_token_ids,
+             result.can_run_cuda_graph,
+         )
+-        self.materialize_sampling_mask_output(batch.reqs, logits_output)
++        is_spec = not batch.spec_algorithm.is_none()
++        sampling_mask_stride = _get_speculative_output_stride(result) if is_spec else 1
+ 
+         next_token_ids, next_token_logprobs = self._normalize_decode_outputs(
+             batch=batch,
+@@ -946,6 +947,14 @@
+             logits_output=logits_output,
+             next_token_ids=next_token_ids,
+         )
++        self.materialize_sampling_mask_output(
++            batch.reqs,
++            logits_output,
++            # Speculative verification can accept tokens past a stop boundary.
++            # Only materialize replay rows for tokens that will actually be emitted.
++            accept_lens=[len(tokens) for tokens in next_token_ids] if is_spec else None,
++            stride=sampling_mask_stride,
++        )
+ 
+         batch_size = batch.batch_size()
+         num_generated_tokens = result.get_num_generated_tokens(batch_size)
+@@ -997,7 +1006,6 @@
+             # next_token_id is a per-req list: 1 token for non-spec, the verified
+             # run for spec (already grammar-truncated in _resolve_spec_v2_tokens).
+             next_token_id = next_token_ids[i]
+-            is_spec = not batch.spec_algorithm.is_none()
+ 
+             req.time_stats.set_last_decode_finish_time()
+             sampling_mask_finish_reason = None
+@@ -1033,9 +1041,12 @@
+                 )
+ 
+             if req.return_sampling_mask:
+-                # return_sampling_mask + speculative decoding is rejected at
+-                # request entry, so this remains one support mask per token.
+-                self.add_sampling_mask_return_values(i, req, logits_output)
++                self.add_sampling_mask_return_values(
++                    i,
++                    req,
++                    logits_output,
++                    speculative=is_spec,
++                )
+ 
+             if req.return_hidden_states and logits_output.hidden_states is not None:
+                 # hidden_states is [bs * stride, hidden_dim], one row per emitted
+@@ -1160,19 +1171,30 @@
+         i: int,
+         req: Req,
+         output: LogitsProcessorOutput,
++        *,
++        speculative: bool = False,
+     ) -> None:
+         """Attach sparse sampling support metadata to the return values."""
+-        mask = output.next_token_sampling_mask_idx
++        masks = output.next_token_sampling_mask_idx
+         logprobs = output.next_token_sampling_logprobs
+-        req.output_token_sampling_mask.append(None if mask is None else mask[i])
+-        req.output_token_sampling_logprobs.append(
+-            None if logprobs is None else logprobs[i]
+-        )
++        mask = None if masks is None else masks[i]
++        logprob = None if logprobs is None else logprobs[i]
++        if speculative:
++            req.output_token_sampling_mask.extend([] if mask is None else mask)
++            req.output_token_sampling_logprobs.extend(
++                [] if logprob is None else logprob
++            )
++        else:
++            req.output_token_sampling_mask.append(mask)
++            req.output_token_sampling_logprobs.append(logprob)
+ 
+     @staticmethod
+     def materialize_sampling_mask_output(
+         reqs: List[Req],
+         output: Optional[LogitsProcessorOutput],
++        *,
++        accept_lens: Optional[torch.Tensor] = None,
++        stride: int = 1,
+     ) -> None:
+         """Convert opted-in tensor rows to batch-aligned Python results."""
+         if output is None or output.sampling_mask_output is None:
+@@ -1183,7 +1205,8 @@
+         lengths = sampling_output.lengths.tolist()
+         selected_logprobs = sampling_output.selected_logprobs.tolist()
+         statuses = sampling_output.statuses.tolist()
+-        assert len(batch_indices) == len(lengths)
++        rows_per_request = stride if accept_lens is not None else 1
++        assert len(batch_indices) * rows_per_request == len(lengths)
+ 
+         batch_size = len(reqs)
+         masks = [None] * batch_size
+@@ -1191,15 +1214,32 @@
+         status_by_batch = [None] * batch_size
+         token_ids = sampling_output.token_ids.cpu()
+         packed_width = token_ids.shape[1]
+-        for row, batch_index in enumerate(batch_indices):
+-            status = int(statuses[row])
+-            length = int(lengths[row])
+-            if status == SamplingMaskStatus.OK and not (0 <= length <= packed_width):
+-                status = SamplingMaskStatus.INVALID
+-            status_by_batch[batch_index] = status
+-            if status == SamplingMaskStatus.OK:
+-                masks[batch_index] = token_ids[row, :length].tolist()
+-                logprobs[batch_index] = float(selected_logprobs[row])
++        accepted = accept_lens.tolist() if isinstance(accept_lens, torch.Tensor) else accept_lens
++        for request_row, batch_index in enumerate(batch_indices):
++            start = request_row * rows_per_request
++            count = int(accepted[batch_index]) if accepted is not None else 1
++            request_masks = []
++            request_logprobs = []
++            request_status = SamplingMaskStatus.OK
++            for row in range(start, start + count):
++                status = int(statuses[row])
++                length = int(lengths[row])
++                if status == SamplingMaskStatus.OK and not (
++                    0 <= length <= packed_width
++                ):
++                    status = SamplingMaskStatus.INVALID
++                request_status = max(request_status, status)
++                if status == SamplingMaskStatus.OK:
++                    request_masks.append(token_ids[row, :length].tolist())
++                    request_logprobs.append(float(selected_logprobs[row]))
++            status_by_batch[batch_index] = request_status
++            if request_status == SamplingMaskStatus.OK:
++                masks[batch_index] = (
++                    request_masks if accepted is not None else request_masks[0]
++                )
++                logprobs[batch_index] = (
++                    request_logprobs if accepted is not None else request_logprobs[0]
++                )
+ 
+         output.next_token_sampling_mask_idx = masks
+         output.next_token_sampling_logprobs = logprobs
+--- a/python/sglang/srt/speculative/eagle_worker_common.py
++++ b/python/sglang/srt/speculative/eagle_worker_common.py
+@@ -635,7 +635,13 @@
+         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
+ 
+     if batch.return_logprob and not batch.forward_mode.is_idle():
+-        compute_spec_logprobs(batch, logits_output, predict, accept_index=accept_index)
++        compute_spec_logprobs(
++            batch,
++            logits_output,
++            predict,
++            accept_index=accept_index,
++            accept_lens=accept_lens,
++        )
+ 
+     if finalize_tree_path and not batch.forward_mode.is_idle() and topk > 1:
+         # topk == 1 needs nothing here: the accepted path is already the front
+--- a/python/sglang/srt/managers/scheduler_components/output_streamer.py
++++ b/python/sglang/srt/managers/scheduler_components/output_streamer.py
+@@ -627,7 +627,12 @@
+         if self.return_sampling_mask:
+             if req.return_sampling_mask:
+                 send_output_sampling_mask_offset = req.send_output_sampling_mask_offset
+-                sampling_mask_end = len(req.output_token_sampling_mask)
++                # Speculative verification may accept tokens past an EOS, stop
++                # sequence, or max_new_tokens boundary. Match output_ids_through_stop
++                # so replay metadata remains one-to-one with emitted tokens.
++                sampling_mask_end = min(
++                    len(req.output_token_sampling_mask), len(output_ids_)
++                )
+                 self.output_token_sampling_mask.append(
+                     req.output_token_sampling_mask[
+                         send_output_sampling_mask_offset:sampling_mask_end

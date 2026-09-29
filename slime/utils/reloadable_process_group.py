@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 
 old_new_group_dict = {}
 default_process_group_states = {}
-# Healthy-memory checks are shared by nested Python/C++ communication wrappers.
-# Recheck immediately after a low-memory result, group recreation, or an error.
+# Default to time-based throttling; an explicit interval also bounds calls between checks.
+_COMM_MEMORY_CHECK_INTERVAL = max(0, int(os.environ.get("SLIME_COMM_MEMORY_CHECK_INTERVAL", "0")))
 _COMM_MEMORY_CHECK_INTERVAL_S = 0.1
 _next_comm_memory_check = {}
 
@@ -492,13 +492,19 @@ def _wrap_low_level_call(check_memory=True):
     try:
         if check_memory:
             pid, now = os.getpid(), time.monotonic()
-            if now >= _next_comm_memory_check.get(pid, float("-inf")):
+            deadline, remaining = _next_comm_memory_check.get(pid, (float("-inf"), 0))
+            if now >= deadline or (_COMM_MEMORY_CHECK_INTERVAL > 0 and remaining <= 0):
                 mem_info = available_memory()
                 if mem_info["free_GB"] < 3:
                     _next_comm_memory_check.pop(pid, None)
                     clear_memory()
                 else:
-                    _next_comm_memory_check[pid] = now + _COMM_MEMORY_CHECK_INTERVAL_S
+                    _next_comm_memory_check[pid] = (
+                        now + _COMM_MEMORY_CHECK_INTERVAL_S,
+                        _COMM_MEMORY_CHECK_INTERVAL - 1,
+                    )
+            elif _COMM_MEMORY_CHECK_INTERVAL > 0:
+                _next_comm_memory_check[pid] = (deadline, remaining - 1)
         yield
     except Exception as e:
         _next_comm_memory_check.pop(os.getpid(), None)

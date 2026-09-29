@@ -192,9 +192,11 @@ class TestZeroGpuRolloutConfig:
         assert group.parallel_config()["pp_size"] == 2
         assert group.parallel_config()["tp_size"] == 16
 
-    def test_sglang_server_args_derive_tp_from_overridden_pp(self):
+    def test_sglang_server_args_derive_tp_from_overridden_pp(self, monkeypatch):
         from slime.backends.sglang_utils.sglang_engine import _compute_server_args
+        from slime.utils import accelerator
 
+        monkeypatch.setattr(accelerator, "resolve_visible_device_id", lambda device_id: device_id)
         args = Namespace(
             hf_checkpoint="/tmp/hf",
             seed=1,
@@ -223,8 +225,11 @@ class TestZeroGpuRolloutConfig:
         assert kwargs["pp_size"] == 2
         assert kwargs["tp_size"] == 16
 
-    def test_memory_saver_disables_default_breakable_prefill_cuda_graph(self, monkeypatch):
+    @pytest.mark.parametrize("server_args_kind", ["dataclass", "msgspec"])
+    def test_memory_saver_disables_default_breakable_prefill_cuda_graph(self, monkeypatch, server_args_kind):
         from slime.backends.sglang_utils import sglang_engine
+
+        monkeypatch.setattr(sglang_engine.accelerator, "resolve_visible_device_id", lambda device_id: device_id)
 
         @dataclass
         class CurrentServerArgs:
@@ -234,6 +239,15 @@ class TestZeroGpuRolloutConfig:
         @dataclass
         class LegacyServerArgs:
             enable_memory_saver: bool = False
+
+        if server_args_kind == "msgspec":
+            from msgspec import defstruct
+
+            CurrentServerArgs = defstruct(
+                "CurrentServerArgs",
+                [("enable_memory_saver", bool, False), ("cuda_graph_backend_prefill", str | None, None)],
+            )
+            LegacyServerArgs = defstruct("LegacyServerArgs", [("enable_memory_saver", bool, False)])
 
         args = Namespace(
             hf_checkpoint="/tmp/hf",
@@ -263,6 +277,14 @@ class TestZeroGpuRolloutConfig:
         args.sglang_cuda_graph_backend_prefill = "full"
         kwargs, _ = sglang_engine._compute_server_args(args, **compute_kwargs)
         assert kwargs["cuda_graph_backend_prefill"] == "full"
+
+        kwargs, _ = sglang_engine._compute_server_args(
+            args,
+            **compute_kwargs,
+            sglang_overrides={"cuda_graph_backend_prefill": "disabled", "unsupported_field": True},
+        )
+        assert kwargs["cuda_graph_backend_prefill"] == "disabled"
+        assert "unsupported_field" not in kwargs
 
         monkeypatch.setattr(sglang_engine, "ServerArgs", LegacyServerArgs)
         kwargs, _ = sglang_engine._compute_server_args(args, **compute_kwargs)

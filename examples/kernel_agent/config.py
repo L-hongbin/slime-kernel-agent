@@ -44,6 +44,20 @@ correctness_timeout = (
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 # Reward settings.
+coverage_reward_type = os.environ.get("CUDA_AGENT_COVERAGE_REWARD_TYPE", "time_coverage").strip().lower()
+coverage_reward_weight = float(os.environ.get("CUDA_AGENT_COVERAGE_REWARD_WEIGHT", 0.5))
+if coverage_reward_type not in {
+    "time_coverage",
+    "number_coverage",
+    "reference_time_coverage",
+    "efficiency_reference_time_coverage",
+    "capped_speed_auxiliary",
+    "gated_time_coverage",
+}:
+    raise ValueError(
+        "CUDA_AGENT_COVERAGE_REWARD_TYPE must be time_coverage, number_coverage, "
+        "reference_time_coverage, efficiency_reference_time_coverage, capped_speed_auxiliary, or gated_time_coverage"
+    )
 # Speedup reward mapping. ``legacy`` preserves the historical clipped raw
 # speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].
 # ``lcb_improvement`` applies a lower confidence bound to speedup first, using
@@ -72,6 +86,7 @@ if apply_kernel_failed_score and apply_failed_group_reward:
 # NCU, Compute Sanitizer, correctness input perturbations, and adaptive perf
 # trials are opt-in because they add latency or change the evaluated inputs.
 enable_profiling = bool(int(os.environ.get("CUDA_AGENT_ENABLE_PROFILING", 1)))
+verbose_errors = bool(int(os.environ.get("CUDA_AGENT_VERBOSE_ERRORS", 1)))
 enable_ncu = bool(int(os.environ.get("CUDA_AGENT_ENABLE_NCU", 0)))
 enable_compute_sanitizer = bool(int(os.environ.get("CUDA_AGENT_ENABLE_COMPUTE_SANITIZER", 0)))
 # Detailed correctness is opt-in and independent of Compute Sanitizer.
@@ -145,7 +160,7 @@ CUDA_AGENT_CONFIGS = {
         "correctness_timeout": correctness_timeout,
         "correctness_timeout_enabled": correctness_timeout_enabled,
         # Diagnostic and validation settings.
-        "verbose_errors": True,
+        "verbose_errors": verbose_errors,
         "enable_profiling": enable_profiling,
         "enable_ncu": enable_ncu,
         "enable_compute_sanitizer": enable_compute_sanitizer,
@@ -186,8 +201,8 @@ CUDA_AGENT_CONFIGS = {
             "other": -1.0,
         },
         "coverage_reward_enable": True,
-        "coverage_reward_type": "time_coverage",
-        "coverage_reward_weight": 0.5,
+        "coverage_reward_type": coverage_reward_type,
+        "coverage_reward_weight": coverage_reward_weight,
         "performance_reward_requires_correctness": bool(
             int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "1"))
         ),

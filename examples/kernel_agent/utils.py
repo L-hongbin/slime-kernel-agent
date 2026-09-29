@@ -7,9 +7,9 @@ from typing import Any
 from slime.utils.types import Sample
 
 try:
-    pass
+    from .kernel_coverage import _compute_coverage
 except ImportError:
-    pass
+    from kernel_coverage import _compute_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -417,6 +417,15 @@ def _extract_env_extra_info(env_state: dict[str, Any]) -> dict[str, Any]:
         "precheck": env_state.get("precheck"),
         "detail_env_time": detail_env_time,
     }
+    # Use exactly the reward metric, including units, clipping and validation.
+    # Failed evaluations may have no reference/profiler data; never substitute
+    # time coverage for missing reference coverage.
+    try:
+        env_extra_info["reference_time_coverage"] = _compute_coverage(
+            env_state, {"coverage_reward_type": "reference_time_coverage"}
+        )["coverage"]
+    except (ValueError, TypeError, OverflowError):
+        pass
     decoy_reason = metadata.get("decoy_reason") or metadata.get("policy_violation_reason")
     if isinstance(decoy_reason, str) and decoy_reason:
         env_extra_info["decoy_reason"] = decoy_reason
@@ -1139,6 +1148,12 @@ def _apply_coverage_rs(args, output_samples: list[Sample]) -> None:
         env_extra_info = metadata.get("env_extra_info")
         if not isinstance(env_extra_info, dict):
             raise ValueError("--use-coverage-rs requires sample.metadata['env_extra_info'].")
+        if coverage_key == "reference_time_coverage":
+            if not bool(env_extra_info["correctness"]) or bool(env_extra_info["decoy_kernel"]):
+                continue
+            if coverage_key not in env_extra_info:
+                _mark_remove_sample(sample, "invalid_reference_coverage")
+                continue
         if coverage_key not in env_extra_info:
             raise KeyError(f"env_extra_info missing coverage key: {coverage_key}")
 

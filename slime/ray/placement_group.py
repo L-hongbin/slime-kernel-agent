@@ -314,6 +314,17 @@ def create_rollout_manager(args, pg):
     }
     if getattr(args, "rollout_data_transport", "object-store") == "nixl":
         rollout_manager_options["enable_tensor_transport"] = True
+    rollout_resource = getattr(args, "rollout_placement_resource", None)
+    if rollout_resource:
+        rollout_nodes = sorted(
+            (node for node in ray.nodes() if node["Alive"] and node["Resources"].get(rollout_resource, 0) > 0),
+            key=lambda node: node["NodeManagerAddress"],
+        )
+        if not rollout_nodes:
+            raise RuntimeError(f"No Ray node provides rollout resource {rollout_resource!r}")
+        rollout_ip = rollout_nodes[0]["NodeManagerAddress"]
+        rollout_manager_options["resources"] = {f"node:{rollout_ip}": 0.001}
+        logger.info("Placing RolloutManager on Ray node %s for resource %s", rollout_ip, rollout_resource)
     rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
     # calculate num_rollout from num_epoch

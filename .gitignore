@@ -255,3 +255,4 @@ gpu_mem_trend.png
 *.bundle
 local_artifacts/
 .slime-v4-source-provenance
+.codex_tasks/

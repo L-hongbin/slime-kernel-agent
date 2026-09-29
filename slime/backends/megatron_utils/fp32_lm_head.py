@@ -77,7 +77,15 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         else:
             total_input = input_
 
-        output = torch.matmul(total_input.float(), weight.float().t())
+        # Explicitly fold token/batch axes into GEMM. With strided 3D inputs,
+        # matmul can otherwise select a batch of GEMVs, especially when MTP
+        # supplies a detached output weight.
+        input_2d = total_input.reshape(-1, total_input.shape[-1]).float()
+        # Megatron MTP cross entropy mutates FP32 logits in place. Returning a
+        # view created inside this custom Function makes its backward illegal.
+        # Write GEMM into an owned output tensor without copying the full logits.
+        output = torch.empty((*total_input.shape[:-1], weight.shape[0]), dtype=torch.float32, device=input_2d.device)
+        torch.mm(input_2d, weight.float().t(), out=output.view(-1, weight.shape[0]))
         if bias is not None:
             output = output + bias.float()
         return output
@@ -106,7 +114,9 @@ class _FP32LmHeadLinear(torch.autograd.Function):
             gather_handle = None
             total_input = input_
 
-        grad_input = torch.matmul(grad_output.float(), weight.float()).to(input_.dtype)
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+        grad_input = torch.mm(grad_output_2d, weight.float())
+        grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.shape[1]).to(input_.dtype)
 
         if gather_handle is not None:
             gather_handle.wait()

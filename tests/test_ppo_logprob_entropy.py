@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import os
 import socket
+import weakref
 
 import pytest
 import torch
 
 from slime.utils.ppo_utils import calculate_log_probs_and_entropy
-
 
 NUM_GPUS = 0
 
@@ -414,6 +414,62 @@ def test_calculate_log_probs_and_entropy_matches_unfused_reference_vocab_paralle
         nprocs=world_size,
         join=True,
     )
+
+
+@pytest.mark.parametrize("chunk_size", [-1, 1, 3, 32])
+@pytest.mark.parametrize("with_entropy,with_entropy_grad", [(False, False), (True, False), (True, True)])
+def test_lazy_mask_matches_dense_outputs_and_gradients(chunk_size, with_entropy, with_entropy_grad):
+    generator = torch.Generator().manual_seed(43)
+    logits = torch.randn(11, 19, generator=generator, requires_grad=True)
+    lazy_logits = logits.detach().clone().requires_grad_()
+    tokens = torch.randint(0, 19, (11,), generator=generator)
+    keep = torch.rand(11, 19, generator=generator) > 0.7
+    keep[0] = False
+    calls = []
+    mask_references = []
+
+    def mask_factory(*, row_start, row_end):
+        assert all(reference() is None for reference in mask_references)
+        calls.append((row_start, row_end))
+        mask = keep[row_start:row_end].clone()
+        mask_references.append(weakref.ref(mask))
+        return mask
+
+    arguments = dict(
+        tokens=tokens,
+        tp_group=None,
+        with_entropy=with_entropy,
+        with_entropy_grad=with_entropy_grad,
+        chunk_size=chunk_size,
+    )
+    dense_outputs = calculate_log_probs_and_entropy(logits, **arguments, log_prob_keep_mask=keep)
+    lazy_outputs = calculate_log_probs_and_entropy(lazy_logits, **arguments, log_prob_keep_mask=mask_factory)
+    assert all(reference() is None for reference in mask_references)
+    for dense, lazy in zip(dense_outputs, lazy_outputs, strict=True):
+        if dense is not None:
+            torch.testing.assert_close(dense, lazy, rtol=0, atol=0)
+        else:
+            assert lazy is None
+    weights = torch.randn(11, 1, generator=generator)
+    for outputs in (dense_outputs, lazy_outputs):
+        loss = (outputs[0] * weights).sum()
+        if with_entropy and with_entropy_grad:
+            loss = loss + (outputs[1] * weights.squeeze(-1)).sum()
+        loss.backward()
+    torch.testing.assert_close(logits.grad, lazy_logits.grad, rtol=0, atol=0)
+    assert calls[0][0] == 0 and calls[-1][1] == logits.size(0)
+    assert all(left[1] == right[0] for left, right in zip(calls, calls[1:], strict=False))
+    assert all(end - start <= chunk_size for start, end in calls) if chunk_size > 0 else len(calls) == 1
+
+
+def test_lazy_mask_is_not_built_for_empty_logits():
+    def unexpected_mask(**kwargs):
+        raise AssertionError("Empty logits must not allocate a mask")
+
+    outputs = calculate_log_probs_and_entropy(
+        torch.empty(0, 19), torch.empty(0, dtype=torch.long), None, chunk_size=3, log_prob_keep_mask=unexpected_mask
+    )
+    assert outputs[0].numel() == 0
 
 
 if __name__ == "__main__":

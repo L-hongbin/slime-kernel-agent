@@ -24,6 +24,7 @@ from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_filter import filter_cuda_kernel_group
 from examples.kernel_agent.kernel_reward import (
     _calculate_performance_score,
+    _compute_coverage,
     _compute_speedup_log_standard_error,
     calculate_kernel_reward,
     post_process_rollout_rewards,
@@ -42,6 +43,74 @@ def _reward_config(output_mismatch_score: float = 0.25) -> dict:
         },
         "performance_reward_requires_correctness": True,
     }
+
+
+@pytest.mark.parametrize("custom_us", [80.0, 40.0, 10.0])
+def test_reference_coverage_is_invariant_to_custom_kernel_speed(custom_us):
+    result = {
+        "reference_runtime": 0.1,
+        "metadata": {
+            "custom_kernel_cuda_time_in_profiling_us": custom_us,
+            "total_kernel_run_time_in_profiling_us": custom_us + 20.0,
+        },
+    }
+    assert _compute_coverage(result, {"coverage_reward_type": "reference_time_coverage"})["coverage"] == pytest.approx(
+        0.8
+    )
+
+
+@pytest.mark.parametrize("noncustom_us, expected", [(200.0, 0.0), (100.0, 0.0), (50.0, 0.5), (0.0, 1.0)])
+def test_reference_coverage_reduces_remaining_cost_and_clips(noncustom_us, expected):
+    result = {
+        "reference_runtime": 0.1,
+        "custom_kernel_cuda_time_in_profiling_us": 10.0,
+        "total_kernel_run_time_in_profiling_us": 10.0 + noncustom_us,
+    }
+    assert _compute_coverage(result, {"coverage_reward_type": "reference_time_coverage"})["coverage"] == expected
+
+
+@pytest.mark.parametrize("reference_ms", [None, 0.0, -1.0, float("nan"), float("inf")])
+def test_reference_coverage_requires_valid_reference(reference_ms):
+    with pytest.raises(ValueError, match="reference_runtime"):
+        _compute_coverage({"reference_runtime": reference_ms}, {"coverage_reward_type": "reference_time_coverage"})
+
+
+def test_reference_coverage_requires_profiling():
+    with pytest.raises(ValueError, match="total profiling time"):
+        _compute_coverage({"reference_runtime": 0.1}, {"coverage_reward_type": "reference_time_coverage"})
+
+
+@pytest.mark.parametrize("reference_ms", [None, -1.0, 0.0, float("nan")])
+def test_reference_evaluation_failure_is_excluded_without_retrying_group(monkeypatch, reference_ms):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_type", "reference_time_coverage")
+    state = _completed_env(correctness=True)
+    state["reference_runtime"] = reference_ms
+    state["metadata"]["model_load_error"] = "reference initialization failed"
+    sample = Sample(metadata={"env_result": {"env_state": state}})
+    assert asyncio.run(generate_with_cuda_agent.reward_func(SimpleNamespace(), sample)) == 0.0
+    assert sample.remove_sample
+    assert sample.metadata["remove_reason"] == "invalid_reference_runtime"
+    assert sample.metadata["env_result"]["env_state"]["correctness"] is True
+
+
+def test_reference_coverage_flows_through_piecewise_reward(monkeypatch):
+    config = _reward_config()
+    config.update(coverage_reward_type="reference_time_coverage", speedup_score_mode="legacy")
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "reward", config)
+    args = SimpleNamespace(dynamic_reward_gate="piecewise", overlong_penalty=None, use_multi_turn=False)
+    samples = []
+    for custom_us in (80.0, 40.0):
+        state = _completed_env(correctness=True, speedup=2.0)
+        state.update(
+            reference_runtime=0.1,
+            custom_kernel_cuda_time_in_profiling_us=custom_us,
+            total_kernel_run_time_in_profiling_us=custom_us + 20.0,
+        )
+        details = calculate_kernel_reward(state, config)
+        assert details["kernel_score"]["coverage"] == pytest.approx(0.8)
+        samples.append(Sample(group_index=0, reward=details["reward"], metadata=details))
+    assert post_process_rollout_rewards(args, samples) == pytest.approx([2.18, 2.18])
+    assert [s.metadata["reward_component"]["coverage"] for s in samples] == pytest.approx([0.48, 0.48])
 
 
 def _completed_env(

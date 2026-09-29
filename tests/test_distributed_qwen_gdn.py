@@ -129,7 +129,7 @@ def test_fused_packed_a2a_values_and_nonuniform_gradients(monkeypatch, device, w
         for r, w in enumerate(widths)
     ]
     for rank in range(cp):
-        group = SimpleNamespace(size=lambda: cp, rank=lambda: rank)
+        group = SimpleNamespace(size=lambda: cp, rank=lambda rank=rank: rank)
         source = sources[rank].clone().requires_grad_()
         expected_send = torch.cat([x.reshape(-1) for x in reordered[rank].split(widths, -1)])
         backward_chunks = [g.index_select(0, inverse).chunk(cp, 0)[rank] for g in grads]
@@ -138,7 +138,18 @@ def test_fused_packed_a2a_values_and_nonuniform_gradients(monkeypatch, device, w
         expected_grad.index_copy_(-1, permutation, torch.cat(backward_chunks, -1))
         calls = []
 
-        def cp2hp(output, input_, output_split_sizes, input_split_sizes, actual_group):
+        def cp2hp(
+            output,
+            input_,
+            output_split_sizes,
+            input_split_sizes,
+            actual_group,
+            *,
+            calls=calls,
+            expected_send=expected_send,
+            rank=rank,
+            received_grad=received_grad,
+        ):
             assert output.data_ptr() != input_.data_ptr()
             if not calls:
                 torch.testing.assert_close(input_, expected_send)
@@ -164,7 +175,19 @@ def test_fused_packed_a2a_values_and_nonuniform_gradients(monkeypatch, device, w
         expected_backward_send = torch.cat([x.reshape(-1) for x in out_grads[rank].split(widths, -1)])
         calls.clear()
 
-        def hp2cp(output, input_, output_split_sizes, input_split_sizes, actual_group):
+        def hp2cp(
+            output,
+            input_,
+            output_split_sizes,
+            input_split_sizes,
+            actual_group,
+            *,
+            calls=calls,
+            expected_send=expected_send,
+            received=received,
+            expected_backward_send=expected_backward_send,
+            recv_grad=recv_grad,
+        ):
             assert output.data_ptr() != input_.data_ptr()
             if not calls:
                 torch.testing.assert_close(input_, expected_send)
@@ -959,6 +982,25 @@ def test_packed_boundaries_allow_odd_lengths_without_cp():
     boundaries = torch.tensor([0, 4001, 4096], dtype=torch.int32)
 
     assert _resolve_cu_seqlens(None, boundaries, 4096, "cu_seqlens_q", cp_size=1) is boundaries
+
+
+def test_packed_boundary_validation_reuses_cpu_metadata(monkeypatch):
+    from slime.utils.sequence_metadata import cache_cpu_sequence_boundaries
+
+    boundaries = torch.tensor([0, 8, 24], dtype=torch.int32)
+    cache_cpu_sequence_boundaries(boundaries, [0, 8, 24])
+    monkeypatch.setattr(torch.Tensor, "item", lambda self: pytest.fail("unexpected scalar readback"))
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda self: pytest.fail("unexpected boundary readback"))
+    for _ in range(3):
+        assert _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2) is boundaries
+
+
+def test_packed_boundary_validation_detects_mutated_tensor():
+    boundaries = torch.tensor([0, 8, 24])
+    _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2)
+    boundaries[-1] = 26
+    with pytest.raises(ValueError, match="does not match"):
+        _resolve_cu_seqlens(None, boundaries, 24, "cu_seqlens_q", cp_size=2)
 
 
 def test_parameter_cp_slice_preserves_fused_sections():

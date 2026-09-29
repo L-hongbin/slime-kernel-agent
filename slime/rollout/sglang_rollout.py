@@ -56,6 +56,11 @@ _PREDICTIVE_SUPPORT_FIELDS = (
 )
 
 
+def _uses_native_sampling_mask(args: Namespace) -> bool:
+    """Return whether the installed SGLang exposes its native support-mask API."""
+    return hasattr(args, "sglang_sampling_mask_max_tokens")
+
+
 def _empty_predictive_support(num_tokens: int, top_k: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return compact all-invalid predictive-support rows.
 
@@ -398,7 +403,8 @@ class GenerateState(metaclass=SingletonMeta):
             no_stop_trim=True,
             spaces_between_special_tokens=False,
         )
-        if args.rollout_top_p != 1.0:
+        self.use_native_sampling_mask = _uses_native_sampling_mask(args)
+        if args.rollout_top_p != 1.0 and not self.use_native_sampling_mask:
             self.sampling_params["custom_params"] = {"return_top_p_token_ids": True}
 
         if getattr(args, "sglang_enable_deterministic_inference", False):
@@ -515,6 +521,8 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         "sampling_params": sampling_params,
         "return_logprob": True,
     }
+    if _uses_native_sampling_mask(args) and getattr(args, "rollout_top_p", 1.0) != 1.0:
+        payload["return_sampling_mask"] = True
 
     predictive_top_k = int(getattr(args, "dppo_predictive_top_k", 0) or 0)
     if predictive_top_k < 0:
@@ -569,6 +577,15 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     elif "output_token_logprobs" in output["meta_info"]:
         new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
         new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        if _uses_native_sampling_mask(args) and getattr(args, "rollout_top_p", 1.0) != 1.0:
+            sampling_logprobs = output["meta_info"].get("output_token_sampling_logprobs")
+            if sampling_logprobs is None or len(sampling_logprobs) != len(new_response_tokens):
+                raise ValueError(
+                    "SGLang native sampling-mask logprobs must align with generated tokens: "
+                    f"logprobs={None if sampling_logprobs is None else len(sampling_logprobs)}, "
+                    f"tokens={len(new_response_tokens)}."
+                )
+            new_response_log_probs = [float(value) for value in sampling_logprobs]
     else:
         new_response_tokens, new_response_log_probs = [], []
 

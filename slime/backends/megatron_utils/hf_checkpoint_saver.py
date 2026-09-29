@@ -49,17 +49,7 @@ def save_hf_model_to_path(
 
     is_save_rank = _is_global_rank_zero()
 
-    setup_error = None
-    if is_save_rank:
-        try:
-            logger.info("Saving model in HuggingFace format to %s", path)
-            path.mkdir(parents=True, exist_ok=True)
-            _clear_existing_hf_weights(path)
-            _copy_hf_assets(args.hf_checkpoint, path)
-        except Exception as e:
-            setup_error = repr(e)
-
-    _raise_if_rank_zero_failed("prepare raw HuggingFace save directory", setup_error)
+    _prepare_hf_output_directory(args, path)
 
     metadata_error = None
     payload: list[Any] = [None]
@@ -129,6 +119,34 @@ def save_hf_model_to_path(
 
     if is_save_rank:
         logger.info("Successfully saved HuggingFace model to %s", path)
+
+
+def _prepare_hf_output_directory(args, path: Path) -> None:
+    """Prepare each node writer's directory before any rank writes shards.
+
+    Serialize setup across writers so this also works on a shared filesystem.
+    Broadcast each writer's error before entering conversion collectives.
+    """
+    import torch.distributed as dist
+
+    distributed = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    _, _, _, writer_ranks = _get_node_save_layout(args)
+    for writer_rank in writer_ranks:
+        error = None
+        if rank == writer_rank:
+            try:
+                logger.info("Preparing HuggingFace output directory on writer rank %s: %s", rank, path)
+                path.mkdir(parents=True, exist_ok=True)
+                _clear_existing_hf_weights(path)
+                _copy_hf_assets(args.hf_checkpoint, path)
+            except Exception as exc:
+                error = repr(exc)
+        payload = [error]
+        if distributed:
+            dist.broadcast_object_list(payload, src=writer_rank)
+        if payload[0] is not None:
+            raise RuntimeError(f"Failed to prepare HF output directory on writer rank {writer_rank}: {payload[0]}")
 
 
 class _SafetensorShardWriter:
