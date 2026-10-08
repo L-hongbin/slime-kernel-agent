@@ -552,9 +552,9 @@ def test_default_speedup_reward_upper_bound(mode, speedup, expected):
 @pytest.mark.parametrize("upper", [None, "3.5", "5"])
 def test_speedup_reward_upper_from_environment(monkeypatch, upper):
     if upper is None:
-        monkeypatch.delenv("SPEEDUP_REWARD_UPPER", raising=False)
+        monkeypatch.delenv("CUDA_AGENT_SPEEDUP_REWARD_UPPER", raising=False)
     else:
-        monkeypatch.setenv("SPEEDUP_REWARD_UPPER", upper)
+        monkeypatch.setenv("CUDA_AGENT_SPEEDUP_REWARD_UPPER", upper)
     config_path = REPO_ROOT / "examples/kernel_agent/config.py"
     spec = importlib.util.spec_from_file_location("_kernel_agent_speedup_upper_env_test", config_path)
     config_module = importlib.util.module_from_spec(spec)

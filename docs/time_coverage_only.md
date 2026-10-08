@@ -52,10 +52,10 @@ Result: **474 passed, 7 skipped** (CPU-only run). Black, isort, and whitespace c
 
 ## Speedup reward upper bound
 
-`SPEEDUP_REWARD_UPPER` configures `speedup_reward_upper_bound` and defaults to `2.0` (previously fixed at `5.0`). Both Qwen3.8 WarmUp and MultiTurn launchers forward it through the Ray runtime environment and append `-SRUP${SPEEDUP_REWARD_UPPER}` to the experiment name. For example:
+`CUDA_AGENT_SPEEDUP_REWARD_UPPER` configures `speedup_reward_upper_bound` and defaults to `2.0` (previously fixed at `5.0`). Both Qwen3.8 WarmUp and MultiTurn launchers forward it through the Ray runtime environment and append `-SRUP${CUDA_AGENT_SPEEDUP_REWARD_UPPER}` to the experiment name. For example:
 
 ```bash
-SPEEDUP_REWARD_UPPER=3 bash examples/kernel_agent/run_qwen3.8_27B_WarmUp.sh
+CUDA_AGENT_SPEEDUP_REWARD_UPPER=3 bash examples/kernel_agent/run_qwen3.8_27B_WarmUp.sh
 ```
 
 In legacy mode, speedup scores are capped at this value; improvement modes use it as the speedup corresponding to score 1.

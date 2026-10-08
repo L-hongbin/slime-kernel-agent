@@ -180,7 +180,7 @@ CUDA_AGENT_CONFIGS = {
         "init_correct_weight": 0.5,
         "init_performance_weight": 0.5,
         "speedup_score_mode": speedup_score_mode,
-        "speedup_reward_upper_bound": float(os.environ.get("SPEEDUP_REWARD_UPPER", "2")),
+        "speedup_reward_upper_bound": float(os.environ.get("CUDA_AGENT_SPEEDUP_REWARD_UPPER", "2")),
         "speedup_reward_lower_bound": 0.0,
         "speedup_uncertainty_z_score": speedup_uncertainty_z_score,
         "speedup_uncertainty_log_std_floor": speedup_uncertainty_log_std_floor,
