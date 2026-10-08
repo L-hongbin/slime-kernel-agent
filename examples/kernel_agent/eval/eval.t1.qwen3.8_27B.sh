@@ -33,7 +33,7 @@ DATA_TAG="GEPAv2"
 
 case "${LEVEL}" in
     1)
-        EVAL_DATA="${EVAL_DATA:-"/ms/FM/lihongbin/dataset/CUDA_RL/Eval_data/KernelBench-TVMFFI-GEPA-V2/kernelbench_level1val.parquet"}"
+        EVAL_DATA="${EVAL_DATA:-"/ms/FM/lihongbin/dataset/CUDA_RL/Eval_data/KernelBench-TVMFFI-GEPA-V2/kernelbench_level1_val.parquet"}"
         ;;
     2)
         EVAL_DATA="${EVAL_DATA:-"/ms/FM/lihongbin/dataset/CUDA_RL/Eval_data/KernelBench-TVMFFI-GEPA-V2/kernelbench_level2_val.parquet"}"
