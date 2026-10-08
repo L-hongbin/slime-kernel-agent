@@ -1,5 +1,49 @@
 # Sample 级 Sequence MIS
 
+## 公共计算入口
+
+static 后处理和 dynamic loss 都调用 `slime.utils.sequence_mis.compute_sequence_mis`。
+调用方准备完整 response 的 actor/reference logprob（CP 分片需先 gather）和原始 loss mask。
+公共函数返回 `loss_masks`、每条 sample 的 `keep` 和 `scores`，可通过 `collect_stats=True` 获取静态诊断统计。
+函数不修改输入 mask，不参与反向传播，也不依赖 Megatron。所有聚合方法共用分块计算；
+`sequence_mis_mode=loop/batch` 仅改变分块大小，多轮模式始终保留完整轨迹分组。
+旧的 `examples.kernel_agent.kernel_filter.sequence_mis` 路径继续作为 static 后处理适配入口。
+
+## 选择 actor logprob 来源
+
+`--sequence-mis-config` 中的 `actor_logprob` 与 `aggregation` 分开配置：
+
+| actor_logprob | 概率来源 | 筛选时机 |
+| --- | --- | --- |
+| `static` | 训练前重算的 actor logprob | rollout 数据后处理时筛选一次，后续更新复用 mask |
+| `dynamic` | 当前训练 forward 的 logits 计算出的 logprob | 每个 microbatch、每次 forward 重新筛选 |
+
+为兼容旧脚本，不指定时 `binary_kl` 默认 `dynamic`，其他聚合方法默认 `static`。
+`kl`、`geometric`、`mirrorpop`、`binary_kl` 都支持两种来源。
+`turns_geometric` 和 `turns_mirrorpop` 只支持 `static`，因为完整轨迹可能跨 microbatch。
+
+例如，训练前按 binary-KL 过滤：
+
+```bash
+--sequence-mis-config '{"aggregation":"binary_kl","actor_logprob":"static","upper":0.05}' \
+--rollout-data-postprocess-path examples.kernel_agent.kernel_filter.sequence_mis
+```
+
+`static` 必须配置上述后处理入口（或在自定义后处理中调用它）。该模式会要求训练前重算，
+即使开启 `--use-rollout-logprobs` 或当前批次本可直接复用 loss forward，也不能跳过。
+
+使用实时 forward 做 geometric 过滤：
+
+```bash
+--sequence-mis-config '{"aggregation":"geometric","actor_logprob":"dynamic","lower":0.9,"upper":1.1}'
+```
+
+`dynamic` 当前支持 Megatron policy loss；不需要后处理入口，保留该入口也会自动跳过，避免重复过滤。
+传统聚合的 `token_veto_threshold` 和 `use_advantage` 在 dynamic 模式下仍然有效。
+`ratio_source` 继续决定参考概率：默认 `rollout`，传统聚合也支持 `old_actor`（仍需 `--keep-old-actor`，
+并保留与 routing replay 不兼容的限制）。dynamic 使用 old_actor 时，分子来自当前 forward，
+不再额外重算一次当前 actor。
+
 ## 训练 forward 的 Bernoulli KL 筛选
 
 Megatron policy loss 支持直接使用本次 actor 训练 forward 的 logprob，对每个训练 sample 进行筛选：
@@ -46,5 +90,7 @@ sample_kl > upper → 当前 sample 的 loss_mask 全部置零
 
 ## 与旧 actor 侧 seq-MIS 的区别
 
-旧 `kl/geometric/mirrorpop/turns_*` 模式继续使用训练前后处理入口及原有行为。
-`binary_kl` 在训练 loss 内执行，始终比较当前训练 forward 和实际 rollout 的概率，不使用预先重算的旧 actor 概率冒充当前策略。
+不指定 `actor_logprob` 时保留旧行为。指定后，执行阶段由 `actor_logprob` 决定，
+聚合方法由 `aggregation` 决定；static 的预计算概率不会随当前批次内的参数更新而变化。
+非 binary-KL 的 dynamic 模式输出 `seq_mis_score` 和 `seq_mis_masked_fraction`；
+static 模式继续通过后处理入口输出 `seq_mis/` 指标。

@@ -50,6 +50,8 @@ def should_recompute_old_actor_log_probs(args) -> bool:
 
     return bool(
         not getattr(args, "use_rollout_logprobs", False)
+        or getattr(args, "sequence_mis_actor_logprob", None) == "static"
+        or getattr(args, "sequence_mis_ratio_source", "rollout") == "old_actor"
         or getattr(args, "get_mismatch_metrics", False)
         or getattr(args, "debug_force_old_actor_logprob_recompute", False)
     )

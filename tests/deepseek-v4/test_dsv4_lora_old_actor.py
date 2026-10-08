@@ -329,13 +329,15 @@ def test_sequence_mis_ratio_source_selects_pair(monkeypatch):
 
     captured = {}
 
-    def fake_batch(*, train_log_probs, rollout_log_probs, qkv_format, max_seq_lens, **kwargs):
-        captured["train"] = train_log_probs
-        captured["rollout"] = rollout_log_probs
-        captured["qkv_format"] = qkv_format
-        captured["max_seq_lens"] = max_seq_lens
+    original_compute = kf.compute_sequence_mis
 
-    monkeypatch.setattr(kf, "_batch_sequence_mis", fake_batch)
+    def capture_compute(args, actor, reference, masks, *a, **kw):
+        captured["train"] = actor
+        captured["rollout"] = reference
+        return original_compute(args, actor, reference, masks, *a, **kw)
+
+    monkeypatch.setattr(kf, "compute_sequence_mis", capture_compute)
+    monkeypatch.setattr(kf, "all_gather_with_cp", lambda tensor, *a, **kw: tensor)
 
     old = [torch.tensor([0.0, 0.0])]
     cur = [torch.tensor([0.1, 0.2])]
@@ -371,8 +373,6 @@ def test_sequence_mis_ratio_source_selects_pair(monkeypatch):
     kf.sequence_mis(make_args("rollout"), 0, make_data(with_cur=False))
     assert torch.equal(captured["train"][0], old[0])
     assert torch.equal(captured["rollout"][0], sglang[0])
-    assert captured["qkv_format"] == "bshd"
-    assert captured["max_seq_lens"] == [256]
 
     # old_actor: same-stack pair (cur numerator, old denominator)
     kf.sequence_mis(make_args("old_actor"), 0, make_data(with_cur=True))
@@ -688,6 +688,25 @@ def test_debug_force_old_actor_logprob_recompute_validation_is_fail_closed():
         kwargs[missing_field] = None if missing_field == "load_debug_rollout_data" else False
         with pytest.raises(ValueError, match=expected_flag):
             _validate_debug_force_old_actor_logprob_recompute(Namespace(**kwargs))
+
+
+@pytest.mark.parametrize(
+    "actor_logprob,ratio_source,expected",
+    [
+        ("static", "rollout", True),
+        ("dynamic", "rollout", False),
+        ("dynamic", "old_actor", True),
+    ],
+)
+def test_sequence_mis_recompute_requirement(actor_logprob, ratio_source, expected):
+    from argparse import Namespace
+
+    args = Namespace(
+        use_rollout_logprobs=True,
+        sequence_mis_actor_logprob=actor_logprob,
+        sequence_mis_ratio_source=ratio_source,
+    )
+    assert should_recompute_old_actor_log_probs(args) is expected
 
 
 if __name__ == "__main__":

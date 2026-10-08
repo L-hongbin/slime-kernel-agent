@@ -12,9 +12,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from slime.backends.megatron_utils import loss as loss_module
 from slime.backends.megatron_utils.cp_utils import get_sum_of_sample_mean
 from slime.utils.arguments import _parse_sequence_mis_args, get_slime_extra_args_provider, slime_validate_args
-from slime.utils.ppo_utils import compute_binary_kl_sample_gate
+from slime.utils.sequence_mis import compute_sequence_mis
 
 NUM_GPUS = 0
+
+
+def _binary_gate(actor, reference, mask, threshold):
+    result = compute_sequence_mis(
+        Namespace(sequence_mis_aggregation="binary_kl", sequence_mis_upper=threshold), [actor], [reference], [mask]
+    )
+    return result.keep[0], result.scores[0]
+
+
+def _sample_gate(args, actor, reference, mask, advantage=None):
+    result = compute_sequence_mis(args, [actor], [reference], [mask], None if advantage is None else [advantage])
+    return result.keep[0], result.scores[0]
 
 
 def test_binary_kl_sample_gate_matches_bernoulli_kl_and_ignores_padding():
@@ -25,21 +37,21 @@ def test_binary_kl_sample_gate_matches_bernoulli_kl_and_ignores_padding():
         torch.distributions.Bernoulli(probs=behavior[:2]),
         torch.distributions.Bernoulli(probs=current[:2].exp()),
     ).mean()
-    keep, kl = compute_binary_kl_sample_gate(current, behavior.log(), mask, 1.0)
+    keep, kl = _binary_gate(current, behavior.log(), mask, 1.0)
     assert keep
     torch.testing.assert_close(kl, expected.detach())
     assert not kl.requires_grad
-    keep, _ = compute_binary_kl_sample_gate(current, behavior.log(), mask, kl.item())
+    keep, _ = _binary_gate(current, behavior.log(), mask, kl.item())
     assert keep  # Inclusive threshold.
-    keep, _ = compute_binary_kl_sample_gate(current, behavior.log(), mask, kl.item() / 2)
+    keep, _ = _binary_gate(current, behavior.log(), mask, kl.item() / 2)
     assert not keep
-    keep, kl = compute_binary_kl_sample_gate(current, behavior.log(), torch.zeros(3), 0.0)
+    keep, kl = _binary_gate(current, behavior.log(), torch.zeros(3), 0.0)
     assert keep and kl == 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_binary_kl_extreme_probabilities_are_finite(dtype):
-    keep, kl = compute_binary_kl_sample_gate(
+    keep, kl = _binary_gate(
         torch.tensor([0.0, -1000.0], dtype=dtype),
         torch.tensor([-1000.0, 0.0], dtype=dtype),
         torch.ones(2),
@@ -95,6 +107,137 @@ def test_sequence_mis_remains_opt_in():
     _parse_sequence_mis_args(args)
     assert not hasattr(args, "sequence_mis_aggregation")
     assert not hasattr(args, "sequence_mis_upper")
+
+
+@pytest.mark.parametrize("aggregation", ["binary_kl", "geometric", "kl", "mirrorpop"])
+@pytest.mark.parametrize("source", ["static", "dynamic"])
+def test_sequence_mis_actor_logprob_is_independent_of_aggregation(aggregation, source):
+    args = Namespace(sequence_mis_config=json.dumps({"aggregation": aggregation, "actor_logprob": source}))
+    _parse_sequence_mis_args(args)
+    assert args.sequence_mis_actor_logprob == source
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"actor_logprob": "forward"},
+        {"actor_logprob": "dynamic", "aggregation": "turns_geometric"},
+        {"actor_logprob": "dynamic", "aggregation": "turns_mirrorpop"},
+    ],
+)
+def test_sequence_mis_rejects_invalid_actor_logprob(config):
+    with pytest.raises(ValueError, match="actor_logprob"):
+        _parse_sequence_mis_args(Namespace(sequence_mis_config=json.dumps(config)))
+
+
+@pytest.mark.parametrize("aggregation,expected", [("binary_kl", "dynamic"), ("geometric", "static")])
+def test_sequence_mis_preserves_default_actor_logprob(aggregation, expected):
+    args = Namespace(sequence_mis_config=json.dumps({"aggregation": aggregation}))
+    _parse_sequence_mis_args(args)
+    assert args.sequence_mis_actor_logprob == expected
+
+
+def test_static_binary_kl_filters_precomputed_probabilities(monkeypatch):
+    from examples.kernel_agent import kernel_filter
+
+    monkeypatch.setattr(kernel_filter, "all_gather_with_cp", lambda tensor, *a, **kw: tensor)
+    args = Namespace(sequence_mis_config='{"aggregation":"binary_kl","actor_logprob":"static","upper":0.003}')
+    _parse_sequence_mis_args(args)
+    data = {
+        "log_probs": [torch.tensor([-1.0, -1.0]), torch.tensor([-1.0])],
+        "rollout_log_probs": [torch.tensor([-1.0, -1.0]), torch.tensor([-3.0])],
+        "loss_masks": [torch.ones(2), torch.ones(1)],
+        "total_lengths": [3, 2],
+        "response_lengths": [2, 1],
+    }
+    kernel_filter.sequence_mis(args, 0, data)
+    torch.testing.assert_close(data["loss_masks"][0], torch.ones(2))
+    torch.testing.assert_close(data["loss_masks"][1], torch.zeros(1))
+
+
+def test_static_binary_kl_does_not_filter_again_in_loss(monkeypatch):
+    args, batch, _ = _loss_fixture(monkeypatch)
+    args.sequence_mis_aggregation = "binary_kl"
+    args.sequence_mis_actor_logprob = "static"
+    args.sequence_mis_upper = 0.003
+    batch["rollout_log_probs"][1] = torch.full((4,), -2.0)
+    _, _, stats = loss_module.loss_function(args, batch, 1, 1, torch.zeros(1, 7, 2))
+    assert "seq_mis_masked_fraction" not in stats["keys"]
+
+
+def test_sequence_gate_token_veto_and_positive_advantage_protection():
+    args = Namespace(
+        sequence_mis_aggregation="geometric",
+        sequence_mis_lower=0.1,
+        sequence_mis_upper=10.0,
+        sequence_mis_token_veto_threshold=0.5,
+        sequence_mis_use_advantage=False,
+    )
+    actor = torch.tensor([-3.0, -1.0, float("nan")], requires_grad=True)
+    reference = torch.tensor([-1.0, -3.0, float("nan")])
+    mask = torch.tensor([1.0, 1.0, 0.0])
+    keep, score = _sample_gate(args, actor, reference, mask)
+    assert not keep and score == 1 and not score.requires_grad
+    args.sequence_mis_use_advantage = True
+    keep, _ = _sample_gate(args, actor, reference, mask, torch.tensor([-1.0, -1.0, 1.0]))
+    assert not keep  # Positive advantage on a masked token must not protect.
+    keep, _ = _sample_gate(args, actor, reference, mask, torch.tensor([1.0, -1.0, 0.0]))
+    assert keep
+
+
+def test_dynamic_geometric_uses_old_actor_reference_when_requested(monkeypatch):
+    args, batch, _ = _loss_fixture(monkeypatch)
+    monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None)
+    args.sequence_mis_actor_logprob = "dynamic"
+    args.sequence_mis_aggregation = "geometric"
+    args.sequence_mis_ratio_source = "old_actor"
+    args.sequence_mis_lower, args.sequence_mis_upper = 0.9, 1.1
+    batch["rollout_log_probs"] = [torch.full_like(t, -3.0) for t in batch["log_probs"]]
+    _, _, stats = loss_module.loss_function(args, batch, 1, 1, torch.zeros(1, 7, 2))
+    metrics = dict(zip(stats["keys"], stats["values"][1:], strict=True))
+    assert metrics["seq_mis_masked_fraction"] == 0
+
+
+@pytest.mark.parametrize("mode", ["loop", "batch"])
+@pytest.mark.parametrize("aggregation", ["turns_geometric", "turns_mirrorpop"])
+def test_unified_sequence_mis_complete_trajectory_gate(mode, aggregation):
+    args = Namespace(
+        sequence_mis_aggregation=aggregation,
+        max_turns=2,
+        sequence_mis_mode=mode,
+        sequence_mis_batch_size=3,
+        sequence_mis_lower=0.9,
+        sequence_mis_upper=1.1,
+    )
+    # Geometric mean of 0.5 and 2 is 1; mean absolute log-ratio is log(2).
+    actor = [torch.tensor([-2.0]).requires_grad_(), torch.tensor([-2.0]).requires_grad_()]
+    reference = [actor[0].detach() + torch.log(torch.tensor(2.0)), actor[1].detach() - torch.log(torch.tensor(2.0))]
+    masks = [torch.ones(1), torch.ones(1)]
+    result = compute_sequence_mis(args, actor, reference, masks, collect_stats=True)
+    assert result.keep.tolist() == ([True, True] if aggregation == "turns_geometric" else [False, False])
+    assert result.stats["valid_sequences"] == 2
+    assert result.stats["rejected"] == (0 if aggregation == "turns_geometric" else 2)
+    assert not result.scores.requires_grad
+    assert all(torch.equal(mask, torch.ones(1)) for mask in masks)
+    with pytest.raises(ValueError, match="complete trajectory"):
+        compute_sequence_mis(args, actor[:1], reference[:1], masks[:1])
+
+
+@pytest.mark.parametrize("aggregation", ["binary_kl", "geometric", "kl", "mirrorpop"])
+def test_unified_sequence_mis_empty_and_padding_only(aggregation):
+    args = Namespace(sequence_mis_aggregation=aggregation, sequence_mis_upper=0.05)
+    empty = compute_sequence_mis(args, [], [], [], collect_stats=True)
+    assert empty.loss_masks == [] and empty.keep.numel() == 0
+    assert empty.stats["valid_sequences"] == 0
+    result = compute_sequence_mis(
+        args,
+        [torch.tensor([float("nan")]), torch.empty(0)],
+        [torch.tensor([float("nan")]), torch.empty(0)],
+        [torch.zeros(1), torch.empty(0)],
+        collect_stats=True,
+    )
+    assert torch.isfinite(result.scores).all()
+    assert result.stats["valid_sequences"] == 0 and result.stats["rejected"] == 0
 
 
 def test_minirl_cli_is_opt_in():
@@ -323,11 +466,15 @@ def test_prompt_mean_requires_metadata(monkeypatch):
 
 @pytest.mark.parametrize("mode", ["default", "minirl", "per_token", "prompt"])
 @pytest.mark.parametrize("recompute", [False, True])
-def test_live_sample_mis_masks_loss_without_changing_original_denominators(monkeypatch, mode, recompute):
+@pytest.mark.parametrize("aggregation", ["binary_kl", "geometric", "kl", "mirrorpop"])
+def test_live_sample_mis_masks_loss_without_changing_original_denominators(monkeypatch, mode, recompute, aggregation):
     args, batch, log_probs = _loss_fixture(monkeypatch, mode=mode, same_trajectory=True)
     monkeypatch.setattr(loss_module.mpu, "get_context_parallel_group", lambda: None)
-    args.sequence_mis_aggregation = "binary_kl"
-    args.sequence_mis_upper = 0.003
+    args.sequence_mis_aggregation = aggregation
+    args.sequence_mis_actor_logprob = "dynamic"
+    args.sequence_mis_upper = 1.001 if aggregation == "geometric" else 0.003
+    if aggregation == "kl":
+        args.sequence_mis_lower = -0.003
     args.recompute_loss_function = recompute
     # Precomputed actor log_probs equal the live forward. Only the actual
     # rollout pair differs: sample 2 must be rejected even though both turns
