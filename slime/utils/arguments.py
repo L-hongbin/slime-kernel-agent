@@ -2324,7 +2324,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 dest="kernel_env_url",
                 type=str,
                 default=None,
-                help="Kernel agent environment server URL, e.g. http://127.0.0.1:8002.",
+                help="Kernel environment URL(s), separated by spaces or commas; select the least-loaded endpoint per rollout process.",
             )
             parser.add_argument(
                 "--kernel-backend",

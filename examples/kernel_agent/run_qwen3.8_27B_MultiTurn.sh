@@ -260,7 +260,7 @@ SAVE_PATH="/ms/FM/lihongbin/kernel_rl/checkpoints/${EXP_NAME}"
 
 
 if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
-   --urls "${KERNEL_ENV_ENDPOINTS[@]}" \
+   --url "${KERNEL_ENV_ENDPOINTS[*]}" \
    --timeout "${KERNELGYM_HEALTH_TIMEOUT:-5}" \
    --attempts "${KERNELGYM_HEALTH_ATTEMPTS:-3}" \
    --interval "${KERNELGYM_HEALTH_INTERVAL:-2}"; then
@@ -513,7 +513,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-urls "${KERNEL_ENV_ENDPOINTS[@]}"
+   --kernel-env-url "${KERNEL_ENV_ENDPOINTS[*]}"
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck

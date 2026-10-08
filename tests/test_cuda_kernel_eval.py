@@ -2333,7 +2333,7 @@ def test_detail_config_defaults_off_and_accepts_opt_in(monkeypatch, value, expec
     "urls",
     [
         [],
-        "http://a",
+        " , ",
         [""],
         ["ftp://a"],
         [None],
@@ -2346,6 +2346,20 @@ def test_detail_config_defaults_off_and_accepts_opt_in(monkeypatch, value, expec
 def test_kernel_env_urls_reject_invalid_values(urls):
     with pytest.raises(ValueError):
         kernel_response._kernel_env_urls(SimpleNamespace(kernel_env_urls=urls), {})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["http://a/ http://b,http://a", "http://a/,http://b", " http://a/\nhttp://b "])
+@pytest.mark.parametrize("source", ["cli_single", "cli_plural", "config_single", "config_plural"])
+def test_kernel_env_urls_split_combined_addresses(value, source):
+    args = SimpleNamespace()
+    config = {}
+    key = "kernel_env_url" if source.endswith("single") else "kernel_env_urls"
+    if source.startswith("cli"):
+        setattr(args, key, [value] if source == "cli_plural" else value)
+    else:
+        config[key] = value
+    assert kernel_response._kernel_env_urls(args, config) == ["http://a", "http://b"]
 
 
 @pytest.mark.unit

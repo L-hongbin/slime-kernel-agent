@@ -231,7 +231,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     endpoints.add_argument(
         "--url",
         default=None,
-        help=f"KernelGym base URL. Defaults to KERNELGYM_URL or {DEFAULT_KERNELGYM_URL}.",
+        help=f"KernelGym base URL(s), separated by spaces or commas. Defaults to KERNELGYM_URL or {DEFAULT_KERNELGYM_URL}.",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds.")
     parser.add_argument(
@@ -330,7 +330,10 @@ async def run(args: argparse.Namespace) -> int:
     urls = getattr(args, "urls", None)
     if urls is None:
         urls = [args.url]
-    if not urls or isinstance(urls, str):
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [url for value in urls for url in value.replace(",", " ").split()]
+    if not urls:
         raise ValueError("At least one KernelGym URL is required")
     normalized = []
     for url in urls:

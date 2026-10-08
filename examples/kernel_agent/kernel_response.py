@@ -425,13 +425,20 @@ def _kernel_env_urls(args, config: dict[str, Any]) -> list[str]:
             if urls is None:
                 url = config.get("kernel_env_url")
                 urls = [url] if url else []
-    if isinstance(urls, str) or not urls:
-        raise ValueError("Configure --kernel-env-url or a non-empty --kernel-env-urls list")
-    normalized = []
-    for url in urls:
-        if not isinstance(url, str):
+    if isinstance(urls, str):
+        urls = [urls]
+    if not urls:
+        raise ValueError("Configure at least one Kernel environment URL")
+    split_urls = []
+    for value in urls:
+        if not isinstance(value, str):
             raise ValueError("Kernel environment URLs must be strings")
-        url = url.strip().rstrip("/")
+        split_urls.extend(value.replace(",", " ").split())
+    if not split_urls:
+        raise ValueError("Configure at least one Kernel environment URL")
+    normalized = []
+    for url in split_urls:
+        url = url.rstrip("/")
         parsed = urlsplit(url)
         if (
             parsed.scheme not in {"http", "https"}

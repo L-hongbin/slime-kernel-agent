@@ -70,3 +70,13 @@ Sequence MIS validation: `CUDA_VISIBLE_DEVICES='' PYTHONPATH=. python -m pytest 
 
 
 After requiring explicit gate ranges and adding the speedup environment setting, the combined CPU regression run covered metadata/GDN, reward processing, partial rewards, sequence MIS, old-actor recomputation, and temperature validation: **703 passed, 7 skipped**. The earlier counts above describe their respective integration stages.
+
+## Multiple KernelGym endpoints
+
+Use the same option for one or multiple endpoints. Space- or comma-separated URLs are automatically split and deduplicated:
+
+```bash
+python scripts/check_kernelgym_health.py --url "http://host-a:20111 http://host-b:20111"
+```
+
+Training accepts `--kernel-env-url "http://host-a:20111 http://host-b:20111"`. The Qwen3.8 WarmUp and MultiTurn launchers also accept multiple addresses in `KERNEL_ENV_URL`. The older plural options and environment variables remain supported; `KERNEL_ENV_URLS` takes precedence when set. Health checks require matching GPU hardware and, when every endpoint reports it, matching KernelGym versions.

@@ -231,7 +231,8 @@ def test_host_preflight_rejects_busy_gpu_before_waiting_for_kernelgym(tmp_path):
         ("unhealthy", 1, "not healthy"),
     ],
 )
-def test_multiple_health_urls_over_local_http(case, expected, message, capsys):
+@pytest.mark.parametrize("url_style", ["plural", "single_space", "single_comma", "plural_combined"])
+def test_multiple_health_urls_over_local_http(case, expected, message, capsys, url_style):
     from aiohttp import web
 
     # Same schema as a real local KernelGym /health response.
@@ -298,9 +299,16 @@ def test_multiple_health_urls_over_local_http(case, expected, message, capsys):
                 await site.start()
                 port = runner.addresses[0][1]
                 urls.append(f"http://127.0.0.1:{port}")
-            args = health.parse_args(["--urls", *urls, "--attempts", "1", "--timeout", "2", "--workers-status"])
+            if url_style == "plural":
+                url_args = ["--urls", *urls]
+            elif url_style == "plural_combined":
+                url_args = ["--urls", " ".join(urls)]
+            else:
+                separator = "," if url_style == "single_comma" else " "
+                url_args = ["--url", separator.join([*urls, urls[0] + "/"])]
+            args = health.parse_args([*url_args, "--attempts", "1", "--timeout", "2", "--workers-status"])
             assert await health.run(args) == expected
-            assert all((i, "/health") in requested for i in range(len(payloads)))
+            assert all(requested.count((i, "/health")) == 1 for i in range(len(payloads)))
             if expected == 0:
                 assert all((i, "/workers/status") in requested for i in range(len(payloads)))
         finally:
@@ -338,6 +346,14 @@ def test_single_url_keeps_legacy_health_contract(monkeypatch):
     monkeypatch.setattr(health, "KernelGymHealthClient", FakeClient)
     args = health.parse_args(["--url", "http://legacy", "--attempts", "1"])
     assert health.asyncio.run(health.run(args)) == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", " , ", "http://a bad", "http://a,ftp://b", "http://a:bad"])
+def test_health_rejects_invalid_combined_urls(value):
+    args = health.parse_args(["--url", value])
+    with pytest.raises(ValueError):
+        health.asyncio.run(health.run(args))
 
 
 if __name__ == "__main__":
