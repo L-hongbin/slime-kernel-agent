@@ -2341,7 +2341,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--coverage-rs-key",
                 type=str,
-                choices=["time_coverage", "num_coverage"],
+                choices=["time_coverage", "num_coverage", "reference_time_coverage"],
                 default="time_coverage",
                 help="Coverage metric used by kernel-agent coverage-based rejection sampling.",
             )

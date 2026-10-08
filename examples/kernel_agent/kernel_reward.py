@@ -5,6 +5,7 @@ from typing import Any
 import torch
 
 try:
+    from .kernel_coverage import _compute_coverage
     from .config import CUDA_AGENT_CONFIGS
     from .utils import (
         COMPILATION_ERROR,
@@ -17,6 +18,7 @@ try:
         VALIDATION_ERROR,
     )
 except ImportError:
+    from kernel_coverage import _compute_coverage
     from config import CUDA_AGENT_CONFIGS
     from utils import (
         COMPILATION_ERROR,
@@ -767,37 +769,6 @@ def _resolve_kernel_failed_score(env_state: dict[str, Any], config: dict[str, An
         stage = "other"
 
     return float(kernel_failed_score.get(stage, config["failed_score"])), stage
-
-
-def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[str, float]:
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
-    num_custom_kernel = result.get("num_custom_kernel", metadata.get("num_custom_kernel", 0)) or 0
-    num_total_kernels = result.get("num_total_kernels", metadata.get("num_total_kernels", 0)) or 0
-    custom_time = (
-        result.get(
-            "custom_kernel_cuda_time_in_profiling_us",
-            metadata.get("custom_kernel_cuda_time_in_profiling_us", 0),
-        )
-        or 0
-    )
-    total_time = (
-        result.get(
-            "total_kernel_run_time_in_profiling_us",
-            metadata.get("total_kernel_run_time_in_profiling_us", 0),
-        )
-        or 0
-    )
-
-    number_coverage = float(num_custom_kernel) / float(num_total_kernels) if num_total_kernels else 0.0
-    time_coverage = float(custom_time) / float(total_time) if total_time else 0.0
-    coverage = time_coverage if config["coverage_reward_type"] == "time_coverage" else number_coverage
-    return {
-        "coverage": coverage,
-        "num_custom_kernel": num_custom_kernel,
-        "num_total_kernels": num_total_kernels,
-        "custom_kernel_cuda_time_in_profiling_us": custom_time,
-        "total_kernel_run_time_in_profiling_us": total_time,
-    }
 
 
 def calculate_kernel_reward(

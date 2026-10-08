@@ -44,6 +44,20 @@ correctness_timeout = (
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 # Reward settings.
+coverage_reward_type = os.environ.get("CUDA_AGENT_COVERAGE_REWARD_TYPE", "time_coverage").strip().lower()
+coverage_reward_weight = float(os.environ.get("CUDA_AGENT_COVERAGE_REWARD_WEIGHT", 0.5))
+if coverage_reward_type not in {
+    "time_coverage",
+    "number_coverage",
+    "reference_time_coverage",
+    "efficiency_reference_time_coverage",
+    "capped_speed_auxiliary",
+    "gated_time_coverage",
+}:
+    raise ValueError(
+        "CUDA_AGENT_COVERAGE_REWARD_TYPE must be time_coverage, number_coverage, "
+        "reference_time_coverage, efficiency_reference_time_coverage, capped_speed_auxiliary, or gated_time_coverage"
+    )
 # Speedup reward mapping. ``legacy`` preserves the historical clipped raw
 # speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].
 # ``lcb_improvement`` applies a lower confidence bound to speedup first, using
@@ -186,8 +200,8 @@ CUDA_AGENT_CONFIGS = {
             "other": -1.0,
         },
         "coverage_reward_enable": True,
-        "coverage_reward_type": "time_coverage",
-        "coverage_reward_weight": 0.5,
+        "coverage_reward_type": coverage_reward_type,
+        "coverage_reward_weight": coverage_reward_weight,
         "performance_reward_requires_correctness": bool(
             int(os.environ.get("CUDA_AGENT_PERFORMANCE_REWARD_REQUIRES_CORRECTNESS", "1"))
         ),
