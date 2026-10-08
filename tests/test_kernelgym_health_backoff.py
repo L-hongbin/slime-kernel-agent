@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +15,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from scripts import check_kernelgym_health as health
-
 
 NUM_GPUS = 0
 RESOURCE_CHECK = REPO_ROOT / "scripts/check_host_resources.sh"
@@ -210,6 +210,134 @@ def test_host_preflight_rejects_busy_gpu_before_waiting_for_kernelgym(tmp_path):
     assert result.returncode != 0
     assert "GPU compute processes are already running" in result.stderr
     assert not marker.exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "case,expected,message",
+    [
+        ("matching", 0, "kernelgym_version matches"),
+        ("different_gpu", 1, "GPU mismatch"),
+        ("different_memory", 1, "GPU mismatch"),
+        ("missing_gpu", 1, "missing GPU information"),
+        ("unavailable", 1, "GPU unavailable"),
+        ("mixed_gpu", 1, "GPU mismatch"),
+        ("different_version", 1, "kernelgym_version mismatch"),
+        ("different_dirty", 1, "kernelgym_version mismatch"),
+        ("one_missing_version", 0, "SKIP:"),
+        ("all_missing_version", 0, "SKIP:"),
+        ("null_version", 0, "SKIP:"),
+        ("missing_with_other_mismatch", 0, "SKIP:"),
+        ("unhealthy", 1, "not healthy"),
+    ],
+)
+def test_multiple_health_urls_over_local_http(case, expected, message, capsys):
+    from aiohttp import web
+
+    # Same schema as a real local KernelGym /health response.
+    first = {
+        "status": "healthy",
+        "gpu_status": {
+            "cuda:0": {"name": "NVIDIA H100 PCIe", "memory_total": "79.6GB", "memory_used": "1.1GB", "available": True}
+        },
+        "kernelgym_version": {"git_commit": "abc", "git_branch": "main", "git_dirty": False},
+    }
+    second = deepcopy(first)
+    gpu = second["gpu_status"].pop("cuda:0")
+    gpu["memory_used"] = "23.0GB"
+    gpu["memory_total"] = "79.60 GB"
+    second["gpu_status"] = {"cuda:3": gpu, "cuda:7": deepcopy(gpu)}
+    payloads = [first, second]
+    if case == "different_gpu":
+        gpu["name"] = "NVIDIA A100"
+    elif case == "different_memory":
+        gpu["memory_total"] = "40GB"
+    elif case == "missing_gpu":
+        second.pop("gpu_status")
+    elif case == "unavailable":
+        gpu["available"] = False
+    elif case == "mixed_gpu":
+        second["gpu_status"]["cuda:7"]["name"] = "NVIDIA A100"
+    elif case == "different_version":
+        second["kernelgym_version"]["git_commit"] = "def"
+    elif case == "different_dirty":
+        second["kernelgym_version"]["git_dirty"] = True
+    elif case == "one_missing_version":
+        second.pop("kernelgym_version")
+    elif case == "all_missing_version":
+        for payload in payloads:
+            payload.pop("kernelgym_version")
+    elif case == "null_version":
+        second["kernelgym_version"] = {"git_commit": None, "git_branch": None, "git_dirty": None}
+    elif case == "missing_with_other_mismatch":
+        second["kernelgym_version"]["git_commit"] = "def"
+        third = deepcopy(first)
+        third.pop("kernelgym_version")
+        payloads.append(third)
+    elif case == "unhealthy":
+        second["status"] = "unhealthy"
+
+    async def scenario():
+        runners, urls, requested = [], [], []
+        try:
+            for index, payload in enumerate(payloads):
+
+                async def handler(request, payload=payload, index=index):
+                    requested.append((index, request.path))
+                    if request.path == "/health":
+                        return web.json_response(payload)
+                    return web.json_response({"workers": {}})
+
+                app = web.Application()
+                app.router.add_get("/health", handler)
+                app.router.add_get("/workers/status", handler)
+                runner = web.AppRunner(app)
+                await runner.setup()
+                runners.append(runner)
+                site = web.TCPSite(runner, "127.0.0.1", 0)
+                await site.start()
+                port = runner.addresses[0][1]
+                urls.append(f"http://127.0.0.1:{port}")
+            args = health.parse_args(["--urls", *urls, "--attempts", "1", "--timeout", "2", "--workers-status"])
+            assert await health.run(args) == expected
+            assert all((i, "/health") in requested for i in range(len(payloads)))
+            if expected == 0:
+                assert all((i, "/workers/status") in requested for i in range(len(payloads)))
+        finally:
+            for runner in runners:
+                await runner.cleanup()
+
+    health.asyncio.run(scenario())
+    captured = capsys.readouterr()
+    assert message in captured.out + captured.err
+
+
+@pytest.mark.unit
+def test_health_url_cli_and_environment_precedence(monkeypatch):
+    monkeypatch.setenv("KERNELGYM_URLS", "http://a,http://b")
+    assert health.parse_args([]).urls == ["http://a", "http://b"]
+    single = health.parse_args(["--url", "http://single"])
+    assert single.urls is None and single.url == "http://single"
+    assert health.parse_args(["--urls", "http://explicit"]).urls == ["http://explicit"]
+    with pytest.raises(SystemExit):
+        health.parse_args(["--url", "http://a", "--urls", "http://b"])
+
+
+@pytest.mark.unit
+def test_single_url_keeps_legacy_health_contract(monkeypatch):
+    class FakeClient:
+        def __init__(self, base_url, timeout_s):
+            self.base_url = base_url
+
+        async def check_health(self):
+            return {"status": "healthy"}
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(health, "KernelGymHealthClient", FakeClient)
+    args = health.parse_args(["--url", "http://legacy", "--attempts", "1"])
+    assert health.asyncio.run(health.run(args)) == 0
 
 
 if __name__ == "__main__":

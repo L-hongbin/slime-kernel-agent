@@ -60,6 +60,14 @@ MEGATRON_MODEL_PATH="/ms/FM/lihongbin/dataset/CUDA_RL/megatron_ckpt/Qwen3.8-27B-
 LOAD_PATH="$warmup_ckpt"
 KERNEL_BACKEND="tvm_ffi"
 KERNEL_ENV_URL="${KERNEL_ENV_URL:-"http://192.168.116.44:20111"}"
+# KERNEL_ENV_URLS accepts space- or comma-separated endpoints; the single URL remains supported.
+read -r -a KERNEL_ENV_ENDPOINTS <<< "${KERNEL_ENV_URLS:-${KERNEL_ENV_URL}}"
+KERNEL_ENV_ENDPOINTS_TEXT="${KERNEL_ENV_ENDPOINTS[*]//,/ }"
+read -r -a KERNEL_ENV_ENDPOINTS <<< "${KERNEL_ENV_ENDPOINTS_TEXT}"
+if (( ${#KERNEL_ENV_ENDPOINTS[@]} == 0 )); then
+   echo "KERNEL_ENV_URLS must contain at least one URL." >&2
+   exit 1
+fi
 LOSS_MODE="${LOSS_MODE:-dppoTV}"
 USE_ROLLOUT_LOGPROBS="${USE_ROLLOUT_LOGPROBS:-"true"}"
 
@@ -251,11 +259,11 @@ SAVE_PATH="/ms/FM/lihongbin/kernel_rl/checkpoints/${EXP_NAME}"
 
 
 if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
-   --url "${KERNEL_ENV_URL}" \
+   --urls "${KERNEL_ENV_ENDPOINTS[@]}" \
    --timeout "${KERNELGYM_HEALTH_TIMEOUT:-5}" \
    --attempts "${KERNELGYM_HEALTH_ATTEMPTS:-3}" \
    --interval "${KERNELGYM_HEALTH_INTERVAL:-2}"; then
-   echo "KernelGym health check failed at ${KERNEL_ENV_URL}" >&2
+   echo "KernelGym health or consistency check failed: ${KERNEL_ENV_ENDPOINTS[*]}" >&2
    exit 1
 fi
 
@@ -504,7 +512,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-urls "${KERNEL_ENV_ENDPOINTS[@]}"
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck

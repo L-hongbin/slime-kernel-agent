@@ -1,11 +1,15 @@
 import asyncio
+import hashlib
 import inspect
 import logging
+import random
 import threading
 import time
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 from weakref import WeakKeyDictionary
 
@@ -16,6 +20,7 @@ from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
 _TASK_COUNTER = 0
+_ENDPOINT_RANDOM = random.SystemRandom()
 _WORKERS: dict[tuple[str, int, int, int, int], Any] = {}
 
 
@@ -164,8 +169,11 @@ class _HybridHttpWorker:
             timeout=_CONTROL_TIMEOUT_S,
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=8),
         )
+        # Share submission slots for one endpoint across workers, while keeping
+        # independent KernelENV servers from competing for the same limit.
+        endpoint_key = hashlib.sha256(self.server_url.encode()).hexdigest()
         self._rate_limit_worker = _TokenBucketWorker.options(
-            name="kernel-eval-rate-limiter-v2", get_if_exists=True
+            name=f"kernel-eval-rate-limiter-v3-{endpoint_key}", get_if_exists=True
         ).remote(rate_limit)
         self._task_status: dict[str, dict[str, Any]] = {}
         # Ray concurrency groups run on distinct event loops/threads.
@@ -403,12 +411,61 @@ def _kernel_eval_param(args, config: dict[str, Any], name: str, default: Any = _
     raise KeyError(f"Missing kernel eval parameter: {name}")
 
 
-async def cancel_kernel_eval(args, task_id: str | None, config: dict[str, Any]) -> bool:
+def _kernel_env_urls(args, config: dict[str, Any]) -> list[str]:
+    urls = getattr(args, "kernel_env_urls", None)
+    url = getattr(args, "kernel_env_url", None)
+    if urls is not None and url is not None:
+        raise ValueError("Configure only one of --kernel-env-url and --kernel-env-urls")
+    if urls is None:
+        # Explicit CLI values override either spelling in the config.
+        if url is not None:
+            urls = [url]
+        else:
+            urls = config.get("kernel_env_urls")
+            if urls is None:
+                url = config.get("kernel_env_url")
+                urls = [url] if url else []
+    if isinstance(urls, str) or not urls:
+        raise ValueError("Configure --kernel-env-url or a non-empty --kernel-env-urls list")
+    normalized = []
+    for url in urls:
+        if not isinstance(url, str):
+            raise ValueError("Kernel environment URLs must be strings")
+        url = url.strip().rstrip("/")
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.query
+            or parsed.fragment
+            or any(char.isspace() for char in url)
+        ):
+            raise ValueError(f"Invalid Kernel environment URL: {url!r}")
+        # Accessing .port validates numeric values and the allowed port range.
+        _ = parsed.port
+        if url not in normalized:
+            normalized.append(url)
+    return normalized
+
+
+async def cancel_kernel_eval(
+    args, task_id: str | None, config: dict[str, Any], *, server_url: str | None = None
+) -> bool:
     if not task_id:
         return False
 
     config = dict(config)
-    server_url = _kernel_eval_param(args, config, "kernel_env_url", None)
+    if server_url is None:
+        server_url = next((url for url, active_task_id in _ACTIVE_EVALS if active_task_id == task_id), None)
+    if server_url is None:
+        try:
+            urls = _kernel_env_urls(args, config)
+        except ValueError:
+            return False
+        if len(urls) != 1:
+            logger.warning("Cannot cancel Kernel eval without endpoint affinity: task_id=%s", task_id)
+            return False
+        server_url = urls[0]
     if not server_url:
         return False
     server_url = str(server_url).rstrip("/")
@@ -585,8 +642,21 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
     trajectory_deadline = KERNEL_EVAL_DEADLINE.get()
     if trajectory_deadline is not None:
         deadline = min(deadline, trajectory_deadline)
-    server_url = str(_kernel_eval_param(args, config, "kernel_env_url")).rstrip("/")
+    urls = _kernel_env_urls(args, config)
+    # Selection and registration contain no await, so concurrent coroutines in
+    # this rollout process see earlier reservations, including queued work.
+    loads = {url: 0 for url in urls}
+    for url, _ in _ACTIVE_EVALS:
+        if url in loads:
+            loads[url] += 1
+    minimum = min(loads.values())
+    server_url = _ENDPOINT_RANDOM.choice([url for url in urls if loads[url] == minimum])
     task_id = payload["task_id"]
+    sample.metadata = dict(sample.metadata or {})
+    sample.metadata["kernel_eval_server_url"] = server_url
+    worker_args = copy(args)
+    worker_args.kernel_env_url = server_url
+    logger.info("Kernel eval event=assigned task_id=%s server_url=%s pending=%s", task_id, server_url, minimum)
     call = _EvalCall(task_id, deadline)
     _ACTIVE_EVALS[(server_url, task_id)] = call
     try:
@@ -594,7 +664,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
             raise TimeoutError
         if asyncio.current_task().cancelling():
             raise asyncio.CancelledError
-        call.worker = worker = _get_kernel_eval_worker(args, config)
+        call.worker = worker = _get_kernel_eval_worker(worker_args, config)
         # Worker lookup may itself take time. Never create expired queued work.
         if call.invalidated or asyncio.current_task().cancelling():
             raise asyncio.CancelledError

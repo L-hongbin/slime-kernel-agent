@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any
+from urllib.parse import urlsplit
 
 import aiohttp
-
 
 DEFAULT_KERNELGYM_URL = "http://127.0.0.1:20211"
 DEFAULT_TIMEOUT = 5.0
@@ -80,11 +82,13 @@ def _print_key_value_table(title: str, payload: Any) -> None:
 
 def _record_columns(records: list[dict[str, Any]]) -> list[str]:
     preferred = [
+        "name",
+        "memory_total",
         "available",
         "memory_used",
         "utilization_gpu_percent",
     ]
-    hidden = {"memory_total", "memory_used_percent", "name", "source"}
+    hidden = {"memory_used_percent", "source"}
     keys = {key for record in records for key, value in record.items() if _is_scalar(value) and key not in hidden}
     return [key for key in preferred if key in keys] + sorted(keys - set(preferred))
 
@@ -218,9 +222,15 @@ class KernelGymHealthClient:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Preflight KernelGym /health before launching DrKernel training.")
-    parser.add_argument(
+    endpoints = parser.add_mutually_exclusive_group()
+    endpoints.add_argument(
+        "--urls",
+        nargs="+",
+        help="KernelGym base URLs; require matching GPU hardware and, when all report it, matching versions.",
+    )
+    endpoints.add_argument(
         "--url",
-        default=os.environ.get("KERNELGYM_URL", DEFAULT_KERNELGYM_URL),
+        default=None,
         help=f"KernelGym base URL. Defaults to KERNELGYM_URL or {DEFAULT_KERNELGYM_URL}.",
     )
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout in seconds.")
@@ -248,7 +258,61 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="After /health passes, also print GET /workers/status if the endpoint exists.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.urls is None and args.url is None:
+        env_urls = os.environ.get("KERNELGYM_URLS")
+        if env_urls is not None:
+            args.urls = env_urls.replace(",", " ").split()
+        else:
+            args.url = os.environ.get("KERNELGYM_URL", DEFAULT_KERNELGYM_URL)
+    return args
+
+
+def validate_consistency(results: list[tuple[str, dict[str, Any]]]) -> None:
+    """Require homogeneous GPU hardware; ignore device indices and live load."""
+    expected = None
+    for url, payload in results:
+        gpu_status = payload.get("gpu_status")
+        if not isinstance(gpu_status, dict) or not gpu_status:
+            raise KernelGymRequestError(f"{url}: missing GPU information in /health gpu_status")
+        for device, info in gpu_status.items():
+            if not isinstance(info, dict) or info.get("error") or info.get("available") is not True:
+                raise KernelGymRequestError(f"{url} {device}: GPU unavailable or invalid information: {info}")
+            name = info.get("name")
+            memory = str(info.get("memory_total", "")).strip().upper().replace(" ", "")
+            match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([A-Z]*)", memory)
+            if not isinstance(name, str) or not name.strip() or name.strip().lower() == "unknown" or not match:
+                raise KernelGymRequestError(f"{url} {device}: missing GPU name or valid memory_total: {info}")
+            capacity = Decimal(match[1])
+            if capacity <= 0:
+                raise KernelGymRequestError(f"{url} {device}: memory_total must be positive")
+            signature = (" ".join(name.split()), capacity, match[2])
+            if expected is None:
+                expected = (url, device, signature)
+            elif signature != expected[2]:
+                raise KernelGymRequestError(
+                    f"GPU mismatch: {expected[0]} {expected[1]}={expected[2]} vs {url} {device}={signature}"
+                )
+    print("OK: GPU models and total memory match across all KernelGym URLs")
+
+    versions = [(url, payload.get("kernelgym_version")) for url, payload in results]
+    missing = [
+        url
+        for url, version in versions
+        if version is None
+        or version == ""
+        or (isinstance(version, dict) and not any(v is not None for v in version.values()))
+    ]
+    if missing:
+        print(f"SKIP: kernelgym_version comparison; version information missing from: {', '.join(missing)}")
+        return
+    reference_url, reference_version = versions[0]
+    for url, version in versions[1:]:
+        if version != reference_version:
+            raise KernelGymRequestError(
+                f"kernelgym_version mismatch: {reference_url}={reference_version!r} vs {url}={version!r}"
+            )
+    print(f"OK: kernelgym_version matches across all KernelGym URLs: {reference_version}")
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -263,7 +327,40 @@ async def run(args: argparse.Namespace) -> int:
     if args.max_interval < 0:
         raise ValueError("--max-interval must be >= 0")
 
-    client = KernelGymHealthClient(args.url, timeout_s=args.timeout)
+    urls = getattr(args, "urls", None)
+    if urls is None:
+        urls = [args.url]
+    if not urls or isinstance(urls, str):
+        raise ValueError("At least one KernelGym URL is required")
+    normalized = []
+    for url in urls:
+        url = url.strip().rstrip("/")
+        parsed = urlsplit(url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.query
+            or parsed.fragment
+            or any(c.isspace() for c in url)
+        ):
+            raise ValueError(f"Invalid KernelGym URL: {url!r}")
+        _ = parsed.port
+        if url not in normalized:
+            normalized.append(url)
+    results = await asyncio.gather(*(_check_url(args, url) for url in normalized))
+    if any(result is None for result in results):
+        return 1
+    if len(normalized) > 1:
+        try:
+            validate_consistency(list(zip(normalized, results, strict=True)))
+        except KernelGymRequestError as exc:
+            print(f"FAIL: KernelGym consistency check: {exc}", file=sys.stderr)
+            return 1
+    return 0
+
+
+async def _check_url(args: argparse.Namespace, url: str) -> dict[str, Any] | None:
+    client = KernelGymHealthClient(url, timeout_s=args.timeout)
     try:
         last_error: Exception | None = None
         attempt = 0
@@ -274,26 +371,28 @@ async def run(args: argparse.Namespace) -> int:
             try:
                 payload = await client.check_health()
                 print(f"OK: KernelGym healthy at {client.base_url}")
-                print_table("health", payload)
+                print_table(f"health {url}", payload)
 
                 if args.workers_status:
                     workers = await client.request_json("GET", "/workers/status")
-                    print_table("workers/status", workers)
-                return 0
+                    print_table(f"workers/status {url}", workers)
+                return payload
             except Exception as exc:
                 last_error = exc
-                print(f"FAIL attempt {attempt}/{attempt_limit}: {exc}", file=sys.stderr)
+                print(f"FAIL {url} attempt {attempt}/{attempt_limit}: {exc}", file=sys.stderr)
                 if args.attempts == 0 or attempt < args.attempts:
                     delay = retry_interval
                     print(
-                        f"RETRY KernelGym health in {delay:g}s " f"(next attempt {attempt + 1}/{attempt_limit})",
+                        f"RETRY KernelGym health {url} in {delay:g}s " f"(next attempt {attempt + 1}/{attempt_limit})",
                         file=sys.stderr,
                     )
                     await asyncio.sleep(delay)
                     retry_interval = min(retry_interval * args.backoff_factor, args.max_interval)
 
-        print(f"KernelGym health check failed after {args.attempts} attempt(s): {last_error}", file=sys.stderr)
-        return 1
+        print(
+            f"KernelGym health check failed for {url} after {args.attempts} attempt(s): {last_error}", file=sys.stderr
+        )
+        return None
     finally:
         await client.close()
 

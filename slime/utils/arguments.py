@@ -2283,7 +2283,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return parser
 
         def add_kernel_agent_arguments(parser):
-            parser.add_argument(
+            kernel_env = parser.add_mutually_exclusive_group()
+            kernel_env.add_argument(
+                "--kernel-env-urls",
+                nargs="+",
+                default=None,
+                help="Kernel environment URLs; select the least-loaded endpoint per rollout process for each task.",
+            )
+            kernel_env.add_argument(
                 "--kernel-env-url",
                 dest="kernel_env_url",
                 type=str,

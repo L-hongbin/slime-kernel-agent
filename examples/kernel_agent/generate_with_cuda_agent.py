@@ -624,6 +624,7 @@ async def cuda_kernel_env(
         task_id = next_kernel_task_id()
         metadata = dict(sample.metadata or {})
         metadata["task_id"] = task_id
+        metadata.pop("kernel_eval_server_url", None)
         sample.metadata = metadata
 
         env_config = CUDA_AGENT_CONFIGS["env"]
@@ -969,7 +970,12 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         cancel_acknowledged = False
         if task_id:
             try:
-                cancel_acknowledged = await cancel_kernel_eval(args, str(task_id), CUDA_AGENT_CONFIGS["env"])
+                cancel_acknowledged = await cancel_kernel_eval(
+                    args,
+                    str(task_id),
+                    CUDA_AGENT_CONFIGS["env"],
+                    server_url=metadata.get("kernel_eval_server_url"),
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Failed to cancel KernelGYM task after generate timeout: task_id=%s error=%s", task_id, exc

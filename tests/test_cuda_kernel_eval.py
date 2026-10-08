@@ -2328,5 +2328,195 @@ def test_detail_config_defaults_off_and_accepts_opt_in(monkeypatch, value, expec
     assert config["CUDA_AGENT_CONFIGS"]["env"][f"return_detail_{diagnostic}"] is expected
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "urls",
+    [
+        [],
+        "http://a",
+        [""],
+        ["ftp://a"],
+        [None],
+        ["http://a?x=1"],
+        ["http://a b"],
+        ["http://a:bad"],
+        ["http://a:99999"],
+    ],
+)
+def test_kernel_env_urls_reject_invalid_values(urls):
+    with pytest.raises(ValueError):
+        kernel_response._kernel_env_urls(SimpleNamespace(kernel_env_urls=urls), {})
+
+
+@pytest.mark.unit
+def test_kernel_env_urls_cli_and_legacy_fallback():
+    import argparse
+
+    from slime.utils.arguments import get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1", "--kernel-env-urls", "http://a/", "http://b", "http://a"])
+    assert kernel_response._kernel_env_urls(args, {}) == ["http://a", "http://b"]
+    assert kernel_response._kernel_env_urls(SimpleNamespace(kernel_env_url="http://a/"), {}) == ["http://a"]
+    assert kernel_response._kernel_env_urls(SimpleNamespace(), {"kernel_env_urls": ["http://b/"]}) == ["http://b"]
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            ["--rollout-batch-size", "1", "--kernel-env-url", "http://a", "--kernel-env-urls", "http://b"]
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["complete", "error", "cancel"])
+def test_kernel_env_pool_balances_and_keeps_task_affinity(monkeypatch, outcome):
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response._ENDPOINT_RANDOM, "choice", lambda urls: urls[0])
+    selected, pending, cleaned = {}, {}, []
+    config = {
+        "kernel_eval_client_timeout": 5,
+        "kernel_eval_max_retries": 1,
+        "kernel_eval_poll_interval": 0.01,
+        "kernel_eval_heartbeat_interval": 0,
+        "kernel_eval_rate_limit": 1,
+    }
+    args = SimpleNamespace(kernel_env_urls=["http://a/", "http://b"], kernel_env_url=None)
+
+    def worker_for(worker_args, config):
+        def submit(payload, **kwargs):
+            task_id = payload["task_id"]
+            selected[task_id] = worker_args.kernel_env_url
+            pending[task_id] = asyncio.get_running_loop().create_future()
+            return pending[task_id]
+
+        return SimpleNamespace(submit_and_poll=SimpleNamespace(remote=submit))
+
+    async def cleanup(worker, ref, url, task_id, deadline, timeout):
+        cleaned.append((url, task_id))
+        return True
+
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", worker_for)
+    monkeypatch.setattr(kernel_response, "_cancel_eval_call", cleanup)
+
+    async def scenario():
+        samples = [Sample() for _ in range(3)]
+        tasks = [
+            asyncio.create_task(kernel_response.run_kernel_eval(args, samples[i], {"task_id": str(i)}, config))
+            for i in range(2)
+        ]
+        await asyncio.sleep(0)
+        assert selected == {"0": "http://a", "1": "http://b"}
+        pending["1"].set_result({"status": "completed"})
+        await tasks[1]
+        tasks.append(asyncio.create_task(kernel_response.run_kernel_eval(args, samples[2], {"task_id": "2"}, config)))
+        await asyncio.sleep(0)
+        assert selected["2"] == "http://b"
+        assert samples[2].metadata["kernel_eval_server_url"] == "http://b"
+        assert args.kernel_env_url is None
+        if outcome == "error":
+            pending["2"].set_exception(RuntimeError("backend failed"))
+            with pytest.raises(RuntimeError, match="backend failed"):
+                await tasks[2]
+        elif outcome == "cancel":
+            assert await kernel_response.cancel_kernel_eval(args, "2", config)
+            tasks[2].cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await tasks[2]
+        else:
+            pending["2"].set_result({"status": "completed"})
+            await tasks[2]
+        if outcome != "complete":
+            assert cleaned and all(item == ("http://b", "2") for item in cleaned)
+        pending["0"].set_result({"status": "completed"})
+        await tasks[0]
+        assert not kernel_response._ACTIVE_EVALS
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_env_cancel_after_completion_uses_saved_endpoint(monkeypatch):
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    deleted = []
+
+    async def delete(url, task_id, timeout):
+        deleted.append((url, task_id))
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+    args = SimpleNamespace(kernel_env_urls=["http://a", "http://b"], kernel_env_url=None)
+    assert asyncio.run(kernel_response.cancel_kernel_eval(args, "finished", {}, server_url="http://b"))
+    assert deleted == [("http://b", "finished")]
+    assert not asyncio.run(kernel_response.cancel_kernel_eval(args, "unknown", {}))
+    assert deleted == [("http://b", "finished")]
+
+
+@pytest.mark.unit
+def test_kernel_env_explicit_single_url_overrides_config_pool():
+    args = SimpleNamespace(kernel_env_url="http://explicit")
+    assert kernel_response._kernel_env_urls(args, {"kernel_env_urls": ["http://configured"]}) == ["http://explicit"]
+    with pytest.raises(ValueError, match="only one"):
+        kernel_response._kernel_env_urls(SimpleNamespace(kernel_env_url="http://a", kernel_env_urls=["http://b"]), {})
+
+
+@pytest.mark.unit
+def test_kernel_env_routing_preserves_reward_random_state(monkeypatch):
+    # Execute the actual routing path, including with a single URL. A global
+    # random draw here would perturb coverage rejection sampling downstream.
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lambda *args: None)
+
+    async def cleanup(*args):
+        return True
+
+    monkeypatch.setattr(kernel_response, "_cancel_eval_call", cleanup)
+
+    async def scenario():
+        for urls in [["http://a"], ["http://a", "http://b"]]:
+            before = kernel_response.random.getstate()
+            with pytest.raises(AttributeError):
+                await kernel_response.run_kernel_eval(
+                    SimpleNamespace(kernel_env_urls=urls),
+                    Sample(),
+                    {"task_id": "rng"},
+                    {"kernel_eval_client_timeout": 5},
+                )
+            assert kernel_response.random.getstate() == before
+            assert not kernel_response._ACTIVE_EVALS
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_env_workers_share_limiter_only_for_same_endpoint(monkeypatch):
+    limiters = {}
+    limiter_cls = kernel_response._TokenBucketWorker.__ray_metadata__.modified_class
+    worker_cls = kernel_response._HybridHttpWorker.__ray_metadata__.modified_class
+
+    def options(*, name, get_if_exists):
+        assert get_if_exists
+
+        def remote(rate_limit):
+            return limiters.setdefault(name, limiter_cls(rate_limit))
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(kernel_response._TokenBucketWorker, "options", options)
+
+    async def scenario():
+        workers = [worker_cls(url, 1, 10, 1) for url in ["http://a", "http://a/", "http://b"]]
+        try:
+            a, same_a, b = [worker._rate_limit_worker for worker in workers]
+            assert a is same_a and a is not b
+            deadline = time.time() + 10
+            assert a.acquire("a1", deadline)
+            assert not same_a.acquire("a2", deadline)
+            assert b.acquire("b1", deadline)
+        finally:
+            for worker in workers:
+                await worker._client.aclose()
+                await worker._control_client.aclose()
+
+    asyncio.run(scenario())
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

@@ -722,3 +722,34 @@ if __name__ == "__main__":
 - `--custom-megatron-init-path`：会增加一些 init 的调用；
 - `--custom-megatron-before-log-prob-hook-path`：会在计算 log prob 之前调用；
 - `--custom-megatron-before-train-step-hook-path`：会在每个训练步之前调用。可以考虑用这种方式混入特殊的训练 loss 之类的。
+
+
+### 多个 KernelENV 服务
+
+单个服务继续使用 `--kernel-env-url URL`。多个服务使用互斥参数：
+
+```bash
+--kernel-env-urls http://host-a:20111 http://host-b:20111
+```
+
+Qwen3.8 WarmUp 和 MultiTurn 脚本支持 `KERNEL_ENV_URLS`，使用空格或逗号分隔；设置后优先于原来的 `KERNEL_ENV_URL`。例如：
+
+```bash
+KERNEL_ENV_URLS="http://host-a:20111,http://host-b:20111" \
+bash examples/kernel_agent/run_qwen3.8_27B_WarmUp.sh
+```
+
+启动脚本会一次传入全部 URL，并发检查各服务的 `/health`；全部健康后，多 URL 场景校验所有 GPU 的型号和总显存一致。设备编号、GPU 数量和实时负载可以不同；GPU 信息缺失或不可用则失败。只有所有服务都提供有效 `kernelgym_version` 时，才比较完整版本信息；任意服务未返回版本信息时，输出 `SKIP` 并跳过版本比较。单 URL 保持原来的健康检查行为。每个评测任务选择当前 rollout 进程内未完成任务数最少的服务，平局随机选择；提交、重试、轮询与取消固定使用选中的 URL。任务完成、异常或取消后释放该服务的本地计数。样本 metadata 的 `kernel_eval_server_url` 和 `event=assigned` 日志记录所选服务。
+
+负载统计不是跨进程的全局队列长度。`kernel_eval_rate_limit` 限制同一 Ray namespace 下同一 URL 的并发提交请求，同 URL 的 worker 共享限流器；不同 URL 独立限流。该限额不等同于服务端 GPU 执行并发数，worker 的任务并发上限也独立生效。路由随机选择使用独立随机源，不消耗 coverage 筛选使用的全局随机数状态。运行中沿用原有单服务重试和超时处理，不将已提交的任务自动转发到其他服务。建议服务使用相同 GPU 型号、KernelGym 版本和评测配置，以保持速度奖励可比。
+
+
+也可以直接运行健康检查：
+
+```bash
+python scripts/check_kernelgym_health.py \
+  --urls http://host-a:20111 http://host-b:20111 \
+  --attempts 3 --timeout 5
+```
+
+原来的 `--url URL` 用法保持兼容；也可通过 `KERNELGYM_URLS` 配置逗号或空格分隔的 URL。显式命令行参数优先于环境变量。GPU 或版本不一致时退出码为 1，训练脚本随即退出。
