@@ -341,13 +341,24 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 
 `--difficulty-thresholds` 是通用的难度分界列表，默认 `[1/3, 2/3]`，将正确率范围三等分，不是让三个桶的样本数相等。数值口径为正确率（不是 `1 - 正确率` 的难度值）。上面的示例省略该参数以使用默认值；仍可显式传入小数覆盖，例如 `--difficulty-thresholds 0.25 0.75`。列表非空、严格递增，每个值有限且在 `(0, 1)` 内；其校验不依赖动态调权是否开启。两种分段模式都要求恰好两个分界点，依次为困难区间上界、简单区间下界；其他功能可复用更长的列表。
 
-记 `G` 为同题、同 turn 的有效样本数，`c` 为其中正确样本数，`s=c/G`。移除、pad 和 aborted 样本不计入 `G`，因此 `G` 不一定等于配置的 `--n-samples-per-prompt`。记录的 `group_difficulty` 为 `1-s`，但 gate 阈值使用正确率 `s`。记 `h, e = difficulty_thresholds`，`lo, hi = dynamic_reward_gate_range`（默认 `[0.8, 1.2]`）。
+记 `G` 为同题、同 turn 的有效样本数，`c` 为其中正确样本数，`s=c/G`。移除、pad 和 aborted 样本不计入 `G`，因此 `G` 不一定等于配置的 `--n-samples-per-prompt`。记录的 `group_difficulty` 为 `1-s`，但 gate 阈值使用正确率 `s`。记 `h, e = difficulty_thresholds`，`lo, hi = dynamic_reward_gate_range`。启用任一 gate 模式都必须显式指定 `--dynamic-reward-gate-range MIN MAX`，未指定则报错。
 
-旧 `sqrt` 模式忽略阈值和 gate 范围：
+`sqrt` 模式忽略难度阈值，将原来的平方根输出映射到配置范围：
 
 ```python
-gate = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+strength = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+gate = lo + (hi - lo) * strength
 ```
+
+显式配置 `[0, 1]` 可保留原来的行为。正确样本不超过一个的组，以及空组、单样本组，均取下界 `lo`。例如，启用无中间平台的平方根 gate，并同时反向调整正确性：
+
+```bash
+--dynamic-reward-gate sqrt \
+--dynamic-reward-gate-range 0.8 1.2 \
+--dynamic-reward-correctness inverse-gate
+```
+
+这只改变取值范围，不改变原平方根函数，并非对正确率做线性插值。上下限须有限且满足 `0 <= lo <= hi`。
 
 两种分段模式共用下面的计算式：`piecewise` 使用 `f(d)=d`，`piecewise-sqrt` 使用 `f(d)=sqrt(d)`。
 
@@ -362,7 +373,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。gate 上下限必须有限且 `0 <= lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤和训练读取同一份已结算 reward，不再各自重算 gate。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
+`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。分段模式的上下限还须满足 `lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤和训练读取同一份已结算 reward，不再各自重算 gate。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
 
 对走常规分量评分路径的样本，奖励按以下方式组合：
 
@@ -383,7 +394,7 @@ sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正�
 --dynamic-reward-correctness inverse-gate
 ```
 
-`--dynamic-reward-correctness` 默认为 `None`（也支持显式传入）。选择 `inverse-gate` 后，非显式失败分支的 reward 为 `C / gate + gate * (P + Coverage) + length_score`，C/P/Coverage 均为未调权的贡献。gate=0.8 时 correctness 乘以 1.25；gate=1.2 时乘以约 0.8333。要求搭配 `piecewise` 或 `piecewise-sqrt`，gate 下界严格大于 0 且倒数有限；旧 `sqrt` 可能产生 0，因此不允许组合使用。显式失败评分、长度分数、`raw_task_reward` 及已固定的 `return_reward` 不变。每次都从基础分数及配置权重重建 correctness，重复后处理不会叠乘。
+`--dynamic-reward-correctness` 默认为 `None`（也支持显式传入）。选择 `inverse-gate` 后，非显式失败分支的 reward 为 `C / gate + gate * (P + Coverage) + length_score`，C/P/Coverage 均为未调权的贡献。gate=0.8 时 correctness 乘以 1.25；gate=1.2 时乘以约 0.8333。要求启用 gate，且下界严格大于 0、倒数有限。`sqrt` 显式配置正下界后也支持此组合；使用 `[0, 1]` 范围时仍拒绝 `inverse-gate`。显式失败评分、长度分数、`raw_task_reward` 及已固定的 `return_reward` 不变。每次都从基础分数及配置权重重建 correctness，重复后处理不会叠乘。
 
 另一个候选值是 `--dynamic-reward-correctness inverse-correct-rate`：采用 `C / p`，其中 `p` 为同一个 prompt/turn group 内有效样本的正确率。它可独立于 `--dynamic-reward-gate` 启用：关闭 gate 时 performance/coverage 保持基础权重；同时启用 gate 时，非显式失败分支的 reward 为 `C / p + gate * (P + Coverage) + length_score`。已移除、aborted 和 padding 样本不进入正确率统计。`p=0` 时 correctness 缩放系数设为零，不做除法；显式失败分数及其他奖励组成仍按原有规则处理。两种 correctness 模式都不改原始历史奖励和未来折算项，重复处理不叠乘。
 
@@ -393,7 +404,7 @@ sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正�
 
 ##### G=16 的 gate 实例分布
 
-假设 16 条样本均有效，阈值为 `[1/3, 2/3]`、gate 范围为 `[0.8, 1.2]`，数值保留四位小数：
+假设 16 条样本均有效，阈值为 `[1/3, 2/3]`。`sqrt` 列显式使用范围 `[0, 1]`，两种分段模式使用 `[0.8, 1.2]`。数值保留四位小数：
 
 | 正确样本数 | 正确率 | `sqrt` | `piecewise` | `piecewise-sqrt` |
 |---|---:|---:|---:|---:|

@@ -5,8 +5,8 @@ from typing import Any
 import torch
 
 try:
-    from .kernel_coverage import _compute_coverage
     from .config import CUDA_AGENT_CONFIGS
+    from .kernel_coverage import _compute_coverage
     from .utils import (
         COMPILATION_ERROR,
         CORRECTNESS_ERROR,
@@ -18,8 +18,9 @@ try:
         VALIDATION_ERROR,
     )
 except ImportError:
-    from kernel_coverage import _compute_coverage
     from config import CUDA_AGENT_CONFIGS
+    from kernel_coverage import _compute_coverage
+
     from utils import (
         COMPILATION_ERROR,
         CORRECTNESS_ERROR,
@@ -128,11 +129,14 @@ def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=N
     mode = getattr(args, "dynamic_reward_gate", None)
     if mode is None:
         return 1.0
+    gate_range = getattr(args, "dynamic_reward_gate_range", None)
+    if gate_range is None:
+        raise ValueError("--dynamic-reward-gate-range is required when dynamic reward gate is enabled")
+    gate_min, gate_max = gate_range
     if mode == "sqrt":
-        if group_size <= 1 or num_correct <= 1:
-            return 0.0
-        return math.sqrt(max((num_correct - 1) / (group_size - 1), 0.0))
-    if mode in {"piecewise", "piecewise-sqrt"}:
+        strength = 0.0 if group_size <= 1 or num_correct <= 1 else math.sqrt((num_correct - 1) / (group_size - 1))
+        return gate_min + (gate_max - gate_min) * strength
+    elif mode in {"piecewise", "piecewise-sqrt"}:
         # Adapt Coda's thresholded gates (arXiv:2603.08659, Eq. 4), not its
         # length reward: downweight auxiliary objectives on hard groups and
         # upweight them on easy groups, with a neutral middle region.
@@ -140,7 +144,6 @@ def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=N
             return 1.0  # Insufficient group evidence: preserve the base weights.
         success_rate = num_correct / group_size
         hard_threshold, easy_threshold = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
-        gate_min, gate_max = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
         # Curve the distance from the neutral region, not the final gate:
         # piecewise-sqrt strengthens both tails while preserving their bounds.
         if success_rate < hard_threshold:
@@ -229,8 +232,8 @@ def _apply_dynamic_group_reward_weights(
         raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
     correctness_scale = 1.0
     if correctness_mode == "inverse-gate":
-        if getattr(args, "dynamic_reward_gate", None) not in {"piecewise", "piecewise-sqrt"}:
-            raise ValueError("--dynamic-reward-correctness inverse-gate requires a piecewise or piecewise-sqrt gate")
+        if getattr(args, "dynamic_reward_gate", None) not in {"sqrt", "piecewise", "piecewise-sqrt"}:
+            raise ValueError("--dynamic-reward-correctness inverse-gate requires an enabled auxiliary gate")
         if not math.isfinite(gate) or gate <= 0.0 or not math.isfinite(1.0 / gate):
             raise ValueError("--dynamic-reward-correctness inverse-gate requires a positive gate with finite inverse")
         correctness_scale = 1.0 / gate

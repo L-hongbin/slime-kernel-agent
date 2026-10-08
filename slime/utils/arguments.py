@@ -52,23 +52,28 @@ def _validate_rollout_reward_post_process_args(args) -> None:
     gate = getattr(args, "dynamic_reward_gate", None)
     if gate not in {None, "sqrt", "piecewise", "piecewise-sqrt"}:
         raise ValueError("--dynamic-reward-gate must be sqrt, piecewise, or piecewise-sqrt")
+    if gate is not None:
+        gate_range = getattr(args, "dynamic_reward_gate_range", None)
+        if gate_range is None:
+            raise ValueError("--dynamic-reward-gate-range is required when dynamic reward gate is enabled")
+        if len(gate_range) != 2:
+            raise ValueError("--dynamic-reward-gate-range requires exactly two values: min max")
+        gate_min, gate_max = gate_range
+        if not all(math.isfinite(value) for value in (gate_min, gate_max)):
+            raise ValueError("--dynamic-reward-gate-range values must be finite")
+        if not 0.0 <= gate_min <= gate_max:
+            raise ValueError("--dynamic-reward-gate-range requires 0 <= min <= max")
     if gate in {"piecewise", "piecewise-sqrt"}:
         if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
             raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
-        gate_range = getattr(args, "dynamic_reward_gate_range", [0.8, 1.2])
-        if len(gate_range) != 2:
-            raise ValueError("Piecewise --dynamic-reward-gate-range requires exactly two values: min max")
-        gate_min, gate_max = gate_range
-        if not all(math.isfinite(value) for value in (gate_min, gate_max)):
-            raise ValueError("Piecewise dynamic reward gate parameters must be finite")
-        if not 0.0 <= gate_min <= 1.0 <= gate_max:
+        if not gate_min <= 1.0 <= gate_max:
             raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
     correctness = getattr(args, "dynamic_reward_correctness", None)
     if correctness not in {None, "inverse-gate", "inverse-correct-rate"}:
         raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
     if correctness == "inverse-gate":
-        if gate not in {"piecewise", "piecewise-sqrt"}:
-            raise ValueError("--dynamic-reward-correctness inverse-gate requires a piecewise or piecewise-sqrt gate")
+        if gate is None:
+            raise ValueError("--dynamic-reward-correctness inverse-gate requires an enabled auxiliary gate")
         if gate_min <= 0.0 or not math.isfinite(1.0 / gate_min):
             raise ValueError(
                 "--dynamic-reward-correctness inverse-gate requires a positive gate min with finite inverse"
@@ -2395,7 +2400,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Enable dynamic performance/coverage weighting with this gate; omitted (None) disables it. "
-                    "sqrt preserves the legacy gate. piecewise uses correctness-rate thresholds to reduce "
+                    "sqrt maps the legacy square-root gate to the required --dynamic-reward-gate-range. "
+                    "piecewise uses correctness-rate thresholds to reduce "
                     "hard-group weights, keep middle groups unchanged, and boost easy-group weights linearly. "
                     "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
                     "to strengthen both tails without changing their bounds. "
@@ -2409,7 +2415,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=(
                     "Optional correctness weighting: inverse-gate divides the base correctness contribution by "
-                    "the performance/coverage gate (requires piecewise or piecewise-sqrt with a positive minimum). "
+                    "the performance/coverage gate (requires an enabled gate with a positive minimum). "
                     "inverse-correct-rate divides by the valid prompt/turn group's correctness rate, independently "
                     "of the auxiliary gate; all-wrong groups use a zero correctness scale. "
                     "Omitted or None keeps correctness unchanged; failure scores are never scaled."
@@ -2432,10 +2438,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 nargs=2,
                 metavar=("MIN", "MAX"),
-                default=[0.8, 1.2],
+                default=None,
                 help=(
-                    "Piecewise gate bounds at correctness rates 0 and 1, respectively. "
-                    "Both must be finite with 0 <= MIN <= 1 <= MAX. Ignored by sqrt mode."
+                    "Required when a dynamic gate is enabled. Bounds must be finite with 0 <= MIN <= MAX; "
+                    "piecewise modes additionally require MIN <= 1 <= MAX. "
+                    "sqrt maps its original [0, 1] output into this range, using MIN when the group has "
+                    "fewer than two samples or at most one correct sample."
                 ),
             )
             parser.add_argument(

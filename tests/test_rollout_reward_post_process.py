@@ -35,6 +35,7 @@ def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_no
     manager.custom_reward_post_process_func = None
     manager.rollout_id = 0
     manager.args = SimpleNamespace(
+        dynamic_reward_gate_range=[0.0, 1.0],
         advantage_estimator=advantage_estimator,
         grpo_std_normalization=grpo_std_normalization,
         max_turns=2,
@@ -778,8 +779,56 @@ def _set_reward_component(
     ],
 )
 def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: float):
-    args = SimpleNamespace(dynamic_reward_gate="sqrt")
+    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=[0.0, 1.0])
     assert _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("bounds", [[0.0, 1.0], [0.8, 1.2], [1.1, 2.0], [0.2, 0.9], [0.7, 0.7]])
+def test_sqrt_configurable_range_endpoints_and_small_groups(bounds):
+    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=bounds)
+    low, high = bounds
+    gates = [_compute_dynamic_auxiliary_gate(k, 8, args=args) for k in range(9)]
+    assert gates == sorted(gates)
+    assert gates[:2] == pytest.approx([low, low])
+    assert gates[-1] == pytest.approx(high)
+    for correct, size in [(0, 0), (0, 1), (1, 1)]:
+        assert _compute_dynamic_auxiliary_gate(correct, size, args=args) == pytest.approx(low)
+
+
+def test_sqrt_custom_range_inverse_gate_cli():
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--dynamic-reward-gate",
+            "sqrt",
+            "--dynamic-reward-gate-range",
+            "0.8",
+            "1.2",
+            "--dynamic-reward-correctness",
+            "inverse-gate",
+        ]
+    )
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_gate_range == [0.8, 1.2]
+    assert _compute_dynamic_auxiliary_gate(0, 8, args=args) == pytest.approx(0.8)
+    assert _compute_dynamic_auxiliary_gate(8, 8, args=args) == pytest.approx(1.2)
+
+
+@pytest.mark.parametrize(
+    "bounds", [[], [0.8], [0.8, 1.0, 1.2], [-0.1, 1.2], [1.2, 0.8], [float("nan"), 1.2], [0.8, float("inf")]]
+)
+def test_sqrt_rejects_invalid_range(bounds):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=bounds)
+    with pytest.raises(ValueError, match="--dynamic-reward-gate-range"):
+        _validate_rollout_reward_post_process_args(args)
 
 
 @pytest.mark.parametrize(
@@ -803,11 +852,14 @@ def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: flo
     ],
 )
 def test_piecewise_dynamic_gate_default_regions(num_correct, group_size, expected):
-    args = SimpleNamespace(dynamic_reward_gate="piecewise")
+    args = SimpleNamespace(
+        dynamic_reward_gate="piecewise",
+        dynamic_reward_gate_range=[0.8, 1.2],
+    )
     assert _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args) == pytest.approx(expected)
 
 
-def test_piecewise_dynamic_gate_equal_thirds_cli_defaults_match_fallback_for_group_16():
+def test_piecewise_dynamic_gate_equal_thirds_cli_matches_explicit_range_for_group_16():
     import argparse
 
     from slime.utils.arguments import (
@@ -817,12 +869,28 @@ def test_piecewise_dynamic_gate_equal_thirds_cli_defaults_match_fallback_for_gro
     )
 
     parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
-    args = parser.parse_args(["--rollout-batch-size", "1", "--dynamic-reward-gate", "piecewise"])
+    args = parser.parse_args(
+        [
+            "--rollout-batch-size",
+            "1",
+            "--dynamic-reward-gate",
+            "piecewise",
+            "--dynamic-reward-gate-range",
+            "0.8",
+            "1.2",
+        ]
+    )
     assert args.difficulty_thresholds == [1 / 3, 2 / 3]
     _validate_difficulty_thresholds_args(args)
     _validate_rollout_reward_post_process_args(args)
     expected = [0.8, 0.8375, 0.875, 0.9125, 0.95, 0.9875, *([1.0] * 5), 1.0125, 1.05, 1.0875, 1.125, 1.1625, 1.2]
-    for config in (args, SimpleNamespace(dynamic_reward_gate="piecewise")):
+    for config in (
+        args,
+        SimpleNamespace(
+            dynamic_reward_gate="piecewise",
+            dynamic_reward_gate_range=[0.8, 1.2],
+        ),
+    ):
         gates = [_compute_dynamic_auxiliary_gate(correct, 16, args=config) for correct in range(17)]
         assert gates == pytest.approx(expected)
 
@@ -844,7 +912,10 @@ def test_piecewise_dynamic_gate_custom_bounds_are_continuous_and_monotonic():
 
 
 def test_piecewise_square_root_gate_for_group_16():
-    args = SimpleNamespace(dynamic_reward_gate="piecewise-sqrt")
+    args = SimpleNamespace(
+        dynamic_reward_gate="piecewise-sqrt",
+        dynamic_reward_gate_range=[0.8, 1.2],
+    )
     expected = [0.8, 0.8197, 0.8419, 0.8677, 0.9, 0.95, *([1.0] * 5), 1.05, 1.1, 1.1323, 1.1581, 1.1803, 1.2]
     gates = [_compute_dynamic_auxiliary_gate(correct, 16, args=args) for correct in range(17)]
     assert gates == pytest.approx(expected, abs=5e-5)
@@ -865,13 +936,21 @@ def test_documented_group_16_gate_table_matches_implementation(language):
         assert float(rate.rstrip("%")) == correct / 16 * 100
         assert len(values) == 3
         for mode, value in zip(("sqrt", "piecewise", "piecewise-sqrt"), values, strict=True):
-            gate = _compute_dynamic_auxiliary_gate(correct, 16, args=SimpleNamespace(dynamic_reward_gate=mode))
+            gate = _compute_dynamic_auxiliary_gate(
+                correct,
+                16,
+                args=SimpleNamespace(
+                    dynamic_reward_gate=mode, dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2])
+                ),
+            )
             assert value == f"{gate:.4f}"
 
 
 @pytest.mark.parametrize("mode,power", [("piecewise", 1.0), ("piecewise-sqrt", 0.5)])
 def test_piecewise_gate_modes_preserve_bounds_neutral_region_and_continuity(mode, power):
-    args = SimpleNamespace(dynamic_reward_gate=mode)
+    args = SimpleNamespace(
+        dynamic_reward_gate=mode, dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2])
+    )
     gates = [_compute_dynamic_auxiliary_gate(correct, 300, args=args) for correct in range(301)]
     assert gates == sorted(gates)
     assert gates[0] == pytest.approx(0.8)
@@ -889,6 +968,7 @@ def test_piecewise_gate_modes_preserve_bounds_neutral_region_and_continuity(mode
 def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, num_correct, expected_gate):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.dynamic_reward_gate_range = [0.8, 1.2]
     args.dynamic_reward_gate = "piecewise-sqrt"
     samples = [_make_sample(i, 0, float(i < num_correct)) for i in range(16)]
     for i, sample in enumerate(samples):
@@ -916,7 +996,7 @@ def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, 
 
 @pytest.mark.parametrize(
     "mode,correctness_mode",
-    [(mode, "inverse-gate") for mode in ("piecewise", "piecewise-sqrt")]
+    [(mode, "inverse-gate") for mode in ("sqrt", "piecewise", "piecewise-sqrt")]
     + [(mode, "inverse-correct-rate") for mode in (None, "sqrt", "piecewise", "piecewise-sqrt")],
 )
 @pytest.mark.parametrize("num_correct", [0, 2, 8, 14, 16])
@@ -932,8 +1012,11 @@ def test_dynamic_correctness_settlement_is_idempotent(monkeypatch, mode, correct
     }.items():
         monkeypatch.setitem(config, key, value)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.dynamic_reward_gate_range = [0.8, 1.2]
     args.dynamic_reward_gate = mode
     args.dynamic_reward_correctness = correctness_mode
+    if mode == "sqrt" and correctness_mode == "inverse-gate":
+        args.dynamic_reward_gate_range = [0.8, 1.2]
     args.reward_key = reward_key
     gate = _compute_dynamic_auxiliary_gate(num_correct, 16, args=args)
     scale = 1 / gate if correctness_mode == "inverse-gate" else (16 / num_correct if num_correct else 0.0)
@@ -986,7 +1069,7 @@ def test_dynamic_correctness_args(selection, mode):
 
     parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
     args = parser.parse_args(
-        ["--rollout-batch-size", "1", "--dynamic-reward-gate", mode]
+        ["--rollout-batch-size", "1", "--dynamic-reward-gate", mode, "--dynamic-reward-gate-range", "0.8", "1.2"]
         + (["--dynamic-reward-correctness", selection] if selection is not None else [])
     )
     assert args.dynamic_reward_correctness == (None if selection in {None, "None"} else selection)
@@ -997,7 +1080,8 @@ def test_dynamic_correctness_args(selection, mode):
     "mode,bounds,selection",
     [
         (None, [0.8, 1.2], "inverse-gate"),
-        ("sqrt", [0.8, 1.2], "inverse-gate"),
+        ("sqrt", [0.0, 1.2], "inverse-gate"),
+        ("sqrt", [1e-320, 1.2], "inverse-gate"),
         ("piecewise", [0.0, 1.2], "inverse-gate"),
         ("piecewise-sqrt", [1e-320, 1.2], "inverse-gate"),
         ("piecewise", [0.8, 1.2], "unknown"),
@@ -1096,7 +1180,11 @@ def test_dynamic_correctness_disabled_preserves_component_and_metrics():
     sample = _make_sample(0, 0, 3.0)
     _set_reward_component(sample, correctness_score=1.0)
     sample.metadata["reward_component"]["correctness"] = 3.0
-    args = SimpleNamespace(dynamic_reward_gate="piecewise", dynamic_reward_correctness=None)
+    args = SimpleNamespace(
+        dynamic_reward_gate="piecewise",
+        dynamic_reward_correctness=None,
+        dynamic_reward_gate_range=[0.8, 1.2],
+    )
     assert _apply_dynamic_group_reward_weights(
         [sample], [3.0], CUDA_AGENT_CONFIGS["reward"], args=args, record_metrics=True
     ) == [3.0]
@@ -1110,6 +1198,7 @@ def test_piecewise_gate_boosts_auxiliary_components_and_records_positive_delta(m
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_enable", True)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
     args.overlong_penalty = "dapo"
+    args.dynamic_reward_gate_range = [0.8, 1.2]
     args.dynamic_reward_gate = "piecewise"
     args.dynamic_reward_gate_range = [0.8, 2.0]
     args.rollout_max_response_len = 100
@@ -1529,7 +1618,13 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     assert flushes == [True]
 
 
-@pytest.mark.parametrize("args", [SimpleNamespace(), SimpleNamespace(dynamic_reward_gate=None)])
+@pytest.mark.parametrize(
+    "args",
+    [
+        SimpleNamespace(),
+        SimpleNamespace(dynamic_reward_gate=None, dynamic_reward_gate_range=[0.8, 1.2]),
+    ],
+)
 def test_disabled_dynamic_gate_is_neutral(args):
     assert _compute_dynamic_auxiliary_gate(1, 16, args=args) == 1.0
     assert _compute_dynamic_auxiliary_gate(16, 16, args=args) == 1.0
@@ -1574,7 +1669,17 @@ def test_explicit_reward_method_choices(gate, penalty):
 
     parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
     args = parser.parse_args(
-        ["--rollout-batch-size", "1", "--dynamic-reward-gate", gate, "--overlong-penalty", penalty]
+        [
+            "--rollout-batch-size",
+            "1",
+            "--dynamic-reward-gate",
+            gate,
+            "--overlong-penalty",
+            penalty,
+            "--dynamic-reward-gate-range",
+            "0.8",
+            "1.2",
+        ]
     )
     _validate_rollout_reward_post_process_args(args)
     assert args.dynamic_reward_gate == (None if gate == "None" else gate)
@@ -1613,7 +1718,11 @@ def test_dynamic_gate_rejects_invalid_selection(gate):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
     with pytest.raises(ValueError, match="--dynamic-reward-gate"):
-        _validate_rollout_reward_post_process_args(SimpleNamespace(dynamic_reward_gate=gate))
+        _validate_rollout_reward_post_process_args(
+            SimpleNamespace(
+                dynamic_reward_gate=gate, dynamic_reward_gate_range=([0.0, 1.0] if gate == "sqrt" else [0.8, 1.2])
+            )
+        )
 
 
 @pytest.mark.parametrize("gate", [None, "sqrt", "piecewise", "piecewise-sqrt"])
@@ -1628,7 +1737,11 @@ def test_rollout_reward_switch_args_parse_and_validate(gate, overlong):
         [
             "--rollout-batch-size",
             "1",
-            *(["--dynamic-reward-gate", gate] if gate is not None else []),
+            *(
+                ["--dynamic-reward-gate", gate, "--dynamic-reward-gate-range", "0.8", "1.2"]
+                if gate is not None
+                else []
+            ),
             *(["--overlong-penalty", "dapo"] if overlong else []),
             "--custom-reward-post-process-path",
             "examples.kernel_agent.kernel_reward.reward_post_process_by_group",
@@ -1638,9 +1751,11 @@ def test_rollout_reward_switch_args_parse_and_validate(gate, overlong):
     assert args.dynamic_reward_gate == gate
     assert args.overlong_penalty == ("dapo" if overlong else None)
     assert args.difficulty_thresholds == [1 / 3, 2 / 3]
-    assert args.dynamic_reward_gate_range == [0.8, 1.2]
+    assert args.dynamic_reward_gate_range == (None if gate is None else [0.8, 1.2])
     assert not hasattr(args, "dynamic_reward_gate_power")
     _validate_rollout_reward_post_process_args(args)
+    expected_range = None if gate is None else [0.8, 1.2]
+    assert args.dynamic_reward_gate_range == expected_range
 
 
 @pytest.mark.parametrize("mode,power", [("piecewise", 1.0), ("piecewise-sqrt", 0.5)])
@@ -1692,7 +1807,7 @@ def test_reward_args_reject_removed_options(option, value):
     assert exc.value.code == 2
 
 
-def test_legacy_sqrt_gate_ignores_piecewise_thresholds_and_range():
+def test_sqrt_gate_maps_range_and_ignores_piecewise_thresholds():
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
     args = SimpleNamespace(
@@ -1700,8 +1815,8 @@ def test_legacy_sqrt_gate_ignores_piecewise_thresholds_and_range():
     )
     _validate_rollout_reward_post_process_args(args)
     for correct in range(17):
-        expected = ((correct - 1) / 15) ** 0.5 if correct > 1 else 0.0
-        assert _compute_dynamic_auxiliary_gate(correct, 16, args=args) == pytest.approx(expected)
+        strength = ((correct - 1) / 15) ** 0.5 if correct > 1 else 0.0
+        assert _compute_dynamic_auxiliary_gate(correct, 16, args=args) == pytest.approx(0.5 + 1.5 * strength)
 
 
 @pytest.mark.parametrize(
@@ -1723,7 +1838,7 @@ def test_piecewise_dynamic_gate_args_reject_invalid_values(gate_range, mode):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
     args = SimpleNamespace(dynamic_reward_gate=mode, dynamic_reward_gate_range=gate_range)
-    with pytest.raises(ValueError, match="Piecewise"):
+    with pytest.raises(ValueError, match="--dynamic-reward-gate-range"):
         _validate_rollout_reward_post_process_args(args)
 
 
@@ -1747,7 +1862,11 @@ def test_difficulty_thresholds_validation_is_independent_of_reward_mode(threshol
 
     with pytest.raises(ValueError, match="--difficulty-thresholds"):
         _validate_difficulty_thresholds_args(
-            SimpleNamespace(difficulty_thresholds=thresholds, dynamic_reward_gate=mode)
+            SimpleNamespace(
+                difficulty_thresholds=thresholds,
+                dynamic_reward_gate=mode,
+                dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2]),
+            )
         )
 
 
@@ -1767,6 +1886,7 @@ def test_shared_difficulty_thresholds_allow_more_buckets_but_piecewise_requires_
     assert args.difficulty_thresholds == thresholds
     _validate_difficulty_thresholds_args(args)
     _validate_rollout_reward_post_process_args(args)
+    args.dynamic_reward_gate_range = [0.8, 1.2]
     args.dynamic_reward_gate = mode
     with pytest.raises(ValueError, match="exactly two --difficulty-thresholds"):
         _validate_rollout_reward_post_process_args(args)
@@ -2178,6 +2298,20 @@ def test_ctm_rejects_non_max_length_or_repeated_response(response_length, tokens
     assert candidate.remove_sample is False
     assert candidate.metadata.get("conditional_truncation_masking_eligible", False) is False
     assert rewards == pytest.approx([0.0])
+
+
+@pytest.mark.parametrize("mode", ["sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("explicit_none", [False, True])
+def test_dynamic_gate_requires_explicit_range(mode, explicit_none):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(dynamic_reward_gate=mode)
+    if explicit_none:
+        args.dynamic_reward_gate_range = None
+    with pytest.raises(ValueError, match="--dynamic-reward-gate-range is required"):
+        _validate_rollout_reward_post_process_args(args)
+    with pytest.raises(ValueError, match="--dynamic-reward-gate-range is required"):
+        _compute_dynamic_auxiliary_gate(0, 1, args=args)
 
 
 if __name__ == "__main__":

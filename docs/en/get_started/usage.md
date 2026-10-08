@@ -330,13 +330,24 @@ The two method selectors are independent: `--dynamic-reward-gate` selects dynami
 
 `--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[1/3, 2/3]` to divide the correctness-rate range into three equal intervals, not equal-sized sample buckets. The example omits this flag to use those defaults; explicit decimal values override them (e.g. `--difficulty-thresholds 0.25 0.75`). Its validation is independent of dynamic reward weighting. Both piecewise modes require exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
 
-Let `G` be the number of valid samples for the same prompt and turn, `c` the correct count, and `s=c/G`. Removed, padded, and aborted samples do not count toward `G`; it can therefore differ from `--n-samples-per-prompt`. The recorded `group_difficulty` is `1-s`, but gate thresholds use `s`. Define `h, e = difficulty_thresholds` and `lo, hi = dynamic_reward_gate_range` (default `[0.8, 1.2]`).
+Let `G` be the number of valid samples for the same prompt and turn, `c` the correct count, and `s=c/G`. Removed, padded, and aborted samples do not count toward `G`; it can therefore differ from `--n-samples-per-prompt`. The recorded `group_difficulty` is `1-s`, but gate thresholds use `s`. Define `h, e = difficulty_thresholds` and `lo, hi = dynamic_reward_gate_range`. All enabled gate modes require an explicit `--dynamic-reward-gate-range MIN MAX`; omitting it raises an error.
 
-The legacy `sqrt` mode ignores the thresholds and range:
+The `sqrt` mode ignores difficulty thresholds and maps the original square-root output into the configured range:
 
 ```python
-gate = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+strength = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
+gate = lo + (hi - lo) * strength
 ```
+
+Explicitly setting `[0, 1]` preserves the original behavior. groups with at most one correct sample, including singleton and empty groups, use `lo`. For a non-piecewise gate with positive bounds and reciprocal correctness scaling:
+
+```bash
+--dynamic-reward-gate sqrt \
+--dynamic-reward-gate-range 0.8 1.2 \
+--dynamic-reward-correctness inverse-gate
+```
+
+This changes the range, not the underlying square-root function; it is not linear in correctness rate. Finite bounds must satisfy `0 <= lo <= hi`.
 
 For `piecewise`, use `f(d)=d`; for `piecewise-sqrt`, use `f(d)=sqrt(d)`:
 
@@ -351,7 +362,7 @@ else:
     gate = 1
 ```
 
-`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Gate bounds must be finite with `0 <= lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filtering and training read the same settled rewards without separately recomputing gates. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Piecewise gate bounds must additionally satisfy `lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filtering and training read the same settled rewards without separately recomputing gates. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
 
 For samples on the normal component-scoring path, the resulting contributions are:
 
@@ -372,7 +383,7 @@ To also scale correctness by the reciprocal of the same gate, opt in separately:
 --dynamic-reward-correctness inverse-gate
 ```
 
-`--dynamic-reward-correctness` defaults to `None` (also accepted explicitly). With `inverse-gate`, the non-failure reward becomes `C / gate + gate * (P + Coverage) + length_score`, where C/P/Coverage are ungated contributions. A gate of 0.8 scales correctness by 1.25; 1.2 scales it by about 0.8333. This requires `piecewise` or `piecewise-sqrt` with a strictly positive minimum and a finite reciprocal; legacy `sqrt` can produce zero and is rejected. Explicit failure scores, length scores, `raw_task_reward`, and frozen `return_reward` are unchanged. Correctness is rebuilt from the base score and configured weight on every invocation, so repeated post-processing does not compound the scale.
+`--dynamic-reward-correctness` defaults to `None` (also accepted explicitly). With `inverse-gate`, the non-failure reward becomes `C / gate + gate * (P + Coverage) + length_score`, where C/P/Coverage are ungated contributions. A gate of 0.8 scales correctness by 1.25; 1.2 scales it by about 0.8333. This requires an enabled gate with a strictly positive minimum and a finite reciprocal. `sqrt` is supported with an explicit positive minimum; a `[0, 1]` range is rejected for this combination. Explicit failure scores, length scores, `raw_task_reward`, and frozen `return_reward` are unchanged. Correctness is rebuilt from the base score and configured weight on every invocation, so repeated post-processing does not compound the scale.
 
 Alternatively, `--dynamic-reward-correctness inverse-correct-rate` uses `C / p`, where `p` is the correctness rate of valid samples in the same prompt/turn group. It works independently of `--dynamic-reward-gate`: with the gate disabled, performance/coverage keep their base weights; with a gate enabled, the non-failure reward is `C / p + gate * (P + Coverage) + length_score`. Removed, aborted, and padding samples do not enter `p`. For `p=0`, correctness scale is zero (no division); explicit failure scores and other reward components keep their existing rules. Both correctness modes preserve raw history and frozen future credit and are idempotent.
 
@@ -382,7 +393,7 @@ When either correctness mode is enabled, `rollout/dynamic_reward/correctness_sca
 
 ##### Gate values for G=16
 
-Assume all 16 samples are valid, with thresholds `[1/3, 2/3]` and range `[0.8, 1.2]`. Values are rounded to four decimal places:
+Assume all 16 samples are valid, with thresholds `[1/3, 2/3]`. The `sqrt` column uses an explicit `[0, 1]` range; the piecewise columns use `[0.8, 1.2]`. Values are rounded to four decimal places:
 
 | Correct count | Correctness rate | `sqrt` | `piecewise` | `piecewise-sqrt` |
 |---|---:|---:|---:|---:|

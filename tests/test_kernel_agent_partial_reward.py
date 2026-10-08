@@ -97,7 +97,12 @@ def test_reference_coverage_flows_through_piecewise_reward(monkeypatch):
     config = _reward_config()
     config.update(coverage_reward_type="reference_time_coverage", speedup_score_mode="legacy")
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "reward", config)
-    args = SimpleNamespace(dynamic_reward_gate="piecewise", overlong_penalty=None, use_multi_turn=False)
+    args = SimpleNamespace(
+        dynamic_reward_gate="piecewise",
+        dynamic_reward_gate_range=[0.8, 1.2],
+        overlong_penalty=None,
+        use_multi_turn=False,
+    )
     samples = []
     for custom_us in (80.0, 40.0):
         state = _completed_env(correctness=True, speedup=2.0)
@@ -529,19 +534,35 @@ def test_failed_sample_does_not_receive_performance_reward_from_malformed_env_st
     "mode,speedup,expected",
     [
         ("legacy", 2.0, 2.0),
-        ("legacy", 3.0, 3.0),
-        ("legacy", 5.0, 5.0),
-        ("legacy", 6.0, 5.0),
-        ("improvement", 2.0, 0.25),
-        ("improvement", 3.0, 0.5),
+        ("legacy", 3.0, 2.0),
+        ("legacy", 5.0, 2.0),
+        ("legacy", 6.0, 2.0),
+        ("improvement", 1.25, 0.25),
+        ("improvement", 1.5, 0.5),
         ("improvement", 5.0, 1.0),
         ("improvement", 6.0, 1.0),
     ],
 )
 def test_default_speedup_reward_upper_bound(mode, speedup, expected):
     config = _reward_config()
-    assert config["speedup_reward_upper_bound"] == 5.0
+    assert config["speedup_reward_upper_bound"] == 2.0
     assert _calculate_performance_score(speedup, mode, None, config) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("upper", [None, "3.5", "5"])
+def test_speedup_reward_upper_from_environment(monkeypatch, upper):
+    if upper is None:
+        monkeypatch.delenv("SPEEDUP_REWARD_UPPER", raising=False)
+    else:
+        monkeypatch.setenv("SPEEDUP_REWARD_UPPER", upper)
+    config_path = REPO_ROOT / "examples/kernel_agent/config.py"
+    spec = importlib.util.spec_from_file_location("_kernel_agent_speedup_upper_env_test", config_path)
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    config = config_module.CUDA_AGENT_CONFIGS["reward"]
+    expected = 2.0 if upper is None else float(upper)
+    assert config["speedup_reward_upper_bound"] == expected
+    assert _calculate_performance_score(10.0, "legacy", None, config) == expected
 
 
 def test_improvement_performance_score_only_rewards_gain_over_reference():
