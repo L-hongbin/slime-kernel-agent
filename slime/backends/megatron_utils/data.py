@@ -7,6 +7,7 @@ from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from slime.utils import accelerator
+from slime.utils.sequence_metadata import cache_cpu_sequence_boundaries
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import compute_cp_padded_max_seq_len, slice_with_cp
@@ -214,7 +215,6 @@ def get_batch(
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
-            cu_seqlens = cu_seqlens_list
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(token_ids, pad_token_id, qkv_format) for token_ids in tokens]
@@ -230,10 +230,11 @@ def get_batch(
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # THD requires cu_seqlens in the original (pre-CP) lengths.
-            cu_seqlens = [offset * cp_size for offset in cu_seqlens]
+            cu_seqlens_list = [boundary * cp_size for boundary in cu_seqlens]
 
-        max_seqlen = max(end - start for start, end in zip(cu_seqlens[:-1], cu_seqlens[1:], strict=True))
-        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int, device=accelerator.current_device())
+        max_seqlen = max(end - start for start, end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:], strict=True))
+        cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=accelerator.current_device())
+        cache_cpu_sequence_boundaries(cu_seqlens, cu_seqlens_list)
         packed_seq_params = PackedSeqParams(
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
