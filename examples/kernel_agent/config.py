@@ -60,11 +60,12 @@ if coverage_reward_type not in {
     )
 # Speedup reward mapping. ``legacy`` preserves the historical clipped raw
 # speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].
+# ``rational`` maps x to M*x/(x+M-1), with M=upper_bound > 1 as an asymptote.
 # ``lcb_improvement`` applies a lower confidence bound to speedup first, using
 # timing statistics returned by KernelGYM, and then uses the same mapping.
 speedup_score_mode = os.environ.get("CUDA_AGENT_SPEEDUP_SCORE_MODE", "legacy").strip().lower()
-if speedup_score_mode not in {"legacy", "improvement", "lcb_improvement"}:
-    raise ValueError("CUDA_AGENT_SPEEDUP_SCORE_MODE must be one of: legacy, improvement, lcb_improvement")
+if speedup_score_mode not in {"legacy", "rational", "improvement", "lcb_improvement"}:
+    raise ValueError("CUDA_AGENT_SPEEDUP_SCORE_MODE must be one of: legacy, rational, improvement, lcb_improvement")
 speedup_uncertainty_z_score = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_Z_SCORE", 1.96))
 speedup_uncertainty_log_std_floor = float(os.environ.get("CUDA_AGENT_SPEEDUP_UNCERTAINTY_LOG_STD_FLOOR", 0.0))
 if speedup_uncertainty_z_score < 0.0:

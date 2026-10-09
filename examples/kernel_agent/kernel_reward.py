@@ -86,7 +86,7 @@ def _calculate_performance_score(
     """Map a raw evaluator speedup to the scalar performance score."""
 
     mode = str(mode).strip().lower()
-    allowed_modes = {"legacy", "improvement", "lcb_improvement"}
+    allowed_modes = {"legacy", "rational", "improvement", "lcb_improvement"}
     if mode not in allowed_modes:
         raise ValueError(f"speedup_score_mode must be one of {sorted(allowed_modes)}, got {mode!r}")
 
@@ -95,6 +95,15 @@ def _calculate_performance_score(
     if mode == "legacy":
         performance_score = min(speedup, upper_bound)
         return 0.0 if performance_score < lower_bound else performance_score
+
+    if mode == "rational":
+        if not math.isfinite(upper_bound) or upper_bound <= 1.0:
+            raise ValueError("speedup_reward_upper_bound must be finite and greater than 1.0 for rational mode")
+        if not math.isfinite(speedup) or speedup <= 0.0 or speedup < lower_bound:
+            return 0.0
+        # M*x/(x+M-1), rearranged to avoid overflow in M*x or x+M.
+        # Keep f(1)=1 and approach M smoothly, without clipping the raw speedup.
+        return speedup / (1.0 + (speedup - 1.0) / upper_bound)
 
     if not math.isfinite(speedup) or speedup <= 0.0:
         return 0.0

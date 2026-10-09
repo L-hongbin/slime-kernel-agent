@@ -294,6 +294,24 @@ Kernel-agent 多轮 rollout 可通过 `--use-context-budget-nudge 0.2` 开启上
 
 内置及仓库中的 response 模板已包含提醒字段；自定义 format/YAML 模板需要加入 `{context_budget_nudge}`，Jinja 模板需要加入 `{{ context_budget_nudge }}` 才会展示提醒。每轮满足条件都可以追加，不是整条轨迹只提醒一次。提醒属于下一轮 user 输入，不是 assistant 输出，不直接修改 reward 或 response loss mask；只在轮次之间生效，不能中断单轮长思考。若评测也打开此参数，评测同样生效。
 
+#### Kernel Agent 有理函数速度奖励
+
+速度得分默认使用 `legacy`：`f(x) = min(x, M)`。设置以下环境变量可启用平滑有界的有理函数：
+
+```bash
+export CUDA_AGENT_SPEEDUP_SCORE_MODE=rational
+export CUDA_AGENT_SPEEDUP_REWARD_UPPER=2
+```
+
+`x` 是原始加速比；`M` 复用 `CUDA_AGENT_SPEEDUP_REWARD_UPPER`，默认 `2`，在 `rational` 模式下必须有限且大于 `1`。
+得分为 `f(x) = M*x/(x+M-1)`，满足 `f(0)=0`、`f(1)=1`，随加速比增加而趋近 `M`，不会在 `x=M` 处截断。
+例如 `M=2` 时，`0.5x / 1x / 2x / 5x` 对应 `0.667 / 1 / 1.333 / 1.667`。
+非有限或非正的加速比不获得速度得分；错误程序仍走原有失败奖励路径。
+
+该模式只替换 `kernel_score.performance` 的映射，随后仍乘 performance 权重和动态 gate；correctness inverse-gate、coverage 和原始 speedup 指标保持原有计算方式。
+Qwen3.8 WarmUp/MultiTurn 启动脚本会将模式透传给 Ray worker；非 `legacy` 模式的实验名追加 `-SSM模式名`，例如 `-SRUP2-SSMrational`。
+自定义启动脚本也需要将 `CUDA_AGENT_SPEEDUP_SCORE_MODE` 和 `CUDA_AGENT_SPEEDUP_REWARD_UPPER` 放入 Ray runtime environment。
+
 #### KernelGYM 详细正确性诊断
 
 `CUDA_AGENT_RETURN_DETAIL_CORRECTNESS` 默认 `0`（`False`），训练启动前设为 `1` 即可在 KernelGYM 评测请求中传入 `return_detail_correctness=true`。Qwen3.8 的 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传；自定义启动脚本也需要将此环境变量传给 rollout worker。

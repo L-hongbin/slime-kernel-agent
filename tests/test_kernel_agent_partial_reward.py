@@ -281,7 +281,12 @@ def test_failed_group_reward_config_separates_flag_and_failure_scores():
 
 @pytest.mark.parametrize(
     ("env_value", "expected"),
-    [(None, "legacy"), ("improvement", "improvement"), ("lcb_improvement", "lcb_improvement")],
+    [
+        (None, "legacy"),
+        ("rational", "rational"),
+        ("improvement", "improvement"),
+        ("lcb_improvement", "lcb_improvement"),
+    ],
 )
 def test_speedup_score_mode_reads_environment(monkeypatch, env_value, expected):
     env_name = "CUDA_AGENT_SPEEDUP_SCORE_MODE"
@@ -585,6 +590,94 @@ def test_improvement_performance_score_only_rewards_gain_over_reference():
     }
     assert improved["reward_component"]["performance"] == pytest.approx(0.25)
     assert improved["reward"] == pytest.approx(0.75)
+
+
+@pytest.mark.parametrize("upper", [1.01, 2.0, 5.0])
+def test_rational_score_is_bounded_monotonic_and_preserves_one_x(upper):
+    config = {**_reward_config(), "speedup_reward_upper_bound": upper}
+    speeds = [0.0, 0.01, 0.5, 1.0, 2.0, 5.0, 10.0, 1000.0]
+    scores = [_calculate_performance_score(speed, "rational", None, config) for speed in speeds]
+    assert scores[0] == 0.0
+    assert scores[3] == 1.0
+    assert all(left < right for left, right in zip(scores, scores[1:], strict=False))
+    assert all(0 <= score < upper for score in scores)
+    # Unlike legacy clipping, speeds above M still receive distinct scores.
+    assert _calculate_performance_score(upper * 2, "rational", None, config) > _calculate_performance_score(
+        upper, "rational", None, config
+    )
+
+
+@pytest.mark.parametrize("speedup,expected", [(0.5, 2 / 3), (2.0, 4 / 3), (5.0, 5 / 3), (10.0, 20 / 11)])
+def test_rational_score_default_curve(speedup, expected):
+    config = {**_reward_config(), "speedup_reward_upper_bound": 2.0}
+    assert _calculate_performance_score(speedup, "rational", None, config) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("speedup", [-1.0, 0.0, float("nan"), float("inf"), -float("inf")])
+def test_rational_score_invalid_measurements_get_no_speed_credit(speedup):
+    assert _calculate_performance_score(speedup, "rational", None, _reward_config()) == 0.0
+
+
+@pytest.mark.parametrize("upper", [0.0, 1.0, -2.0, float("nan"), float("inf")])
+def test_rational_score_requires_finite_asymptote_greater_than_one(upper):
+    config = {**_reward_config(), "speedup_reward_upper_bound": upper}
+    with pytest.raises(ValueError, match="finite and greater than 1.0"):
+        _calculate_performance_score(1.0, "rational", None, config)
+
+
+@pytest.mark.parametrize("upper,expected", [(2.0, 2.0), (1e308, 5e307)])
+def test_rational_score_does_not_overflow_large_finite_speedup(upper, expected):
+    config = {**_reward_config(), "speedup_reward_upper_bound": upper}
+    assert _calculate_performance_score(1e308, "rational", None, config) == pytest.approx(expected)
+
+
+def test_rational_score_respects_lower_bound():
+    config = {**_reward_config(), "speedup_reward_lower_bound": 0.5}
+    assert _calculate_performance_score(0.4, "rational", None, config) == 0.0
+    assert _calculate_performance_score(0.5, "rational", None, config) == pytest.approx(2 / 3)
+
+
+@pytest.mark.parametrize("coverage_type", ["time_coverage", "reference_time_coverage"])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_rational_reward_composes_with_coverage_and_inverse_gate(monkeypatch, coverage_type, dynamic):
+    config = {
+        **_reward_config(),
+        "speedup_score_mode": "rational",
+        "speedup_reward_upper_bound": 2.0,
+        "coverage_reward_type": coverage_type,
+        "coverage_reward_weight": 0.5,
+    }
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS, "reward", config)
+    args = SimpleNamespace(
+        dynamic_reward_gate="piecewise-sqrt" if dynamic else None,
+        dynamic_reward_gate_range=[0.8, 1.2],
+        dynamic_reward_correctness="inverse-gate" if dynamic else None,
+        overlong_penalty=None,
+        use_multi_turn=False,
+    )
+    samples = []
+    for speedup in (2.0, 5.0):
+        state = _completed_env(correctness=True, speedup=speedup)
+        total_us = 1000.0 / speedup
+        state.update(
+            reference_runtime=1.0,
+            total_kernel_run_time_in_profiling_us=total_us,
+            custom_kernel_cuda_time_in_profiling_us=total_us - 100.0,
+        )
+        details = calculate_kernel_reward(state, config)
+        assert details["speedup"] == speedup
+        samples.append(Sample(group_index=0, reward=details["reward"], metadata=details))
+    rewards = post_process_rollout_rewards(args, samples)
+    gate = 1.2 if dynamic else 1.0
+    coverages = [0.8, 0.5] if coverage_type == "time_coverage" else [0.9, 0.9]
+    expected = [
+        0.5 / gate + gate * (0.5 * score + 0.5 * cov) for score, cov in zip([4 / 3, 5 / 3], coverages, strict=True)
+    ]
+    assert rewards == pytest.approx(expected)
+    assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
+    failed = calculate_kernel_reward(_completed_env(correctness=False, speedup=5.0), config)
+    assert failed["reward_component"]["performance"] == 0.0
+    assert failed["reward"] == 0.0
 
 
 def test_lcb_improvement_uses_timing_uncertainty_before_reward_mapping():
