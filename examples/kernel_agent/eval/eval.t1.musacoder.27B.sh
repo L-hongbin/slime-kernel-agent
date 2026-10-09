@@ -73,25 +73,8 @@ echo "DUMP_DIR=${DUMP_DIR}"
 if [ "${SKIP_KERNELGYM_HEALTH:-0}" = "1" ]; then
    echo "Skipping KernelGym health check (SKIP_KERNELGYM_HEALTH=1); KERNEL_ENV_URL=${KERNEL_ENV_URL} will not be required for rollout."
 else
-health_ok=0
-for health_attempt in $(seq 1 30); do
-   # Truncate first: curl leaves -o untouched on a timeout/connection failure, so
-   # a stale body from a prior successful probe would otherwise be printed below.
-   : > /tmp/kernelgym-health.out
-   health_code=$(curl -sS --max-time 8 "${KERNEL_ENV_URL}/health" -o /tmp/kernelgym-health.out -w '%{http_code}' || true)
-   if [ "${health_code}" = "200" ]; then
-      health_ok=1
-      break
-   fi
-   echo "KernelGym health attempt ${health_attempt}/30 failed at ${KERNEL_ENV_URL}: code=${health_code}" >&2
-   head -c 300 /tmp/kernelgym-health.out >&2 2>/dev/null || true
-   echo >&2
-   sleep 2
-done
-if [ "${health_ok}" != "1" ]; then
-   echo "KernelGym health check failed at ${KERNEL_ENV_URL} after 30 attempts" >&2
-   exit 1
-fi
+   python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
+      --url "${KERNEL_ENV_URL}" --timeout 8 --attempts 30 --interval 2 --backoff-factor 1
 fi
 
 # clean any prior ray on this eval cluster
@@ -132,7 +115,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend ${KERNEL_BACKEND}
    --reference-backend torch
    --do-precheck

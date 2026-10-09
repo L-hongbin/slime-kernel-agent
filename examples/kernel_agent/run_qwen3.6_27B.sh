@@ -37,7 +37,7 @@ MAX_RESPONSE_LEN=8192
 MODEL_NAME="Qwen3.6-27B"
 DATASET="Drkernel-rl-thinking-PV4"
 KERNEL_BACKEND="cuda_agent"
-KERNEL_ENV_URL="http://192.168.116.97:20111"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://192.168.116.97:20111}"
 
 case "${MODEL_NAME}" in
     Qwen3.6-27B)
@@ -296,7 +296,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck
@@ -370,5 +370,5 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${KERNEL_AGENT_ARGS[@]} \
+   "${KERNEL_AGENT_ARGS[@]}" \
    ${CUSTOM_ARGS[@]}

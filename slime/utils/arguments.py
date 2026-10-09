@@ -2327,14 +2327,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--kernel-env-urls",
                 nargs="+",
                 default=None,
-                help="Kernel environment URLs; select the least-loaded endpoint per rollout process for each task.",
+                help="Kernel environment URLs; assign tasks round-robin per rollout process with a random starting offset.",
             )
             kernel_env.add_argument(
                 "--kernel-env-url",
                 dest="kernel_env_url",
                 type=str,
                 default=None,
-                help="Kernel environment URL(s), separated by spaces or commas; select the least-loaded endpoint per rollout process.",
+                help="Kernel environment URL(s), separated by spaces or commas; assign tasks round-robin per rollout process.",
             )
             parser.add_argument(
                 "--kernel-backend",

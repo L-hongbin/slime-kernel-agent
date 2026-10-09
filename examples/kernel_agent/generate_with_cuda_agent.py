@@ -625,6 +625,7 @@ async def cuda_kernel_env(
         metadata = dict(sample.metadata or {})
         metadata["task_id"] = task_id
         metadata.pop("kernel_eval_server_url", None)
+        metadata.pop("kernel_eval_submission_rejected", None)
         sample.metadata = metadata
 
         env_config = CUDA_AGENT_CONFIGS["env"]
@@ -968,7 +969,7 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]) -> Sam
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         task_id = metadata.get("task_id")
         cancel_acknowledged = False
-        if task_id:
+        if task_id and not metadata.get("kernel_eval_submission_rejected"):
             try:
                 cancel_acknowledged = await cancel_kernel_eval(
                     args,
@@ -1255,11 +1256,18 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs):
     """Compute reward from the CUDA env response collected during generation."""
 
     def get_reward(sample: Sample):
-        if sample.reward is not None:
-            return sample.reward
         metadata = dict(sample.metadata or {})
         env_result = metadata.get("env_result") if isinstance(metadata.get("env_result"), dict) else {}
         env_state = env_result.get("env_state") if isinstance(env_result.get("env_state"), dict) else {}
+        env_metadata = env_state.get("metadata") or {}
+        if env_metadata.get("kernel_eval_infrastructure_failure"):
+            sample.remove_sample = True
+            sample.reward = 0.0
+            metadata["remove_reason"] = "kernel_eval_infrastructure_failure"
+            sample.metadata = metadata
+            return sample.reward
+        if sample.reward is not None:
+            return sample.reward
         if CUDA_AGENT_CONFIGS["reward"]["coverage_reward_type"] == "reference_time_coverage":
             reference_ms = env_state.get(
                 "reference_runtime", (env_state.get("metadata") or {}).get("reference_runtime")

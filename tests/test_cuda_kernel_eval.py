@@ -1865,7 +1865,7 @@ def test_kernel_eval_preserves_terminal_result_diagnostics(local_eval_worker, st
     async def handler(request):
         urls.append(request.url.path)
         if request.url.path == "/evaluate":
-            return httpx.Response(409)
+            return httpx.Response(409, text="already submitted")
         if request.url.path.startswith("/status/"):
             return httpx.Response(200, json={"status": status})
         return httpx.Response(200, json={"compiled": True, "correctness": False, "metadata": {"compile_s": 2.0}})
@@ -1979,7 +1979,7 @@ def test_kernel_eval_errors_and_infinite_retries_respect_deadline_and_release(lo
 
     async def handler(request):
         if request.method == "POST":
-            return httpx.Response({"http_error": 500, "retry": 503, "poll_timeout": 200}[failure])
+            return httpx.Response({"http_error": 400, "retry": 503, "poll_timeout": 200}[failure])
         await asyncio.Event().wait()
 
     async def scenario():
@@ -1988,7 +1988,370 @@ def test_kernel_eval_errors_and_infinite_retries_respect_deadline_and_release(lo
         assert result["status"] == ("failed" if failure == "http_error" else "timeout")
         assert len(releases) == len(set(releases)) == 1
         assert limiter.get_current_count() == 0
-        assert deletes == ["failed"]
+        assert deletes == ([] if failure == "http_error" else ["failed"])
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", [429, 500, 502, 503, 504, "read_error"])
+def test_kernel_eval_retries_transient_submit_with_identical_payload(local_eval_worker, failure):
+    worker, limiter, _ = local_eval_worker
+    worker._backoff = lambda *args, **kwargs: 0
+    payloads = []
+
+    async def handler(request):
+        assert request.url.host == "eval.test"
+        if request.method == "POST":
+            payloads.append(json.loads(request.content))
+            if len(payloads) == 1:
+                if failure == "read_error":
+                    raise httpx.ReadError("connection reset", request=request)
+                return httpx.Response(failure)
+            return httpx.Response(409, text="already submitted")  # First request might already be accepted.
+        if request.url.path.startswith("/status/"):
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(200, json={"correctness": True, "speedup": 2.0})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "retry", "workflow_timeout": 10}, 1, 3, 0)
+        assert result["correctness"] is True
+        assert len(payloads) == 2 and payloads[0] == payloads[1]
+        assert limiter.get_current_count() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("submit_failure", [429, 503, "timeout"])
+@pytest.mark.parametrize("status_behavior", ["missing", "unavailable", "accepted_late"])
+def test_kernel_eval_exhausted_submission_has_bounded_status_recovery(
+    local_eval_worker, submit_failure, status_behavior
+):
+    worker, limiter, _ = local_eval_worker
+    worker._backoff = lambda *args, **kwargs: 0
+    posts, polls = [], []
+
+    async def handler(request):
+        if request.method == "POST":
+            posts.append(json.loads(request.content))
+            if submit_failure == "timeout":
+                raise httpx.ReadTimeout("submit reply lost", request=request)
+            return httpx.Response(submit_failure)
+        if request.url.path.startswith("/status/"):
+            polls.append(request.url.path)
+            if status_behavior == "accepted_late" and len(polls) >= 2:
+                return httpx.Response(200, json={"status": "completed"})
+            return httpx.Response(503 if status_behavior == "unavailable" else 404)
+        return httpx.Response(200, json={"correctness": True})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            # Must finish promptly even when the full task budget is long.
+            result = await asyncio.wait_for(worker.submit_and_poll({"task_id": "exhausted"}, 2400, 3, 0), 1)
+        assert len(posts) == 3 and all(payload == posts[0] for payload in posts)
+        if status_behavior == "accepted_late":
+            assert result["status"] == "completed" and result["correctness"] is True
+            assert len(polls) == 2
+        else:
+            assert result["status"] == "failed"
+            assert "could not be confirmed" in result["error_message"]
+            assert len(polls) == 3
+        assert limiter.get_current_count() == 0
+        assert not worker._running
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_kernel_eval_confirmed_submission_can_outlast_status_recovery_budget(local_eval_worker):
+    worker, _, _ = local_eval_worker
+    polls = []
+
+    async def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200)
+        if request.url.path.startswith("/status/"):
+            polls.append(request.url.path)
+            if len(polls) < 5:
+                return httpx.Response(404)
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(200, json={"correctness": True})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "accepted"}, 1, 2, 0)
+        assert result["status"] == "completed" and result["correctness"] is True
+        assert len(polls) == 5
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("terminal_status", ["completed", "failed", "timeout", "cancelled"])
+@pytest.mark.parametrize("failure", [404, 503, "timeout", "invalid_json", "invalid_payload"])
+@pytest.mark.parametrize("recover", [False, True])
+def test_kernel_eval_retries_result_retrieval_without_resubmitting(
+    local_eval_worker, terminal_status, failure, recover
+):
+    worker, limiter, _ = local_eval_worker
+    paths = []
+
+    async def handler(request):
+        paths.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(200)
+        if request.url.path.startswith("/status/"):
+            return httpx.Response(200, json={"status": terminal_status, "error_message": "server diagnostic"})
+        if recover and paths.count("/results/result") == 2:
+            return httpx.Response(200, json={"correctness": True, "speedup": 2.0})
+        if failure == "timeout":
+            raise httpx.ReadTimeout("result reply lost", request=request)
+        if failure == "invalid_json":
+            return httpx.Response(200, text="not json")
+        if failure == "invalid_payload":
+            return httpx.Response(200, json=[])
+        return httpx.Response(failure)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "result"}, 1, 3, 0)
+        assert paths.count("/evaluate") == paths.count("/status/result") == 1
+        if recover:
+            assert result["status"] == terminal_status
+            assert result["correctness"] is True and result["speedup"] == 2.0
+            assert paths.count("/results/result") == 2
+        else:
+            assert result["status"] == ("failed" if terminal_status == "completed" else terminal_status)
+            assert "Unable to retrieve" in result["error_message"]
+            assert "server diagnostic" in result["error_message"]
+            assert paths.count("/results/result") == 3
+        assert limiter.get_current_count() == 0
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cancel", [False, True])
+def test_kernel_eval_result_retries_obey_deadline_and_cancellation(local_eval_worker, cancel):
+    worker, limiter, _ = local_eval_worker
+
+    async def scenario():
+        retrieving = asyncio.Event()
+
+        async def handler(request):
+            if request.method == "POST":
+                return httpx.Response(200)
+            if request.url.path.startswith("/status/"):
+                return httpx.Response(200, json={"status": "completed"})
+            retrieving.set()
+            await asyncio.Event().wait()
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            task = asyncio.create_task(
+                worker.submit_and_poll({"task_id": "result-wait"}, 1 if cancel else 0.05, -1, 0)
+            )
+            await asyncio.wait_for(retrieving.wait(), 1)
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                result = await asyncio.wait_for(task, 1)
+                assert result["status"] == "timeout"
+        assert limiter.get_current_count() == 0
+        assert not worker._running
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cached_reward", [None, 7.0])
+def test_kernel_infrastructure_failure_is_excluded_from_reward_and_difficulty(cached_reward):
+    from examples.kernel_agent.kernel_reward import annotate_group_difficulty
+
+    failure = kernel_response._client_eval_failure("results unavailable: HTTP 503")
+    failure = kernel_response._format_env_return(failure, {"task_id": "infra"})
+    failure, extra = normalize_env_feedback(failure)
+    sample = Sample(
+        reward=cached_reward,
+        status=Sample.Status.COMPLETED,
+        metadata={"env_result": {"env_state": failure}, "env_extra_info": extra},
+    )
+    reward = asyncio.run(generate_with_cuda_agent.reward_func(SimpleNamespace(), sample))
+    assert reward == 0.0 and sample.remove_sample
+    assert sample.metadata["remove_reason"] == "kernel_eval_infrastructure_failure"
+    good = Sample(status=Sample.Status.COMPLETED, metadata={"kernel_score": {"correctness": 1.0}})
+    assert annotate_group_difficulty([good, sample]) == (1, 1)
+    assert good.metadata["group_correct_rate"] == 1.0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "env_state",
+    [
+        {"status": "completed", "compiled": False, "correctness": False},
+        {"status": "completed", "compiled": True, "correctness": False},
+        {"status": "failed", "error_code": "RUNTIME_ERROR", "compiled": True},
+        {"status": "timeout", "compiled": True},
+        {"status": "failed", "precheck": "failed", "error": "PRECHECK_ERROR"},
+    ],
+)
+def test_kernel_verdicts_are_not_excluded_as_infrastructure_failures(env_state):
+    from examples.kernel_agent.kernel_reward import annotate_group_difficulty
+
+    env_state = {**env_state, "metadata": {"kernel_eval_failure": True}}
+    sample = Sample(status=Sample.Status.COMPLETED, metadata={"env_result": {"env_state": env_state}})
+    asyncio.run(generate_with_cuda_agent.reward_func(SimpleNamespace(), sample))
+    assert not sample.remove_sample
+    assert annotate_group_difficulty([sample]) == (0, 1)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code", [400, 409, 422])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Task id already exists with incompatible content/state; use a new ID",
+        "Duplicate task has different content",
+        "Workflow result belongs to another generation",
+        "Unexpected conflict",
+    ],
+)
+def test_kernel_eval_rejected_conflicts_never_poll_or_delete(local_eval_worker, monkeypatch, code, message):
+    worker, _, _ = local_eval_worker
+    paths, deletes = [], []
+
+    async def handler(request):
+        paths.append(request.url.path)
+        return httpx.Response(code, json={"detail": message})
+
+    async def delete(*args):
+        deletes.append(args)
+        return True
+
+    monkeypatch.setattr(kernel_response, "_delete_server_task", delete)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "conflict"}, 1, 3, 0)
+        assert result["status"] == "failed"
+        assert result["metadata"]["kernel_eval_submission_rejected"]
+        assert result["metadata"]["kernel_eval_infrastructure_failure"]
+        assert paths == ["/evaluate"] and not deletes
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("recover", [False, True])
+@pytest.mark.parametrize(
+    "invalid_result",
+    [
+        {"task_id": "wrong", "status": "completed", "correctness": True},
+        {"task_id": "result", "status": "running", "correctness": True},
+        {"task_id": "result", "status": "completed"},
+        {"detail": "results not ready"},
+    ],
+)
+def test_kernel_eval_rejects_misidentified_or_incomplete_results(local_eval_worker, recover, invalid_result):
+    worker, _, _ = local_eval_worker
+    paths = []
+
+    async def handler(request):
+        paths.append(request.url.path)
+        if request.method == "POST":
+            return httpx.Response(200)
+        if request.url.path.startswith("/status/"):
+            return httpx.Response(200, json={"task_id": "result", "status": "completed"})
+        result = invalid_result
+        if recover and paths.count("/results/result") == 2:
+            result = {"task_id": "result", "status": "completed", "compiled": True, "correctness": True}
+        return httpx.Response(200, json=result)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "result"}, 1, 3, 0)
+        assert paths.count("/evaluate") == 1
+        if recover:
+            assert result["status"] == "completed" and result["task_id"] == "result"
+            assert paths.count("/results/result") == 2
+        else:
+            assert result["status"] == "failed"
+            assert result["metadata"]["kernel_eval_infrastructure_failure"]
+            assert paths.count("/results/result") == 3
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["failed", "timeout", "cancelled"])
+def test_kernel_eval_keeps_result_verdict_when_status_snapshot_differs(local_eval_worker, status):
+    worker, _, _ = local_eval_worker
+
+    async def handler(request):
+        if request.method == "POST":
+            return httpx.Response(200)
+        if request.url.path.startswith("/status/"):
+            return httpx.Response(200, json={"status": "completed"})
+        return httpx.Response(200, json={"task_id": "verdict", "status": status, "error_message": "kernel failed"})
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as worker._client:
+            result = await worker.submit_and_poll({"task_id": "verdict"}, 1, 3, 0)
+        assert result["status"] == status
+        assert result["error_message"] == "kernel failed"
+        assert not result.get("metadata", {}).get("kernel_eval_infrastructure_failure")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+def test_rejected_submission_is_not_cancelled_by_later_trajectory_timeout(monkeypatch):
+    sample = Sample(metadata={"task_id": "conflict", "kernel_eval_submission_rejected": True})
+
+    async def impl(*args):
+        raise TimeoutError
+
+    async def cancel(*args, **kwargs):
+        pytest.fail("A rejected submission must not cancel another task")
+
+    monkeypatch.setattr(generate_with_cuda_agent, "_generate_impl", impl)
+    monkeypatch.setattr(generate_with_cuda_agent, "cancel_kernel_eval", cancel)
+    monkeypatch.setattr(generate_with_cuda_agent, "_abort_result", lambda *args: sample)
+    assert asyncio.run(generate_with_cuda_agent.generate(SimpleNamespace(), sample, {})) is sample
+
+
+@pytest.mark.unit
+def test_kernel_eval_propagates_and_resets_submission_rejection(local_eval_worker, monkeypatch):
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response, "_ENDPOINT_NEXT", {})
+    calls = []
+
+    async def submit(*args, **kwargs):
+        calls.append(None)
+        if len(calls) == 1:
+            return kernel_response._client_eval_failure("HTTP 409", submission_rejected=True)
+        return {"status": "completed", "correctness": True}
+
+    worker = SimpleNamespace(submit_and_poll=_LocalEvalRPC(submit))
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lambda *args: worker)
+    config = {
+        "kernel_eval_client_timeout": 1,
+        "kernel_eval_max_retries": 3,
+        "kernel_eval_poll_interval": 0,
+        "kernel_eval_heartbeat_interval": 0,
+        "kernel_eval_rate_limit": 1,
+    }
+
+    async def scenario():
+        sample = Sample()
+        args = SimpleNamespace(kernel_env_url="http://eval.test")
+        await kernel_response.run_kernel_eval(args, sample, {"task_id": "rejected"}, config)
+        assert sample.metadata["kernel_eval_submission_rejected"]
+        await kernel_response.run_kernel_eval(args, sample, {"task_id": "new"}, config)
+        assert not sample.metadata.get("kernel_eval_submission_rejected")
 
     asyncio.run(scenario())
 
@@ -2380,10 +2743,62 @@ def test_kernel_env_urls_cli_and_legacy_fallback():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("outcome", ["complete", "error", "cancel"])
-def test_kernel_env_pool_balances_and_keeps_task_affinity(monkeypatch, outcome):
+@pytest.mark.parametrize("pool_size,start", [(1, 0), (2, 0), (2, 1), (3, 2)])
+def test_kernel_env_round_robin_wraps_and_preserves_independent_pool_cursors(monkeypatch, pool_size, start):
     monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
-    monkeypatch.setattr(kernel_response._ENDPOINT_RANDOM, "choice", lambda urls: urls[0])
+    monkeypatch.setattr(kernel_response, "_ENDPOINT_NEXT", {})
+    random_draws, selected = [], {}
+
+    def initial_offset(size):
+        random_draws.append(size)
+        return start
+
+    monkeypatch.setattr(kernel_response._ENDPOINT_RANDOM, "randrange", initial_offset)
+
+    def worker_for(args, config):
+        async def submit(payload, **kwargs):
+            selected[payload["task_id"]] = args.kernel_env_url
+            return {"status": "completed"}
+
+        return SimpleNamespace(submit_and_poll=_LocalEvalRPC(submit))
+
+    monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", worker_for)
+    config = {
+        "kernel_eval_client_timeout": 5,
+        "kernel_eval_max_retries": 1,
+        "kernel_eval_poll_interval": 0.01,
+        "kernel_eval_heartbeat_interval": 0,
+        "kernel_eval_rate_limit": 1,
+    }
+    urls = [f"http://a{i}" for i in range(pool_size)]
+    other_urls = [f"http://b{i}" for i in range(pool_size)]
+
+    async def scenario():
+        for i in range(7):
+            # Trailing slashes and duplicate URLs must not create a new cursor.
+            raw_urls = [url + "/" for url in urls] + urls if i % 2 else urls
+            await asyncio.gather(
+                kernel_response.run_kernel_eval(
+                    SimpleNamespace(kernel_env_urls=raw_urls), Sample(), {"task_id": f"a{i}"}, config
+                ),
+                kernel_response.run_kernel_eval(
+                    SimpleNamespace(kernel_env_urls=other_urls), Sample(), {"task_id": f"b{i}"}, config
+                ),
+            )
+            assert not kernel_response._ACTIVE_EVALS
+        assert [selected[f"a{i}"] for i in range(7)] == [urls[(start + i) % pool_size] for i in range(7)]
+        assert [selected[f"b{i}"] for i in range(7)] == [other_urls[(start + i) % pool_size] for i in range(7)]
+        assert random_draws == [pool_size, pool_size]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["complete", "error", "cancel"])
+def test_kernel_env_pool_round_robins_and_keeps_task_affinity(monkeypatch, outcome):
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response, "_ENDPOINT_NEXT", {})
+    monkeypatch.setattr(kernel_response._ENDPOINT_RANDOM, "randrange", lambda size: 0)
     selected, pending, cleaned = {}, {}, []
     config = {
         "kernel_eval_client_timeout": 5,
@@ -2422,8 +2837,9 @@ def test_kernel_env_pool_balances_and_keeps_task_affinity(monkeypatch, outcome):
         await tasks[1]
         tasks.append(asyncio.create_task(kernel_response.run_kernel_eval(args, samples[2], {"task_id": "2"}, config)))
         await asyncio.sleep(0)
-        assert selected["2"] == "http://b"
-        assert samples[2].metadata["kernel_eval_server_url"] == "http://b"
+        # A is still busy and B is idle; round-robin must still return to A.
+        assert selected["2"] == "http://a"
+        assert samples[2].metadata["kernel_eval_server_url"] == "http://a"
         assert args.kernel_env_url is None
         if outcome == "error":
             pending["2"].set_exception(RuntimeError("backend failed"))
@@ -2438,7 +2854,7 @@ def test_kernel_env_pool_balances_and_keeps_task_affinity(monkeypatch, outcome):
             pending["2"].set_result({"status": "completed"})
             await tasks[2]
         if outcome != "complete":
-            assert cleaned and all(item == ("http://b", "2") for item in cleaned)
+            assert cleaned and all(item == ("http://a", "2") for item in cleaned)
         pending["0"].set_result({"status": "completed"})
         await tasks[0]
         assert not kernel_response._ACTIVE_EVALS
@@ -2476,6 +2892,7 @@ def test_kernel_env_routing_preserves_reward_random_state(monkeypatch):
     # Execute the actual routing path, including with a single URL. A global
     # random draw here would perturb coverage rejection sampling downstream.
     monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response, "_ENDPOINT_NEXT", {})
     monkeypatch.setattr(kernel_response, "_get_kernel_eval_worker", lambda *args: None)
 
     async def cleanup(*args):
@@ -2528,6 +2945,144 @@ def test_kernel_env_workers_share_limiter_only_for_same_endpoint(monkeypatch):
             for worker in workers:
                 await worker._client.aclose()
                 await worker._control_client.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", ["complete", "cancel"])
+def test_kernel_env_pool_routes_real_http_and_keeps_retries_and_cancel_local(monkeypatch, outcome):
+    from aiohttp import web
+
+    worker_cls = kernel_response._HybridHttpWorker.__ray_metadata__.modified_class
+    limiter_cls = kernel_response._TokenBucketWorker.__ray_metadata__.modified_class
+    monkeypatch.setattr(kernel_response, "_WORKERS", {})
+    monkeypatch.setattr(kernel_response, "_ACTIVE_EVALS", {})
+    monkeypatch.setattr(kernel_response, "_ensure_ray_initialized", lambda: None)
+    monkeypatch.setattr(kernel_response, "_ENDPOINT_NEXT", {})
+    monkeypatch.setattr(kernel_response._ENDPOINT_RANDOM, "randrange", lambda size: 0)
+    monkeypatch.setattr(kernel_response.ray, "cancel", lambda ref, **kwargs: ref.cancel())
+    workers, limiters = [], {}
+
+    def limiter_options(*, name, get_if_exists):
+        def remote(rate):
+            if name not in limiters:
+                limiter = limiter_cls(rate)
+                limiters[name] = SimpleNamespace(
+                    **{
+                        method: _LocalEvalRPC(getattr(limiter, method))
+                        for method in ("acquire", "release", "get_current_count")
+                    }
+                )
+            return limiters[name]
+
+        return SimpleNamespace(remote=remote)
+
+    def worker_options(**kwargs):
+        def remote(*args):
+            worker = worker_cls(*args)
+            worker._backoff = lambda *args, **kwargs: 0
+            workers.append(worker)
+            return SimpleNamespace(
+                **{method: _LocalEvalRPC(getattr(worker, method)) for method in ("submit_and_poll", "invalidate")}
+            )
+
+        return SimpleNamespace(remote=remote)
+
+    monkeypatch.setattr(kernel_response._TokenBucketWorker, "options", limiter_options)
+    monkeypatch.setattr(kernel_response._HybridHttpWorker, "options", worker_options)
+
+    async def scenario():
+        runners, urls, tasks = [], [], []
+        requests = []
+        payloads = [{}, {}]
+        completed, retried, first_submitted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        try:
+            for index in range(2):
+
+                async def handler(request, index=index):
+                    task_id = request.match_info.get("task_id")
+                    if request.path == "/evaluate":
+                        payload = await request.json()
+                        task_id = payload["task_id"]
+                        history = payloads[index].setdefault(task_id, [])
+                        history.append(payload)
+                        requests.append((index, request.method, request.path, task_id))
+                        if index == 1 and len(history) == 1:
+                            return web.Response(status=503)
+                        if index == 1:
+                            retried.set()
+                            return web.Response(status=409, text="already submitted")
+                        first_submitted.set()
+                        return web.json_response({"task_id": task_id})
+                    requests.append((index, request.method, request.path, task_id))
+                    assert task_id in payloads[index], "poll/results/cancel reached the wrong service"
+                    if request.method == "DELETE":
+                        return web.json_response({"status": "cancelled"})
+                    if request.path.startswith("/status/"):
+                        return web.json_response({"status": "completed" if completed.is_set() else "running"})
+                    return web.json_response(
+                        {"status": "completed", "task_id": task_id, "server_index": index, "correctness": True}
+                    )
+
+                app = web.Application()
+                app.router.add_post("/evaluate", handler)
+                app.router.add_get("/status/{task_id}", handler)
+                app.router.add_get("/results/{task_id}", handler)
+                app.router.add_delete("/tasks/{task_id}", handler)
+                runner = web.AppRunner(app)
+                await runner.setup()
+                runners.append(runner)
+                site = web.TCPSite(runner, "127.0.0.1", 0)
+                await site.start()
+                urls.append(f"http://127.0.0.1:{runner.addresses[0][1]}")
+            config = {
+                "kernel_eval_client_timeout": 10,
+                "kernel_eval_task_timeout": 10,
+                "kernel_eval_worker_max_concurrency": 2,
+                "kernel_eval_rate_limit": 1,
+                "kernel_eval_acquire_timeout": 2,
+                "kernel_eval_cancel_timeout": 2,
+                "kernel_eval_max_retries": 2,
+                "kernel_eval_poll_interval": 0.01,
+                "kernel_eval_heartbeat_interval": 0,
+            }
+            args = SimpleNamespace(kernel_env_url=" ".join(urls))
+            samples = [Sample(), Sample()]
+            tasks = [
+                asyncio.create_task(kernel_response.run_kernel_eval(args, sample, {"task_id": f"task_{i}"}, config))
+                for i, sample in enumerate(samples)
+            ]
+            await asyncio.wait_for(asyncio.gather(first_submitted.wait(), retried.wait()), 5)
+            assert [sample.metadata["kernel_eval_server_url"] for sample in samples] == urls
+            assert args.kernel_env_url == " ".join(urls)
+            assert len(workers) == len(limiters) == 2
+            assert list(payloads[0]) == ["task_0"]
+            assert list(payloads[1]) == ["task_1"]
+            assert payloads[1]["task_1"][0] == payloads[1]["task_1"][1]
+            if outcome == "cancel":
+                tasks[0].cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await tasks[0]
+                deletes = [(index, task_id) for index, method, _, task_id in requests if method == "DELETE"]
+                assert deletes and all(item == (0, "task_0") for item in deletes)
+            completed.set()
+            if outcome == "complete":
+                result = await tasks[0]
+                assert result["env_state"]["server_index"] == 0
+            result = await tasks[1]
+            assert result["env_state"]["server_index"] == 1
+            assert not kernel_response._ACTIVE_EVALS
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            for worker in workers:
+                await worker._client.aclose()
+                await worker._control_client.aclose()
+            for runner in runners:
+                await runner.cleanup()
 
     asyncio.run(scenario())
 

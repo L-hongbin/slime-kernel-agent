@@ -612,5 +612,5 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${KERNEL_AGENT_ARGS[@]} \
+   "${KERNEL_AGENT_ARGS[@]}" \
    ${CUSTOM_ARGS[@]}

@@ -416,7 +416,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck
@@ -494,5 +494,5 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${KERNEL_AGENT_ARGS[@]} \
+   "${KERNEL_AGENT_ARGS[@]}" \
    ${CUSTOM_ARGS[@]}

@@ -6,7 +6,7 @@ EXP_NAME="qwen3_14B_cuda_rl_fully_async"
 HF_MODEL_PATH="/nfs/FM/checkpoints/Qwen/Qwen3-14B/"
 MEGATRON_MODEL_PATH="/nfs/FM/checkpoints/Qwen/Qwen3-14B_torch_dist/"
 RL_DATA="/nfs/FM/lihongbin/datasets/CUDA_RL/RL_Data/prompt_v4/drkernel_rl_thinking.parquet"
-KERNEL_ENV_URL="http://127.0.0.1:8002"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://127.0.0.1:8002}"
 NCCL_SOCKET_IFNAME="ens22f0"
 GLOO_SOCKET_IFNAME="ens22f0"
 
@@ -230,7 +230,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend cuda_agent
    --reference-backend torch
    --do-precheck
@@ -285,5 +285,5 @@ ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    ${PERF_ARGS[@]} \
    ${SGLANG_ARGS[@]} \
    ${MISC_ARGS[@]} \
-   ${KERNEL_AGENT_ARGS[@]} \
+   "${KERNEL_AGENT_ARGS[@]}" \
    ${CUSTOM_ARGS[@]}

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import os
+import re
 import subprocess
 import sys
 from copy import deepcopy
@@ -354,6 +356,132 @@ def test_health_rejects_invalid_combined_urls(value):
     args = health.parse_args(["--url", value])
     with pytest.raises(ValueError):
         health.asyncio.run(health.run(args))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("launcher", ["WarmUp", "MultiTurn"])
+@pytest.mark.parametrize("env_key", ["KERNEL_ENV_URL", "KERNEL_ENV_URLS"])
+@pytest.mark.parametrize("separator", [" ", ","])
+def test_launcher_preserves_multiple_urls_in_ray_entrypoint(launcher, env_key, separator):
+    script = (REPO_ROOT / f"examples/kernel_agent/run_qwen3.8_27B_{launcher}.sh").read_text()
+    # Execute the real URL parsing, argument array, and final Ray submission.
+    # Stub Ray itself so no cluster or training process is started.
+    url_config = script[script.index("KERNEL_ENV_URL=") : script.index("LOSS_MODE=")]
+    kernel_args = re.search(r"^KERNEL_AGENT_ARGS=\(\n.*?^\)", script, re.MULTILINE | re.DOTALL).group()
+    ray_submit = script[script.rindex("ray job submit ") :]
+    urls = ["http://192.168.116.76:20111", "http://192.168.116.14:20111"]
+    env = {key: value for key, value in os.environ.items() if key not in {"KERNEL_ENV_URL", "KERNEL_ENV_URLS"}}
+    env[env_key] = separator.join(urls)
+    # Binary NUL separators preserve shell argument boundaries, including spaces.
+    stub = 'ray() { printf "%s\\0" "$@"; }\n'
+    result = subprocess.run(
+        ["bash", "-c", stub + url_config + "\n" + kernel_args + "\n" + ray_submit],
+        env=env,
+        capture_output=True,
+        check=True,
+    )
+    argv = result.stdout.decode().rstrip("\0").split("\0")
+    # Ray's job CLI uses list2cmdline to construct the entrypoint command.
+    entrypoint = subprocess.list2cmdline(argv[argv.index("--") + 1 :])
+    captured = subprocess.run(
+        ["bash", "-c", 'python3() { printf "%s\\0" "$@"; }; ' + entrypoint],
+        capture_output=True,
+        check=True,
+    )
+    training_argv = captured.stdout.decode().rstrip("\0").split("\0")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kernel-env-url")
+    parsed, unknown = parser.parse_known_args(training_argv)
+    assert parsed.kernel_env_url.split() == urls
+    assert not any(url in unknown for url in urls)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "launcher",
+    [
+        path.relative_to(REPO_ROOT).as_posix()
+        for path in sorted((REPO_ROOT / "examples/kernel_agent").rglob("*.sh"))
+        if "KERNEL_AGENT_ARGS=(" in path.read_text() and "ray job submit " in path.read_text()
+    ],
+)
+@pytest.mark.parametrize("separator", [" ", ","])
+def test_kernel_launchers_keep_url_argument_intact(launcher, separator):
+    script = (REPO_ROOT / launcher).read_text()
+    kernel_args = re.search(r"^KERNEL_AGENT_ARGS=\(\n.*?^\)", script, re.MULTILINE | re.DOTALL).group()
+    submit_lines = []
+    for line in script[script.rindex("ray job submit ") :].splitlines():
+        submit_lines.append(line)
+        if not line.rstrip().endswith("\\"):
+            break
+    urls = ["http://192.168.116.76:20111", "http://192.168.116.14:20111"]
+    setup = 'ray() { printf "%s\\0" "$@"; }; KERNEL_ENV_ENDPOINTS=("$1" "$2");\n'
+    url_config = re.search(r"^KERNEL_ENV_URL=.*$", script, re.MULTILINE).group()
+    result = subprocess.run(
+        ["bash", "-c", setup + url_config + "\n" + kernel_args + "\n" + "\n".join(submit_lines), "test", *urls],
+        env={**os.environ, "KERNEL_ENV_URL": separator.join(urls)},
+        capture_output=True,
+        check=True,
+    )
+    argv = result.stdout.decode().rstrip("\0").split("\0")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--kernel-env-url")
+    parsed, unknown = parser.parse_known_args(argv[argv.index("--") + 1 :])
+    assert parsed.kernel_env_url.replace(",", " ").split() == urls
+    assert not any(url in unknown for url in urls)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("launcher", ["eval.t1.qwen3.6.27B.sh", "eval.t1.musacoder.27B.sh"])
+@pytest.mark.parametrize("separator", [" ", ","])
+def test_legacy_eval_preflight_passes_all_urls_to_health_checker(launcher, separator):
+    script = (REPO_ROOT / "examples/kernel_agent/eval" / launcher).read_text()
+    preflight = script[script.index("# preflight:") : script.index("# clean any prior ray")]
+    urls = ["http://127.0.0.1:20111", "http://127.0.0.1:20112"]
+    result = subprocess.run(
+        ["bash", "-c", 'python3() { printf "%s\\0" "$@"; };\n' + preflight],
+        env={
+            **os.environ,
+            "REPO_ROOT": str(REPO_ROOT),
+            "KERNEL_ENV_URL": separator.join(urls),
+            "SKIP_KERNELGYM_HEALTH": "0",
+        },
+        capture_output=True,
+        check=True,
+    )
+    argv = result.stdout.decode().rstrip("\0").split("\0")
+    assert argv[0] == str(REPO_ROOT / "scripts/check_kernelgym_health.py")
+    assert health.parse_args(argv[1:]).url.replace(",", " ").split() == urls
+
+
+@pytest.mark.unit
+def test_remote_host_preflight_preserves_multiple_url_argument():
+    script = (REPO_ROOT / "examples/kernel_agent/run.t1.qwen3.6.27B.fasync.sh").read_text()
+    functions = "\n".join(
+        re.search(rf"^{name}\(\) \{{\n.*?^\}}", script, re.MULTILINE | re.DOTALL).group()
+        for name in ("host_resource_check_args", "check_remote_host_resources")
+    )
+    # ssh joins its command arguments with spaces and the remote shell parses
+    # the result again. Capture the final bash invocation after that round trip.
+    stub = """run_ssh() {
+   shift 2
+   case "$*" in "cat > "*) return ;; esac
+   bash -s -- "$*" <<'REMOTE'
+bash() { printf '%s\\0' "$@"; }
+eval "$1"
+REMOTE
+}
+"""
+    urls = "http://127.0.0.1:20111 http://127.0.0.1:20112"
+    result = subprocess.run(
+        ["bash", "-c", stub + functions + '\ncheck_remote_host_resources host 22 "worker test"'],
+        env={**os.environ, "REPO_ROOT": str(REPO_ROOT), "KERNEL_ENV_URL": urls, "PYTHON_BIN": "python3"},
+        capture_output=True,
+        check=True,
+    )
+    argv = result.stdout.decode().rstrip("\0").split("\0")
+    assert argv[argv.index("--kernelgym-url") + 1] == urls
+    assert argv[argv.index("--label") + 1] == "worker test"
 
 
 if __name__ == "__main__":

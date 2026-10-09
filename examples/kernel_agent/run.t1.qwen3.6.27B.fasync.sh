@@ -55,7 +55,7 @@ N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-16}
 GLOBAL_BATCH_SIZE=$((ROLLOUT_BATCH_SIZE * N_SAMPLES_PER_PROMPT))
 MODEL_NAME="Qwen3.6-27B"
 KERNEL_BACKEND="tvm_ffi"
-KERNEL_ENV_URL="http://127.0.0.1:20211"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://127.0.0.1:20211}"
 
 
 HF_MODEL_PATH="/nfs/FM/chenshuailin/checkpoints/Qwen/Qwen3.6-27B"
@@ -262,7 +262,9 @@ check_remote_host_resources() {
    run_ssh "${host}" "${port}" "cat > ${remote_health_script}" \
       < "${REPO_ROOT}/scripts/check_kernelgym_health.py"
    host_resource_check_args args "${remote_health_script}"
-   run_ssh "${host}" "${port}" bash -s -- --label "${label}" "${args[@]}" \
+   local remote_command
+   printf -v remote_command '%q ' bash -s -- --label "${label}" "${args[@]}"
+   run_ssh "${host}" "${port}" "${remote_command}" \
       < "${REPO_ROOT}/scripts/check_host_resources.sh"
 }
 
@@ -506,7 +508,7 @@ if [[ "${DEBUG_ROLLOUT_ONLY}" == "1" ]]; then
 fi
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend $KERNEL_BACKEND
    --reference-backend torch
    --do-precheck

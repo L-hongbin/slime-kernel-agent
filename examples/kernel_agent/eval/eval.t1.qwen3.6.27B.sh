@@ -34,7 +34,7 @@ if [ ! -f "${EVAL_HF_CKPT}/config.json" ]; then
    exit 1
 fi
 EVAL_DATA=${EVAL_DATA:-${REPO_ROOT}/Data/kernelbench-level1-validation-tvm-v2/train.parquet}
-KERNEL_ENV_URL="http://127.0.0.1:20211"
+KERNEL_ENV_URL="${KERNEL_ENV_URL:-http://127.0.0.1:20211}"
 KERNEL_BACKEND="tvm_ffi"
 N_SAMPLES_PER_EVAL_PROMPT=${N_SAMPLES_PER_EVAL_PROMPT:-8}
 MAX_CONTEXT_LEN=${MAX_CONTEXT_LEN:-38000}
@@ -69,7 +69,8 @@ echo "KERNEL_ENV_URL=${KERNEL_ENV_URL}"
 echo "DUMP_DIR=${DUMP_DIR}"
 
 # preflight: KernelGym health on this node/port
-if ! curl -s --max-time 5 "${KERNEL_ENV_URL}/health" -o /dev/null -w '%{http_code}' | grep -q 200; then
+if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
+   --url "${KERNEL_ENV_URL}" --timeout 5 --attempts 1; then
    echo "KernelGym health check failed at ${KERNEL_ENV_URL}" >&2
    exit 1
 fi
@@ -110,7 +111,7 @@ CUSTOM_ARGS=(
 )
 
 KERNEL_AGENT_ARGS=(
-   --kernel-env-url ${KERNEL_ENV_URL}
+   --kernel-env-url "${KERNEL_ENV_URL}"
    --kernel-backend ${KERNEL_BACKEND}
    --reference-backend torch
    --do-precheck

@@ -21,6 +21,7 @@ from slime.utils.types import Sample
 
 _TASK_COUNTER = 0
 _ENDPOINT_RANDOM = random.SystemRandom()
+_ENDPOINT_NEXT: dict[tuple[str, ...], int] = {}
 _WORKERS: dict[tuple[str, int, int, int, int], Any] = {}
 
 
@@ -46,6 +47,18 @@ _HEARTBEAT_STARTED_AT = time.time()
 # because an overloaded /evaluate can enqueue the task quickly yet be slow to send
 # the HTTP response -- a too-short value here just triggers redundant polling.
 _SUBMIT_READ_TIMEOUT_S = 60
+
+
+def _client_eval_failure(error_message: str, *, status: str = "failed", submission_rejected: bool = False):
+    """Client failures have no reliable kernel verdict and must not train the policy."""
+    return {
+        "status": status,
+        "error_message": error_message,
+        "metadata": {
+            "kernel_eval_infrastructure_failure": True,
+            "kernel_eval_submission_rejected": submission_rejected,
+        },
+    }
 
 
 def next_kernel_task_id(prefix: str = "parallel_task") -> str:
@@ -188,12 +201,28 @@ class _HybridHttpWorker:
     def _is_duplicate_response(response: Any) -> bool:
         """Best-effort detection of an 'already accepted' response (e.g. HTTP 400/422
         with a duplicate message) so a resubmit of an already-enqueued task_id is
-        polled rather than treated as a hard failure. HTTP 409 is handled directly."""
+        polled rather than treated as a hard failure. Conflicts are never duplicates."""
         if getattr(response, "status_code", None) not in (400, 409, 422):
             return False
         try:
             body = response.text.lower()
         except Exception:
+            return False
+        if any(
+            marker in body
+            for marker in (
+                "incompatible",
+                "conflict",
+                "mismatch",
+                "different",
+                "replaced",
+                "another generation",
+                "unavailable",
+                "cancelled",
+                "canceled",
+                "use a new id",
+            )
+        ):
             return False
         return any(m in body for m in ("already exists", "already submitted", "already running", "duplicate"))
 
@@ -246,18 +275,18 @@ class _HybridHttpWorker:
         deadline = time.time() + client_timeout if deadline is None else deadline
         with self._lock:
             if task_id in self._invalidated:
-                return {"status": "cancelled", "error_message": "Kernel eval call invalidated before execution"}
+                return _client_eval_failure("Kernel eval call invalidated before execution", status="cancelled")
             if time.time() >= deadline:
-                return {"status": "timeout", "error_message": "Kernel eval deadline expired in Ray queue"}
+                return _client_eval_failure("Kernel eval deadline expired in Ray queue", status="timeout")
             self._running[task_id] = (asyncio.get_running_loop(), asyncio.current_task())
             self._task_status[task_id] = {"status": "submitting", "seen_at": time.time(), "submitted": False}
         try:
             async with asyncio.timeout(max(0.0, deadline - time.time())):
                 return await self._submit_and_poll(task_data, max_retries, poll_interval, deadline)
         except TimeoutError:
-            return {"status": "timeout", "error_message": f"Task timeout after {client_timeout}s (client-side)"}
+            return _client_eval_failure(f"Task timeout after {client_timeout}s (client-side)", status="timeout")
         except Exception as exc:
-            return {"status": "failed", "error_message": str(exc)}
+            return _client_eval_failure(str(exc))
         finally:
             with self._lock:
                 state = self._task_status[task_id]
@@ -276,6 +305,8 @@ class _HybridHttpWorker:
         submitted_payload = None
         attempt = 0
         unlimited = max_retries is None or max_retries == -1
+        submission_confirmed = False
+        submit_error = "Submission was not confirmed"
         while unlimited or attempt < max(1, max_retries):
             self._check_live(task_id, deadline)
             lease_id = uuid4().hex
@@ -294,7 +325,7 @@ class _HybridHttpWorker:
                                 break
                             await asyncio.sleep(0.05)
                 except TimeoutError:
-                    return {"status": "timeout", "error_message": "rate limiter acquire timeout"}
+                    return _client_eval_failure("rate limiter acquire timeout", status="timeout")
                 self._check_live(task_id, deadline)
                 with self._lock:
                     # Set before the first await in POST: cancellation must cover
@@ -317,14 +348,11 @@ class _HybridHttpWorker:
                         f"{self.server_url}/evaluate", json=submitted_payload, timeout=submit_timeout
                     )
                 print(f"[HybridWorker] POST /evaluate resp={response.status_code} task_id={task_id}")
-            except (httpx.TimeoutException, httpx.ConnectError, TimeoutError) as exc:
-                if unlimited or attempt < max(1, max_retries) - 1:
-                    response = None
-                else:
-                    # A submit timeout can still mean accepted. Preserve polling
-                    # and retrieval of the server's real compilation/error result.
-                    print(f"[HybridWorker] submit transport error task_id={task_id} err={exc!r}; polling")
-                    break
+            except (httpx.TransportError, TimeoutError) as exc:
+                # A transport failure can still mean accepted. Retry the same
+                # payload/ID, then use bounded status recovery if retries run out.
+                response = None
+                submit_error = f"Submit transport error: {exc!r}"
             finally:
                 try:
                     await _shielded_cleanup(
@@ -339,17 +367,33 @@ class _HybridHttpWorker:
 
             self._check_live(task_id, deadline)
             if response is not None:
-                if response.status_code == 409 and "cancelled" in response.text.lower():
-                    return {"status": "cancelled", "error_message": "Server rejected cancelled task ID"}
-                if response.status_code in (200, 409) or self._is_duplicate_response(response):
+                if response.status_code == 200 or self._is_duplicate_response(response):
+                    submission_confirmed = True
                     break
-                if response.status_code not in (429, 503):
+                if 400 <= response.status_code < 500 and response.status_code != 429:
+                    # An explicit rejection gives no ownership of this ID. In
+                    # particular, never delete the original task on a conflict.
+                    with self._lock:
+                        self._task_status[task_id]["submitted"] = False
+                    cancelled = response.status_code == 409 and any(
+                        word in response.text.lower() for word in ("cancelled", "canceled")
+                    )
+                    return _client_eval_failure(
+                        f"Kernel eval submission rejected: HTTP {response.status_code}: {response.text[:1000]}",
+                        status="cancelled" if cancelled else "failed",
+                        submission_rejected=True,
+                    )
+                if response.status_code not in (429, 500, 502, 503, 504):
                     response.raise_for_status()
-            base = 5 if response is not None and response.status_code == 503 else 2
-            await asyncio.sleep(min(self._backoff(attempt, base=base), max(0.0, deadline - time.time())))
+                submit_error = f"Submit returned HTTP {response.status_code}"
             attempt += 1
+            if not unlimited and attempt >= max(1, max_retries):
+                break
+            base = 5 if response is not None and response.status_code == 503 else 2
+            await asyncio.sleep(min(self._backoff(attempt - 1, base=base), max(0.0, deadline - time.time())))
 
         last_status = None
+        recovery_attempts = 0
         while True:
             self._check_live(task_id, deadline)
             try:
@@ -360,7 +404,12 @@ class _HybridHttpWorker:
                     )
                 if status_response.status_code == 200:
                     status_payload = status_response.json()
-                    status = status_payload.get("status", "unknown")
+                    if not isinstance(status_payload, dict) or not status_payload.get("status"):
+                        raise ValueError("Invalid Kernel eval status response")
+                    if status_payload.get("task_id", task_id) != task_id:
+                        raise ValueError("Kernel eval status task_id mismatch")
+                    submission_confirmed = True
+                    status = status_payload["status"]
                     terminal = status in ("completed", "failed", "timeout", "cancelled")
                     with self._lock:
                         self._task_status[task_id].update(status=status, seen_at=time.time(), terminal=terminal)
@@ -369,26 +418,60 @@ class _HybridHttpWorker:
                         print(f"[HybridWorker] STATUS task_id={task_id} -> {status}")
                     if terminal:
                         error_message = status_payload.get("error_message", f"Task {status}")
-                        # Fetch results for all terminal states, retaining compile
-                        # diagnostics on server timeout/cancellation as before.
-                        try:
-                            request_timeout = min(_CONTROL_TIMEOUT_S, max(0.0, deadline - time.time()))
-                            async with asyncio.timeout(request_timeout):
-                                result_response = await self._control_client.get(
-                                    f"{self.server_url}/results/{task_id}", timeout=request_timeout
-                                )
-                            if result_response.status_code == 200:
-                                result = result_response.json()
-                                result["status"] = status
-                                if status != "completed":
-                                    result["error_message"] = result.get("error_message") or error_message
-                                return result
-                        except (httpx.HTTPError, TimeoutError, ValueError):
-                            pass
-                        return {"status": status, "error_message": error_message}
+                        # Terminal status may arrive before results are available.
+                        # Retry retrieval without resubmitting the completed task.
+                        result_attempts = 0
+                        result_error = "Results unavailable"
+                        while unlimited or result_attempts < max(1, max_retries):
+                            self._check_live(task_id, deadline)
+                            try:
+                                request_timeout = min(_CONTROL_TIMEOUT_S, max(0.0, deadline - time.time()))
+                                async with asyncio.timeout(request_timeout):
+                                    result_response = await self._control_client.get(
+                                        f"{self.server_url}/results/{task_id}", timeout=request_timeout
+                                    )
+                                if result_response.status_code == 200:
+                                    result = result_response.json()
+                                    if not isinstance(result, dict) or not result:
+                                        raise ValueError("Invalid Kernel eval results response")
+                                    if result.get("task_id", task_id) != task_id:
+                                        raise ValueError("Kernel eval results task_id mismatch")
+                                    # Older services may omit status/ID; validate
+                                    # them when present and honor the result's verdict.
+                                    result_status = result.get("status", status)
+                                    if result_status not in ("completed", "failed", "timeout", "cancelled"):
+                                        raise ValueError("Kernel eval results are not terminal")
+                                    if result_status == "completed" and not any(
+                                        isinstance(result.get(key), bool) for key in ("compiled", "correctness")
+                                    ):
+                                        raise ValueError("Completed Kernel eval results lack a kernel verdict")
+                                    result["status"] = result_status
+                                    if result_status != "completed":
+                                        result["error_message"] = result.get("error_message") or (
+                                            error_message if result_status == status else f"Task {result_status}"
+                                        )
+                                    return result
+                                result_error = f"HTTP {result_response.status_code}"
+                            except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+                                result_error = repr(exc)
+                            result_attempts += 1
+                            if unlimited or result_attempts < max(1, max_retries):
+                                await asyncio.sleep(min(poll_interval, max(0.0, deadline - time.time())))
+                        return _client_eval_failure(
+                            f"Unable to retrieve Kernel eval results after {result_attempts} attempts "
+                            f"(server status={status}): {result_error}; {error_message}",
+                            status="failed" if status == "completed" else status,
+                        )
                 # 404 is not evidence of completion or successful cancellation.
             except (httpx.HTTPError, TimeoutError, ValueError):
                 pass
+            if not submission_confirmed:
+                recovery_attempts += 1
+                if not unlimited and recovery_attempts >= max(1, max_retries):
+                    return _client_eval_failure(
+                        f"{submit_error}; task existence could not be confirmed after "
+                        f"{recovery_attempts} status checks"
+                    )
             await asyncio.sleep(min(poll_interval, max(0.0, deadline - time.time())))
 
 
@@ -650,20 +733,27 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
     if trajectory_deadline is not None:
         deadline = min(deadline, trajectory_deadline)
     urls = _kernel_env_urls(args, config)
-    # Selection and registration contain no await, so concurrent coroutines in
-    # this rollout process see earlier reservations, including queued work.
-    loads = {url: 0 for url in urls}
-    for url, _ in _ACTIVE_EVALS:
-        if url in loads:
-            loads[url] += 1
-    minimum = min(loads.values())
-    server_url = _ENDPOINT_RANDOM.choice([url for url in urls if loads[url] == minimum])
+    # Each URL pool has a process-local cursor. Advance before any await so
+    # concurrent tasks take consecutive turns, regardless of completion order.
+    # Randomize only the initial offset to spread different rollout processes.
+    pool = tuple(urls)
+    endpoint_index = _ENDPOINT_NEXT.get(pool)
+    if endpoint_index is None:
+        endpoint_index = _ENDPOINT_RANDOM.randrange(len(urls))
+    server_url = urls[endpoint_index]
+    _ENDPOINT_NEXT[pool] = (endpoint_index + 1) % len(urls)
     task_id = payload["task_id"]
     sample.metadata = dict(sample.metadata or {})
     sample.metadata["kernel_eval_server_url"] = server_url
+    sample.metadata.pop("kernel_eval_submission_rejected", None)
     worker_args = copy(args)
     worker_args.kernel_env_url = server_url
-    logger.info("Kernel eval event=assigned task_id=%s server_url=%s pending=%s", task_id, server_url, minimum)
+    logger.info(
+        "Kernel eval event=assigned task_id=%s server_url=%s strategy=round_robin endpoint_index=%s",
+        task_id,
+        server_url,
+        endpoint_index,
+    )
     call = _EvalCall(task_id, deadline)
     _ACTIVE_EVALS[(server_url, task_id)] = call
     try:
@@ -693,6 +783,8 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
             rate_limit=int(_kernel_eval_param(args, config, "kernel_eval_rate_limit")),
             timeout=min(client_timeout - (time.monotonic() - started), deadline - time.time()),
         )
+        if (result.get("metadata") or {}).get("kernel_eval_submission_rejected"):
+            sample.metadata["kernel_eval_submission_rejected"] = True
         return {"env_state": result}
     except BaseException as exc:
         call.invalidated = True
@@ -705,7 +797,7 @@ async def run_kernel_eval(args, sample: Sample, payload: dict[str, Any], config:
         if isinstance(exc, TimeoutError):
             return {
                 "env_state": _format_env_return(
-                    {"status": "timeout", "error_message": f"Task timeout after {client_timeout}s (client-side)"},
+                    _client_eval_failure(f"Task timeout after {client_timeout}s (client-side)", status="timeout"),
                     payload,
                 )
             }
