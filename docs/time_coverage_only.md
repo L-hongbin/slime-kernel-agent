@@ -80,3 +80,23 @@ python scripts/check_kernelgym_health.py --url "http://host-a:20111 http://host-
 ```
 
 Training accepts `--kernel-env-url "http://host-a:20111 http://host-b:20111"`. The Qwen3.8 WarmUp and MultiTurn launchers also accept multiple addresses in `KERNEL_ENV_URL`. The older plural options and environment variables remain supported; `KERNEL_ENV_URLS` takes precedence when set. Health checks require matching GPU hardware and, when every endpoint reports it, matching KernelGym versions.
+
+## LM head implementation
+
+`--lm-head-impl {normal,flatten}` selects the Megatron actor LM-head matrix multiplication implementation, independently of `--enable-fp32-lm-head`. The default is `normal`, preserving this branch's existing behavior.
+
+- `normal`: preserve the input dimensions and use the original projection. A native head keeps Megatron's implementation; an FP32 head uses `torch.matmul` with FP32 operands.
+- `flatten`: reshape token/batch dimensions into a matrix and use `torch.mm` in both the forward projection and input-gradient computation. Native heads retain their computation dtype; FP32 heads use FP32 operands. Native flatten mode requires Megatron's `ColumnParallelLinear._forward_impl` hook.
+
+The implementation choice applies to the actor head, including its log-probability forward passes. It does not configure the SGLang rollout head. The flatten output owns its storage to support Megatron/MTP cross entropy that modifies logits in place.
+
+The Qwen3.8 WarmUp and MultiTurn launchers accept `LM_HEAD_IMPL`, defaulting to `normal`, and pass it as `--lm-head-impl`. `USE_FP32HEAD` independently controls FP32 projection:
+
+```bash
+LM_HEAD_IMPL=flatten bash examples/kernel_agent/run_qwen3.8_27B_WarmUp.sh
+USE_FP32HEAD=false LM_HEAD_IMPL=flatten bash examples/kernel_agent/run_qwen3.8_27B_WarmUp.sh
+```
+
+Only when `USE_FP32HEAD=true` and `LM_HEAD_IMPL=flatten` does the experiment name append `Fp32HeadFlatten`. Normal mode retains the existing FP32-head label. Native-head flatten mode does not add a Flatten label.
+
+Flatten can avoid batched GEMV paths for some noncontiguous inputs. Speedups depend on actual tensor layouts and hardware; normal and flatten need not produce bitwise-identical results.

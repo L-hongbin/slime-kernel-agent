@@ -72,6 +72,7 @@ LOSS_MODE="${LOSS_MODE:-dppoTV}"
 USE_ROLLOUT_LOGPROBS="${USE_ROLLOUT_LOGPROBS:-"true"}"
 
 USE_FP32HEAD="${USE_FP32HEAD:-"true"}"
+LM_HEAD_IMPL="${LM_HEAD_IMPL:-normal}"
 CALC_LOSS_MODE="${CALC_LOSS_MODE:-"PerSample"}"
 USE_CTM="${USE_CTM:-"false"}"
 
@@ -177,8 +178,18 @@ if [ "$USE_CTM" != "false" ]; then
    )
 fi
 
+case "$LM_HEAD_IMPL" in
+   normal|flatten) ;;
+   *) echo "LM_HEAD_IMPL must be normal or flatten." >&2; exit 1 ;;
+esac
+EXP_ARGS+=(--lm-head-impl "$LM_HEAD_IMPL")
+
 if [[ $USE_FP32HEAD == "true" ]]; then
-   EXP_PARAM+="Fp32Head"
+   if [[ "$LM_HEAD_IMPL" == flatten ]]; then
+      EXP_PARAM+="Fp32HeadFlatten"
+   else
+      EXP_PARAM+="Fp32Head"
+   fi
    EXP_ARGS+=(
       --enable-fp32-lm-head
    )

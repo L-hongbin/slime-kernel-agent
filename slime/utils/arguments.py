@@ -839,6 +839,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--lm-head-impl",
+                choices=("normal", "flatten"),
+                default="normal",
+                help=(
+                    "Megatron actor LM-head projection: normal preserves native input dimensions; "
+                    "flatten uses 2D GEMM for forward and input gradients. Applies with or without "
+                    "--enable-fp32-lm-head; does not change SGLang rollout computation."
+                ),
+            )
+            parser.add_argument(
                 "--only-train-params-name-list",
                 type=str,
                 nargs="*",

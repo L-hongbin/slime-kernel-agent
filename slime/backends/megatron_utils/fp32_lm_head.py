@@ -1,10 +1,8 @@
-"""FP32 vocab projection for Megatron actor LM heads.
+"""Normal/flatten vocab projections and optional FP32 math for Megatron LM heads.
 
-This module patches Megatron's actor ``output_layer`` in-place without changing
-the parameter dtype.  The output-layer parameter remains bf16/fp16 for the
-distributed optimizer, checkpoint save/resume, and Megatron-to-HF export; only
-the hidden states and output weight used by the final vocab-projection GEMM are
-temporarily upcast to fp32.
+Parameter dtypes and checkpoint layouts are preserved. Native normal heads use
+Megatron unchanged; native flatten heads replace only the local projection hook.
+FP32 heads upcast projection operands while retaining the original parameters.
 """
 
 from __future__ import annotations
@@ -13,7 +11,7 @@ from types import MethodType
 
 import torch
 from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.tensor_parallel.layers import dist_all_gather_func, dist_reduce_scatter_func
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, dist_all_gather_func, dist_reduce_scatter_func
 from megatron.core.tensor_parallel.mappings import (
     copy_to_tensor_model_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -37,8 +35,8 @@ except ImportError:
     _HAVE_TE = False
 
 
-class _FP32LmHeadLinear(torch.autograd.Function):
-    """Column-parallel linear with fp32 forward GEMM and Megatron main_grad support."""
+class _LmHeadLinear(torch.autograd.Function):
+    """Column-parallel projection with selectable dtype/layout and main_grad support."""
 
     @staticmethod
     def forward(
@@ -52,6 +50,8 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         grad_output_buffer: list[torch.Tensor] | None,
         wgrad_deferral_limit: int | None,
         tp_group,
+        fp32: bool,
+        impl: str,
     ) -> torch.Tensor:
         if gradient_accumulation_fusion and weight.requires_grad and hasattr(weight, "main_grad"):
             main_grad = weight.main_grad
@@ -67,6 +67,8 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         ctx.grad_output_buffer = grad_output_buffer
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.tp_group = tp_group
+        ctx.compute_dtype = torch.float32 if fp32 else input_.dtype
+        ctx.impl = impl
 
         if sequence_parallel:
             dim_size = list(input_.size())
@@ -77,9 +79,18 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         else:
             total_input = input_
 
-        output = torch.matmul(total_input.float(), weight.float().t())
+        if impl == "flatten":
+            input_2d = total_input.reshape(-1, total_input.shape[-1]).to(ctx.compute_dtype)
+            # Megatron/MTP cross entropy mutates logits in place. Return an owned
+            # tensor, not a view created inside this custom autograd Function.
+            output = torch.empty(
+                (*total_input.shape[:-1], weight.shape[0]), dtype=ctx.compute_dtype, device=input_2d.device
+            )
+            torch.mm(input_2d, weight.to(ctx.compute_dtype).t(), out=output.view(-1, weight.shape[0]))
+        else:
+            output = torch.matmul(total_input.to(ctx.compute_dtype), weight.to(ctx.compute_dtype).t())
         if bias is not None:
-            output = output + bias.float()
+            output = output + bias.to(ctx.compute_dtype)
         return output
 
     @staticmethod
@@ -106,7 +117,12 @@ class _FP32LmHeadLinear(torch.autograd.Function):
             gather_handle = None
             total_input = input_
 
-        grad_input = torch.matmul(grad_output.float(), weight.float()).to(input_.dtype)
+        if ctx.impl == "flatten":
+            grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]).to(ctx.compute_dtype)
+            grad_input = torch.mm(grad_output_2d, weight.to(ctx.compute_dtype))
+            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.shape[1]).to(input_.dtype)
+        else:
+            grad_input = torch.matmul(grad_output.to(ctx.compute_dtype), weight.to(ctx.compute_dtype)).to(input_.dtype)
 
         if gather_handle is not None:
             gather_handle.wait()
@@ -123,13 +139,13 @@ class _FP32LmHeadLinear(torch.autograd.Function):
         if weight.requires_grad:
             if ctx.gradient_accumulation_fusion:
                 if compute_wgrad:
-                    _accumulate_main_grad(total_input.float(), grad_output.float(), weight)
+                    _accumulate_main_grad(total_input.to(ctx.compute_dtype), grad_output.to(ctx.compute_dtype), weight)
                 grad_weight = _dummy_grad_weight(weight, input_.dtype)
                 if hasattr(weight, "grad_added_to_main_grad"):
                     weight.grad_added_to_main_grad = True
             elif compute_wgrad:
                 grad_output_2d, total_input_2d = prepare_input_tensors_for_wgrad_compute(
-                    grad_output.float(), total_input.float()
+                    grad_output.to(ctx.compute_dtype), total_input.to(ctx.compute_dtype)
                 )
                 grad_weight = grad_output_2d.t().matmul(total_input_2d)
 
@@ -141,24 +157,30 @@ class _FP32LmHeadLinear(torch.autograd.Function):
             dgrad_handle.wait()
 
         if ctx.sequence_parallel:
-            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None, None, None
 
 
 def _accumulate_main_grad(total_input: torch.Tensor, grad_output: torch.Tensor, weight: torch.Tensor) -> None:
     grad_output_2d, total_input_2d = prepare_input_tensors_for_wgrad_compute(grad_output, total_input)
     main_grad = weight.main_grad
     if main_grad is None:
-        raise RuntimeError("--enable-fp32-lm-head requires weight.main_grad for gradient accumulation fusion.")
+        raise RuntimeError("LM head requires weight.main_grad for gradient accumulation fusion.")
 
     if (
         _FUSED_WGRAD_AVAILABLE
         and total_input_2d.is_cuda
         and grad_output_2d.is_cuda
         and main_grad.is_cuda
-        and main_grad.dtype == torch.float32
+        and (
+            main_grad.dtype == torch.float32
+            or (main_grad.dtype in (torch.float16, torch.bfloat16) and total_input_2d.dtype == main_grad.dtype)
+        )
     ):
-        fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input_2d, grad_output_2d, main_grad)
+        if main_grad.dtype == torch.float32:
+            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(total_input_2d, grad_output_2d, main_grad)
+        else:
+            fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(total_input_2d, grad_output_2d, main_grad)
     else:
         main_grad.add_(grad_output_2d.t().matmul(total_input_2d).to(main_grad.dtype))
 
@@ -215,7 +237,7 @@ def _fp32_lm_head_forward(
             self.embedding_activation_buffer.append(input_parallel.float())
 
     allreduce_dgrad = False if self.explicit_expert_comm else self.allreduce_dgrad
-    output_parallel = _FP32LmHeadLinear.apply(
+    output_parallel = _LmHeadLinear.apply(
         input_parallel,
         weight,
         bias,
@@ -225,6 +247,8 @@ def _fp32_lm_head_forward(
         self.grad_output_buffer if self.config.defer_embedding_wgrad_compute else None,
         self.config.wgrad_deferral_limit if self.config.defer_embedding_wgrad_compute else None,
         self.tp_group,
+        True,
+        self._slime_lm_head_impl,
     )
 
     gather_output = self.gather_output if runtime_gather_output is None else runtime_gather_output
@@ -236,12 +260,55 @@ def _fp32_lm_head_forward(
     return output, output_bias
 
 
-def enable_fp32_lm_head(model: torch.nn.Module) -> None:
+def enable_fp32_lm_head(model: torch.nn.Module, impl: str = "normal") -> None:
     """Patch ``model.output_layer`` so only the vocab projection GEMM runs in fp32."""
+    if impl not in ("normal", "flatten"):
+        raise ValueError(f"Unsupported LM head implementation: {impl}")
     output_layer = getattr(model, "output_layer", None)
     if output_layer is None:
         raise RuntimeError("--enable-fp32-lm-head was requested on a post-process model without output_layer.")
+    output_layer._slime_lm_head_impl = impl
     if getattr(output_layer, "_slime_fp32_lm_head_enabled", False):
         return
     output_layer.forward = MethodType(_fp32_lm_head_forward, output_layer)
     output_layer._slime_fp32_lm_head_enabled = True
+
+
+def _flatten_lm_head_forward_impl(
+    self,
+    input,
+    weight,
+    bias,
+    gradient_accumulation_fusion,
+    allreduce_dgrad,
+    sequence_parallel,
+    grad_output_buffer,
+    wgrad_deferral_limit,
+    tp_group,
+):
+    return _LmHeadLinear.apply(
+        input,
+        weight,
+        bias,
+        gradient_accumulation_fusion,
+        allreduce_dgrad,
+        sequence_parallel,
+        grad_output_buffer,
+        wgrad_deferral_limit,
+        tp_group,
+        False,
+        "flatten",
+    )
+
+
+def enable_flatten_lm_head(model: torch.nn.Module) -> None:
+    """Replace only the local projection of a native ColumnParallelLinear head."""
+    output_layer = getattr(model, "output_layer", None)
+    if not isinstance(output_layer, ColumnParallelLinear):
+        raise TypeError("--lm-head-impl flatten requires a Megatron ColumnParallelLinear output_layer")
+    if not callable(getattr(output_layer, "_forward_impl", None)):
+        raise TypeError(
+            "This Megatron ColumnParallelLinear does not expose the _forward_impl hook required for flatten"
+        )
+    output_layer._forward_impl = MethodType(_flatten_lm_head_forward_impl, output_layer)
+    output_layer._slime_lm_head_impl = "flatten"
