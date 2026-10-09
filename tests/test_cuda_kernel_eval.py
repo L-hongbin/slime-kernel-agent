@@ -527,7 +527,17 @@ def test_context_budget_nudge_cli_is_opt_in():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_context_budget_nudge_reaches_next_turn_but_not_response(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    "router_policy,session_id,expected_headers",
+    [
+        ("consistent_hashing", "session-a", {"X-SMG-Routing-Key": "session-a"}),
+        ("consistent_hashing", None, None),
+        ("round_robin", "session-a", None),
+    ],
+)
+def test_context_budget_nudge_reaches_next_turn_but_not_response(
+    monkeypatch, enabled, router_policy, session_id, expected_headers
+):
     tokenizer = _BudgetTokenizer()
     state = SimpleNamespace(
         tokenizer=tokenizer,
@@ -544,6 +554,7 @@ def test_context_budget_nudge_reaches_next_turn_but_not_response(monkeypatch, en
         turn_logs.extend(logs)
 
     async def fake_post(url, payload, **kwargs):
+        assert kwargs.get("headers") == expected_headers
         requests.append(payload)
         return {
             "text": "kernel",
@@ -574,9 +585,12 @@ def test_context_budget_nudge_reaches_next_turn_but_not_response(monkeypatch, en
         rollout_max_context_len=2000,
         sglang_router_ip="localhost",
         sglang_router_port=1,
+        router_policy=router_policy,
     )
     samples = asyncio.run(
-        generate_with_cuda_agent._generate_impl(args, Sample(prompt="x" * 1550), {"max_new_tokens": 10})
+        generate_with_cuda_agent._generate_impl(
+            args, Sample(prompt="x" * 1550, session_id=session_id), {"max_new_tokens": 10}
+        )
     )
     assert len(requests) == len(samples) == 2
     assert tokenizer.render_calls == 2
