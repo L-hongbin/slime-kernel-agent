@@ -79,7 +79,7 @@ USE_CTM="${USE_CTM:-"false"}"
 RECORD_MEMORY="${RECORD_MEMORY:-"false"}"
 DATASET="${DATASET:-""}"
 TURN_PROMPT_PATH="$REPO_ROOT/examples/kernel_agent/prompt_config/response_prompt/tvm_ffi_gepa_kimi_v2.jinja"
-MAX_TOKENS_PER_GPU=9120
+MAX_TOKENS_PER_GPU=65536
 OFFLOAD_OPTIMIZE="${OFFLOAD_OPTIMIZE:-"false"}"
 OPTIMIZER="${OPTIMIZER:-"adam"}"
 QWEN_GDN_IMPLEMENTATION=${QWEN_GDN_IMPLEMENTATION:-distributed}
@@ -459,9 +459,9 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 8
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size $CP_SIZE
    --cp-partition-mode "${CP_PARTITION_MODE}"
    --qwen-gdn-implementation "${QWEN_GDN_IMPLEMENTATION}"

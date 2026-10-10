@@ -73,7 +73,7 @@ LM_HEAD_IMPL="${LM_HEAD_IMPL:-normal}"
 CALC_LOSS_MODE="${CALC_LOSS_MODE:-"PerSample"}"
 RECORD_MEMORY="${RECORD_MEMORY:-"false"}"
 DATASET="${DATASET:-"TorchOpsV4_DifficultyLt18"}"
-MAX_TOKENS_PER_GPU=9120
+MAX_TOKENS_PER_GPU=65536
 OFFLOAD_OPTIMIZE="${OFFLOAD_OPTIMIZE:-"false"}"
 OPTIMIZER="${OPTIMIZER:-"adam"}"
 QWEN_GDN_IMPLEMENTATION=${QWEN_GDN_IMPLEMENTATION:-distributed}
@@ -446,9 +446,9 @@ ROLLOUT_ARGS=(
 )
 
 PERF_ARGS=(
-   --tensor-model-parallel-size 4
+   --tensor-model-parallel-size 8
    --sequence-parallel
-   --pipeline-model-parallel-size 2
+   --pipeline-model-parallel-size 1
    --context-parallel-size $CP_SIZE
    --cp-partition-mode "${CP_PARTITION_MODE}"
    --qwen-gdn-implementation "${QWEN_GDN_IMPLEMENTATION}"
