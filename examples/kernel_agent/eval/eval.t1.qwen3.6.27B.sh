@@ -68,6 +68,8 @@ echo "EVAL_DATA=${EVAL_DATA}"
 echo "KERNEL_ENV_URL=${KERNEL_ENV_URL}"
 echo "DUMP_DIR=${DUMP_DIR}"
 
+source "${SCRIPT_DIR}/mtp_speculation.sh"
+
 # preflight: KernelGym health on this node/port
 if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
    --url "${KERNEL_ENV_URL}" --timeout 5 --attempts 1; then
@@ -129,10 +131,7 @@ SGLANG_ARGS=(
    --router-policy round_robin
    --sglang-cuda-graph-max-bs ${SGLANG_MAX_RUNNING_REQUESTS}
    --sglang-disable-custom-all-reduce
-   --sglang-speculative-algorithm EAGLE
-   --sglang-speculative-num-steps 3
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 4
+   "${SGLANG_SPECULATIVE_ARGS[@]}"
    --sglang-mamba-scheduler-strategy extra_buffer
 )
 

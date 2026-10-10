@@ -130,6 +130,7 @@ echo "CUDA_AGENT_ADAPTIVE_PERF_TRIALS=$CUDA_AGENT_ADAPTIVE_PERF_TRIALS"
 echo "CUDA_AGENT_REFER_NUM_PERF_TRIALS=$CUDA_AGENT_REFER_NUM_PERF_TRIALS"
 echo "CUDA_AGENT_NUM_PERF_TRIALS=$CUDA_AGENT_NUM_PERF_TRIALS"
 
+source "${SCRIPT_DIR}/eval/mtp_speculation.sh"
 
 if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
    --url "${KERNEL_ENV_URL}" \
@@ -201,10 +202,7 @@ SGLANG_ARGS=(
    --sglang-mamba-radix-cache-strategy extra_buffer
    --sglang-watchdog-timeout "${SGLANG_WATCHDOG_TIMEOUT}"
    --sglang-server-concurrency 64
-   --sglang-speculative-algorithm EAGLE
-   --sglang-speculative-num-steps 3
-   --sglang-speculative-eagle-topk 1
-   --sglang-speculative-num-draft-tokens 4
+   "${SGLANG_SPECULATIVE_ARGS[@]}"
 )
 
 MISC_ARGS=(
