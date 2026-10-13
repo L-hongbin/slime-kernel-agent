@@ -50,6 +50,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= _compute_kernel_agent_metrics(samples)
     log_dict |= _compute_reward_component_metrics(samples)
+    log_dict |= _compute_group_correct_rate_metrics(samples)
     if getattr(args, "use_multi_turn", False):
         log_dict |= _compute_kernel_multi_turn_metrics(args, samples)
     log_dict |= _compute_zero_std_metrics(args, samples)
@@ -90,6 +91,42 @@ def _compute_reward_component_metrics(samples: list[Sample]) -> dict[str, float]
     return metrics
 
 
+def _compute_group_correct_rate_metrics(samples: list[Sample]) -> dict[str, float]:
+    """Count retained prompt/turn groups using their pre-filter correctness rates."""
+    group_correct_rates = {}
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if (
+            sample.remove_sample
+            or sample.status == Sample.Status.ABORTED
+            or metadata.get("role", "kernel") != "kernel"
+            or metadata.get("is_pad_turn")
+        ):
+            continue
+        correct_rate = metadata.get("group_correct_rate")
+        if (
+            isinstance(correct_rate, (int, float))
+            and not isinstance(correct_rate, bool)
+            and np.isfinite(correct_rate)
+            and 0.0 <= correct_rate <= 1.0
+        ):
+            group_correct_rates[(sample.group_index, metadata.get("turn_idx"))] = float(correct_rate)
+    if not group_correct_rates:
+        return {}
+
+    correct_rates = np.asarray(list(group_correct_rates.values()))
+    metrics = {"group_correct_rate_count": len(correct_rates)}
+    # Include both boundaries in the middle bucket so every group counts once.
+    for bucket, mask in (
+        ("low", correct_rates < 1 / 3),
+        ("medium", (correct_rates >= 1 / 3) & (correct_rates <= 2 / 3)),
+        ("high", correct_rates > 2 / 3),
+    ):
+        metrics[f"group_correct_rate_{bucket}_count"] = int(np.sum(mask))
+        metrics[f"group_correct_rate_{bucket}_fraction"] = float(np.mean(mask))
+    return metrics
+
+
 def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, float]:
     """Aggregate final dynamic-weight records, never filter previews.
 
@@ -122,14 +159,15 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
             for value in (gate, delta)
         ):
             continue
-        group_gates[(sample.group_index, metadata.get("turn_idx"))] = float(gate)
+        group_key = (sample.group_index, metadata.get("turn_idx"))
+        group_gates[group_key] = float(gate)
         performance_deltas.append(float(delta))
         scale, correctness_delta = record.get("correctness_scale"), record.get("correctness_reward_delta")
         if all(
             isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
             for value in (scale, correctness_delta)
         ):
-            group_correctness_scales[(sample.group_index, metadata.get("turn_idx"))] = float(scale)
+            group_correctness_scales[group_key] = float(scale)
             correctness_deltas.append(float(correctness_delta))
     metrics = {}
     if laser_records:

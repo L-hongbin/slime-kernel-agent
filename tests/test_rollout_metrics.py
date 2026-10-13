@@ -187,7 +187,8 @@ def test_regular_reward_components_skip_padding_and_nonfinite_values(component):
     assert _compute_reward_component_metrics([]) == {}
 
 
-def test_reward_components_reach_regular_tracker_without_exp_metrics(monkeypatch):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_reward_components_and_group_rates_reach_regular_tracker_without_exp_metrics(monkeypatch, caplog, dynamic):
     from slime.observability import rollout_metrics
 
     args = Namespace(
@@ -197,20 +198,36 @@ def test_reward_components_reach_regular_tracker_without_exp_metrics(monkeypatch
         custom_rollout_log_function_path=None,
         load_debug_rollout_data=None,
         wandb_always_use_train_step=False,
+        dynamic_reward_gate="sqrt" if dynamic else None,
     )
-    samples = [Sample(reward=1.0, metadata={"reward_component": {"correctness": 1.0, "return_reward": 0.5}})]
+    samples = [
+        Sample(
+            group_index=0,
+            reward=1.0,
+            metadata={"reward_component": {"correctness": 1.0, "return_reward": 0.5}, "group_correct_rate": 1.0},
+        )
+    ]
+    if dynamic:
+        samples[0].metadata["dynamic_reward"] = {"gate": 1.0, "performance_reward_delta": 0.0}
     logged = []
     monkeypatch.setattr(rollout_metrics, "compute_perf_metrics_from_samples", lambda *args: {})
     monkeypatch.setattr(rollout_metrics, "compute_rollout_step", lambda *args: 7)
     monkeypatch.setattr(rollout_metrics.logging_utils, "log", lambda args, metrics, **kwargs: logged.append(metrics))
     monkeypatch.setattr(rollout_metrics.logging_utils, "log_exp_metrics", lambda *args, **kwargs: None)
 
-    rollout_metrics.log_rollout_data(7, args, samples, {}, 1.0)
+    with caplog.at_level("INFO", logger=rollout_metrics.__name__):
+        rollout_metrics.log_rollout_data(7, args, samples, {}, 1.0)
 
     assert len(logged) == 1
     assert logged[0]["rollout/reward/component/return_reward/mean"] == 0.5
     assert logged[0]["rollout/reward/component/correctness/mean"] == 1.0
     assert logged[0]["rollout/step"] == 7
+    assert logged[0]["rollout/group_correct_rate_count"] == 1
+    for bucket, count in (("low", 0), ("medium", 0), ("high", 1)):
+        assert logged[0][f"rollout/group_correct_rate_{bucket}_count"] == count
+        assert logged[0][f"rollout/group_correct_rate_{bucket}_fraction"] == float(count)
+    assert "rollout/group_correct_rate_high_count" in caplog.text
+    assert "rollout/dynamic_reward/group_correct_rate" not in caplog.text
     assert not any(key.startswith("exp/") for key in logged[0])
 
 

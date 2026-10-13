@@ -441,6 +441,8 @@ With `apply_failed_group_reward` enabled, detect all-failed groups whose scores 
 
 The filter is read-only: LASER-D reads `sample.reward` including its length bonus; other modes prefer `metadata.task_reward`, falling back to `sample.reward` only when absent. The training hook `reward_post_process_by_group` computes returns/advantages from written-back turn rewards without reshaping a filtered subset. Group processing excludes invalid samples. Disabling length and gate shaping does not disable separate failure-scoring policies or CTM.
 
+Group correctness buckets are logged by default in the regular rollout log and TensorBoard/W&B, regardless of dynamic weighting or `--log-exp-metrics`. `rollout/group_correct_rate_{low,medium,high}_count` and `rollout/group_correct_rate_{low,medium,high}_fraction` report group counts and fractions for `rate < 1/3`, `1/3 <= rate <= 2/3`, and `rate > 2/3`. Each retained `(group_index, turn_idx)` counts once, using its pre-filter `metadata.group_correct_rate`; removed, aborted, padded, and non-kernel samples are excluded. These fixed thresholds do not follow `--difficulty-thresholds`. `rollout/group_correct_rate_count` is the fraction denominator. Groups without a finite rate in `[0, 1]` are excluded; no bucket metrics are emitted when none qualify.
+
 When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
 
 - `gate_mean`, `gate_min`, `gate_max`, `gate_p25/p50/p75`: one vote per `(group_index, turn_idx)` group.

@@ -22,7 +22,10 @@ from examples.kernel_agent.kernel_reward import (
     reward_post_process_by_group,
 )
 from examples.kernel_agent.utils import _set_multi_turn_rewards
-from slime.observability.rollout_metrics import compute_reward_post_process_metrics
+from slime.observability.rollout_metrics import (
+    _compute_group_correct_rate_metrics,
+    compute_reward_post_process_metrics,
+)
 from slime.ray.rollout import RolloutManager
 from slime.utils.types import Sample
 
@@ -1530,6 +1533,67 @@ def test_dynamic_reward_metrics_use_group_gates_and_ungated_performance(monkeypa
         assert metrics[f"{prefix}performance_reward_delta_mean"] == pytest.approx((partial_gate - 1.5) / 7)
         assert metrics[f"{prefix}performance_reward_delta_min"] == -0.5
         assert metrics[f"{prefix}performance_reward_delta_max"] == 0.0
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_correct_rate_buckets_count_retained_prompt_turn_groups(dynamic):
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
+    args.dynamic_reward_gate = "sqrt" if dynamic else None
+    samples = []
+    for group_idx, turn, num_correct, size in [
+        (0, 0, 0, 2),
+        (0, 1, 1, 3),
+        (1, 0, 1, 2),
+        (1, 1, 2, 3),
+        (2, 0, 4, 4),
+        (3, 0, 1, 1),
+    ]:
+        group = []
+        for index in range(size):
+            correct = index < num_correct
+            sample = _make_sample(len(samples), group_idx, float(correct), turn_idx=turn)
+            _set_reward_component(
+                sample,
+                correctness_score=float(correct),
+                performance_score=float(correct),
+                failed=None if correct else 0.0,
+            )
+            samples.append(sample)
+            group.append(sample)
+        # Both kernel collectors annotate complete groups independently of shaping.
+        annotate_group_difficulty(group)
+    post_process_rollout_rewards(args, samples)
+    # Drop a whole group and the incorrect sample of the 2/3 group. Keep the
+    # original complete-group rate, rather than recomputing it as 1 after filtering.
+    retained = [s for s in samples if s.group_index != 3 and s.index != 9]
+    for index, exclusion in enumerate(("removed", "aborted", "pad", "non_kernel")):
+        sample = _make_sample(100 + index, 100 + index, 0.0, turn_idx=0)
+        sample.metadata.update(group_correct_rate=1.0, dynamic_reward={"gate": 1.0, "performance_reward_delta": 0.0})
+        if exclusion == "removed":
+            sample.remove_sample = True
+        elif exclusion == "aborted":
+            sample.status = Sample.Status.ABORTED
+        elif exclusion == "pad":
+            sample.metadata["is_pad_turn"] = True
+        else:
+            sample.metadata["role"] = "other"
+        retained.append(sample)
+
+    metrics = _compute_group_correct_rate_metrics(retained)
+    assert metrics["group_correct_rate_count"] == 5
+    for bucket, count in (("low", 1), ("medium", 3), ("high", 1)):
+        assert metrics[f"group_correct_rate_{bucket}_count"] == count
+        assert metrics[f"group_correct_rate_{bucket}_fraction"] == pytest.approx(count / 5)
+    assert not any("group_correct_rate" in key for key in compute_reward_post_process_metrics(retained))
+
+
+@pytest.mark.parametrize("correct_rate", [None, True, "0.5", float("nan"), float("inf"), -0.1, 1.1])
+def test_correct_rate_buckets_skip_missing_or_invalid_rates(correct_rate):
+    sample = _make_sample(0, 0, 0.0)
+    sample.metadata["group_correct_rate"] = correct_rate
+    assert _compute_group_correct_rate_metrics([sample]) == {}
+    assert _compute_group_correct_rate_metrics([_make_sample(1, 1, 0.0)]) == {}
+    assert _compute_group_correct_rate_metrics([]) == {}
 
 
 @pytest.mark.parametrize("explicit_none", [False, True])

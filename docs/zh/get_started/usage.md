@@ -470,6 +470,8 @@ Megatron 训练侧在 advantage 计算及 rollout 后处理后、训练 forward 
 
 过滤器只读已结算结果：LASER-D 使用包含长度 bonus 的 `sample.reward`；其它模式优先使用 `metadata.task_reward`，字段不存在时才回退到 `sample.reward`。训练侧的 `reward_post_process_by_group` 不再调权或加减分，只从写回的单 turn reward 计算 return/advantage，避免过滤后重算 gate。完整 group 后处理跳过无效样本。两项长度/调权开关均未启用也不影响独立的失败评分或 CTM。
 
+group 正确率分档默认输出到普通 rollout 日志和 TensorBoard/W&B，不依赖动态调权或 `--log-exp-metrics`。`rollout/group_correct_rate_{low,medium,high}_count` 和 `rollout/group_correct_rate_{low,medium,high}_fraction` 分别记录 `rate < 1/3`、`1/3 <= rate <= 2/3`、`rate > 2/3` 三档的 group 数和比例。每个保留的 `(group_index, turn_idx)` 只计一次，使用过滤前的 `metadata.group_correct_rate`；排除 remove、aborted、pad 和非 kernel 样本。阈值固定，不随 `--difficulty-thresholds` 改变。`rollout/group_correct_rate_count` 是比例分母；缺少正确率或值不在有限的 `[0, 1]` 范围内的组不计入，没有符合条件的组时不输出这些指标。
+
 开启动态调权时，训练数据转换在最终 reward 后处理结束后，单独输出 `reward post-process` 日志，并通过现有 TensorBoard/W&B 通道记录 `rollout/dynamic_reward/*` scalar；不需要额外开启 `--log-exp-metrics`。关闭动态调权，或本批没有符合条件的样本时，不输出这些指标：
 
 - `gate_mean`、`gate_min`、`gate_max`、`gate_p25/p50/p75`：按 `(group_index, turn_idx)` 去重，每个 group 只计一次。
