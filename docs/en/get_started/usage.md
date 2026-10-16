@@ -311,113 +311,156 @@ The existing training hook calls this interface:
 
 ```bash
 --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
---dynamic-reward-gate sqrt \
+--dynamic-reward-speedup correct-rate-sqrt \
+--dynamic-reward-coverage correct-rate-sqrt \
 --overlong-penalty dapo \
 --overlong-buffer-len 2048 \
 --overlong-penalty-factor 0.2
 ```
 
-The two method selectors are independent: `--dynamic-reward-gate` selects dynamic weighting, and `--overlong-penalty` selects length shaping. Both default to Python `None` (disabled), and both accept the explicit CLI value `None`. `--overlong-penalty dapo` enables the existing soft linear penalty; a bare `--overlong-penalty` is no longer accepted. Buffer length and penalty factor keep their existing meanings. When both methods are enabled, weights always precede the penalty. There is no processor-list selector or separate configuration/environment switch for dynamic weighting. The DPPO example script sets `--dynamic-reward-gate None`, so dynamic weighting is off by default there as well. The new interface returns one reward list and must not directly replace `--custom-reward-post-process-path`, whose hook returns `(raw_rewards, rewards)`.
+The three independent selectors `--dynamic-reward-correctness`, `--dynamic-reward-speedup`, and `--dynamic-reward-coverage` each default to Python `None`. Omitting a selector or explicitly passing `None` leaves that component unchanged. `--overlong-penalty` independently selects length shaping, applied after dynamic weights. The old `--dynamic-reward-gate`, `--dynamic-reward-gate-range`, `sqrt`, and `inverse-gate` selectors are removed. Use `--dynamic-reward-amplitude` for correctness/speedup and `--dynamic-reward-range` only for piecewise coverage bounds. The reward interface returns one list; it must not directly replace the training hook returning `(raw_rewards, rewards)`.
 
-##### Dynamic gate calculation
+##### Independent additive correctness/speedup weights
 
-`--dynamic-reward-gate` defaults to `None` (disabled); specifying `sqrt`, `piecewise` (linear), or `piecewise-sqrt` (square-root tails) enables the selected mode. By default, dynamic weighting scales **performance and coverage**, leaving correctness weights and failure scores unchanged. To enable square-root tails with the existing reward hook:
+Each selector accepts `piecewise-sqrt`, `piecewise`, `correct-rate-sqrt`, `correct-rate`, and their `inverse-*` variants. Correctness/speedup additionally accept `global-piecewise`, `global-piecewise-sqrt`, and their `inverse-*` variants. For correctness and speedup, forward modes **add** `x(p)` to the configured base weight and inverse modes **subtract** it. Here `inverse` means the opposite offset, not a reciprocal. Omitted selectors and explicit `None` leave the corresponding contribution unchanged.
 
-```bash
---dynamic-reward-gate piecewise-sqrt \
---dynamic-reward-gate-range 0.8 1.2
-```
-
-`--difficulty-thresholds` is a shared, non-empty list of strictly increasing correctness-rate boundaries between 0 and 1 (not `1 - correctness` difficulty values), defaulting to `[1/3, 2/3]` to divide the correctness-rate range into three equal intervals, not equal-sized sample buckets. The example omits this flag to use those defaults; explicit decimal values override them (e.g. `--difficulty-thresholds 0.25 0.75`). Its validation is independent of dynamic reward weighting. Both piecewise modes require exactly two boundaries: the hard upper boundary and easy lower boundary; other consumers can use longer lists.
-
-Let `G` be the number of valid samples for the same prompt and turn, `c` the correct count, and `s=c/G`. Removed, padded, and aborted samples do not count toward `G`; it can therefore differ from `--n-samples-per-prompt`. The recorded `group_difficulty` is `1-s`, but gate thresholds use `s`. Define `h, e = difficulty_thresholds` and `lo, hi = dynamic_reward_gate_range`. All enabled gate modes require an explicit `--dynamic-reward-gate-range MIN MAX`; omitting it raises an error.
-
-The `sqrt` mode ignores difficulty thresholds and maps the original square-root output into the configured range:
-
-```python
-strength = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
-gate = lo + (hi - lo) * strength
-```
-
-Explicitly setting `[0, 1]` preserves the original behavior. groups with at most one correct sample, including singleton and empty groups, use `lo`. For a non-piecewise gate with positive bounds and reciprocal correctness scaling:
+For matched curves, choose inverse correctness and forward speedup:
 
 ```bash
---dynamic-reward-gate sqrt \
---dynamic-reward-gate-range 0.8 1.2 \
---dynamic-reward-correctness inverse-gate
+--dynamic-reward-correctness inverse-piecewise-sqrt \
+--dynamic-reward-speedup piecewise-sqrt \
+--dynamic-reward-amplitude 0.1 \
+--dynamic-reward-coverage None
 ```
 
-This changes the range, not the underlying square-root function; it is not linear in correctness rate. Finite bounds must satisfy `0 <= lo <= hi`.
+With default base weights `0.5 / 0.5`, the final weights are `0.5-x(p)` and `0.5+x(p)`. Matching curves preserve their sum of 1. If `CUDA_AGENT_CORRECT_REWARD_WEIGHT` and `CUDA_AGENT_SPEEDUP_REWARD_WEIGHT` override the bases, the weights become `base_correctness-x(p)` and `base_speedup+x(p)`, preserving the configured total. Unmatched curves or enabling only one selector do not generally preserve the sum. This fixes the total weight, not the expected reward.
 
-For `piecewise`, use `f(d)=d`; for `piecewise-sqrt`, use `f(d)=sqrt(d)`:
+Let `G` be the valid sample count for one `(group_index, turn_idx)`, `k` its correct count, and `p=k/G`. Removed, aborted, padded, and non-kernel samples are excluded. `--dynamic-reward-amplitude a` defaults to `0.1` and bounds `x` to `[-a,a]`. It must be finite, between 0 and 0.5, and no larger than each enabled component's finite base weight, so adjusted weights remain nonnegative.
+
+- `correct-rate`: `x = a*(2*p-1)`; balanced at `p=0.5`.
+- `correct-rate-sqrt`: `x = a*(2*sqrt(p)-1)`; balanced at `p=0.25`.
+- `piecewise`: the formula below with `f(t)=t`.
+- `piecewise-sqrt`: the same formula with `f(t)=sqrt(t)`, strengthening both tails.
+- `global-piecewise`: use `x=0` inside `[h,e]`, otherwise `x=a*(2*p-1)`, without rescaling by the thresholds.
+- `global-piecewise-sqrt`: use `x=0` inside `[h,e]`, otherwise `x=a*(2*sqrt(p)-1)`; see below.
+- Every `inverse-*` variant subtracts the corresponding `x`; there is no division by `p`, including at `p=0`.
+
+Shared `--difficulty-thresholds` default to `[1/3,2/3]`. Piecewise and global-piecewise modes require exactly two finite, increasing thresholds `h,e` in `(0,1)`:
 
 ```python
 if G <= 1:
-    gate = 1  # Insufficient group evidence.
-elif s < h:
-    gate = 1 - (1 - lo) * f((h - s) / h)
-elif s > e:
-    gate = 1 + (hi - 1) * f((s - e) / (1 - e))
+    x = 0
+elif p < h:
+    x = -a * f((h - p) / h)
+elif p > e:
+    x = a * f((p - e) / (1 - e))
 else:
-    gate = 1
+    x = 0
 ```
 
-`piecewise-sqrt` curves the normalized distance from the neutral region, **not the final gate**. It strengthens both tails relative to linear interpolation while preserving bounds and the neutral interval, including both thresholds. Piecewise gate bounds must additionally satisfy `lo <= 1 <= hi`. Setting thresholds or a gate range alone does not enable dynamic weighting; selecting a gate does. Filtering and training read the same settled rewards without separately recomputing gates. Square-root tails are a kernel-specific extension, not a claim of reproducing Coda's formula.
+Empty groups are neutral for all modes. Piecewise and global-piecewise singleton groups remain neutral; `correct-rate` and `correct-rate-sqrt` use the singleton's actual `p`. Threshold equality belongs to the neutral region. Correctness/speedup do not use `--dynamic-reward-range` anymore: the former symmetric multiplier range `[0.8,1.2]` corresponds to `a=0.1` at base weight 0.5; use `a=0.2` for final weights in `[0.3,0.7]`.
 
-For samples on the normal component-scoring path, the resulting contributions are:
+Enabled contributions are rebuilt from their base scores on every invocation, making processing idempotent. The speedup correctness prerequisite still applies after weight selection. Failure scores, length shaping, raw task rewards, and frozen future credit are preserved. Logging weights describe the configured group weights before sample correctness gating, not guaranteed nonzero reward contributions.
 
-```text
-performance_reward = ungated_performance_reward * gate
-coverage_reward    = ungated_coverage_reward * gate
-task_reward        = correctness_reward + performance_reward + coverage_reward
-sample.reward      = task_reward + length_score  # Negative for DAPO, positive for LASER-D, zero when disabled.
+The Qwen3.8 WarmUp/MultiTurn launchers expose `DYNAMIC_CORRECTNESS_REWARD`, `DYNAMIC_SPEEDUP_REWARD`, and `DYNAMIC_COVERAGE_REWARD`, all defaulting to `None`. `DYNAMIC_REWARD_AMPLITUDE` defaults to `0.1` and is included in the experiment name when correctness or speedup adjustment is enabled.
+
+##### Final weights for Group=16
+
+With a=0.2, inverse correctness and forward speedup, default base weights, and thresholds [1/3,2/3]. Each cell is correctness / speedup.
+
+| k | p | piecewise | piecewise-sqrt |
+|---:|---:|---:|---:|
+| 0 | 0.0000 | 0.7000 / 0.3000 | 0.7000 / 0.3000 |
+| 1 | 0.0625 | 0.6625 / 0.3375 | 0.6803 / 0.3197 |
+| 2 | 0.1250 | 0.6250 / 0.3750 | 0.6581 / 0.3419 |
+| 3 | 0.1875 | 0.5875 / 0.4125 | 0.6323 / 0.3677 |
+| 4 | 0.2500 | 0.5500 / 0.4500 | 0.6000 / 0.4000 |
+| 5 | 0.3125 | 0.5125 / 0.4875 | 0.5500 / 0.4500 |
+| 6 | 0.3750 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 7 | 0.4375 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 8 | 0.5000 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 9 | 0.5625 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 10 | 0.6250 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 11 | 0.6875 | 0.4875 / 0.5125 | 0.4500 / 0.5500 |
+| 12 | 0.7500 | 0.4500 / 0.5500 | 0.4000 / 0.6000 |
+| 13 | 0.8125 | 0.4125 / 0.5875 | 0.3677 / 0.6323 |
+| 14 | 0.8750 | 0.3750 / 0.6250 | 0.3419 / 0.6581 |
+| 15 | 0.9375 | 0.3375 / 0.6625 | 0.3197 / 0.6803 |
+| 16 | 1.0000 | 0.3000 / 0.7000 | 0.3000 / 0.7000 |
+
+##### Global linear curve with a neutral interval
+
+`global-piecewise` and `global-piecewise-sqrt` are additional options, leaving existing modes unchanged. Both interval endpoints are neutral; empty and singleton groups retain their base weights. Only correctness/speedup support these modes and their inverse variants. They use the existing amplitude and thresholds, not `--dynamic-reward-range`:
+
+```python
+if G <= 1 or h <= p <= e:
+    x = 0
+else:
+    x = a * (2 * f(p) - 1)
 ```
 
-Existing correctness requirements and the coverage enable switch still apply. An explicit failure-score branch keeps its failure reward; the gate does not turn an all-failed group into positive rewards. Speedup affects the base performance score, not the gate itself.
+Here `f(p)=p` for `global-piecewise`, and `f(p)=sqrt(p)` for `global-piecewise-sqrt`.
 
-To also scale correctness by the reciprocal of the same gate, opt in separately:
+Thresholds only switch adjustment on or off; they do not rescale the tails. This generally introduces jumps at h and e. Outside the neutral interval, the linear curve changes sign at p=0.5 and the square-root curve at p=0.25. With default thresholds, global square root has a positive x at p=5/16, then x=0 at p=6/16; it is not globally monotonic. There is no separate piecewise-mode argument.
 
 ```bash
---dynamic-reward-gate piecewise-sqrt \
---dynamic-reward-gate-range 0.8 1.2 \
---dynamic-reward-correctness inverse-gate
+--dynamic-reward-correctness inverse-global-piecewise \
+--dynamic-reward-speedup global-piecewise \
+--dynamic-reward-amplitude 0.1 \
+--dynamic-reward-coverage None
 ```
 
-`--dynamic-reward-correctness` defaults to `None` (also accepted explicitly). With `inverse-gate`, the non-failure reward becomes `C / gate + gate * (P + Coverage) + length_score`, where C/P/Coverage are ungated contributions. A gate of 0.8 scales correctness by 1.25; 1.2 scales it by about 0.8333. This requires an enabled gate with a strictly positive minimum and a finite reciprocal. `sqrt` is supported with an explicit positive minimum; a `[0, 1]` range is rejected for this combination. Explicit failure scores, length scores, `raw_task_reward`, and frozen `return_reward` are unchanged. Correctness is rebuilt from the base score and configured weight on every invocation, so repeated post-processing does not compound the scale.
+For the Qwen3.8 launchers, set `DYNAMIC_CORRECTNESS_REWARD=inverse-global-piecewise` and `DYNAMIC_SPEEDUP_REWARD=global-piecewise`. With G=16, a=0.1, default thresholds and base weights, each cell below is correctness / speedup:
 
-Alternatively, `--dynamic-reward-correctness inverse-correct-rate` uses `C / p`, where `p` is the correctness rate of valid samples in the same prompt/turn group. It works independently of `--dynamic-reward-gate`: with the gate disabled, performance/coverage keep their base weights; with a gate enabled, the non-failure reward is `C / p + gate * (P + Coverage) + length_score`. Removed, aborted, and padding samples do not enter `p`. For `p=0`, correctness scale is zero (no division); explicit failure scores and other reward components keep their existing rules. Both correctness modes preserve raw history and frozen future credit and are idempotent.
+| k | piecewise | global-piecewise |
+|---:|---:|---:|
+| 0 | 0.60000 / 0.40000 | 0.60000 / 0.40000 |
+| 1 | 0.58125 / 0.41875 | 0.58750 / 0.41250 |
+| 2 | 0.56250 / 0.43750 | 0.57500 / 0.42500 |
+| 3 | 0.54375 / 0.45625 | 0.56250 / 0.43750 |
+| 4 | 0.52500 / 0.47500 | 0.55000 / 0.45000 |
+| 5 | 0.50625 / 0.49375 | 0.53750 / 0.46250 |
+| 6 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 7 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 8 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 9 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 10 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 11 | 0.49375 / 0.50625 | 0.46250 / 0.53750 |
+| 12 | 0.47500 / 0.52500 | 0.45000 / 0.55000 |
+| 13 | 0.45625 / 0.54375 | 0.43750 / 0.56250 |
+| 14 | 0.43750 / 0.56250 | 0.42500 / 0.57500 |
+| 15 | 0.41875 / 0.58125 | 0.41250 / 0.58750 |
+| 16 | 0.40000 / 0.60000 | 0.40000 / 0.60000 |
 
-For binary correctness-only rewards with unit base weight, group mean centering produces `(correct_i - p) / p` when `p>0`, matching the [MaxRL-style advantage](https://zanette-labs.github.io/MaxRL/). This option is a reward transformation, not a new advantage estimator or a full MaxRL implementation. Group standard-deviation normalization cancels a common correctness scale: use `--disable-grpo-std-normalization` to retain it with GRPO. Startup warns about this combination without changing your configuration. Performance rewards, nonzero failure scores, length shaping, and multi-turn future credit make the objective different from correctness-only MaxRL.
+##### Independent coverage multiplier
 
-When either correctness mode is enabled, `rollout/dynamic_reward/correctness_scale_{mean,min,max,p25,p50,p75}` reports one scale per prompt/turn group; `correctness_reward_delta_{mean,min,max,p25,p50,p75}` under the same prefix reports per-sample correctness contribution changes (including unchanged zeros). These additional metrics are absent when the option is disabled. The adjusted contribution is also written to `metadata.reward_component.correctness`.
+Coverage keeps its previous multiplicative semantics: `correct-rate` uses `p`, `correct-rate-sqrt` uses `sqrt(p)`, and inverse variants use their reciprocals (`p=0` gives scale 0). Piecewise coverage still requires `--dynamic-reward-range lo hi`, with finite `0 <= lo <= 1 <= hi`; inverse modes additionally require positive `lo` with finite reciprocal. Bounds apply before inversion. The launchers pass `[0.8,1.2]`. Coverage ignores the amplitude and never transfers weight to correctness or speedup.
+
+Its piecewise multiplier is `1-(1-lo)*f((h-p)/h)` below `h`, `1+(hi-1)*f((p-e)/(1-e))` above `e`, and 1 in the middle or when `G<=1`. `f` is linear or square root according to the selected mode. Consequently, choosing the same mode name for coverage and speedup no longer implies the same multiplier. All selectors use group correctness `p`; coverage does not multiply speedup by the sample's time coverage.
 
 ##### Gate values for G=16
 
-Assume all 16 samples are valid, with thresholds `[1/3, 2/3]`. The `sqrt` column uses an explicit `[0, 1]` range; the piecewise columns use `[0.8, 1.2]`. Values are rounded to four decimal places:
+This table describes coverage multipliers only. All 16 samples are valid. Piecewise thresholds are `[1/3,2/3]` and bounds are `[0.8,1.2]`; the rate-square-root column is simply `sqrt(k/16)`:
 
-| Correct count | Correctness rate | `sqrt` | `piecewise` | `piecewise-sqrt` |
+| Correct count | Correctness rate | `correct-rate-sqrt` | `piecewise` | `piecewise-sqrt` |
 |---|---:|---:|---:|---:|
 | 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
-| 1 | 6.25% | 0.0000 | 0.8375 | 0.8197 |
-| 2 | 12.5% | 0.2582 | 0.8750 | 0.8419 |
-| 3 | 18.75% | 0.3651 | 0.9125 | 0.8677 |
-| 4 | 25% | 0.4472 | 0.9500 | 0.9000 |
-| 5 | 31.25% | 0.5164 | 0.9875 | 0.9500 |
-| 6 | 37.5% | 0.5774 | 1.0000 | 1.0000 |
-| 7 | 43.75% | 0.6325 | 1.0000 | 1.0000 |
-| 8 | 50% | 0.6831 | 1.0000 | 1.0000 |
-| 9 | 56.25% | 0.7303 | 1.0000 | 1.0000 |
-| 10 | 62.5% | 0.7746 | 1.0000 | 1.0000 |
-| 11 | 68.75% | 0.8165 | 1.0125 | 1.0500 |
-| 12 | 75% | 0.8563 | 1.0500 | 1.1000 |
-| 13 | 81.25% | 0.8944 | 1.0875 | 1.1323 |
-| 14 | 87.5% | 0.9309 | 1.1250 | 1.1581 |
-| 15 | 93.75% | 0.9661 | 1.1625 | 1.1803 |
+| 1 | 6.25% | 0.2500 | 0.8375 | 0.8197 |
+| 2 | 12.5% | 0.3536 | 0.8750 | 0.8419 |
+| 3 | 18.75% | 0.4330 | 0.9125 | 0.8677 |
+| 4 | 25% | 0.5000 | 0.9500 | 0.9000 |
+| 5 | 31.25% | 0.5590 | 0.9875 | 0.9500 |
+| 6 | 37.5% | 0.6124 | 1.0000 | 1.0000 |
+| 7 | 43.75% | 0.6614 | 1.0000 | 1.0000 |
+| 8 | 50% | 0.7071 | 1.0000 | 1.0000 |
+| 9 | 56.25% | 0.7500 | 1.0000 | 1.0000 |
+| 10 | 62.5% | 0.7906 | 1.0000 | 1.0000 |
+| 11 | 68.75% | 0.8292 | 1.0125 | 1.0500 |
+| 12 | 75% | 0.8660 | 1.0500 | 1.1000 |
+| 13 | 81.25% | 0.9014 | 1.0875 | 1.1323 |
+| 14 | 87.5% | 0.9354 | 1.1250 | 1.1581 |
+| 15 | 93.75% | 0.9682 | 1.1625 | 1.1803 |
 | 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
-
-These are mappings, not observed training frequencies. Both piecewise modes reduce weights for 0–5 correct samples, preserve them for 6–10, and increase them for 11–16. Actual gate frequencies depend on the observed group correctness distribution; see the metrics below.
-
-This adapts [Coda's thresholded difficulty gates](https://arxiv.org/html/2603.08659v1#S3), **not its length reward**: hard kernel groups receive weaker performance/coverage incentives, easy groups stronger ones. No token-length bonus is introduced.
 
 `kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions. Its `length` contribution is negative for DAPO penalties, positive for LASER-D bonuses, and zero when disabled or inactive. Component metrics use `reward/component/length`, replacing the separate `overlong_penalty` and `length_bonus` components. Top-level `metadata.length_score` uses the same signed value; related metrics are `kernel/length_score/mean` and `exp/rollout/reward/length_score/*`. Existing CLI arguments are unchanged. `task_reward` excludes length shaping and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties.
 
@@ -443,14 +486,15 @@ The filter is read-only: LASER-D reads `sample.reward` including its length bonu
 
 Group correctness buckets are logged by default in the regular rollout log and TensorBoard/W&B, regardless of dynamic weighting or `--log-exp-metrics`. `rollout/group_correct_rate_{low,medium,high}_count` and `rollout/group_correct_rate_{low,medium,high}_fraction` report group counts and fractions for `rate < 1/3`, `1/3 <= rate <= 2/3`, and `rate > 2/3`. Each retained `(group_index, turn_idx)` counts once, using its pre-filter `metadata.group_correct_rate`; removed, aborted, padded, and non-kernel samples are excluded. These fixed thresholds do not follow `--difficulty-thresholds`. `rollout/group_correct_rate_count` is the fraction denominator. Groups without a finite rate in `[0, 1]` are excluded; no bucket metrics are emitted when none qualify.
 
-When dynamic weighting is enabled, train-data conversion emits a separate `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to the configured TensorBoard/W&B tracker **after** final reward processing. No additional `--log-exp-metrics` flag is required. Metrics are absent when disabled or when no eligible samples were processed:
+When any dynamic component is enabled, train-data conversion emits a `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to TensorBoard/W&B after final reward processing, without `--log-exp-metrics`:
 
-- `gate_mean`, `gate_min`, `gate_max`, `gate_p25/p50/p75`: one vote per `(group_index, turn_idx)` group.
-- `gate_zero_fraction`, `gate_scaled_fraction`, `gate_one_fraction`, `gate_boosted_fraction`: fractions with gate equal to zero, strictly between zero and one, equal to one, and greater than one.
-- `performance_reward_delta_mean/min/max/p25/p50/p75`: per-sample performance contribution after gating minus its ungated contribution, not a change in measured speedup or total reward. Unchanged valid samples contribute zero.
-- `group_count`, `sample_count`: denominators; removed, aborted, and padded samples are excluded.
+- `{correctness,speedup}_{weight,offset}_{mean,min,max,p25,p50,p75}`: group-weighted final weights and signed adjustments; emitted only for enabled components.
+- `{correctness,speedup,coverage}_scale_{mean,min,max,p25,p50,p75}`: group-weighted scale statistics, deduplicated by `(group_index, turn_idx)`.
+- `{correctness,speedup,coverage}_scale_{zero,scaled,one,boosted}_fraction`: group fractions with scale 0, between 0 and 1, equal to 1, and above 1.
+- `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`: sample-weighted changes from unscaled base contributions, including unchanged zeros. Speedup deltas refer to performance reward, not measured speedup.
+- `group_count`, `sample_count`: valid groups and samples with final records. Removed, aborted, padded, and non-kernel samples are excluded.
 
-Final per-sample records live in `metadata.dynamic_reward` and are created before filtering; train-data conversion aggregates retained samples only. Repeated processing compares against the ungated baseline. Early per-sample generation logs can still precede complete-group weighting.
+Only enabled components emit dynamic metrics. Final per-sample records live in `metadata.dynamic_reward` and are created before filtering; train-data conversion aggregates retained samples only. The former shared `gate_*` metrics are replaced by separate component scales. Regular `rollout/group_correct_rate_*` metrics remain independent of all dynamic switches. Early generation logs can precede complete-group weighting.
 
 #### LASER-D adaptive length rewards
 
@@ -466,7 +510,7 @@ Final per-sample records live in `metadata.dynamic_reward` and are created befor
 --laser-d-monitor-groups 500
 ```
 
-These are the defaults. The search upper bound is `--rollout-max-response-len`; the lower bound must not exceed it. DAPO's buffer, penalty factor, and effective-context-cap options do not affect LASER-D. Dynamic performance/coverage gating remains independent and does not scale the bonus.
+These are the defaults. The search upper bound is `--rollout-max-response-len`; the lower bound must not exceed it. DAPO's buffer, penalty factor, and effective-context-cap options do not affect LASER-D. Dynamic reward weighting remains independent and does not scale the bonus.
 
 Reuse the two `--difficulty-thresholds` (default thirds): hard if `s < h`, medium if `h <= s < e`, easy if `s >= e`, where `s` is the valid prompt/turn group's correctness rate. Monitoring and reward assignment share these boundaries. Removed, aborted, and padded samples are excluded.
 

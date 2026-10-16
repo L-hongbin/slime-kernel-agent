@@ -72,7 +72,7 @@ USE_FP32HEAD="${USE_FP32HEAD:-"true"}"
 LM_HEAD_IMPL="${LM_HEAD_IMPL:-normal}"
 CALC_LOSS_MODE="${CALC_LOSS_MODE:-"PerSample"}"
 RECORD_MEMORY="${RECORD_MEMORY:-"false"}"
-DATASET="${DATASET:-"TorchOpsV4_DifficultyLt18"}"
+DATASET="${DATASET:-"TorchOpsDifficultyLt18"}"
 MAX_TOKENS_PER_GPU=65536
 OFFLOAD_OPTIMIZE="${OFFLOAD_OPTIMIZE:-"false"}"
 OPTIMIZER="${OPTIMIZER:-"adam"}"
@@ -80,11 +80,15 @@ QWEN_GDN_IMPLEMENTATION=${QWEN_GDN_IMPLEMENTATION:-distributed}
 CP_PARTITION_MODE=${CP_PARTITION_MODE:-zigzag}
 
 ADVANTAGE_ESTIMATOR=${ADVANTAGE_ESTIMATOR:-trloo}
-DYNAMIC_REWARD=${DYNAMIC_REWARD:-None}
+DYNAMIC_SPEEDUP_REWARD=${DYNAMIC_SPEEDUP_REWARD:-None}
+DYNAMIC_COVERAGE_REWARD=${DYNAMIC_COVERAGE_REWARD:-None}
 DYNAMIC_CORRECTNESS_REWARD=${DYNAMIC_CORRECTNESS_REWARD:-None}
+DYNAMIC_REWARD_AMPLITUDE=${DYNAMIC_REWARD_AMPLITUDE:-0.1}
 CUDA_AGENT_APPLY_FAILED_GROUP_REWARD=${CUDA_AGENT_APPLY_FAILED_GROUP_REWARD:-0}
 CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE=${CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE:-0}
 export CUDA_AGENT_SPEEDUP_REWARD_UPPER="${CUDA_AGENT_SPEEDUP_REWARD_UPPER:-2}"
+export CUDA_AGENT_CORRECT_REWARD_WEIGHT="${CUDA_AGENT_CORRECT_REWARD_WEIGHT:-0.5}"
+export CUDA_AGENT_SPEEDUP_REWARD_WEIGHT="${CUDA_AGENT_SPEEDUP_REWARD_WEIGHT:-0.5}"
 export CUDA_AGENT_SPEEDUP_SCORE_MODE="${CUDA_AGENT_SPEEDUP_SCORE_MODE:-legacy}"
 case "${CUDA_AGENT_SPEEDUP_SCORE_MODE}" in
    legacy|rational|improvement|lcb_improvement) ;;
@@ -109,7 +113,7 @@ export CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE=$CUDA_AGENT_APPLY_KERNEL_FAILED_SCOR
 
 EXP_PARAM="${LOSS_MODE^}"
 case "${DATASET}" in
-    "TorchOpsV4_DifficultyLt18")
+    "TorchOpsDifficultyLt18")
       RL_DATA="/ms/FM/lihongbin/dataset/CUDA_RL/cuda_rl/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet"
       # 外网："/nfs/FM/lihongbin/datasets/KernelData/prompt_tvm_GEPA4o_v2/torch_ops_difficulty_lt18.parquet"
       ;;
@@ -232,27 +236,28 @@ elif [[ $CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE == 1 ]]; then
    EXP_PARAM+="ApplyPenalty"
 fi
 
-case "${DYNAMIC_REWARD}" in
-   None) ;;
-   sqrt) EXP_PARAM+="DynamicRWSqrt" ;;
-   piecewise) EXP_PARAM+="DynamicRWPiecewise" ;;
-   piecewise-sqrt) EXP_PARAM+="DynamicRWPiecewiseSqrt" ;;
-   *)
-      echo "DYNAMIC_REWARD must be None, sqrt, piecewise, or piecewise-sqrt." >&2
-      exit 1
-      ;;
-esac
-EXP_ARGS+=(--dynamic-reward-gate "${DYNAMIC_REWARD}" --dynamic-reward-gate-range 0.8 1.2)
-case "${DYNAMIC_CORRECTNESS_REWARD}" in
-   None) ;;  # correctness 不调权
-   inverse-correct-rate) EXP_PARAM+="CorrectnessMaxFormat" ;;
-   inverse-gate) EXP_PARAM+="CorrectnessGateFormat" ;;
-   *)
-      echo "DYNAMIC_CORRECTNESS_REWARD must be None, inverse-correct-rate." >&2
-      exit 1
-      ;;
-esac
-EXP_ARGS+=(--dynamic-reward-correctness $DYNAMIC_CORRECTNESS_REWARD)
+for component in correctness speedup coverage; do
+   case "${component}" in
+      correctness) mode="${DYNAMIC_CORRECTNESS_REWARD}" ;;
+      speedup) mode="${DYNAMIC_SPEEDUP_REWARD}" ;;
+      coverage) mode="${DYNAMIC_COVERAGE_REWARD}" ;;
+   esac
+   case "${mode}" in
+      None) ;;
+      piecewise|piecewise-sqrt|correct-rate|correct-rate-sqrt|inverse-piecewise|inverse-piecewise-sqrt|inverse-correct-rate|inverse-correct-rate-sqrt|global-piecewise|global-piecewise-sqrt|inverse-global-piecewise|inverse-global-piecewise-sqrt)
+         if [[ "${component}" == coverage && "${mode}" == *global-piecewise* ]]; then
+            echo "${mode} is only supported for correctness and speedup" >&2; exit 1
+         fi
+         EXP_PARAM+="Dynamic${component^}-${mode}"
+         ;;
+      *) echo "Invalid dynamic reward mode for ${component}: ${mode}" >&2; exit 1 ;;
+   esac
+   EXP_ARGS+=("--dynamic-reward-${component}" "${mode}")
+done
+EXP_ARGS+=(--dynamic-reward-amplitude "${DYNAMIC_REWARD_AMPLITUDE}" --dynamic-reward-range 0.8 1.2)
+if [[ "${DYNAMIC_CORRECTNESS_REWARD}" != None || "${DYNAMIC_SPEEDUP_REWARD}" != None ]]; then
+   EXP_PARAM+="Amplitude${DYNAMIC_REWARD_AMPLITUDE}"
+fi
 
 EXP_ARGS+=("${MIS_ARGS[@]}")
 EXP_NAME="Kernel-FAsyncWarmUp-${KERNEL_BACKEND^^}"
@@ -578,6 +583,8 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_AGENT_APPLY_FAILED_GROUP_REWARD": "${CUDA_AGENT_APPLY_FAILED_GROUP_REWARD}",
     "CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE":"${CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE}",
     "CUDA_AGENT_SPEEDUP_REWARD_UPPER": "${CUDA_AGENT_SPEEDUP_REWARD_UPPER}",
+    "CUDA_AGENT_CORRECT_REWARD_WEIGHT": "${CUDA_AGENT_CORRECT_REWARD_WEIGHT}",
+    "CUDA_AGENT_SPEEDUP_REWARD_WEIGHT": "${CUDA_AGENT_SPEEDUP_REWARD_WEIGHT}",
     "CUDA_AGENT_SPEEDUP_SCORE_MODE": "${CUDA_AGENT_SPEEDUP_SCORE_MODE}",
     "CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY": "${CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY}"
   }

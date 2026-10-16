@@ -132,39 +132,81 @@ _REWARD_COMPONENT_KEYS = (
 _KERNEL_SCORE_KEYS = ("correctness", "performance", "coverage")
 
 
-def _compute_dynamic_auxiliary_gate(num_correct: int, group_size: int, *, args=None) -> float:
-    """Return the shared speedup/coverage gate for one valid reward group."""
+def _compute_dynamic_reward_offset(num_correct: int, group_size: int, mode: str | None, *, args=None) -> float:
+    """Return the bounded forward offset x(p) for an additive reward weight."""
+    if mode is None:
+        return 0.0
+    amplitude = getattr(args, "dynamic_reward_amplitude", 0.1)
+    if not math.isfinite(amplitude) or not 0.0 <= amplitude <= 0.5:
+        raise ValueError("--dynamic-reward-amplitude must be finite and between 0 and 0.5")
+    if mode not in {
+        "correct-rate",
+        "correct-rate-sqrt",
+        "piecewise",
+        "piecewise-sqrt",
+        "global-piecewise",
+        "global-piecewise-sqrt",
+    }:
+        raise ValueError(f"Unknown dynamic reward mode: {mode!r}")
+    if group_size == 0:
+        return 0.0
+    rate = num_correct / group_size
+    if mode in {"correct-rate", "correct-rate-sqrt"}:
+        strength = math.sqrt(rate) if mode == "correct-rate-sqrt" else rate
+        return amplitude * (2.0 * strength - 1.0)
+    if group_size <= 1:
+        return 0.0
+    hard, easy = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
+    if mode in {"global-piecewise", "global-piecewise-sqrt"}:
+        if hard <= rate <= easy:
+            return 0.0
+        strength = math.sqrt(rate) if mode == "global-piecewise-sqrt" else rate
+        return amplitude * (2.0 * strength - 1.0)
+    if rate < hard:
+        distance = (hard - rate) / hard
+        strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
+        return -amplitude * strength
+    if rate > easy:
+        distance = (rate - easy) / (1.0 - easy)
+        strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
+        return amplitude * strength
+    return 0.0
 
-    mode = getattr(args, "dynamic_reward_gate", None)
+
+def _compute_dynamic_coverage_scale(num_correct: int, group_size: int, mode: str | None, *, args=None) -> float:
+    """Compute the coverage multiplier from the valid prompt/turn correctness rate."""
     if mode is None:
         return 1.0
-    gate_range = getattr(args, "dynamic_reward_gate_range", None)
+    inverse = mode.startswith("inverse-")
+    base_mode = mode.removeprefix("inverse-")
+    if base_mode not in {"correct-rate", "correct-rate-sqrt", "piecewise", "piecewise-sqrt"}:
+        raise ValueError(f"Unknown dynamic reward mode: {mode!r}")
+    rate = num_correct / group_size if group_size else 0.0
+    if base_mode in {"correct-rate", "correct-rate-sqrt"}:
+        scale = math.sqrt(rate) if base_mode == "correct-rate-sqrt" else rate
+        # All-wrong groups have no successful contribution to amplify.
+        return (1.0 / scale if scale > 0.0 else 0.0) if inverse else scale
+
+    gate_range = getattr(args, "dynamic_reward_range", None)
     if gate_range is None:
-        raise ValueError("--dynamic-reward-gate-range is required when dynamic reward gate is enabled")
-    gate_min, gate_max = gate_range
-    if mode == "sqrt":
-        strength = 0.0 if group_size <= 1 or num_correct <= 1 else math.sqrt((num_correct - 1) / (group_size - 1))
-        return gate_min + (gate_max - gate_min) * strength
-    elif mode in {"piecewise", "piecewise-sqrt"}:
-        # Adapt Coda's thresholded gates (arXiv:2603.08659, Eq. 4), not its
-        # length reward: downweight auxiliary objectives on hard groups and
-        # upweight them on easy groups, with a neutral middle region.
-        if group_size <= 1:
-            return 1.0  # Insufficient group evidence: preserve the base weights.
-        success_rate = num_correct / group_size
-        hard_threshold, easy_threshold = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
-        # Curve the distance from the neutral region, not the final gate:
-        # piecewise-sqrt strengthens both tails while preserving their bounds.
-        if success_rate < hard_threshold:
-            distance = (hard_threshold - success_rate) / hard_threshold
-            strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
-            return 1.0 - (1.0 - gate_min) * strength
-        if success_rate > easy_threshold:
-            distance = (success_rate - easy_threshold) / (1.0 - easy_threshold)
-            strength = math.sqrt(distance) if mode == "piecewise-sqrt" else distance
-            return 1.0 + (gate_max - 1.0) * strength
+        raise ValueError("--dynamic-reward-range is required for piecewise coverage modes")
+    low, high = gate_range
+    if inverse and (low <= 0.0 or not math.isfinite(1.0 / low)):
+        raise ValueError("Inverse piecewise modes require --dynamic-reward-range min > 0 with finite inverse")
+    if group_size <= 1:
         return 1.0
-    raise ValueError(f"Unknown dynamic reward gate: {mode!r}")
+    hard, easy = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
+    if rate < hard:
+        distance = (hard - rate) / hard
+        strength = math.sqrt(distance) if base_mode == "piecewise-sqrt" else distance
+        scale = low + (1.0 - low) * (1.0 - strength)
+    elif rate > easy:
+        distance = (rate - easy) / (1.0 - easy)
+        strength = math.sqrt(distance) if base_mode == "piecewise-sqrt" else distance
+        scale = 1.0 + (high - 1.0) * strength
+    else:
+        scale = 1.0
+    return 1.0 / scale if inverse else scale
 
 
 def _sample_is_correct(sample) -> bool:
@@ -228,33 +270,29 @@ def _apply_dynamic_group_reward_weights(
     args=None,
     record_metrics: bool = False,
 ) -> list[float]:
-    """Rebuild rewards from their components with a group auxiliary gate."""
+    """Balance correctness/speedup and independently scale coverage using complete groups."""
 
     rewards = [float(reward) for reward in rewards]
     if len(samples) != len(rewards):
         raise ValueError("samples and rewards must have the same length")
 
     num_correct, group_size = annotate_group_difficulty(samples)
-    gate = _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args)
-    correctness_mode = getattr(args, "dynamic_reward_correctness", None)
-    if correctness_mode not in {None, "inverse-gate", "inverse-correct-rate"}:
-        raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
-    correctness_scale = 1.0
-    if correctness_mode == "inverse-gate":
-        if getattr(args, "dynamic_reward_gate", None) not in {"sqrt", "piecewise", "piecewise-sqrt"}:
-            raise ValueError("--dynamic-reward-correctness inverse-gate requires an enabled auxiliary gate")
-        if not math.isfinite(gate) or gate <= 0.0 or not math.isfinite(1.0 / gate):
-            raise ValueError("--dynamic-reward-correctness inverse-gate requires a positive gate with finite inverse")
-        correctness_scale = 1.0 / gate
-    elif correctness_mode == "inverse-correct-rate":
-        # MaxRL-inspired inverse success-rate weighting: https://arxiv.org/abs/2602.02710
-        # For binary correctness c with unit weight and p=mean(c)>0, centering c/p
-        # over the same group gives (c-p)/p, the MaxRL advantage. Group std
-        # normalization cancels this scale; RLOO centering adds a G/(G-1) factor.
-        # This scales only correctness, not the full advantage: auxiliary rewards,
-        # nonzero failure scores, length shaping, or future returns break that equivalence.
-        # At p=0, keep the correctness contribution zero without dividing by zero.
-        correctness_scale = group_size / num_correct if num_correct else 0.0
+    modes = {name: getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")}
+    scales = {"coverage": _compute_dynamic_coverage_scale(num_correct, group_size, modes["coverage"], args=args)}
+    weights = {}
+    offsets = {}
+    for name, config_key in (("correctness", "init_correct_weight"), ("speedup", "init_performance_weight")):
+        mode = modes[name]
+        if mode is None:
+            continue
+        base_weight = float(config[config_key])
+        amplitude = getattr(args, "dynamic_reward_amplitude", 0.1)
+        offset = _compute_dynamic_reward_offset(num_correct, group_size, mode.removeprefix("inverse-"), args=args)
+        if not math.isfinite(base_weight) or base_weight < amplitude:
+            raise ValueError(f"Dynamic reward amplitude must not exceed the finite, nonnegative {name} base weight")
+        offsets[name] = -offset if mode.startswith("inverse-") else offset
+        weights[name] = base_weight + offsets[name]
+        scales[name] = weights[name] / base_weight if base_weight else 1.0
     dynamic_rewards = []
     for sample, reward in zip(samples, rewards, strict=True):
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
@@ -270,47 +308,46 @@ def _apply_dynamic_group_reward_weights(
             continue
 
         correctness_score, performance_score, coverage_score = (float(kernel_score[key]) for key in _KERNEL_SCORE_KEYS)
-        correctness_reward = float(components["correctness"])
         failed_reward = components["failed"]
         length_score = float(components["length"])
         failed_reward = None if failed_reward is None else float(failed_reward)
-
+        deltas = dict.fromkeys(modes, 0.0)
         dynamic_reward = failed_reward
-        base_performance_reward = float(components["performance"])
-        correctness_delta = 0.0
-        if dynamic_reward is None:
-            if correctness_mode is not None:
-                # Rebuild from the base score, not a previously scaled component.
-                base_correctness_reward = float(config["init_correct_weight"]) * correctness_score
-                correctness_reward = base_correctness_reward * correctness_scale
-                components["correctness"] = correctness_reward
-                correctness_delta = correctness_reward - base_correctness_reward
+        if failed_reward is None:
             weight_performance = float(config["init_performance_weight"])
             if config.get("performance_reward_requires_correctness", False):
                 weight_performance *= correctness_score
-            base_performance_reward = weight_performance * performance_score
-            weight_performance *= gate
-            weight_coverage = float(config["coverage_reward_weight"]) * gate
-            if not config["coverage_reward_enable"]:
-                weight_coverage = 0.0
-            performance_reward = weight_performance * performance_score
-            coverage_reward = weight_coverage * coverage_score
-            components["performance"] = performance_reward
-            components["coverage"] = coverage_reward
-            dynamic_reward = correctness_reward + performance_reward + coverage_reward
+            base_rewards = {
+                "correctness": float(config["init_correct_weight"]) * correctness_score,
+                "speedup": weight_performance * performance_score,
+                "coverage": (
+                    float(config["coverage_reward_weight"]) * coverage_score
+                    if config["coverage_reward_enable"]
+                    else 0.0
+                ),
+            }
+            for name, component in (
+                ("correctness", "correctness"),
+                ("speedup", "performance"),
+                ("coverage", "coverage"),
+            ):
+                if modes[name] is not None:
+                    # Rebuild from base scores to avoid compounding repeated processing.
+                    components[component] = base_rewards[name] * scales[name]
+                    deltas[name] = components[component] - base_rewards[name]
+            dynamic_reward = sum(float(components[name]) for name in ("correctness", "performance", "coverage"))
         metadata["task_reward"] = dynamic_reward
         metadata["length_score"] = length_score
         if record_metrics:
-            # Compare against the ungated contribution, not an earlier filter
-            # preview or a previous invocation of reward post-processing.
             metadata["dynamic_reward"] = {
-                "gate": gate,
-                "performance_reward_delta": float(components["performance"]) - base_performance_reward,
+                key: value
+                for name, mode in modes.items()
+                if mode is not None
+                for key, value in ((f"{name}_scale", scales[name]), (f"{name}_reward_delta", deltas[name]))
             }
-            if correctness_mode is not None:
-                metadata["dynamic_reward"].update(
-                    correctness_scale=correctness_scale, correctness_reward_delta=correctness_delta
-                )
+            for name in weights:
+                metadata["dynamic_reward"][f"{name}_weight"] = weights[name]
+                metadata["dynamic_reward"][f"{name}_offset"] = offsets[name]
         dynamic_rewards.append(dynamic_reward + length_score)
     return dynamic_rewards
 
@@ -355,9 +392,8 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             if isinstance(sample.metadata, dict):
                 sample.metadata.pop("dynamic_reward", None)
     config = CUDA_AGENT_CONFIGS["reward"]
-    dynamic_weight = stage == "rollout" and (
-        getattr(args, "dynamic_reward_gate", None) is not None
-        or getattr(args, "dynamic_reward_correctness", None) is not None
+    dynamic_weight = stage == "rollout" and any(
+        getattr(args, f"dynamic_reward_{name}", None) is not None for name in ("correctness", "speedup", "coverage")
     )
     failed_group_reward = stage == "rollout" and bool(config["apply_failed_group_reward"])
     overlong_penalty = getattr(args, "overlong_penalty", None)
@@ -610,7 +646,9 @@ def reward_post_process_by_group(args, samples):
         group_samples = [samples[idx] for idx in group_indices]
         annotate_group_difficulty(group_samples)
         group_reward_values = [raw_rewards[idx] for idx in group_indices]
-        group_rewards = torch.tensor(group_reward_values, dtype=torch.float)
+        # Match Python reward precision; float32 rounding can create a spurious
+        # advantage when equal fractional rewards are divided by the std epsilon.
+        group_rewards = torch.tensor(group_reward_values, dtype=torch.float64)
         group_stats[group_index] = {
             "mean": group_rewards.mean().item(),
             "std": group_rewards.std().item() if len(group_reward_values) > 1 else 0.0,

@@ -35,7 +35,7 @@ At that initial integration, the only core `slime/` change was adding `reference
 The branch now also includes these user-requested changes from `main`:
 
 - GDN CPU sequence-boundary caching, including packed-batch metadata construction, cache invalidation, and boundary validation. The optional FlashQLA CPU-metadata patch script is included with its contract test; copying the script does not patch the installed package.
-- Configurable `sqrt` reward gate bounds and support for `inverse-gate` when the minimum is positive, from `f87db0e7`. All enabled gate modes now require an explicit range; no mode-specific default is supplied.
+- Configurable `sqrt` reward gate bounds and support for `inverse-gate` when the minimum is positive were initially integrated from `f87db0e7`. These selectors have since been replaced by independent correctness, speedup, and coverage modes. Correctness/speedup now use bounded additive offsets (inverse means subtraction); coverage retains multiplicative scales, and only piecewise coverage requires an explicit `--dynamic-reward-range`. See the [current reward configuration](en/get_started/usage.md).
 
 The earlier scope check describes the initial integration only. The selected GDN changes now also modify `slime/backends/megatron_utils/data.py`, `slime/utils/sequence_metadata.py`, and `slime_plugins/models/distributed_gdn.py`. The sqrt integration additionally updates argument validation and reward processing. Training launcher parallelism and token-budget defaults remain those of the pre-merge base; the speedup reward setting below is an intentional additional change.
 

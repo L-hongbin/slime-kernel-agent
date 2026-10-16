@@ -15,13 +15,15 @@ sys.path.insert(0, repo_root_path)
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_reward import (
     _apply_dynamic_group_reward_weights,
-    _compute_dynamic_auxiliary_gate,
+    _compute_dynamic_coverage_scale,
+    _compute_dynamic_reward_offset,
     annotate_group_difficulty,
     calculate_kernel_reward,
     post_process_rollout_rewards,
     reward_post_process_by_group,
 )
 from examples.kernel_agent.utils import _set_multi_turn_rewards
+
 from slime.observability.rollout_metrics import (
     _compute_group_correct_rate_metrics,
     compute_reward_post_process_metrics,
@@ -32,13 +34,378 @@ from slime.utils.types import Sample
 NUM_GPUS = 0
 
 
+@pytest.mark.parametrize("mode", ["correct-rate", "correct-rate-sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("amplitude", [0.0, 0.1, 0.2, 0.5])
+def test_dynamic_offset_group16_bounds_and_monotonicity(mode, amplitude):
+    args = SimpleNamespace(dynamic_reward_amplitude=amplitude)
+    offsets = [_compute_dynamic_reward_offset(k, 16, mode, args=args) for k in range(17)]
+    assert offsets[0] == pytest.approx(-amplitude)
+    assert offsets[-1] == pytest.approx(amplitude)
+    assert offsets == sorted(offsets)
+    for offset in offsets:
+        assert -amplitude <= offset <= amplitude
+        assert (0.5 - offset) + (0.5 + offset) == pytest.approx(1.0)
+    if mode.startswith("piecewise"):
+        assert offsets[6:11] == [0.0] * 5
+        assert offsets == pytest.approx([-offset for offset in reversed(offsets)])
+        assert offsets[4] == pytest.approx(-amplitude * (0.5 if mode == "piecewise-sqrt" else 0.25))
+    elif mode == "correct-rate":
+        assert offsets[8] == 0.0
+    else:
+        assert offsets[4] == 0.0
+
+
+@pytest.mark.parametrize("amplitude", [-0.1, 0.51, float("nan"), float("inf")])
+def test_dynamic_offset_rejects_invalid_amplitude(amplitude):
+    with pytest.raises(ValueError, match="--dynamic-reward-amplitude"):
+        _compute_dynamic_reward_offset(1, 16, "piecewise", args=SimpleNamespace(dynamic_reward_amplitude=amplitude))
+
+
+def test_global_piecewise_uses_linear_curve_and_inclusive_custom_thresholds():
+    args = SimpleNamespace(dynamic_reward_amplitude=0.1, difficulty_thresholds=[0.25, 0.75])
+    expected = [-0.1, -0.0875, -0.075, -0.0625, *([0.0] * 9), 0.0625, 0.075, 0.0875, 0.1]
+    actual = [_compute_dynamic_reward_offset(k, 16, "global-piecewise", args=args) for k in range(17)]
+    assert actual == pytest.approx(expected)
+    for correct, size in ((0, 0), (0, 1), (1, 1)):
+        assert _compute_dynamic_reward_offset(correct, size, "global-piecewise", args=args) == 0.0
+
+
+@pytest.mark.parametrize("mode,power", [("global-piecewise", 1.0), ("global-piecewise-sqrt", 0.5)])
+def test_global_piecewise_uses_rate_curve_without_threshold_rescaling(mode, power):
+    args = SimpleNamespace(dynamic_reward_amplitude=0.1)
+    for correct in range(17):
+        p = correct / 16
+        expected = 0.0 if 6 <= correct <= 10 else 0.1 * (2 * p**power - 1)
+        assert _compute_dynamic_reward_offset(correct, 16, mode, args=args) == pytest.approx(expected)
+    # Global sqrt crosses zero at p=0.25, even below the hard threshold.
+    if mode == "global-piecewise-sqrt":
+        assert _compute_dynamic_reward_offset(4, 16, mode, args=args) == 0.0
+        assert _compute_dynamic_reward_offset(5, 16, mode, args=args) > 0.0
+    args.difficulty_thresholds = [0.25, 0.75]
+    for correct in (4, 12):
+        assert _compute_dynamic_reward_offset(correct, 16, mode, args=args) == 0.0
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup"])
+@pytest.mark.parametrize("inverse", [False, True])
+@pytest.mark.parametrize("curve,power", [("global-piecewise", 1.0), ("global-piecewise-sqrt", 0.5)])
+def test_global_piecewise_cli_adjusts_only_selected_component(monkeypatch, component, inverse, curve, power):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    for key in ("init_correct_weight", "init_performance_weight", "coverage_reward_weight"):
+        monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], key, 0.5)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    mode = f"inverse-{curve}" if inverse else curve
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1", f"--dynamic-reward-{component}", mode])
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_range is None
+    samples = [_make_sample(i, 0, float(i < 5)) for i in range(16)]
+    for i, sample in enumerate(samples):
+        _set_reward_component(sample, correctness_score=float(i < 5), performance_score=float(i < 5))
+    offset = 0.1 * (2 * (5 / 16) ** power - 1)
+    expected_weight = 0.5 - offset if inverse else 0.5 + offset
+    expected = [0.5 + expected_weight] * 5 + [0.0] * 11
+    for _ in range(2):
+        assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
+        record = samples[0].metadata["dynamic_reward"]
+        assert record[f"{component}_weight"] == pytest.approx(expected_weight)
+        other = "speedup" if component == "correctness" else "correctness"
+        assert f"{other}_weight" not in record
+        metrics = compute_reward_post_process_metrics(samples)
+        assert metrics[f"rollout/dynamic_reward/{component}_offset_mean"] == pytest.approx(expected_weight - 0.5)
+
+
+@pytest.mark.parametrize(
+    "mode", ["global-piecewise", "global-piecewise-sqrt", "inverse-global-piecewise", "inverse-global-piecewise-sqrt"]
+)
+def test_global_piecewise_is_not_a_coverage_mode(mode):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--rollout-batch-size", "1", "--dynamic-reward-coverage", mode])
+    with pytest.raises(ValueError, match="--dynamic-reward-coverage"):
+        _validate_rollout_reward_post_process_args(SimpleNamespace(dynamic_reward_coverage=mode))
+    with pytest.raises(ValueError, match="Unknown dynamic reward mode"):
+        _compute_dynamic_coverage_scale(1, 16, mode)
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup"])
+@pytest.mark.parametrize(
+    "mode", ["global-piecewise", "inverse-global-piecewise", "global-piecewise-sqrt", "inverse-global-piecewise-sqrt"]
+)
+@pytest.mark.parametrize("thresholds", [[0.5], [0.1, 0.4, 0.8], [0.7, 0.3], [0.0, 0.7], [0.3, float("nan")]])
+def test_global_piecewise_requires_two_valid_thresholds(component, mode, thresholds):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(difficulty_thresholds=thresholds, **{f"dynamic_reward_{component}": mode})
+    with pytest.raises(ValueError, match="--difficulty-thresholds"):
+        _validate_rollout_reward_post_process_args(args)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["correct-rate", "correct-rate-sqrt", "piecewise", "piecewise-sqrt", "global-piecewise", "global-piecewise-sqrt"],
+)
+@pytest.mark.parametrize("correct", range(17))
+@pytest.mark.parametrize("base_correctness,base_speedup", [(0.5, 0.5), (0.4, 0.6)])
+def test_matched_modes_transfer_weight_without_changing_total(
+    monkeypatch, mode, correct, base_correctness, base_speedup
+):
+    config = CUDA_AGENT_CONFIGS["reward"]
+    monkeypatch.setitem(config, "init_correct_weight", base_correctness)
+    monkeypatch.setitem(config, "init_performance_weight", base_speedup)
+    monkeypatch.setitem(config, "performance_reward_requires_correctness", False)
+    monkeypatch.setitem(config, "apply_failed_group_reward", False)
+    args = SimpleNamespace(
+        dynamic_reward_correctness=f"inverse-{mode}",
+        dynamic_reward_speedup=mode,
+        dynamic_reward_amplitude=0.2,
+    )
+    samples = [_make_sample(i, 0, 0.0) for i in range(16)]
+    for i, sample in enumerate(samples):
+        _set_reward_component(sample, correctness_score=float(i < correct), performance_score=0.8)
+    first = post_process_rollout_rewards(args, samples)
+    assert post_process_rollout_rewards(args, samples) == pytest.approx(first)
+    for i, sample in enumerate(samples):
+        record = sample.metadata["dynamic_reward"]
+        wc, ws = record["correctness_weight"], record["speedup_weight"]
+        assert wc + ws == pytest.approx(base_correctness + base_speedup)
+        assert record["correctness_offset"] == -record["speedup_offset"]
+        assert base_correctness - 0.2 - 1e-12 <= wc <= base_correctness + 0.2 + 1e-12
+        assert base_speedup - 0.2 - 1e-12 <= ws <= base_speedup + 0.2 + 1e-12
+        assert sample.reward == pytest.approx(wc * (i < correct) + ws * 0.8)
+    metrics = compute_reward_post_process_metrics(samples)
+    assert metrics["rollout/dynamic_reward/correctness_weight_mean"] == pytest.approx(wc)
+    assert metrics["rollout/dynamic_reward/speedup_weight_mean"] == pytest.approx(ws)
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup"])
+@pytest.mark.parametrize("base", [0.0, 0.05, -0.1, float("nan"), float("inf")])
+def test_additive_weight_rejects_unsafe_base_weight(component, base):
+    config = {**CUDA_AGENT_CONFIGS["reward"]}
+    config["init_correct_weight" if component == "correctness" else "init_performance_weight"] = base
+    args = SimpleNamespace(**{f"dynamic_reward_{component}": "piecewise", "dynamic_reward_amplitude": 0.1})
+    with pytest.raises(ValueError, match="base weight"):
+        _apply_dynamic_group_reward_weights([], [], config, args=args)
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup"])
+def test_zero_amplitude_allows_zero_base_weight(component):
+    config = {**CUDA_AGENT_CONFIGS["reward"], "init_correct_weight": 0.0, "init_performance_weight": 0.0}
+    args = SimpleNamespace(**{f"dynamic_reward_{component}": "inverse-correct-rate", "dynamic_reward_amplitude": 0.0})
+    sample = _make_sample(0, 0, 0.0)
+    _set_reward_component(sample)
+    assert _apply_dynamic_group_reward_weights([sample], [0.0], config, args=args, record_metrics=True) == [0.0]
+    assert sample.metadata["dynamic_reward"][f"{component}_weight"] == 0.0
+
+
+@pytest.mark.parametrize("value", ["-0.1", "0.51", "nan", "inf"])
+def test_amplitude_cli_rejects_invalid_values(value):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1", "--dynamic-reward-amplitude", value])
+    with pytest.raises(ValueError, match="--dynamic-reward-amplitude"):
+        _validate_rollout_reward_post_process_args(args)
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup"])
+@pytest.mark.parametrize("mode", ["piecewise", "piecewise-sqrt", "inverse-piecewise", "inverse-piecewise-sqrt"])
+def test_additive_piecewise_needs_no_range_and_preserves_singleton(component, mode):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    args = parser.parse_args(["--rollout-batch-size", "1", f"--dynamic-reward-{component}", mode])
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_amplitude == 0.1
+    assert args.dynamic_reward_range is None
+    for correct in (0, 1):
+        assert _compute_dynamic_reward_offset(correct, 1, mode.removeprefix("inverse-"), args=args) == 0.0
+
+
+_DYNAMIC_MODES_AND_QUARTER_SCALES = [
+    (None, 1.0),
+    ("correct-rate", 0.25),
+    ("correct-rate-sqrt", 0.5),
+    ("piecewise", 0.95),
+    ("piecewise-sqrt", 0.9),
+    ("inverse-correct-rate", 4.0),
+    ("inverse-correct-rate-sqrt", 2.0),
+    ("inverse-piecewise", 1 / 0.95),
+    ("inverse-piecewise-sqrt", 1 / 0.9),
+]
+
+
+_ADDITIVE_QUARTER_SCALES = {
+    None: 1.0,
+    "correct-rate": 0.9,
+    "correct-rate-sqrt": 1.0,
+    "piecewise": 0.95,
+    "piecewise-sqrt": 0.9,
+    "inverse-correct-rate": 1.1,
+    "inverse-correct-rate-sqrt": 1.0,
+    "inverse-piecewise": 1.05,
+    "inverse-piecewise-sqrt": 1.1,
+}
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup", "coverage"])
+@pytest.mark.parametrize("mode,scale", _DYNAMIC_MODES_AND_QUARTER_SCALES)
+@pytest.mark.parametrize("reward_key", [None, "score"])
+def test_dynamic_components_are_independent_and_idempotent(monkeypatch, component, mode, scale, reward_key):
+    if component != "coverage":
+        scale = _ADDITIVE_QUARTER_SCALES[mode]
+    config = CUDA_AGENT_CONFIGS["reward"]
+    for key, value in {
+        "init_correct_weight": 0.5,
+        "init_performance_weight": 0.5,
+        "coverage_reward_weight": 0.5,
+        "coverage_reward_enable": True,
+        "apply_failed_group_reward": False,
+    }.items():
+        monkeypatch.setitem(config, key, value)
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.dynamic_reward_range = [0.8, 1.2]
+    args.reward_key = reward_key
+    setattr(args, f"dynamic_reward_{component}", mode)
+    samples = []
+    for i in range(4):
+        base = 1.2 if i == 0 else -0.7
+        sample = _make_sample(i, 0, base - 0.1)
+        _set_reward_component(
+            sample,
+            correctness_score=float(i == 0),
+            performance_score=0.8 if i == 0 else 0.0,
+            coverage_score=0.6 if i == 0 else 0.0,
+            failed=None if i == 0 else -0.7,
+            length_score=-0.1,
+        )
+        sample.metadata.update(raw_task_reward=base, task_reward=base, return_reward=7.0)
+        sample.metadata["reward_component"]["return_reward"] = 7.0
+        if reward_key:
+            sample.reward = {"score": sample.reward, "other": 123}
+        samples.append(sample)
+    bases = {"correctness": 0.5, "speedup": 0.4, "coverage": 0.3}
+    expected = [1.1 + bases[component] * (scale - 1), -0.8, -0.8, -0.8]
+    for _ in range(2):
+        assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
+        for name, key in (("correctness", "correctness"), ("speedup", "performance"), ("coverage", "coverage")):
+            assert samples[0].metadata["reward_component"][key] == pytest.approx(
+                bases[name] * (scale if name == component else 1)
+            )
+        for i, sample in enumerate(samples):
+            assert sample.get_reward_value(args) == pytest.approx(expected[i])
+            assert sample.metadata["raw_task_reward"] == (1.2 if i == 0 else -0.7)
+            assert sample.metadata["reward_component"]["return_reward"] == sample.metadata["return_reward"] == 7.0
+            assert sample.metadata["reward_component"]["length"] == -0.1
+            if reward_key:
+                assert sample.reward["other"] == 123
+        metrics = compute_reward_post_process_metrics(samples)
+        if mode is None:
+            assert metrics == {}
+        else:
+            prefix = f"rollout/dynamic_reward/{component}"
+            assert metrics[f"{prefix}_scale_mean"] == pytest.approx(scale)
+            assert metrics[f"{prefix}_reward_delta_mean"] == pytest.approx(bases[component] * (scale - 1) / 4)
+            expected_fields = {f"{component}_scale", f"{component}_reward_delta"}
+            if component != "coverage":
+                expected_fields.update({f"{component}_weight", f"{component}_offset"})
+                assert metrics[f"{prefix}_weight_mean"] == pytest.approx(0.5 * scale)
+                assert metrics[f"{prefix}_offset_mean"] == pytest.approx(0.5 * (scale - 1))
+            assert set(samples[0].metadata["dynamic_reward"]) == expected_fields
+
+
+def test_three_dynamic_modes_compose_without_sharing_scales():
+    args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
+    args.dynamic_reward_correctness = "inverse-correct-rate"
+    args.dynamic_reward_speedup = "correct-rate-sqrt"
+    args.dynamic_reward_coverage = "piecewise-sqrt"
+    args.dynamic_reward_range = [0.8, 1.2]
+    samples = [_make_sample(i, 0, 1.5 if i == 0 else 0.0) for i in range(4)]
+    for i, sample in enumerate(samples):
+        _set_reward_component(
+            sample, correctness_score=float(i == 0), performance_score=float(i == 0), coverage_score=float(i == 0)
+        )
+    assert post_process_rollout_rewards(args, samples) == pytest.approx([0.55 + 0.5 + 0.45, 0, 0, 0])
+    record = samples[0].metadata["dynamic_reward"]
+    assert record["correctness_scale"] == pytest.approx(1.1)
+    assert record["speedup_scale"] == 1.0
+    assert record["coverage_scale"] == pytest.approx(0.9)
+
+
+@pytest.mark.parametrize("component", ["correctness", "speedup", "coverage"])
+@pytest.mark.parametrize("mode,scale", _DYNAMIC_MODES_AND_QUARTER_SCALES)
+def test_dynamic_component_cli_choices(component, mode, scale):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    for selection in (
+        [[], [f"--dynamic-reward-{component}", "None"]] if mode is None else [[f"--dynamic-reward-{component}", mode]]
+    ):
+        args = parser.parse_args(["--rollout-batch-size", "1", "--dynamic-reward-range", "0.8", "1.2", *selection])
+        _validate_rollout_reward_post_process_args(args)
+        assert not hasattr(args, "dynamic_reward_gate")
+        for name in ("correctness", "speedup", "coverage"):
+            assert getattr(args, f"dynamic_reward_{name}") == (mode if name == component else None)
+        if component == "coverage":
+            assert _compute_dynamic_coverage_scale(1, 4, mode, args=args) == pytest.approx(scale)
+        else:
+            base_mode = mode.removeprefix("inverse-") if mode else None
+            offset = _compute_dynamic_reward_offset(1, 4, base_mode, args=args)
+            if mode and mode.startswith("inverse-"):
+                offset = -offset
+            assert 0.5 + offset == pytest.approx(0.5 * _ADDITIVE_QUARTER_SCALES[mode])
+
+
+@pytest.mark.parametrize("mode,power", [("correct-rate", 1.0), ("correct-rate-sqrt", 0.5)])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_rate_scales_include_singletons_and_zero_without_range(mode, power, inverse):
+    selected = f"inverse-{mode}" if inverse else mode
+    for correct, size in ((0, 0), (0, 1), (1, 1), (0, 16), (1, 16), (4, 16), (16, 16)):
+        expected = (correct / size) ** power if size else 0.0
+        if inverse and expected > 0:
+            expected = 1 / expected
+        assert _compute_dynamic_coverage_scale(correct, size, selected) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("component", ["coverage"])
+@pytest.mark.parametrize("mode", ["inverse-piecewise", "inverse-piecewise-sqrt"])
+@pytest.mark.parametrize("lower", [0.0, 1e-320])
+def test_inverse_piecewise_rejects_nonfinite_reciprocal(component, mode, lower):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(dynamic_reward_range=[lower, 1.2], **{f"dynamic_reward_{component}": mode})
+    with pytest.raises(ValueError, match="finite inverse"):
+        _validate_rollout_reward_post_process_args(args)
+    with pytest.raises(ValueError, match="finite inverse"):
+        _compute_dynamic_coverage_scale(0, 4, mode, args=args)
+
+
+@pytest.mark.parametrize("mode", ["inverse-piecewise", "inverse-piecewise-sqrt"])
+def test_inverse_piecewise_preserves_tiny_positive_lower_bound(mode):
+    args = SimpleNamespace(dynamic_reward_range=[1e-200, 1.2])
+    assert _compute_dynamic_coverage_scale(0, 4, mode, args=args) == pytest.approx(1e200)
+
+
 def _make_manager(*, advantage_estimator: str, use_multi_turn: bool, grpo_std_normalization: bool = False):
     manager_cls = RolloutManager.__ray_metadata__.modified_class
     manager = manager_cls.__new__(manager_cls)
     manager.custom_reward_post_process_func = None
     manager.rollout_id = 0
     manager.args = SimpleNamespace(
-        dynamic_reward_gate_range=[0.0, 1.0],
+        dynamic_reward_range=[0.0, 1.0],
         advantage_estimator=advantage_estimator,
         grpo_std_normalization=grpo_std_normalization,
         max_turns=2,
@@ -199,11 +566,11 @@ def test_laser_d_search_uses_paper_ecr_and_includes_non_grid_cap():
     assert select_laser_d_budgets([], [1 / 3, 2 / 3], 4, 16, 4) == [16, 16, 16]
 
 
-@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise-sqrt"])
+@pytest.mark.parametrize("gate", [None, "correct-rate-sqrt", "piecewise-sqrt"])
 def test_laser_d_step_bonus_is_idempotent_and_composes_with_gate(gate):
     from examples.kernel_agent.length_reward import LaserDBudgetController
 
-    args = _laser_args(dynamic_reward_gate=gate)
+    args = _laser_args(dynamic_reward_speedup=gate)
     controller = LaserDBudgetController(args, SimpleNamespace(metadata={}), 0)
     samples = _laser_group(correct=2, lengths=(4, 5, 3, 3, 3, 3, 3, 3))
     for sample in samples:
@@ -211,7 +578,7 @@ def test_laser_d_step_bonus_is_idempotent_and_composes_with_gate(gate):
     controller.observe(samples)
     post_process_rollout_rewards(args, samples, stage="sample")
     assert [sample.reward for sample in samples] == [1.5, 1.0, 0, 0, 0, 0, 0, 0]
-    auxiliary_gate = _compute_dynamic_auxiliary_gate(2, 8, args=args)
+    auxiliary_gate = 0.9 if gate == "piecewise-sqrt" else 1.0
     for _ in range(2):
         rewards = post_process_rollout_rewards(args, samples)
         assert rewards[:2] == pytest.approx([1 + 0.5 * auxiliary_gate, 0.5 + 0.5 * auxiliary_gate])
@@ -259,6 +626,7 @@ def test_laser_d_reservoir_and_budget_restore_through_dataset_checkpoint(tmp_pat
     import copy
 
     from examples.kernel_agent.length_reward import LaserDBudgetController
+
     from slime.rollout.data_source import RolloutDataSourceWithBuffer
 
     args = _laser_args(save=str(tmp_path), load=str(tmp_path), rollout_shuffle=False)
@@ -396,14 +764,15 @@ def test_laser_d_cli_routes_default_rollout_and_keeps_full_async(length_score):
     assert args.rollout_function_path.endswith("generate_rollout_fully_async")
 
 
-@pytest.mark.parametrize("gate", [None, "sqrt"])
+@pytest.mark.parametrize("gate", [None, "correct-rate-sqrt"])
 @pytest.mark.parametrize("method", [None, "dapo"])
 def test_kernel_reward_hook_routes_prefilter_settlement_even_without_length_shaping(gate, method):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
     args = _laser_args(
         overlong_penalty=method,
-        dynamic_reward_gate=gate,
+        dynamic_reward_speedup=gate,
+        dynamic_reward_coverage=gate,
         overlong_buffer_len=16,
         overlong_penalty_factor=1.0,
         rollout_function_path="slime.rollout.sglang_rollout.generate_rollout",
@@ -420,6 +789,7 @@ def test_kernel_sglang_collector_settles_before_dynamic_filter(monkeypatch, meth
     import asyncio
 
     from examples.kernel_agent.kernel_reward import generate_rollout
+
     from slime.rollout import sglang_rollout
     from slime.rollout.filter_hub.base_types import DynamicFilterOutput
 
@@ -514,7 +884,10 @@ def test_failed_group_replacement_preserves_length_penalty_exactly_once(monkeypa
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", True)
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "failed_score", -1.0)
     args = _laser_args(
-        overlong_penalty="dapo", dynamic_reward_gate="sqrt", overlong_buffer_len=16, overlong_penalty_factor=1.0
+        overlong_penalty="dapo",
+        dynamic_reward_speedup="correct-rate-sqrt",
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
     )
     samples = _laser_group(correct=0, lengths=(8, 8))
     for sample, stage_score in zip(samples, [-0.25, -0.75], strict=True):
@@ -595,15 +968,17 @@ def test_uniform_failure_stages_still_fail_formal_filter(monkeypatch):
 
 
 def test_training_does_not_reweight_a_filtered_subset():
-    args = _laser_args(overlong_penalty=None, dynamic_reward_gate="sqrt")
+    args = _laser_args(overlong_penalty=None, dynamic_reward_speedup="correct-rate-sqrt")
     samples = _laser_group(correct=3, lengths=(4, 4, 4, 4))
     post_process_rollout_rewards(args, samples)
     selected = [samples[0], samples[3]]
     expected = [sample.reward for sample in selected]
     raw, _ = reward_post_process_by_group(args, selected)
     assert raw == expected
-    assert selected[0].metadata["dynamic_reward"]["gate"] == pytest.approx((2 / 3) ** 0.5)
-    assert selected[0].metadata["reward_component"]["performance"] == pytest.approx(0.5 * (2 / 3) ** 0.5)
+    assert selected[0].metadata["dynamic_reward"]["speedup_scale"] == pytest.approx(1 + 0.2 * (2 * (3 / 4) ** 0.5 - 1))
+    assert selected[0].metadata["reward_component"]["performance"] == pytest.approx(
+        0.5 + 0.1 * (2 * (3 / 4) ** 0.5 - 1)
+    )
 
 
 def test_trloo_reads_settled_turn_rewards_even_without_shaping():
@@ -662,7 +1037,8 @@ def test_trloo_future_credit_excludes_all_group_shaping_and_survives_filtering(m
         overlong_penalty="dapo",
         overlong_buffer_len=16,
         overlong_penalty_factor=1.0,
-        dynamic_reward_gate="sqrt",
+        dynamic_reward_speedup="correct-rate-sqrt",
+        dynamic_reward_coverage="correct-rate-sqrt",
         finalize_mode=None,
     )
     turns = [_laser_group(correct=correct, lengths=(length, length)) for correct, length in [(2, 4), (0, 8), (1, 12)]]
@@ -677,12 +1053,12 @@ def test_trloo_future_credit_excludes_all_group_shaping_and_survives_filtering(m
         post_process_rollout_rewards(args, group)
     assert [sample.reward for sample in turns[1]] == [-1.0, -0.875]
     assert [sample.metadata["task_reward"] for sample in turns[1]] == [-0.5, -0.375]
-    assert turns[2][0].metadata["task_reward"] == 0.5  # Gated down from raw 1.0.
+    assert turns[2][0].metadata["task_reward"] == pytest.approx(1.0 + 0.1 * (2 * 0.5**0.5 - 1))
     all_samples = [sample for group in turns for sample in group]
     assert [sample.metadata["raw_task_reward"] for sample in all_samples] == [1.0, 1.0, 0.0, 0.0, 1.0, 0.0]
     for sample in all_samples:
         assert sample.metadata["reward_component"]["return_reward"] == sample.metadata["return_reward"]
-    expected = [0.75 + gamma**2, 0.75, -1.0 + gamma, -0.875, -0.25, -0.75]
+    expected = [0.85 + gamma**2, 0.85, -1.0 + gamma, -0.875, 0.25 + 0.1 * (2 * 0.5**0.5 - 1), -0.75]
     assert reward_post_process_by_group(args, all_samples)[0] == pytest.approx(expected)
     assert [
         sum(value for value in sample.metadata["reward_component"].values() if value is not None)
@@ -690,7 +1066,7 @@ def test_trloo_future_credit_excludes_all_group_shaping_and_survives_filtering(m
     ] == pytest.approx(expected)
     # Future groups may be filtered out, but frozen raw task credit is retained.
     assert reward_post_process_by_group(args, turns[0])[0] == pytest.approx(expected[:2])
-    assert [sample.reward for sample in turns[0]] == [0.75, 0.75]
+    assert [sample.reward for sample in turns[0]] == pytest.approx([0.85, 0.85])
 
 
 def test_trloo_missing_raw_future_credit_cannot_silently_use_shaped_returns():
@@ -772,69 +1148,6 @@ def _set_reward_component(
 
 
 @pytest.mark.parametrize(
-    ("num_correct", "group_size", "expected"),
-    [
-        (0, 16, 0.0),
-        (1, 16, 0.0),
-        (4, 16, (3.0 / 15.0) ** 0.5),
-        (16, 16, 1.0),
-        (1, 1, 0.0),
-    ],
-)
-def test_dynamic_auxiliary_gate(num_correct: int, group_size: int, expected: float):
-    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=[0.0, 1.0])
-    assert _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args) == pytest.approx(expected)
-
-
-@pytest.mark.parametrize("bounds", [[0.0, 1.0], [0.8, 1.2], [1.1, 2.0], [0.2, 0.9], [0.7, 0.7]])
-def test_sqrt_configurable_range_endpoints_and_small_groups(bounds):
-    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=bounds)
-    low, high = bounds
-    gates = [_compute_dynamic_auxiliary_gate(k, 8, args=args) for k in range(9)]
-    assert gates == sorted(gates)
-    assert gates[:2] == pytest.approx([low, low])
-    assert gates[-1] == pytest.approx(high)
-    for correct, size in [(0, 0), (0, 1), (1, 1)]:
-        assert _compute_dynamic_auxiliary_gate(correct, size, args=args) == pytest.approx(low)
-
-
-def test_sqrt_custom_range_inverse_gate_cli():
-    import argparse
-
-    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
-
-    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
-    args = parser.parse_args(
-        [
-            "--rollout-batch-size",
-            "1",
-            "--dynamic-reward-gate",
-            "sqrt",
-            "--dynamic-reward-gate-range",
-            "0.8",
-            "1.2",
-            "--dynamic-reward-correctness",
-            "inverse-gate",
-        ]
-    )
-    _validate_rollout_reward_post_process_args(args)
-    assert args.dynamic_reward_gate_range == [0.8, 1.2]
-    assert _compute_dynamic_auxiliary_gate(0, 8, args=args) == pytest.approx(0.8)
-    assert _compute_dynamic_auxiliary_gate(8, 8, args=args) == pytest.approx(1.2)
-
-
-@pytest.mark.parametrize(
-    "bounds", [[], [0.8], [0.8, 1.0, 1.2], [-0.1, 1.2], [1.2, 0.8], [float("nan"), 1.2], [0.8, float("inf")]]
-)
-def test_sqrt_rejects_invalid_range(bounds):
-    from slime.utils.arguments import _validate_rollout_reward_post_process_args
-
-    args = SimpleNamespace(dynamic_reward_gate="sqrt", dynamic_reward_gate_range=bounds)
-    with pytest.raises(ValueError, match="--dynamic-reward-gate-range"):
-        _validate_rollout_reward_post_process_args(args)
-
-
-@pytest.mark.parametrize(
     "num_correct,group_size,expected",
     [
         (0, 8, 0.8),
@@ -856,10 +1169,13 @@ def test_sqrt_rejects_invalid_range(bounds):
 )
 def test_piecewise_dynamic_gate_default_regions(num_correct, group_size, expected):
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise",
-        dynamic_reward_gate_range=[0.8, 1.2],
+        dynamic_reward_speedup="piecewise",
+        dynamic_reward_coverage="piecewise",
+        dynamic_reward_range=[0.8, 1.2],
     )
-    assert _compute_dynamic_auxiliary_gate(num_correct, group_size, args=args) == pytest.approx(expected)
+    assert _compute_dynamic_coverage_scale(
+        num_correct, group_size, args=args, mode=getattr(args, "dynamic_reward_speedup", None)
+    ) == pytest.approx(expected)
 
 
 def test_piecewise_dynamic_gate_equal_thirds_cli_matches_explicit_range_for_group_16():
@@ -876,9 +1192,9 @@ def test_piecewise_dynamic_gate_equal_thirds_cli_matches_explicit_range_for_grou
         [
             "--rollout-batch-size",
             "1",
-            "--dynamic-reward-gate",
+            "--dynamic-reward-speedup",
             "piecewise",
-            "--dynamic-reward-gate-range",
+            "--dynamic-reward-range",
             "0.8",
             "1.2",
         ]
@@ -890,21 +1206,31 @@ def test_piecewise_dynamic_gate_equal_thirds_cli_matches_explicit_range_for_grou
     for config in (
         args,
         SimpleNamespace(
-            dynamic_reward_gate="piecewise",
-            dynamic_reward_gate_range=[0.8, 1.2],
+            dynamic_reward_speedup="piecewise",
+            dynamic_reward_coverage="piecewise",
+            dynamic_reward_range=[0.8, 1.2],
         ),
     ):
-        gates = [_compute_dynamic_auxiliary_gate(correct, 16, args=config) for correct in range(17)]
+        gates = [
+            _compute_dynamic_coverage_scale(
+                correct, 16, args=config, mode=getattr(config, "dynamic_reward_speedup", None)
+            )
+            for correct in range(17)
+        ]
         assert gates == pytest.approx(expected)
 
 
 def test_piecewise_dynamic_gate_custom_bounds_are_continuous_and_monotonic():
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise",
-        dynamic_reward_gate_range=[0.4, 2.0],
+        dynamic_reward_speedup="piecewise",
+        dynamic_reward_coverage="piecewise",
+        dynamic_reward_range=[0.4, 2.0],
         difficulty_thresholds=[0.2, 0.8],
     )
-    gates = [_compute_dynamic_auxiliary_gate(correct, 100, args=args) for correct in range(101)]
+    gates = [
+        _compute_dynamic_coverage_scale(correct, 100, args=args, mode=getattr(args, "dynamic_reward_speedup", None))
+        for correct in range(101)
+    ]
     assert gates == sorted(gates)
     assert gates[0] == 0.4
     assert gates[10] == pytest.approx(0.7)
@@ -916,17 +1242,48 @@ def test_piecewise_dynamic_gate_custom_bounds_are_continuous_and_monotonic():
 
 def test_piecewise_square_root_gate_for_group_16():
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise-sqrt",
-        dynamic_reward_gate_range=[0.8, 1.2],
+        dynamic_reward_speedup="piecewise-sqrt",
+        dynamic_reward_coverage="piecewise-sqrt",
+        dynamic_reward_range=[0.8, 1.2],
     )
     expected = [0.8, 0.8197, 0.8419, 0.8677, 0.9, 0.95, *([1.0] * 5), 1.05, 1.1, 1.1323, 1.1581, 1.1803, 1.2]
-    gates = [_compute_dynamic_auxiliary_gate(correct, 16, args=args) for correct in range(17)]
+    gates = [
+        _compute_dynamic_coverage_scale(correct, 16, args=args, mode=getattr(args, "dynamic_reward_speedup", None))
+        for correct in range(17)
+    ]
     assert gates == pytest.approx(expected, abs=5e-5)
 
 
 @pytest.mark.parametrize("language", ["en", "zh"])
 def test_documented_group_16_gate_table_matches_implementation(language):
     document = (repo_root / "docs" / language / "get_started" / "usage.md").read_text(encoding="utf-8")
+    global_heading = (
+        "##### 全局线性曲线加中间不调整区间"
+        if language == "zh"
+        else "##### Global linear curve with a neutral interval"
+    )
+    global_section = document.split(global_heading, 1)[1]
+    global_table = next(block for block in global_section.split("\n\n") if block.startswith("|"))
+    assert len(global_table.splitlines()[2:]) == 17
+    for correct, row in enumerate(global_table.splitlines()[2:]):
+        count, *values = [cell.strip() for cell in row.strip("|").split("|")]
+        assert int(count) == correct
+        for mode, value in zip(("piecewise", "global-piecewise"), values, strict=True):
+            offset = _compute_dynamic_reward_offset(correct, 16, mode)
+            assert value == f"{0.5 - offset:.5f} / {0.5 + offset:.5f}"
+    heading = "##### Group=16 的最终权重" if language == "zh" else "##### Final weights for Group=16"
+    weight_section = document.split(heading, 1)[1]
+    weight_table = next(block for block in weight_section.split("\n\n") if block.startswith("|"))
+    assert len(weight_table.splitlines()[2:]) == 17
+    for correct, row in enumerate(weight_table.splitlines()[2:]):
+        count, rate, *values = [cell.strip() for cell in row.strip("|").split("|")]
+        assert int(count) == correct
+        assert float(rate) == correct / 16
+        for mode, value in zip(("piecewise", "piecewise-sqrt"), values, strict=True):
+            offset = _compute_dynamic_reward_offset(
+                correct, 16, mode, args=SimpleNamespace(dynamic_reward_amplitude=0.2)
+            )
+            assert value == f"{0.5 - offset:.4f} / {0.5 + offset:.4f}"
     section = (
         document.split("##### G=16", 1)[1] if language == "zh" else document.split("##### Gate values for G=16", 1)[1]
     )
@@ -938,12 +1295,21 @@ def test_documented_group_16_gate_table_matches_implementation(language):
         assert int(count) == correct
         assert float(rate.rstrip("%")) == correct / 16 * 100
         assert len(values) == 3
-        for mode, value in zip(("sqrt", "piecewise", "piecewise-sqrt"), values, strict=True):
-            gate = _compute_dynamic_auxiliary_gate(
+        for mode, value in zip(("correct-rate-sqrt", "piecewise", "piecewise-sqrt"), values, strict=True):
+            gate = _compute_dynamic_coverage_scale(
                 correct,
                 16,
                 args=SimpleNamespace(
-                    dynamic_reward_gate=mode, dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2])
+                    dynamic_reward_speedup=mode,
+                    dynamic_reward_range=([0.0, 1.0] if mode == "correct-rate-sqrt" else [0.8, 1.2]),
+                ),
+                mode=getattr(
+                    SimpleNamespace(
+                        dynamic_reward_speedup=mode,
+                        dynamic_reward_range=([0.0, 1.0] if mode == "correct-rate-sqrt" else [0.8, 1.2]),
+                    ),
+                    "dynamic_reward_speedup",
+                    None,
                 ),
             )
             assert value == f"{gate:.4f}"
@@ -952,9 +1318,13 @@ def test_documented_group_16_gate_table_matches_implementation(language):
 @pytest.mark.parametrize("mode,power", [("piecewise", 1.0), ("piecewise-sqrt", 0.5)])
 def test_piecewise_gate_modes_preserve_bounds_neutral_region_and_continuity(mode, power):
     args = SimpleNamespace(
-        dynamic_reward_gate=mode, dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2])
+        dynamic_reward_speedup=mode,
+        dynamic_reward_range=([0.0, 1.0] if mode == "correct-rate-sqrt" else [0.8, 1.2]),
     )
-    gates = [_compute_dynamic_auxiliary_gate(correct, 300, args=args) for correct in range(301)]
+    gates = [
+        _compute_dynamic_coverage_scale(correct, 300, args=args, mode=getattr(args, "dynamic_reward_speedup", None))
+        for correct in range(301)
+    ]
     assert gates == sorted(gates)
     assert gates[0] == pytest.approx(0.8)
     assert gates[-1] == pytest.approx(1.2)
@@ -962,17 +1332,25 @@ def test_piecewise_gate_modes_preserve_bounds_neutral_region_and_continuity(mode
     assert gates[50] == pytest.approx(1 - 0.2 * 0.5**power)
     assert gates[250] == pytest.approx(1 + 0.2 * 0.5**power)
     for correct in (999999, 1000000, 2000000, 2000001):
-        assert _compute_dynamic_auxiliary_gate(correct, 3000000, args=args) == pytest.approx(1.0, abs=0.001)
+        assert _compute_dynamic_coverage_scale(
+            correct, 3000000, args=args, mode=getattr(args, "dynamic_reward_speedup", None)
+        ) == pytest.approx(1.0, abs=0.001)
     for correct, size in ((0, 0), (0, 1), (1, 1)):
-        assert _compute_dynamic_auxiliary_gate(correct, size, args=args) == 1.0
+        assert (
+            _compute_dynamic_coverage_scale(
+                correct, size, args=args, mode=getattr(args, "dynamic_reward_speedup", None)
+            )
+            == 1.0
+        )
 
 
 @pytest.mark.parametrize("num_correct,expected_gate", [(4, 0.9), (8, 1.0), (12, 1.1)])
 def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, num_correct, expected_gate):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.dynamic_reward_gate_range = [0.8, 1.2]
-    args.dynamic_reward_gate = "piecewise-sqrt"
+    args.dynamic_reward_range = [0.8, 1.2]
+    args.dynamic_reward_speedup = "piecewise-sqrt"
+    args.dynamic_reward_coverage = "piecewise-sqrt"
     samples = [_make_sample(i, 0, float(i < num_correct)) for i in range(16)]
     for i, sample in enumerate(samples):
         _set_reward_component(
@@ -991,115 +1369,10 @@ def test_piecewise_square_root_gate_preview_and_final_reward_match(monkeypatch, 
         assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
         assert [s.reward for s in samples] == pytest.approx(expected)
         metrics = compute_reward_post_process_metrics(samples)
-        assert metrics["rollout/dynamic_reward/gate_mean"] == pytest.approx(expected_gate)
-        assert metrics["rollout/dynamic_reward/performance_reward_delta_mean"] == pytest.approx(
+        assert metrics["rollout/dynamic_reward/speedup_scale_mean"] == pytest.approx(expected_gate)
+        assert metrics["rollout/dynamic_reward/speedup_reward_delta_mean"] == pytest.approx(
             num_correct / 16 * 0.5 * (expected_gate - 1)
         )
-
-
-@pytest.mark.parametrize(
-    "mode,correctness_mode",
-    [(mode, "inverse-gate") for mode in ("sqrt", "piecewise", "piecewise-sqrt")]
-    + [(mode, "inverse-correct-rate") for mode in (None, "sqrt", "piecewise", "piecewise-sqrt")],
-)
-@pytest.mark.parametrize("num_correct", [0, 2, 8, 14, 16])
-@pytest.mark.parametrize("reward_key", [None, "score"])
-def test_dynamic_correctness_settlement_is_idempotent(monkeypatch, mode, correctness_mode, num_correct, reward_key):
-    config = CUDA_AGENT_CONFIGS["reward"]
-    for key, value in {
-        "init_correct_weight": 0.5,
-        "init_performance_weight": 0.5,
-        "coverage_reward_weight": 0.5,
-        "coverage_reward_enable": True,
-        "apply_failed_group_reward": False,
-    }.items():
-        monkeypatch.setitem(config, key, value)
-    args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.dynamic_reward_gate_range = [0.8, 1.2]
-    args.dynamic_reward_gate = mode
-    args.dynamic_reward_correctness = correctness_mode
-    if mode == "sqrt" and correctness_mode == "inverse-gate":
-        args.dynamic_reward_gate_range = [0.8, 1.2]
-    args.reward_key = reward_key
-    gate = _compute_dynamic_auxiliary_gate(num_correct, 16, args=args)
-    scale = 1 / gate if correctness_mode == "inverse-gate" else (16 / num_correct if num_correct else 0.0)
-    samples = [_make_sample(i, 0, 0.0) for i in range(16)]
-    expected = []
-    for i, sample in enumerate(samples):
-        correct = i < num_correct
-        _set_reward_component(
-            sample,
-            correctness_score=float(correct),
-            performance_score=float(correct),
-            coverage_score=float(correct),
-            failed=None if correct else -0.7,
-            length_score=-0.1,
-        )
-        raw = 1.5 if correct else -0.7
-        sample.reward = {"score": raw - 0.1, "other": 123} if reward_key else raw - 0.1
-        sample.metadata.update(raw_task_reward=raw, task_reward=raw, return_reward=7.0)
-        sample.metadata["reward_component"]["return_reward"] = 7.0
-        expected.append(0.5 * scale + gate - 0.1 if correct else -0.8)
-
-    for _ in range(2):
-        assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)
-        for i, sample in enumerate(samples):
-            correct = i < num_correct
-            assert sample.get_reward_value(args) == pytest.approx(expected[i])
-            if reward_key:
-                assert sample.reward["other"] == 123
-            components = sample.metadata["reward_component"]
-            assert components["correctness"] == pytest.approx(0.5 * scale if correct else 0.0)
-            assert components["performance"] == pytest.approx(0.5 * gate if correct else 0.0)
-            assert components["coverage"] == pytest.approx(0.5 * gate if correct else 0.0)
-            assert components["length"] == -0.1
-            assert components["return_reward"] == sample.metadata["return_reward"] == 7.0
-            assert sample.metadata["raw_task_reward"] == (1.5 if correct else -0.7)
-            assert sample.metadata["task_reward"] == pytest.approx(expected[i] + 0.1)
-        metrics = compute_reward_post_process_metrics(samples)
-        assert metrics["rollout/dynamic_reward/correctness_scale_mean"] == pytest.approx(scale)
-        assert metrics["rollout/dynamic_reward/correctness_reward_delta_mean"] == pytest.approx(
-            num_correct / 16 * 0.5 * (scale - 1)
-        )
-
-
-@pytest.mark.parametrize("selection", [None, "None", "inverse-gate", "inverse-correct-rate"])
-@pytest.mark.parametrize("mode", ["piecewise", "piecewise-sqrt"])
-def test_dynamic_correctness_args(selection, mode):
-    import argparse
-
-    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
-
-    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
-    args = parser.parse_args(
-        ["--rollout-batch-size", "1", "--dynamic-reward-gate", mode, "--dynamic-reward-gate-range", "0.8", "1.2"]
-        + (["--dynamic-reward-correctness", selection] if selection is not None else [])
-    )
-    assert args.dynamic_reward_correctness == (None if selection in {None, "None"} else selection)
-    _validate_rollout_reward_post_process_args(args)
-
-
-@pytest.mark.parametrize(
-    "mode,bounds,selection",
-    [
-        (None, [0.8, 1.2], "inverse-gate"),
-        ("sqrt", [0.0, 1.2], "inverse-gate"),
-        ("sqrt", [1e-320, 1.2], "inverse-gate"),
-        ("piecewise", [0.0, 1.2], "inverse-gate"),
-        ("piecewise-sqrt", [1e-320, 1.2], "inverse-gate"),
-        ("piecewise", [0.8, 1.2], "unknown"),
-    ],
-)
-def test_dynamic_correctness_rejects_unsafe_configuration(mode, bounds, selection):
-    from slime.utils.arguments import _validate_rollout_reward_post_process_args
-
-    args = SimpleNamespace(
-        dynamic_reward_gate=mode, dynamic_reward_gate_range=bounds, dynamic_reward_correctness=selection
-    )
-    with pytest.raises(ValueError, match="--dynamic-reward-correctness"):
-        _validate_rollout_reward_post_process_args(args)
-    with pytest.raises(ValueError, match="--dynamic-reward-correctness"):
-        _apply_dynamic_group_reward_weights([_make_sample(i, 0, 0.0) for i in range(2)], [0, 0], {}, args=args)
 
 
 @pytest.mark.parametrize("std_normalization", [False, True])
@@ -1121,9 +1394,9 @@ def test_inverse_correct_rate_cli_without_auxiliary_gate(caplog, std_normalizati
         + ([] if std_normalization else ["--disable-grpo-std-normalization"])
     )
     _validate_rollout_reward_post_process_args(args)
-    assert args.dynamic_reward_gate is None
+    assert args.dynamic_reward_speedup is None
     assert args.grpo_std_normalization is std_normalization
-    assert ("can cancel inverse-correct-rate" in caplog.text) is std_normalization
+    assert "can cancel inverse-correct-rate" not in caplog.text
     assert "Rollout reward shaping requires" in caplog.text
 
 
@@ -1143,7 +1416,7 @@ def test_inverse_correct_rate_binary_centering(monkeypatch, num_correct, std_nor
     _, centered = reward_post_process_by_group(args, samples)
     p = num_correct / 16
     if not std_normalization:
-        expected = [(float(i < num_correct) - p) / p if p else 0.0 for i in range(16)]
+        expected = [(float(i < num_correct) - p) * (1.0 - 0.1 * (2 * p - 1)) for i in range(16)]
         assert centered == pytest.approx(expected)
     else:
         # Group std cancels the common scale (up to the normalization epsilon).
@@ -1171,12 +1444,12 @@ def test_inverse_correct_rate_groups_by_turn_and_excludes_ineligible_samples(mon
     excluded[1].metadata["is_pad_turn"] = True
     excluded[2].status = Sample.Status.ABORTED
     post_process_rollout_rewards(args, samples + excluded)
-    assert [s.reward for s in samples] == [2.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+    assert [s.reward for s in samples] == pytest.approx([0.55, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0])
     assert [s.reward for s in excluded] == [99.0] * 3
     for sample in samples:
         assert sample.metadata["group_num_valid"] == 4
     metrics = compute_reward_post_process_metrics(samples + excluded)
-    assert metrics["rollout/dynamic_reward/correctness_scale_mean"] == 3.0
+    assert metrics["rollout/dynamic_reward/correctness_scale_mean"] == pytest.approx(1.05)
 
 
 def test_dynamic_correctness_disabled_preserves_component_and_metrics():
@@ -1184,14 +1457,19 @@ def test_dynamic_correctness_disabled_preserves_component_and_metrics():
     _set_reward_component(sample, correctness_score=1.0)
     sample.metadata["reward_component"]["correctness"] = 3.0
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise",
+        dynamic_reward_speedup="piecewise",
         dynamic_reward_correctness=None,
-        dynamic_reward_gate_range=[0.8, 1.2],
+        dynamic_reward_range=[0.8, 1.2],
     )
     assert _apply_dynamic_group_reward_weights(
         [sample], [3.0], CUDA_AGENT_CONFIGS["reward"], args=args, record_metrics=True
     ) == [3.0]
-    assert sample.metadata["dynamic_reward"] == {"gate": 1.0, "performance_reward_delta": 0.0}
+    assert sample.metadata["dynamic_reward"] == {
+        "speedup_scale": 1.0,
+        "speedup_reward_delta": 0.0,
+        "speedup_weight": 0.5,
+        "speedup_offset": 0.0,
+    }
     assert not any("correctness" in name for name in compute_reward_post_process_metrics([sample]))
 
 
@@ -1201,9 +1479,10 @@ def test_piecewise_gate_boosts_auxiliary_components_and_records_positive_delta(m
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "coverage_reward_enable", True)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
     args.overlong_penalty = "dapo"
-    args.dynamic_reward_gate_range = [0.8, 1.2]
-    args.dynamic_reward_gate = "piecewise"
-    args.dynamic_reward_gate_range = [0.8, 2.0]
+    args.dynamic_reward_range = [0.8, 1.2]
+    args.dynamic_reward_speedup = "piecewise"
+    args.dynamic_reward_coverage = "piecewise"
+    args.dynamic_reward_range = [0.8, 2.0]
     args.rollout_max_response_len = 100
     args.overlong_buffer_len = 100
     args.overlong_penalty_factor = 0.1
@@ -1213,14 +1492,14 @@ def test_piecewise_gate_boosts_auxiliary_components_and_records_positive_delta(m
         sample.tokens = [0] * 100
         _set_reward_component(sample, correctness_score=1.0, performance_score=1.0 + i, coverage_score=1.0)
     for _ in range(2):
-        assert post_process_rollout_rewards(args, samples) == pytest.approx([2.4, 3.4])
+        assert post_process_rollout_rewards(args, samples) == pytest.approx([2.0, 2.6])
         assert [s.metadata["reward_component"]["coverage"] for s in samples] == [1.0, 1.0]
         assert [s.metadata["reward_component"]["correctness"] for s in samples] == [0.5, 0.5]
         metrics = compute_reward_post_process_metrics(samples)
-        assert metrics["rollout/dynamic_reward/gate_mean"] == 2.0
-        assert metrics["rollout/dynamic_reward/gate_boosted_fraction"] == 1.0
-        assert metrics["rollout/dynamic_reward/gate_scaled_fraction"] == 0.0
-        assert metrics["rollout/dynamic_reward/performance_reward_delta_mean"] == 0.75
+        assert metrics["rollout/dynamic_reward/speedup_scale_mean"] == 1.2
+        assert metrics["rollout/dynamic_reward/speedup_scale_boosted_fraction"] == 1.0
+        assert metrics["rollout/dynamic_reward/speedup_scale_scaled_fraction"] == 0.0
+        assert metrics["rollout/dynamic_reward/speedup_reward_delta_mean"] == pytest.approx(0.15)
 
 
 def test_annotate_group_difficulty_records_shared_group_statistics():
@@ -1259,7 +1538,8 @@ def test_annotate_group_difficulty_does_not_mark_empty_group_as_hard():
 
 def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     samples = [
         _make_sample(0, 0, 0.0),
         _make_sample(1, 0, 0.8),
@@ -1274,8 +1554,9 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
     post_process_rollout_rewards(manager.args, samples)
     raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
 
-    gate = (1.0 / 3.0) ** 0.5
-    expected_raw = [0.0, 0.5 + gate * 0.3, 0.5 + gate * 0.7, 0.0]
+    gate = 0.5**0.5
+    speedup_scale = 1 + 0.2 * (2 * gate - 1)
+    expected_raw = [0.0, 0.5 + speedup_scale * 0.1 + gate * 0.2, 0.5 + speedup_scale * 0.3 + gate * 0.4, 0.0]
     mean = sum(expected_raw) / len(expected_raw)
     expected_advantages = [(reward - mean) * 4.0 / 3.0 for reward in expected_raw]
     assert raw_rewards == pytest.approx(expected_raw)
@@ -1286,7 +1567,7 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
         "performance": 0.2,
         "coverage": 0.4,
     }
-    assert samples[1].metadata["reward_component"]["performance"] == pytest.approx(gate * 0.1)
+    assert samples[1].metadata["reward_component"]["performance"] == pytest.approx(speedup_scale * 0.1)
     assert samples[1].metadata["reward_component"]["coverage"] == pytest.approx(gate * 0.2)
     for sample in samples:
         assert sample.metadata["group_num_correct"] == 2
@@ -1295,9 +1576,10 @@ def test_dynamic_reward_weights_keep_half_maxima_and_apply_before_rloo():
         assert sample.metadata["group_difficulty"] == pytest.approx(0.5)
 
 
-def test_dynamic_reward_all_correct_matches_fixed_half_weights():
+def test_dynamic_reward_all_correct_adds_amplitude_to_speedup_weight():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     samples = [_make_sample(index, 0, reward) for index, reward in enumerate([0.6, 0.8, 1.0])]
     for sample, performance_reward in zip(samples, [0.1, 0.2, 0.3], strict=True):
         _set_reward_component(
@@ -1310,12 +1592,13 @@ def test_dynamic_reward_all_correct_matches_fixed_half_weights():
     post_process_rollout_rewards(manager.args, samples)
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, samples)
 
-    assert raw_rewards == pytest.approx([0.6, 0.8, 1.0])
+    assert raw_rewards == pytest.approx([0.62, 0.84, 1.06])
 
 
 def test_dynamic_reward_rebuilds_overlong_penalty_from_components():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     correct = _make_sample(0, 0, 99.0)
     incorrect = _make_sample(1, 0, 0.0)
     _set_reward_component(correct, correctness_score=1.0, performance_score=1.0, length_score=-0.2)
@@ -1326,21 +1609,22 @@ def test_dynamic_reward_rebuilds_overlong_penalty_from_components():
     post_process_rollout_rewards(manager.args, [correct, incorrect])
     raw_rewards, _advantages = reward_post_process_by_group(manager.args, [correct, incorrect])
 
-    # C=1 makes the auxiliary gate zero; the penalty is rebuilt from components.
-    assert raw_rewards == pytest.approx([0.3, 0.0])
-    assert correct.reward == pytest.approx(0.3)
+    # One of two samples is correct; the penalty is retained exactly once.
+    assert raw_rewards == pytest.approx([0.8 + 0.1 * (2 * 0.5**0.5 - 1), 0.0])
+    assert correct.reward == pytest.approx(0.8 + 0.1 * (2 * 0.5**0.5 - 1))
     assert correct.reward == pytest.approx(
         sum(v for v in correct.metadata["reward_component"].values() if v is not None)
     )
     # Reprocessing must rebuild from base scores, not compound weighting or penalties.
     post_process_rollout_rewards(manager.args, [correct, incorrect])
     assert reward_post_process_by_group(manager.args, [correct, incorrect])[0] == pytest.approx(raw_rewards)
-    assert correct.reward == pytest.approx(0.3)
+    assert correct.reward == pytest.approx(0.8 + 0.1 * (2 * 0.5**0.5 - 1))
 
 
 def test_dynamic_reward_writeback_preserves_other_reward_keys():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     manager.args.reward_key = "kernel"
     sample = _make_sample(0, 0, 99.0)
     original_reward = {"kernel": 99.0, "other": 7.0}
@@ -1350,14 +1634,15 @@ def test_dynamic_reward_writeback_preserves_other_reward_keys():
     post_process_rollout_rewards(manager.args, [sample])
     raw, _ = reward_post_process_by_group(manager.args, [sample])
 
-    assert raw == pytest.approx([0.3])
-    assert sample.reward == pytest.approx({"kernel": 0.3, "other": 7.0})
+    assert raw == pytest.approx([0.9])
+    assert sample.reward == pytest.approx({"kernel": 0.9, "other": 7.0})
     assert original_reward == {"kernel": 99.0, "other": 7.0}
 
 
 def test_dynamic_reward_uses_failed_component_as_branch_sentinel():
     manager = _make_manager(advantage_estimator="rloo", use_multi_turn=False)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     kernel_failure = _make_sample(0, 0, 99.0)
     output_mismatch = _make_sample(1, 0, 99.0)
     _set_reward_component(
@@ -1384,7 +1669,8 @@ def test_dynamic_reward_uses_failed_component_as_branch_sentinel():
 
 def test_dynamic_reward_trloo_discounts_raw_return_rewards():
     manager = _make_manager(advantage_estimator="trloo", use_multi_turn=True)
-    manager.args.dynamic_reward_gate = "sqrt"
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt"
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt"
     manager.args.multi_turn_gamma = 0.5
     samples = [
         _make_sample(0, 0, 0.6, turn_idx=0),
@@ -1405,20 +1691,22 @@ def test_dynamic_reward_trloo_discounts_raw_return_rewards():
     post_process_rollout_rewards(manager.args, samples)
     raw_rewards, advantages = reward_post_process_by_group(manager.args, samples)
 
-    # turn 0: C=N => gate 1; turn 1: C=1 => gate 0.
-    assert raw_rewards == pytest.approx([1.05, 0.7, 0.5, 0.0])
-    assert advantages == pytest.approx([0.35, -0.35, 0.5, -0.5])
-    assert [sample.reward for sample in samples] == pytest.approx([0.6, 0.7, 0.5, 0.0])
+    # Turn 0 adds a=0.1; turn 1 adds a*(2*sqrt(1/2)-1) to the speedup weight.
+    last_reward = 0.5 + 0.8 * (0.5 + 0.1 * (2 * 0.5**0.5 - 1))
+    assert raw_rewards == pytest.approx([1.07, 0.74, last_reward, 0.0])
+    assert advantages == pytest.approx([0.33, -0.33, last_reward, -last_reward])
+    assert [sample.reward for sample in samples] == pytest.approx([0.62, 0.74, last_reward, 0.0])
     repeated_raw, repeated_advantages = reward_post_process_by_group(manager.args, samples)
     assert repeated_raw == pytest.approx(raw_rewards)
     assert repeated_advantages == pytest.approx(advantages)
 
 
-@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("gate", [None, "correct-rate-sqrt", "piecewise", "piecewise-sqrt"])
 @pytest.mark.parametrize("overlong", [False, True])
 def test_reward_switches_are_independent_and_keep_components_consistent(gate, overlong):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.dynamic_reward_gate = gate
+    args.dynamic_reward_speedup = gate
+    args.dynamic_reward_coverage = gate
     args.overlong_penalty = "dapo" if overlong else None
     args.overlong_buffer_len = 100
     args.overlong_penalty_factor = 0.2
@@ -1440,7 +1728,7 @@ def test_reward_switches_are_independent_and_keep_components_consistent(gate, ov
     assert post_process_rollout_rewards(args, samples, stage="sample") == pytest.approx(
         [1.0 - penalty, 1.0 - penalty, -penalty]
     )
-    task_reward = 0.5 + 0.5 * ((0.5**0.5) if gate == "sqrt" else 1.0)
+    task_reward = 1.0 + (0.1 * (2 * (2 / 3) ** 0.5 - 1) if gate == "correct-rate-sqrt" else 0.0)
     expected = [task_reward - penalty, task_reward - penalty, -penalty]
 
     for _ in range(2):
@@ -1493,7 +1781,8 @@ def test_rollout_reward_processors_reject_unknown_stage():
 def test_dynamic_reward_metrics_use_group_gates_and_ungated_performance(monkeypatch):
     monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
-    args.dynamic_reward_gate = "sqrt"
+    args.dynamic_reward_speedup = "correct-rate-sqrt"
+    args.dynamic_reward_coverage = "correct-rate-sqrt"
     samples = []
     groups = []
     for group_idx, turn, correct_flags in [(0, 0, [True, True, False]), (0, 1, [True, True]), (1, 0, [True, False])]:
@@ -1515,30 +1804,35 @@ def test_dynamic_reward_metrics_use_group_gates_and_ungated_performance(monkeypa
     for group in groups:
         _apply_dynamic_group_reward_weights(group, [s.reward for s in group], CUDA_AGENT_CONFIGS["reward"], args=args)
     assert compute_reward_post_process_metrics(samples) == {}
-    partial_gate = 0.5**0.5
+    lower_scale = 1 + 0.2 * (2 * 0.5**0.5 - 1)
+    upper_scale = 1 + 0.2 * (2 * (2 / 3) ** 0.5 - 1)
     for _ in range(2):
         post_process_rollout_rewards(args, samples)
         metrics = compute_reward_post_process_metrics(samples)
         prefix = "rollout/dynamic_reward/"
         assert metrics[f"{prefix}group_count"] == 3
         assert metrics[f"{prefix}sample_count"] == 7
-        assert metrics[f"{prefix}gate_mean"] == pytest.approx((partial_gate + 1.0) / 3)
-        assert metrics[f"{prefix}gate_min"] == 0.0
-        assert metrics[f"{prefix}gate_max"] == 1.0
-        assert metrics[f"{prefix}gate_p25"] == pytest.approx(partial_gate / 2)
-        assert metrics[f"{prefix}gate_p50"] == pytest.approx(partial_gate)
-        assert metrics[f"{prefix}gate_p75"] == pytest.approx((partial_gate + 1.0) / 2)
-        for name in ("gate_zero_fraction", "gate_scaled_fraction", "gate_one_fraction"):
-            assert metrics[f"{prefix}{name}"] == pytest.approx(1 / 3)
-        assert metrics[f"{prefix}performance_reward_delta_mean"] == pytest.approx((partial_gate - 1.5) / 7)
-        assert metrics[f"{prefix}performance_reward_delta_min"] == -0.5
-        assert metrics[f"{prefix}performance_reward_delta_max"] == 0.0
+        assert metrics[f"{prefix}speedup_scale_mean"] == pytest.approx((lower_scale + upper_scale + 1.2) / 3)
+        assert metrics[f"{prefix}speedup_scale_min"] == pytest.approx(lower_scale)
+        assert metrics[f"{prefix}speedup_scale_max"] == 1.2
+        assert metrics[f"{prefix}speedup_scale_p25"] == pytest.approx((lower_scale + upper_scale) / 2)
+        assert metrics[f"{prefix}speedup_scale_p50"] == pytest.approx(upper_scale)
+        assert metrics[f"{prefix}speedup_scale_p75"] == pytest.approx((upper_scale + 1.2) / 2)
+        assert metrics[f"{prefix}speedup_scale_zero_fraction"] == 0.0
+        assert metrics[f"{prefix}speedup_scale_scaled_fraction"] == 0.0
+        assert metrics[f"{prefix}speedup_scale_one_fraction"] == 0.0
+        assert metrics[f"{prefix}speedup_reward_delta_mean"] == pytest.approx(
+            (upper_scale + 0.5 * lower_scale - 1.3) / 7
+        )
+        assert metrics[f"{prefix}speedup_reward_delta_min"] == 0.0
+        assert metrics[f"{prefix}speedup_reward_delta_max"] == pytest.approx(0.1)
 
 
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_correct_rate_buckets_count_retained_prompt_turn_groups(dynamic):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=True).args
-    args.dynamic_reward_gate = "sqrt" if dynamic else None
+    args.dynamic_reward_speedup = "correct-rate-sqrt" if dynamic else None
+    args.dynamic_reward_coverage = "correct-rate-sqrt" if dynamic else None
     samples = []
     for group_idx, turn, num_correct, size in [
         (0, 0, 0, 2),
@@ -1568,7 +1862,9 @@ def test_correct_rate_buckets_count_retained_prompt_turn_groups(dynamic):
     retained = [s for s in samples if s.group_index != 3 and s.index != 9]
     for index, exclusion in enumerate(("removed", "aborted", "pad", "non_kernel")):
         sample = _make_sample(100 + index, 100 + index, 0.0, turn_idx=0)
-        sample.metadata.update(group_correct_rate=1.0, dynamic_reward={"gate": 1.0, "performance_reward_delta": 0.0})
+        sample.metadata.update(
+            group_correct_rate=1.0, dynamic_reward={"speedup_scale": 1.0, "speedup_reward_delta": 0.0}
+        )
         if exclusion == "removed":
             sample.remove_sample = True
         elif exclusion == "aborted":
@@ -1600,8 +1896,9 @@ def test_correct_rate_buckets_skip_missing_or_invalid_rates(correct_rate):
 def test_disabled_dynamic_reward_clears_stale_metric_records(explicit_none):
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
     if explicit_none:
-        args.dynamic_reward_gate = None
-    sample = Sample(reward=1.0, metadata={"dynamic_reward": {"gate": 0.0, "performance_reward_delta": -1.0}})
+        args.dynamic_reward_speedup = None
+        args.dynamic_reward_coverage = None
+    sample = Sample(reward=1.0, metadata={"dynamic_reward": {"speedup_scale": 0.0, "speedup_reward_delta": -1.0}})
     assert post_process_rollout_rewards(args, [sample]) == [1.0]
     assert "dynamic_reward" not in sample.metadata
     assert compute_reward_post_process_metrics([sample]) == {}
@@ -1620,7 +1917,8 @@ def test_dynamic_reward_metrics_logged_after_final_processing(monkeypatch, caplo
     manager.rollout_id = 4
     manager.args.wandb_always_use_train_step = train_step_axis
     manager.args.global_batch_size = 3
-    manager.args.dynamic_reward_gate = "sqrt" if dynamic else None
+    manager.args.dynamic_reward_speedup = "correct-rate-sqrt" if dynamic else None
+    manager.args.dynamic_reward_coverage = "correct-rate-sqrt" if dynamic else None
     samples = [_make_sample(i, 0, float(i < 2)) for i in range(3)]
     for i, sample in enumerate(samples):
         sample.tokens = [1, 2]
@@ -1634,7 +1932,7 @@ def test_dynamic_reward_metrics_logged_after_final_processing(monkeypatch, caplo
         assert args is manager.args
         assert step_key == "rollout/step"
         # The sample has already been shaped; this is not the earlier rollout log.
-        assert samples[0].reward == pytest.approx(0.5 + 0.5 * (0.5**0.5))
+        assert samples[0].reward == pytest.approx(1.0 + 0.1 * (2 * (2 / 3) ** 0.5 - 1))
         logged.append(dict(metrics))
 
     monkeypatch.setattr(rollout_module.logging_utils, "log", capture_log)
@@ -1649,8 +1947,10 @@ def test_dynamic_reward_metrics_logged_after_final_processing(monkeypatch, caplo
     assert logged[0]["rollout/step"] == (8 if train_step_axis else 4)
     if train_step_axis:
         assert logged[0]["train/step"] == 8
-    assert logged[0]["rollout/dynamic_reward/gate_mean"] == pytest.approx(0.5**0.5)
-    assert logged[0]["rollout/dynamic_reward/performance_reward_delta_mean"] == pytest.approx(((0.5**0.5) - 1) / 3)
+    assert logged[0]["rollout/dynamic_reward/speedup_scale_mean"] == pytest.approx(1 + 0.2 * (2 * (2 / 3) ** 0.5 - 1))
+    assert logged[0]["rollout/dynamic_reward/speedup_reward_delta_mean"] == pytest.approx(
+        0.2 * (2 * (2 / 3) ** 0.5 - 1) / 3
+    )
     assert "reward post-process 4" in caplog.text
 
 
@@ -1659,7 +1959,8 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     from slime.observability.tensorboard_utils import _TensorboardAdapter
 
     args = _make_manager(advantage_estimator="grpo", use_multi_turn=False).args
-    args.dynamic_reward_gate = "sqrt"
+    args.dynamic_reward_speedup = "correct-rate-sqrt"
+    args.dynamic_reward_coverage = "correct-rate-sqrt"
     args.use_tensorboard = True
     samples = [_make_sample(i, 0, 1.0) for i in range(2)]
     for sample in samples:
@@ -1677,8 +1978,10 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     logging_utils.log(args, {**metrics, "rollout/step": 4}, step_key="rollout/step")
     assert len(scalars) == len(metrics)
     assert all(isinstance(value, (int, float)) and step == 4 for _, value, step in scalars)
-    assert ("rollout/dynamic_reward/gate_mean", 1.0, 4) in scalars
-    assert ("rollout/dynamic_reward/performance_reward_delta_mean", 0.0, 4) in scalars
+    assert ("rollout/dynamic_reward/speedup_scale_mean", 1.2, 4) in scalars
+    assert dict((key, value) for key, value, _ in scalars)[
+        "rollout/dynamic_reward/speedup_reward_delta_mean"
+    ] == pytest.approx(0.1)
     assert flushes == [True]
 
 
@@ -1686,12 +1989,14 @@ def test_dynamic_reward_metrics_reach_tensorboard_as_scalars(monkeypatch):
     "args",
     [
         SimpleNamespace(),
-        SimpleNamespace(dynamic_reward_gate=None, dynamic_reward_gate_range=[0.8, 1.2]),
+        SimpleNamespace(dynamic_reward_speedup=None, dynamic_reward_range=[0.8, 1.2]),
     ],
 )
 def test_disabled_dynamic_gate_is_neutral(args):
-    assert _compute_dynamic_auxiliary_gate(1, 16, args=args) == 1.0
-    assert _compute_dynamic_auxiliary_gate(16, 16, args=args) == 1.0
+    assert _compute_dynamic_coverage_scale(1, 16, args=args, mode=getattr(args, "dynamic_reward_speedup", None)) == 1.0
+    assert (
+        _compute_dynamic_coverage_scale(16, 16, args=args, mode=getattr(args, "dynamic_reward_speedup", None)) == 1.0
+    )
 
 
 def test_thresholds_and_range_do_not_enable_dynamic_weight():
@@ -1707,13 +2012,13 @@ def test_thresholds_and_range_do_not_enable_dynamic_weight():
             "--difficulty-thresholds",
             "0.2",
             "0.8",
-            "--dynamic-reward-gate-range",
+            "--dynamic-reward-range",
             "0.4",
             "2",
         ]
     )
     _validate_rollout_reward_post_process_args(args)
-    assert args.dynamic_reward_gate is None
+    assert args.dynamic_reward_speedup is None
     sample = Sample(reward=0.7, metadata={})
     assert post_process_rollout_rewards(args, [sample]) == [0.7]
     assert sample.metadata == {}
@@ -1721,10 +2026,10 @@ def test_thresholds_and_range_do_not_enable_dynamic_weight():
 
 def test_dppo_script_disables_dynamic_weight_by_default():
     script = repo_root / "examples/kernel_agent/run_qwen3.6_27B_full_async_dppo.sh"
-    assert "--dynamic-reward-gate None" in script.read_text(encoding="utf-8")
+    assert "--dynamic-reward-speedup None" in script.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("gate", ["None", "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("gate", ["None", "correct-rate-sqrt", "piecewise", "piecewise-sqrt"])
 @pytest.mark.parametrize("penalty", ["None", "dapo"])
 def test_explicit_reward_method_choices(gate, penalty):
     import argparse
@@ -1736,17 +2041,17 @@ def test_explicit_reward_method_choices(gate, penalty):
         [
             "--rollout-batch-size",
             "1",
-            "--dynamic-reward-gate",
+            "--dynamic-reward-speedup",
             gate,
             "--overlong-penalty",
             penalty,
-            "--dynamic-reward-gate-range",
+            "--dynamic-reward-range",
             "0.8",
             "1.2",
         ]
     )
     _validate_rollout_reward_post_process_args(args)
-    assert args.dynamic_reward_gate == (None if gate == "None" else gate)
+    assert args.dynamic_reward_speedup == (None if gate == "None" else gate)
     assert args.overlong_penalty == (None if penalty == "None" else penalty)
     if gate == "None" and penalty == "None":
         sample = Sample(reward=0.7, metadata={})
@@ -1781,15 +2086,16 @@ def test_reward_runtime_rejects_unparsed_penalty_methods(method):
 def test_dynamic_gate_rejects_invalid_selection(gate):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
-    with pytest.raises(ValueError, match="--dynamic-reward-gate"):
+    with pytest.raises(ValueError, match="--dynamic-reward-speedup"):
         _validate_rollout_reward_post_process_args(
             SimpleNamespace(
-                dynamic_reward_gate=gate, dynamic_reward_gate_range=([0.0, 1.0] if gate == "sqrt" else [0.8, 1.2])
+                dynamic_reward_speedup=gate,
+                dynamic_reward_range=([0.0, 1.0] if gate == "correct-rate-sqrt" else [0.8, 1.2]),
             )
         )
 
 
-@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("gate", [None, "correct-rate-sqrt", "piecewise", "piecewise-sqrt"])
 @pytest.mark.parametrize("overlong", [False, True])
 def test_rollout_reward_switch_args_parse_and_validate(gate, overlong):
     import argparse
@@ -1801,25 +2107,21 @@ def test_rollout_reward_switch_args_parse_and_validate(gate, overlong):
         [
             "--rollout-batch-size",
             "1",
-            *(
-                ["--dynamic-reward-gate", gate, "--dynamic-reward-gate-range", "0.8", "1.2"]
-                if gate is not None
-                else []
-            ),
+            *(["--dynamic-reward-speedup", gate, "--dynamic-reward-range", "0.8", "1.2"] if gate is not None else []),
             *(["--overlong-penalty", "dapo"] if overlong else []),
             "--custom-reward-post-process-path",
             "examples.kernel_agent.kernel_reward.reward_post_process_by_group",
         ]
     )
     assert not hasattr(args, "rollout_reward_post_processors")
-    assert args.dynamic_reward_gate == gate
+    assert args.dynamic_reward_speedup == gate
     assert args.overlong_penalty == ("dapo" if overlong else None)
     assert args.difficulty_thresholds == [1 / 3, 2 / 3]
-    assert args.dynamic_reward_gate_range == (None if gate is None else [0.8, 1.2])
+    assert args.dynamic_reward_range == (None if gate is None else [0.8, 1.2])
     assert not hasattr(args, "dynamic_reward_gate_power")
     _validate_rollout_reward_post_process_args(args)
     expected_range = None if gate is None else [0.8, 1.2]
-    assert args.dynamic_reward_gate_range == expected_range
+    assert args.dynamic_reward_range == expected_range
 
 
 @pytest.mark.parametrize("mode,power", [("piecewise", 1.0), ("piecewise-sqrt", 0.5)])
@@ -1837,12 +2139,12 @@ def test_piecewise_dynamic_gate_args_parse_and_validate(mode, power):
         [
             "--rollout-batch-size",
             "1",
-            "--dynamic-reward-gate",
+            "--dynamic-reward-speedup",
             mode,
             "--difficulty-thresholds",
             "0.2",
             "0.8",
-            "--dynamic-reward-gate-range",
+            "--dynamic-reward-range",
             "0.4",
             "2.0",
         ]
@@ -1850,15 +2152,27 @@ def test_piecewise_dynamic_gate_args_parse_and_validate(mode, power):
     _validate_difficulty_thresholds_args(args)
     _validate_rollout_reward_post_process_args(args)
     assert args.difficulty_thresholds == [0.2, 0.8]
-    assert args.dynamic_reward_gate_range == [0.4, 2.0]
-    assert args.dynamic_reward_gate == mode
+    assert args.dynamic_reward_range == [0.4, 2.0]
+    assert args.dynamic_reward_speedup == mode
     assert args.overlong_penalty is None  # Enabling a gate does not enable length shaping.
-    assert _compute_dynamic_auxiliary_gate(1, 10, args=args) == pytest.approx(1 - 0.6 * 0.5**power)
-    assert _compute_dynamic_auxiliary_gate(9, 10, args=args) == pytest.approx(1 + 0.5**power)
+    assert _compute_dynamic_coverage_scale(
+        1, 10, args=args, mode=getattr(args, "dynamic_reward_speedup", None)
+    ) == pytest.approx(1 - 0.6 * 0.5**power)
+    assert _compute_dynamic_coverage_scale(
+        9, 10, args=args, mode=getattr(args, "dynamic_reward_speedup", None)
+    ) == pytest.approx(1 + 0.5**power)
 
 
 @pytest.mark.parametrize(
-    "option,value", [("--dynamic-reward-gate-power", "0.5"), ("--rollout-reward-post-processors", "dynamic-weight")]
+    "option,value",
+    [
+        ("--dynamic-reward-gate", "piecewise"),
+        ("--dynamic-reward-gate-range", "0.8"),
+        ("--dynamic-reward-gate-power", "0.5"),
+        ("--dynamic-reward-speedup", "sqrt"),
+        ("--dynamic-reward-correctness", "inverse-gate"),
+        ("--rollout-reward-post-processors", "dynamic-weight"),
+    ],
 )
 def test_reward_args_reject_removed_options(option, value):
     import argparse
@@ -1869,18 +2183,6 @@ def test_reward_args_reject_removed_options(option, value):
     with pytest.raises(SystemExit) as exc:
         parser.parse_args(["--rollout-batch-size", "1", option, value])
     assert exc.value.code == 2
-
-
-def test_sqrt_gate_maps_range_and_ignores_piecewise_thresholds():
-    from slime.utils.arguments import _validate_rollout_reward_post_process_args
-
-    args = SimpleNamespace(
-        dynamic_reward_gate="sqrt", difficulty_thresholds=[0.1, 0.9], dynamic_reward_gate_range=[0.5, 2.0]
-    )
-    _validate_rollout_reward_post_process_args(args)
-    for correct in range(17):
-        strength = ((correct - 1) / 15) ** 0.5 if correct > 1 else 0.0
-        assert _compute_dynamic_auxiliary_gate(correct, 16, args=args) == pytest.approx(0.5 + 1.5 * strength)
 
 
 @pytest.mark.parametrize(
@@ -1901,8 +2203,8 @@ def test_sqrt_gate_maps_range_and_ignores_piecewise_thresholds():
 def test_piecewise_dynamic_gate_args_reject_invalid_values(gate_range, mode):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
-    args = SimpleNamespace(dynamic_reward_gate=mode, dynamic_reward_gate_range=gate_range)
-    with pytest.raises(ValueError, match="--dynamic-reward-gate-range"):
+    args = SimpleNamespace(dynamic_reward_coverage=mode, dynamic_reward_range=gate_range)
+    with pytest.raises(ValueError, match="--dynamic-reward-range"):
         _validate_rollout_reward_post_process_args(args)
 
 
@@ -1920,7 +2222,7 @@ def test_piecewise_dynamic_gate_args_reject_invalid_values(gate_range, mode):
         [0.25, float("inf")],
     ],
 )
-@pytest.mark.parametrize("mode", ["sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("mode", ["correct-rate-sqrt", "piecewise", "piecewise-sqrt"])
 def test_difficulty_thresholds_validation_is_independent_of_reward_mode(thresholds, mode):
     from slime.utils.arguments import _validate_difficulty_thresholds_args
 
@@ -1928,8 +2230,9 @@ def test_difficulty_thresholds_validation_is_independent_of_reward_mode(threshol
         _validate_difficulty_thresholds_args(
             SimpleNamespace(
                 difficulty_thresholds=thresholds,
-                dynamic_reward_gate=mode,
-                dynamic_reward_gate_range=([0.0, 1.0] if mode == "sqrt" else [0.8, 1.2]),
+                dynamic_reward_speedup=mode,
+                dynamic_reward_coverage=mode,
+                dynamic_reward_range=([0.0, 1.0] if mode == "correct-rate-sqrt" else [0.8, 1.2]),
             )
         )
 
@@ -1950,8 +2253,9 @@ def test_shared_difficulty_thresholds_allow_more_buckets_but_piecewise_requires_
     assert args.difficulty_thresholds == thresholds
     _validate_difficulty_thresholds_args(args)
     _validate_rollout_reward_post_process_args(args)
-    args.dynamic_reward_gate_range = [0.8, 1.2]
-    args.dynamic_reward_gate = mode
+    args.dynamic_reward_range = [0.8, 1.2]
+    args.dynamic_reward_speedup = mode
+    args.dynamic_reward_coverage = mode
     with pytest.raises(ValueError, match="exactly two --difficulty-thresholds"):
         _validate_rollout_reward_post_process_args(args)
 
@@ -2364,18 +2668,18 @@ def test_ctm_rejects_non_max_length_or_repeated_response(response_length, tokens
     assert rewards == pytest.approx([0.0])
 
 
-@pytest.mark.parametrize("mode", ["sqrt", "piecewise", "piecewise-sqrt"])
+@pytest.mark.parametrize("mode", ["piecewise", "piecewise-sqrt", "inverse-piecewise", "inverse-piecewise-sqrt"])
 @pytest.mark.parametrize("explicit_none", [False, True])
 def test_dynamic_gate_requires_explicit_range(mode, explicit_none):
     from slime.utils.arguments import _validate_rollout_reward_post_process_args
 
-    args = SimpleNamespace(dynamic_reward_gate=mode)
+    args = SimpleNamespace(dynamic_reward_coverage=mode)
     if explicit_none:
-        args.dynamic_reward_gate_range = None
-    with pytest.raises(ValueError, match="--dynamic-reward-gate-range is required"):
+        args.dynamic_reward_range = None
+    with pytest.raises(ValueError, match="--dynamic-reward-range is required"):
         _validate_rollout_reward_post_process_args(args)
-    with pytest.raises(ValueError, match="--dynamic-reward-gate-range is required"):
-        _compute_dynamic_auxiliary_gate(0, 1, args=args)
+    with pytest.raises(ValueError, match="--dynamic-reward-range is required"):
+        _compute_dynamic_coverage_scale(0, 1, args=args, mode=getattr(args, "dynamic_reward_coverage", None))
 
 
 if __name__ == "__main__":

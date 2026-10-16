@@ -98,8 +98,9 @@ def test_reference_coverage_flows_through_piecewise_reward(monkeypatch):
     config.update(coverage_reward_type="reference_time_coverage", speedup_score_mode="legacy")
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "reward", config)
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise",
-        dynamic_reward_gate_range=[0.8, 1.2],
+        dynamic_reward_speedup="piecewise",
+        dynamic_reward_coverage="piecewise",
+        dynamic_reward_range=[0.8, 1.2],
         overlong_penalty=None,
         use_multi_turn=False,
     )
@@ -649,9 +650,10 @@ def test_rational_reward_composes_with_coverage_and_inverse_gate(monkeypatch, co
     }
     monkeypatch.setitem(CUDA_AGENT_CONFIGS, "reward", config)
     args = SimpleNamespace(
-        dynamic_reward_gate="piecewise-sqrt" if dynamic else None,
-        dynamic_reward_gate_range=[0.8, 1.2],
-        dynamic_reward_correctness="inverse-gate" if dynamic else None,
+        dynamic_reward_speedup="piecewise-sqrt" if dynamic else None,
+        dynamic_reward_coverage="piecewise-sqrt" if dynamic else None,
+        dynamic_reward_range=[0.8, 1.2],
+        dynamic_reward_correctness="inverse-piecewise-sqrt" if dynamic else None,
         overlong_penalty=None,
         use_multi_turn=False,
     )
@@ -671,7 +673,8 @@ def test_rational_reward_composes_with_coverage_and_inverse_gate(monkeypatch, co
     gate = 1.2 if dynamic else 1.0
     coverages = [0.8, 0.5] if coverage_type == "time_coverage" else [0.9, 0.9]
     expected = [
-        0.5 / gate + gate * (0.5 * score + 0.5 * cov) for score, cov in zip([4 / 3, 5 / 3], coverages, strict=True)
+        (0.4 if dynamic else 0.5) + gate * (0.5 * score + 0.5 * cov)
+        for score, cov in zip([4 / 3, 5 / 3], coverages, strict=True)
     ]
     assert rewards == pytest.approx(expected)
     assert post_process_rollout_rewards(args, samples) == pytest.approx(expected)

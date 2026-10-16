@@ -91,7 +91,9 @@ def test_low_variance_drop_logs_ids_and_corresponding_rewards(caplog):
     }
 
 
-@pytest.mark.parametrize("gate,keep", [(None, True), ("sqrt", False), ("piecewise", True), ("piecewise-sqrt", True)])
+@pytest.mark.parametrize(
+    "gate,keep", [(None, True), ("correct-rate-sqrt", True), ("piecewise", True), ("piecewise-sqrt", True)]
+)
 def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, keep):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 
@@ -105,7 +107,9 @@ def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, k
         reward_key=None,
         reward_std_threshold=0.001,
         target_group_size=2,
-        dynamic_reward_gate=gate,
+        dynamic_reward_range=[0.8, 1.2],
+        dynamic_reward_speedup=gate,
+        dynamic_reward_coverage=gate,
     )
     samples = []
     for i, performance in enumerate([0.0, 1.0]):
@@ -135,7 +139,7 @@ def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, k
     assert [sample.to_dict() for sample in samples] == before
 
 
-@pytest.mark.parametrize("mode,keep", [("sqrt", False), ("piecewise", True), ("piecewise-sqrt", True)])
+@pytest.mark.parametrize("mode,keep", [("correct-rate-sqrt", True), ("piecewise", True), ("piecewise-sqrt", True)])
 def test_filter_reads_settled_dynamic_gate_without_mutation(monkeypatch, mode, keep):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 
@@ -146,7 +150,9 @@ def test_filter_reads_settled_dynamic_gate_without_mutation(monkeypatch, mode, k
         target_group_size=2,
         reward_key=None,
         reward_std_threshold=0.27,
-        dynamic_reward_gate=mode,
+        dynamic_reward_range=[0.8, 1.2],
+        dynamic_reward_speedup=mode,
+        dynamic_reward_coverage=mode,
     )
     samples = [
         Sample(
@@ -173,7 +179,7 @@ def test_filter_reads_settled_dynamic_gate_without_mutation(monkeypatch, mode, k
     assert all("dynamic_reward" in sample.metadata for sample in samples)
 
 
-@pytest.mark.parametrize("gate", [None, "sqrt", "piecewise-sqrt"])
+@pytest.mark.parametrize("gate", [None, "correct-rate-sqrt", "piecewise-sqrt"])
 def test_laser_d_bonus_keeps_all_correct_groups_with_different_lengths(monkeypatch, gate):
     from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
     from examples.kernel_agent.length_reward import LaserDBudgetController
@@ -185,7 +191,9 @@ def test_laser_d_bonus_keeps_all_correct_groups_with_different_lengths(monkeypat
         target_group_size=2,
         reward_key=None,
         reward_std_threshold=0.1,
-        dynamic_reward_gate=gate,
+        dynamic_reward_range=[0.8, 1.2],
+        dynamic_reward_speedup=gate,
+        dynamic_reward_coverage=gate,
         overlong_penalty="laser-d",
         rollout_max_response_len=16,
         laser_d_min_length=4,

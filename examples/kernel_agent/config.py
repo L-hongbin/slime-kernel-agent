@@ -44,6 +44,8 @@ correctness_timeout = (
 _cte = os.environ.get("CUDA_AGENT_CORRECTNESS_TIMEOUT_ENABLED")
 correctness_timeout_enabled = None if _cte is None else bool(int(_cte))
 # Reward settings.
+correct_reward_weight = float(os.environ.get("CUDA_AGENT_CORRECT_REWARD_WEIGHT", 0.5))
+speedup_reward_weight = float(os.environ.get("CUDA_AGENT_SPEEDUP_REWARD_WEIGHT", 0.5))
 coverage_reward_type = os.environ.get("CUDA_AGENT_COVERAGE_REWARD_TYPE", "time_coverage").strip().lower()
 coverage_reward_weight = float(os.environ.get("CUDA_AGENT_COVERAGE_REWARD_WEIGHT", 0.5))
 if coverage_reward_type not in {
@@ -178,8 +180,8 @@ CUDA_AGENT_CONFIGS = {
     },
     # Reward settings.
     "reward": {
-        "init_correct_weight": 0.5,
-        "init_performance_weight": 0.5,
+        "init_correct_weight": correct_reward_weight,
+        "init_performance_weight": speedup_reward_weight,
         "speedup_score_mode": speedup_score_mode,
         "speedup_reward_upper_bound": float(os.environ.get("CUDA_AGENT_SPEEDUP_REWARD_UPPER", "2")),
         "speedup_reward_lower_bound": 0.0,

@@ -198,7 +198,8 @@ def test_reward_components_and_group_rates_reach_regular_tracker_without_exp_met
         custom_rollout_log_function_path=None,
         load_debug_rollout_data=None,
         wandb_always_use_train_step=False,
-        dynamic_reward_gate="sqrt" if dynamic else None,
+        dynamic_reward_speedup="correct-rate-sqrt" if dynamic else None,
+        dynamic_reward_coverage="correct-rate-sqrt" if dynamic else None,
     )
     samples = [
         Sample(
@@ -208,7 +209,7 @@ def test_reward_components_and_group_rates_reach_regular_tracker_without_exp_met
         )
     ]
     if dynamic:
-        samples[0].metadata["dynamic_reward"] = {"gate": 1.0, "performance_reward_delta": 0.0}
+        samples[0].metadata["dynamic_reward"] = {"speedup_scale": 1.0, "speedup_reward_delta": 0.0}
     logged = []
     monkeypatch.setattr(rollout_metrics, "compute_perf_metrics_from_samples", lambda *args: {})
     monkeypatch.setattr(rollout_metrics, "compute_rollout_step", lambda *args: 7)

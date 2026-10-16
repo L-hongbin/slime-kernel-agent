@@ -308,7 +308,7 @@ export CUDA_AGENT_SPEEDUP_REWARD_UPPER=2
 例如 `M=2` 时，`0.5x / 1x / 2x / 5x` 对应 `0.667 / 1 / 1.333 / 1.667`。
 非有限或非正的加速比不获得速度得分；错误程序仍走原有失败奖励路径。
 
-该模式只替换 `kernel_score.performance` 的映射，随后仍乘 performance 权重和动态 gate；correctness inverse-gate、coverage 和原始 speedup 指标保持原有计算方式。
+该模式只替换 `kernel_score.performance` 的映射，随后仍乘 performance 权重和 speedup 动态系数；correctness、coverage 的独立调权和原始 speedup 指标保持原有计算方式。
 Qwen3.8 WarmUp/MultiTurn 启动脚本会将模式透传给 Ray worker；非 `legacy` 模式的实验名追加 `-SSM模式名`，例如 `-SRUP2-SSMrational`。
 自定义启动脚本也需要将 `CUDA_AGENT_SPEEDUP_SCORE_MODE` 和 `CUDA_AGENT_SPEEDUP_REWARD_UPPER` 放入 Ray runtime environment。
 
@@ -340,113 +340,156 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 
 ```bash
 --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group \
---dynamic-reward-gate sqrt \
+--dynamic-reward-speedup correct-rate-sqrt \
+--dynamic-reward-coverage correct-rate-sqrt \
 --overlong-penalty dapo \
 --overlong-buffer-len 2048 \
 --overlong-penalty-factor 0.2
 ```
 
-两个参数独立选择方法：`--dynamic-reward-gate` 选择动态调权，`--overlong-penalty` 选择长度惩罚。两者均默认为 Python `None`（关闭），也支持在命令行显式传入 `None`。`--overlong-penalty dapo` 启用现有的线性超长惩罚，不再接受不带值的 `--overlong-penalty`；缓冲长度和惩罚系数的含义不变。同时启用时总是先动态加权、再应用长度惩罚。不再保留处理器列表选择参数或独立的动态调权配置、环境变量开关。DPPO 示例脚本设置 `--dynamic-reward-gate None`，默认也不启用动态调权。新增接口返回单个 reward 列表，不能直接替换要求返回 `(raw_rewards, rewards)` 的 `--custom-reward-post-process-path`。
+三个独立入口 `--dynamic-reward-correctness`、`--dynamic-reward-speedup`、`--dynamic-reward-coverage` 均默认为 Python `None`；未设置或显式传 `None` 时，对应分量不调权。`--overlong-penalty` 独立选择长度奖惩，总是在动态调权之后执行。旧 `--dynamic-reward-gate`、`--dynamic-reward-gate-range`、`sqrt` 和 `inverse-gate` 已移除，correctness/speedup 改用 `--dynamic-reward-amplitude`，`--dynamic-reward-range` 仅用于 coverage 分段上下界。后处理接口返回单个 reward 列表，不能直接替换返回 `(raw_rewards, rewards)` 的训练 hook。
 
-##### 动态 gate 计算方式
+##### correctness/speedup 独立加性调权
 
-`--dynamic-reward-gate` 默认为 `None`（关闭），指定 `sqrt`、`piecewise`（分段线性）或 `piecewise-sqrt`（分段开方）即启用对应模式。默认仅缩放 **performance 和 coverage**，correctness 权重及失败评分不变。搭配上面的 reward hook，启用分段开方：
+每个入口仍支持 `piecewise-sqrt`、`piecewise`、`correct-rate-sqrt`、`correct-rate` 及对应的 `inverse-*`。correctness/speedup 额外支持 `global-piecewise`、`global-piecewise-sqrt` 及对应的 `inverse-*`。对于 correctness 和 speedup，正向模式在配置基础权重上 **加上** `x(p)`，inverse 模式 **减去** `x(p)`。这里 inverse 表示反向偏移，不再表示倒数。省略或显式传 `None` 时，对应贡献保持不变。
 
-```bash
---dynamic-reward-gate piecewise-sqrt \
---dynamic-reward-gate-range 0.8 1.2
-```
-
-`--difficulty-thresholds` 是通用的难度分界列表，默认 `[1/3, 2/3]`，将正确率范围三等分，不是让三个桶的样本数相等。数值口径为正确率（不是 `1 - 正确率` 的难度值）。上面的示例省略该参数以使用默认值；仍可显式传入小数覆盖，例如 `--difficulty-thresholds 0.25 0.75`。列表非空、严格递增，每个值有限且在 `(0, 1)` 内；其校验不依赖动态调权是否开启。两种分段模式都要求恰好两个分界点，依次为困难区间上界、简单区间下界；其他功能可复用更长的列表。
-
-记 `G` 为同题、同 turn 的有效样本数，`c` 为其中正确样本数，`s=c/G`。移除、pad 和 aborted 样本不计入 `G`，因此 `G` 不一定等于配置的 `--n-samples-per-prompt`。记录的 `group_difficulty` 为 `1-s`，但 gate 阈值使用正确率 `s`。记 `h, e = difficulty_thresholds`，`lo, hi = dynamic_reward_gate_range`。启用任一 gate 模式都必须显式指定 `--dynamic-reward-gate-range MIN MAX`，未指定则报错。
-
-`sqrt` 模式忽略难度阈值，将原来的平方根输出映射到配置范围：
-
-```python
-strength = 0 if G <= 1 or c <= 1 else sqrt((c - 1) / (G - 1))
-gate = lo + (hi - lo) * strength
-```
-
-显式配置 `[0, 1]` 可保留原来的行为。正确样本不超过一个的组，以及空组、单样本组，均取下界 `lo`。例如，启用无中间平台的平方根 gate，并同时反向调整正确性：
+使用匹配曲线时，选择 correctness inverse、speedup 正向：
 
 ```bash
---dynamic-reward-gate sqrt \
---dynamic-reward-gate-range 0.8 1.2 \
---dynamic-reward-correctness inverse-gate
+--dynamic-reward-correctness inverse-piecewise-sqrt \
+--dynamic-reward-speedup piecewise-sqrt \
+--dynamic-reward-amplitude 0.1 \
+--dynamic-reward-coverage None
 ```
 
-这只改变取值范围，不改变原平方根函数，并非对正确率做线性插值。上下限须有限且满足 `0 <= lo <= hi`。
+默认基础权重为 `0.5 / 0.5`，最终得到 `0.5-x(p)` 和 `0.5+x(p)`，总和为 1。若通过 `CUDA_AGENT_CORRECT_REWARD_WEIGHT`、`CUDA_AGENT_SPEEDUP_REWARD_WEIGHT` 改写基础权重，则分别为 `base_correctness-x(p)`、`base_speedup+x(p)`，仍保持原来的权重总和。选择不同曲线、相同方向或只启用一项时，不保证总和不变。固定总权重不等于严格固定 reward 期望。
 
-两种分段模式共用下面的计算式：`piecewise` 使用 `f(d)=d`，`piecewise-sqrt` 使用 `f(d)=sqrt(d)`。
+令 `G` 为同一个 `(group_index, turn_idx)` 的有效样本数，`k` 为正确数，`p=k/G`；remove、aborted、pad 和非 kernel 样本不计入。`--dynamic-reward-amplitude a` 默认 `0.1`，控制 `x` 的值域 `[-a,a]`。要求 `a` 有限且位于 `[0,0.5]`，并且不超过每个已启用分量的有限基础权重，确保最终权重非负。
+
+- `correct-rate`：`x = a*(2*p-1)`，在 `p=0.5` 时平衡。
+- `correct-rate-sqrt`：`x = a*(2*sqrt(p)-1)`，在 `p=0.25` 时平衡。
+- `piecewise`：使用下方分段公式，`f(t)=t`。
+- `piecewise-sqrt`：使用相同分段公式，`f(t)=sqrt(t)`，两端调整更强。
+- `global-piecewise`：在 `[h,e]` 内令 `x=0`，区间外使用 `x=a*(2*p-1)`，不按阈值重新缩放。
+- `global-piecewise-sqrt`：在 `[h,e]` 内令 `x=0`，区间外使用 `x=a*(2*sqrt(p)-1)`；详见下方。
+- 所有 `inverse-*` 都改为减去对应的 `x`；包括 `p=0` 在内，不再执行除法。
+
+共享 `--difficulty-thresholds` 默认为 `[1/3,2/3]`。分段模式和 global-piecewise 模式要求恰好两个有限、严格递增且位于 `(0,1)` 的阈值 `h,e`：
 
 ```python
 if G <= 1:
-    gate = 1  # 有效样本不足，保持原权重。
-elif s < h:
-    gate = 1 - (1 - lo) * f((h - s) / h)
-elif s > e:
-    gate = 1 + (hi - 1) * f((s - e) / (1 - e))
+    x = 0
+elif p < h:
+    x = -a * f((h - p) / h)
+elif p > e:
+    x = a * f((p - e) / (1 - e))
 else:
-    gate = 1
+    x = 0
 ```
 
-`piecewise-sqrt` 对偏离中间区间的归一化距离开方，**不是对最终 gate 开方**。相对线性版本，它增强两侧调权，但上下限及中间区间不变，两个阈值处都取 1。分段模式的上下限还须满足 `lo <= 1 <= hi`。指定 gate 即启用动态调权；仅设置难度阈值或 gate 范围不会启用。过滤和训练读取同一份已结算 reward，不再各自重算 gate。分段开方是 kernel 场景的可选扩展，不代表复现 Coda 的原始公式。
+空组在所有模式下均不偏移。分段模式和 global-piecewise 模式沿用 singleton 不调整的规则；`correct-rate`、`correct-rate-sqrt` 按 singleton 的真实 `p` 计算。阈值点属于中间区间。correctness/speedup 不再使用 `--dynamic-reward-range`：基础权重为 0.5 时，旧对称乘数范围 `[0.8,1.2]` 对应 `a=0.1`；设置 `a=0.2` 可得到 `[0.3,0.7]` 的最终权重范围。
 
-对走常规分量评分路径的样本，奖励按以下方式组合：
+已开启分量每次都从基础评分重建，重复处理不会累积偏移。speedup 的 correctness 前置条件仍在选择权重后应用；失败分、长度奖惩、原始任务奖励和冻结的未来 credit 保持原有行为。日志中的权重是按 group 选择的权重，尚未乘单样本 correctness 条件，因此不表示该样本必然获得非零贡献。
 
-```text
-performance_reward = 未调权的 performance_reward * gate
-coverage_reward    = 未调权的 coverage_reward * gate
-task_reward        = correctness_reward + performance_reward + coverage_reward
-sample.reward      = task_reward + length_score  # DAPO 为负，LASER-D 为正，未启用时为 0。
+Qwen3.8 WarmUp/MultiTurn 脚本仍使用 `DYNAMIC_CORRECTNESS_REWARD`、`DYNAMIC_SPEEDUP_REWARD`、`DYNAMIC_COVERAGE_REWARD`，均默认 `None`。新增 `DYNAMIC_REWARD_AMPLITUDE`，默认 `0.1`；开启 correctness 或 speedup 调整时，幅度也会写入实验名。
+
+##### Group=16 的最终权重
+
+取 a=0.2、默认基础权重和阈值 [1/3,2/3]，correctness 使用 inverse、speedup 使用正向模式。每格为 correctness / speedup。
+
+| k | p | piecewise | piecewise-sqrt |
+|---:|---:|---:|---:|
+| 0 | 0.0000 | 0.7000 / 0.3000 | 0.7000 / 0.3000 |
+| 1 | 0.0625 | 0.6625 / 0.3375 | 0.6803 / 0.3197 |
+| 2 | 0.1250 | 0.6250 / 0.3750 | 0.6581 / 0.3419 |
+| 3 | 0.1875 | 0.5875 / 0.4125 | 0.6323 / 0.3677 |
+| 4 | 0.2500 | 0.5500 / 0.4500 | 0.6000 / 0.4000 |
+| 5 | 0.3125 | 0.5125 / 0.4875 | 0.5500 / 0.4500 |
+| 6 | 0.3750 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 7 | 0.4375 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 8 | 0.5000 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 9 | 0.5625 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 10 | 0.6250 | 0.5000 / 0.5000 | 0.5000 / 0.5000 |
+| 11 | 0.6875 | 0.4875 / 0.5125 | 0.4500 / 0.5500 |
+| 12 | 0.7500 | 0.4500 / 0.5500 | 0.4000 / 0.6000 |
+| 13 | 0.8125 | 0.4125 / 0.5875 | 0.3677 / 0.6323 |
+| 14 | 0.8750 | 0.3750 / 0.6250 | 0.3419 / 0.6581 |
+| 15 | 0.9375 | 0.3375 / 0.6625 | 0.3197 / 0.6803 |
+| 16 | 1.0000 | 0.3000 / 0.7000 | 0.3000 / 0.7000 |
+
+##### 全局线性曲线加中间不调整区间
+
+新增 `global-piecewise`、`global-piecewise-sqrt`，现有模式不变。区间两端 h、e 都属于不调整区间，空组和 singleton 也保留基础权重。该模式及其 inverse 仅支持 correctness/speedup，使用现有 amplitude 和 thresholds，不使用 `--dynamic-reward-range`：
+
+```python
+if G <= 1 or h <= p <= e:
+    x = 0
+else:
+    x = a * (2 * f(p) - 1)
 ```
 
-原有 correctness 条件及 coverage 开关仍然生效；显式失败评分分支保持其失败 reward，不会因全错 group 的 gate 为正就获得正奖励。speedup 影响基础 performance 评分，不参与 gate 的计算。
+`global-piecewise` 使用 `f(p)=p`，`global-piecewise-sqrt` 使用 `f(p)=sqrt(p)`。
 
-若要同时将 correctness 乘以同一个 gate 的倒数，可单独开启：
+h、e 只决定是否开启调整，不参与两端幅度的缩放，因此阈值处通常存在跳变。区间外线性版本在 p=0.5 变号，平方根版本在 p=0.25 变号。默认阈值下，global 平方根版本在 p=5/16 时 x 为正，到 p=6/16 时置零，所以并非全局单调。不额外增加 piecewise-mode 参数。
 
 ```bash
---dynamic-reward-gate piecewise-sqrt \
---dynamic-reward-gate-range 0.8 1.2 \
---dynamic-reward-correctness inverse-gate
+--dynamic-reward-correctness inverse-global-piecewise \
+--dynamic-reward-speedup global-piecewise \
+--dynamic-reward-amplitude 0.1 \
+--dynamic-reward-coverage None
 ```
 
-`--dynamic-reward-correctness` 默认为 `None`（也支持显式传入）。选择 `inverse-gate` 后，非显式失败分支的 reward 为 `C / gate + gate * (P + Coverage) + length_score`，C/P/Coverage 均为未调权的贡献。gate=0.8 时 correctness 乘以 1.25；gate=1.2 时乘以约 0.8333。要求启用 gate，且下界严格大于 0、倒数有限。`sqrt` 显式配置正下界后也支持此组合；使用 `[0, 1]` 范围时仍拒绝 `inverse-gate`。显式失败评分、长度分数、`raw_task_reward` 及已固定的 `return_reward` 不变。每次都从基础分数及配置权重重建 correctness，重复后处理不会叠乘。
+Qwen3.8 启动脚本对应设置 `DYNAMIC_CORRECTNESS_REWARD=inverse-global-piecewise`、`DYNAMIC_SPEEDUP_REWARD=global-piecewise`。以下取 G=16、a=0.1、默认阈值和基础权重，每格为 correctness / speedup：
 
-另一个候选值是 `--dynamic-reward-correctness inverse-correct-rate`：采用 `C / p`，其中 `p` 为同一个 prompt/turn group 内有效样本的正确率。它可独立于 `--dynamic-reward-gate` 启用：关闭 gate 时 performance/coverage 保持基础权重；同时启用 gate 时，非显式失败分支的 reward 为 `C / p + gate * (P + Coverage) + length_score`。已移除、aborted 和 padding 样本不进入正确率统计。`p=0` 时 correctness 缩放系数设为零，不做除法；显式失败分数及其他奖励组成仍按原有规则处理。两种 correctness 模式都不改原始历史奖励和未来折算项，重复处理不叠乘。
+| k | piecewise | global-piecewise |
+|---:|---:|---:|
+| 0 | 0.60000 / 0.40000 | 0.60000 / 0.40000 |
+| 1 | 0.58125 / 0.41875 | 0.58750 / 0.41250 |
+| 2 | 0.56250 / 0.43750 | 0.57500 / 0.42500 |
+| 3 | 0.54375 / 0.45625 | 0.56250 / 0.43750 |
+| 4 | 0.52500 / 0.47500 | 0.55000 / 0.45000 |
+| 5 | 0.50625 / 0.49375 | 0.53750 / 0.46250 |
+| 6 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 7 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 8 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 9 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 10 | 0.50000 / 0.50000 | 0.50000 / 0.50000 |
+| 11 | 0.49375 / 0.50625 | 0.46250 / 0.53750 |
+| 12 | 0.47500 / 0.52500 | 0.45000 / 0.55000 |
+| 13 | 0.45625 / 0.54375 | 0.43750 / 0.56250 |
+| 14 | 0.43750 / 0.56250 | 0.42500 / 0.57500 |
+| 15 | 0.41875 / 0.58125 | 0.41250 / 0.58750 |
+| 16 | 0.40000 / 0.60000 | 0.40000 / 0.60000 |
 
-只保留二值 correctness、基础权重为 1 时，组均值中心化得到 `(correct_i - p) / p`（`p>0`），即 MaxRL 形式的 advantage。但该选项只是奖励变换，不是新增 advantage estimator，也不代表完整复现 MaxRL。组内标准差归一化会抵消统一的 correctness 缩放，因此搭配 GRPO 时应使用 `--disable-grpo-std-normalization` 保留该效果；启动时会提示此组合，但不会自动修改配置。若加入性能奖励、非零失败分、长度奖惩或多轮未来折算，目标就不再是 correctness-only MaxRL。
+##### coverage 独立乘法调权
 
-开启任一 correctness 模式后新增 `rollout/dynamic_reward/correctness_scale_{mean,min,max,p25,p50,p75}`（每个 prompt/turn group 一票），以及同前缀的 `correctness_reward_delta_{mean,min,max,p25,p50,p75}`（逐样本统计 correctness 贡献变化，包括不变的零值）。关闭时不输出这些额外指标。调整后的贡献也写回 `metadata.reward_component.correctness`。
+coverage 保留原来的乘法语义：`correct-rate`、`correct-rate-sqrt` 分别乘 `p`、`sqrt(p)`；inverse 仍表示倒数（`p=0` 时系数为 0）。coverage 分段模式仍要求显式设置 `--dynamic-reward-range lo hi`，满足有限的 `0 <= lo <= 1 <= hi`，inverse 额外要求 `lo>0` 且倒数有限。上下界作用于取倒数之前，启动脚本传入 `[0.8,1.2]`。coverage 不使用 amplitude，也不与 correctness/speedup 转移权重。
+
+coverage 的分段乘数在 `p<h` 时为 `1-(1-lo)*f((h-p)/h)`，在 `p>e` 时为 `1+(hi-1)*f((p-e)/(1-e))`，中间区间以及 `G<=1` 时为 1。`f` 根据模式取线性或平方根。因此 coverage 与 speedup 选择相同模式名，已不代表乘数相同。所有入口的输入仍是 group 正确率 `p`，并不是用单样本 time_coverage 去乘 speedup。
 
 ##### G=16 的 gate 实例分布
 
-假设 16 条样本均有效，阈值为 `[1/3, 2/3]`。`sqrt` 列显式使用范围 `[0, 1]`，两种分段模式使用 `[0.8, 1.2]`。数值保留四位小数：
+下表仅表示 coverage 乘数。假设 16 条样本均有效；分段阈值为 `[1/3,2/3]`，范围为 `[0.8,1.2]`；正确率开方列为 `sqrt(k/16)`：
 
-| 正确样本数 | 正确率 | `sqrt` | `piecewise` | `piecewise-sqrt` |
+| 正确数 | 正确率 | `correct-rate-sqrt` | `piecewise` | `piecewise-sqrt` |
 |---|---:|---:|---:|---:|
 | 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
-| 1 | 6.25% | 0.0000 | 0.8375 | 0.8197 |
-| 2 | 12.5% | 0.2582 | 0.8750 | 0.8419 |
-| 3 | 18.75% | 0.3651 | 0.9125 | 0.8677 |
-| 4 | 25% | 0.4472 | 0.9500 | 0.9000 |
-| 5 | 31.25% | 0.5164 | 0.9875 | 0.9500 |
-| 6 | 37.5% | 0.5774 | 1.0000 | 1.0000 |
-| 7 | 43.75% | 0.6325 | 1.0000 | 1.0000 |
-| 8 | 50% | 0.6831 | 1.0000 | 1.0000 |
-| 9 | 56.25% | 0.7303 | 1.0000 | 1.0000 |
-| 10 | 62.5% | 0.7746 | 1.0000 | 1.0000 |
-| 11 | 68.75% | 0.8165 | 1.0125 | 1.0500 |
-| 12 | 75% | 0.8563 | 1.0500 | 1.1000 |
-| 13 | 81.25% | 0.8944 | 1.0875 | 1.1323 |
-| 14 | 87.5% | 0.9309 | 1.1250 | 1.1581 |
-| 15 | 93.75% | 0.9661 | 1.1625 | 1.1803 |
+| 1 | 6.25% | 0.2500 | 0.8375 | 0.8197 |
+| 2 | 12.5% | 0.3536 | 0.8750 | 0.8419 |
+| 3 | 18.75% | 0.4330 | 0.9125 | 0.8677 |
+| 4 | 25% | 0.5000 | 0.9500 | 0.9000 |
+| 5 | 31.25% | 0.5590 | 0.9875 | 0.9500 |
+| 6 | 37.5% | 0.6124 | 1.0000 | 1.0000 |
+| 7 | 43.75% | 0.6614 | 1.0000 | 1.0000 |
+| 8 | 50% | 0.7071 | 1.0000 | 1.0000 |
+| 9 | 56.25% | 0.7500 | 1.0000 | 1.0000 |
+| 10 | 62.5% | 0.7906 | 1.0000 | 1.0000 |
+| 11 | 68.75% | 0.8292 | 1.0125 | 1.0500 |
+| 12 | 75% | 0.8660 | 1.0500 | 1.1000 |
+| 13 | 81.25% | 0.9014 | 1.0875 | 1.1323 |
+| 14 | 87.5% | 0.9354 | 1.1250 | 1.1581 |
+| 15 | 93.75% | 0.9682 | 1.1625 | 1.1803 |
 | 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
-
-这是正确数到 gate 的映射，不是实测训练频率。两种分段模式在正确数 0～5 时降低权重，6～10 时保持原权重，11～16 时提高权重。训练中各 gate 出现的频率取决于实际 group 正确率分布，可通过下方指标观察。
-
-这里借鉴 [Coda 的难度阈值 gate](https://arxiv.org/html/2603.08659v1#S3)，**不是其长度奖励**：困难 kernel group 降低 performance/coverage 激励，简单 group 提高激励。不引入 token 长度 bonus。
 
 `kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，长度贡献记为 `length`：DAPO 惩罚为负数，LASER-D bonus 为正数，未启用或未触发时为 0。组件指标统一为 `reward/component/length`，不再分别记录 `overlong_penalty` 和 `length_bonus` 组件。顶层 `metadata.length_score` 使用相同有符号值，相关指标为 `kernel/length_score/mean` 和 `exp/rollout/reward/length_score/*`；现有 CLI 参数不变。`task_reward` 不含长度奖惩，`sample.reward` 包含长度奖惩。再次执行从评分/分量重建，避免重复扣分。
 
@@ -472,14 +515,15 @@ Megatron 训练侧在 advantage 计算及 rollout 后处理后、训练 forward 
 
 group 正确率分档默认输出到普通 rollout 日志和 TensorBoard/W&B，不依赖动态调权或 `--log-exp-metrics`。`rollout/group_correct_rate_{low,medium,high}_count` 和 `rollout/group_correct_rate_{low,medium,high}_fraction` 分别记录 `rate < 1/3`、`1/3 <= rate <= 2/3`、`rate > 2/3` 三档的 group 数和比例。每个保留的 `(group_index, turn_idx)` 只计一次，使用过滤前的 `metadata.group_correct_rate`；排除 remove、aborted、pad 和非 kernel 样本。阈值固定，不随 `--difficulty-thresholds` 改变。`rollout/group_correct_rate_count` 是比例分母；缺少正确率或值不在有限的 `[0, 1]` 范围内的组不计入，没有符合条件的组时不输出这些指标。
 
-开启动态调权时，训练数据转换在最终 reward 后处理结束后，单独输出 `reward post-process` 日志，并通过现有 TensorBoard/W&B 通道记录 `rollout/dynamic_reward/*` scalar；不需要额外开启 `--log-exp-metrics`。关闭动态调权，或本批没有符合条件的样本时，不输出这些指标：
+任一动态分量开启时，训练数据转换在最终 reward 后处理后输出 `reward post-process` 日志，并通过 TensorBoard/W&B 记录 `rollout/dynamic_reward/*`，不需要 `--log-exp-metrics`：
 
-- `gate_mean`、`gate_min`、`gate_max`、`gate_p25/p50/p75`：按 `(group_index, turn_idx)` 去重，每个 group 只计一次。
-- `gate_zero_fraction`、`gate_scaled_fraction`、`gate_one_fraction`、`gate_boosted_fraction`：gate 为零、在零和一之间、等于一、大于一的 group 占比。
-- `performance_reward_delta_mean/min/max/p25/p50/p75`：逐样本统计“调权后的 performance 贡献 − 未调权时的贡献”，不是实测 speedup 或总 reward 的差值；未发生变化的有效样本计为零。
-- `group_count`、`sample_count`：统计分母；排除 remove、aborted 和 pad 样本。
+- `{correctness,speedup}_{weight,offset}_{mean,min,max,p25,p50,p75}`：按 group 汇总最终权重及有符号偏移，仅记录已开启分量。
+- `{correctness,speedup,coverage}_scale_{mean,min,max,p25,p50,p75}`：按 `(group_index, turn_idx)` 去重的缩放系数统计，每组计一次。
+- `{correctness,speedup,coverage}_scale_{zero,scaled,one,boosted}_fraction`：系数为 0、在 0 和 1 之间、等于 1、大于 1 的组比例。
+- `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`：逐样本相对未调权基础贡献的变化，包含未发生变化的零值。speedup delta 是 performance 奖励的变化，不是实测加速比变化。
+- `group_count`、`sample_count`：有最终记录的有效组数和样本数，排除 remove、aborted、pad 和非 kernel 样本。
 
-最终逐样本记录保存在 `metadata.dynamic_reward`，在过滤前生成；训练数据转换只汇总保留样本的记录。重复后处理始终相对未调权基准计算差值。单样本生成阶段的早期日志仍可能早于完整 group 调权。
+仅开启的分量输出动态指标。最终逐样本记录位于 `metadata.dynamic_reward`，过滤前生成，训练数据转换只汇总保留样本。原统一 `gate_*` 指标改为三个分量各自的 scale 指标。普通 `rollout/group_correct_rate_*` 指标仍默认记录，不受动态调权开关影响。生成阶段的早期日志可能早于完整 group 调权。
 
 #### LASER-D 自适应长度奖励
 
@@ -495,7 +539,7 @@ group 正确率分档默认输出到普通 rollout 日志和 TensorBoard/W&B，�
 --laser-d-monitor-groups 500
 ```
 
-上面是各参数默认值；预算搜索上限直接取 `--rollout-max-response-len`，下限不得超过上限。DAPO 的 `--overlong-buffer-len`、`--overlong-penalty-factor`、`--overlong-use-effective-response-cap` 不参与 LASER-D。`--dynamic-reward-gate` 仍独立控制 performance/coverage 权重，不缩放长度 bonus。
+上面是各参数默认值；预算搜索上限直接取 `--rollout-max-response-len`，下限不得超过上限。DAPO 的 `--overlong-buffer-len`、`--overlong-penalty-factor`、`--overlong-use-effective-response-cap` 不参与 LASER-D。三个动态 reward 入口独立控制 correctness、speedup、coverage 权重，不缩放长度 bonus。
 
 按同题、同 turn 的有效样本计算正确率 `s`，复用 `--difficulty-thresholds`（必须恰好两个，默认 `1/3 2/3`）：`s < h` 为 hard，`h <= s < e` 为 medium，`s >= e` 为 easy。监测和奖励使用同一套边界。移除、aborted、pad 轨迹不参与监测或 LASER-D 加分。
 

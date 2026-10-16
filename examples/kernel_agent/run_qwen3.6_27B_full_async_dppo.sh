@@ -407,7 +407,9 @@ CUSTOM_ARGS=(
    --custom-generate-function-path examples.kernel_agent.generate_with_cuda_agent.generate
    --custom-rm-path examples.kernel_agent.generate_with_cuda_agent.reward_func
    --custom-reward-post-process-path examples.kernel_agent.kernel_reward.reward_post_process_by_group
-   --dynamic-reward-gate None
+   --dynamic-reward-correctness None
+   --dynamic-reward-speedup None
+   --dynamic-reward-coverage None
    --dynamic-sampling-filter-path examples.kernel_agent.kernel_filter.filter_cuda_kernel_group
    --multi-turn-prompt-config-path $TURN_PROMPT_PATH
    # TIS-related args, recommended to enable when using TIS

@@ -49,35 +49,37 @@ def _validate_rollout_reward_post_process_args(args) -> None:
             args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
         elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
             logger.warning("Custom kernel rollout must call post_process_rollout_rewards before group filtering")
-    gate = getattr(args, "dynamic_reward_gate", None)
-    if gate not in {None, "sqrt", "piecewise", "piecewise-sqrt"}:
-        raise ValueError("--dynamic-reward-gate must be sqrt, piecewise, or piecewise-sqrt")
-    if gate is not None:
-        gate_range = getattr(args, "dynamic_reward_gate_range", None)
+    modes = {name: getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")}
+    allowed = {"piecewise", "piecewise-sqrt", "correct-rate-sqrt", "correct-rate"}
+    for name, mode in modes.items():
+        component_modes = allowed if name == "coverage" else allowed | {"global-piecewise", "global-piecewise-sqrt"}
+        if mode is not None and mode.removeprefix("inverse-") not in component_modes:
+            raise ValueError(f"Invalid --dynamic-reward-{name}: {mode!r}")
+    coverage = modes["coverage"]
+    amplitude = getattr(args, "dynamic_reward_amplitude", 0.1)
+    if not math.isfinite(amplitude) or not 0.0 <= amplitude <= 0.5:
+        raise ValueError("--dynamic-reward-amplitude must be finite and between 0 and 0.5")
+    coverage_piecewise = coverage is not None and coverage.removeprefix("inverse-") in {"piecewise", "piecewise-sqrt"}
+    if any(
+        mode is not None and mode.removeprefix("inverse-").removeprefix("global-") in {"piecewise", "piecewise-sqrt"}
+        for mode in modes.values()
+    ):
+        _validate_difficulty_thresholds_args(args)
+        if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
+            raise ValueError("Piecewise dynamic reward modes require exactly two --difficulty-thresholds")
+    if coverage_piecewise:
+        gate_range = getattr(args, "dynamic_reward_range", None)
         if gate_range is None:
-            raise ValueError("--dynamic-reward-gate-range is required when dynamic reward gate is enabled")
+            raise ValueError("--dynamic-reward-range is required for piecewise coverage modes")
         if len(gate_range) != 2:
-            raise ValueError("--dynamic-reward-gate-range requires exactly two values: min max")
+            raise ValueError("--dynamic-reward-range requires exactly two values: min max")
         gate_min, gate_max = gate_range
         if not all(math.isfinite(value) for value in (gate_min, gate_max)):
-            raise ValueError("--dynamic-reward-gate-range values must be finite")
-        if not 0.0 <= gate_min <= gate_max:
-            raise ValueError("--dynamic-reward-gate-range requires 0 <= min <= max")
-    if gate in {"piecewise", "piecewise-sqrt"}:
-        if len(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])) != 2:
-            raise ValueError("Piecewise dynamic reward gate requires exactly two --difficulty-thresholds")
-        if not gate_min <= 1.0 <= gate_max:
-            raise ValueError("Piecewise --dynamic-reward-gate-range requires 0 <= min <= 1 <= max")
-    correctness = getattr(args, "dynamic_reward_correctness", None)
-    if correctness not in {None, "inverse-gate", "inverse-correct-rate"}:
-        raise ValueError("--dynamic-reward-correctness must be None, inverse-gate, or inverse-correct-rate")
-    if correctness == "inverse-gate":
-        if gate is None:
-            raise ValueError("--dynamic-reward-correctness inverse-gate requires an enabled auxiliary gate")
-        if gate_min <= 0.0 or not math.isfinite(1.0 / gate_min):
-            raise ValueError(
-                "--dynamic-reward-correctness inverse-gate requires a positive gate min with finite inverse"
-            )
+            raise ValueError("--dynamic-reward-range values must be finite")
+        if not 0.0 <= gate_min <= 1.0 <= gate_max:
+            raise ValueError("Piecewise --dynamic-reward-range requires 0 <= min <= 1 <= max")
+        if coverage.startswith("inverse-") and (gate_min <= 0.0 or not math.isfinite(1.0 / gate_min)):
+            raise ValueError("Inverse piecewise modes require --dynamic-reward-range min > 0 with finite inverse")
     overlong_penalty = getattr(args, "overlong_penalty", None)
     if overlong_penalty not in {None, "dapo", "laser-d"}:
         raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
@@ -88,17 +90,7 @@ def _validate_rollout_reward_post_process_args(args) -> None:
             raise ValueError("overlong-penalty requires a finite --overlong-penalty-factor >= 0")
     elif overlong_penalty == "laser-d":
         _validate_laser_d_args(args)
-    if (
-        correctness == "inverse-correct-rate"
-        and getattr(args, "advantage_estimator", None) in {"grpo", "gspo"}
-        and getattr(args, "rewards_normalization", True)
-        and getattr(args, "grpo_std_normalization", True)
-    ):
-        logger.warning(
-            "Group std normalization can cancel inverse-correct-rate scaling for correctness-only rewards. "
-            "Use --disable-grpo-std-normalization to preserve it; this reward option does not select a MaxRL estimator."
-        )
-    if gate is not None or correctness is not None or overlong_penalty is not None:
+    if any(mode is not None for mode in modes.values()) or overlong_penalty is not None:
         if getattr(args, "custom_reward_post_process_path", None) != expected_path:
             logger.warning(
                 "Rollout reward shaping requires %s or a custom hook calling "
@@ -2403,32 +2395,41 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=0.1,
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
             )
+            dynamic_reward_modes = ["piecewise-sqrt", "piecewise", "correct-rate-sqrt", "correct-rate"]
+            additive_reward_modes = [*dynamic_reward_modes, "global-piecewise", "global-piecewise-sqrt"]
+            for component in ("correctness", "speedup"):
+                parser.add_argument(
+                    f"--dynamic-reward-{component}",
+                    type=lambda value: None if value == "None" else value,
+                    choices=[None, *additive_reward_modes, *(f"inverse-{mode}" for mode in additive_reward_modes)],
+                    default=None,
+                    help=(
+                        f"Adjust the {component} weight by +x(p), or -x(p) for inverse-*; inverse no longer means reciprocal. "
+                        "Omitted or None leaves this component unchanged. "
+                        "correct-rate uses x=a*(2*p-1); correct-rate-sqrt uses x=a*(2*sqrt(p)-1). "
+                        "Piecewise modes keep the middle region neutral and interpolate x from -a to +a. "
+                        "global-piecewise/global-piecewise-sqrt use the corresponding global rate curve outside the neutral interval. "
+                        "Matching inverse correctness and forward speedup preserve the sum of base weights."
+                    ),
+                )
             parser.add_argument(
-                "--dynamic-reward-gate",
-                type=lambda value: None if value == "None" else value,
-                choices=[None, "sqrt", "piecewise", "piecewise-sqrt"],
-                default=None,
+                "--dynamic-reward-amplitude",
+                type=float,
+                default=0.1,
                 help=(
-                    "Enable dynamic performance/coverage weighting with this gate; omitted (None) disables it. "
-                    "sqrt maps the legacy square-root gate to the required --dynamic-reward-gate-range. "
-                    "piecewise uses correctness-rate thresholds to reduce "
-                    "hard-group weights, keep middle groups unchanged, and boost easy-group weights linearly. "
-                    "piecewise-sqrt takes the square root of the normalized distance from the neutral region "
-                    "to strengthen both tails without changing their bounds. "
-                    "Piecewise groups with fewer than two valid samples keep gate=1."
+                    "Maximum absolute weight adjustment a for correctness/speedup (default 0.1). "
+                    "Must be finite, between 0 and 0.5, and no larger than each enabled component's configured base weight."
                 ),
             )
             parser.add_argument(
-                "--dynamic-reward-correctness",
+                "--dynamic-reward-coverage",
                 type=lambda value: None if value == "None" else value,
-                choices=[None, "inverse-gate", "inverse-correct-rate"],
+                choices=[None, *dynamic_reward_modes, *(f"inverse-{mode}" for mode in dynamic_reward_modes)],
                 default=None,
                 help=(
-                    "Optional correctness weighting: inverse-gate divides the base correctness contribution by "
-                    "the performance/coverage gate (requires an enabled gate with a positive minimum). "
-                    "inverse-correct-rate divides by the valid prompt/turn group's correctness rate, independently "
-                    "of the auxiliary gate; all-wrong groups use a zero correctness scale. "
-                    "Omitted or None keeps correctness unchanged; failure scores are never scaled."
+                    "Independently scale coverage; omitted or None leaves it unchanged. "
+                    "Rate modes use p or sqrt(p); piecewise modes require --dynamic-reward-range. "
+                    "inverse-* takes the reciprocal, with zero for all-wrong rate groups."
                 ),
             )
             parser.add_argument(
@@ -2439,21 +2440,20 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Shared difficulty-bucket boundaries expressed as group correctness rates (not 1 - correctness). "
                     "Defaults to 1/3 and 2/3, dividing the correctness-rate range into three equal intervals. "
-                    "Values must be strictly increasing and between 0 and 1. Both piecewise dynamic reward gates "
+                    "Values must be strictly increasing and between 0 and 1. Piecewise modes "
                     "require exactly two values: the hard upper boundary and easy lower boundary."
                 ),
             )
             parser.add_argument(
-                "--dynamic-reward-gate-range",
+                "--dynamic-reward-range",
                 type=float,
                 nargs=2,
                 metavar=("MIN", "MAX"),
                 default=None,
                 help=(
-                    "Required when a dynamic gate is enabled. Bounds must be finite with 0 <= MIN <= MAX; "
-                    "piecewise modes additionally require MIN <= 1 <= MAX. "
-                    "sqrt maps its original [0, 1] output into this range, using MIN when the group has "
-                    "fewer than two samples or at most one correct sample."
+                    "Bounds for piecewise and inverse-piecewise coverage modes; required when coverage uses either. "
+                    "Bounds must be finite with 0 <= MIN <= 1 <= MAX; inverse modes require MIN > 0. "
+                    "Bounds apply before inversion. Coverage rate modes and correctness/speedup ignore this range."
                 ),
             )
             parser.add_argument(

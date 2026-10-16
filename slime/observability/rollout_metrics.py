@@ -130,13 +130,14 @@ def _compute_group_correct_rate_metrics(samples: list[Sample]) -> dict[str, floa
 def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, float]:
     """Aggregate final dynamic-weight records, never filter previews.
 
-    Gate and correctness-scale statistics give each prompt/turn group one vote. Reward deltas
+    Each component's scales give each prompt/turn group one vote. Reward deltas
     give each valid ordinary kernel sample one vote, including unchanged zeros.
     """
-    group_gates = {}
-    performance_deltas = []
-    group_correctness_scales = {}
-    correctness_deltas = []
+    group_scales = {name: {} for name in ("correctness", "speedup", "coverage")}
+    group_weights = {f"{name}_{field}": {} for name in ("correctness", "speedup") for field in ("weight", "offset")}
+    reward_deltas = {name: [] for name in group_scales}
+    groups = set()
+    sample_count = 0
     laser_records = []
     for sample in samples:
         metadata = sample.metadata or {}
@@ -153,22 +154,25 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
         record = metadata.get("dynamic_reward")
         if not isinstance(record, dict):
             continue
-        gate, delta = record.get("gate"), record.get("performance_reward_delta")
-        if not all(
-            isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
-            for value in (gate, delta)
-        ):
-            continue
         group_key = (sample.group_index, metadata.get("turn_idx"))
-        group_gates[group_key] = float(gate)
-        performance_deltas.append(float(delta))
-        scale, correctness_delta = record.get("correctness_scale"), record.get("correctness_reward_delta")
-        if all(
-            isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
-            for value in (scale, correctness_delta)
-        ):
-            group_correctness_scales[group_key] = float(scale)
-            correctness_deltas.append(float(correctness_delta))
+        for name, records in group_weights.items():
+            value = record.get(name)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
+                records[group_key] = float(value)
+        has_record = False
+        for name in group_scales:
+            scale, delta = record.get(f"{name}_scale"), record.get(f"{name}_reward_delta")
+            if not all(
+                isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value)
+                for value in (scale, delta)
+            ):
+                continue
+            group_scales[name][group_key] = float(scale)
+            reward_deltas[name].append(float(delta))
+            has_record = True
+        if has_record:
+            groups.add(group_key)
+            sample_count += 1
     metrics = {}
     if laser_records:
         bonuses = np.asarray([record["length_score"] for record in laser_records])
@@ -180,26 +184,23 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
             metrics[f"rollout/laser_d/{bucket}/sample_count"] = len(budgets)
             if budgets:
                 metrics[f"rollout/laser_d/{bucket}/budget_mean"] = float(np.mean(budgets))
-    if not group_gates:
+    if not groups:
         return metrics
 
-    gates = np.asarray(list(group_gates.values()))
-    deltas = np.asarray(performance_deltas)
     prefix = "rollout/dynamic_reward/"
-    metrics.update(
-        {
-            f"{prefix}group_count": len(gates),
-            f"{prefix}sample_count": len(deltas),
-            f"{prefix}gate_zero_fraction": float(np.mean(gates == 0.0)),
-            f"{prefix}gate_scaled_fraction": float(np.mean((gates > 0.0) & (gates < 1.0))),
-            f"{prefix}gate_one_fraction": float(np.mean(gates == 1.0)),
-            f"{prefix}gate_boosted_fraction": float(np.mean(gates > 1.0)),
-        }
-    )
-    distributions = {"gate": gates, "performance_reward_delta": deltas}
-    if group_correctness_scales:
-        distributions["correctness_scale"] = np.asarray(list(group_correctness_scales.values()))
-        distributions["correctness_reward_delta"] = np.asarray(correctness_deltas)
+    metrics[f"{prefix}group_count"] = len(groups)
+    metrics[f"{prefix}sample_count"] = sample_count
+    distributions = {name: np.asarray(list(records.values())) for name, records in group_weights.items() if records}
+    for name, records in group_scales.items():
+        if not records:
+            continue
+        scales = np.asarray(list(records.values()))
+        distributions[f"{name}_scale"] = scales
+        distributions[f"{name}_reward_delta"] = np.asarray(reward_deltas[name])
+        metrics[f"{prefix}{name}_scale_zero_fraction"] = float(np.mean(scales == 0.0))
+        metrics[f"{prefix}{name}_scale_scaled_fraction"] = float(np.mean((scales > 0.0) & (scales < 1.0)))
+        metrics[f"{prefix}{name}_scale_one_fraction"] = float(np.mean(scales == 1.0))
+        metrics[f"{prefix}{name}_scale_boosted_fraction"] = float(np.mean(scales > 1.0))
     for name, values in distributions.items():
         metrics[f"{prefix}{name}_mean"] = float(np.mean(values))
         metrics[f"{prefix}{name}_min"] = float(np.min(values))
