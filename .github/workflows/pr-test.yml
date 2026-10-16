@@ -719,6 +719,10 @@ jobs:
             },
             {
               "num_gpus": 0,
+              "test_file": "test_ray_job_retry.py"
+            },
+            {
+              "num_gpus": 0,
               "test_file": "test_docs_consistency.py"
             },
             {

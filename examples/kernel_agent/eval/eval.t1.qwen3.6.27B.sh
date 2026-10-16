@@ -24,6 +24,7 @@ export PYTHONUNBUFFERED=1
 # export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/ray_job_retry.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/scripts/models/qwen3.5-27B.sh"
 
@@ -176,7 +177,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 EOF_JSON
 )
 
-ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
+ray_job_submit_with_retry --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 "${REPO_ROOT}/train.py" \
    --actor-num-gpus-per-node 8 \

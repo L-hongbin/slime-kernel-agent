@@ -9,6 +9,7 @@ export no_proxy="127.0.0.1,localhost,0.0.0.0,::1,${MASTER_ADDR:-10.11.2.164}"
 export NO_PROXY="${no_proxy}"
 ulimit -n 1048576 || true
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/ray_job_retry.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/scripts/models/qwen3.5-27B.sh"
 
@@ -176,7 +177,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 EOF_JSON
 )
 
-ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
+ray_job_submit_with_retry --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --working-dir="${REPO_ROOT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \

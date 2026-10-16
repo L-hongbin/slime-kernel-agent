@@ -8,6 +8,7 @@ export PYTHONUNBUFFERED=1
 ulimit -n 1048576 || true
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/eval/ray_job_retry.sh"
 # SCRIPT_DIR="$(cd "${SCRIPT_DIR}" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 echo $SCRIPT_DIR
@@ -254,7 +255,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 EOF_JSON
 )
 echo $RUNTIME_ENV_JSON
-ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
+ray_job_submit_with_retry --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
    --rollout-num-gpus "${GPUS_PER_NODE}" \

@@ -13,6 +13,7 @@ trap 'status=$?; echo "ERROR status ${status} at line ${LINENO}: ${BASH_COMMAND}
 export PYTHONUNBUFFERED=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+source "${SCRIPT_DIR}/ray_job_retry.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 source "${REPO_ROOT}/scripts/models/gpt-oss-120b.sh"
 
@@ -213,7 +214,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 EOF_JSON
 )
 
-ray job submit --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
+ray_job_submit_with_retry --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --working-dir="${REPO_ROOT}" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train.py \
