@@ -318,11 +318,11 @@ The existing training hook calls this interface:
 --overlong-penalty-factor 0.2
 ```
 
-The three independent selectors `--dynamic-reward-correctness`, `--dynamic-reward-speedup`, and `--dynamic-reward-coverage` each default to Python `None`. Omitting a selector or explicitly passing `None` leaves that component unchanged. `--overlong-penalty` independently selects length shaping, applied after dynamic weights. The old `--dynamic-reward-gate`, `--dynamic-reward-gate-range`, `sqrt`, and `inverse-gate` selectors are removed. Use `--dynamic-reward-amplitude` for correctness/speedup and `--dynamic-reward-range` only for piecewise coverage bounds. The reward interface returns one list; it must not directly replace the training hook returning `(raw_rewards, rewards)`.
+The three independent selectors `--dynamic-reward-correctness`, `--dynamic-reward-speedup`, and `--dynamic-reward-coverage` each default to Python `None`. Omitting a selector or explicitly passing `None` leaves that component unchanged. `--overlong-penalty` independently selects length shaping, applied after dynamic weights. The old `--dynamic-reward-gate`, `--dynamic-reward-gate-range`, `sqrt`, and `inverse-gate` selectors are removed. All three selectors use `--dynamic-reward-amplitude`; `--dynamic-reward-range` is removed. The reward interface returns one list; it must not directly replace the training hook returning `(raw_rewards, rewards)`.
 
-##### Independent additive correctness/speedup weights
+##### Independent additive reward weights
 
-Each selector accepts `piecewise-sqrt`, `piecewise`, `correct-rate-sqrt`, `correct-rate`, and their `inverse-*` variants. Correctness/speedup additionally accept `global-piecewise`, `global-piecewise-sqrt`, and their `inverse-*` variants. For correctness and speedup, forward modes **add** `x(p)` to the configured base weight and inverse modes **subtract** it. Here `inverse` means the opposite offset, not a reciprocal. Omitted selectors and explicit `None` leave the corresponding contribution unchanged.
+Each selector accepts `piecewise-sqrt`, `piecewise`, `correct-rate-sqrt`, `correct-rate`, and their `inverse-*` variants. All three selectors additionally accept `global-piecewise`, `global-piecewise-sqrt`, and their `inverse-*` variants. For all three components, forward modes **add** `x(p)` to the configured base weight and inverse modes **subtract** it. Here `inverse` means the opposite offset, not a reciprocal. Omitted selectors and explicit `None` leave the corresponding contribution unchanged.
 
 For matched curves, choose inverse correctness and forward speedup:
 
@@ -358,11 +358,11 @@ else:
     x = 0
 ```
 
-Empty groups are neutral for all modes. Piecewise and global-piecewise singleton groups remain neutral; `correct-rate` and `correct-rate-sqrt` use the singleton's actual `p`. Threshold equality belongs to the neutral region. Correctness/speedup do not use `--dynamic-reward-range` anymore: the former symmetric multiplier range `[0.8,1.2]` corresponds to `a=0.1` at base weight 0.5; use `a=0.2` for final weights in `[0.3,0.7]`.
+Empty groups are neutral for all modes. Piecewise and global-piecewise singleton groups remain neutral; `correct-rate` and `correct-rate-sqrt` use the singleton's actual `p`. Threshold equality belongs to the neutral region. The removed `--dynamic-reward-range` is replaced by amplitude: the former symmetric multiplier range `[0.8,1.2]` corresponds to `a=0.1` at base weight 0.5; use `a=0.2` for final weights in `[0.3,0.7]`.
 
 Enabled contributions are rebuilt from their base scores on every invocation, making processing idempotent. The speedup correctness prerequisite still applies after weight selection. Failure scores, length shaping, raw task rewards, and frozen future credit are preserved. Logging weights describe the configured group weights before sample correctness gating, not guaranteed nonzero reward contributions.
 
-The Qwen3.8 WarmUp/MultiTurn launchers expose `DYNAMIC_CORRECTNESS_REWARD`, `DYNAMIC_SPEEDUP_REWARD`, and `DYNAMIC_COVERAGE_REWARD`, all defaulting to `None`. `DYNAMIC_REWARD_AMPLITUDE` defaults to `0.1` and is included in the experiment name when correctness or speedup adjustment is enabled.
+The Qwen3.8 WarmUp/MultiTurn launchers expose `DYNAMIC_CORRECTNESS_REWARD`, `DYNAMIC_SPEEDUP_REWARD`, and `DYNAMIC_COVERAGE_REWARD`, all defaulting to `None`. `DYNAMIC_REWARD_AMPLITUDE` defaults to `0.1` and is included in the experiment name when any reward adjustment is enabled.
 
 ##### Final weights for Group=16
 
@@ -390,7 +390,7 @@ With a=0.2, inverse correctness and forward speedup, default base weights, and t
 
 ##### Global linear curve with a neutral interval
 
-`global-piecewise` and `global-piecewise-sqrt` are additional options, leaving existing modes unchanged. Both interval endpoints are neutral; empty and singleton groups retain their base weights. Only correctness/speedup support these modes and their inverse variants. They use the existing amplitude and thresholds, not `--dynamic-reward-range`:
+`global-piecewise` and `global-piecewise-sqrt` are additional options, leaving existing modes unchanged. Both interval endpoints are neutral; empty and singleton groups retain their base weights. All three components support these modes and their inverse variants. They use the existing amplitude and thresholds, not `--dynamic-reward-range`:
 
 ```python
 if G <= 1 or h <= p <= e:
@@ -432,35 +432,11 @@ For the Qwen3.8 launchers, set `DYNAMIC_CORRECTNESS_REWARD=inverse-global-piecew
 | 15 | 0.41875 / 0.58125 | 0.41250 / 0.58750 |
 | 16 | 0.40000 / 0.60000 | 0.40000 / 0.60000 |
 
-##### Independent coverage multiplier
+##### Coverage uses the same additive formula
 
-Coverage keeps its previous multiplicative semantics: `correct-rate` uses `p`, `correct-rate-sqrt` uses `sqrt(p)`, and inverse variants use their reciprocals (`p=0` gives scale 0). Piecewise coverage still requires `--dynamic-reward-range lo hi`, with finite `0 <= lo <= 1 <= hi`; inverse modes additionally require positive `lo` with finite reciprocal. Bounds apply before inversion. The launchers pass `[0.8,1.2]`. Coverage ignores the amplitude and never transfers weight to correctness or speedup.
+`--dynamic-reward-coverage` accepts all the same modes, including `global-piecewise*` and inverse variants. Its final weight is `coverage_reward_weight + x(p)` or `coverage_reward_weight - x(p)`; the base comes from `CUDA_AGENT_COVERAGE_REWARD_WEIGHT` (default 0.5). It shares `--dynamic-reward-amplitude` and `--difficulty-thresholds`. Omitting the selector or using `None` leaves the coverage contribution unchanged. The coverage enable switch still controls whether the reward contributes at all.
 
-Its piecewise multiplier is `1-(1-lo)*f((h-p)/h)` below `h`, `1+(hi-1)*f((p-e)/(1-e))` above `e`, and 1 in the middle or when `G<=1`. `f` is linear or square root according to the selected mode. Consequently, choosing the same mode name for coverage and speedup no longer implies the same multiplier. All selectors use group correctness `p`; coverage does not multiply speedup by the sample's time coverage.
-
-##### Gate values for G=16
-
-This table describes coverage multipliers only. All 16 samples are valid. Piecewise thresholds are `[1/3,2/3]` and bounds are `[0.8,1.2]`; the rate-square-root column is simply `sqrt(k/16)`:
-
-| Correct count | Correctness rate | `correct-rate-sqrt` | `piecewise` | `piecewise-sqrt` |
-|---|---:|---:|---:|---:|
-| 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
-| 1 | 6.25% | 0.2500 | 0.8375 | 0.8197 |
-| 2 | 12.5% | 0.3536 | 0.8750 | 0.8419 |
-| 3 | 18.75% | 0.4330 | 0.9125 | 0.8677 |
-| 4 | 25% | 0.5000 | 0.9500 | 0.9000 |
-| 5 | 31.25% | 0.5590 | 0.9875 | 0.9500 |
-| 6 | 37.5% | 0.6124 | 1.0000 | 1.0000 |
-| 7 | 43.75% | 0.6614 | 1.0000 | 1.0000 |
-| 8 | 50% | 0.7071 | 1.0000 | 1.0000 |
-| 9 | 56.25% | 0.7500 | 1.0000 | 1.0000 |
-| 10 | 62.5% | 0.7906 | 1.0000 | 1.0000 |
-| 11 | 68.75% | 0.8292 | 1.0125 | 1.0500 |
-| 12 | 75% | 0.8660 | 1.0500 | 1.1000 |
-| 13 | 81.25% | 0.9014 | 1.0875 | 1.1323 |
-| 14 | 87.5% | 0.9354 | 1.1250 | 1.1581 |
-| 15 | 93.75% | 0.9682 | 1.1625 | 1.1803 |
-| 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
+`--dynamic-reward-range` has been removed. Remove it from old commands and set `--dynamic-reward-amplitude` instead. At base weight 0.5, the former forward piecewise range `[0.8,1.2]` corresponds to amplitude 0.1. Coverage rate modes and inverse modes now use additive offsets rather than the old multiplicative or reciprocal formulas. Enabling coverage adjustment does not preserve the sum of all three weights; paired inverse correctness/forward speedup preserves only their own total.
 
 `kernel_score` keeps scores before reward weighting, while `reward_component` contains weighted contributions. Its `length` contribution is negative for DAPO penalties, positive for LASER-D bonuses, and zero when disabled or inactive. Component metrics use `reward/component/length`, replacing the separate `overlong_penalty` and `length_bonus` components. Top-level `metadata.length_score` uses the same signed value; related metrics are `kernel/length_score/mean` and `exp/rollout/reward/length_score/*`. Existing CLI arguments are unchanged. `task_reward` excludes length shaping and `sample.reward` includes it. Reprocessing rebuilds from scores/components without compounding penalties.
 
@@ -488,7 +464,7 @@ Group correctness buckets are logged by default in the regular rollout log and T
 
 When any dynamic component is enabled, train-data conversion emits a `reward post-process` log and sends `rollout/dynamic_reward/*` scalars to TensorBoard/W&B after final reward processing, without `--log-exp-metrics`:
 
-- `{correctness,speedup}_{weight,offset}_{mean,min,max,p25,p50,p75}`: group-weighted final weights and signed adjustments; emitted only for enabled components.
+- `{correctness,speedup,coverage}_{weight,offset}_{mean,min,max,p25,p50,p75}`: group-weighted final weights and signed adjustments; emitted only for enabled components.
 - `{correctness,speedup,coverage}_scale_{mean,min,max,p25,p50,p75}`: group-weighted scale statistics, deduplicated by `(group_index, turn_idx)`.
 - `{correctness,speedup,coverage}_scale_{zero,scaled,one,boosted}_fraction`: group fractions with scale 0, between 0 and 1, equal to 1, and above 1.
 - `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`: sample-weighted changes from unscaled base contributions, including unchanged zeros. Speedup deltas refer to performance reward, not measured speedup.

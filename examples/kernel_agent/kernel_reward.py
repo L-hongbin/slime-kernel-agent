@@ -173,42 +173,6 @@ def _compute_dynamic_reward_offset(num_correct: int, group_size: int, mode: str 
     return 0.0
 
 
-def _compute_dynamic_coverage_scale(num_correct: int, group_size: int, mode: str | None, *, args=None) -> float:
-    """Compute the coverage multiplier from the valid prompt/turn correctness rate."""
-    if mode is None:
-        return 1.0
-    inverse = mode.startswith("inverse-")
-    base_mode = mode.removeprefix("inverse-")
-    if base_mode not in {"correct-rate", "correct-rate-sqrt", "piecewise", "piecewise-sqrt"}:
-        raise ValueError(f"Unknown dynamic reward mode: {mode!r}")
-    rate = num_correct / group_size if group_size else 0.0
-    if base_mode in {"correct-rate", "correct-rate-sqrt"}:
-        scale = math.sqrt(rate) if base_mode == "correct-rate-sqrt" else rate
-        # All-wrong groups have no successful contribution to amplify.
-        return (1.0 / scale if scale > 0.0 else 0.0) if inverse else scale
-
-    gate_range = getattr(args, "dynamic_reward_range", None)
-    if gate_range is None:
-        raise ValueError("--dynamic-reward-range is required for piecewise coverage modes")
-    low, high = gate_range
-    if inverse and (low <= 0.0 or not math.isfinite(1.0 / low)):
-        raise ValueError("Inverse piecewise modes require --dynamic-reward-range min > 0 with finite inverse")
-    if group_size <= 1:
-        return 1.0
-    hard, easy = getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])
-    if rate < hard:
-        distance = (hard - rate) / hard
-        strength = math.sqrt(distance) if base_mode == "piecewise-sqrt" else distance
-        scale = low + (1.0 - low) * (1.0 - strength)
-    elif rate > easy:
-        distance = (rate - easy) / (1.0 - easy)
-        strength = math.sqrt(distance) if base_mode == "piecewise-sqrt" else distance
-        scale = 1.0 + (high - 1.0) * strength
-    else:
-        scale = 1.0
-    return 1.0 / scale if inverse else scale
-
-
 def _sample_is_correct(sample) -> bool:
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     env_extra_info = metadata.get("env_extra_info")
@@ -270,7 +234,7 @@ def _apply_dynamic_group_reward_weights(
     args=None,
     record_metrics: bool = False,
 ) -> list[float]:
-    """Balance correctness/speedup and independently scale coverage using complete groups."""
+    """Apply independent additive weight adjustments using complete-group statistics."""
 
     rewards = [float(reward) for reward in rewards]
     if len(samples) != len(rewards):
@@ -278,10 +242,14 @@ def _apply_dynamic_group_reward_weights(
 
     num_correct, group_size = annotate_group_difficulty(samples)
     modes = {name: getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")}
-    scales = {"coverage": _compute_dynamic_coverage_scale(num_correct, group_size, modes["coverage"], args=args)}
+    scales = {}
     weights = {}
     offsets = {}
-    for name, config_key in (("correctness", "init_correct_weight"), ("speedup", "init_performance_weight")):
+    for name, config_key in (
+        ("correctness", "init_correct_weight"),
+        ("speedup", "init_performance_weight"),
+        ("coverage", "coverage_reward_weight"),
+    ):
         mode = modes[name]
         if mode is None:
             continue

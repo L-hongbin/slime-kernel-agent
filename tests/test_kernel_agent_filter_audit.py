@@ -107,7 +107,6 @@ def test_filter_respects_gate_switch_without_writing_reward(monkeypatch, gate, k
         reward_key=None,
         reward_std_threshold=0.001,
         target_group_size=2,
-        dynamic_reward_range=[0.8, 1.2],
         dynamic_reward_speedup=gate,
         dynamic_reward_coverage=gate,
     )
@@ -150,7 +149,6 @@ def test_filter_reads_settled_dynamic_gate_without_mutation(monkeypatch, mode, k
         target_group_size=2,
         reward_key=None,
         reward_std_threshold=0.27,
-        dynamic_reward_range=[0.8, 1.2],
         dynamic_reward_speedup=mode,
         dynamic_reward_coverage=mode,
     )
@@ -191,7 +189,6 @@ def test_laser_d_bonus_keeps_all_correct_groups_with_different_lengths(monkeypat
         target_group_size=2,
         reward_key=None,
         reward_std_threshold=0.1,
-        dynamic_reward_range=[0.8, 1.2],
         dynamic_reward_speedup=gate,
         dynamic_reward_coverage=gate,
         overlong_penalty="laser-d",

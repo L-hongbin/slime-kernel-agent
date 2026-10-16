@@ -134,7 +134,9 @@ def compute_reward_post_process_metrics(samples: list[Sample]) -> dict[str, floa
     give each valid ordinary kernel sample one vote, including unchanged zeros.
     """
     group_scales = {name: {} for name in ("correctness", "speedup", "coverage")}
-    group_weights = {f"{name}_{field}": {} for name in ("correctness", "speedup") for field in ("weight", "offset")}
+    group_weights = {
+        f"{name}_{field}": {} for name in ("correctness", "speedup", "coverage") for field in ("weight", "offset")
+    }
     reward_deltas = {name: [] for name in group_scales}
     groups = set()
     sample_count = 0

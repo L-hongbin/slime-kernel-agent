@@ -100,7 +100,6 @@ def test_reference_coverage_flows_through_piecewise_reward(monkeypatch):
     args = SimpleNamespace(
         dynamic_reward_speedup="piecewise",
         dynamic_reward_coverage="piecewise",
-        dynamic_reward_range=[0.8, 1.2],
         overlong_penalty=None,
         use_multi_turn=False,
     )
@@ -652,7 +651,6 @@ def test_rational_reward_composes_with_coverage_and_inverse_gate(monkeypatch, co
     args = SimpleNamespace(
         dynamic_reward_speedup="piecewise-sqrt" if dynamic else None,
         dynamic_reward_coverage="piecewise-sqrt" if dynamic else None,
-        dynamic_reward_range=[0.8, 1.2],
         dynamic_reward_correctness="inverse-piecewise-sqrt" if dynamic else None,
         overlong_penalty=None,
         use_multi_turn=False,

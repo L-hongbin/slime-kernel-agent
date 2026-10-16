@@ -347,11 +347,11 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 --overlong-penalty-factor 0.2
 ```
 
-三个独立入口 `--dynamic-reward-correctness`、`--dynamic-reward-speedup`、`--dynamic-reward-coverage` 均默认为 Python `None`；未设置或显式传 `None` 时，对应分量不调权。`--overlong-penalty` 独立选择长度奖惩，总是在动态调权之后执行。旧 `--dynamic-reward-gate`、`--dynamic-reward-gate-range`、`sqrt` 和 `inverse-gate` 已移除，correctness/speedup 改用 `--dynamic-reward-amplitude`，`--dynamic-reward-range` 仅用于 coverage 分段上下界。后处理接口返回单个 reward 列表，不能直接替换返回 `(raw_rewards, rewards)` 的训练 hook。
+三个独立入口 `--dynamic-reward-correctness`、`--dynamic-reward-speedup`、`--dynamic-reward-coverage` 均默认为 Python `None`；未设置或显式传 `None` 时，对应分量不调权。`--overlong-penalty` 独立选择长度奖惩，总是在动态调权之后执行。旧 `--dynamic-reward-gate`、`--dynamic-reward-gate-range`、`sqrt` 和 `inverse-gate` 已移除，三个入口统一使用 `--dynamic-reward-amplitude`，`--dynamic-reward-range` 已移除。后处理接口返回单个 reward 列表，不能直接替换返回 `(raw_rewards, rewards)` 的训练 hook。
 
-##### correctness/speedup 独立加性调权
+##### 三个 reward 分量独立加性调权
 
-每个入口仍支持 `piecewise-sqrt`、`piecewise`、`correct-rate-sqrt`、`correct-rate` 及对应的 `inverse-*`。correctness/speedup 额外支持 `global-piecewise`、`global-piecewise-sqrt` 及对应的 `inverse-*`。对于 correctness 和 speedup，正向模式在配置基础权重上 **加上** `x(p)`，inverse 模式 **减去** `x(p)`。这里 inverse 表示反向偏移，不再表示倒数。省略或显式传 `None` 时，对应贡献保持不变。
+每个入口仍支持 `piecewise-sqrt`、`piecewise`、`correct-rate-sqrt`、`correct-rate` 及对应的 `inverse-*`。三个入口都额外支持 `global-piecewise`、`global-piecewise-sqrt` 及对应的 `inverse-*`。对于三个分量，正向模式在配置基础权重上 **加上** `x(p)`，inverse 模式 **减去** `x(p)`。这里 inverse 表示反向偏移，不再表示倒数。省略或显式传 `None` 时，对应贡献保持不变。
 
 使用匹配曲线时，选择 correctness inverse、speedup 正向：
 
@@ -387,11 +387,11 @@ else:
     x = 0
 ```
 
-空组在所有模式下均不偏移。分段模式和 global-piecewise 模式沿用 singleton 不调整的规则；`correct-rate`、`correct-rate-sqrt` 按 singleton 的真实 `p` 计算。阈值点属于中间区间。correctness/speedup 不再使用 `--dynamic-reward-range`：基础权重为 0.5 时，旧对称乘数范围 `[0.8,1.2]` 对应 `a=0.1`；设置 `a=0.2` 可得到 `[0.3,0.7]` 的最终权重范围。
+空组在所有模式下均不偏移。分段模式和 global-piecewise 模式沿用 singleton 不调整的规则；`correct-rate`、`correct-rate-sqrt` 按 singleton 的真实 `p` 计算。阈值点属于中间区间。`--dynamic-reward-range` 已由 amplitude 替代：基础权重为 0.5 时，旧对称乘数范围 `[0.8,1.2]` 对应 `a=0.1`；设置 `a=0.2` 可得到 `[0.3,0.7]` 的最终权重范围。
 
 已开启分量每次都从基础评分重建，重复处理不会累积偏移。speedup 的 correctness 前置条件仍在选择权重后应用；失败分、长度奖惩、原始任务奖励和冻结的未来 credit 保持原有行为。日志中的权重是按 group 选择的权重，尚未乘单样本 correctness 条件，因此不表示该样本必然获得非零贡献。
 
-Qwen3.8 WarmUp/MultiTurn 脚本仍使用 `DYNAMIC_CORRECTNESS_REWARD`、`DYNAMIC_SPEEDUP_REWARD`、`DYNAMIC_COVERAGE_REWARD`，均默认 `None`。新增 `DYNAMIC_REWARD_AMPLITUDE`，默认 `0.1`；开启 correctness 或 speedup 调整时，幅度也会写入实验名。
+Qwen3.8 WarmUp/MultiTurn 脚本仍使用 `DYNAMIC_CORRECTNESS_REWARD`、`DYNAMIC_SPEEDUP_REWARD`、`DYNAMIC_COVERAGE_REWARD`，均默认 `None`。新增 `DYNAMIC_REWARD_AMPLITUDE`，默认 `0.1`；开启任一分量调整时，幅度也会写入实验名。
 
 ##### Group=16 的最终权重
 
@@ -419,7 +419,7 @@ Qwen3.8 WarmUp/MultiTurn 脚本仍使用 `DYNAMIC_CORRECTNESS_REWARD`、`DYNAMIC
 
 ##### 全局线性曲线加中间不调整区间
 
-新增 `global-piecewise`、`global-piecewise-sqrt`，现有模式不变。区间两端 h、e 都属于不调整区间，空组和 singleton 也保留基础权重。该模式及其 inverse 仅支持 correctness/speedup，使用现有 amplitude 和 thresholds，不使用 `--dynamic-reward-range`：
+新增 `global-piecewise`、`global-piecewise-sqrt`，现有模式不变。区间两端 h、e 都属于不调整区间，空组和 singleton 也保留基础权重。三个分量均支持这些模式及其 inverse，使用现有 amplitude 和 thresholds，不使用 `--dynamic-reward-range`：
 
 ```python
 if G <= 1 or h <= p <= e:
@@ -461,35 +461,11 @@ Qwen3.8 启动脚本对应设置 `DYNAMIC_CORRECTNESS_REWARD=inverse-global-piec
 | 15 | 0.41875 / 0.58125 | 0.41250 / 0.58750 |
 | 16 | 0.40000 / 0.60000 | 0.40000 / 0.60000 |
 
-##### coverage 独立乘法调权
+##### coverage 使用相同的加性公式
 
-coverage 保留原来的乘法语义：`correct-rate`、`correct-rate-sqrt` 分别乘 `p`、`sqrt(p)`；inverse 仍表示倒数（`p=0` 时系数为 0）。coverage 分段模式仍要求显式设置 `--dynamic-reward-range lo hi`，满足有限的 `0 <= lo <= 1 <= hi`，inverse 额外要求 `lo>0` 且倒数有限。上下界作用于取倒数之前，启动脚本传入 `[0.8,1.2]`。coverage 不使用 amplitude，也不与 correctness/speedup 转移权重。
+`--dynamic-reward-coverage` 支持完全相同的模式，包括 `global-piecewise*` 和所有 inverse 选项。最终权重为 `coverage_reward_weight + x(p)` 或 `coverage_reward_weight - x(p)`；基础权重来自 `CUDA_AGENT_COVERAGE_REWARD_WEIGHT`，默认 0.5。它共用 `--dynamic-reward-amplitude` 和 `--difficulty-thresholds`。省略入口或传 `None` 保持原有 coverage 贡献；coverage 总开关仍决定该项是否贡献奖励。
 
-coverage 的分段乘数在 `p<h` 时为 `1-(1-lo)*f((h-p)/h)`，在 `p>e` 时为 `1+(hi-1)*f((p-e)/(1-e))`，中间区间以及 `G<=1` 时为 1。`f` 根据模式取线性或平方根。因此 coverage 与 speedup 选择相同模式名，已不代表乘数相同。所有入口的输入仍是 group 正确率 `p`，并不是用单样本 time_coverage 去乘 speedup。
-
-##### G=16 的 gate 实例分布
-
-下表仅表示 coverage 乘数。假设 16 条样本均有效；分段阈值为 `[1/3,2/3]`，范围为 `[0.8,1.2]`；正确率开方列为 `sqrt(k/16)`：
-
-| 正确数 | 正确率 | `correct-rate-sqrt` | `piecewise` | `piecewise-sqrt` |
-|---|---:|---:|---:|---:|
-| 0 | 0% | 0.0000 | 0.8000 | 0.8000 |
-| 1 | 6.25% | 0.2500 | 0.8375 | 0.8197 |
-| 2 | 12.5% | 0.3536 | 0.8750 | 0.8419 |
-| 3 | 18.75% | 0.4330 | 0.9125 | 0.8677 |
-| 4 | 25% | 0.5000 | 0.9500 | 0.9000 |
-| 5 | 31.25% | 0.5590 | 0.9875 | 0.9500 |
-| 6 | 37.5% | 0.6124 | 1.0000 | 1.0000 |
-| 7 | 43.75% | 0.6614 | 1.0000 | 1.0000 |
-| 8 | 50% | 0.7071 | 1.0000 | 1.0000 |
-| 9 | 56.25% | 0.7500 | 1.0000 | 1.0000 |
-| 10 | 62.5% | 0.7906 | 1.0000 | 1.0000 |
-| 11 | 68.75% | 0.8292 | 1.0125 | 1.0500 |
-| 12 | 75% | 0.8660 | 1.0500 | 1.1000 |
-| 13 | 81.25% | 0.9014 | 1.0875 | 1.1323 |
-| 14 | 87.5% | 0.9354 | 1.1250 | 1.1581 |
-| 15 | 93.75% | 0.9682 | 1.1625 | 1.1803 |
-| 16 | 100% | 1.0000 | 1.2000 | 1.2000 |
+`--dynamic-reward-range` 已移除，旧命令需要删除该参数，改用 `--dynamic-reward-amplitude`。基础权重为 0.5 时，旧正向分段范围 `[0.8,1.2]` 对应幅度 0.1。coverage 的 rate 和 inverse 模式也统一为加减偏移，不再使用旧乘法或倒数公式。开启 coverage 调整不保证三项总权重不变；匹配的 correctness inverse / speedup 正向配置只保持这两项的权重总和。
 
 `kernel_score` 保留未乘 reward 权重的评分；`reward_component` 保存实际加权贡献，长度贡献记为 `length`：DAPO 惩罚为负数，LASER-D bonus 为正数，未启用或未触发时为 0。组件指标统一为 `reward/component/length`，不再分别记录 `overlong_penalty` 和 `length_bonus` 组件。顶层 `metadata.length_score` 使用相同有符号值，相关指标为 `kernel/length_score/mean` 和 `exp/rollout/reward/length_score/*`；现有 CLI 参数不变。`task_reward` 不含长度奖惩，`sample.reward` 包含长度奖惩。再次执行从评分/分量重建，避免重复扣分。
 
@@ -517,7 +493,7 @@ group 正确率分档默认输出到普通 rollout 日志和 TensorBoard/W&B，�
 
 任一动态分量开启时，训练数据转换在最终 reward 后处理后输出 `reward post-process` 日志，并通过 TensorBoard/W&B 记录 `rollout/dynamic_reward/*`，不需要 `--log-exp-metrics`：
 
-- `{correctness,speedup}_{weight,offset}_{mean,min,max,p25,p50,p75}`：按 group 汇总最终权重及有符号偏移，仅记录已开启分量。
+- `{correctness,speedup,coverage}_{weight,offset}_{mean,min,max,p25,p50,p75}`：按 group 汇总最终权重及有符号偏移，仅记录已开启分量。
 - `{correctness,speedup,coverage}_scale_{mean,min,max,p25,p50,p75}`：按 `(group_index, turn_idx)` 去重的缩放系数统计，每组计一次。
 - `{correctness,speedup,coverage}_scale_{zero,scaled,one,boosted}_fraction`：系数为 0、在 0 和 1 之间、等于 1、大于 1 的组比例。
 - `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`：逐样本相对未调权基础贡献的变化，包含未发生变化的零值。speedup delta 是 performance 奖励的变化，不是实测加速比变化。

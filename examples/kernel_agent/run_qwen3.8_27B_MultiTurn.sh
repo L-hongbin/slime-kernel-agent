@@ -261,17 +261,14 @@ for component in correctness speedup coverage; do
    case "${mode}" in
       None) ;;
       piecewise|piecewise-sqrt|correct-rate|correct-rate-sqrt|inverse-piecewise|inverse-piecewise-sqrt|inverse-correct-rate|inverse-correct-rate-sqrt|global-piecewise|global-piecewise-sqrt|inverse-global-piecewise|inverse-global-piecewise-sqrt)
-         if [[ "${component}" == coverage && "${mode}" == *global-piecewise* ]]; then
-            echo "${mode} is only supported for correctness and speedup" >&2; exit 1
-         fi
          EXP_PARAM+="Dynamic${component^}-${mode}"
          ;;
       *) echo "Invalid dynamic reward mode for ${component}: ${mode}" >&2; exit 1 ;;
    esac
    EXP_ARGS+=("--dynamic-reward-${component}" "${mode}")
 done
-EXP_ARGS+=(--dynamic-reward-amplitude "${DYNAMIC_REWARD_AMPLITUDE}" --dynamic-reward-range 0.8 1.2)
-if [[ "${DYNAMIC_CORRECTNESS_REWARD}" != None || "${DYNAMIC_SPEEDUP_REWARD}" != None ]]; then
+EXP_ARGS+=(--dynamic-reward-amplitude "${DYNAMIC_REWARD_AMPLITUDE}")
+if [[ "${DYNAMIC_CORRECTNESS_REWARD}" != None || "${DYNAMIC_SPEEDUP_REWARD}" != None || "${DYNAMIC_COVERAGE_REWARD}" != None ]]; then
    EXP_PARAM+="Amplitude${DYNAMIC_REWARD_AMPLITUDE}"
 fi
 
