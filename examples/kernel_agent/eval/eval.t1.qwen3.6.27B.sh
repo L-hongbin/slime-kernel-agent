@@ -79,8 +79,12 @@ if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
 fi
 
 # clean any prior ray on this eval cluster
-ray stop --force || true
-sleep 2
+if [[ "${EVAL_REUSE_RAY:-0}" == "1" ]]; then
+   echo "EVAL_REUSE_RAY=1: reusing Ray at ${MASTER_ADDR}:${RAY_PORT}"
+else
+   ray stop --force || true
+   sleep 2
+fi
 
 EVAL_ARGS=(
    --num-rollout 0
@@ -143,17 +147,19 @@ MISC_ARGS=(
 )
 
 export MASTER_ADDR
-GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME}" ray start \
-   --head \
-   --node-ip-address ${MASTER_ADDR} \
-   --port ${RAY_PORT} \
-   --dashboard-host 0.0.0.0 \
-   --dashboard-port ${RAY_DASHBOARD_PORT} \
-   --dashboard-agent-listen-port 52366 \
-   --dashboard-agent-grpc-port 52367 \
-   --num-gpus 8 \
-   --disable-usage-stats \
-   --temp-dir="${RAY_TEMP_DIR}"
+if [[ "${EVAL_REUSE_RAY:-0}" != "1" ]]; then
+   GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME}" ray start \
+      --head \
+      --node-ip-address ${MASTER_ADDR} \
+      --port ${RAY_PORT} \
+      --dashboard-host 0.0.0.0 \
+      --dashboard-port ${RAY_DASHBOARD_PORT} \
+      --dashboard-agent-listen-port 52366 \
+      --dashboard-agent-grpc-port 52367 \
+      --num-gpus 8 \
+      --disable-usage-stats \
+      --temp-dir="${RAY_TEMP_DIR}"
+fi
 
 NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR}"
 RUNTIME_ENV_JSON=$(cat <<EOF_JSON

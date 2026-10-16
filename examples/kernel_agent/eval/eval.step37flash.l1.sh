@@ -160,8 +160,12 @@ if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
    exit 1
 fi
 
-ray stop --force || true
-sleep 2
+if [[ "${EVAL_REUSE_RAY:-0}" == "1" ]]; then
+   echo "EVAL_REUSE_RAY=1: reusing Ray at ${MASTER_ADDR}:${RAY_PORT}"
+else
+   ray stop --force || true
+   sleep 2
+fi
 
 EVAL_ARGS=(
    --num-rollout 0
@@ -249,16 +253,18 @@ export MASTER_ADDR
 # the dashboard agent's nvidia-smi probe can be slow when KernelGym is pegging the
 # GPUs at 100% util, so the raylet otherwise crashes in WaitForDashboardAgentPorts.
 export RAY_agent_register_timeout_ms="${RAY_AGENT_REGISTER_TIMEOUT_MS:-180000}"
-GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
-   --head \
-   --node-ip-address "${MASTER_ADDR}" \
-   --port "${RAY_PORT}" \
-   --dashboard-host 0.0.0.0 \
-   --dashboard-port "${RAY_DASHBOARD_PORT}" \
-   --num-gpus "${GPUS_PER_NODE}" \
-   --num-cpus "${RAY_NUM_CPUS}" \
-   --disable-usage-stats \
-   --temp-dir="${RAY_TEMP_DIR}"
+if [[ "${EVAL_REUSE_RAY:-0}" != "1" ]]; then
+   GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
+      --head \
+      --node-ip-address "${MASTER_ADDR}" \
+      --port "${RAY_PORT}" \
+      --dashboard-host 0.0.0.0 \
+      --dashboard-port "${RAY_DASHBOARD_PORT}" \
+      --num-gpus "${GPUS_PER_NODE}" \
+      --num-cpus "${RAY_NUM_CPUS}" \
+      --disable-usage-stats \
+      --temp-dir="${RAY_TEMP_DIR}"
+fi
 
 NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR}"
 RUNTIME_ENV_JSON=$(cat <<EOF_JSON

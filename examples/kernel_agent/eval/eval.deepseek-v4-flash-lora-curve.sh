@@ -34,9 +34,11 @@ exec > >(tee -a "${ORCHESTRATOR_LOG}") 2>&1
 cleanup() {
    local status=$?
    trap - EXIT
-   ray stop --force >/dev/null 2>&1 || true
-   if [[ -n "${RAY_WORKER_HOST}" ]]; then
-      ssh "${RAY_WORKER_HOST}" "ray stop --force >/dev/null 2>&1 || true"
+   if [[ "${EVAL_REUSE_RAY:-0}" != "1" ]]; then
+      ray stop --force >/dev/null 2>&1 || true
+      if [[ -n "${RAY_WORKER_HOST}" ]]; then
+         ssh "${RAY_WORKER_HOST}" "ray stop --force >/dev/null 2>&1 || true"
+      fi
    fi
    echo "curve_exit_status=${status}"
    exit "${status}"

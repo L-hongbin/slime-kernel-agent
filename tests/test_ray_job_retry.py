@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -136,6 +137,87 @@ def test_eval_shell_syntax_and_retry_source(script):
             check=True,
             capture_output=True,
         )
+
+
+@pytest.mark.parametrize(
+    "script",
+    sorted(path for path in EVAL_DIR.glob("eval.*.sh") if "ray_job_submit_with_retry --address=" in path.read_text()),
+    ids=lambda path: path.name,
+)
+@pytest.mark.parametrize("reuse", [None, "0", "1"])
+@pytest.mark.parametrize("worker", ["", "worker-host"])
+def test_eval_ray_lifecycle(script, reuse, worker):
+    text = script.read_text()
+    # Exercise the actual lifecycle blocks with command stubs, without loading models or stopping Ray.
+    blocks = re.findall(r'^if \[\[ "\$\{EVAL_REUSE_RAY:-0\}".*?^fi$', text, re.MULTILINE | re.DOTALL)
+    assert len(blocks) == (3 if script.name == "eval.deepseek-v4-flash.sh" else 2)
+    submission = re.search(r"^ray_job_submit_with_retry (?:[^\n]*\\\n)*[^\n]*", text, re.MULTILINE).group()
+    body = "\n".join([*blocks, submission])
+    env = {**os.environ, **dict.fromkeys(re.findall(r"\$\{([A-Z_][A-Z_0-9]*)", body), "1")}
+    env.update(MASTER_ADDR="existing-head", RAY_PORT="6380", RAY_DASHBOARD_PORT="8266", RAY_WORKER_HOST=worker)
+    env.pop("EVAL_REUSE_RAY", None)
+    if reuse is not None:
+        env["EVAL_REUSE_RAY"] = reuse
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "set -euo pipefail\n"
+            'ray() { echo "CALL ray $*"; }\n'
+            'ssh() { echo "CALL ssh $*"; }\n'
+            'sleep() { echo "CALL sleep $*"; }\n'
+            'python3() { echo "CALL python3 $*"; }\n'
+            'ray_job_submit_with_retry() { ray job submit "$@"; }\n' + body,
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CALL ray job submit --address=http://existing-head:8266" in result.stdout
+    if reuse == "1":
+        assert "EVAL_REUSE_RAY=1: reusing Ray at existing-head:6380" in result.stdout
+        assert "CALL ray stop" not in result.stdout
+        assert "CALL ray start" not in result.stdout
+        assert "CALL ssh" not in result.stdout
+        assert "CALL sleep" not in result.stdout
+        assert "CALL python3" not in result.stdout
+    else:
+        assert result.stdout.index("CALL ray stop --force") < result.stdout.index("CALL ray start --head")
+        assert "CALL sleep" in result.stdout
+        if script.name == "eval.deepseek-v4-flash.sh" and worker:
+            assert "CALL ssh worker-host ray stop --force" in result.stdout
+            assert "ray start --address='existing-head:6380'" in result.stdout
+
+
+@pytest.mark.parametrize("reuse", ["0", "1"])
+@pytest.mark.parametrize("status", [0, 7])
+def test_curve_cleanup_preserves_reused_cluster_and_exit_status(tmp_path, reuse, status):
+    text = (EVAL_DIR / "eval.deepseek-v4-flash-lora-curve.sh").read_text()
+    cleanup = text[text.index("cleanup() {") : text.index("trap cleanup EXIT")]
+    calls = tmp_path / "calls"
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'ray() { echo "ray $*" >> "$CALLS"; }\n'
+            'ssh() { echo "ssh $*" >> "$CALLS"; }\n' + cleanup + f"trap cleanup EXIT\nexit {status}",
+        ],
+        env={**os.environ, "EVAL_REUSE_RAY": reuse, "RAY_WORKER_HOST": "worker-host", "CALLS": str(calls)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == status
+    assert f"curve_exit_status={status}" in result.stdout
+    if reuse == "1":
+        assert not calls.exists()
+    else:
+        assert calls.read_text().splitlines() == [
+            "ray stop --force",
+            "ssh worker-host ray stop --force >/dev/null 2>&1 || true",
+        ]
 
 
 if __name__ == "__main__":

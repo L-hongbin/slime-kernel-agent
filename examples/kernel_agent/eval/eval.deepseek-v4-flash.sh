@@ -247,11 +247,15 @@ if ! python3 "${REPO_ROOT}/scripts/check_kernelgym_health.py" \
    exit 1
 fi
 
-ray stop --force || true
-if [[ -n "${RAY_WORKER_HOST}" ]]; then
-   ssh "${RAY_WORKER_HOST}" "ray stop --force || true"
+if [[ "${EVAL_REUSE_RAY:-0}" == "1" ]]; then
+   echo "EVAL_REUSE_RAY=1: reusing Ray at ${MASTER_ADDR}:${RAY_PORT}"
+else
+   ray stop --force || true
+   if [[ -n "${RAY_WORKER_HOST}" ]]; then
+      ssh "${RAY_WORKER_HOST}" "ray stop --force || true"
+   fi
+   sleep "${RAY_RESTART_SETTLE_SECS}"
 fi
-sleep "${RAY_RESTART_SETTLE_SECS}"
 
 EVAL_ARGS=(
    --num-rollout 0
@@ -380,25 +384,26 @@ MISC_ARGS=(
 
 export MASTER_ADDR
 export SLIME_RAY_DASHBOARD_AGENT_EARLY_PORT
-RAY_raylet_start_wait_time_s="${RAYLET_START_WAIT_TIME_SECS}" \
-GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
-   --head \
-   --node-ip-address "${MASTER_ADDR}" \
-   --port "${RAY_PORT}" \
-   --dashboard-host 0.0.0.0 \
-   --dashboard-port "${RAY_DASHBOARD_PORT}" \
-   --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
-   --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
-   --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
-   --num-gpus "${RAY_HEAD_GPUS}" \
-   --num-cpus "${RAY_NUM_CPUS}" \
-   --disable-usage-stats \
-   --temp-dir="${RAY_TEMP_DIR}"
+if [[ "${EVAL_REUSE_RAY:-0}" != "1" ]]; then
+   RAY_raylet_start_wait_time_s="${RAYLET_START_WAIT_TIME_SECS}" \
+   GLOO_SOCKET_IFNAME="${LOCAL_GLOO_SOCKET_IFNAME}" ray start \
+      --head \
+      --node-ip-address "${MASTER_ADDR}" \
+      --port "${RAY_PORT}" \
+      --dashboard-host 0.0.0.0 \
+      --dashboard-port "${RAY_DASHBOARD_PORT}" \
+      --dashboard-agent-listen-port "${RAY_DASHBOARD_AGENT_LISTEN_PORT}" \
+      --dashboard-agent-grpc-port "${RAY_DASHBOARD_AGENT_GRPC_PORT}" \
+      --runtime-env-agent-port "${RAY_RUNTIME_ENV_AGENT_PORT}" \
+      --num-gpus "${RAY_HEAD_GPUS}" \
+      --num-cpus "${RAY_NUM_CPUS}" \
+      --disable-usage-stats \
+      --temp-dir="${RAY_TEMP_DIR}"
 
-if [[ -n "${RAY_WORKER_HOST}" ]]; then
-   ssh "${RAY_WORKER_HOST}" \
-      "ulimit -n 1048576 || true; RAY_raylet_start_wait_time_s='${RAYLET_START_WAIT_TIME_SECS}' GLOO_SOCKET_IFNAME='${LOCAL_GLOO_SOCKET_IFNAME}' NCCL_SOCKET_IFNAME='${NCCL_SOCKET_IFNAME}' ray start --address='${MASTER_ADDR}:${RAY_PORT}' --node-ip-address='${RAY_WORKER_IP}' --num-gpus='${GPUS_PER_NODE}' --num-cpus='${RAY_NUM_CPUS}' --disable-usage-stats --temp-dir='${RAY_WORKER_TEMP_DIR}'"
-   python3 - "${MASTER_ADDR}:${RAY_PORT}" "${ROLLOUT_NUM_GPUS}" <<'PY'
+   if [[ -n "${RAY_WORKER_HOST}" ]]; then
+      ssh "${RAY_WORKER_HOST}" \
+         "ulimit -n 1048576 || true; RAY_raylet_start_wait_time_s='${RAYLET_START_WAIT_TIME_SECS}' GLOO_SOCKET_IFNAME='${LOCAL_GLOO_SOCKET_IFNAME}' NCCL_SOCKET_IFNAME='${NCCL_SOCKET_IFNAME}' ray start --address='${MASTER_ADDR}:${RAY_PORT}' --node-ip-address='${RAY_WORKER_IP}' --num-gpus='${GPUS_PER_NODE}' --num-cpus='${RAY_NUM_CPUS}' --disable-usage-stats --temp-dir='${RAY_WORKER_TEMP_DIR}'"
+      python3 - "${MASTER_ADDR}:${RAY_PORT}" "${ROLLOUT_NUM_GPUS}" <<'PY'
 import sys
 import time
 
@@ -417,6 +422,7 @@ else:
     raise SystemExit(f"Ray rollout worker did not expose {required_gpus:g} GPUs within 180s")
 ray.shutdown()
 PY
+   fi
 fi
 
 NO_PROXY_LIST="localhost,127.0.0.1,0.0.0.0,::1,${MASTER_ADDR}"
@@ -473,12 +479,13 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
 EOF_JSON
 )
 
-# Early port publication lets raylet start before slow H20 NVML discovery, but
-# the jobs API must not race the agent's remaining module initialization.  The
-# health route is registered by the same completed module load as JobAgent.
-echo "waiting for Ray dashboard agent on ${MASTER_ADDR}:${RAY_DASHBOARD_AGENT_LISTEN_PORT}"
-dashboard_agent_deadline=$((SECONDS + RAY_DASHBOARD_AGENT_READY_TIMEOUT_SECS))
-while ! python3 - "http://${MASTER_ADDR}:${RAY_DASHBOARD_AGENT_LISTEN_PORT}/api/healthz" <<'PY'
+if [[ "${EVAL_REUSE_RAY:-0}" != "1" ]]; then
+   # Early port publication lets raylet start before slow H20 NVML discovery, but
+   # the jobs API must not race the agent's remaining module initialization.  The
+   # health route is registered by the same completed module load as JobAgent.
+   echo "waiting for Ray dashboard agent on ${MASTER_ADDR}:${RAY_DASHBOARD_AGENT_LISTEN_PORT}"
+   dashboard_agent_deadline=$((SECONDS + RAY_DASHBOARD_AGENT_READY_TIMEOUT_SECS))
+   while ! python3 - "http://${MASTER_ADDR}:${RAY_DASHBOARD_AGENT_LISTEN_PORT}/api/healthz" <<'PY'
 import sys
 import urllib.request
 
@@ -489,14 +496,15 @@ try:
 except Exception:
     raise SystemExit(1)
 PY
-do
-   if (( SECONDS >= dashboard_agent_deadline )); then
-      echo "Ray dashboard agent did not become ready within ${RAY_DASHBOARD_AGENT_READY_TIMEOUT_SECS}s" >&2
-      exit 1
-   fi
-   sleep 2
-done
-echo "Ray dashboard agent ready"
+   do
+      if (( SECONDS >= dashboard_agent_deadline )); then
+         echo "Ray dashboard agent did not become ready within ${RAY_DASHBOARD_AGENT_READY_TIMEOUT_SECS}s" >&2
+         exit 1
+      fi
+      sleep 2
+   done
+   echo "Ray dashboard agent ready"
+fi
 
 ray_job_submit_with_retry --address="http://${MASTER_ADDR}:${RAY_DASHBOARD_PORT}" \
    --working-dir="${REPO_ROOT}" \
