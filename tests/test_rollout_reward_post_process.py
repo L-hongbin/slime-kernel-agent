@@ -14,10 +14,13 @@ sys.path.insert(0, repo_root_path)
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
 from examples.kernel_agent.kernel_reward import (
+    StepRewardController,
     _apply_dynamic_group_reward_weights,
     _compute_dynamic_reward_offset,
     annotate_group_difficulty,
     calculate_kernel_reward,
+    count_kernel_correctness,
+    finalize_batch_reward_weights,
     post_process_rollout_rewards,
     reward_post_process_by_group,
 )
@@ -2412,6 +2415,384 @@ def test_ctm_rejects_non_max_length_or_repeated_response(response_length, tokens
     assert candidate.remove_sample is False
     assert candidate.metadata.get("conditional_truncation_masking_eligible", False) is False
     assert rewards == pytest.approx([0.0])
+
+
+@pytest.mark.parametrize("scope", [None, "group", "batch"])
+@pytest.mark.parametrize("multi_turn", [False, True])
+@pytest.mark.parametrize("mode,quarter_scale", _DYNAMIC_MODES_AND_QUARTER_SCALES[1:])
+def test_dynamic_weight_scope_pools_valid_samples(monkeypatch, scope, multi_turn, mode, quarter_scale):
+    config = CUDA_AGENT_CONFIGS["reward"]
+    for name in ("init_correct_weight", "init_performance_weight", "coverage_reward_weight"):
+        monkeypatch.setitem(config, name, 0.5)
+    monkeypatch.setitem(config, "coverage_reward_enable", True)
+    monkeypatch.setitem(config, "apply_failed_group_reward", False)
+    args = SimpleNamespace(use_multi_turn=multi_turn)
+    if scope is not None:
+        args.dynamic_reward_scope = scope
+    for component in ("correctness", "speedup", "coverage"):
+        setattr(args, f"dynamic_reward_{component}", mode)
+    samples = []
+    for group, size in enumerate((1, 3)):
+        for index in range(size):
+            sample = _make_sample(index, 0 if multi_turn else group, 0.0, turn_idx=group if multi_turn else None)
+            _set_reward_component(
+                sample, correctness_score=float(group == 0), performance_score=0.8, coverage_score=0.6
+            )
+            samples.append(sample)
+    first = post_process_rollout_rewards(args, samples)
+    assert post_process_rollout_rewards(args, samples) == pytest.approx(first)
+    for sample in samples:
+        group_rate = float(sample is samples[0])
+        if scope == "batch":
+            expected_weight = 0.5 * quarter_scale
+        else:
+            offset = _compute_dynamic_reward_offset(
+                int(group_rate), 1 if group_rate else 3, mode.removeprefix("inverse-")
+            )
+            expected_weight = 0.5 + (-offset if mode.startswith("inverse-") else offset)
+        for component in ("correctness", "speedup", "coverage"):
+            assert sample.metadata["dynamic_reward"][f"{component}_weight"] == pytest.approx(expected_weight)
+        speedup = 0.8 * (group_rate if config.get("performance_reward_requires_correctness", False) else 1)
+        assert sample.reward == pytest.approx(expected_weight * (group_rate + speedup + 0.6))
+        assert sample.metadata["group_correct_rate"] == group_rate
+
+
+def test_batch_difficulty_excludes_invalid_samples_and_preserves_prefilter_group_rates(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = _laser_args(overlong_penalty=None, dynamic_reward_speedup="correct-rate", dynamic_reward_scope="batch")
+    samples = _laser_group(correct=2, lengths=(4,) * 4)
+    annotate_group_difficulty(samples)
+    # A removed correct sample is excluded from the pooled rate; original group metrics stay at 2/4.
+    samples[0].remove_sample = True
+    excluded = _laser_group(correct=4, lengths=(4,) * 4, group_index=1)
+    excluded[0].status = Sample.Status.ABORTED
+    excluded[1].metadata["is_pad_turn"] = True
+    excluded[2].metadata["role"] = "pad"
+    excluded[3].metadata["role"] = "assistant"
+    decoy = _laser_group(correct=1, lengths=(4,), group_index=2)[0]
+    decoy.metadata["env_extra_info"]["decoy_kernel"] = True
+    all_samples = samples + excluded + [decoy]
+    assert count_kernel_correctness(all_samples) == (1, 4)
+    post_process_rollout_rewards(args, all_samples)
+    for sample in samples[1:] + [decoy]:
+        assert sample.metadata["dynamic_reward"]["speedup_weight"] == pytest.approx(0.45)
+    assert all(sample.metadata["group_correct_rate"] == 0.5 for sample in samples)
+    assert all(sample.reward == 1.0 and "dynamic_reward" not in sample.metadata for sample in [samples[0], *excluded])
+    assert post_process_rollout_rewards(args, []) == []
+    assert post_process_rollout_rewards(args, excluded) == [1.0] * 4
+
+
+@pytest.mark.parametrize("scope", [None, "group", "batch", "step"])
+def test_dynamic_scope_cli_and_disabled_components(scope):
+    import argparse
+
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args, get_slime_extra_args_provider
+
+    parser = get_slime_extra_args_provider()(argparse.ArgumentParser())
+    cli = ["--rollout-batch-size", "1"]
+    if scope is not None:
+        cli += ["--dynamic-reward-scope", scope]
+    args = parser.parse_args(cli)
+    _validate_rollout_reward_post_process_args(args)
+    assert args.dynamic_reward_scope == (scope or "group")
+    assert args.dynamic_reward_step_window == 1
+    if scope == "step":
+        configured = parser.parse_args(cli + ["--dynamic-reward-step-window", "10"])
+        _validate_rollout_reward_post_process_args(configured)
+        assert configured.dynamic_reward_step_window == 10
+    sample = _laser_group(correct=1, lengths=(4,))[0]
+    assert post_process_rollout_rewards(args, [sample]) == [1.0]
+    assert "dynamic_reward" not in sample.metadata
+    with pytest.raises(SystemExit):
+        parser.parse_args(cli + ["--dynamic-reward-scope", "invalid"])
+    args.dynamic_reward_scope = "invalid"
+    with pytest.raises(ValueError, match="dynamic-reward-scope"):
+        _validate_rollout_reward_post_process_args(args)
+
+
+@pytest.mark.parametrize("collector", ["regular", "fully_async"])
+@pytest.mark.parametrize("method", [None, "dapo", "laser-d"])
+@pytest.mark.parametrize("rejected_correct", [0, 4])
+@pytest.mark.parametrize("scope", ["batch", "step"])
+def test_collectors_settle_one_batch_after_filtering(monkeypatch, collector, method, rejected_correct, scope):
+    import asyncio
+    import queue
+
+    from examples.kernel_agent import fully_async_rollout
+    from examples.kernel_agent.kernel_reward import generate_rollout
+
+    from slime.rollout import sglang_rollout
+    from slime.rollout.filter_hub.base_types import DynamicFilterOutput
+
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "apply_failed_group_reward", False)
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = _laser_args(
+        overlong_penalty=method,
+        overlong_buffer_len=16,
+        overlong_penalty_factor=1.0,
+        dynamic_reward_speedup="correct-rate",
+        dynamic_reward_scope=scope,
+        dynamic_reward_step_window=1,
+        rollout_batch_size=2,
+        n_samples_per_prompt=4,
+        over_sampling_batch_size=1,
+        dynamic_sampling_filter_path=None,
+        rollout_sample_filter_path=None,
+        rollout_all_samples_process_path=None,
+        use_rollout_routing_replay=False,
+    )
+    groups = [
+        _laser_group(correct=count, lengths=(4,) * 4, group_index=gid)
+        for gid, count in enumerate((rejected_correct, 1, 0, 4))
+    ]
+    visited = []
+
+    def filter_group(fn, args, group):
+        visited.append(group[0].group_index)
+        assert all("dynamic_reward" not in sample.metadata for sample in group)
+        for sample in group:
+            correct = float(sample.metadata["env_extra_info"]["correctness"])
+            length_reward = -0.25 if method == "dapo" else (0.5 * correct if method == "laser-d" else 0.0)
+            assert sample.reward == pytest.approx(correct + length_reward)
+        return DynamicFilterOutput(keep=group[0].group_index != 0, reason="test")
+
+    source = SimpleNamespace(metadata={})
+    if collector == "regular":
+
+        class State:
+            remaining_batch_size = 0
+
+            def __init__(self):
+                self.pendings = set()
+
+            def submit_generate_tasks(self, inputs):
+                async def completed(group):
+                    return group
+
+                self.remaining_batch_size += len(inputs)
+                self.pendings.update(asyncio.create_task(completed(group)) for group in inputs)
+
+            def reset(self):
+                self.remaining_batch_size = 0
+
+        pending = iter(groups)
+        source.get_samples = lambda count: [next(pending)]
+        monkeypatch.setattr(sglang_rollout, "GenerateState", lambda args: State())
+        monkeypatch.setattr(sglang_rollout, "call_dynamic_filter", filter_group)
+
+        async def abort(*args):
+            return []
+
+        monkeypatch.setattr(sglang_rollout, "abort", abort)
+        output = generate_rollout(args, 0, source)
+    else:
+        worker = fully_async_rollout.KernelAgentAsyncRolloutWorker.__new__(
+            fully_async_rollout.KernelAgentAsyncRolloutWorker
+        )
+        worker.output_queue = queue.Queue()
+        for gid, group in enumerate(groups):
+            worker.output_queue.put((gid, group))
+        monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda *args: worker)
+        monkeypatch.setattr(fully_async_rollout, "call_dynamic_filter", filter_group)
+        output = asyncio.run(fully_async_rollout._generate_rollout_async(args, 0, source))
+        assert worker.queue_size() == 1
+    assert sorted(visited) == [0, 1, 2]
+    assert [group[0].group_index for group in output.samples] == [1, 2]
+    candidate_weight = 0.5 + 0.1 * (2 * (rejected_correct + 1) / 12 - 1)
+    expected_weight = 0.5 if scope == "step" else candidate_weight
+    for group in output.samples:
+        for sample in group:
+            assert sample.metadata["dynamic_reward"]["speedup_weight"] == pytest.approx(expected_weight)
+    prefix = "rollout/dynamic_reward/batch"
+    assert output.metrics[f"{prefix}_correct_rate_before_filter"] == pytest.approx((rejected_correct + 1) / 12)
+    assert output.metrics[f"{prefix}_correct_rate_after_filter"] == 1 / 8
+    assert output.metrics[f"{prefix}_num_correct_before_filter"] == rejected_correct + 1
+    assert output.metrics[f"{prefix}_num_valid_before_filter"] == 12
+    assert output.metrics[f"{prefix}_num_correct_after_filter"] == 1
+    assert output.metrics[f"{prefix}_num_valid_after_filter"] == 8
+    assert all("dynamic_reward" not in sample.metadata for sample in groups[0] + groups[3])
+    retained = [sample for group in output.samples for sample in group]
+    # Training reads the settled rewards without changing the batch scope after sample selection.
+    expected = [sample.reward for sample in retained]
+    assert reward_post_process_by_group(args, retained)[0] == pytest.approx(expected)
+    assert reward_post_process_by_group(args, [retained[0], retained[4]])[0] == pytest.approx(
+        [expected[0], expected[4]]
+    )
+    metrics = compute_reward_post_process_metrics(retained)
+    assert metrics["rollout/dynamic_reward/speedup_weight_min"] == pytest.approx(expected_weight)
+    assert metrics["rollout/dynamic_reward/speedup_weight_max"] == pytest.approx(expected_weight)
+    # Each rollout starts fresh; the previously unconsumed group belongs only to the next batch.
+    args.rollout_batch_size = 1
+    if collector == "regular":
+        next_output = generate_rollout(args, 1, source)
+    else:
+        next_output = asyncio.run(fully_async_rollout._generate_rollout_async(args, 1, source))
+    assert next_output.metrics[f"{prefix}_num_valid_before_filter"] == 4
+    assert next_output.metrics[f"{prefix}_correct_rate_before_filter"] == 1.0
+    assert next_output.samples[0][0].metadata["dynamic_reward"]["speedup_weight"] == pytest.approx(
+        candidate_weight if scope == "step" else 0.6
+    )
+    if scope == "step":
+        assert output.metrics["rollout/dynamic_reward/step_num_valid_used"] == 0
+        assert next_output.metrics["rollout/dynamic_reward/step_num_valid_used"] == 12
+
+
+@pytest.mark.parametrize("mode,quarter_scale", _DYNAMIC_MODES_AND_QUARTER_SCALES[1:])
+def test_batch_prefilter_counts_override_retained_difficulty(monkeypatch, mode, quarter_scale):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = SimpleNamespace(dynamic_reward_scope="batch", dynamic_reward_speedup=mode)
+    retained = _laser_group(correct=1, lengths=(4,))
+    annotate_group_difficulty(retained)
+    for _ in range(2):
+        metrics = finalize_batch_reward_weights(args, retained, (1, 4))
+        assert retained[0].metadata["dynamic_reward"]["speedup_weight"] == pytest.approx(0.5 * quarter_scale)
+        assert retained[0].metadata["group_correct_rate"] == 1.0
+        assert metrics["rollout/dynamic_reward/batch_correct_rate_before_filter"] == 0.25
+        assert metrics["rollout/dynamic_reward/batch_correct_rate_after_filter"] == 1.0
+
+
+def test_batch_finalization_uses_snapshot_before_sample_filtering(monkeypatch):
+    monkeypatch.setitem(CUDA_AGENT_CONFIGS["reward"], "init_performance_weight", 0.5)
+    args = SimpleNamespace(dynamic_reward_scope="batch", dynamic_reward_speedup="correct-rate")
+    samples = _laser_group(correct=2, lengths=(4,) * 4)
+    before_filter = count_kernel_correctness(samples)
+    samples[0].remove_sample = True
+    samples[1].remove_sample = True
+    metrics = finalize_batch_reward_weights(args, samples, before_filter)
+    assert metrics["rollout/dynamic_reward/batch_correct_rate_before_filter"] == 0.5
+    assert metrics["rollout/dynamic_reward/batch_correct_rate_after_filter"] == 0.0
+    assert metrics["rollout/dynamic_reward/batch_num_valid_after_filter"] == 2
+    assert all(sample.metadata["dynamic_reward"]["speedup_weight"] == 0.5 for sample in samples[2:])
+    assert all("dynamic_reward" not in sample.metadata for sample in samples[:2])
+    empty_metrics = finalize_batch_reward_weights(args, [], (0, 0))
+    assert all(value == 0 for value in empty_metrics.values())
+
+
+@pytest.mark.parametrize("mode,quarter_scale", _DYNAMIC_MODES_AND_QUARTER_SCALES[1:])
+def test_step_windows_use_previous_pooled_counts_and_start_with_base_weights(monkeypatch, mode, quarter_scale):
+    import copy
+
+    config = CUDA_AGENT_CONFIGS["reward"]
+    for key in ("init_correct_weight", "init_performance_weight", "coverage_reward_weight"):
+        monkeypatch.setitem(config, key, 0.5)
+    monkeypatch.setitem(config, "coverage_reward_enable", True)
+    args = SimpleNamespace(
+        dynamic_reward_scope="step",
+        dynamic_reward_step_window=2,
+        dynamic_reward_speedup=mode,
+        dynamic_reward_coverage=mode,
+        dynamic_reward_correctness=mode.removeprefix("inverse-") if mode.startswith("inverse-") else f"inverse-{mode}",
+    )
+    source = SimpleNamespace(metadata={})
+    observations = [(0, 3), (1, 1), (4, 4), (4, 4), (0, 0), (0, 0), (1, 4)]
+    full_weight = 0.4 if mode.startswith("inverse-") else 0.6
+    expected_weights = [0.5, 0.5, 0.5 * quarter_scale, 0.5 * quarter_scale, full_weight, full_weight, 0.5]
+    for step, (counts, weight) in enumerate(zip(observations, expected_weights, strict=True)):
+        before = copy.deepcopy(source.metadata)
+        controller = StepRewardController(args, source, step + 10)
+        samples = _laser_group(correct=1, lengths=(4,))
+        _set_reward_component(samples[0], correctness_score=1, performance_score=1, coverage_score=1)
+        assert source.metadata == before  # Starting or abandoning a rollout does not commit progress.
+        metrics = controller.finish(samples, counts)
+        record = samples[0].metadata["dynamic_reward"]
+        assert record["speedup_weight"] == pytest.approx(weight)
+        assert record["coverage_weight"] == pytest.approx(weight)
+        assert record["correctness_weight"] == pytest.approx(1.0 - weight)
+        assert samples[0].reward == pytest.approx(1.0 + weight)
+        assert metrics["rollout/dynamic_reward/step_completed_steps"] == step + 1
+        assert metrics["rollout/dynamic_reward/step_window_updated"] == int(step % 2 == 1)
+        assert metrics["rollout/dynamic_reward/step_base_weights_used"] == int(step < 2 or step == 6)
+        if step in (2, 3):
+            assert metrics["rollout/dynamic_reward/step_correct_rate_used"] == 0.25  # (0+1)/(3+1), not 0.5
+        if step == 1:
+            assert metrics["rollout/dynamic_reward/step_num_valid_used"] == 0
+            assert metrics["rollout/dynamic_reward/step_num_valid_next"] == 4
+        with pytest.raises(ValueError, match="already finalized"):
+            controller.finish(samples, counts)
+
+
+def test_step_window_restore_from_dataset_checkpoint(tmp_path):
+    from slime.rollout.data_source import RolloutDataSourceWithBuffer
+
+    args = _laser_args(
+        save=str(tmp_path),
+        load=str(tmp_path),
+        rollout_shuffle=False,
+        overlong_penalty=None,
+        dynamic_reward_scope="step",
+        dynamic_reward_step_window=3,
+        dynamic_reward_speedup="correct-rate",
+    )
+    source = object.__new__(RolloutDataSourceWithBuffer)
+    source.args, source.metadata, source.dataset = args, {}, None
+    source.sample_offset = source.epoch_id = source.sample_group_index = source.sample_index = 0
+    for step, counts in enumerate(((1, 4), (0, 4))):
+        StepRewardController(args, source, step).finish(_laser_group(), counts)
+    source.save(1)
+    restored = object.__new__(RolloutDataSourceWithBuffer)
+    restored.args, restored.metadata, restored.dataset = args, {}, None
+    restored.load(1)
+    assert restored.metadata == source.metadata
+    assert restored.metadata["dynamic_reward_step"]["window_num_valid"] == 8
+    for step in range(2, 7):
+        original_samples, restored_samples = _laser_group(), _laser_group()
+        original_metrics = StepRewardController(args, source, step).finish(original_samples, (0, 4))
+        restored_metrics = StepRewardController(args, restored, step).finish(restored_samples, (0, 4))
+        assert original_metrics == restored_metrics
+        assert [sample.reward for sample in original_samples] == [sample.reward for sample in restored_samples]
+        assert restored.metadata == source.metadata
+        if step == 2:
+            assert original_metrics["rollout/dynamic_reward/step_num_valid_used"] == 0
+        if step in (3, 4, 5):
+            assert original_metrics["rollout/dynamic_reward/step_correct_rate_used"] == 1 / 12
+    with pytest.raises(ValueError, match="IDs must advance"):
+        StepRewardController(args, restored, 6)
+    args.dynamic_reward_step_window = 2
+    with pytest.raises(ValueError, match="checkpoint configuration"):
+        StepRewardController(args, restored, 7)
+
+
+def test_step_window_failure_does_not_commit_or_use_current_batch(monkeypatch):
+    import copy
+
+    from examples.kernel_agent import kernel_reward
+
+    args = SimpleNamespace(
+        dynamic_reward_scope="step", dynamic_reward_step_window=2, dynamic_reward_speedup="correct-rate"
+    )
+    source = SimpleNamespace(metadata={})
+    StepRewardController(args, source, 0).finish(_laser_group(), (1, 4))
+    before = copy.deepcopy(source.metadata)
+    controller = StepRewardController(args, source, 1)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("reward settlement failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(kernel_reward, "post_process_rollout_rewards", fail)
+        with pytest.raises(RuntimeError, match="settlement failed"):
+            controller.finish(_laser_group(), (4, 4))
+    assert source.metadata == before
+    controller.finish(_laser_group(), (4, 4))
+    assert source.metadata["dynamic_reward_step"]["active_counts"] == [5, 8]
+    with pytest.raises(ValueError, match="previous-window"):
+        post_process_rollout_rewards(args, _laser_group())
+    with pytest.raises(ValueError, match="previous-window"):
+        finalize_batch_reward_weights(args, _laser_group(), (1, 4))
+    with pytest.raises(TypeError, match="checkpointable"):
+        StepRewardController(args, None, 2)
+
+
+@pytest.mark.parametrize("window", [0, -1, 1.5, True])
+def test_step_window_requires_positive_integer(window):
+    from slime.utils.arguments import _validate_rollout_reward_post_process_args
+
+    args = SimpleNamespace(dynamic_reward_scope="step", dynamic_reward_step_window=window)
+    with pytest.raises(ValueError, match="dynamic-reward-step-window"):
+        _validate_rollout_reward_post_process_args(args)
+    with pytest.raises(ValueError, match="dynamic-reward-step-window"):
+        StepRewardController(args, SimpleNamespace(metadata={}), 0)
 
 
 if __name__ == "__main__":

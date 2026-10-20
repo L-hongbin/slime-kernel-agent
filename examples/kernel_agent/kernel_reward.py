@@ -1,3 +1,4 @@
+import copy
 import math
 import random
 from typing import Any
@@ -187,6 +188,23 @@ def _sample_is_correct(sample) -> bool:
     return isinstance(components, dict) and float(components.get("correctness", 0.0)) > 0.0
 
 
+def count_kernel_correctness(samples) -> tuple[int, int]:
+    """Count valid kernel outcomes without changing group annotations or retaining samples."""
+    num_correct = num_valid = 0
+    for sample in samples:
+        metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+        if (
+            sample.remove_sample
+            or sample.status == sample.Status.ABORTED
+            or metadata.get("role", "kernel") != "kernel"
+            or metadata.get("is_pad_turn")
+        ):
+            continue
+        num_valid += 1
+        num_correct += _sample_is_correct(sample)
+    return num_correct, num_valid
+
+
 def annotate_group_difficulty(samples) -> tuple[int, int]:
     """Annotate one reward group with shared correctness/difficulty statistics.
 
@@ -233,14 +251,21 @@ def _apply_dynamic_group_reward_weights(
     *,
     args=None,
     record_metrics: bool = False,
+    difficulty_counts: tuple[int, int] | None = None,
 ) -> list[float]:
-    """Apply independent additive weight adjustments using complete-group statistics."""
+    """Apply additive weights using group statistics or shared batch counts."""
 
     rewards = [float(reward) for reward in rewards]
     if len(samples) != len(rewards):
         raise ValueError("samples and rewards must have the same length")
 
-    num_correct, group_size = annotate_group_difficulty(samples)
+    if difficulty_counts is None:
+        num_correct, group_size = annotate_group_difficulty(samples)
+    else:
+        num_correct, group_size = difficulty_counts
+        # Preserve pre-filter group statistics when settling a collected batch.
+        if any("group_correct_rate" not in (sample.metadata or {}) for sample in samples):
+            annotate_group_difficulty(samples)
     modes = {name: getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")}
     scales = {}
     weights = {}
@@ -346,24 +371,33 @@ def _apply_overlong_penalty(args, sample, metadata: dict[str, Any]) -> float:
     return float(metadata["task_reward"]) - penalty
 
 
-def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> list[float]:
+def post_process_rollout_rewards(
+    args, samples, *, stage: str = "rollout", batch_difficulty_counts: tuple[int, int] | None = None
+) -> list[float]:
     """Shape and write back single-turn rewards; never compute returns or advantages.
 
-    The sample stage applies per-response length shaping. The rollout stage settles dynamic weights, length shaping,
-    and failure-stage fallback before filtering complete prompt/turn groups.
+    The sample stage applies per-response length shaping. The group stage settles
+    group weights, length shaping, and failure fallback before filtering. Batch
+    weights are deferred until the rollout stage receives the retained samples
+    and pre-filter batch_difficulty_counts. Step scope requires the controller's
+    previous-window counts; (0, 0) keeps base weights during warmup or after an
+    empty window. Standalone batch calls without counts use the supplied samples.
     Reapplication is idempotent; removed samples are always untouched.
     """
-    if stage not in {"sample", "rollout"}:
-        raise ValueError("Reward post-processing stage must be sample or rollout")
-    if stage == "rollout":
+    if stage not in {"sample", "group", "rollout"}:
+        raise ValueError("Reward post-processing stage must be sample, group, or rollout")
+    scope = getattr(args, "dynamic_reward_scope", "group")
+    if scope not in {"group", "batch", "step"}:
+        raise ValueError("--dynamic-reward-scope must be group, batch, or step")
+    if stage != "sample":
         for sample in samples:
             if isinstance(sample.metadata, dict):
                 sample.metadata.pop("dynamic_reward", None)
     config = CUDA_AGENT_CONFIGS["reward"]
-    dynamic_weight = stage == "rollout" and any(
+    dynamic_weight = (stage == "rollout" or (stage == "group" and scope == "group")) and any(
         getattr(args, f"dynamic_reward_{name}", None) is not None for name in ("correctness", "speedup", "coverage")
     )
-    failed_group_reward = stage == "rollout" and bool(config["apply_failed_group_reward"])
+    failed_group_reward = stage != "sample" and bool(config["apply_failed_group_reward"])
     overlong_penalty = getattr(args, "overlong_penalty", None)
     if overlong_penalty not in {None, "dapo", "laser-d"}:
         raise ValueError("--overlong-penalty must be None, dapo, or laser-d")
@@ -392,6 +426,16 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
                 group_key = group_key, int(turn_idx)
             reward_groups.setdefault(group_key, []).append(idx)
 
+    difficulty_counts = None
+    if dynamic_weight and scope in {"batch", "step"}:
+        if scope == "step" and batch_difficulty_counts is None:
+            raise ValueError("Step reward scope requires the controller's previous-window difficulty counts")
+        difficulty_counts = (
+            batch_difficulty_counts
+            if batch_difficulty_counts is not None
+            else (sum(_sample_is_correct(samples[idx]) for idx in eligible_indices), len(eligible_indices))
+        )
+
     for group_indices in reward_groups.values():
         if not dynamic_weight:
             continue
@@ -402,6 +446,7 @@ def post_process_rollout_rewards(args, samples, *, stage: str = "rollout") -> li
             config,
             args=args,
             record_metrics=True,
+            difficulty_counts=difficulty_counts,
         )
         for idx, reward in zip(group_indices, group_values, strict=True):
             rewards[idx] = reward
@@ -700,8 +745,105 @@ def _apply_failed_group_reward(
     ]
 
 
+class StepRewardController:
+    """Checkpoint compact window counts; apply a frozen previous-window snapshot per rollout."""
+
+    def __init__(self, args, data_source, rollout_id: int):
+        if not isinstance(getattr(data_source, "metadata", None), dict):
+            raise TypeError("Step reward scope requires a checkpointable data source with dictionary metadata")
+        self.args = args
+        self.data_source = data_source
+        self.rollout_id = int(rollout_id)
+        self.window = getattr(args, "dynamic_reward_step_window", 1)
+        if isinstance(self.window, bool) or not isinstance(self.window, int) or self.window < 1:
+            raise ValueError("--dynamic-reward-step-window must be a positive integer")
+        config = CUDA_AGENT_CONFIGS["reward"]
+        signature = {
+            "window": self.window,
+            "modes": [
+                getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")
+            ],
+            "amplitude": getattr(args, "dynamic_reward_amplitude", 0.1),
+            "thresholds": list(getattr(args, "difficulty_thresholds", [1 / 3, 2 / 3])),
+            "base_weights": [
+                config[key] for key in ("init_correct_weight", "init_performance_weight", "coverage_reward_weight")
+            ],
+        }
+        self.state = copy.deepcopy(data_source.metadata.get("dynamic_reward_step"))
+        if self.state is None:
+            self.state = {
+                "format_version": 1,
+                "signature": signature,
+                "completed_steps": 0,
+                "window_num_correct": 0,
+                "window_num_valid": 0,
+                "active_counts": [0, 0],
+                "last_completed_rollout_id": None,
+            }
+        elif self.state.get("format_version") != 1 or self.state.get("signature") != signature:
+            raise ValueError("Step reward checkpoint configuration differs from current window/reward parameters")
+        last_completed = self.state["last_completed_rollout_id"]
+        if last_completed is not None and self.rollout_id <= last_completed:
+            raise ValueError("Step reward rollout IDs must advance beyond the last checkpointed rollout")
+        self.used_counts = tuple(self.state["active_counts"])
+        self.finished = False
+
+    def finish(self, samples, pre_filter_counts: tuple[int, int]) -> dict[str, float]:
+        if self.finished:
+            raise ValueError("Step reward controller has already finalized this rollout")
+        # Finalize rewards first: failures must not advance the checkpointed window.
+        metrics = finalize_batch_reward_weights(self.args, samples, pre_filter_counts, weight_counts=self.used_counts)
+        num_correct, num_valid = pre_filter_counts
+        self.state["window_num_correct"] += num_correct
+        self.state["window_num_valid"] += num_valid
+        self.state["completed_steps"] += 1
+        steps_in_window = self.state["completed_steps"] % self.window
+        updated = steps_in_window == 0
+        if updated:
+            self.state["active_counts"] = [self.state["window_num_correct"], self.state["window_num_valid"]]
+            self.state["window_num_correct"] = self.state["window_num_valid"] = 0
+        prefix = "rollout/dynamic_reward/step"
+        metrics[f"{prefix}_window_size"] = self.window
+        metrics[f"{prefix}_completed_steps"] = self.state["completed_steps"]
+        metrics[f"{prefix}_steps_in_window"] = steps_in_window
+        metrics[f"{prefix}_window_updated"] = int(updated)
+        metrics[f"{prefix}_window_num_correct"] = self.state["window_num_correct"]
+        metrics[f"{prefix}_window_num_valid"] = self.state["window_num_valid"]
+        for name, (correct, valid) in (("used", self.used_counts), ("next", self.state["active_counts"])):
+            metrics[f"{prefix}_correct_rate_{name}"] = correct / valid if valid else 0.0
+            metrics[f"{prefix}_num_correct_{name}"] = correct
+            metrics[f"{prefix}_num_valid_{name}"] = valid
+            metrics[f"{prefix}_base_weights_{name}"] = int(valid == 0)
+        self.state["last_completed_rollout_id"] = self.rollout_id
+        self.data_source.metadata["dynamic_reward_step"] = copy.deepcopy(self.state)
+        self.finished = True
+        return metrics
+
+
+def finalize_batch_reward_weights(
+    args, samples, pre_filter_counts: tuple[int, int], *, weight_counts: tuple[int, int] | None = None
+) -> dict[str, float]:
+    """Apply candidate-population weights only to retained samples and report selection bias."""
+    if getattr(args, "dynamic_reward_scope", "group") == "step" and weight_counts is None:
+        raise ValueError("Step reward scope requires explicit previous-window weight_counts")
+    post_filter_counts = count_kernel_correctness(samples)
+    post_process_rollout_rewards(
+        args, samples, batch_difficulty_counts=pre_filter_counts if weight_counts is None else weight_counts
+    )
+    metrics = {}
+    for stage, (num_correct, num_valid) in (
+        ("before_filter", pre_filter_counts),
+        ("after_filter", post_filter_counts),
+    ):
+        prefix = "rollout/dynamic_reward/batch"
+        metrics[f"{prefix}_correct_rate_{stage}"] = num_correct / num_valid if num_valid else 0.0
+        metrics[f"{prefix}_num_correct_{stage}"] = num_correct
+        metrics[f"{prefix}_num_valid_{stage}"] = num_valid
+    return metrics
+
+
 def generate_rollout(args, rollout_id, data_source, evaluation=False):
-    """Kernel reward settlement before the standard SGLang group filter."""
+    """Settle group rewards before filtering and batch weights after collection."""
     from slime.rollout.sglang_rollout import generate_rollout as default_generate_rollout
     from slime.rollout.sglang_rollout import generate_rollout_async
     from slime.utils.async_utils import run
@@ -715,18 +857,39 @@ def generate_rollout(args, rollout_id, data_source, evaluation=False):
         if getattr(args, "overlong_penalty", None) == "laser-d"
         else None
     )
+    scope = getattr(args, "dynamic_reward_scope", "group")
+    step_controller = StepRewardController(args, data_source, rollout_id) if scope == "step" else None
+    batch_scope = scope in {"batch", "step"}
+    batch_num_correct = batch_num_valid = 0
 
     def process_group(group):
+        nonlocal batch_num_correct, batch_num_valid
+        if batch_scope:
+            num_correct, num_valid = count_kernel_correctness(group)
+            batch_num_correct += num_correct
+            batch_num_valid += num_valid
         annotate_group_difficulty(group)
         if controller is not None:
             controller.observe(group)
-        post_process_rollout_rewards(args, group)
+        post_process_rollout_rewards(args, group, stage="group")
 
     output, aborted = run(
         generate_rollout_async(args, rollout_id, data_source.get_samples, on_group_completed=process_group)
     )
     if aborted:
         data_source.add_samples(aborted)
+    if step_controller is not None:
+        step_metrics = step_controller.finish(
+            [sample for group in output.samples for sample in group], (batch_num_correct, batch_num_valid)
+        )
+        output.metrics = {**(output.metrics or {}), **step_metrics}
+    elif batch_scope:
+        batch_metrics = finalize_batch_reward_weights(
+            args,
+            [sample for group in output.samples for sample in group],
+            (batch_num_correct, batch_num_valid),
+        )
+        output.metrics = {**(output.metrics or {}), **batch_metrics}
     if controller is not None:
         output.metrics = {**(output.metrics or {}), **controller.finish()}
     return output

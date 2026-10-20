@@ -320,6 +320,43 @@ The existing training hook calls this interface:
 
 The three independent selectors `--dynamic-reward-correctness`, `--dynamic-reward-speedup`, and `--dynamic-reward-coverage` each default to Python `None`. Omitting a selector or explicitly passing `None` leaves that component unchanged. `--overlong-penalty` independently selects length shaping, applied after dynamic weights. The old `--dynamic-reward-gate`, `--dynamic-reward-gate-range`, `sqrt`, and `inverse-gate` selectors are removed. All three selectors use `--dynamic-reward-amplitude`; `--dynamic-reward-range` is removed. The reward interface returns one list; it must not directly replace the training hook returning `(raw_rewards, rewards)`.
 
+`--dynamic-reward-scope` selects the difficulty scope for all three components:
+
+- `group` (default) preserves the existing behavior: each prompt/turn group uses its own correctness rate, shared by its samples.
+- `batch` uses `p = total correct / total valid` across completed candidate groups examined during this rollout, **before filtering, including rejected groups**. Every retained group and turn uses this same `p`; this is a sample-weighted rate, not an unweighted mean of group rates. Samples already marked removed, aborted, padded, or non-kernel when observed are excluded. Unfinished generation and completed work still queued for future rollouts are excluded. Counters reset for each rollout.
+- `step` accumulates the same pre-filter counts over N completed rollout steps, then freezes weights derived from that window for the next N steps. The first N steps use the configured base weights.
+
+In `batch` mode, collectors snapshot correctness counts before each group's filter runs. Group filtering and rejection sampling use the configured base weights (length shaping and failure fallback still apply). Once collection finishes, the pooled pre-filter rate selects weights applied **only to retained training samples**, before returns/advantages are computed. Rejected groups contribute only to the difficulty statistics, not training. Filtering or marking samples removed later does not erase their earlier contributions to the snapshot. Existing group difficulty annotations remain group-specific; all observed valid turns contribute to the batch rate, even when a whole trajectory is rejected by its last turn. This batch is a rollout collection, not an optimizer minibatch or a running statistic across rollouts.
+
+Both regular and fully-async kernel collectors support this order. Custom collectors should accumulate `count_kernel_correctness(group)` before filtering, call `post_process_rollout_rewards(..., stage="group")` for group settlement, then call `finalize_batch_reward_weights(args, retained_samples, (num_correct, num_valid))` and merge its returned metrics into the rollout output. Direct callers of `post_process_rollout_rewards` can pass `batch_difficulty_counts=(num_correct, num_valid)` at the default `rollout` stage. Without explicit counts, standalone calls use the supplied samples as their population; passing only a filtered subset cannot recover rejected outcomes.
+
+For example, a rejected group with 0/3 correct and a retained group with 1/1 correct yield `p_batch=1/4`, while the post-filter rate is 1. With `correct-rate`, `a=0.1`, and base weight 0.5, retained samples use weight 0.45 (inverse: 0.55); the rejected group is not trained. A retained singleton can receive a piecewise adjustment when the pre-filter population is larger; only a total pre-filter valid sample count of one retains the singleton exception.
+
+Batch mode reports `rollout/dynamic_reward/batch_correct_rate_before_filter` and `rollout/dynamic_reward/batch_correct_rate_after_filter`, plus `batch_num_correct_{before,after}_filter` and `batch_num_valid_{before,after}_filter` under the same prefix. The after-filter rate is measured on valid retained samples at collection completion. Empty populations report rate 0 alongside count 0. These metrics are logged without `--log-exp-metrics`.
+
+For `step` scope, set `--dynamic-reward-step-window N` (positive integer, default 1). For example:
+
+```bash
+--dynamic-reward-scope step \
+--dynamic-reward-step-window 10 \
+--dynamic-reward-correctness inverse-correct-rate \
+--dynamic-reward-speedup correct-rate
+```
+
+| Completed rollout steps (counted from starting this schedule) | Weight source |
+|---|---|
+| 1–10 | Configured base weights, with zero offset for every curve |
+| 11–20 | Pooled pre-filter correctness counts from steps 1–10 |
+| 21–30 | Pooled pre-filter correctness counts from steps 11–20 |
+
+Windows do not overlap: `p_previous = sum(correct_counts) / sum(valid_counts)`, not the average of step rates. A window's final step still uses the previous window's weights; new weights take effect on the next step. Counts are gathered while the current weights remain fixed. Every retained group/turn in a step uses the same snapshot. Filters keep using base weights. Here a step is a successfully finalized rollout collection, not an optimizer step, microbatch, background worker completion, or Ray submission. An entirely empty observation window makes the next window use base weights; a nonempty all-incorrect window uses `p=0` and the normal curve.
+
+The schedule stores compact counters and the active previous-window snapshot in `data_source.metadata["dynamic_reward_step"]`, saved/restored with the rollout dataset checkpoint. Restoring mid-window continues the existing schedule. Starting without this metadata restarts the N-step base-weight phase, even if the rollout ID is nonzero. Changing the window length, curves, amplitude, thresholds, or base weights while restoring the state raises a configuration error; repeated/backward rollout IDs are rejected. An abandoned rollout does not advance the counters. Custom collectors should construct `StepRewardController(args, data_source, rollout_id)` before collection and call `finish(retained_samples, pre_filter_counts)` on completion, merging its metrics into the output. Standalone step reward processing requires explicit previous-window counts; it must not silently use current samples.
+
+Step mode keeps the current rollout's `batch_*_before_filter`/`batch_*_after_filter` metrics and adds `rollout/dynamic_reward/step_*`: `window_size`, `completed_steps`, `steps_in_window`, `window_updated`, `window_num_correct`, `window_num_valid`, plus `correct_rate_{used,next}`, `num_correct_{used,next}`, `num_valid_{used,next}`, and `base_weights_{used,next}`. `used` describes this step's historical snapshot, `next` the next step's snapshot; `base_weights=1` identifies no-history/empty-history fallback, and an unavailable rate is logged as 0 with count 0. Running window counters reset to zero at a boundary. Existing per-component weight/offset metrics report the weights actually used.
+
+The Qwen3.8 WarmUp/MultiTurn launchers expose `DYNAMIC_REWARD_SCOPE=group|batch|step` (default `group`) and `DYNAMIC_REWARD_STEP_WINDOW=N` (default 1). Experiment names include `ScopeBatch` or `ScopeStepN` when a dynamic component is enabled. Selecting a scope alone does not enable dynamic adjustment.
+
 ##### Independent additive reward weights
 
 Each selector accepts `piecewise-sqrt`, `piecewise`, `correct-rate-sqrt`, `correct-rate`, and their `inverse-*` variants. All three selectors additionally accept `global-piecewise`, `global-piecewise-sqrt`, and their `inverse-*` variants. For all three components, forward modes **add** `x(p)` to the configured base weight and inverse modes **subtract** it. Here `inverse` means the opposite offset, not a reciprocal. Omitted selectors and explicit `None` leave the corresponding contribution unchanged.
@@ -335,7 +372,7 @@ For matched curves, choose inverse correctness and forward speedup:
 
 With default base weights `0.5 / 0.5`, the final weights are `0.5-x(p)` and `0.5+x(p)`. Matching curves preserve their sum of 1. If `CUDA_AGENT_CORRECT_REWARD_WEIGHT` and `CUDA_AGENT_SPEEDUP_REWARD_WEIGHT` override the bases, the weights become `base_correctness-x(p)` and `base_speedup+x(p)`, preserving the configured total. Unmatched curves or enabling only one selector do not generally preserve the sum. This fixes the total weight, not the expected reward.
 
-Let `G` be the valid sample count for one `(group_index, turn_idx)`, `k` its correct count, and `p=k/G`. Removed, aborted, padded, and non-kernel samples are excluded. `--dynamic-reward-amplitude a` defaults to `0.1` and bounds `x` to `[-a,a]`. It must be finite, between 0 and 0.5, and no larger than each enabled component's finite base weight, so adjusted weights remain nonnegative.
+Let `G` be the valid sample count in the selected scope (one `(group_index, turn_idx)` for `group`, the pre-filter candidate population for `batch`, or the preceding window for `step`), `k` its correct count, and `p=k/G`. Removed, aborted, padded, and non-kernel samples are excluded. `--dynamic-reward-amplitude a` defaults to `0.1` and bounds `x` to `[-a,a]`. It must be finite, between 0 and 0.5, and no larger than each enabled component's finite base weight, so adjusted weights remain nonnegative.
 
 - `correct-rate`: `x = a*(2*p-1)`; balanced at `p=0.5`.
 - `correct-rate-sqrt`: `x = a*(2*sqrt(p)-1)`; balanced at `p=0.25`.
@@ -360,7 +397,7 @@ else:
 
 Empty groups are neutral for all modes. Piecewise and global-piecewise singleton groups remain neutral; `correct-rate` and `correct-rate-sqrt` use the singleton's actual `p`. Threshold equality belongs to the neutral region. The removed `--dynamic-reward-range` is replaced by amplitude: the former symmetric multiplier range `[0.8,1.2]` corresponds to `a=0.1` at base weight 0.5; use `a=0.2` for final weights in `[0.3,0.7]`.
 
-Enabled contributions are rebuilt from their base scores on every invocation, making processing idempotent. The speedup correctness prerequisite still applies after weight selection. Failure scores, length shaping, raw task rewards, and frozen future credit are preserved. Logging weights describe the configured group weights before sample correctness gating, not guaranteed nonzero reward contributions.
+Enabled contributions are rebuilt from their base scores on every invocation, making processing idempotent. The speedup correctness prerequisite still applies after weight selection. Failure scores, length shaping, raw task rewards, and frozen future credit are preserved. Logging weights describe the configured group or batch weights before sample correctness gating, not guaranteed nonzero reward contributions.
 
 The Qwen3.8 WarmUp/MultiTurn launchers expose `DYNAMIC_CORRECTNESS_REWARD`, `DYNAMIC_SPEEDUP_REWARD`, and `DYNAMIC_COVERAGE_REWARD`, all defaulting to `None`. `DYNAMIC_REWARD_AMPLITUDE` defaults to `0.1` and is included in the experiment name when any reward adjustment is enabled.
 
@@ -454,7 +491,7 @@ These metrics use the current loss masks. Fully masked samples have zero mean ad
 
 `metadata.raw_task_reward` preserves the initial single-turn task reward with the configured base weights, before dynamic weighting, failed-group replacement, and length shaping. It is written at base scoring and is not overwritten by reward postprocessing. Unlike mutable `task_reward`, it is a stable source for historical statistics. TRLOO prefers this field for future credit, falling back to `task_reward` (then the turn reward) for legacy samples at pre-shaping trajectory finalization. It is not an extra additive reward component.
 
-Ordinary kernels follow: base scoring → complete prompt/turn group reward processing (dynamic weights → length bonus/penalty → failed-group replacement) → write back `sample.reward` and `metadata.reward_component` → group filtering → return/advantage calculation. With the kernel reward hook configured, the default SGLang rollout automatically uses `examples.kernel_agent.kernel_reward.generate_rollout`. The fully-async collector settles rewards after draining complete groups and before filtering.
+With the default `group` scope, ordinary kernels follow: base scoring → complete prompt/turn group reward processing (dynamic weights → length bonus/penalty → failed-group replacement) → write back `sample.reward` and `metadata.reward_component` → group filtering → return/advantage calculation. With the kernel reward hook configured, the default SGLang rollout automatically uses `examples.kernel_agent.kernel_reward.generate_rollout`. The fully-async collector settles rewards after draining complete groups and before filtering. In `batch` mode, both collectors accumulate difficulty before filtering and apply weights only after the full accepted batch has been collected; length shaping and failure fallback still run before filtering.
 
 With `apply_failed_group_reward` enabled, detect all-failed groups whose scores all exactly equal the weighted default failure score (`failed_score * init_correct_weight`), using the same reward basis as filtering. Failure-group detection does not use a variance threshold. Ordinary modes use `task_reward` without DAPO penalties; LASER-D uses reward including its bonus (failed samples receive no bonus). If every sample has a saved `kernel_failed_score`, replace task contributions with that score times `init_correct_weight`, updating `task_reward`, `sample.reward`, and components while retaining length penalties exactly once. Then run formal filtering once, followed by return calculation. Replacement does not bypass low-variance or minimum-size filtering.
 
@@ -470,7 +507,7 @@ When any dynamic component is enabled, train-data conversion emits a `reward pos
 - `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`: sample-weighted changes from unscaled base contributions, including unchanged zeros. Speedup deltas refer to performance reward, not measured speedup.
 - `group_count`, `sample_count`: valid groups and samples with final records. Removed, aborted, padded, and non-kernel samples are excluded.
 
-Only enabled components emit dynamic metrics. Final per-sample records live in `metadata.dynamic_reward` and are created before filtering; train-data conversion aggregates retained samples only. The former shared `gate_*` metrics are replaced by separate component scales. Regular `rollout/group_correct_rate_*` metrics remain independent of all dynamic switches. Early generation logs can precede complete-group weighting.
+Only enabled components emit dynamic metrics. Final per-sample records live in `metadata.dynamic_reward` and are created before filtering in `group` mode, or after batch collection in `batch` mode; train-data conversion aggregates retained samples only. The former shared `gate_*` metrics are replaced by separate component scales. Regular `rollout/group_correct_rate_*` metrics remain independent of all dynamic switches. Early generation logs can precede complete-group weighting.
 
 #### LASER-D adaptive length rewards
 

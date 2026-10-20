@@ -334,7 +334,7 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 
 #### Kernel rollout reward 后处理
 
-`examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；同题同轮次的 group 只作为动态权重的内部统计范围。接口不计算累计 return、baseline 或归一化 advantage。
+`examples.kernel_agent.kernel_reward.post_process_rollout_rewards(args, samples)` 接收一批 samples，返回逐 turn 的处理后 reward，并同步更新 `sample.reward`。动态权重和长度惩罚在这里统一管理；动态权重的统计范围可选择同题同轮次 group 或整个 rollout batch。接口不计算累计 return、baseline 或归一化 advantage。
 
 现有训练 hook 已调用此接口，启动时仍使用：
 
@@ -348,6 +348,43 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 ```
 
 三个独立入口 `--dynamic-reward-correctness`、`--dynamic-reward-speedup`、`--dynamic-reward-coverage` 均默认为 Python `None`；未设置或显式传 `None` 时，对应分量不调权。`--overlong-penalty` 独立选择长度奖惩，总是在动态调权之后执行。旧 `--dynamic-reward-gate`、`--dynamic-reward-gate-range`、`sqrt` 和 `inverse-gate` 已移除，三个入口统一使用 `--dynamic-reward-amplitude`，`--dynamic-reward-range` 已移除。后处理接口返回单个 reward 列表，不能直接替换返回 `(raw_rewards, rewards)` 的训练 hook。
+
+`--dynamic-reward-scope` 统一控制三个分量的难度统计范围：
+
+- `group`（默认）：保留原行为，按每个 prompt/turn group 的正确率调权，同组样本共享权重。
+- `batch`：使用本次 rollout 已完成、进入过滤流程的候选样本的 `p = 正确样本总数 / 有效样本总数`，**在过滤前统计，包括随后被拒绝的 group**。所有保留的 group、turn 共享此正确率。按有效样本数加权，不是各 group 正确率的简单平均；排除统计时已标记 removed、aborted、pad 和非 kernel 的样本。不包含未完成的生成任务，也不包含仍留在队列中供后续 rollout 使用的样本；每次 rollout 重新计数。
+- `step`：沿用过滤前统计口径，积累 N 个已完成 rollout step 的正确数和有效样本数，用其正确率固定决定之后 N 个 step 的权重。最初 N 个 step 使用配置的基础权重。
+
+`batch` 模式在每个 group 进入过滤器前保存计数。过滤和 rejection sampling 使用配置的基础权重，长度奖惩和失败组兜底仍正常执行；收集完成后，用过滤前累计正确率计算统一权重，**只应用于最终保留的训练样本**，再计算 return/advantage。被拒绝的 group 只参与难度统计，不参与训练；后续过滤或标记 removed 不会反向删除已统计的贡献。原有 group 难度注解仍保留 group 含义；多轮中所有已观测的有效 turn 都参与统计，即使整条轨迹因末轮过滤而被拒绝。这里的 batch 是本次 rollout 收集范围，不是 optimizer minibatch，也不是跨 rollout 的滑动统计。
+
+普通和 fully-async kernel collector 均已接入。自定义 collector 应在过滤前累计 `count_kernel_correctness(group)`，通过 `post_process_rollout_rewards(..., stage="group")` 完成 group 奖励处理；收集后调用 `finalize_batch_reward_weights(args, retained_samples, (num_correct, num_valid))`，并把返回的指标合入 rollout output。直接调用 `post_process_rollout_rewards` 时，可在默认 `rollout` stage 传入 `batch_difficulty_counts=(num_correct, num_valid)`；未传时使用调用方提供的 samples 作为统计全集，仅传过滤后的子集无法恢复已拒绝样本的统计。
+
+例如被拒绝的 group 正确 0/3、保留的 group 正确 1/1，则调权使用 `p_batch=1/4`，而过滤后正确率是 1。使用 `correct-rate`、`a=0.1`、基础权重 0.5 时，保留样本共用权重 0.45（inverse 为 0.55），被拒绝的 group 不参与训练。保留 group 即使只有一个样本，只要过滤前有效候选数大于 1，也会执行分段调权；singleton 例外判断使用过滤前的有效候选总数。
+
+batch 模式额外记录 `rollout/dynamic_reward/batch_correct_rate_before_filter`、`rollout/dynamic_reward/batch_correct_rate_after_filter`，以及相同前缀下的 `batch_num_correct_{before,after}_filter`、`batch_num_valid_{before,after}_filter`。过滤后指标按收集完成时保留的有效样本计算；空统计的正确率记为 0，同时记录样本数 0。这些指标无需开启 `--log-exp-metrics`。
+
+`step` 模式通过 `--dynamic-reward-step-window N` 设置窗口长度，必须为正整数，默认 1。例如：
+
+```bash
+--dynamic-reward-scope step \
+--dynamic-reward-step-window 10 \
+--dynamic-reward-correctness inverse-correct-rate \
+--dynamic-reward-speedup correct-rate
+```
+
+| 已完成的 rollout step（从本调度开始计数） | 使用的权重来源 |
+|---|---|
+| 第 1–10 步 | 配置的基础权重，所有曲线的偏移均为 0 |
+| 第 11–20 步 | 第 1–10 步过滤前累计正确率 |
+| 第 21–30 步 | 第 11–20 步过滤前累计正确率 |
+
+窗口不重叠，`p_previous = 上一窗口正确数之和 / 上一窗口有效样本数之和`，不是各 step 正确率的简单平均。窗口最后一步仍使用上一窗口决定的权重，新权重从下一步生效；当前窗口固定使用权重的同时，继续积累供下一窗口使用的数据。每一步所有保留 group/turn 共用同一历史快照，过滤仍使用基础权重。这里的 step 是一次成功完成的 rollout 收集，不是 optimizer step、microbatch、后台单个任务完成或 Ray 提交次数。若整段窗口没有有效观测，下一窗口使用基础权重；有有效样本但全错则使用 `p=0` 正常调权。
+
+调度将紧凑计数和当前历史快照保存在 `data_source.metadata["dynamic_reward_step"]`，随 rollout dataset checkpoint 保存与恢复；窗口中途恢复会接着累计。未恢复该状态时，即使 rollout ID 非零，也重新执行前 N 步基础权重阶段。恢复时若窗口长度、曲线、幅度、阈值或基础权重变化会报配置不一致；重复或倒退的 rollout ID 也会报错。未完成的 rollout 不推进窗口。自定义 collector 在收集前创建 `StepRewardController(args, data_source, rollout_id)`，完成后调用 `finish(retained_samples, pre_filter_counts)` 并合入返回指标；直接执行 step reward 后处理时必须明确传入历史窗口计数，不能默默使用当前样本统计。
+
+step 模式保留当前 rollout 的 `batch_*_before_filter`/`batch_*_after_filter` 指标，并新增 `rollout/dynamic_reward/step_*`：`window_size`、`completed_steps`、`steps_in_window`、`window_updated`、`window_num_correct`、`window_num_valid`，以及 `correct_rate_{used,next}`、`num_correct_{used,next}`、`num_valid_{used,next}`、`base_weights_{used,next}`。`used` 是本步使用的历史快照，`next` 是下一步使用的快照；`base_weights=1` 表示没有有效历史数据而回退到基础权重，无历史正确率记录为 0、有效数为 0。当前窗口计数在边界处清零。原有各分量 weight/offset 日志记录实际使用的权重。
+
+Qwen3.8 WarmUp/MultiTurn 脚本通过 `DYNAMIC_REWARD_SCOPE=group|batch|step`（默认 `group`）和 `DYNAMIC_REWARD_STEP_WINDOW=N`（默认 1）设置。启用任意动态分量后，实验名追加 `ScopeBatch` 或 `ScopeStepN`。只设置范围不会自动开启任何分量的调权。
 
 ##### 三个 reward 分量独立加性调权
 
@@ -364,7 +401,7 @@ Qwen3.8 WarmUp/MultiTurn 脚本已通过 Ray runtime environment 透传，自定
 
 默认基础权重为 `0.5 / 0.5`，最终得到 `0.5-x(p)` 和 `0.5+x(p)`，总和为 1。若通过 `CUDA_AGENT_CORRECT_REWARD_WEIGHT`、`CUDA_AGENT_SPEEDUP_REWARD_WEIGHT` 改写基础权重，则分别为 `base_correctness-x(p)`、`base_speedup+x(p)`，仍保持原来的权重总和。选择不同曲线、相同方向或只启用一项时，不保证总和不变。固定总权重不等于严格固定 reward 期望。
 
-令 `G` 为同一个 `(group_index, turn_idx)` 的有效样本数，`k` 为正确数，`p=k/G`；remove、aborted、pad 和非 kernel 样本不计入。`--dynamic-reward-amplitude a` 默认 `0.1`，控制 `x` 的值域 `[-a,a]`。要求 `a` 有限且位于 `[0,0.5]`，并且不超过每个已启用分量的有限基础权重，确保最终权重非负。
+令 `G` 为所选范围的有效样本数（`group` 为同一个 `(group_index, turn_idx)`，`batch` 为过滤前有效候选全集，`step` 为上一完整窗口），`k` 为正确数，`p=k/G`；remove、aborted、pad 和非 kernel 样本不计入。`--dynamic-reward-amplitude a` 默认 `0.1`，控制 `x` 的值域 `[-a,a]`。要求 `a` 有限且位于 `[0,0.5]`，并且不超过每个已启用分量的有限基础权重，确保最终权重非负。
 
 - `correct-rate`：`x = a*(2*p-1)`，在 `p=0.5` 时平衡。
 - `correct-rate-sqrt`：`x = a*(2*sqrt(p)-1)`，在 `p=0.25` 时平衡。
@@ -483,7 +520,7 @@ Megatron 训练侧在 advantage 计算及 rollout 后处理后、训练 forward 
 
 `metadata.raw_task_reward` 保存按配置基础权重计算的原始单 turn 任务奖励，不含动态调权、失败组替换和长度奖惩。基础评分时写入，后续 reward 后处理不覆盖；它与可变的 `task_reward` 分开，可作为后续历史统计的数据源。TRLOO 的未来折算优先读取此字段；缺少字段的旧样本，在后处理前的轨迹收尾阶段仍回退到 `task_reward`，再回退到单 turn reward。该字段不是额外可加的 reward component。
 
-`calculate_kernel_reward()` 只计算基础评分。普通 kernel 的处理顺序为：基础评分 → 完整 prompt/turn group 的 reward 后处理（动态调权 → 长度奖励/惩罚 → 失败组替换）→ 写回 `sample.reward` 和 `metadata.reward_component` → group 过滤 → return/advantage。默认 SGLang rollout 在配置 kernel reward hook 时自动接入 `examples.kernel_agent.kernel_reward.generate_rollout`；fully-async collector 在取出完整 group 后、过滤前执行相同后处理。
+`calculate_kernel_reward()` 只计算基础评分。默认 `group` 范围下，普通 kernel 的处理顺序为：基础评分 → 完整 prompt/turn group 的 reward 后处理（动态调权 → 长度奖励/惩罚 → 失败组替换）→ 写回 `sample.reward` 和 `metadata.reward_component` → group 过滤 → return/advantage。默认 SGLang rollout 在配置 kernel reward hook 时自动接入 `examples.kernel_agent.kernel_reward.generate_rollout`；fully-async collector 在取出完整 group 后、过滤前执行相同后处理。`batch` 模式在过滤前累计难度统计，在完整 batch 收集后仅对保留样本执行动态调权；长度奖惩和失败组兜底仍在过滤前执行。
 
 开启 `apply_failed_group_reward` 时，先按过滤器相同的奖励口径判断：有效样本全部 failed，且每个分数都精确等于默认失败分 `failed_score * init_correct_weight`，才尝试用各样本的 `kernel_failed_score * init_correct_weight` 替换基础奖励。失败组判定不使用方差阈值。普通模式的判定使用 `task_reward`，不计入 DAPO 长度惩罚；LASER-D 使用含 bonus 的 reward（失败样本无 bonus）。缺少任一样本的失败阶段分则保持原值。替换同步更新 `task_reward`、`sample.reward` 和组件贡献，保留长度惩罚且不重复扣分；随后只执行一次正式过滤，再计算 return。替换后仍低方差或样本数不足的组不会被强制放行。
 
@@ -499,7 +536,7 @@ group 正确率分档默认输出到普通 rollout 日志和 TensorBoard/W&B，�
 - `{correctness,speedup,coverage}_reward_delta_{mean,min,max,p25,p50,p75}`：逐样本相对未调权基础贡献的变化，包含未发生变化的零值。speedup delta 是 performance 奖励的变化，不是实测加速比变化。
 - `group_count`、`sample_count`：有最终记录的有效组数和样本数，排除 remove、aborted、pad 和非 kernel 样本。
 
-仅开启的分量输出动态指标。最终逐样本记录位于 `metadata.dynamic_reward`，过滤前生成，训练数据转换只汇总保留样本。原统一 `gate_*` 指标改为三个分量各自的 scale 指标。普通 `rollout/group_correct_rate_*` 指标仍默认记录，不受动态调权开关影响。生成阶段的早期日志可能早于完整 group 调权。
+仅开启的分量输出动态指标。最终逐样本记录位于 `metadata.dynamic_reward`，`group` 模式在过滤前生成，`batch` 模式在批次收集完成后生成，训练数据转换只汇总保留样本。原统一 `gate_*` 指标改为三个分量各自的 scale 指标。普通 `rollout/group_correct_rate_*` 指标仍默认记录，不受动态调权开关影响。生成阶段的早期日志可能早于完整 group 调权。
 
 #### LASER-D 自适应长度奖励
 

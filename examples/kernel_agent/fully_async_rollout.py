@@ -19,7 +19,13 @@ from itertools import islice
 from typing import Any
 
 from examples.kernel_agent.config import CUDA_AGENT_CONFIGS
-from examples.kernel_agent.kernel_reward import annotate_group_difficulty, post_process_rollout_rewards
+from examples.kernel_agent.kernel_reward import (
+    StepRewardController,
+    annotate_group_difficulty,
+    count_kernel_correctness,
+    finalize_batch_reward_weights,
+    post_process_rollout_rewards,
+)
 from examples.kernel_agent.length_reward import LaserDBudgetController
 
 from slime.observability.metric_utils import compute_rollout_step
@@ -496,6 +502,10 @@ class KernelAgentAsyncRolloutWorker:
 
 async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> RolloutFnTrainOutput:
     assert args.rollout_global_dataset
+    scope = getattr(args, "dynamic_reward_scope", "group")
+    step_controller = StepRewardController(args, data_buffer, rollout_id) if scope == "step" else None
+    batch_scope = scope in {"batch", "step"}
+    batch_num_correct = batch_num_valid = 0
     laser_d = (
         LaserDBudgetController(args, data_buffer, rollout_id)
         if getattr(args, "overlong_penalty", None) == "laser-d"
@@ -560,10 +570,14 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             if not groups:
                 continue
             for group in groups:
+                if batch_scope:
+                    num_correct, num_valid = count_kernel_correctness(group)
+                    batch_num_correct += num_correct
+                    batch_num_valid += num_valid
                 annotate_group_difficulty(group)
                 if laser_d is not None:
                     laser_d.observe(group)
-                post_process_rollout_rewards(args, group)
+                post_process_rollout_rewards(args, group, stage="group")
 
             if do_print:
                 sample = groups[0][0]
@@ -648,6 +662,19 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     data = [
         group for _gid, groups in sorted(collected.items(), key=lambda item: _sort_key(item[1])) for group in groups
     ]
+    metrics = metric_gatherer.collect()
+    if step_controller is not None:
+        metrics.update(
+            step_controller.finish(
+                [sample for group in data for sample in group], (batch_num_correct, batch_num_valid)
+            )
+        )
+    elif batch_scope:
+        metrics.update(
+            finalize_batch_reward_weights(
+                args, [sample for group in data for sample in group], (batch_num_correct, batch_num_valid)
+            )
+        )
     if log_sample_bodies:
         sample = data[-1][0]
         logger.info(
@@ -667,7 +694,6 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             worker.queue_size(),
             len(data),
         )
-    metrics = metric_gatherer.collect()
     metrics["fully_async_collect_time"] = collect_time
     metrics["fully_async_no_progress_warnings"] = no_progress_warnings
     metrics["fully_async_max_no_progress_seconds"] = max_no_progress_seconds

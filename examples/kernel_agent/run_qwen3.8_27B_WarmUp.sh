@@ -84,6 +84,8 @@ DYNAMIC_SPEEDUP_REWARD=${DYNAMIC_SPEEDUP_REWARD:-None}
 DYNAMIC_COVERAGE_REWARD=${DYNAMIC_COVERAGE_REWARD:-None}
 DYNAMIC_CORRECTNESS_REWARD=${DYNAMIC_CORRECTNESS_REWARD:-None}
 DYNAMIC_REWARD_AMPLITUDE=${DYNAMIC_REWARD_AMPLITUDE:-0.1}
+DYNAMIC_REWARD_SCOPE=${DYNAMIC_REWARD_SCOPE:-group}
+DYNAMIC_REWARD_STEP_WINDOW=${DYNAMIC_REWARD_STEP_WINDOW:-1}
 CUDA_AGENT_APPLY_FAILED_GROUP_REWARD=${CUDA_AGENT_APPLY_FAILED_GROUP_REWARD:-0}
 CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE=${CUDA_AGENT_APPLY_KERNEL_FAILED_SCORE:-0}
 export CUDA_AGENT_SPEEDUP_REWARD_UPPER="${CUDA_AGENT_SPEEDUP_REWARD_UPPER:-2}"
@@ -251,9 +253,26 @@ for component in correctness speedup coverage; do
    esac
    EXP_ARGS+=("--dynamic-reward-${component}" "${mode}")
 done
-EXP_ARGS+=(--dynamic-reward-amplitude "${DYNAMIC_REWARD_AMPLITUDE}")
+case "${DYNAMIC_REWARD_SCOPE}" in
+   group|batch|step) ;;
+   *) echo "Invalid dynamic reward scope: ${DYNAMIC_REWARD_SCOPE}" >&2; exit 1 ;;
+esac
+if [[ ! "${DYNAMIC_REWARD_STEP_WINDOW}" =~ ^[1-9][0-9]*$ ]]; then
+   echo "DYNAMIC_REWARD_STEP_WINDOW must be a positive integer" >&2
+   exit 1
+fi
+EXP_ARGS+=(
+   --dynamic-reward-amplitude "${DYNAMIC_REWARD_AMPLITUDE}"
+   --dynamic-reward-scope "${DYNAMIC_REWARD_SCOPE}"
+   --dynamic-reward-step-window "${DYNAMIC_REWARD_STEP_WINDOW}"
+)
 if [[ "${DYNAMIC_CORRECTNESS_REWARD}" != None || "${DYNAMIC_SPEEDUP_REWARD}" != None || "${DYNAMIC_COVERAGE_REWARD}" != None ]]; then
    EXP_PARAM+="Amplitude${DYNAMIC_REWARD_AMPLITUDE}"
+   if [[ "${DYNAMIC_REWARD_SCOPE}" == batch ]]; then
+      EXP_PARAM+="ScopeBatch"
+   elif [[ "${DYNAMIC_REWARD_SCOPE}" == step ]]; then
+      EXP_PARAM+="ScopeStep${DYNAMIC_REWARD_STEP_WINDOW}"
+   fi
 fi
 
 EXP_ARGS+=("${MIS_ARGS[@]}")

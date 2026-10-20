@@ -48,8 +48,17 @@ def _validate_rollout_reward_post_process_args(args) -> None:
         if rollout_path == _DEFAULT_ROLLOUT_FUNCTION_PATH:
             args.rollout_function_path = _KERNEL_AGENT_REWARD_ROLLOUT_PATH
         elif rollout_path not in {_KERNEL_AGENT_REWARD_ROLLOUT_PATH, _KERNEL_AGENT_FULLY_ASYNC_ROLLOUT_PATH}:
-            logger.warning("Custom kernel rollout must call post_process_rollout_rewards before group filtering")
+            logger.warning(
+                "Custom kernel rollout must call post_process_rollout_rewards at the group stage before filtering "
+                "and accumulate pre-filter correctness counts for batch/step scopes. "
+                "Finalize batch weights after collection; use StepRewardController for step windows."
+            )
     modes = {name: getattr(args, f"dynamic_reward_{name}", None) for name in ("correctness", "speedup", "coverage")}
+    if getattr(args, "dynamic_reward_scope", "group") not in {"group", "batch", "step"}:
+        raise ValueError("--dynamic-reward-scope must be group, batch, or step")
+    step_window = getattr(args, "dynamic_reward_step_window", 1)
+    if isinstance(step_window, bool) or not isinstance(step_window, int) or step_window < 1:
+        raise ValueError("--dynamic-reward-step-window must be a positive integer")
     allowed = {
         "piecewise",
         "piecewise-sqrt",
@@ -2385,6 +2394,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=0.1,
                 help="Linear keep-probability factor used by kernel-agent coverage-based rejection sampling.",
+            )
+            parser.add_argument(
+                "--dynamic-reward-scope",
+                choices=["group", "batch", "step"],
+                default="group",
+                help=(
+                    "Difficulty scope for dynamic reward weights: group preserves prompt/turn-group weighting; "
+                    "batch pools valid completed candidates before filtering, including rejected groups. "
+                    "step uses the preceding N-rollout window's pooled pre-filter rate for the next N rollouts. "
+                    "Batch/step weights apply only to retained samples after collection; filters use base weights."
+                ),
+            )
+            parser.add_argument(
+                "--dynamic-reward-step-window",
+                type=int,
+                default=1,
+                help=(
+                    "Positive window length N in completed rollout steps for step scope (default 1). "
+                    "The first N steps use base weights; each completed window determines the next N steps' weights."
+                ),
             )
             dynamic_reward_modes = [
                 "piecewise-sqrt",
