@@ -90,6 +90,12 @@ export CUDA_AGENT_SPEEDUP_REWARD_UPPER="${CUDA_AGENT_SPEEDUP_REWARD_UPPER:-2}"
 export CUDA_AGENT_CORRECT_REWARD_WEIGHT="${CUDA_AGENT_CORRECT_REWARD_WEIGHT:-0.5}"
 export CUDA_AGENT_SPEEDUP_REWARD_WEIGHT="${CUDA_AGENT_SPEEDUP_REWARD_WEIGHT:-0.5}"
 export CUDA_AGENT_SPEEDUP_SCORE_MODE="${CUDA_AGENT_SPEEDUP_SCORE_MODE:-legacy}"
+export CUDA_AGENT_COVERAGE_REWARD_TYPE="${CUDA_AGENT_COVERAGE_REWARD_TYPE:-time_coverage}"
+COVERAGE_RS_KEY=time_coverage
+if [[ "${CUDA_AGENT_COVERAGE_REWARD_TYPE}" == "efficiency_reference_time_coverage" ||
+      "${CUDA_AGENT_COVERAGE_REWARD_TYPE}" == "efficiency_reference_speedup_coverage" ]]; then
+   COVERAGE_RS_KEY=reference_time_coverage
+fi
 case "${CUDA_AGENT_SPEEDUP_SCORE_MODE}" in
    legacy|rational|improvement|lcb_improvement) ;;
    *) echo "Invalid CUDA_AGENT_SPEEDUP_SCORE_MODE: ${CUDA_AGENT_SPEEDUP_SCORE_MODE}" >&2; exit 1 ;;
@@ -566,7 +572,7 @@ KERNEL_AGENT_ARGS=(
    --padding-turns
    --max-turns 3
    --use-coverage-rs
-   --coverage-rs-key time_coverage
+   --coverage-rs-key "${COVERAGE_RS_KEY}"
    --coverage-rs-threshold 0.3
    --coverage-rs-factor 0.1
 )
@@ -624,6 +630,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF_JSON
     "CUDA_AGENT_CORRECT_REWARD_WEIGHT": "${CUDA_AGENT_CORRECT_REWARD_WEIGHT}",
     "CUDA_AGENT_SPEEDUP_REWARD_WEIGHT": "${CUDA_AGENT_SPEEDUP_REWARD_WEIGHT}",
     "CUDA_AGENT_SPEEDUP_SCORE_MODE": "${CUDA_AGENT_SPEEDUP_SCORE_MODE}",
+    "CUDA_AGENT_COVERAGE_REWARD_TYPE": "${CUDA_AGENT_COVERAGE_REWARD_TYPE}",
     "CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY": "${CUDA_AGENT_LOG_ROLLOUT_STATS_ONLY}"
   }
 }

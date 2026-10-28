@@ -53,12 +53,14 @@ if coverage_reward_type not in {
     "number_coverage",
     "reference_time_coverage",
     "efficiency_reference_time_coverage",
+    "efficiency_reference_speedup_coverage",
     "capped_speed_auxiliary",
     "gated_time_coverage",
 }:
     raise ValueError(
         "CUDA_AGENT_COVERAGE_REWARD_TYPE must be time_coverage, number_coverage, "
-        "reference_time_coverage, efficiency_reference_time_coverage, capped_speed_auxiliary, or gated_time_coverage"
+        "reference_time_coverage, efficiency_reference_time_coverage, efficiency_reference_speedup_coverage, "
+        "capped_speed_auxiliary, or gated_time_coverage"
     )
 # Speedup reward mapping. ``legacy`` preserves the historical clipped raw
 # speedup. ``improvement`` maps [1x, upper_bound] to [0, 1].

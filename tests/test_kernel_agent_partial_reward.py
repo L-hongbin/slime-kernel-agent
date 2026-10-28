@@ -29,7 +29,7 @@ from examples.kernel_agent.kernel_reward import (
     calculate_kernel_reward,
     post_process_rollout_rewards,
 )
-from examples.kernel_agent.utils import normalize_env_feedback, postprocess_turn_samples
+from examples.kernel_agent.utils import _extract_env_extra_info, normalize_env_feedback, postprocess_turn_samples
 
 from slime.utils.types import Sample
 
@@ -568,6 +568,89 @@ def test_speedup_reward_upper_from_environment(monkeypatch, upper):
     expected = 2.0 if upper is None else float(upper)
     assert config["speedup_reward_upper_bound"] == expected
     assert _calculate_performance_score(10.0, "legacy", None, config) == expected
+
+
+def test_speedup_coverage_type_from_environment(monkeypatch):
+    monkeypatch.setenv("CUDA_AGENT_COVERAGE_REWARD_TYPE", "efficiency_reference_speedup_coverage")
+    spec = importlib.util.spec_from_file_location(
+        "_kernel_agent_speedup_coverage_env_test", REPO_ROOT / "examples/kernel_agent/config.py"
+    )
+    config_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(config_module)
+    assert (
+        config_module.CUDA_AGENT_CONFIGS["reward"]["coverage_reward_type"] == "efficiency_reference_speedup_coverage"
+    )
+
+
+@pytest.mark.parametrize(
+    "mode,speedup,upper,lower,expected",
+    [
+        ("legacy", 0.5, 2.0, 0.0, 0.5),
+        ("legacy", 1.0, 2.0, 0.0, 1.0),
+        ("legacy", 3.0, 2.0, 0.0, 2.0),
+        ("legacy", 5.0, 4.0, 0.0, 4.0),
+        ("legacy", 0.5, 2.0, 0.6, 0.0),
+        ("legacy", 0.5, 2.0, 0.5, 0.5),
+        ("rational", 2.0, 2.0, 0.0, 4.0 / 3.0),
+        ("rational", 0.5, 2.0, 0.6, 0.0),
+        ("improvement", 2.0, 3.0, 0.0, 0.5),
+        ("lcb_improvement", 2.0, 3.0, 0.0, (2.0 * math.exp(-0.1) - 1.0) / 2.0),
+    ],
+)
+def test_speedup_coverage_reuses_performance_mapping(mode, speedup, upper, lower, expected):
+    config = {
+        **_reward_config(),
+        "coverage_reward_type": "efficiency_reference_speedup_coverage",
+        "coverage_reward_enable": True,
+        "coverage_reward_weight": 0.3,
+        "init_performance_weight": 0.7,
+        "speedup_score_mode": mode,
+        "speedup_reward_upper_bound": upper,
+        "speedup_reward_lower_bound": lower,
+        "speedup_uncertainty_z_score": 1.0,
+        "speedup_uncertainty_log_std_floor": 0.1,
+    }
+    state = _completed_env(
+        correctness=True,
+        speedup=speedup,
+        timing_metadata={
+            "custom_kernel_cuda_time_in_profiling_us": 600.0,
+            "total_kernel_run_time_in_profiling_us": 1000.0,
+            "kg_kernel_perf_mean_ms": 1.0 / speedup,
+            "kg_kernel_perf_std_ms": 0.0,
+            "kg_kernel_perf_num_trials": 10,
+            "cached": True,
+        },
+    )
+    state.update(reference_runtime=1.0, kernel_runtime=1.0 / speedup)
+    details = calculate_kernel_reward(state, config)
+    assert details["kernel_score"]["performance"] == pytest.approx(expected)
+    assert details["coverage_performance_score"] == pytest.approx(expected)
+    assert details["kernel_score"]["coverage"] == pytest.approx(0.6 * expected)
+    assert details["reward_component"]["coverage"] == pytest.approx(0.3 * 0.6 * expected)
+    assert details["reward"] == pytest.approx(config["init_correct_weight"] + (0.7 + 0.3 * 0.6) * expected)
+    # Rejection sampling continues to use reference coverage, independent of reward mapping.
+    assert _extract_env_extra_info(state)["reference_time_coverage"] == pytest.approx(0.6)
+
+    disabled = calculate_kernel_reward(state, {**config, "coverage_reward_enable": False})
+    assert disabled["reward_component"]["coverage"] == 0.0
+    assert disabled["reward"] == pytest.approx(config["init_correct_weight"] + 0.7 * expected)
+
+
+@pytest.mark.parametrize("failure", [{"correctness": False}, {"decoy_kernel": True}, {"compiled": False}])
+def test_speedup_coverage_does_not_reward_failed_kernels(failure):
+    state = _completed_env(correctness=True, speedup=3.0)
+    state.update(failure)
+    details = calculate_kernel_reward(
+        state,
+        {
+            **_reward_config(),
+            "coverage_reward_type": "efficiency_reference_speedup_coverage",
+            "coverage_reward_enable": True,
+        },
+    )
+    assert details["kernel_score"]["coverage"] == 0.0
+    assert details["reward_component"]["coverage"] == 0.0
 
 
 def test_improvement_performance_score_only_rewards_gain_over_reference():

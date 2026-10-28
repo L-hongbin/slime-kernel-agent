@@ -1013,7 +1013,7 @@ def calculate_kernel_reward(
         performance_reward = weight_performance * performance_score
         task_reward = correctness_reward + performance_reward
 
-        coverage_info = _compute_coverage(env_state, config)
+        coverage_info = _compute_coverage(env_state, config, performance_score=performance_score)
         coverage_score = coverage_info["coverage"]
         weight_coverage = float(config["coverage_reward_weight"]) if config["coverage_reward_enable"] else 0.0
         coverage_reward = weight_coverage * coverage_score

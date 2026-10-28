@@ -308,9 +308,40 @@ export CUDA_AGENT_SPEEDUP_REWARD_UPPER=2
 例如 `M=2` 时，`0.5x / 1x / 2x / 5x` 对应 `0.667 / 1 / 1.333 / 1.667`。
 非有限或非正的加速比不获得速度得分；错误程序仍走原有失败奖励路径。
 
-该模式只替换 `kernel_score.performance` 的映射，随后仍乘 performance 权重和 speedup 动态系数；correctness、coverage 的独立调权和原始 speedup 指标保持原有计算方式。
+该模式替换 `kernel_score.performance` 的映射，随后仍乘 performance 权重和 speedup 动态系数；correctness、coverage 的独立调权和原始 speedup 指标保持原有计算方式。若选择下述 `efficiency_reference_speedup_coverage`，coverage 得分也复用这个映射后的 performance score。
 Qwen3.8 WarmUp/MultiTurn 启动脚本会将模式透传给 Ray worker；非 `legacy` 模式的实验名追加 `-SSM模式名`，例如 `-SRUP2-SSMrational`。
 自定义启动脚本也需要将 `CUDA_AGENT_SPEEDUP_SCORE_MODE` 和 `CUDA_AGENT_SPEEDUP_REWARD_UPPER` 放入 Ray runtime environment。
+
+#### Kernel Agent 结合速度得分的 reference coverage 奖励
+
+```bash
+export CUDA_AGENT_COVERAGE_REWARD_TYPE=efficiency_reference_speedup_coverage
+```
+
+新类型复用 `efficiency_reference_time_coverage` 的测量有效性检查和 reference fraction `F`：
+
+```text
+F = clip(1 - (total_profiling_us - custom_profiling_us) / (reference_runtime_ms * 1000), 0, 1)
+原效率 coverage = F * min(reference_runtime / kernel_runtime, 1)
+新 coverage 得分 = F * performance_score
+coverage 奖励 = coverage 权重 * 新 coverage 得分
+```
+
+`performance_score` 直接使用本次 reward 计算中的速度得分，不重复计算或乘入 performance 权重。
+默认 `legacy` 模式下，它是 `min(speedup, CUDA_AGENT_SPEEDUP_REWARD_UPPER)`，低于配置的
+`speedup_reward_lower_bound` 时为 0；上界默认 2。因此新 coverage 得分可以大于 1。
+若速度映射为 `rational`、`improvement` 或 `lcb_improvement`，新 coverage 同样使用该映射的结果及其上下界规则。
+例如 `F=0.6`、`speedup=3`、`upper=2` 时，原效率 coverage 为 0.6，新得分为 1.2；coverage 权重为 0.5 时贡献奖励 0.6。
+
+测量无效或没有 custom kernel 工作量时，新得分仍为 0；错误、编译失败或 decoy 样本仍走失败奖励路径。
+传入的 performance score 必须有限、非负且不是布尔值。返回的 reward details 增加
+`coverage_performance_score`，记录本次复用的得分；`coverage_reference_fraction` 和
+`coverage_efficiency_discount` 沿用原有含义。
+
+原 `efficiency_reference_time_coverage` 保持 `[0,1]` 的计算方式，PRS 的 `reference_time_coverage`
+指标也保持原有公式。Qwen3.8 WarmUp/MultiTurn 脚本会透传新的 coverage 类型，并在选择
+`efficiency_reference_time_coverage` 或 `efficiency_reference_speedup_coverage` 时自动使用
+`--coverage-rs-key reference_time_coverage`。默认 coverage 类型仍为 `time_coverage`。
 
 #### KernelGYM 详细正确性诊断
 

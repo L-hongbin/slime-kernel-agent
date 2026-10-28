@@ -76,8 +76,13 @@ def test_auxiliary_scores_share_diagnostics_without_mutating_input(
 )
 def test_invalid_or_no_custom_measurements_share_zero_credit_and_reason(value):
     scores = [
-        _compute_coverage(value, {"coverage_reward_type": mode})
-        for mode in ("efficiency_reference_time_coverage", "capped_speed_auxiliary", "gated_time_coverage")
+        _compute_coverage(value, {"coverage_reward_type": mode}, performance_score=2.0)
+        for mode in (
+            "efficiency_reference_time_coverage",
+            "efficiency_reference_speedup_coverage",
+            "capped_speed_auxiliary",
+            "gated_time_coverage",
+        )
     ]
     assert all(score["coverage"] == 0 for score in scores)
     assert all(score["coverage_invalid_reason"] == scores[0]["coverage_invalid_reason"] for score in scores)
@@ -86,8 +91,13 @@ def test_invalid_or_no_custom_measurements_share_zero_credit_and_reason(value):
 def test_explicit_measurement_invalid_flag_is_preserved():
     value = result()
     value["metadata"]["coverage_measurement_valid"] = False
-    for mode in ("efficiency_reference_time_coverage", "capped_speed_auxiliary", "gated_time_coverage"):
-        assert _compute_coverage(value, {"coverage_reward_type": mode})["coverage"] == 0
+    for mode in (
+        "efficiency_reference_time_coverage",
+        "efficiency_reference_speedup_coverage",
+        "capped_speed_auxiliary",
+        "gated_time_coverage",
+    ):
+        assert _compute_coverage(value, {"coverage_reward_type": mode}, performance_score=2.0)["coverage"] == 0
 
 
 def test_zero_custom_with_positive_reference_coverage_earns_no_auxiliary():
@@ -95,8 +105,42 @@ def test_zero_custom_with_positive_reference_coverage_earns_no_auxiliary():
     assert _compute_coverage(value, {"coverage_reward_type": "reference_time_coverage"})["coverage"] == pytest.approx(
         0.9
     )
-    for mode in ("efficiency_reference_time_coverage", "capped_speed_auxiliary", "gated_time_coverage"):
-        assert _compute_coverage(value, {"coverage_reward_type": mode})["coverage"] == 0
+    for mode in (
+        "efficiency_reference_time_coverage",
+        "efficiency_reference_speedup_coverage",
+        "capped_speed_auxiliary",
+        "gated_time_coverage",
+    ):
+        assert _compute_coverage(value, {"coverage_reward_type": mode}, performance_score=2.0)["coverage"] == 0
+
+
+@pytest.mark.parametrize("performance_score", [None, True, False, float("nan"), float("inf"), -float("inf"), -0.1])
+def test_speedup_coverage_requires_valid_performance_score(performance_score):
+    with pytest.raises(ValueError, match="finite nonnegative performance score"):
+        _compute_coverage(
+            result(),
+            {"coverage_reward_type": "efficiency_reference_speedup_coverage"},
+            performance_score=performance_score,
+        )
+
+
+def test_speedup_coverage_uses_supplied_score_and_preserves_original_metrics():
+    value = result(candidate=0.5)
+    before = copy.deepcopy(value)
+    old = _compute_coverage(value, {"coverage_reward_type": "efficiency_reference_time_coverage"})
+    new = _compute_coverage(
+        value, {"coverage_reward_type": "efficiency_reference_speedup_coverage"}, performance_score=3.0
+    )
+    assert old["coverage"] == pytest.approx(0.6)
+    assert new["coverage"] == pytest.approx(1.8)
+    assert new["coverage_performance_score"] == 3.0
+    assert {k: v for k, v in new.items() if k not in {"coverage", "coverage_performance_score"}} == {
+        k: v for k, v in old.items() if k != "coverage"
+    }
+    assert _compute_coverage(value, {"coverage_reward_type": "reference_time_coverage"})["coverage"] == pytest.approx(
+        0.6
+    )
+    assert value == before
 
 
 if __name__ == "__main__":

@@ -54,7 +54,9 @@ def _efficiency_reference_coverage(result, metadata, custom_time, total_time):
         return 0.0, diagnostics
 
 
-def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def _compute_coverage(
+    result: dict[str, Any], config: dict[str, Any], *, performance_score: float | None = None
+) -> dict[str, Any]:
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     num_custom_kernel = result.get("num_custom_kernel", metadata.get("num_custom_kernel", 0)) or 0
     num_total_kernels = result.get("num_total_kernels", metadata.get("num_total_kernels", 0)) or 0
@@ -73,9 +75,28 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
         or 0
     )
 
-    if config["coverage_reward_type"] in {"efficiency_reference_time_coverage", "capped_speed_auxiliary", "gated_time_coverage"}:
+    if config["coverage_reward_type"] in {
+        "efficiency_reference_time_coverage",
+        "efficiency_reference_speedup_coverage",
+        "capped_speed_auxiliary",
+        "gated_time_coverage",
+    }:
         coverage, diagnostics = _efficiency_reference_coverage(result, metadata, custom_time, total_time)
-        if config["coverage_reward_type"] == "capped_speed_auxiliary":
+        if config["coverage_reward_type"] == "efficiency_reference_speedup_coverage":
+            # Reward-only auxiliary: reuse the caller's exact performance mapping,
+            # including its upper/lower bounds. Preserve Effrefcov and the PRS metric.
+            if (
+                performance_score is None
+                or isinstance(performance_score, bool)
+                or not math.isfinite(performance_score)
+                or performance_score < 0.0
+            ):
+                raise ValueError(
+                    "efficiency_reference_speedup_coverage requires a finite nonnegative performance score"
+                )
+            coverage = diagnostics["coverage_reference_fraction"] * performance_score
+            diagnostics["coverage_performance_score"] = performance_score
+        elif config["coverage_reward_type"] == "capped_speed_auxiliary":
             # Speed-only auxiliary reward, with exactly the same measurement and
             # custom-work gates as Effrefcov. PRS still uses original ref coverage.
             coverage = diagnostics["coverage_efficiency_discount"]
@@ -84,9 +105,7 @@ def _compute_coverage(result: dict[str, Any], config: dict[str, Any]) -> dict[st
             # eligible auxiliary score changes to the historical custom ratio.
             # A zero reference fraction is valid and must not suppress Timecov.
             coverage = (
-                float(custom_time) / float(total_time)
-                if diagnostics["coverage_efficiency_discount"] > 0.0
-                else 0.0
+                float(custom_time) / float(total_time) if diagnostics["coverage_efficiency_discount"] > 0.0 else 0.0
             )
         return {
             "coverage": coverage,
